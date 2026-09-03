@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = ROOT / "standards/edge-canon.lock.json"
 JSON_PATH = ROOT / "docs/product/target-status.json"
 MARKDOWN_PATH = ROOT / "docs/product/target-status.zh.md"
+CLI_JSON_PATH = ROOT / "crates/deis/src/commands/target-status.json"
+WEB_JSON_PATH = ROOT / "crates/deis-control/web/src/generated/target-status.json"
 MATURITY = {
     "artifact-generated": 0,
     "syntax-verified": 1,
@@ -239,9 +241,12 @@ def main() -> int:
         outputs = {
             JSON_PATH: render_json(status),
             MARKDOWN_PATH: render_markdown(status),
+            CLI_JSON_PATH: render_json(status),
+            WEB_JSON_PATH: render_json(status),
         }
         if args.write:
             for path, content in outputs.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
             print("generated target status from the locked Edge Canon registry")
             return 0

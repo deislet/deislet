@@ -1,6 +1,6 @@
 # 基础服务 (Basic Services)
 
-> Edge Canon 规范要求所有平台必须支持的基础服务
+> 选定 Edge Canon 标准版本要求的基础服务
 
 ---
 
@@ -11,7 +11,8 @@
 1. **KV Storage** - 键值存储
 2. **Cache API** - HTTP 响应缓存
 
-这些服务**无需在配置中启用**，deis-build 编译器不会对它们进行平台兼容性检查，因为所有平台都保证支持。
+这些服务**无需在配置中启用**，走共同构建路径。后端是否符合它们的标准语义，只能由
+Edge Canon 一致性测试和 registry 证明，编译器不能根据目标名称推断。
 
 ---
 
@@ -49,14 +50,11 @@ const parsed = await kv.get('user:123', { type: 'json' }); // 等价于 JSON.par
 `kv.put` 还接受 `expirationTtl`（秒数，到期后自动失效）与 `metadata`
 （跟值一起存、`kv.getWithMetadata()` 单独读回，不占用值本身的大小）。
 
-### 平台实现
+### 标准与目标状态
 
-| 平台 | 实现方式 | 值大小限制 |
-|------|---------|-----------|
-| Cloudflare | KV Namespaces | ≤ 25MB |
-| Deno | Deno KV | ≤ 64KB |
-| Tencent | EdgeKV | ≤ 2MB |
-| Deislet | Runtime KV | ≤ 10MB |
+选定的 Edge Canon release 定义可移植 KV 行为和最低限额。在本指南复制供应商产品名或
+value-size 数值，不能证明后端实现了这些语义。当前后端证据、认证和支持状态只看
+[registry 派生视图](../../../docs/product/target-status.zh.md)。
 
 ### 配置
 
@@ -94,18 +92,19 @@ export default async function handler(context: Context) {
 }
 ```
 
-### 平台实现
+### 标准与目标状态
 
-所有平台均支持标准 Cache API。
+Cache 是选定标准的 mandatory 能力；这项要求不等于每个后端当前已经合规。编译器在这里
+不按目标名称推断，只有共享测试套件和 registry 才能建立合规结论。
 
 ---
 
 ## 与扩展服务的区别
 
-| 类型 | 示例 | 配置要求 | 平台检查 |
+| 类型 | 示例 | 配置要求 | 构建检查 |
 |------|------|---------|---------|
 | **基础服务** | KV, Cache | 无需启用 | ❌ 不检查 |
-| **扩展服务** | SQL Database, Object Storage, Queues | 需要 `enabled: true` | ✅ 检查平台支持 |
+| **扩展服务** | SQL Database, Object Storage, Queues | 需要 `enabled: true` | ✅ 检查当前目标打包器映射 |
 
 ### 扩展服务示例
 
@@ -120,7 +119,9 @@ export default async function handler(context: Context) {
 }
 ```
 
-编译时会检查目标平台是否支持 SQL Database，不支持则报错并提供替代方案。
+编译时，Deislet 检查自己的当前目标打包器是否有 SQL Database 映射；缺少映射会终止
+目标产物构建。这不是供应商能力、合规或支持结论；这些状态只看
+[registry 派生视图](../../../docs/product/target-status.zh.md)。
 
 启用之后，`context.services.database` 除了逐条 `execute`/`query`，还有两种
 把多条语句合成一次的办法：
@@ -160,9 +161,8 @@ UTF-8 编码，对象先 `JSON.stringify` 再编码，`ArrayBuffer`/`ArrayBuffer
 
 ```bash
 $ deis-build build --vendor tencent
-
-✓ Basic services (KV, Cache) are always available
-✓ No platform compatibility check needed
+# 不打印能力判断。KV、Cache 走共同产物路径；部署后的语义由一致性测试检查，
+# 不是由这次构建证明。
 ```
 
 ### 扩展服务
@@ -170,13 +170,9 @@ $ deis-build build --vendor tencent
 ```bash
 $ deis-build build --vendor tencent
 
-✗ Platform capability validation failed
-Feature 'SQL Database' is not supported on EdgeOne Pages
-
-Alternatives:
-  1. Use external database service
-  2. Use KV for simple data
-  3. Deploy to Cloudflare (D1) or Deno (Postgres)
+✗ Target artifact implementation check failed
+Project cannot yet be compiled by Deislet's EdgeOne Pages target packager:
+1. Feature 'SQL Database': no current target implementation
 ```
 
 ---
@@ -215,6 +211,5 @@ Alternatives:
 
 ## 参考
 
-- [Edge Canon 基础规范](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_BASIC.md)
-- [Edge Canon 平台支持矩阵](https://github.com/deislet/edge-canon/blob/main/PLATFORM_MATRIX.md)
-- [deis-build 平台能力系统](../../deis-build-core/src/platform_capabilities.rs)
+- [锁定的 Edge Canon 标准与 registry](../../../standards/edge-canon.lock.json)
+- [deis-build 目标产物覆盖](../../deis-build-core/src/target_artifact_coverage.rs)

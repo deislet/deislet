@@ -2,11 +2,18 @@
 name: Deno Deploy Platform Specification
 version: 2026.01
 source: https://docs.deno.com/deploy/
+status: unverified-research-snapshot
+normative: false
 ---
 
 # Deno Deploy Platform Specification
 
-This document provides the complete specification for building applications on Deno Deploy platform for the deis-build adapter.
+> Boundary: this is an unpinned research snapshot for artifact work, not the
+> Edge Canon application contract, a complete current vendor specification, or
+> conformance/support evidence. Recheck claims against versioned official
+> sources; current target status is generated from the locked registry.
+
+This document records research used to build Deno-target artifacts.
 
 ## Platform Overview
 

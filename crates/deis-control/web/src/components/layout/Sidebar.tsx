@@ -10,6 +10,7 @@ import {
   ChevronLeft,
   ChevronRight,
   LogOut,
+  Globe2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -27,6 +28,7 @@ const navItems: NavItem[] = [
   { title: 'Commands', href: '/commands', icon: Terminal },
   { title: 'Configs', href: '/configs', icon: Settings },
   { title: 'Events', href: '/events', icon: ScrollText },
+  { title: 'Targets', href: '/targets', icon: Globe2 },
 ]
 
 export function Sidebar() {

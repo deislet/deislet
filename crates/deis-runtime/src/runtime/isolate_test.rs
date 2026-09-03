@@ -2129,7 +2129,7 @@ export default function handler(context: any): Response {
     //
     // Both halves are asserted on purpose. The present list is what the
     // platform promises; the absent list is what `crates/deis-runtime/README.md`
-    // and edge-canon's `PLATFORM_MATRIX.md` say a handler cannot use. Adding a
+    // say a handler cannot use. Adding a
     // global therefore fails this test until those documents move with it,
     // which is the only thing keeping them honest.
 
@@ -2630,7 +2630,7 @@ export default function handler(context: any): Response {
             assert_eq!(
                 seen[*name], false,
                 "`{name}` is now defined in the isolate; add it to the present list here and \
-                 to crates/deis-runtime/README.md and edge-canon's PLATFORM_MATRIX.md"
+                 to crates/deis-runtime/README.md"
             );
         }
     }
@@ -2964,7 +2964,7 @@ export default function handler(context: any): Response {
             seen["sourceDetached"], false,
             "a transferred buffer is now detached; structuredClone's transfer list has started \
              moving buffers, so js/bootstrap.js, crates/deis-runtime/README.md and edge-canon's \
-             PLATFORM_MATRIX.md all say something that is no longer true"
+             implementation inventory all say something that is no longer true"
         );
     }
 

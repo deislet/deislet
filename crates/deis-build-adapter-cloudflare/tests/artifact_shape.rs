@@ -1,8 +1,8 @@
 /**
- * Cloudflare Workers Adapter Spec Compliance Tests
+ * Cloudflare target artifact shape tests (not conformance tests)
  *
- * These tests verify that the generated code complies with
- * deis-build-adapter-cloudflare/spec.mdc requirements.
+ * These tests preserve output assumptions recorded in the unpinned spec.mdc
+ * research snapshot. They are not Edge Canon conformance or support evidence.
  */
 use deis_build_adapter_cloudflare::{generate, ASSETS_DIR};
 use deis_build_core::{ProjectConfig, StaticAsset};
@@ -162,13 +162,13 @@ fn test_error_handling_present() {
 }
 
 #[test]
-fn test_spec_reference_in_comments() {
+fn test_research_snapshot_reference_in_comments() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify spec compliance is documented
+    // Preserve a pointer to the artifact research snapshot.
     assert!(result.router_code.contains("spec.mdc"));
     assert!(result.context_builder_code.contains("spec.mdc"));
 }

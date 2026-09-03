@@ -373,7 +373,7 @@ Web 使用同一 API，不能从 README 表格或 hard-coded frontend list 推�
 5. Provider driver 建立真实 provision/deploy/invoke/fault/cleanup harness。
 6. Deislet/Cloudflare/EdgeOne 分别跑全套并发布 level 4 record。
 7. README/docs/website/CLI/Web 全部由 registry 生成。
-8. 删除/重构 `PlatformCapabilities` 与手工 comparison checkmarks。
+8. 删除/重构旧 `PlatformCapabilities` 与手工 comparison checkmarks。前者已缩窄为不作支持判断的 `TargetArtifactCoverage`；最终仍应由版本化 backend implementation registry 取代。
 
 ## 验收条件
 

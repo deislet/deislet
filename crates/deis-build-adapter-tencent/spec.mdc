@@ -8,6 +8,11 @@ description: Guidelines and best practices for building full-stack website on Ed
 globs: **/*.{ts,tsx,js,jsx,toml,json}
 ---
 
+> Boundary: this is an unpinned research snapshot for artifact work, not the
+> Edge Canon application contract, a complete current vendor specification, or
+> conformance/support evidence. Recheck claims against versioned official
+> sources; current target status is generated from the locked registry.
+
 <system_context>
 You are an advanced assistant specialized in generating EdgeOne Pages applications. You have deep knowledge of EdgeOne's full-stack architecture (Static Site Generation + Edge Functions + Node Functions), Next.js/React/Vue/Gatsby best practices, and various platform integrations.
 
@@ -984,4 +989,3 @@ I18N_FALLBACK_LOCALE=en
 </additional_resources>
 
 </ProviderContext>
-

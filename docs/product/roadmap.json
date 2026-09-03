@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-04T03:35:54+08:00",
+  "updatedAt": "2026-09-04T04:10:26+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -12,9 +12,7 @@
   },
   "nextActions": [
     "P0-SPEC-002",
-    "P0-MODEL-001",
-    "P0-CI-001",
-    "P0-EVID-001"
+    "P0-MODEL-001"
   ],
   "phases": [
     {
@@ -99,7 +97,7 @@
           "id": "P0-EVID-001",
           "title": "把能力矩阵和支持文案迁移为 registry 派生视图",
           "owner": "joint",
-          "status": "active",
+          "status": "done",
           "dependsOn": ["P0-CONF-001"],
           "outputs": [
             {"type": "local-path", "value": "standards/edge-canon.conformance-registry.json"},
@@ -107,9 +105,11 @@
             {"type": "local-path", "value": "docs/product/target-status.json"},
             {"type": "local-path", "value": "docs/product/target-status.zh.md"},
             {"type": "local-path", "value": "scripts/generate-target-status.py"},
-            {"type": "planned-path", "value": "CLI/Web target status views"}
+            {"type": "local-path", "value": "crates/deis/src/commands/targets.rs"},
+            {"type": "local-path", "value": "crates/deis-control/web/src/pages/Targets.tsx"},
+            {"type": "local-path", "value": "crates/deis-build-core/src/target_artifact_coverage.rs"}
           ],
-          "verification": "python3 scripts/generate-target-status.py --check 已保证离线 JSON/Markdown 状态严格派生自 SHA-256 锁定的 Edge Canon registry，proposal、compliant、supported 与 evidence maturity 不变量失败关闭；完成前仍须让 CLI/Web 使用同一 JSON，并把 compiler 的 provider implementation availability 与标准支持状态彻底分离"
+          "verification": "python3 scripts/generate-target-status.py --check 保证文档、CLI 和 Web 的 JSON 字节一致并严格派生自 SHA-256 锁定的 Edge Canon registry，proposal、compliant、supported 与 evidence maturity 不变量失败关闭；CLI targets list/inspect 和 Web Target evidence 已消费生成视图，单目标 JSON/人类视图保留标准版本和 registry SHA-256；compiler 的旧 PlatformCapabilities/UnsupportedFeatureError 已替换为只覆盖配置中可声明项的 TargetArtifactCoverage/MissingTargetImplementationError，不可检测 API、跨平台替代建议、未固定版本的 adapter 对比表和手工绿色支持表已移除或明确降为非规范研究快照，三个 adapter 测试入口从 spec_compliance 改为 artifact_shape，当前支持声明统一指向 registry"
         },
         {
           "id": "P0-MODEL-001",
@@ -136,12 +136,12 @@
           "id": "P0-CI-001",
           "title": "升级使用 Node 20 action runtime 的 GitHub Actions",
           "owner": "deislet",
-          "status": "active",
+          "status": "done",
           "dependsOn": ["P0-ROAD-001"],
           "outputs": [
             {"type": "local-path", "value": ".github/workflows/checks.yml"}
           ],
-          "verification": "python3 scripts/check-product-governance.py 固定 reviewed Node 24 majors、60 分钟 static workspace job、三组完整且互斥覆盖 package 的 90 分钟 test shard，以及 runtime shard 启动真实 deis-proxy 前的显式构建前置；修复后的完整 checks run 必须全部成功且不再产生 Node 20 runtime annotation"
+          "verification": "python3 scripts/check-product-governance.py 固定 reviewed Node 24 majors、60 分钟 static workspace job、三组完整且互斥覆盖 package 的 90 分钟 test shard，以及 runtime shard 启动真实 deis-proxy 前的显式构建前置；commit cedb2a5 的完整 checks run 33797445803 于 2026-09-03T20:03:54Z 结束，8/8 jobs 成功；逐一读取 8 个 check run annotations 得到总数 0，因此 Node 20 runtime annotation 为零"
         }
       ]
     },

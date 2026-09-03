@@ -1,8 +1,8 @@
 /**
- * EdgeOne Pages Adapter Spec Compliance Tests
+ * EdgeOne target artifact shape tests (not conformance tests)
  *
- * These tests verify that the generated code complies with
- * deis-build-adapter-tencent/spec.mdc (pages-llms.mdc) requirements.
+ * These tests preserve output assumptions recorded in the unpinned spec.mdc
+ * research snapshot. They are not Edge Canon conformance or support evidence.
  */
 use deis_build_adapter_tencent::generate;
 use deis_build_core::ProjectConfig;
@@ -64,7 +64,7 @@ fn test_no_modern_syntax() {
 }
 
 #[test]
-fn test_web_apis_compliance() {
+fn test_emitted_web_apis_match_research_snapshot() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
@@ -103,7 +103,7 @@ fn test_context_structure() {
 }
 
 #[test]
-fn test_cookie_parsing_compatibility() {
+fn test_cookie_parsing_shape() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
@@ -154,13 +154,13 @@ fn test_edgeone_json_format() {
 }
 
 #[test]
-fn test_spec_reference_in_comments() {
+fn test_research_snapshot_reference_in_comments() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify spec compliance is documented (references pages-llms.mdc)
+    // Preserve a pointer to the artifact research snapshot.
     assert!(
         result.router_code.contains("pages-llms.mdc") || result.router_code.contains("spec.mdc")
     );
@@ -183,7 +183,7 @@ fn test_traditional_loops_only() {
 }
 
 #[test]
-fn test_kv_adapter_compatibility() {
+fn test_kv_adapter_shape() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", true);
 

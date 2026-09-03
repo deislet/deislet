@@ -1,6 +1,6 @@
 # Basic Services
 
-> Basic services that all platforms must support according to Edge Canon specification
+> Baseline services required by the selected Edge Canon standard version
 
 ---
 
@@ -11,7 +11,9 @@ According to the [Edge Canon Basic Specification](https://github.com/deislet/edg
 1. **KV Storage** - Key-Value storage
 2. **Cache API** - HTTP response caching
 
-These services **do not need to be enabled in configuration**, and the deis-build compiler will not perform platform compatibility checks for them, as all platforms are guaranteed to support them.
+These services **do not need to be enabled in configuration** and use the
+common build path. Backend conformance is proven by the Edge Canon suite; the
+compiler does not infer it from a target name.
 
 ---
 
@@ -54,14 +56,13 @@ const parsed = await kv.get('user:123', { type: 'json' }); // same as JSON.parse
 `metadata` (stored alongside the value and read back separately with
 `kv.getWithMetadata()`; it does not count against the value's own size).
 
-### Platform Implementations
+### Standard and target status
 
-| Platform | Implementation | Value Size Limit |
-|----------|---------------|------------------|
-| Cloudflare | KV Namespaces | ≤ 25MB |
-| Deno | Deno KV | ≤ 64KB |
-| Tencent | EdgeKV | ≤ 2MB |
-| Deislet | Runtime KV | ≤ 10MB |
+The selected Edge Canon release defines the portable KV behavior and minimum
+limits. A vendor product name or a value-size number copied into this guide is
+not proof that a backend implements those semantics. Current backend evidence,
+certification and support status comes from the
+[registry-derived view](../../../docs/product/target-status.zh.md).
 
 ### Configuration
 
@@ -107,18 +108,21 @@ export default async function handler(context: Context) {
 }
 ```
 
-### Platform Implementations
+### Standard and target status
 
-All platforms support the standard Cache API.
+Cache is mandatory in the selected standard; that requirement is not evidence
+that every backend currently conforms. The compiler deliberately makes no
+target-name inference here. Conformance is established only by the shared
+suite and registry.
 
 ---
 
 ## Difference from Extended Services
 
-| Type | Examples | Configuration Requirement | Platform Check |
+| Type | Examples | Configuration Requirement | Build Check |
 |------|----------|--------------------------|---------------|
 | **Basic Services** | KV, Cache | No need to enable | ❌ Not checked |
-| **Extended Services** | SQL Database, Object Storage, Queues | Need `enabled: true` | ✅ Platform support checked |
+| **Extended Services** | SQL Database, Object Storage, Queues | Need `enabled: true` | ✅ Current target-packager mapping checked |
 
 ### Extended Service Example
 
@@ -133,7 +137,10 @@ All platforms support the standard Cache API.
 }
 ```
 
-At compile time, it will check whether the target platform supports SQL Database. If not supported, it will fail with alternative suggestions.
+At compile time, Deislet checks whether its current target packager has a SQL
+Database mapping. A missing mapping fails the artifact build. This is not a
+vendor capability, conformance, or support result; use the
+[registry-derived status](../../../docs/product/target-status.zh.md) for those.
 
 Once enabled, `context.services.database` offers more than statement-by-statement
 `execute`/`query`: two ways to combine several statements into one call.
@@ -178,9 +185,8 @@ rather than trying to parse text that was never there.
 
 ```bash
 $ deis-build build --vendor tencent
-
-✓ Basic services (KV, Cache) are always available
-✓ No platform compatibility check needed
+# No capability message is printed. KV and Cache use the common artifact path;
+# their deployed semantics are checked by conformance tests, not this build.
 ```
 
 ### Extended Services
@@ -188,13 +194,9 @@ $ deis-build build --vendor tencent
 ```bash
 $ deis-build build --vendor tencent
 
-✗ Platform capability validation failed
-Feature 'SQL Database' is not supported on EdgeOne Pages
-
-Alternatives:
-  1. Use external database service
-  2. Use KV for simple data
-  3. Deploy to Cloudflare (D1) or Deno (Postgres)
+✗ Target artifact implementation check failed
+Project cannot yet be compiled by Deislet's EdgeOne Pages target packager:
+1. Feature 'SQL Database': no current target implementation
 ```
 
 ---
@@ -235,6 +237,5 @@ never had one.
 
 ## References
 
-- [Edge Canon Basic Specification](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_BASIC.md)
-- [Edge Canon Platform Support Matrix](https://github.com/deislet/edge-canon/blob/main/PLATFORM_MATRIX.md)
-- [deis-build Platform Capabilities System](../../deis-build-core/src/platform_capabilities.rs)
+- [Locked Edge Canon standard and registry](../../../standards/edge-canon.lock.json)
+- [deis-build target artifact coverage](../../deis-build-core/src/target_artifact_coverage.rs)

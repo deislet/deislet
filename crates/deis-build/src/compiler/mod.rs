@@ -516,8 +516,10 @@ impl Compiler {
     fn detect_required_features(&self, config: &ProjectConfig) -> Vec<Feature> {
         let mut features = Vec::new();
 
-        // Note: KV Storage and Cache API are base services that every platform
-        // must support, so there is no need to detect or validate them
+        // KV Storage and Cache API use the common build path, so this
+        // transitional target-packager inventory does not inspect them.
+        // Whether a backend conforms to their standard semantics is decided
+        // by the Edge Canon suite, not assumed here.
 
         // Detect extended service configuration
         if let Some(ref services) = config.services {
@@ -554,9 +556,11 @@ impl Compiler {
         }
 
         // Everything above is read from `.config.json`, and that is the whole
-        // reach of this check by design: a declared feature that the target
-        // platform does not have fails the build here, before anything is
-        // deployed. A feature the code uses without declaring it - SSR, a
+        // reach of this check by design: a declared feature that Deislet's
+        // current target packager cannot translate fails the build here,
+        // before anything is deployed. This says nothing about the vendor's
+        // product capability or this target's Edge Canon certification. A
+        // feature the code uses without declaring it - SSR, a
         // rendering framework, `BroadcastChannel`, `fetch` - has nowhere to be
         // declared, so it cannot be caught here and fails at runtime instead.
         // That split is written down in docs/architecture.zh.md section 12;
@@ -566,14 +570,12 @@ impl Compiler {
         features
     }
 
-    /// Validate that the platform supports the required features
+    /// Check whether Deislet's current packager implements the requested output.
     ///
-    /// Returns the warnings the build should carry: features the target is
-    /// specified to have and has not wired up yet. Those do not stop a build -
-    /// the declaration still belongs in the bundle, where the control plane
-    /// records it - but the person building has to be told what will not work
-    /// when they deploy.
-    fn validate_platform_capabilities(
+    /// This transitional implementation-coverage check is not a provider
+    /// capability matrix, conformance result, or support decision. Those
+    /// statuses come only from the locked Edge Canon registry.
+    fn validate_target_artifact_coverage(
         &self,
         vendor: &str,
         features: &[Feature],
@@ -593,19 +595,15 @@ impl Compiler {
             // an exemption from every capability check.
             other => {
                 return Err(anyhow::anyhow!(
-                    "{other} has no platform capability table, so nothing would check whether \
-                     this project's declared features exist there"
+                    "{other} has no Deislet target implementation table, so nothing would check \
+                     whether the current packager can encode this project's declared features"
                 ));
             }
         };
 
-        let caps = PlatformCapabilities::new(platform);
-        let (errors, pending) = caps.partition_unsupported(features);
-
-        let warnings: Vec<String> = pending.iter().map(|p| p.to_string()).collect();
-        for warning in &warnings {
-            println!("{}", format!("  ⚠ {warning}").yellow());
-        }
+        let coverage = TargetArtifactCoverage::new(platform);
+        let errors = coverage.missing(features);
+        let warnings = Vec::new();
 
         match if errors.is_empty() {
             Ok(())
@@ -617,20 +615,26 @@ impl Compiler {
                 // Show detailed error information
                 eprintln!(
                     "\n{}",
-                    "✗ Platform capability validation failed".red().bold()
+                    "✗ Target artifact implementation check failed".red().bold()
                 );
                 eprintln!(
-                    "{} cannot be deployed to {} due to unsupported features:\n",
+                    "{} cannot yet be compiled by Deislet's {} target packager:\n",
                     "Project".yellow(),
                     platform.display_name().cyan()
                 );
 
                 for (i, error) in errors.iter().enumerate() {
-                    eprintln!("{}. {}\n", i + 1, error.detailed_message());
+                    eprintln!(
+                        "{}. Feature '{}': no current target implementation\n   Description: {}\n",
+                        i + 1,
+                        error.feature.name(),
+                        error.feature.description()
+                    );
                 }
 
                 Err(anyhow::anyhow!(
-                    "Platform {} does not support required features",
+                    "Deislet's {} target implementation cannot encode all requested features; \
+                     this is artifact coverage, not a vendor support or conformance result",
                     platform.display_name()
                 ))
             }
@@ -659,9 +663,10 @@ impl Compiler {
         let minify = minify && build_settings.map(|b| b.minify).unwrap_or(true);
         let source_map = build_settings.map(|b| b.sourcemap).unwrap_or(true);
 
-        // Validate platform capabilities
+        // Check this packager's artifact coverage. Standard validation and
+        // target certification are separate registry-driven gates.
         let required_features = self.detect_required_features(config);
-        let mut warnings = self.validate_platform_capabilities(vendor, &required_features)?;
+        let mut warnings = self.validate_target_artifact_coverage(vendor, &required_features)?;
 
         let output_mode = self.options.output_mode;
         let keeps_output = matches!(output_mode, OutputMode::Files | OutputMode::Both);

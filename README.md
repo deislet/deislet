@@ -135,13 +135,13 @@ protocol.
 
 | Component | What it does |
 |---|---|
-| [`deis-control`](crates/deis-control) | The control plane, and the only authority on metadata. Holds applications, immutable versions, environments, deployment pointers, routes, encrypted secrets, accounts, scoped tokens and an append-only audit log in SQLite; serves the bundle download and each node's assignment list; owns the cron schedule; mints the per-tenant storage capability tokens the CLI uses; exports Prometheus metrics; and runs the React console, which covers fleet operations only — dashboard, nodes, control channels, commands, events, node configuration. The catalog half has no console page: applications, versions, environments, deployments, secrets and routes are reached through `deis` or the REST API. |
+| [`deis-control`](crates/deis-control) | The control plane, and the only authority on metadata. Holds applications, immutable versions, environments, deployment pointers, routes, encrypted secrets, accounts, scoped tokens and an append-only audit log in SQLite; serves the bundle download and each node's assignment list; owns the cron schedule; mints the per-tenant storage capability tokens the CLI uses; exports Prometheus metrics; and runs the React console, which covers dashboard, nodes, control channels, commands, events, node configuration, and registry-derived target evidence. The catalog half has no console page: applications, versions, environments, deployments, secrets and routes are reached through `deis` or the REST API. |
 | [`deis-runtime`](crates/deis-runtime) | A node. Runs every application of every environment it is assigned, one isolate per `(app, environment)` on its own OS thread. Serves static assets from the bundle before starting an isolate — through the version's own `_redirects`, `_headers` and not-found rules — injects `context.env` (including the `ASSETS` binding), the storage clients and the application's named `context.bindings`, dispatches a `service` binding to another application in this same process without an address anywhere, streams a response body out as it is produced, polls the queues an app declares, and ships logs, metrics and one trace per invocation to deis-telemetry. What an application may assume is pinned to its `compatibilityDate`. |
 | [`deis-proxy`](crates/deis-proxy) | Traffic entry, built on Pingora. Terminates TLS and picks the certificate by SNI, resolves the application by `x-deis-app-id` or by host **and path prefix** against the routing table it polls from the control plane, stamps `x-deis-app-id` and `x-deis-environment` onto the upstream request, load-balances across nodes, obtains and renews its own certificates over ACME when `[tls.acme]` is on, and upgrades its own binary without dropping connections. |
 | [`deis-store`](crates/deis-store) | KV, per-tenant SQL and content-addressed blobs, as three gRPC services in one process on SQLite and the local disk. The object store does more than put/get/delete: listing with a prefix, a delimiter and a cursor, `Head`, ranged reads, and writes and deletes made conditional on an object's sha256 — the platform's one atomic coordination primitive. Consistent backups are `deis-store snapshot` / `restore`. Knows nothing about versions, deployments or environments. |
 | [`deis-queue`](crates/deis-queue) | A durable queue with lease-based consumption: `Send` and `SendBatch`, `Pull` under a lease, `Ack`, `Nack` with a delay, and a dead-letter table once a message has been tried too often - with the reason it was given up on, which `deis queue dead-letters` reads and `deis queue replay` acts on. Nodes poll it; it never pushes. |
 | [`deis-telemetry`](crates/deis-telemetry) | Logs, metrics and invocation traces, independent of everything else. Three services side by side: batched logs with `Query` and a streaming `Tail`; one trace per invocation with `QueryTraces` and `TailTraces`, which is what `deis trace` reads; and metrics exported in Prometheus format, latency among them as a histogram rather than a high-water mark. Only deis-runtime ships to it so far; the other components still log to their own stdout. |
-| [`deis`](crates/deis) | The developer CLI, and the only interface a person needs. `init`, `dev`, `validate` and `build` work on the project on disk and `config` holds the CLI's own settings — the credential among them, which it will not write into the project; `deploy`, `versions`, `rollback`, `status`, `secret`, `logs`, `tail`, `trace`, `kv`, `db`, `blob`, `queue`, `account`, `token` and `audit` talk to a running platform. Delegates every bit of parsing and compiling to deis-build. |
+| [`deis`](crates/deis) | The developer CLI, and the only interface a person needs. `init`, `dev`, `validate` and `build` work on the project on disk; `targets` reads the locked registry-derived standard status embedded at build time; and `config` holds the CLI's own settings — the credential among them, which it will not write into the project. `deploy`, `versions`, `rollback`, `status`, `secret`, `logs`, `tail`, `trace`, `kv`, `db`, `blob`, `queue`, `account`, `token` and `audit` talk to a running platform. Delegates every bit of parsing and compiling to deis-build. |
 | [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four targets — Cloudflare Workers, Deno Deploy, Tencent EdgeOne, and this platform. Translation only: it never deploys. |
 | [`deis-wire`](crates/deis-wire) | The gRPC toolkit and, in `deis_wire::conventions`, the names both sides of every wire agree on: the header names, the tenant id, the message ceiling, the reserved environment keys. |
 
@@ -376,8 +376,8 @@ order it is likely to matter:
   `the_isolate_global_surface_is_the_one_the_documents_describe` in
   `isolate_test.rs` walks these lists both ways inside a real isolate, so a
   global gained or lost fails that test until this section,
-  `crates/deis-runtime/README.md` and edge-canon's `PLATFORM_MATRIX.md` move
-  with it. It asserts every name that should be present, and, of the absent
+  `crates/deis-runtime/README.md` move with it. It asserts every name that
+  should be present, and, of the absent
   ones, the four that are absent by decision — the seven below that are merely
   not taken up yet are outside it on purpose, so binding one is not a test
   failure.
@@ -395,8 +395,9 @@ order it is likely to matter:
   `DecompressionStream`, `EventSource`, `FileReader` and `reportError` remain
   unbound as well, simply not yet taken up. See §12 of the architecture
   document.
-- **No Node.js built-ins and no npm resolution**, and therefore no framework
-  SSR. This is a decision, not a gap: see the capability matrix.
+- **No Node.js built-ins and no npm resolution yet**, and therefore no
+  framework SSR. These are tracked product gaps, not a claim that supported
+  targets may expose different application standards.
 - **Only the node ships logs.** deis-proxy, deis-store, deis-queue and
   deis-control write to their own stdout, so request counts and latency —
   which deis-proxy is the natural source of — can only be inferred from the
@@ -429,15 +430,15 @@ order it is likely to matter:
   queue clients have no per-call timeout of their own, so a deis-store that
   accepts the connection and never answers keeps that runtime thread waiting.
 
-See §11 and §12 of the architecture document for the full list and the
-per-capability accounting against [Edge Canon's platform
-matrix](https://github.com/deislet/edge-canon/blob/main/PLATFORM_MATRIX.md).
+See §11 and §12 of the architecture document for the implementation inventory.
+Current evidence, compliance and support status comes only from the
+[registry-derived target status](docs/product/target-status.zh.md).
 
 ## Related repositories
 
 | Repository | Purpose |
 |---|---|
-| [edge-canon](https://github.com/deislet/edge-canon) | The edge function specification and the cross-platform capability matrix. Public. |
+| [edge-canon](https://github.com/deislet/edge-canon) | The versioned edge application standard, evidence and conformance registry. Public. |
 | coraza | A Rust port of the Coraza WAF engine, intended to run in front of deis-proxy. |
 | capkit | Capability-based multi-cloud abstraction, used for provisioning external resources. |
 

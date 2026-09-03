@@ -7,6 +7,9 @@ apart is the point:
   `deis build` need no platform at all. `deis build --vendor cloudflare|deno|tencent`
   produces what that vendor's own tooling deploys; this CLI never pushes to
   them.
+- **The locked standard registry.** `deis targets list|inspect` reads the same
+  generated target-status JSON as the product documentation and Web console;
+  it does not infer support from an adapter being present.
 - **A Deislet platform.** `deis deploy`, `deis versions`, `deis rollback`,
   `deis status`, `deis secret`, `deis logs`, `deis tail`, `deis trace`,
   `deis kv`, `deis db` and `deis blob` talk to a `deis-control`; for logs and
@@ -155,6 +158,15 @@ fleet ignored is exactly the failure this is for.
 
 A byte-identical bundle reuses the existing version instead of burning a new
 number, and says so.
+
+### `deis targets list|inspect`
+
+Show each target's implementation-evidence maturity, whole-standard
+certification, compliance and support status from the locked Edge Canon
+registry. `list --json` returns the generated document used by the Web console
+and product documentation; `inspect --json` returns one target together with
+the same standard and registry provenance. Artifact generation or deployment
+evidence is not displayed as support.
 
 ### `deis versions [--limit N]`
 

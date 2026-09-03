@@ -100,11 +100,16 @@ To add one:
 1. Create `crates/deis-build-adapter-<vendor>` with `pub const VENDOR` and the
    naming test.
 2. Implement `generate(routes, config) -> AdapterArtifacts`.
-3. Add the variant to `Platform` in `deis-build-core`, along with its honest
-   capability set — a feature the platform cannot do must be `false`, so the
-   build fails rather than the request.
+3. Add the output target identifier to `Platform`. Add a
+   `TargetArtifactCoverage` mapping only for a declaration the compiler can
+   read and this packager can encode. This table is artifact coverage, not a
+   vendor capability or support declaration.
 4. Add the arm to `deis-build`'s dispatch and the re-export in its `lib.rs`.
-5. Write a `spec_compliance` test against the vendor's real documented shape.
+5. Write an `artifact_shape` test against version-pinned official vendor
+   documentation and CLI/API behavior.
+6. Run the same released Edge Canon conformance suite through the target's
+   deploy/invoke harness and publish the resulting evidence to the registry.
+   An adapter existing or producing an accepted artifact is not support.
 
 ## Commits
 

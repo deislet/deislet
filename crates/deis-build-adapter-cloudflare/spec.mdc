@@ -2,11 +2,18 @@
 name: Cloudflare Workers Platform Specification
 version: 2026.01
 source: https://developers.cloudflare.com/workers/
+status: unverified-research-snapshot
+normative: false
 ---
 
 # Cloudflare Workers Platform Specification
 
-This document provides the complete specification for building applications on Cloudflare Workers platform for the deis-build adapter.
+> Boundary: this is an unpinned research snapshot for artifact work, not the
+> Edge Canon application contract, a complete current vendor specification, or
+> conformance/support evidence. Recheck claims against versioned official
+> sources; current target status is generated from the locked registry.
+
+This document records research used to build Cloudflare-target artifacts.
 
 ## Platform Overview
 

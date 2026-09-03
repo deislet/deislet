@@ -77,7 +77,7 @@ deis-build/
 │   ├── deis-build-core/        # 核心类型和工具
 │   │   ├── src/
 │   │   │   ├── config.rs    # 配置解析
-│   │   │   ├── platform_capabilities.rs  # 平台能力系统
+│   │   │   ├── target_artifact_coverage.rs  # 目标产物实现清单
 │   │   │   ├── types.rs     # 核心类型定义
 │   │   │   └── error.rs     # 错误类型
 │   ├── deis-build-adapter-cloudflare/  # Cloudflare 适配器
@@ -210,7 +210,7 @@ Now properly handles and reports as validation error.
 ///
 /// # 错误
 ///
-/// 当配置无效或平台不支持所需特性时返回错误
+/// 当配置无效或当前目标打包器缺少所需映射时返回错误
 pub async fn build(&self, project_dir: &Path, vendor: &str) -> Result<BuildResult> {
     // ...
 }
@@ -269,10 +269,13 @@ let artifacts = match vendor {
 };
 ```
 
-### 4. 更新平台能力系统
+### 4. 更新目标打包器实现清单
+
+该清单只描述 Deislet 代码当前能否生成目标产物，不得据此声称供应商支持或 Edge Canon
+合规。标准与认证状态来自锁定的 conformance registry。
 
 ```rust
-// ../deis-build-core/src/platform_capabilities.rs
+// ../deis-build-core/src/target_artifact_coverage.rs
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -282,21 +285,9 @@ pub enum Platform {
     YourPlatform,  // 添加新平台
 }
 
-impl PlatformCapabilities {
-    pub fn new(platform: Platform) -> Self {
-        let mut supported = HashSet::new();
-
-        match platform {
-            Platform::YourPlatform => {
-                // 添加支持的特性
-                supported.insert(Feature::SQLDatabase);
-                supported.insert(Feature::ObjectStorage);
-            }
-            // ...
-        }
-
-        Self { platform, supported_features: supported }
-    }
+impl TargetArtifactCoverage {
+    // `new` 从 Feature::target_implementation_name 派生集合；新增 target
+    // 时必须逐项记录 Deislet 打包器实际存在的映射。
 }
 ```
 

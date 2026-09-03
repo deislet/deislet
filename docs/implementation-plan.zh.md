@@ -591,7 +591,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 
 合入时补齐的三处：`wire_deployment_env` 此前无人调用（存储绑定全部落空）；`MetricShipper` 无人启动；节点的 `Trigger.OnScheduled` 是个只回 success 的桩，控制面每次触发都被当成成功。
 
-`PLATFORM_MATRIX` 对应更新：deislet 的 SQL / Blob / Queue / Cron 从「暂缺」转正，能力表里已无 pending 项；剩下不支持的（Durable Objects、Node 内置、SSR/ISR、Workers AI、BroadcastChannel）是形态上就没有，按「直接失败」而不是「告警」处理。
+当时的 `PLATFORM_MATRIX` 对应更新：deislet 的 SQL / Blob / Queue / Cron 从「暂缺」转为已实现，旧实现表里已无 pending 项；这段只记录 2026-08-29 的代码清单，不构成当前支持声明。当前证据、合规与支持只看 registry 派生视图。
 
 > 事后更正（2026-08-29）：上面那句「构建直接失败」说满了。`detect_required_features` 只认 `.config.json` 里的 `services.{database,blob,queue}`、`queues`、`cron` 和 `runtime` 里的 `node` 字样；SSR、ISR、Durable Objects、BroadcastChannel、Workers AI 在配置里没有可声明的地方，编译器检不出来，代码里用了它们是运行时才炸。
 
@@ -674,7 +674,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 |---|---|---|
 | C1 | `deis` CLI 闭环：`deploy` / `rollback` / `versions` / `status` / `secret` / `logs` / `tail`，`dev` 接真运行时 | 完成 |
 | C2 | ~~端到端演示扩展~~：`scripts/demo.sh` 已在波次 B 收尾时完成 | 完成 |
-| C3 | 文档与能力矩阵回填 | 完成：README、`architecture.zh.md`、本文与 `edge-canon/PLATFORM_MATRIX.md` 已按代码逐项核对 |
+| C3 | 旧实现清单回填 | 完成：README、`architecture.zh.md` 与本文曾按代码逐项核对；该清单现已降为历史记录，不能作为支持状态 |
 | C4 | `scripts/demo.sh` 的部署动作改走 CLI，并补上 CLI 自身的验收 | 完成：deploy / secret set / rollback 不再打 REST，新增 6 条检查（部署、版本、密钥列名、tail、status、节点注册） |
 
 ### 波次 D（2026-08-30 起，对着 Cloudflare 评审的结论做的）

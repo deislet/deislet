@@ -274,7 +274,8 @@ Configure in `.config.json`:
 }
 ```
 
-> **Note**: Extended services require platform support, otherwise build will fail.
+> **Note**: Extended services require a mapping in the current Deislet target
+> packager or artifact generation fails. This is not a support declaration.
 
 ### How to add environment variables?
 

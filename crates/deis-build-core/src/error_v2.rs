@@ -24,7 +24,7 @@ pub enum BuildError {
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
 
-    /// Platform error - platform capability and compatibility issues
+    /// Target environment or Deislet packager implementation issue.
     #[error("Platform error: {0}")]
     Platform(#[from] PlatformError),
 
@@ -178,9 +178,11 @@ pub enum CodeQualityWarning {
 
 #[derive(Error, Debug, Clone)]
 pub enum PlatformError {
-    /// Unsupported feature (the existing UnsupportedFeatureError)
+    /// Deislet's selected target packager has no mapping for this feature.
     #[error("{0}")]
-    UnsupportedFeature(#[from] crate::platform_capabilities::UnsupportedFeatureError),
+    MissingTargetImplementation(
+        #[from] crate::target_artifact_coverage::MissingTargetImplementationError,
+    ),
 
     /// Incompatible runtime
     #[error("Incompatible runtime for {platform}")]
@@ -412,7 +414,7 @@ impl ParseError {
 impl PlatformError {
     pub fn error_code(&self) -> &'static str {
         match self {
-            PlatformError::UnsupportedFeature(_) => "PLATFORM_UNSUPPORTED_FEATURE",
+            PlatformError::MissingTargetImplementation(_) => "TARGET_IMPLEMENTATION_MISSING",
             PlatformError::IncompatibleRuntime { .. } => "PLATFORM_INCOMPATIBLE_RUNTIME",
             PlatformError::LimitExceeded { .. } => "PLATFORM_LIMIT_EXCEEDED",
             PlatformError::PlatformUnavailable { .. } => "PLATFORM_UNAVAILABLE",

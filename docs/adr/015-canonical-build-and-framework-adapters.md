@@ -44,7 +44,7 @@ Deislet 提供产品级统一构建生命周期，并维护主流框架的一等
 - 没有通用 source checkout、依赖安装、framework build、remote build job 与日志存储生命周期；
 - `deis build --watch` 明确未实现；
 - compiler 直接从 Edge Canon source 生成多个 vendor artifact，缺少独立、稳定的 canonical Build Output 层；
-- `PlatformCapabilities` 根据目标允许或拒绝 Node/SSR/ISR/Stateful Object 等功能，与 DEC-001 的单一合规标准冲突；
+- 决策时的 `PlatformCapabilities` 根据目标允许或拒绝 Node/SSR/ISR/Stateful Object 等功能，与 DEC-001 的单一合规标准冲突；它已改名为只陈述 Deislet 打包器现状的 `TargetArtifactCoverage`，但按标准版本统一验证和 canonical Build Output 仍待本 ADR 后续实现；
 - Tencent `spec.mdc` 等文档很丰富，但不是可执行、版本化、经 conformance suite 验证的框架适配器；
 - README 仍明确写着无 Node built-ins/npm resolution，因此现状无法承载主流全栈框架；
 - 缺少 framework/version/feature 支持矩阵、monorepo roots、lockfile policy、build cache、SBOM、provenance、secret redaction 与 artifact signing；

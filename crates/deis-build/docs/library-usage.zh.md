@@ -183,46 +183,40 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### 示例 4: 检查平台能力
+### 示例 4: 检查目标打包器实现覆盖
+
+这只检查 Deislet 当前打包器能否编码目标产物，不表示供应商能力、合规或支持。
 
 ```rust
-use deis_build::{Platform, PlatformCapabilities, Feature};
+use deis_build::{Platform, TargetArtifactCoverage, Feature};
 
 fn main() {
-    // 检查 Cloudflare 支持的特性
-    let caps = PlatformCapabilities::new(Platform::Cloudflare);
+    // 检查 Cloudflare 目标打包器已有的映射
+    let caps = TargetArtifactCoverage::new(Platform::Cloudflare);
 
-    println!("Cloudflare Workers 支持的特性:");
+    println!("Cloudflare 目标产物已有映射:");
 
-    if caps.supports(Feature::SQLDatabase) {
+    if caps.implements(Feature::SQLDatabase) {
         println!("  ✓ SQL Database (D1)");
     }
 
-    if caps.supports(Feature::ObjectStorage) {
+    if caps.implements(Feature::ObjectStorage) {
         println!("  ✓ Object Storage (R2)");
-    }
-
-    if caps.supports(Feature::WebSockets) {
-        println!("  ✓ WebSockets");
     }
 
     // 检查多个特性
     let required = vec![
         Feature::SQLDatabase,
-        Feature::WebSockets,
-        Feature::SSR,  // Cloudflare 不支持
+        Feature::ObjectStorage,
+        Feature::NodeRuntime,  // 当前 Cloudflare 目标打包器没有此映射
     ];
 
     match caps.check_features(&required) {
-        Ok(_) => println!("所有特性都支持"),
+        Ok(_) => println!("所有目标产物映射都已实现"),
         Err(errors) => {
-            println!("不支持的特性:");
+            println!("Deislet 打包器缺少以下目标产物映射:");
             for err in errors {
                 println!("  ✗ {}", err);
-                println!("    替代方案:");
-                for alt in err.alternatives() {
-                    println!("      - {}", alt);
-                }
             }
         }
     }
@@ -392,11 +386,11 @@ use deis_build::{
     ServicesConfig,
     VendorsConfig,
 
-    // 平台能力
+    // 目标产物实现覆盖（不是标准支持状态）
     Platform,
     Feature,
-    PlatformCapabilities,
-    UnsupportedFeatureError,
+    TargetArtifactCoverage,
+    MissingTargetImplementationError,
 
     // 验证和编译结果
     ValidationResult,
@@ -453,7 +447,7 @@ use deis_build::{
 
 ```rust
 use deis_build::{
-    Compiler, CompilerOptions, Platform, PlatformCapabilities,
+    Compiler, CompilerOptions, Platform, TargetArtifactCoverage,
     load_project_config, Feature,
 };
 use std::path::Path;
@@ -476,15 +470,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 3. 验证目标平台
-    println!("\n🔍 验证平台兼容性...");
+    // 3. 检查当前目标打包器覆盖
+    println!("\n🔍 检查目标产物映射...");
     let target_platform = Platform::Cloudflare;
-    let caps = PlatformCapabilities::new(target_platform);
+    let caps = TargetArtifactCoverage::new(target_platform);
 
     match caps.check_features(&used_features) {
-        Ok(_) => println!("  ✓ 所有特性都支持"),
+        Ok(_) => println!("  ✓ 所有目标产物映射都已实现"),
         Err(errors) => {
-            eprintln!("  ✗ 平台不支持以下特性:");
+            eprintln!("  ✗ Deislet 打包器缺少以下映射:");
             for err in errors {
                 eprintln!("    - {}", err);
             }
@@ -531,7 +525,7 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 #[cfg(test)]
 mod tests {
-    use deis_build::{Compiler, Platform, PlatformCapabilities, Feature};
+    use deis_build::{Compiler, Platform, TargetArtifactCoverage, Feature};
 
     #[test]
     fn test_compiler_creation() {
@@ -540,11 +534,11 @@ mod tests {
     }
 
     #[test]
-    fn test_platform_capabilities() {
-        let caps = PlatformCapabilities::new(Platform::Cloudflare);
-        assert!(caps.supports(Feature::SQLDatabase));
-        assert!(caps.supports(Feature::ObjectStorage));
-        assert!(!caps.supports(Feature::SSR));
+    fn test_target_artifact_coverage() {
+        let caps = TargetArtifactCoverage::new(Platform::Cloudflare);
+        assert!(caps.implements(Feature::SQLDatabase));
+        assert!(caps.implements(Feature::ObjectStorage));
+        assert!(!caps.implements(Feature::NodeRuntime));
     }
 }
 ```

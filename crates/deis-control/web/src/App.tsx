@@ -7,6 +7,7 @@ import { Nodes } from '@/pages/Nodes'
 import { Commands } from '@/pages/Commands'
 import { Configs } from '@/pages/Configs'
 import { Events } from '@/pages/Events'
+import { Targets } from '@/pages/Targets'
 import { SignIn } from '@/pages/SignIn'
 import { api, ApiError } from '@/lib/api'
 
@@ -85,6 +86,7 @@ function App() {
               <Route path="commands" element={<Commands />} />
               <Route path="configs" element={<Configs />} />
               <Route path="events" element={<Events />} />
+              <Route path="targets" element={<Targets />} />
             </Route>
           </Routes>
         </BrowserRouter>

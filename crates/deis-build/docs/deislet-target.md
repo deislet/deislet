@@ -253,31 +253,19 @@ untouched.
   whole key exists to avoid. A zero is refused for the same reason, because
   zero is what "unset" looks like on the wire.
 
-## The capability set says what works today
+## The current build gate is not a support matrix
 
-`Platform::Deislet` is filled in from the code that exists, not from the
-roadmap. Among the extended features these are supported:
+`TargetArtifactCoverage` covers only declarations the compiler can actually
+read from `.config.json`: database, object storage, queue bindings/consumers,
+cron schedules and a Node runtime request. It answers whether Deislet's current
+target packager can encode that declaration. A missing mapping is a hard build
+failure; there is no pending/warning tier.
 
-- **SQL Database** and **Object Storage** - deis-store serves both, and
-  deis-runtime builds the isolate's client from the manifest's `services`, so
-  `context.services.database` and `context.services.blob` reach the server.
-- **Queues** - deis-queue is its own process; `send` reaches it, and a node
-  polls it for every queue the manifest declares a consumer for.
-- **Cron** - the control plane holds one schedule per (app_id, environment) and
-  triggers a node when one is due; the node runs the app's `scheduled` export.
-- **WebSockets** - deis-runtime bridges server-side sockets into the isolate
-  and deis-proxy tunnels the upgrade. The two halves have never been tested end
-  to end, which `docs/architecture.zh.md` section 11 records as an open item.
-
-Two kinds of unsupported feature remain, treated differently at build time:
-
-- **Pending** - specified, half built. These **warn and do not stop the
-  build**: the declaration belongs in the manifest, where the control plane
-  records it, and the binding arrives without the app being rewritten. **The
-  list is empty today**; the mechanism stays for the next half-built service.
-- **Not coming** (Durable Objects, Node Runtime, SSR/ISR, Workers AI,
-  BroadcastChannel) - nothing in the platform's shape provides them, so a build
-  that needs one fails.
+APIs with no declaration site, framework behavior and deployed service
+semantics are outside this gate. The compiler must not guess them from a target
+name, and a successful bundle is only artifact evidence. Current evidence,
+whole-standard certification and support status comes from the
+[registry-derived target status](../../../docs/product/target-status.zh.md).
 
 ## Reproducibility
 

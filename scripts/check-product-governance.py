@@ -365,6 +365,96 @@ def validate_integration() -> None:
         "target-status.zh.md" in product and "target-status.json" in product,
         "product entry does not delegate support status to generated registry views",
     )
+    for path in (
+        "README.md",
+        "crates/deis-build/README.md",
+        "crates/deis-build/README.zh.md",
+    ):
+        document = read_text(path)
+        require(
+            "target-status" in document,
+            f"{path} does not delegate current target support status to the registry view",
+        )
+    cli_targets = read_text("crates/deis/src/commands/targets.rs")
+    web_targets = read_text("crates/deis-control/web/src/pages/Targets.tsx")
+    require(
+        'include_str!("target-status.json")' in cli_targets,
+        "CLI target status is not generated-registry-backed",
+    )
+    require(
+        '"generatedFrom": raw["generatedFrom"]' in cli_targets
+        and '"standard": raw["standard"]' in cli_targets,
+        "CLI target inspection drops registry or standard provenance",
+    )
+    require(
+        "@/generated/target-status.json" in web_targets,
+        "Web target status is not generated-registry-backed",
+    )
+    compiler = read_text("crates/deis-build/src/compiler/mod.rs")
+    coverage = read_text("crates/deis-build-core/src/target_artifact_coverage.rs")
+    require(
+        "PlatformCapabilities" not in compiler + coverage
+        and "UnsupportedFeatureError" not in compiler + coverage
+        and "alternatives(" not in compiler + coverage,
+        "compiler still exposes target artifact coverage as platform support",
+    )
+    phantom_features = (
+        "Feature::SSR",
+        "Feature::ISR",
+        "Feature::WebSockets",
+        "Feature::DurableObjects",
+        "Feature::WorkersAI",
+        "Feature::BroadcastChannel",
+    )
+    require(
+        not any(feature in coverage for feature in phantom_features),
+        "target artifact table contains APIs the compiler cannot detect from project declarations",
+    )
+    stale_build_claims = (
+        "Platform capability validation failed",
+        "Feature 'SQL Database' is not supported on EdgeOne Pages",
+        "No platform compatibility check needed",
+        "Basic services (KV, Cache) are always available",
+    )
+    for path in (
+        "crates/deis-build/docs/basic-services.md",
+        "crates/deis-build/docs/basic-services.zh.md",
+    ):
+        document = read_text(path)
+        require(
+            "target-status" in document
+            and not any(claim in document for claim in stale_build_claims),
+            f"{path} contains a hand-maintained support claim or obsolete compiler output",
+        )
+    adapter_index = read_text("crates/deis-build/docs/adapter-specs.zh.md")
+    require(
+        "target-status" in adapter_index
+        and "## Comparison Matrix" not in adapter_index
+        and "authoritative reference" not in adapter_index,
+        "adapter research index still presents unpinned notes as conformance or support",
+    )
+    for path in (
+        "crates/deis-build-adapter-cloudflare/spec.mdc",
+        "crates/deis-build-adapter-deno/spec.mdc",
+        "crates/deis-build-adapter-tencent/spec.mdc",
+    ):
+        require(
+            "Boundary:" in read_text(path),
+            f"{path} lacks a visible non-normative research boundary",
+        )
+    for vendor in ("cloudflare", "deno", "tencent"):
+        artifact_test = ROOT / f"crates/deis-build-adapter-{vendor}/tests/artifact_shape.rs"
+        require(
+            artifact_test.is_file(),
+            f"{artifact_test.relative_to(ROOT)} is missing; adapter artifact checks must not be named conformance",
+        )
+    contributing = read_text("crates/deis/CONTRIBUTING.md")
+    require(
+        "artifact_shape" in contributing
+        and "spec_compliance" not in contributing
+        and "An adapter existing or producing an accepted artifact is not support" in contributing,
+        "target contribution guide conflates artifact generation with conformance or support",
+    )
 
 
 def main() -> int:

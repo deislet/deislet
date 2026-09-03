@@ -3,7 +3,8 @@
 //! Two halves that deliberately do not mix:
 //!
 //! * `init` / `dev` / `validate` / `build` work on the project on disk and
-//!   need no platform at all. `build --vendor cloudflare|deno|tencent`
+//!   `targets` reads the locked conformance registry; they need no running
+//!   platform. `build --vendor cloudflare|deno|tencent`
 //!   produces what that vendor's own tooling deploys; this CLI never pushes
 //!   to them.
 //! * `deploy` / `versions` / `rollback` / `status` / `secret` / `logs` /
@@ -262,6 +263,12 @@ enum Commands {
 
         #[command(flatten)]
         format: Format,
+    },
+
+    /// Inspect build-target evidence, certification, compliance and support.
+    Targets {
+        #[command(subcommand)]
+        action: TargetsAction,
     },
 
     /// Follow an application's logs until interrupted.
@@ -1007,6 +1014,24 @@ enum ConfigAction {
     },
 }
 
+#[derive(Subcommand)]
+enum TargetsAction {
+    /// List every target from the locked conformance registry.
+    List {
+        #[command(flatten)]
+        format: Format,
+    },
+
+    /// Inspect one target's implementation evidence and certification blockers.
+    Inspect {
+        /// Registry target id, as printed by `deis targets list`.
+        id: String,
+
+        #[command(flatten)]
+        format: Format,
+    },
+}
+
 fn main() -> ExitCode {
     // Progress and diagnostics belong on stderr: stdout is where `--json`
     // puts the one document a script reads.
@@ -1149,6 +1174,11 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Status { target, format } => {
             commands::status::execute(target.app, format.into()).await
         }
+
+        Commands::Targets { action } => match action {
+            TargetsAction::List { format } => commands::targets::list(format.into()),
+            TargetsAction::Inspect { id, format } => commands::targets::inspect(&id, format.into()),
+        },
 
         Commands::Tail {
             target,

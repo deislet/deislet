@@ -23,10 +23,10 @@ Input:  Edge Canon standard code → Output: Platform-specific deployable code
 ## ✨ 特性 | Features
 
 - **纯粹翻译器 | Pure Translator**: 专注代码转换 | Focused on code transformation
-- **多平台支持 | Multi-Platform**: Cloudflare Workers、Deno Deploy、Tencent EdgeOne、Deislet
+- **多目标产物 | Multi-Target Artifacts**: Cloudflare Workers、Deno Deploy、Tencent EdgeOne、Deislet
 - **标准验证 | Standard Validation**: 检测平台特定代码 | Detect platform-specific code
-- **平台能力验证 | Platform Capabilities**: 编译时检查特性支持 | Compile-time feature support checks
-- **类型安全 | Type Safety**: Rust + SWC 保证正确性 | Guaranteed correctness with Rust + SWC
+- **目标实现检查 | Target Implementation Check**: 编译时拒绝打包器尚无映射的目标产物 | Reject missing packager mappings at build time
+- **类型安全 | Type Safety**: Rust + SWC 降低转换错误 | Rust + SWC reduce transformation errors
 
 ## 🚀 快速开始 | Quick Start
 
@@ -93,33 +93,25 @@ let result = compiler.build().await?;
 The three marked *stub* have an English file containing nothing but "English
 version coming soon"; the content is in the Chinese column.
 
-## 📊 支持的平台 | Supported Platforms
+## 目标产物与认证状态 | Target artifacts and certification
 
-| 平台 Platform | 状态 Status | 基础服务 Basic | 扩展服务 Extended |
-|---------------|-------------|---------------|-------------------|
-| Cloudflare Workers | ✅ 完整支持 Full | KV, Cache | D1, R2, Queue, DO |
-| Deno Deploy | ✅ 完整支持 Full | KV, Cache | Postgres |
-| Tencent EdgeOne | ✅ 完整支持 Full | KV, Cache | - |
-| Deislet | ✅ 目标可用 Usable | KV, Cache | SQL, Blob, Queue, Cron, WebSockets |
+`deis-build` 当前可生成 Deislet、Cloudflare、Deno 和 Tencent 形状的目标产物；这只说明
+Deislet 打包器执行到了哪个阶段，不代表供应商能力、Edge Canon 合规或正式支持。唯一当前
+状态来自[锁定 registry 自动生成的目标状态](../../docs/product/target-status.zh.md)，机器读取
+使用其 [JSON](../../docs/product/target-status.json)。CLI 同样读取这一来源：
+`deis targets list` / `deis targets inspect <id>`。
 
-Deislet 那一行说的是**编译目标**：`--vendor deislet` 产出的应用包能被 `deis deploy`
-上传、被节点装载并服务。运行时里 SPECIFICATION_BASIC.md 8.1 节要求的 Web 标准全局
-现在一个不缺，`fetch`、WebSocket 客户端与服务端都已实现并验证：见
-`docs/architecture.zh.md` 第 12 节与 `PLATFORM_MATRIX.md`。
-That row is about the **compile target**: `--vendor deislet` produces a bundle
-that `deis deploy` uploads and a node loads and serves. The runtime's Web
-standard globals required by SPECIFICATION_BASIC.md section 8.1 are all
-present now, including `fetch`, and both the client and server halves of
-WebSocket are implemented and verified; see section 12 of
-`docs/architecture.zh.md` and `PLATFORM_MATRIX.md`.
+`deis-build` can currently generate Deislet-, Cloudflare-, Deno-, and
+Tencent-shaped artifacts. That is packager evidence only; it is not a vendor
+capability, Edge Canon compliance, or support claim. The sole current status is
+the [registry-derived target status](../../docs/product/target-status.zh.md) and
+its [machine JSON](../../docs/product/target-status.json).
 
 ## 🔗 相关资源 | Related Resources
 
 ### Edge Canon 规范 | Edge Canon Specification
 
-- [基础规范 | Basic Spec](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_BASIC.md)
-- [扩展规范 | Extended Spec](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_EXT.md)
-- [平台矩阵 | Platform Matrix](https://github.com/deislet/edge-canon/blob/main/PLATFORM_MATRIX.md)
+- [锁定的标准与 registry | Locked standard and registry](../../standards/edge-canon.lock.json)
 
 ### 社区 | Community
 
@@ -140,7 +132,7 @@ deis-build/
 │   └── commands/        # CLI commands
 └── docs/                # Documentation, *.md and *.zh.md side by side
 
-../deis-build-core/              # Core types & platform capabilities
+../deis-build-core/              # Core types & target artifact coverage
 ../deis-build-adapter-cloudflare/  # --vendor cloudflare
 ../deis-build-adapter-deno/        # --vendor deno
 ../deis-build-adapter-tencent/     # --vendor tencent  (Tencent EdgeOne)

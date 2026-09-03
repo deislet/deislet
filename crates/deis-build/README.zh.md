@@ -21,10 +21,10 @@
 ## ✨ 特性
 
 - **纯粹翻译器**: 专注代码转换，不涉及项目管理、开发服务器或部署
-- **多平台支持**: Cloudflare Workers、Deno Deploy、Tencent EdgeOne、Deislet
+- **多目标产物**: Cloudflare Workers、Deno Deploy、Tencent EdgeOne、Deislet
 - **标准验证**: 检测平台特定代码，确保符合 Edge Canon 规范
-- **平台能力验证**: 编译时检查特性支持
-- **类型安全**: Rust + SWC 保证转换正确性
+- **目标实现检查**: 编译时拒绝打包器尚无映射的目标产物
+- **类型安全**: Rust + SWC 降低转换错误
 
 ## 🚀 快速开始
 
@@ -84,26 +84,18 @@ let result = compiler.build().await?;
 `docs/` 下 `library-usage.md`、`error-system.md`、`adapter-specs.md` 三个英文文件目前
 只有一句「English version coming soon」，内容都在对应的 `.zh.md` 里。
 
-## 📊 支持的平台
+## 目标产物与认证状态
 
-| 平台 | 状态 | 基础服务 | 扩展服务 |
-|------|------|---------|---------|
-| Cloudflare Workers | ✅ 完整支持 | KV, Cache | D1, R2, Queue, Durable Objects |
-| Deno Deploy | ✅ 完整支持 | KV, Cache | - |
-| Tencent EdgeOne | ✅ 完整支持 | KV, Cache | - |
-| Deislet | ✅ 目标可用 | KV, Cache | SQL, Blob, Queue, Cron, WebSockets |
-
-Deislet 那一行说的是**编译目标**：`--vendor deislet` 产出的应用包能被 `deis deploy`
-上传、被节点装载并服务。运行时里 SPECIFICATION_BASIC.md 8.1 节要求的 Web 标准全局
-现在一个不缺，`fetch`、WebSocket 客户端与服务端在内的扩展能力也都已实现并验证：见
-`docs/architecture.zh.md` 第 12 节与 `PLATFORM_MATRIX.md`。
+`deis-build` 当前可生成 Deislet、Cloudflare、Deno 和 Tencent 形状的目标产物。这只表示
+Deislet 打包器执行到了哪个阶段，不代表供应商能力、Edge Canon 合规或正式支持。唯一当前
+状态来自[锁定 registry 自动生成的目标状态](../../docs/product/target-status.zh.md)，机器读取
+使用其 [JSON](../../docs/product/target-status.json)。CLI 同样读取这一来源：
+`deis targets list` / `deis targets inspect <id>`。
 
 ## 🔗 相关资源
 
 ### Edge Canon 规范
-- [基础规范](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_BASIC.md) - 所有平台必须支持的能力
-- [扩展规范](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_EXT.md) - 平台可选支持的特性
-- [平台支持矩阵](https://github.com/deislet/edge-canon/blob/main/PLATFORM_MATRIX.md) - 详细兼容性信息
+- [锁定的标准与 registry](../../standards/edge-canon.lock.json)
 
 ### 社区
 
@@ -123,7 +115,7 @@ deis-build/
 │   └── commands/        # CLI 命令实现
 └── docs/                # 文档，*.md 与 *.zh.md 并排
 
-../deis-build-core/               # 核心类型和平台能力系统
+../deis-build-core/               # 核心类型和目标产物实现覆盖
 ../deis-build-adapter-cloudflare/   # --vendor cloudflare
 ../deis-build-adapter-deno/         # --vendor deno
 ../deis-build-adapter-tencent/      # --vendor tencent（腾讯 EdgeOne）

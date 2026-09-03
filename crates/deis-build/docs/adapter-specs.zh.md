@@ -1,6 +1,15 @@
 # Build Adapter Platform Specifications
 
-This directory contains platform-specific specification documents for each deis-build adapter. These `spec.mdc` files serve as the authoritative reference for implementing adapters that are fully compliant with each platform's requirements.
+This directory indexes historical, platform-specific research notes used while
+building the existing adapters. The `spec.mdc` files are not normative Edge
+Canon sources, complete vendor specifications, or conformance evidence. Their
+URLs are not pinned snapshots, so every claim must be rechecked against a
+versioned official source before it affects an adapter.
+
+Application behavior comes from the locked Edge Canon contract. Target output
+shape comes from version-pinned official vendor documentation and CLI/API
+behavior. Evidence, certification and support status comes only from the
+[registry-derived target status](../../../docs/product/target-status.zh.md).
 
 ## Available Specifications
 
@@ -76,9 +85,9 @@ This directory contains platform-specific specification documents for each deis-
 
 ## Usage for Adapter Development
 
-Each `spec.mdc` file provides:
+Each `spec.mdc` file may provide research input about:
 
-1. **Official API surface** - What's available in the runtime
+1. **Observed API surface** - What the note claimed was available
 2. **Entry point requirements** - How to structure the main handler
 3. **Platform-specific features** - Storage, databases, special APIs
 4. **Limitations and constraints** - What's not allowed or limited
@@ -91,33 +100,23 @@ Each `spec.mdc` file provides:
 喂给编辑器的规则目录（例如放进 `.cursor/rules/`）。写新适配器或改旧的时候，它是
 判断产物对不对的依据。
 
-### Compliance Checklist
+### Adapter artifact checklist
 
-When implementing or updating an adapter, verify:
+When implementing or updating an adapter, verify the generated artifact. Passing
+this checklist does not establish Edge Canon conformance:
 
-- ✅ Entry point format matches spec exactly
-- ✅ Only uses APIs listed in the spec
-- ✅ Respects platform limitations
-- ✅ Follows configuration file format
-- ✅ Implements error handling as specified
-- ✅ Uses platform-specific best practices
+- [ ] Entry point format matches the pinned vendor source and tool version
+- [ ] Generated code only uses APIs verified for that target
+- [ ] Configuration validates with the pinned official CLI/API
+- [ ] Artifact fixtures and deployment smoke tests record exact tool versions
+- [ ] Shared behavior is judged by Edge Canon tests, not this note
 
-## Comparison Matrix
+## No hand-maintained comparison matrix
 
-| Feature | Cloudflare Workers | Deno Deploy | EdgeOne Pages |
-|---------|-------------------|-------------|---------------|
-| **Runtime** | workerd (V8) | Deno 2.x (V8) | V8 + Node.js |
-| **Entry Format** | `export default { fetch() }` | `Deno.serve()` | `export function onRequest()` |
-| **TypeScript** | Via bundler | Native | Via bundler |
-| **KV Storage** | ✅ KV | ✅ Deno KV | ✅ EdgeKV |
-| **SQL Database** | ✅ D1 | ✅ Postgres integration | ❌ |
-| **Object Storage** | ✅ R2 | ❌ | ❌ |
-| **Edge Functions** | ✅ Workers | ✅ Deploy | ✅ Edge Functions |
-| **Node Runtime** | ❌ | ✅ Node compat | ✅ Node Functions |
-| **SSR/ISR** | ❌ | ✅ | ✅ |
-| **Cron Jobs** | ✅ Cron Triggers | ✅ Deno.cron | ❌ |
-| **WebSockets** | ✅ | ✅ | ❌ |
-| **Cold Start** | ~10ms | Near-instant | Fast |
+The former table mixed vendor marketing, product capability and adapter output
+coverage, and had no versioned evidence. It has been removed. Cross-target
+behavior is defined once by Edge Canon and evaluated by the shared suite;
+target status is generated from the locked registry.
 
 ## Maintenance
 
@@ -128,7 +127,8 @@ These specifications should be updated when:
 3. Limitations or constraints change
 4. Best practices evolve
 
-**Last Updated**: 2026-01-24
+**Snapshot date recorded by the original notes**: 2026-01-24. This is not a
+freshness guarantee.
 
 ## References
 

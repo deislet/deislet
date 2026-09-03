@@ -171,19 +171,16 @@ deis-runtime 只认一个默认导出，每个请求调一次，并且**它自�
 - `cron` / `queues` 原样进 manifest，调度是控制面的事。
 - `limits` 是应用给自己提的上限申请，方向**只能是收紧**：`memoryMb`、`timeoutMs`、`cpuTimeLimitMs`、`rateLimitOpsPerSec`、`resourceTableMax`，每个都可不写，不写就是「节点的默认值」。它会译成 manifest 里的同名块，控制面在上传时校验，每个节点再对着自己的天花板夹一次——要得比节点宽的，拿到的是节点那个数，外加一行同时写着两个数字的日志。字段名写错是构建失败而不是被丢掉：作者以为设上了、其实从没生效的上限，正是这个字段存在要防的那件事。写 0 同样被拒，因为在线上 0 就是「没设」的意思。
 
-## 能力矩阵是「今天真能跑什么」
+## 当前构建门禁不是支持矩阵
 
-`Platform::Deislet` 的能力表按当前代码填，不按规划填。扩展能力里下面这些今天都是通的：
+`TargetArtifactCoverage` 只覆盖编译器能从 `.config.json` 实际读取的声明：database、
+object storage、queue binding/consumer、cron schedule 和 Node runtime 请求。它回答的是
+Deislet 当前目标打包器能否编码这项声明。缺少映射会直接终止构建；不再存在 pending/warning
+层级。
 
-- **SQL Database**、**Object Storage**——服务端在 deis-store，deis-runtime 按 manifest 的 `services` 构造客户端，`context.services.database` 和 `context.services.blob` 能真的打到服务端。
-- **Queues**——deis-queue 是独立进程，`send` 直接进队列；节点按 manifest 里声明的消费者逐个起轮询。
-- **Cron**——控制面按 (app_id, environment) 维护调度，到点调节点，节点执行应用的 `scheduled` 导出。
-- **WebSockets**——deis-runtime 有服务端 socket 桥接，deis-proxy 那侧走 upgrade 隧道；但两头从没端到端连起来测过，这条在 `docs/architecture.zh.md` 第 11 节里记着。
-
-剩下的不支持分两类，构建时的待遇不一样：
-
-- **暂缺**——平台规格里有、代码还没接上。构建**只警告不拦**：声明本身该留在 manifest 里让控制面记下，绑定接上之后应用不用改一行。**今天这一类是空的**；机制留着，是给下一个半成品服务用的。
-- **不会有**（Durable Objects、Node Runtime、SSR/ISR、Workers AI、BroadcastChannel）——按平台形态就不存在，构建直接失败。
+没有声明位置的运行时 API、框架行为和部署后服务语义不在这个门禁内。编译器不能根据目标
+名称猜测它们，bundle 成功也只能形成 artifact evidence。当前证据、完整标准认证和支持状态
+只看 [registry 派生目标状态](../../../docs/product/target-status.zh.md)。
 
 ## 可复现
 

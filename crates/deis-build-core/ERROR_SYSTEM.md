@@ -29,7 +29,7 @@ BuildError (顶层)
 │     └─ Deprecated       // 弃用警告
 │
 ├─ PlatformError (平台错误)
-│  ├─ UnsupportedFeature    // 不支持的特性 (KV, Database 等)
+│  ├─ MissingTargetImplementation // 当前目标打包器缺少映射
 │  ├─ IncompatibleRuntime   // 运行时不兼容
 │  ├─ LimitExceeded         // 超出平台限制
 │  └─ PlatformUnavailable   // 平台不可用
@@ -122,7 +122,7 @@ SpecComplianceError::PlatformApi {
 | ConditionalImport | `SPEC_CONDITIONAL_IMPORT` | 条件导入 |
 | InvalidHandlerSignature | `SPEC_INVALID_SIGNATURE` | 无效的 handler 签名 |
 | **平台错误** | | |
-| UnsupportedFeature | `PLATFORM_UNSUPPORTED_FEATURE` | 平台不支持的特性 |
+| MissingTargetImplementation | `TARGET_IMPLEMENTATION_MISSING` | Deislet 当前目标打包器缺少映射 |
 | IncompatibleRuntime | `PLATFORM_INCOMPATIBLE_RUNTIME` | 运行时不兼容 |
 | LimitExceeded | `PLATFORM_LIMIT_EXCEEDED` | 超出平台限制 |
 | PlatformUnavailable | `PLATFORM_UNAVAILABLE` | 平台不可用 |
@@ -202,8 +202,8 @@ match result {
         eprintln!("  Code: {}", err.error_code());
         eprintln!("  Error: {}", err);
     }
-    Err(BuildError::Platform(PlatformError::UnsupportedFeature(err))) => {
-        eprintln!("Platform compatibility issue:");
+    Err(BuildError::Platform(PlatformError::MissingTargetImplementation(err))) => {
+        eprintln!("Target artifact implementation issue:");
         eprintln!("{}", err.detailed_message());
     }
     Err(e) => {
@@ -431,5 +431,5 @@ Error: SPEC_PLATFORM_DETECTION
 ## 参考
 
 - [deislet/spec](https://github.com/deislet/spec) - 规范文档
-- [Platform Capabilities](./src/platform_capabilities.rs) - 平台能力系统
+- [Target Artifact Coverage](./src/target_artifact_coverage.rs) - 目标产物实现清单，不是支持状态
 - [Error Codes Reference](./ERROR_CODES.md) - 完整错误代码列表

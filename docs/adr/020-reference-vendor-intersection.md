@@ -237,7 +237,7 @@ Node compatibility subset、SSR/streaming/ISR、logical resources、queue、SQL/
 
 ## 对当前代码与文档的影响
 
-当前 `PlatformCapabilities` 以 provider 为第一维，逐项返回 `Some/None`，并给应用推荐改投其他平台。这与 standard-first 模型相反，需要拆成：
+决策时的 `PlatformCapabilities` 以 provider 为第一维，逐项返回 `Some/None`，并给应用推荐改投其他平台。这与 standard-first 模型相反。2026-09-04 已删除跨平台替代建议，并将其缩窄、改名为只记录 Deislet 打包器现状的 `TargetArtifactCoverage`；仍需继续拆成：
 
 1. **Normative feature registry**：某 Edge Canon version 要求的完整能力、schema 和 tests；
 2. **Reference evidence registry**：vendor/product/doc/version/semantic observations；

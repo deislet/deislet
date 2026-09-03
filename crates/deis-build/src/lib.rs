@@ -65,7 +65,9 @@ pub mod commands;
 pub use deis_build_core::{
     config::{ProjectConfig, ServicesConfig, VendorsConfig},
     error::{DeniError, Result},
-    platform_capabilities::{Feature, Platform, PlatformCapabilities, UnsupportedFeatureError},
+    target_artifact_coverage::{
+        Feature, MissingTargetImplementationError, Platform, TargetArtifactCoverage,
+    },
     types::{
         BuildArtifacts, CompilationResult, HandlerInfo, OutputMode, ValidationError,
         ValidationResult, VendorBuild,

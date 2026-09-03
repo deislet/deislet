@@ -56,7 +56,7 @@ flowchart TB
         项目侧：init / dev / validate / build
         平台侧：deploy / versions / rollback / status / secret<br/>logs / tail / trace / kv / db / blob"]
         deis-build["<b>deis-build</b> · 编译器
-        SWC 解析 + rolldown 打包 + 平台能力校验
+        SWC 解析 + rolldown 打包 + 目标产物实现检查
         四个目标：cloudflare / deno / tencent / deislet"]
     end
 
@@ -961,14 +961,14 @@ SSR。
 
 ---
 
-## 12. 能力矩阵对账
+## 12. 实现清单（不是支持矩阵）
 
-`edge-canon/PLATFORM_MATRIX.md` 是公开仓库里的那张表。下面是自 2026-08-29 起逐项
-核对、并随每一轮改动更新到 2026-08-30 的结果——**核对的是代码本身，不是变更
-记录**；其中「有哪些全局」这一项另外起了一套
-控制面 + 节点，用探针应用实测过（见下）。编译器侧的同一份判断写在
-`crates/deis-build-core/src/platform_capabilities.rs`，`test_deislet_capabilities`
-会在实现变化而没人改表时失败。
+下面保留的是自 2026-08-29 起对 Deislet 代码路径的实现核对，不能用于声明供应商能力、
+Edge Canon 合规或正式支持；这些当前状态只来自
+[`docs/product/target-status.json`](product/target-status.json)。其中「有哪些全局」这一项
+另外起了一套控制面 + 节点，用探针应用实测过（见下）。编译器侧的临时目标产物覆盖写在
+`crates/deis-build-core/src/target_artifact_coverage.rs`，`deislet_packager_coverage_is_explicit`
+会在实现变化而没人改表时失败；它同样不是标准或认证事实源。
 
 ### 基础特性（规范要求全平台必须支持）
 
@@ -1054,8 +1054,8 @@ UTF-8**，没有换成 deno_web 那一套。这是有意收窄，理由写在 `r
 这份清单有测试守着。`crates/deis-runtime/src/runtime/isolate_test.rs` 里的
 `the_isolate_global_surface_is_the_one_the_documents_describe` 在真 Isolate 里把上下两
 列逐个 `typeof`，**两个方向都断言**：该有的少一个红，不该有的多一个也红。所以往
-`globalThis` 上加或减一个全局，都会先把这条测试打红，逼着本节、
-`crates/deis-runtime/README.md` 和 edge-canon 的 `PLATFORM_MATRIX.md` 跟着改。此前
+`globalThis` 上加或减一个全局，都会先把这条测试打红，逼着本节和
+`crates/deis-runtime/README.md` 跟着改。此前
 这一格的每次结论都来自一次性探针，验完就撤，没有任何东西能在下一次误加误删时报警
 ——那正是它和文档反复走样的原因。
 
@@ -1171,10 +1171,10 @@ Workers AI 在项目配置里根本没有可声明的地方，所以编译器检
 在运行时才炸。要把这几项也挡在构建期，得先做代码扫描（`crates/deis-build/src/compiler/mod.rs`
 的 `detect_required_features` 目前只读配置，不读代码），或者在配置里给它们一个声明位。
 
-### 与公开矩阵的差异
+### 旧公开矩阵的历史差异
 
-`PLATFORM_MATRIX.md` 的 Deislet 一列此前把未实现项降级成了 ⚠️ Planned。已按本节结论
-改过（2026-08-29 第一轮）：
+旧 `PLATFORM_MATRIX.md` 的 Deislet 一列此前把未实现项降级成了 ⚠️ Planned。以下是
+2026-08-29 的历史更正记录，不是当前支持状态；当前状态只看 registry 派生视图：
 
 - **转正**：路由参数、KV、SQL 数据库、对象存储、消息队列、定时任务。静态资产不在那张
   表的行里（edge-canon 规范没有这一条），写在 Deislet 那一节的散文里。

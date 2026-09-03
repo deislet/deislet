@@ -13,6 +13,7 @@ pub mod queue;
 pub mod rollback;
 pub mod secret;
 pub mod status;
+pub mod targets;
 pub mod token;
 pub mod trace;
 pub mod validate;
