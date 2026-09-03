@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-04T01:30:22+08:00",
+  "updatedAt": "2026-09-04T02:40:45+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -134,7 +134,7 @@
           "outputs": [
             {"type": "local-path", "value": ".github/workflows/checks.yml"}
           ],
-          "verification": "python3 scripts/check-product-governance.py 固定 reviewed Node 24 majors；120 分钟 workspace ceiling 下完整 checks run 成功、workspace tests 非取消且不再产生 Node 20 runtime annotation"
+          "verification": "python3 scripts/check-product-governance.py 固定 reviewed Node 24 majors、60 分钟 static workspace job 与三组完整且互斥覆盖 package 的 90 分钟 test shard；分片后的完整 checks run 必须全部成功且不再产生 Node 20 runtime annotation"
         }
       ]
     },

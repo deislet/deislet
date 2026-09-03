@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 
@@ -14,7 +15,21 @@ EXPECTED_ADRS = list(range(1, 23))
 EXPECTED_PHASES = [f"phase-{number}" for number in range(6)]
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 WORK_ID = re.compile(r"^P([0-5])-[A-Z]+-[0-9]{3}$")
-EXPECTED_WORKSPACE_TIMEOUT_MINUTES = 120
+EXPECTED_WORKSPACE_TIMEOUT_MINUTES = 60
+EXPECTED_TEST_SHARD_TIMEOUT_MINUTES = 90
+EXPECTED_TEST_SHARDS = {
+    "runtime-tests": "cargo test -p deis-runtime --no-fail-fast",
+    "compiler-cli-tests": (
+        "cargo test -p deis-bundle -p deis-build-core "
+        "-p deis-build-adapter-cloudflare -p deis-build-adapter-deislet "
+        "-p deis-build-adapter-deno -p deis-build-adapter-tencent "
+        "-p deis-build -p deis --no-fail-fast"
+    ),
+    "control-services-tests": (
+        "cargo test -p deis-wire -p deis-control -p deis-store -p deis-queue "
+        "-p deis-telemetry -p deis-proxy -p deislet-integration-tests --no-fail-fast"
+    ),
+}
 
 
 class ValidationError(RuntimeError):
@@ -41,6 +56,16 @@ def load_json(relative: str) -> dict:
         raise ValidationError(f"{relative}: {error}") from error
     require(isinstance(value, dict), f"{relative}: top-level value must be an object")
     return value
+
+
+def workspace_package_names() -> set[str]:
+    workspace = tomllib.loads(read_text("Cargo.toml"))
+    names: set[str] = set()
+    for member in workspace["workspace"]["members"]:
+        for manifest in ROOT.glob(f"{member}/Cargo.toml"):
+            document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            names.add(document["package"]["name"])
+    return names
 
 
 def validate_adrs() -> None:
@@ -217,8 +242,43 @@ def validate_integration() -> None:
     require(timeout is not None, "CI workspace job must have a finite timeout")
     require(
         int(timeout.group(1)) == EXPECTED_WORKSPACE_TIMEOUT_MINUTES,
-        "CI workspace timeout must remain at the measured "
+        "CI static workspace gates must remain at the measured "
         f"{EXPECTED_WORKSPACE_TIMEOUT_MINUTES}-minute ceiling",
+    )
+    require(
+        "cargo test --workspace" not in workspace_job.group("body"),
+        "CI must not put every workspace test back behind one opaque job ceiling",
+    )
+    for job_id, command in EXPECTED_TEST_SHARDS.items():
+        shard = re.search(
+            rf"(?ms)^  {re.escape(job_id)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+            workflow,
+        )
+        require(shard is not None, f"CI test shard {job_id} is missing")
+        shard_timeout = re.search(
+            r"(?m)^    timeout-minutes:\s*([0-9]+)\s*$", shard.group("body")
+        )
+        require(shard_timeout is not None, f"CI test shard {job_id} must have a finite timeout")
+        require(
+            int(shard_timeout.group(1)) == EXPECTED_TEST_SHARD_TIMEOUT_MINUTES,
+            f"CI test shard {job_id} must keep the "
+            f"{EXPECTED_TEST_SHARD_TIMEOUT_MINUTES}-minute ceiling",
+        )
+        require(command in shard.group("body"), f"CI test shard {job_id} command drifted")
+    assigned_packages = [
+        package
+        for command in EXPECTED_TEST_SHARDS.values()
+        for package in re.findall(r"(?:^|\s)-p\s+([a-zA-Z0-9_-]+)", command)
+    ]
+    require(
+        len(assigned_packages) == len(set(assigned_packages)),
+        "CI test shards assign at least one workspace package more than once",
+    )
+    packages = workspace_package_names()
+    require(
+        set(assigned_packages) == packages,
+        "CI test shards must cover every workspace package exactly once: "
+        f"expected {sorted(packages)}, got {sorted(assigned_packages)}",
     )
     # These are the first official-action majors that run natively on Node
     # 24. Keep the set explicit: silently falling back to an older major
