@@ -85,8 +85,8 @@ export function Sidebar() {
       <div className="flex flex-col gap-2 border-t p-4">
         {/*
           Only when a key is actually held. A control plane with
-          `api_auth_enabled` off admits a caller on its own machine with no
-          credential at all, and there is nothing to sign out of there - a
+          `api_auth_enabled` off admits a direct caller on its own machine with
+          no credential at all, and there is nothing to sign out of there - a
           button that cleared nothing and then demanded a key that does not
           exist would be a way to lock yourself out of an open console.
         */}

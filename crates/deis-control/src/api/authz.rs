@@ -32,10 +32,12 @@
 //! It means no credential is *required*. It has never been allowed to mean
 //! that a credential which *is* presented goes unchecked, and it must not
 //! mean that the whole human API is published to whatever can route to this
-//! port. With it off, [`resolve`] admits an unauthenticated caller only from
-//! the machine this control plane runs on *and* only when the caller is not a
-//! web page on another origin, and a credential that resolves is held to its
-//! own scopes exactly as it would be with the flag on.
+//! port. With it off, [`resolve`] admits an unauthenticated caller only over a
+//! direct connection from the machine this control plane runs on *and* only
+//! when the caller is not a web page on another origin. A loopback reverse
+//! proxy is not treated as the caller: forwarding headers withhold the local
+//! exception. A credential that resolves is held to its own scopes exactly as
+//! it would be with the flag on.
 //!
 //! The second half of that is [`from_another_origin`], and it exists because
 //! "on this machine" turned out not to mean what it sounds like. A browser
@@ -140,6 +142,15 @@ const CROSS_ORIGIN_DETAIL: &str = "This control plane requires no credential \
                                    another origin, whichever machine the browser is on. A console \
                                    hosted elsewhere presents a token (`deis token create`) and \
                                    needs its own origin listed in api_cors_allowed_origins.";
+
+/// What an anonymous call relayed by a proxy is told. The TCP peer is the
+/// proxy, not the original caller, so loopback is no evidence that the caller
+/// is on this machine.
+const PROXIED_DETAIL: &str = "This request reached the control plane through a proxy. \
+                              A proxy's loopback connection does not prove that the original \
+                              caller is local, so proxied human API requests require a \
+                              credential. Set api_auth_enabled = true and present the owner \
+                              token printed at startup.";
 
 /// Every path [`authorize`] hands straight to the handler without resolving a
 /// caller, checking a scope or writing a line.
@@ -675,11 +686,9 @@ pub struct AuthzState {
 /// 5. write the audit line, with the outcome the response actually had.
 ///
 /// With `api_auth_enabled` off, step 1 admits a caller who presented nothing
-/// as anonymous - but only from a loopback peer that is not a web page on
-/// another origin, because a control plane listening on 0.0.0.0 with nothing
-/// required is otherwise handing the whole human API to anything that can
-/// route to the port, and a browser on the box is a loopback peer with a page
-/// of somebody else's choosing in it. Step 3 runs whatever the
+/// as anonymous - but only from a direct loopback peer that is neither a web
+/// page on another origin nor a request relayed by a proxy. A reverse proxy's
+/// TCP connection is local even when its caller is not. Step 3 runs whatever the
 /// flag says: not requiring a credential cannot mean that a `deploy:app/preview`
 /// token which is presented may mint a storage capability for another tenant.
 /// Step 5 runs on every path, so even an unauthenticated platform gets a
@@ -721,6 +730,7 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
                 .map(str::to_string)
         });
     let another_origin = from_another_origin(&headers, own_authority.as_deref());
+    let proxied = came_through_proxy(&headers);
     // Kept as an address and not only as text: with nothing enforced it is
     // what decides whether an unauthenticated caller is admitted at all.
     let peer_addr = request
@@ -729,7 +739,7 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
         .map(|ConnectInfo(addr)| *addr);
     let peer = peer_addr.map(|addr| addr.to_string());
 
-    let principal = match resolve(&state, &headers, peer_addr, another_origin).await {
+    let principal = match resolve(&state, &headers, peer_addr, another_origin, proxied).await {
         Ok(principal) => principal,
         Err(refusal) => {
             let requirement = classify(&method, &path, query.as_deref());
@@ -945,8 +955,27 @@ fn from_another_origin(headers: &HeaderMap, own_authority: Option<&str>) -> bool
     }
 }
 
+/// Whether an intermediary says it relayed this request.
+///
+/// These values are not trusted as client identity. Their presence is used in
+/// one direction only: to withhold the anonymous loopback exception. A remote
+/// caller can forge one and turn its own request into a 401, but can never use
+/// one to be admitted. This avoids believing an arbitrary `X-Forwarded-For`
+/// value without an explicit trusted-proxy list.
+fn came_through_proxy(headers: &HeaderMap) -> bool {
+    [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "via",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
+}
+
 /// The caller nobody authenticated, on a control plane that requires nobody
-/// to be - admitted from this machine, refused from anywhere else.
+/// to be - admitted on a direct local call, refused otherwise.
 ///
 /// This is the whole of the "unconfigured is not unguarded" rule for the
 /// human API, and it is the one shape that fits. deis-queue answers the same
@@ -954,22 +983,23 @@ fn from_another_origin(headers: &HeaderMap, own_authority: Option<&str>) -> bool
 /// not available here: this listener also carries the node gRPC channel, the
 /// assignment fetch and the bundle download, so every node in the fleet needs
 /// the port reachable and moving it to loopback would leave a one-machine
-/// platform. The address therefore stays open and the peer decides. Turning
-/// `api_auth_enabled` on by default was the other candidate and is worse: it
-/// stops an existing installation's dashboard, CLI and deploy pipeline the
-/// moment the binary is replaced. This leaves every one of those working on
-/// the machine the control plane runs on, and refuses only the callers who
-/// are somewhere else - which is exactly the set that was never meant to be
-/// served without a credential.
+/// platform. The address therefore stays open and the peer plus request shape
+/// decide. Turning `api_auth_enabled` on by default was the other candidate
+/// and is worse: it stops an existing installation's dashboard, CLI and deploy
+/// pipeline the moment the binary is replaced. This leaves direct local tools
+/// working while refusing calls whose origin cannot be shown to be local.
 ///
 /// "On this machine" is two questions, not one, because a browser on the
 /// operator's machine is on it and every page it has open is too. A page from
 /// another origin is refused here whatever its peer address, and reaches this
 /// API the way any other remote caller does: with a token. See
-/// [`from_another_origin`].
+/// [`from_another_origin`]. A reverse proxy is the other case: its own socket
+/// may be loopback even though the caller behind it is remote, so standard
+/// forwarding headers withhold the exception as well.
 fn anonymous_from(
     peer: Option<SocketAddr>,
     from_another_origin: bool,
+    came_through_proxy: bool,
 ) -> Result<Principal, Refusal> {
     if !is_local_peer(peer) {
         return Err(Refusal {
@@ -989,6 +1019,15 @@ fn anonymous_from(
             credential: None,
         });
     }
+    if came_through_proxy {
+        return Err(Refusal {
+            log_reason: "the TCP peer is loopback but forwarding headers show that a proxy \
+                         relayed this request, so the original caller cannot use the direct-local \
+                         anonymous exception",
+            caller_detail: PROXIED_DETAIL,
+            credential: None,
+        });
+    }
     Ok(Principal::anonymous())
 }
 
@@ -1004,6 +1043,7 @@ async fn resolve(
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
     from_another_origin: bool,
+    came_through_proxy: bool,
 ) -> Result<Principal, Refusal> {
     let presented: Vec<String> = presented_credentials(headers)
         .into_iter()
@@ -1012,7 +1052,7 @@ async fn resolve(
 
     if presented.is_empty() {
         if !state.enforced {
-            return anonymous_from(peer, from_another_origin);
+            return anonymous_from(peer, from_another_origin, came_through_proxy);
         }
         return Err(Refusal {
             log_reason: "no credential was presented",
@@ -1088,7 +1128,7 @@ async fn resolve(
         // call is treated as the one that offered nothing at all - admitted
         // from this machine, refused from anywhere else - and the audit line
         // says anonymous rather than inventing an account.
-        return anonymous_from(peer, from_another_origin);
+        return anonymous_from(peer, from_another_origin, came_through_proxy);
     }
     Err(refusal)
 }
@@ -1250,12 +1290,11 @@ pub fn log_authorization_ready(enforced: bool, config_keys: usize, unscoped: usi
     if !enforced {
         warn!(
             unscoped,
-            "api_auth_enabled is off, so no caller has to present a credential: anyone on THIS \
-             machine can deploy, rotate a secret and mint a storage token as \"anonymous\", and \
-             every change of theirs is in the audit log under that name. A caller from any other \
-             host is refused with 401 rather than served, because a port bound off loopback with \
-             nothing required would otherwise be the whole platform published to the network. A \
-             credential that IS presented is held to its scopes either way. Set \
+            "api_auth_enabled is off, so a direct caller on THIS machine can deploy, rotate a \
+             secret and mint a storage token as \"anonymous\", and every change of theirs is in \
+             the audit log under that name. A caller from any other host, through a reverse \
+             proxy, or from a web page on another origin is refused with 401 rather than served. \
+             A credential that IS presented is held to its scopes either way. Set \
              api_auth_enabled = true to require one from everybody"
         );
         return;
@@ -2696,9 +2735,9 @@ mod gate_tests {
         assert_eq!(refusal.actor_kind, "anonymous");
     }
 
-    /// With `api_auth_enabled` off, the human API is as open as it always
-    /// was - and the audit log still records every change, so an operator who
-    /// has not turned authentication on still gets a history.
+    /// With `api_auth_enabled` off, a direct local caller stays compatible and
+    /// the audit log still records every change, so an operator who has not
+    /// turned authentication on still gets a history.
     /// The audit line of a hostname claim names the hostname - on the
     /// refusal as much as on the success, because the refusal is where the
     /// attempt shows up.
@@ -3034,6 +3073,50 @@ mod gate_tests {
             .collect();
         assert_eq!(refused.len(), 12, "{refused:?}");
         assert!(refused.iter().all(|line| line.actor_kind == "anonymous"));
+    }
+
+    /// A reverse proxy connects from loopback on behalf of callers that may be
+    /// anywhere. Treating its socket as the original caller turns the local
+    /// compatibility exception into remote anonymous access to the whole API.
+    #[tokio::test]
+    async fn a_proxied_request_cannot_use_the_anonymous_loopback_exception() {
+        let open = gate(false, vec![]).await;
+
+        for marks in [
+            vec![("forwarded", "for=203.0.113.7;proto=https")],
+            vec![("x-forwarded-for", "203.0.113.7")],
+            vec![("x-real-ip", "203.0.113.7")],
+            vec![("x-forwarded-proto", "https")],
+            vec![("via", "1.1 reverse-proxy")],
+        ] {
+            let (status, body) = call_marked(
+                &open,
+                ON_THE_BOX,
+                "POST",
+                "/api/apps/demo/environments/production/deployments",
+                None,
+                "{}",
+                &marks,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "marks: {marks:?}");
+            assert!(body.contains("through a proxy"), "{body}");
+        }
+
+        // The proxy does not make the API unusable: a real credential still
+        // resolves before the anonymous exception is considered.
+        let with_key = gate(false, vec!["proxy-key".to_string()]).await;
+        let (status, _) = call_marked(
+            &with_key,
+            ON_THE_BOX,
+            "GET",
+            "/api/audit",
+            Some("proxy-key"),
+            "{}",
+            &[("x-forwarded-for", "203.0.113.7")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// A page on another origin holding a credential is a console the

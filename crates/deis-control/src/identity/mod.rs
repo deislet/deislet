@@ -171,8 +171,8 @@ pub enum PrincipalKind {
     /// account so the audit log has something to name, and no scopes.
     ConfigKey,
     /// Nobody: `api_auth_enabled` is off, so no credential is required, and
-    /// this is what a caller who presents none is - on the machine the
-    /// control plane runs on, which is as far as that goes (see
+    /// this is what a caller who presents none is - directly connected from
+    /// the machine the control plane runs on, which is as far as that goes (see
     /// [`crate::api::authz::authorize`]). Recorded in the audit log all the
     /// same: a deploy nobody can be blamed for is still a deploy that
     /// happened.

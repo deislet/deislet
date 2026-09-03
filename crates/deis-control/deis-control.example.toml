@@ -68,16 +68,18 @@ node_preshared_keys = [
 #   deis account create prometheus --role viewer
 #   deis token create --account prometheus --scope 'read:*/*' scrape
 #
-# - which goes in the scrape config's `authorization` block. A scrape from
-# this machine needs nothing while this setting is off, like any other read.
+# - which goes in the scrape config's `authorization` block. A direct scrape
+# from this machine needs nothing while this setting is off, like any other
+# read; one relayed by a reverse proxy still presents a credential.
 #
 # With it OFF no credential is REQUIRED, which is not the same as the human
-# API being published. A caller that presents nothing is served only from the
-# machine the control plane runs on, and a page loaded from another origin is
-# refused whichever machine its browser is on - see
-# api_cors_allowed_origins below. A credential that IS presented is held to
-# its scopes whatever this setting says. The audit log is written either way,
-# attributing an unauthenticated call to "anonymous".
+# API being published. A caller that presents nothing is served only over a
+# direct connection from the machine the control plane runs on. A request
+# carrying standard reverse-proxy forwarding headers is refused even when its
+# TCP peer is loopback, as is a page loaded from another origin whichever
+# machine its browser is on - see api_cors_allowed_origins below. A credential
+# that IS presented is held to its scopes whatever this setting says. The audit
+# log is written either way, attributing an unauthenticated call to "anonymous".
 #
 # It does NOT cover the node endpoints, which always use
 # node_preshared_keys - see above. Turning this off makes a dashboard
@@ -200,8 +202,8 @@ bundle_dir = "/var/lib/deis-control/bundles"
 
 # Absolute base URL nodes use to reach this control plane. It ends up in
 # the bundle download links handed out with each assignment. Leave it unset
-# and the URL is derived from the request's Host header, which is right for
-# direct connections and wrong behind a proxy that rewrites it.
+# and the bind-derived fallback is used. Set it whenever nodes are on another
+# host or reach the control plane through a proxy.
 # public_base_url = "https://control.internal:8080"
 
 # File holding the 32-byte master key that encrypts environment secrets

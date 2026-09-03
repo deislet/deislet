@@ -259,7 +259,6 @@ pub(crate) mod tests {
         let secrets = Arc::new(secrets);
         let address = Arc::new(PublicAddress {
             configured: Some("http://control.test".to_string()),
-            scheme: "http",
             fallback: "http://127.0.0.1:8080".to_string(),
         });
         let state = CatalogState {

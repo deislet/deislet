@@ -107,6 +107,11 @@ impl BundleFetcher {
         // applications no longer inherit it.
         let client = crate::egress_proxy::for_node_clients(
             reqwest::Client::builder()
+                // A bundle URL is an instruction from the control plane, and
+                // only that exact destination is trusted. Following a redirect
+                // would let that server move the node's request to an internal
+                // service that was never named in the deployment.
+                .redirect(reqwest::redirect::Policy::none())
                 // Applies to the idle gap between chunks: a control plane that
                 // stops sending mid-bundle must not hold this download open
                 // for the whole outer deadline.

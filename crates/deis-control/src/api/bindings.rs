@@ -42,11 +42,12 @@
 //!
 //! # When nothing is enforced
 //!
-//! `api_auth_enabled = false` leaves every caller anonymous and unscoped, so
-//! every demand here passes, exactly as it does in [`super::authz`]. The
-//! consent half is unaffected and remains the whole of the protection on such
-//! an install - which is the right half to keep, because it is the one the
-//! callee wrote.
+//! `api_auth_enabled = false` leaves every admitted caller that presents no
+//! credential anonymous and unscoped, so every demand here passes, exactly as
+//! it does in [`super::authz`]. Admission is still limited to direct local
+//! calls; the consent half is unaffected and remains the whole of the
+//! cross-application protection on such an install - which is the right half
+//! to keep, because it is the one the callee wrote.
 //!
 //! # A binding this control plane cannot judge
 //!

@@ -407,13 +407,12 @@ fn build_catalog_state(
     };
     let address = Arc::new(PublicAddress {
         configured: config.public_base_url.clone(),
-        scheme,
         fallback: format!("{}://{}:{}", scheme, host, config.port),
     });
     if config.public_base_url.is_none() && !nodes.is_empty() {
         warn!(
             fallback = %address.fallback,
-            "public_base_url is not configured; bundle download links are derived from each request's Host header, which is wrong as soon as a proxy rewrites it and leaves nodes unable to fetch a version"
+            "public_base_url is not configured; bundle download links use the bind-derived fallback, which nodes on another host may be unable to reach"
         );
     }
 
@@ -573,7 +572,7 @@ pub fn log_api_ready(
     // api_auth_enabled said and whatever machine the caller was on; a scrape
     // now follows the same two rules as every other read.
     info!(
-        "📈 Metrics: {}://localhost:{}/api/metrics - a scrape from another host presents a credential (`deis token create --scopes 'read:*/*'`); one from this machine needs none while api_auth_enabled is off",
+        "📈 Metrics: {}://localhost:{}/api/metrics - a scrape from another host or through a reverse proxy presents a credential (`deis token create --scopes 'read:*/*'`); a direct call from this machine needs none while api_auth_enabled is off",
         scheme, port
     );
     info!(
@@ -589,7 +588,7 @@ pub fn log_api_ready(
         );
     } else {
         info!(
-            "⚠️  Human API: NO CREDENTIAL REQUIRED (api_auth_enabled is off, so the dashboard and every catalog route are served to this machine's own tools as \"anonymous\"; a caller from another host gets 401, so does a web page loaded from another origin whichever machine its browser is on, and a credential that is presented is still held to its scopes)"
+            "⚠️  Human API: NO CREDENTIAL REQUIRED FOR DIRECT LOCAL CALLS (api_auth_enabled is off, so the dashboard and every catalog route are served to this machine's directly connected tools as \"anonymous\"; callers from another host, through a reverse proxy, or from a web page loaded on another origin get 401, and a credential that is presented is still held to its scopes)"
         );
     }
     // The third thing that decides who gets in, and the one an operator

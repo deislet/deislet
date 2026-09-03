@@ -137,9 +137,12 @@ export function useMetrics() {
   }, [])
 
   useEffect(() => {
-    fetchMetrics()
-    const interval = setInterval(fetchMetrics, 2000)
-    return () => clearInterval(interval)
+    const initialFetch = window.setTimeout(fetchMetrics, 0)
+    const interval = window.setInterval(fetchMetrics, 2000)
+    return () => {
+      window.clearTimeout(initialFetch)
+      window.clearInterval(interval)
+    }
   }, [fetchMetrics])
 
   return { metrics, loading, error, refetch: fetchMetrics }
@@ -177,9 +180,12 @@ export function useSessions() {
   }, [])
 
   useEffect(() => {
-    fetchSessions()
-    const interval = setInterval(fetchSessions, 5000)
-    return () => clearInterval(interval)
+    const initialFetch = window.setTimeout(fetchSessions, 0)
+    const interval = window.setInterval(fetchSessions, 5000)
+    return () => {
+      window.clearTimeout(initialFetch)
+      window.clearInterval(interval)
+    }
   }, [fetchSessions])
 
   return { sessions, loading, error, refetch: fetchSessions }
@@ -215,9 +221,12 @@ export function useFleet() {
   }, [])
 
   useEffect(() => {
-    fetchNodes()
-    const interval = setInterval(fetchNodes, 5000)
-    return () => clearInterval(interval)
+    const initialFetch = window.setTimeout(fetchNodes, 0)
+    const interval = window.setInterval(fetchNodes, 5000)
+    return () => {
+      window.clearTimeout(initialFetch)
+      window.clearInterval(interval)
+    }
   }, [fetchNodes])
 
   return { fleet: nodes, loading, error, refetch: fetchNodes }
@@ -249,9 +258,12 @@ export function useCommands(nodeId?: string) {
   }, [nodeId])
 
   useEffect(() => {
-    fetchCommands()
-    const interval = setInterval(fetchCommands, 3000)
-    return () => clearInterval(interval)
+    const initialFetch = window.setTimeout(fetchCommands, 0)
+    const interval = window.setInterval(fetchCommands, 3000)
+    return () => {
+      window.clearTimeout(initialFetch)
+      window.clearInterval(interval)
+    }
   }, [fetchCommands])
 
   // The server's body is `{ command_type, data }`. `command_type` is a
@@ -309,9 +321,12 @@ export function useEvents() {
   }, [])
 
   useEffect(() => {
-    fetchEvents()
-    const interval = setInterval(fetchEvents, 5000)
-    return () => clearInterval(interval)
+    const initialFetch = window.setTimeout(fetchEvents, 0)
+    const interval = window.setInterval(fetchEvents, 5000)
+    return () => {
+      window.clearTimeout(initialFetch)
+      window.clearInterval(interval)
+    }
   }, [fetchEvents])
 
   return { events, loading, error, refetch: fetchEvents }
@@ -344,7 +359,8 @@ export function useConfigs(nodeId?: string) {
 
   useEffect(() => {
     initialLoadRef.current = true
-    fetchConfigs()
+    const initialFetch = window.setTimeout(fetchConfigs, 0)
+    return () => window.clearTimeout(initialFetch)
   }, [fetchConfigs])
 
   const updateConfig = async (nodeId: string, configs: Record<string, unknown>) => {

@@ -32,8 +32,8 @@
 //! on every route), so `Access-Control-Allow-Credentials` stays off.
 //!
 //! Being listed here grants no authority. A page on another origin does not
-//! get the unauthenticated admission a caller on this machine gets; it
-//! presents a token like any other remote caller. See
+//! get the unauthenticated admission a directly connected tool on this
+//! machine gets; it presents a token like any other remote caller. See
 //! [`crate::api::authz::authorize`].
 
 use std::time::Duration;
@@ -116,7 +116,7 @@ impl CorsPolicy {
 
         info!(
             origins = ?origins,
-            "Cross-origin browser access is allowed from these origins and no others; a page on any other origin cannot read this control plane's answers, and being listed here is not authority - such a page still presents a token, because the unauthenticated admission is for callers on this machine only"
+            "Cross-origin browser access is allowed from these origins and no others; a page on any other origin cannot read this control plane's answers, and being listed here is not authority - such a page still presents a token, because the unauthenticated admission is for direct callers on this machine only"
         );
 
         let layer = CorsLayer::new()

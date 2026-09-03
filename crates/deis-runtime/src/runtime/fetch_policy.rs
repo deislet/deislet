@@ -286,6 +286,10 @@ pub enum Refusal {
     Scheme(String),
     /// A platform service endpoint. Refused whatever the allowlist says.
     PlatformService,
+    /// The operator named one or more allowed ports for this hostname, and
+    /// the request chose another. Restricting the host as well as opening the
+    /// named port is what lets the portless connector resolver remain safe.
+    PortNotAllowed { host: String, port: u16 },
     /// The destination resolves to an address applications may not reach.
     BlockedAddress { addr: IpAddr, kind: &'static str },
     /// The name does not resolve, so there is nothing to judge and nothing to
@@ -308,6 +312,11 @@ impl std::fmt::Display for Refusal {
                 f,
                 "that address is one of the platform's own service endpoints, which no \
                  application may call directly; use ctx.services instead"
+            ),
+            Self::PortNotAllowed { host, port } => write!(
+                f,
+                "the outbound allowlist restricts {host} to explicitly named ports, and port \
+                 {port} is not one of them"
             ),
             Self::BlockedAddress { addr, kind } => write!(
                 f,
@@ -443,6 +452,23 @@ impl FetchPolicy {
             return Err(Refusal::PlatformService);
         }
 
+        // The connector's DNS resolver receives only the hostname; hyper
+        // attaches the request port afterwards. It must therefore treat an
+        // allowlisted name as opened at connect time without being able to
+        // repeat this port comparison. Refuse every other port here so a
+        // `name:8443` exception cannot be inherited by a request to
+        // `name:9000` after a public-to-private DNS rebind.
+        if let Some(port) = port {
+            if self.is_restricted_to_named_ports(&host_text)
+                && !self.is_allowlisted(&host_text, Some(port))
+            {
+                return Err(Refusal::PortNotAllowed {
+                    host: host_text,
+                    port,
+                });
+            }
+        }
+
         // A literal address needs no lookup, and the connector will not do one
         // either -- see the module comment on the resolve/connect gap.
         let addresses: Vec<IpAddr> = match host {
@@ -496,6 +522,51 @@ impl FetchPolicy {
 
     fn is_allowlisted(&self, host: &str, port: Option<u16>) -> bool {
         self.rules.allow.iter().any(|e| e.covers(host, port))
+    }
+
+    /// Whether hostname entries restrict this name to explicitly listed
+    /// ports. A second unqualified entry deliberately opens every port and
+    /// removes the restriction.
+    fn is_restricted_to_named_ports(&self, host: &str) -> bool {
+        let matching_names = self
+            .rules
+            .allow
+            .iter()
+            .filter(|entry| entry.addr.is_none() && entry.host.eq_ignore_ascii_case(host));
+        let mut saw_port = false;
+        for entry in matching_names {
+            if entry.port.is_none() {
+                return false;
+            }
+            saw_port = true;
+        }
+        saw_port
+    }
+
+    /// Judge an address obtained immediately before opening a socket while
+    /// retaining the original hostname and port.
+    ///
+    /// This is used by the WebSocket connector, whose DNS hook does know the
+    /// destination port. It closes the resolve/connect gap without turning a
+    /// hostname allowlist entry into an unrelated IP-literal policy.
+    pub(crate) fn check_resolved_address(
+        &self,
+        host: &str,
+        port: u16,
+        addr: IpAddr,
+    ) -> Result<(), Refusal> {
+        if self.names_a_platform_service(host, Some(port))
+            || self.is_a_platform_service_address(addr, Some(port))
+        {
+            return Err(Refusal::PlatformService);
+        }
+        if self.is_allowlisted(host, Some(port)) {
+            return Ok(());
+        }
+        if let Some(kind) = blocked_reason(addr) {
+            return Err(Refusal::BlockedAddress { addr, kind });
+        }
+        Ok(())
     }
 
     /// The blocked ranges as deno's net permission spells them, for

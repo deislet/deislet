@@ -389,6 +389,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_port_scoped_name_refuses_other_ports_before_the_portless_resolver() {
+        // hyper gives the resolver only `localhost`, not the destination port,
+        // so the port-aware gate must reject every other port before a request
+        // can reach it. The resolver may then keep the private answer for the
+        // one port that was explicitly opened.
+        let policy = FetchPolicy::new(["localhost:8443"], Vec::<String>::new()).unwrap();
+        assert!(matches!(
+            policy.check("http://localhost:9000/").await,
+            Err(Refusal::PortNotAllowed { port: 9000, .. })
+        ));
+        let resolved = PolicyResolver::new(policy, "port-scope.production")
+            .resolve(name("localhost"))
+            .await
+            .expect("the connector may resolve the hostname after the port-aware gate passed");
+        assert!(resolved.count() > 0);
+    }
+
+    #[test]
+    fn a_port_aware_connector_preserves_a_hostname_exception_exactly() {
+        let policy = FetchPolicy::new(["private.example:8443"], Vec::<String>::new()).unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+
+        policy
+            .check_resolved_address("private.example", 8443, loopback)
+            .expect("the exact hostname and port were opened");
+        assert!(matches!(
+            policy.check_resolved_address("private.example", 9000, loopback),
+            Err(Refusal::BlockedAddress { .. })
+        ));
+        assert!(matches!(
+            FetchPolicy::default().check_resolved_address("public.example", 80, loopback),
+            Err(Refusal::BlockedAddress { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn the_resolver_refuses_a_platform_service_host_whatever_the_allowlist_says() {
         let policy = FetchPolicy::new(["localhost"], ["http://localhost:8090"]).unwrap();
         let error = PolicyResolver::new(policy, "store-reader.production")

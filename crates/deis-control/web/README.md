@@ -28,16 +28,18 @@ as `X-API-Key`, kept in this browser's `localStorage` and nowhere else.
 Which screen you land on is decided by one question the app asks before it
 renders anything: `GET /api/metrics/summary`.
 
-- **401** — the control plane has `api_auth_enabled = true` and wants a
-  credential, so `src/pages/SignIn.tsx` asks for one. The key is spent on a
-  real call before it is committed, so a wrong paste is reported as a refused
-  key rather than as a dashboard that will not load.
+- **401** — the control plane wants a credential, so `src/pages/SignIn.tsx`
+  asks for one. This happens when `api_auth_enabled = true`, and also when a
+  reverse proxy relays the request: the proxy's loopback socket is not proof
+  that its original caller is local. The key is spent on a real call before it
+  is committed, so a wrong paste is reported as a refused key rather than as a
+  dashboard that will not load.
 - **anything else** — straight in. With `api_auth_enabled` off, a caller on
-  the machine the control plane runs on is admitted with no credential at all,
-  and there is no token to ask anyone for; a key screen there would be a
-  locked door with no key cut for it. A 403 or an unreachable control plane
-  also goes straight in, because those are conditions the pages themselves
-  report.
+  the machine the control plane runs on and connected directly is admitted
+  with no credential at all, and there is no token to ask anyone for; a key
+  screen there would be a locked door with no key cut for it. A 403 or an
+  unreachable control plane also goes straight in, because those are
+  conditions the pages themselves report.
 
 A 401 arriving later — a revoked key, or one dropped from `api_keys` and the
 control plane restarted — drops the stored key and shows the key screen again.

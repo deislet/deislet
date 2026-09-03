@@ -336,31 +336,25 @@ async fn an_outbound_websocket_to_a_platform_service_is_refused() {
 }
 
 #[tokio::test]
-async fn a_name_that_resolves_to_a_blocked_address_after_the_policy_passed_is_refused() {
-    // The rebinding gate. A name is resolved twice -- once by the policy, once
-    // to get an address to dial -- and the second answer can differ from the
-    // first. Standing in for that changed answer here is an allowlist entry
-    // that is a *name*: the first check passes on the name, and the address it
-    // resolves to is then judged in its own right and refused. Whichever way
-    // the two answers came to disagree, no socket is opened to an address the
-    // policy did not accept as a literal.
+async fn an_allowlisted_private_websocket_name_keeps_its_hostname_policy() {
+    // The second, connect-time check must retain this hostname and port. If it
+    // converts the answer to a bare IP, the name the operator explicitly
+    // opened can never match and every private hostname is unusable.
     let addr = an_echo_server().await;
     let policy =
         FetchPolicy::new([format!("localhost:{}", addr.port())], Vec::<String>::new()).unwrap();
 
     let body = body_of(
-        "ws-rebind.production",
-        WS_PROBE,
+        "ws-named-private.production",
+        WS_ECHO,
         probe_spec(&format!("ws://localhost:{}/", addr.port()), policy),
     )
     .await;
 
-    assert!(body.starts_with("refused:"), "{body}");
-    assert!(
-        body.contains("between the policy check and the connection"),
+    assert_eq!(
+        body, "open:1:number|text:ping|binary:1,2,3|close:1000:true:3|states:0,1,2,3",
         "{body}"
     );
-    assert!(body.contains("loopback"), "{body}");
 }
 
 /// Open a socket, exchange a text frame and a binary one, then close it.

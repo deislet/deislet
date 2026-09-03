@@ -463,15 +463,6 @@ fn policy_url(parsed: &Url) -> Result<Url, String> {
     Ok(probe)
 }
 
-/// How the policy is asked about one address it is about to be dialled at.
-fn literal_url(secure: bool, addr: SocketAddr) -> String {
-    let scheme = if secure { "https" } else { "http" };
-    match addr.ip() {
-        IpAddr::V4(v4) => format!("{scheme}://{v4}:{}/", addr.port()),
-        IpAddr::V6(v6) => format!("{scheme}://[{v6}]:{}/", addr.port()),
-    }
-}
-
 /// The TLS settings every `wss:` connection from this node uses.
 ///
 /// Built once: it carries the webpki root store, which is a few hundred
@@ -546,15 +537,13 @@ async fn dial(
 
             // The lookup above is a second answer to the same question, and a
             // second answer can differ from the first -- that is DNS
-            // rebinding, and it is the standard way past a check like the one
-            // that just passed. So the address this is about to connect to is
-            // put to the policy in its own right, as a literal, which involves
-            // no resolver and cannot go stale between the verdict and the
-            // connect.
+            // rebinding. Judge the address immediately, but retain the
+            // original hostname and port so a hostname allowlist entry keeps
+            // its intended meaning and cannot silently widen to another port.
             let mut chosen = None;
             let mut refusal = None;
             for candidate in candidates {
-                match policy.check(&literal_url(secure, candidate)).await {
+                match policy.check_resolved_address(&name, port, candidate.ip()) {
                     Ok(()) => {
                         chosen = Some(candidate);
                         break;

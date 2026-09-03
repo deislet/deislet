@@ -342,8 +342,11 @@ So `fetch` is **deny by default and allow by exception**:
 
 An operator who has an internal service applications are meant to call opens it
 with `[fetch] allow` in the node's configuration (`host`, `host:port`, or a
-whole URL; an entry with no port covers every port on that host). That list
-cannot be widened into the platform's own services.
+whole URL; an entry with no port covers every port on that host). A hostname
+listed with a port is also restricted to the explicitly listed ports when its
+current DNS answer is public; otherwise the connector's portless second lookup
+could widen it during a DNS rebind. That list cannot be widened into the
+platform's own services.
 
 #### Why the redirect loop is in the wrapper and not in deno
 

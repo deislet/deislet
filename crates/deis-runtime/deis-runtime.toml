@@ -329,6 +329,9 @@ max_bytes = 134217728
 # Non-public destinations applications on this node may nevertheless reach,
 # written as "host", "host:port" or a whole URL. An entry with no port covers
 # every port on that host. Empty, the default, means public destinations only.
+# Listing a hostname with a port also refuses that hostname on every other
+# port, even when it resolves to a public address, so a second DNS answer cannot
+# widen the exception during connection setup.
 #
 # This cannot be widened into the platform's own services: deis-store,
 # deis-queue, deis-control and deis-telemetry are refused after this list has

@@ -73,10 +73,13 @@ same-origin and needs no entry; `npm run dev` proxies `/api` through the vite
 server, so the development console is same-origin too.
 
 Being named is not authority. With `api_auth_enabled` off a caller that
-presents nothing is admitted from the machine the control plane runs on - and
-a page from another origin is refused there whichever machine its browser is
-on, because a browser on that machine is a loopback peer and every page it has
-open would otherwise be one. A console hosted elsewhere presents a token.
+presents nothing is admitted only over a direct connection from the machine
+the control plane runs on. A request carrying standard proxy forwarding
+headers requires a credential even when the proxy connects over loopback,
+because that socket says nothing about the original caller. A page from
+another origin is refused there whichever machine its browser is on, because
+a browser on that machine is a loopback peer and every page it has open would
+otherwise be one. A console hosted elsewhere presents a token.
 
 ### Node Endpoints Use a Different Credential
 
@@ -688,8 +691,10 @@ rather than sent with a hole in it - the node then does not run it, and an
 `ERROR` line says which application and why.
 
 Every runtime node runs every app, so the list is currently identical for
-all nodes. The `bundle_url` host comes from `public_base_url` when it is
-configured, otherwise from the `Host` header of the request.
+all nodes. The `bundle_url` base comes from `public_base_url` when it is
+configured, otherwise from the control plane's bind address. Request headers
+never choose it: `Host` is controlled by the API caller and may not be an
+address a runtime node can reach.
 
 ---
 
@@ -1127,9 +1132,10 @@ deis account create prometheus --role viewer
 deis token create --account prometheus --scope 'read:*/*' scrape
 ```
 
-- and put the token in the scrape config's `authorization` block. A scrape
-from the machine the control plane runs on needs no credential while
-`api_auth_enabled` is off, exactly like any other read from there.
+- and put the token in the scrape config's `authorization` block. A direct
+scrape from the machine the control plane runs on needs no credential while
+`api_auth_enabled` is off, exactly like any other direct local read. A scrape
+relayed by a reverse proxy presents a credential.
 
 **Response Example**:
 ```
@@ -1254,8 +1260,8 @@ curl http://localhost:8080/api/commands/status/550e8400-e29b-41d4-a716-446655440
 # 6. List events
 curl "http://localhost:8080/api/events?node_id=deis-runtime-1&limit=10"
 
-# 7. Get Prometheus metrics (a credential, unless the scrape is on this box
-#    and api_auth_enabled is off)
+# 7. Get Prometheus metrics (a credential, unless the scrape connects directly
+#    from this box and api_auth_enabled is off)
 curl -H "Authorization: Bearer $DEIS_TOKEN" http://localhost:8080/api/metrics
 ```
 

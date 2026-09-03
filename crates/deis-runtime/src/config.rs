@@ -549,6 +549,10 @@ pub struct FetchConfig {
     /// Non-public destinations applications on this node may nevertheless
     /// reach, as `host` or `host:port` (an entry with no port covers every
     /// port on that host), e.g. `["internal-api.svc:8443", "10.4.0.7"]`.
+    /// Once a hostname is listed with a port, requests to that hostname on
+    /// other ports are refused even if it currently resolves to a public
+    /// address. This keeps the restriction valid across the connector's
+    /// second DNS lookup.
     ///
     /// This is the escape hatch for a deployment whose applications are meant
     /// to call an internal service. It cannot be widened into the platform's

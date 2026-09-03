@@ -235,8 +235,9 @@ The console is then served from the control plane's own port —
 `api_auth_enabled = true`, which is the posture a real installation should be
 in, so the console asks for a key before it shows anything: paste the
 `API_KEY` line from `.demo/state.env`. A control plane with authentication off
-opens straight to the dashboard, because a caller on its own machine needs no
-credential there and there is none to ask for.
+opens straight to the dashboard for a direct caller on its own machine,
+because that connection needs no credential and there is none to ask for. A
+reverse proxy must present a credential even when it connects over loopback.
 
 The last line of a `verify` run is a tally and a roll call: `95 passed, 0
 failed, 95 of the 95 checks this file lists`. The second half is there because

@@ -124,6 +124,7 @@ jobs:
         working-directory: crates/deis-control/web
         run: |
           npm ci
+          npm audit --audit-level=high
           npm run build
 
       # deis-wire's build script compiles the protobuf definitions with
@@ -131,6 +132,13 @@ jobs:
       # this workflow failed here, before a line of Rust was checked.
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+
+      # Keep the written exceptions in .cargo/audit.toml under review while
+      # rejecting every advisory that has not been explicitly judged there.
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
 
       - name: Formatting
         run: cargo fmt --all -- --check

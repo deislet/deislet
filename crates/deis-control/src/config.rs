@@ -109,9 +109,8 @@ pub struct ControlConfig {
     /// instance "https://control.internal:8080".
     ///
     /// It ends up in the bundle download links handed to nodes. Leave it
-    /// unset and the URL is derived from the Host header of the request,
-    /// which is right when nodes talk to the control plane directly and
-    /// wrong behind a proxy that rewrites it.
+    /// unset and the URL is derived from the bind address. Set it whenever
+    /// nodes run on another host or reach this process through a proxy.
     #[serde(default)]
     pub public_base_url: Option<String>,
     /// File holding the 32-byte master key that encrypts environment

@@ -25,12 +25,13 @@
 //!
 //! For the human API, `api_auth_enabled = false` means no credential is
 //! required - not that the surface is published. A caller who presents
-//! nothing is admitted only from the machine the control plane runs on, and
-//! one from any other host is refused; a credential that *is* presented is
-//! held to its scopes whatever the flag says. The default `bind_addr` is
-//! `0.0.0.0` and cannot be narrowed the way deis-queue narrows its own - this
-//! listener is where every node fetches its assignments and its bundles - so
-//! the peer, not the bind address, is what carries the rule. See
+//! nothing is admitted only over a direct connection from the machine the
+//! control plane runs on. A caller from any other host, through a reverse
+//! proxy, or from a web page on another origin is refused; a credential that
+//! *is* presented is held to its scopes whatever the flag says. The default
+//! `bind_addr` is `0.0.0.0` and cannot be narrowed the way deis-queue narrows
+//! its own - this listener is where every node fetches its assignments and its
+//! bundles - so the peer and proxy markers carry the rule. See
 //! [`crate::api::authz::authorize`].
 
 use axum::{

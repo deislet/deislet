@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::http::{HeaderMap, header};
+use axum::http::HeaderMap;
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
@@ -57,8 +57,6 @@ use crate::runtime_client::{RuntimeNodeManager, proto};
 pub struct PublicAddress {
     /// Explicit `public_base_url` from the config. Always wins.
     pub configured: Option<String>,
-    /// Scheme to pair with the request's Host header.
-    pub scheme: &'static str,
     /// Last resort, derived from the bind address.
     pub fallback: String,
 }
@@ -66,21 +64,20 @@ pub struct PublicAddress {
 impl PublicAddress {
     /// Resolve the base URL bundle links are built from.
     ///
-    /// Preference order: the configured value, then the `Host` header of
-    /// the request being served (whatever the caller used to reach us is
-    /// by definition reachable for them), then the bind address.
-    pub fn resolve(&self, headers: &HeaderMap) -> String {
+    /// The configured value wins. Without one, use the bind-derived fallback.
+    ///
+    /// The request's `Host` header is deliberately not consulted. It names the
+    /// address the API caller used, not necessarily one a runtime node can
+    /// reach, and it is caller-controlled. Putting it into a deployment would
+    /// let a deploy-scoped caller make every node issue a request to an
+    /// arbitrary host.
+    pub fn resolve(&self, _headers: &HeaderMap) -> String {
         if let Some(configured) = &self.configured {
             return configured.trim_end_matches('/').to_string();
         }
-        if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok())
-            && !host.is_empty()
-        {
-            return format!("{}://{}", self.scheme, host);
-        }
         warn!(
             fallback = %self.fallback,
-            "Request carried no usable Host header and public_base_url is unset; bundle URLs fall back to the bind address, which nodes on another host cannot reach"
+            "public_base_url is unset, so bundle URLs use the bind-derived fallback; nodes on another host may not be able to reach it"
         );
         self.fallback.clone()
     }
@@ -1152,7 +1149,6 @@ mod tests {
             Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
             Arc::new(PublicAddress {
                 configured: Some("http://control.test".to_string()),
-                scheme: "http",
                 fallback: "http://127.0.0.1:8080".to_string(),
             }),
             storage,
@@ -2032,22 +2028,23 @@ mod tests {
     }
 
     #[test]
-    fn public_address_prefers_configuration_then_host_header() {
+    fn public_address_uses_only_configuration_or_the_safe_fallback() {
         let address = PublicAddress {
             configured: Some("https://deis.example.com/".to_string()),
-            scheme: "http",
             fallback: "http://127.0.0.1:8080".to_string(),
         };
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "node-view:9000".parse().unwrap());
+        headers.insert(
+            axum::http::header::HOST,
+            "attacker.invalid:9000".parse().unwrap(),
+        );
         assert_eq!(address.resolve(&headers), "https://deis.example.com");
 
         let address = PublicAddress {
             configured: None,
-            scheme: "http",
             fallback: "http://127.0.0.1:8080".to_string(),
         };
-        assert_eq!(address.resolve(&headers), "http://node-view:9000");
+        assert_eq!(address.resolve(&headers), "http://127.0.0.1:8080");
         assert_eq!(address.resolve(&HeaderMap::new()), "http://127.0.0.1:8080");
     }
 }

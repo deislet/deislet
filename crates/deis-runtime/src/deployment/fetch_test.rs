@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -34,6 +34,23 @@ impl BundleServer {
                 ),
             )
             .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Self { addr, _task: task }
+    }
+
+    async fn redirect(location: String) -> Self {
+        let router = Router::new().route(
+            "/bundle",
+            get(move || {
+                let location = location.clone();
+                async move { (StatusCode::FOUND, [(header::LOCATION, location)]) }
+            }),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -98,6 +115,22 @@ async fn refuses_an_answer_that_is_not_a_bundle() {
         .unwrap_err();
 
     assert!(matches!(err, FetchError::Status { code: 404, .. }), "{err}");
+    assert!(!temp.exists());
+}
+
+#[tokio::test]
+async fn refuses_a_redirect_instead_of_following_it_from_the_trusted_origin() {
+    let destination = BundleServer::serve(b"redirected body".to_vec(), StatusCode::OK).await;
+    let origin = BundleServer::redirect(destination.url()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let temp = dir.path().join("incoming.part");
+
+    let err = fetcher(1024)
+        .fetch(&origin.url(), &sha256_hex(b"redirected body"), &temp)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, FetchError::Status { code: 302, .. }), "{err}");
     assert!(!temp.exists());
 }
 
