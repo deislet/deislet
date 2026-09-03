@@ -178,6 +178,12 @@ def validate_integration() -> None:
         "python3 scripts/check-product-governance.py" in workflow,
         "CI does not run the product governance check",
     )
+    require(
+        "python3 scripts/check-shared-contracts.py" in workflow,
+        "CI does not execute the shared product contract fixtures",
+    )
+    require((ROOT / "contracts/v1/registry.json").is_file(), "shared product contract registry is missing")
+    require((ROOT / "contracts/v1/README.zh.md").is_file(), "shared product contract documentation is missing")
     require("cargo audit" in workflow, "CI dependency audit is missing")
     audit_policy = read_text(".cargo/audit.toml")
     expected_advisories = {

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/resource-identity.schema.json",
+  "title": "Canonical resource identity envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "id", "displayName", "scope", "revision", "createdAt"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": 1},
+    "kind": {"$ref": "#/$defs/resourceKind"},
+    "id": {"$ref": "#/$defs/canonicalId"},
+    "displayName": {"type": "string", "minLength": 1, "maxLength": 256},
+    "scope": {
+      "type": "array", "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["kind", "id"],
+        "properties": {
+          "kind": {"$ref": "#/$defs/resourceKind"},
+          "id": {"$ref": "#/$defs/canonicalId"}
+        }
+      }
+    },
+    "revision": {"type": "integer", "minimum": 1},
+    "createdAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "resourceKind": {
+      "enum": [
+        "organization", "principal", "application", "environment", "build",
+        "artifact", "version", "deployment", "operation", "alias", "domain",
+        "route", "binding", "resource", "secret-revision", "schedule", "queue",
+        "stateful-object-namespace", "provider-target", "export"
+      ]
+    }
+  }
+}

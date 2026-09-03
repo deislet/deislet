@@ -1,0 +1,46 @@
+{
+  "$schema": "../../canonical-artifact.schema.json",
+  "schemaVersion": 1,
+  "artifactFormat": "edge-canon.canonical-artifact.v1",
+  "artifactId": "01990f44-1000-7000-8000-000000000010",
+  "applicationId": "01990f44-1000-7000-8000-000000000001",
+  "state": "verified",
+  "deployable": false,
+  "createdAt": "2026-09-03T13:01:00Z",
+  "digest": {"algorithm": "sha256", "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "payload": {
+    "mediaType": "application/vnd.edge-canon.artifact.v1+tar",
+    "sizeBytes": 4096,
+    "rootDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+  },
+  "standard": {
+    "contractId": "edge-canon.next",
+    "version": "next@2df06b2c929b2a48728e40583e3f74f097938753",
+    "releaseStatus": "proposal",
+    "sourceCommit": "2df06b2c929b2a48728e40583e3f74f097938753",
+    "contractDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+  },
+  "source": {
+    "repository": "https://github.com/example/checkout-api",
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "treeDigest": {"algorithm": "sha256", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+    "dirty": false
+  },
+  "inputs": {
+    "buildPlanDigest": {"algorithm": "sha256", "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+    "dependencyLockDigest": {"algorithm": "sha256", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+    "publicBuildVariablesDigest": {"algorithm": "sha256", "value": "1111111111111111111111111111111111111111111111111111111111111111"}
+  },
+  "toolchain": [
+    {"name": "deis-build", "version": "0.1.0", "distributionDigest": {"algorithm": "sha256", "value": "2222222222222222222222222222222222222222222222222222222222222222"}}
+  ],
+  "bindingInterfaceDigest": {"algorithm": "sha256", "value": "3333333333333333333333333333333333333333333333333333333333333333"},
+  "sbom": {"format": "spdx-2.3", "digest": {"algorithm": "sha256", "value": "4444444444444444444444444444444444444444444444444444444444444444"}},
+  "provenance": {"format": "slsa-v1", "builderId": "deislet/build/dev", "digest": {"algorithm": "sha256", "value": "5555555555555555555555555555555555555555555555555555555555555555"}},
+  "validation": {
+    "status": "passed",
+    "requirementsDigest": {"algorithm": "sha256", "value": "6666666666666666666666666666666666666666666666666666666666666666"},
+    "reportDigest": {"algorithm": "sha256", "value": "7777777777777777777777777777777777777777777777777777777777777777"}
+  },
+  "signatures": []
+}

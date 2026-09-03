@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/registry.schema.json",
+  "title": "Deislet shared contract registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "contractVersion", "status", "standardLock",
+    "identifierScheme", "documents", "operationTransitions", "fixtures",
+    "requiredProviderOperations", "identityMigrationPhases"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": 1},
+    "contractVersion": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-draft\\.[0-9]+)?$"},
+    "status": {"enum": ["draft", "frozen"]},
+    "standardLock": {"const": "standards/edge-canon.lock.json"},
+    "identifierScheme": {"const": "uuidv7-lowercase"},
+    "documents": {
+      "type": "array", "minItems": 6, "maxItems": 6,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "schema"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+          "schema": {"type": "string", "pattern": "^contracts/v1/[a-z0-9-]+\\.schema\\.json$"}
+        }
+      }
+    },
+    "operationTransitions": {"const": "contracts/v1/operation-transitions.json"},
+    "fixtures": {"const": "contracts/v1/fixtures.json"},
+    "requiredProviderOperations": {
+      "type": "array", "minItems": 12, "maxItems": 12, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z][a-z-]+$"}
+    },
+    "identityMigrationPhases": {
+      "type": "array", "minItems": 8, "maxItems": 8, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z][a-z-]+$"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "frozen"}}, "required": ["status"]},
+      "then": {"properties": {"contractVersion": {"pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"}}}
+    }
+  ]
+}

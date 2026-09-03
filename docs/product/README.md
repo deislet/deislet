@@ -21,6 +21,7 @@
 机器读取入口：
 
 - [标准锁定文件](../../standards/edge-canon.lock.json)
+- [共享产品契约](../../contracts/v1/README.zh.md)及其[机器 registry](../../contracts/v1/registry.json)
 - [执行路线 JSON](roadmap.json)
 - [路线 JSON Schema](roadmap.schema.json)
 - [仓库校验器](../../scripts/check-product-governance.py)

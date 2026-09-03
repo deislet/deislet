@@ -54,8 +54,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install governance schema validator
+        run: python3 -m pip install --disable-pip-version-check -r scripts/governance-requirements.txt
       - name: Validate product governance records
         run: python3 scripts/check-product-governance.py
+      - name: Execute shared product contract fixtures
+        run: python3 scripts/check-shared-contracts.py
 
   document-path-literals:
     name: documents reference the path constants

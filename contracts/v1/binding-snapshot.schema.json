@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/binding-snapshot.schema.json",
+  "title": "Immutable environment binding snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "snapshotId", "applicationId", "environmentId", "versionId",
+    "providerTargetId", "revision", "createdAt", "standardVersion", "declarations",
+    "resolutions", "mappingDigest"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": 1},
+    "snapshotId": {"$ref": "#/$defs/canonicalId"},
+    "applicationId": {"$ref": "#/$defs/canonicalId"},
+    "environmentId": {"$ref": "#/$defs/canonicalId"},
+    "versionId": {"$ref": "#/$defs/canonicalId"},
+    "providerTargetId": {"$ref": "#/$defs/canonicalId"},
+    "revision": {"type": "integer", "minimum": 1},
+    "createdAt": {"type": "string", "format": "date-time"},
+    "standardVersion": {"type": "string", "minLength": 1},
+    "declarations": {
+      "type": "array", "uniqueItems": true,
+      "items": {"$ref": "#/$defs/declaration"}
+    },
+    "resolutions": {
+      "type": "array", "uniqueItems": true,
+      "items": {"$ref": "#/$defs/resolution"}
+    },
+    "mappingDigest": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "canonicalId": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "digest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {"algorithm": {"const": "sha256"}, "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
+    "bindingKind": {"enum": ["kv", "cache", "sql", "blob", "queue", "service", "secret", "stateful-object"]},
+    "permission": {
+      "enum": [
+        "read", "write", "list", "delete", "send", "consume", "manage",
+        "replay", "call", "migrate", "admin"
+      ]
+    },
+    "declaration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bindingId", "name", "kind", "interfaceVersion", "permissions"],
+      "properties": {
+        "bindingId": {"$ref": "#/$defs/canonicalId"},
+        "name": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$", "not": {"enum": ["__PROTO__", "PROTOTYPE", "CONSTRUCTOR"]}},
+        "kind": {"$ref": "#/$defs/bindingKind"},
+        "interfaceVersion": {"type": "string", "minLength": 1},
+        "permissions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/permission"}}
+      }
+    },
+    "resolution": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "bindingId", "name", "kind", "mode", "resourceId", "providerReference",
+        "region", "credentialRevisionId", "ownership", "lifecycle", "resolvedGuarantee"
+      ],
+      "properties": {
+        "bindingId": {"$ref": "#/$defs/canonicalId"},
+        "name": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+        "kind": {"$ref": "#/$defs/bindingKind"},
+        "mode": {"enum": ["managed", "imported", "shared"]},
+        "resourceId": {"$ref": "#/$defs/canonicalId"},
+        "providerReference": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "region": {"type": "string", "minLength": 1},
+        "credentialRevisionId": {"$ref": "#/$defs/canonicalId"},
+        "ownership": {"enum": ["platform-owned", "external", "shared-external"]},
+        "lifecycle": {
+          "type": "object", "additionalProperties": false,
+          "required": ["deleteWithEnvironment", "retentionPolicy"],
+          "properties": {
+            "deleteWithEnvironment": {"type": "boolean"},
+            "retentionPolicy": {"type": "string", "minLength": 1}
+          }
+        },
+        "resolvedGuarantee": {
+          "type": "object", "additionalProperties": false,
+          "required": ["standardVersion", "capabilityFamily", "requirementsDigest"],
+          "properties": {
+            "standardVersion": {"type": "string", "minLength": 1},
+            "capabilityFamily": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+            "requirementsDigest": {"$ref": "#/$defs/digest"}
+          }
+        }
+      }
+    }
+  }
+}

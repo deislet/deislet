@@ -1201,3 +1201,13 @@ Application/framework source + versioned build plan
 - 公开资源证据进一步显示：Cloudflare 入门套餐单次 HTTP CPU 为 10 ms，而 EdgeOne Makers Edge Functions 为 200 ms；两者都公布 128 MB 运行内存，EdgeOne 请求 body 上限为 1 MB。EdgeOne 当前公开材料没有给出响应 body、HTTP wall time、`waitUntil` 宽限和子请求的可依赖保证。标准必须先决定以所有最低入门套餐为基线，还是允许版本化声明各供应商最低套餐/配置；这是影响 SSR 可用性、部署成本和 preflight 行为的产品决策，暂不代填。
 - `web-platform-apis`、`environment-secrets`、`logical-resource-bindings` 和 canonical artifact 仍是未完成依赖；错误响应、断连行为及生命周期边界也需要两个独立实现的反馈和三个一等后端真实部署验证。
 - conformance harness 仍为 `planned`，其余 14 个能力族仍为 `pending`。因此 `edge-canon.next` 继续处于 proposal，registry 中所有后端继续为 `compliant=false`、`supported=false`，不得把草案用例或 artifact 生成解读成支持证明。
+
+## 13. P0-MODEL-001 共享模型迁移发现
+
+- 当前 `App.id` 仍是可读应用名，底层 tenant/namespace 仍由 `app.environment@binding` 拼接。名称同时承担显示、路径、路由、存储隔离和 capability subject，导致同名复用风险只能靠 `retired_app_names` 暂时阻断，不能成为长期 identity 模型。
+- 当前 `Version` 是 Deislet bundle 记录；Control 的 `Deployment` 是 newest-row-wins 环境指针。CLI 失败信息已明确承认 pointer 移动后部分节点可能继续旧版本，这与 Accepted ADR 的 prepare/verify/activate 和 observed-state `active` 定义冲突。
+- `commands` 的状态机正确解决了单节点命令完成/超时竞态，但它不是 build/deploy/migrate/delete 等产品长操作：没有统一 scope、idempotency、target revision、child/provider operation、cancel/recovery 和持久 progress。
+- 当前 compiler/build core 的 `VendorBuild` 与 `AdapterArtifacts` 直接表达多个 vendor 输出；Deislet bundle 已有完整性与解压上限，但仍不是 provider-neutral canonical Edge Canon artifact，也没有统一 source/build-plan/toolchain/SBOM/provenance/signature 记录。
+- 新增 `contracts/v1` Draft 共享契约，以 lowercase UUIDv7 表达不可复用 canonical ID，分离 artifact/version/deployment/operation，固定 immutable binding snapshot 和 provider driver lifecycle，并把旧 identity 迁移拆成 inventory、分配 ID、双读、复制或 rename、验证、cutover、撤销旧 capability、tombstone 八阶段。
+- 六份 schema 均有一份正例和由确定性 mutation 得到的反例；校验器执行 JSON Schema、状态图可达性/终态不变、binding 一一映射、proposal artifact 不可部署、driver 不宣称未发布标准，以及 canonical tenant key 不再使用名称。
+- 这些文件是迁移目标而非当前实现证明。`P0-MODEL-001` 继续为 `active`；只有 Rust/API/SQLite 使用共享类型、已有数据可无停机迁移并通过故障/回滚 fixture 后才可完成。

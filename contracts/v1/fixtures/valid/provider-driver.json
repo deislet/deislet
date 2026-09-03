@@ -1,0 +1,51 @@
+{
+  "$schema": "../../provider-driver.schema.json",
+  "schemaVersion": 1,
+  "driverContractVersion": "1.0.0-draft.1",
+  "driver": {
+    "id": "deislet.driver.cloudflare",
+    "version": "0.1.0-draft.1",
+    "distributionDigest": {"algorithm": "sha256", "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  },
+  "backend": {
+    "id": "cloudflare-workers-pages",
+    "product": "Cloudflare Workers/Pages",
+    "apiVersion": "2026-09",
+    "compatibilityDate": "2026-09-01"
+  },
+  "supportedStandardVersions": [],
+  "operations": ["preflight", "plan", "prepare", "upload", "verify", "activate", "observe", "rollback", "inspect", "reconcile", "delete", "cleanup"],
+  "officialTools": [
+    {
+      "kind": "cli",
+      "name": "wrangler",
+      "version": "pinned-by-driver-lock",
+      "distributionDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+      "nonInteractive": true
+    }
+  ],
+  "credentialTransport": {
+    "allowed": ["stdin", "restricted-temporary-file", "system-keyring", "short-lived-environment"],
+    "argvAllowed": false,
+    "persistPlaintextAllowed": false,
+    "runtimeReceivesManagementCredential": false
+  },
+  "execution": {
+    "nonInteractive": true,
+    "idempotent": true,
+    "crashRecoverable": true,
+    "structuredOutput": true,
+    "queryBeforeRetry": true,
+    "redactsDiagnostics": true
+  },
+  "implementationMappings": [
+    {"capabilityFamily": "web-fetch-events", "implementation": "native", "components": ["Workers module handler wrapper", "Pages Functions wrapper"]}
+  ],
+  "claimPolicy": {
+    "certificationSource": "edge-canon-conformance-registry",
+    "artifactGenerationIsCompliance": false,
+    "syntaxVerificationIsCompliance": false,
+    "deploymentIsCompliance": false
+  },
+  "supportedHostOperatingSystems": ["linux-amd64", "linux-arm64", "macos-arm64", "windows-amd64"]
+}

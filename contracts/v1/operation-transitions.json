@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "initialState": "queued",
+  "terminalStates": ["succeeded", "failed", "cancelled"],
+  "transitions": [
+    {"from": "queued", "event": "start", "to": "running"},
+    {"from": "queued", "event": "cancel-requested", "to": "cancelling"},
+    {"from": "queued", "event": "failed", "to": "failed"},
+    {"from": "running", "event": "wait", "to": "waiting"},
+    {"from": "running", "event": "succeeded", "to": "succeeded"},
+    {"from": "running", "event": "failed", "to": "failed"},
+    {"from": "running", "event": "cancel-requested", "to": "cancelling"},
+    {"from": "waiting", "event": "resume", "to": "running"},
+    {"from": "waiting", "event": "failed", "to": "failed"},
+    {"from": "waiting", "event": "cancel-requested", "to": "cancelling"},
+    {"from": "cancelling", "event": "cancelled", "to": "cancelled"},
+    {"from": "cancelling", "event": "failed", "to": "failed"}
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/operation.schema.json",
+  "title": "Durable product operation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "operationId", "kind", "scope", "target", "state", "phase",
+    "revision", "idempotencyKeyDigest", "actorId", "requestId", "correlationId",
+    "progress", "cancellable", "retryable", "childOperationIds", "providerOperations",
+    "error", "createdAt", "startedAt", "updatedAt", "finishedAt"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": 1},
+    "operationId": {"$ref": "#/$defs/canonicalId"},
+    "kind": {"enum": ["build", "provision", "deploy", "promote", "rollback", "migrate", "export", "delete", "restore", "purge", "provider"]},
+    "scope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["organizationId", "applicationId", "environmentId"],
+      "properties": {
+        "organizationId": {"$ref": "#/$defs/canonicalId"},
+        "applicationId": {"anyOf": [{"$ref": "#/$defs/canonicalId"}, {"type": "null"}]},
+        "environmentId": {"anyOf": [{"$ref": "#/$defs/canonicalId"}, {"type": "null"}]}
+      }
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "id", "expectedRevision"],
+      "properties": {
+        "kind": {"type": "string", "pattern": "^[a-z][a-z-]+$"},
+        "id": {"$ref": "#/$defs/canonicalId"},
+        "expectedRevision": {"type": "integer", "minimum": 0}
+      }
+    },
+    "state": {"enum": ["queued", "running", "waiting", "cancelling", "succeeded", "failed", "cancelled"]},
+    "phase": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "idempotencyKeyDigest": {"$ref": "#/$defs/digest"},
+    "actorId": {"$ref": "#/$defs/canonicalId"},
+    "requestId": {"$ref": "#/$defs/canonicalId"},
+    "correlationId": {"$ref": "#/$defs/canonicalId"},
+    "progress": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 10000}, {"type": "null"}]},
+    "cancellable": {"type": "boolean"},
+    "retryable": {"type": "boolean"},
+    "childOperationIds": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/canonicalId"}},
+    "providerOperations": {
+      "type": "array", "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["providerOperationId", "providerTargetId", "driverId", "nativeOperationId", "state", "observedAt", "diagnosticRef"],
+        "properties": {
+          "providerOperationId": {"$ref": "#/$defs/canonicalId"},
+          "providerTargetId": {"$ref": "#/$defs/canonicalId"},
+          "driverId": {"type": "string", "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"},
+          "nativeOperationId": {"type": ["string", "null"], "maxLength": 1024},
+          "state": {"enum": ["pending", "running", "succeeded", "failed", "unknown"]},
+          "observedAt": {"type": "string", "format": "date-time"},
+          "diagnosticRef": {"type": ["string", "null"], "maxLength": 2048}
+        }
+      }
+    },
+    "error": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["code", "message", "retryable", "retryAfterSeconds", "remediation"],
+          "properties": {
+            "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]+$"},
+            "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "retryable": {"type": "boolean"},
+            "retryAfterSeconds": {"type": ["integer", "null"], "minimum": 0},
+            "remediation": {"type": ["string", "null"], "maxLength": 2048}
+          }
+        }
+      ]
+    },
+    "createdAt": {"type": "string", "format": "date-time"},
+    "startedAt": {"type": ["string", "null"], "format": "date-time"},
+    "updatedAt": {"type": "string", "format": "date-time"},
+    "finishedAt": {"type": ["string", "null"], "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"state": {"enum": ["succeeded", "failed", "cancelled"]}}, "required": ["state"]},
+      "then": {"properties": {"finishedAt": {"type": "string", "format": "date-time"}, "cancellable": {"const": false}}},
+      "else": {"properties": {"finishedAt": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"state": {"const": "failed"}}, "required": ["state"]},
+      "then": {"properties": {"error": {"type": "object"}}},
+      "else": {"properties": {"error": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"state": {"const": "queued"}}, "required": ["state"]},
+      "then": {"properties": {"startedAt": {"type": "null"}}},
+      "else": {"properties": {"startedAt": {"type": "string", "format": "date-time"}}}
+    }
+  ],
+  "$defs": {
+    "canonicalId": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "digest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {"algorithm": {"const": "sha256"}, "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    }
+  }
+}

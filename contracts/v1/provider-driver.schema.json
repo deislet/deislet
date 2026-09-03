@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/provider-driver.schema.json",
+  "title": "Pinned provider deployment driver manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "driverContractVersion", "driver", "backend", "supportedStandardVersions",
+    "operations", "officialTools", "credentialTransport", "execution", "implementationMappings",
+    "claimPolicy", "supportedHostOperatingSystems"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": 1},
+    "driverContractVersion": {"type": "string", "pattern": "^1\\.0\\.0(?:-draft\\.[0-9]+)?$"},
+    "driver": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "version", "distributionDigest"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},
+        "distributionDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "backend": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "product", "apiVersion"],
+      "properties": {
+        "id": {"enum": ["deislet", "cloudflare-workers-pages", "tencent-edgeone-makers", "deno"]},
+        "product": {"type": "string", "minLength": 1},
+        "apiVersion": {"type": "string", "minLength": 1},
+        "compatibilityDate": {"type": "string", "format": "date"}
+      }
+    },
+    "supportedStandardVersions": {
+      "type": "array", "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["contractId", "version", "contractDigest"],
+        "properties": {
+          "contractId": {"type": "string", "pattern": "^edge-canon\\.[a-z0-9.-]+$"},
+          "version": {"type": "string", "minLength": 1},
+          "contractDigest": {"$ref": "#/$defs/digest"}
+        }
+      }
+    },
+    "operations": {
+      "type": "array", "minItems": 12, "maxItems": 12, "uniqueItems": true,
+      "items": {"enum": ["preflight", "plan", "prepare", "upload", "verify", "activate", "observe", "rollback", "inspect", "reconcile", "delete", "cleanup"]}
+    },
+    "officialTools": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["kind", "name", "version", "distributionDigest", "nonInteractive"],
+        "properties": {
+          "kind": {"enum": ["cli", "api", "sdk", "native"]},
+          "name": {"type": "string", "minLength": 1},
+          "version": {"type": "string", "minLength": 1},
+          "distributionDigest": {"$ref": "#/$defs/digest"},
+          "nonInteractive": {"const": true}
+        }
+      }
+    },
+    "credentialTransport": {
+      "type": "object", "additionalProperties": false,
+      "required": ["allowed", "argvAllowed", "persistPlaintextAllowed", "runtimeReceivesManagementCredential"],
+      "properties": {
+        "allowed": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"enum": ["stdin", "restricted-temporary-file", "system-keyring", "short-lived-environment"]}
+        },
+        "argvAllowed": {"const": false},
+        "persistPlaintextAllowed": {"const": false},
+        "runtimeReceivesManagementCredential": {"const": false}
+      }
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["nonInteractive", "idempotent", "crashRecoverable", "structuredOutput", "queryBeforeRetry", "redactsDiagnostics"],
+      "properties": {
+        "nonInteractive": {"const": true},
+        "idempotent": {"const": true},
+        "crashRecoverable": {"const": true},
+        "structuredOutput": {"const": true},
+        "queryBeforeRetry": {"const": true},
+        "redactsDiagnostics": {"const": true}
+      }
+    },
+    "implementationMappings": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["capabilityFamily", "implementation", "components"],
+        "properties": {
+          "capabilityFamily": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+          "implementation": {"enum": ["native", "composed", "companion"]},
+          "components": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    },
+    "claimPolicy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["certificationSource", "artifactGenerationIsCompliance", "syntaxVerificationIsCompliance", "deploymentIsCompliance"],
+      "properties": {
+        "certificationSource": {"const": "edge-canon-conformance-registry"},
+        "artifactGenerationIsCompliance": {"const": false},
+        "syntaxVerificationIsCompliance": {"const": false},
+        "deploymentIsCompliance": {"const": false}
+      }
+    },
+    "supportedHostOperatingSystems": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"enum": ["linux-amd64", "linux-arm64", "macos-arm64", "windows-amd64"]}
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {"algorithm": {"const": "sha256"}, "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    }
+  }
+}

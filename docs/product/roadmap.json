@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-03T21:22:33+08:00",
+  "updatedAt": "2026-09-03T21:34:19+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -12,8 +12,8 @@
   },
   "nextActions": [
     "P0-SPEC-002",
-    "P0-EVID-001",
-    "P0-MODEL-001"
+    "P0-MODEL-001",
+    "P0-EVID-001"
   ],
   "phases": [
     {
@@ -109,12 +109,14 @@
           "id": "P0-MODEL-001",
           "title": "定义 canonical ID、operation、artifact、binding 与 driver 共享模型及迁移计划",
           "owner": "joint",
-          "status": "queued",
+          "status": "active",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "planned-path", "value": "versioned shared schemas and migration fixtures"}
+            {"type": "local-path", "value": "contracts/v1/registry.json"},
+            {"type": "local-path", "value": "contracts/v1/README.zh.md"},
+            {"type": "local-path", "value": "scripts/check-shared-contracts.py"}
           ],
-          "verification": "旧 name-based identity 与 provider-specific config 均有无停机迁移测试"
+          "verification": "python3 scripts/check-shared-contracts.py；完成后还须由旧 name-based 数据执行无停机迁移与 rollback/failure fixtures"
         },
         {
           "id": "P0-CI-001",

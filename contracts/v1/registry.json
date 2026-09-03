@@ -1,0 +1,26 @@
+{
+  "$schema": "registry.schema.json",
+  "schemaVersion": 1,
+  "contractVersion": "1.0.0-draft.1",
+  "status": "draft",
+  "standardLock": "standards/edge-canon.lock.json",
+  "identifierScheme": "uuidv7-lowercase",
+  "documents": [
+    {"id": "resource-identity", "schema": "contracts/v1/resource-identity.schema.json"},
+    {"id": "canonical-artifact", "schema": "contracts/v1/canonical-artifact.schema.json"},
+    {"id": "binding-snapshot", "schema": "contracts/v1/binding-snapshot.schema.json"},
+    {"id": "operation", "schema": "contracts/v1/operation.schema.json"},
+    {"id": "provider-driver", "schema": "contracts/v1/provider-driver.schema.json"},
+    {"id": "identity-migration", "schema": "contracts/v1/identity-migration.schema.json"}
+  ],
+  "operationTransitions": "contracts/v1/operation-transitions.json",
+  "fixtures": "contracts/v1/fixtures.json",
+  "requiredProviderOperations": [
+    "preflight", "plan", "prepare", "upload", "verify", "activate",
+    "observe", "rollback", "inspect", "reconcile", "delete", "cleanup"
+  ],
+  "identityMigrationPhases": [
+    "inventory", "allocate-canonical-ids", "dual-read", "copy-or-rename",
+    "verify", "cutover", "revoke-legacy-capabilities", "tombstone"
+  ]
+}

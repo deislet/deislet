@@ -1,0 +1,35 @@
+{
+  "$schema": "../../binding-snapshot.schema.json",
+  "schemaVersion": 1,
+  "snapshotId": "01990f44-1000-7000-8000-000000000020",
+  "applicationId": "01990f44-1000-7000-8000-000000000001",
+  "environmentId": "01990f44-1000-7000-8000-000000000002",
+  "versionId": "01990f44-1000-7000-8000-000000000011",
+  "providerTargetId": "01990f44-1000-7000-8000-000000000030",
+  "revision": 1,
+  "createdAt": "2026-09-03T13:02:00Z",
+  "standardVersion": "next@2df06b2c929b2a48728e40583e3f74f097938753",
+  "declarations": [
+    {"bindingId": "01990f44-1000-7000-8000-000000000021", "name": "SESSIONS", "kind": "kv", "interfaceVersion": "edge-canon.kv.next", "permissions": ["read", "write", "delete"]}
+  ],
+  "resolutions": [
+    {
+      "bindingId": "01990f44-1000-7000-8000-000000000021",
+      "name": "SESSIONS",
+      "kind": "kv",
+      "mode": "managed",
+      "resourceId": "01990f44-1000-7000-8000-000000000022",
+      "providerReference": "namespace/checkout-preview-sessions",
+      "region": "global",
+      "credentialRevisionId": "01990f44-1000-7000-8000-000000000023",
+      "ownership": "platform-owned",
+      "lifecycle": {"deleteWithEnvironment": true, "retentionPolicy": "preview-7d"},
+      "resolvedGuarantee": {
+        "standardVersion": "next@2df06b2c929b2a48728e40583e3f74f097938753",
+        "capabilityFamily": "kv-cache-sql-blob",
+        "requirementsDigest": {"algorithm": "sha256", "value": "9999999999999999999999999999999999999999999999999999999999999999"}
+      }
+    }
+  ],
+  "mappingDigest": {"algorithm": "sha256", "value": "8888888888888888888888888888888888888888888888888888888888888888"}
+}

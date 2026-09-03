@@ -1,0 +1,45 @@
+{
+  "$schema": "../../identity-migration.schema.json",
+  "schemaVersion": 1,
+  "migrationId": "01990f44-1000-7000-8000-000000000050",
+  "operationId": "01990f44-1000-7000-8000-000000000051",
+  "state": "planned",
+  "legacyApplicationName": "checkout-api",
+  "canonicalApplicationId": "01990f44-1000-7000-8000-000000000001",
+  "environments": [
+    {
+      "legacyName": "production",
+      "legacyTenantKey": "checkout-api.production",
+      "canonicalEnvironmentId": "01990f44-1000-7000-8000-000000000002",
+      "canonicalTenantKey": "v1/01990f44-1000-7000-8000-000000000001/01990f44-1000-7000-8000-000000000002",
+      "bindingMappings": [
+        {"legacyName": "SESSIONS", "bindingId": "01990f44-1000-7000-8000-000000000021"}
+      ]
+    }
+  ],
+  "phases": [
+    {"name": "inventory", "state": "pending", "attempt": 0, "startedAt": null, "finishedAt": null, "errorCode": null},
+    {"name": "allocate-canonical-ids", "state": "pending", "attempt": 0, "startedAt": null, "finishedAt": null, "errorCode": null},
+    {"name": "dual-read", "state": "pending", "attempt": 0, "startedAt": null, "finishedAt": null, "errorCode": null},
+    {"name": "copy-or-rename", "state": "pending", "attempt": 0, "startedAt": null, "finishedAt": null, "errorCode": null},
+    {"name": "verify", "state": "pending", "attempt": 0, "startedAt": null, "finishedAt": null, "errorCode": null},
+    {"name": "cutover", "state": "pending", "attempt": 0, "startedAt": null, "finishedAt": null, "errorCode": null},
+    {"name": "revoke-legacy-capabilities", "state": "pending", "attempt": 0, "startedAt": null, "finishedAt": null, "errorCode": null},
+    {"name": "tombstone", "state": "pending", "attempt": 0, "startedAt": null, "finishedAt": null, "errorCode": null}
+  ],
+  "fence": {"expectedApplicationRevision": 1, "token": "draft-fixture-fence-00000000000001"},
+  "verification": [
+    {
+      "component": "catalog",
+      "sourceCount": 0,
+      "targetCount": 0,
+      "sourceDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+      "targetDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+      "outcome": "pending"
+    }
+  ],
+  "legacyCapabilitiesRevoked": false,
+  "nameTombstoneRetained": true,
+  "createdAt": "2026-09-03T13:05:00Z",
+  "updatedAt": "2026-09-03T13:05:00Z"
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "../../operation.schema.json",
+  "schemaVersion": 1,
+  "operationId": "01990f44-1000-7000-8000-000000000040",
+  "kind": "deploy",
+  "scope": {
+    "organizationId": "01990f44-1000-7000-8000-000000000000",
+    "applicationId": "01990f44-1000-7000-8000-000000000001",
+    "environmentId": "01990f44-1000-7000-8000-000000000002"
+  },
+  "target": {"kind": "environment", "id": "01990f44-1000-7000-8000-000000000002", "expectedRevision": 4},
+  "state": "running",
+  "phase": "verify",
+  "revision": 7,
+  "idempotencyKeyDigest": {"algorithm": "sha256", "value": "9999999999999999999999999999999999999999999999999999999999999999"},
+  "actorId": "01990f44-1000-7000-8000-000000000003",
+  "requestId": "01990f44-1000-7000-8000-000000000041",
+  "correlationId": "01990f44-1000-7000-8000-000000000042",
+  "progress": 4200,
+  "cancellable": true,
+  "retryable": true,
+  "childOperationIds": [],
+  "providerOperations": [
+    {
+      "providerOperationId": "01990f44-1000-7000-8000-000000000043",
+      "providerTargetId": "01990f44-1000-7000-8000-000000000030",
+      "driverId": "deislet.driver.cloudflare",
+      "nativeOperationId": "cf-op-123",
+      "state": "running",
+      "observedAt": "2026-09-03T13:04:00Z",
+      "diagnosticRef": "evidence/provider/cf-op-123.json"
+    }
+  ],
+  "error": null,
+  "createdAt": "2026-09-03T13:03:00Z",
+  "startedAt": "2026-09-03T13:03:01Z",
+  "updatedAt": "2026-09-03T13:04:00Z",
+  "finishedAt": null
+}

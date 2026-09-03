@@ -1,0 +1,12 @@
+{
+  "$schema": "../../resource-identity.schema.json",
+  "schemaVersion": 1,
+  "kind": "application",
+  "id": "01990f44-1000-7000-8000-000000000001",
+  "displayName": "checkout-api",
+  "scope": [
+    {"kind": "organization", "id": "01990f44-1000-7000-8000-000000000000"}
+  ],
+  "revision": 1,
+  "createdAt": "2026-09-03T13:00:00Z"
+}
