@@ -185,6 +185,23 @@ def validate_integration() -> None:
     require((ROOT / "contracts/v1/registry.json").is_file(), "shared product contract registry is missing")
     require((ROOT / "contracts/v1/README.zh.md").is_file(), "shared product contract documentation is missing")
     require("cargo audit" in workflow, "CI dependency audit is missing")
+    # These are the first official-action majors that run natively on Node
+    # 24. Keep the set explicit: silently falling back to an older major
+    # reintroduces the runner compatibility mode and its deprecation warning;
+    # adding another official action requires recording its reviewed major.
+    expected_official_actions = {
+        "actions/checkout@v5",
+        "actions/setup-node@v5",
+        "actions/setup-python@v6",
+        "actions/cache@v5",
+        "actions/upload-artifact@v6",
+    }
+    actual_official_actions = set(re.findall(r"uses:\s+(actions/[a-z-]+@v[0-9]+)", workflow))
+    require(
+        actual_official_actions == expected_official_actions,
+        "official GitHub Actions must stay on the reviewed Node 24 majors: "
+        f"expected {sorted(expected_official_actions)}, got {sorted(actual_official_actions)}",
+    )
     audit_policy = read_text(".cargo/audit.toml")
     expected_advisories = {
         "RUSTSEC-2026-0119",

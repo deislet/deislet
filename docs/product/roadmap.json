@@ -129,7 +129,7 @@
           "outputs": [
             {"type": "local-path", "value": ".github/workflows/checks.yml"}
           ],
-          "verification": "actions/checkout@v5、setup-node@v5、setup-python@v6、cache@v5、upload-artifact@v6 的完整 checks run 成功且不再产生 Node 20 runtime annotation"
+          "verification": "python3 scripts/check-product-governance.py 固定 reviewed Node 24 majors；这些 revisions 的完整 checks run 成功且不再产生 Node 20 runtime annotation"
         }
       ]
     },
