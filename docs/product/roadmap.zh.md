@@ -24,9 +24,13 @@
 - `P0-CONF-001`：公开 registry、证据成熟度和认证不变量已建立。
 - `P0-ROAD-001`：路线、标准锁定、跨文件校验和 CI 门禁已建立。
 
+## 当前进行中
+
+- `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 已形成 20 条候选条款和 11 个 provider-independent 草案用例。最低资源保证仍为 `pending`、执行 harness 仍为 `planned`，其余 14 个能力族尚未开始，故本项继续保持 `active`。
+
 ## 紧接着执行
 
-1. `P0-SPEC-002`：按 15 个 mandatory 能力族逐项写完 API、错误、一致性、生命周期、保证、fixture 和 oracle；`pending` 是发布阻断项。
+1. `P0-SPEC-002`：先完成 `web-fetch-events` 的最低资源保证、依赖类型和三后端可执行 harness，再按其闭环逐项完成其余 14 个 mandatory 能力族；`pending` 是发布阻断项。
 2. `P0-EVID-001`：删除手工维护的“支持”结论，让 README、CLI、Web 和矩阵从 registry 生成。
 3. `P0-MODEL-001`：冻结 canonical ID、operation、artifact、逻辑 binding 和 provider driver 共享 schema，并为旧数据设计迁移 fixture。
 4. `P0-CI-001`：升级仍以 Node 20 action runtime 发布的 GitHub Actions revision，清除 runner 的强制兼容警告。

@@ -81,6 +81,25 @@ def validate_standard_lock() -> str:
     require(standard.get("normativeRelease") is False, "proposal cannot be normative")
     require(standard.get("capabilityModel") == "single-standard", "only the single standard model is valid")
     require(standard.get("profiles") == [], "standard lock must not contain profiles")
+    expected_sources = {
+        "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
+        "contractPath": "standard/contract.json",
+        "contractSchemaPath": "schemas/standard-contract.schema.json",
+        "requirementsPath": "standard/requirements.json",
+        "requirementsSchemaPath": "schemas/requirements-registry.schema.json",
+        "conformanceKitPath": "conformance/kit.json",
+        "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
+        "registryPath": "conformance/registry.json",
+        "registrySchemaPath": "schemas/conformance-registry.schema.json",
+    }
+    for key, expected in expected_sources.items():
+        require(source.get(key) == expected, f"standard lock {key} must be {expected}")
+    verification = lock.get("verification", {})
+    require(verification.get("upstreamResult") == "passed", "locked upstream governance check did not pass")
+    require(verification.get("expectedCapabilityFamilies") == 15, "unexpected capability family count")
+    require(verification.get("expectedDraftClauses") == 20, "unexpected draft clause count")
+    require(verification.get("expectedConformanceSuites") == 15, "unexpected conformance suite count")
+    require(verification.get("expectedBackends") == 4, "unexpected backend record count")
 
     pinned_documents = [
         "docs/adr/README.md",

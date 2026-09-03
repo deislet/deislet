@@ -4,9 +4,11 @@
 
 - 决策事实与问题来源：[阶段分析](../product/phase-analysis-2026-09-03.zh.md)
 - 可执行工程路线：[产品级路线](../product/roadmap.zh.md)
-- 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/proposals/0001-unified-platform-contract/README.zh.md)
-- 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/standard/contract.json)
-- 上游证据 registry：[conformance/registry.json](https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/conformance/registry.json)
+- 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/proposals/0001-unified-platform-contract/README.zh.md)
+- 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/standard/contract.json)
+- 上游逐条要求：[standard/requirements.json](https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/standard/requirements.json)
+- 上游测试入口：[conformance/kit.json](https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/conformance/kit.json)
+- 上游证据 registry：[conformance/registry.json](https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/conformance/registry.json)
 
 | ADR | 决策 | 状态 |
 |---|---|---|

@@ -1191,3 +1191,12 @@ Application/framework source + versioned build plan
 - Edge Canon 顶层入口已指向单一标准 proposal，但 v0.1 的 `SPECIFICATION`、`PRINCIPLES`、`COMPATIBILITY`、Basic/Extended 文档和平台矩阵仍可能被误读为下一版本规则。已在各入口明确版本边界，历史正文保留，下一版本只由 proposal、机器契约和 registry 推进。
 - GitHub Actions 的 Rust 审计步骤声称使用 `.cargo/audit.toml`，该文件却只存在于本机并被 `.git/info/exclude` 排除，导致 CI 无法取得四条已有详细论证的例外。本阶段已把文件正式纳入 Git，并让产品治理校验核对四个精确 advisory ID；后续删除或静默增加例外都会使 CI 失败。
 - GitHub Actions 报告若干 action revision 仍以已弃用的 Node 20 action runtime 发布，目前 runner 强制用 Node 24 执行且不阻断任务。该维护项记录为路线 `P0-CI-001`，验收标准是 annotation 消失，不以设置允许旧 runtime 的环境变量掩盖。
+
+## 12. P0-SPEC-002 首个能力族推进记录
+
+- Edge Canon 已新增 15 个 mandatory 能力族 × 8 个固定语义维度的机器可读需求注册表，以及一一对应的 conformance kit 索引。校验器要求契约、逐条要求、suite 状态、用例覆盖和发布阶段相互一致，不能只改一处状态制造“完成”外观。
+- `web-fetch-events` 基于 Cloudflare Workers/Pages、Tencent EdgeOne Makers/经典 FetchEvent 和 WHATWG Fetch 的官方材料形成首版候选文本。应用 ABI 只有一个默认导出的 `RequestHandler(context)`；Cloudflare 对象式 `fetch`、Pages 具名 `onRequest`、EdgeOne 默认函数和经典 `FetchEvent` 均由 provider adapter 映射，不成为应用 profile。
+- 当前登记 20 条稳定候选条款，覆盖 API、错误、并发、生命周期、安全、失败恢复和升级；11 个 provider-independent 草案用例覆盖全部已定义条款。这里的“稳定”仅指条款标识可供评审和测试引用，不表示语义已经成为不可变标准。
+- 最低资源保证仍为 `pending`。CPU、wall time、流大小、内存、子请求、并发和 `waitUntil` 宽限期必须从参考平台可持续兑现的公开保证中求得标准下限，不能把某个套餐的当前上限直接写进标准。
+- `web-platform-apis`、`environment-secrets`、`logical-resource-bindings` 和 canonical artifact 仍是未完成依赖；错误响应、断连行为及生命周期边界也需要两个独立实现的反馈和三个一等后端真实部署验证。
+- conformance harness 仍为 `planned`，其余 14 个能力族仍为 `pending`。因此 `edge-canon.next` 继续处于 proposal，registry 中所有后端继续为 `compliant=false`、`supported=false`，不得把草案用例或 artifact 生成解读成支持证明。

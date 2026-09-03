@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-03T17:02:29+08:00",
+  "updatedAt": "2026-09-03T21:15:18+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -49,10 +49,10 @@
           "status": "done",
           "dependsOn": ["P0-DEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/proposals/0001-unified-platform-contract/README.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/standard/contract.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/proposals/0001-unified-platform-contract/README.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/standard/contract.json"}
           ],
-          "verification": "在 Edge Canon commit 6599515 运行 python3 scripts/check-governance.py"
+          "verification": "在 Edge Canon commit b59928d 运行 python3 scripts/check-governance.py"
         },
         {
           "id": "P0-CONF-001",
@@ -61,8 +61,8 @@
           "status": "done",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/conformance/registry.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/schemas/conformance-registry.schema.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/conformance/registry.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/schemas/conformance-registry.schema.json"}
           ],
           "verification": "registry 中 proposal 不能 compliant，supported 必须蕴含 compliant"
         },
@@ -87,7 +87,9 @@
           "status": "active",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "planned-path", "value": "Edge Canon normative sections, fixtures and conformance kit"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/standard/requirements.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/standard/requirements/web-fetch-events.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/b59928d547db90b9a002bb893cef4e55ae762dc3/conformance/kit.json"}
           ],
           "verification": "contract.json 的 15 个 definitionStatus 全部为 normative-complete"
         },
