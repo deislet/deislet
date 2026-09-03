@@ -1,14 +1,14 @@
 # Deislet Architecture Decision Records
 
-本目录保存 2026-09-03 产品梳理中已接受的 21 项决策。`Accepted` 表示 Deislet 的产品与实现方向已经确定；涉及应用标准的条款仍须经 Edge Canon 独立治理进入某个不可变标准版本。
+本目录保存从 2026-09-03 产品梳理开始已接受的 22 项决策。`Accepted` 表示 Deislet 的产品与实现方向已经确定；涉及应用标准的条款仍须经 Edge Canon 独立治理进入某个不可变标准版本。
 
 - 决策事实与问题来源：[阶段分析](../product/phase-analysis-2026-09-03.zh.md)
 - 可执行工程路线：[产品级路线](../product/roadmap.zh.md)
-- 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/proposals/0001-unified-platform-contract/README.zh.md)
-- 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/standard/contract.json)
-- 上游逐条要求：[standard/requirements.json](https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/standard/requirements.json)
-- 上游测试入口：[conformance/kit.json](https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/conformance/kit.json)
-- 上游证据 registry：[conformance/registry.json](https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/conformance/registry.json)
+- 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/proposals/0001-unified-platform-contract/README.zh.md)
+- 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/contract.json)
+- 上游逐条要求：[standard/requirements.json](https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/requirements.json)
+- 上游测试入口：[conformance/kit.json](https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/conformance/kit.json)
+- 上游证据 registry：[conformance/registry.json](https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/conformance/registry.json)
 
 | ADR | 决策 | 状态 |
 |---|---|---|
@@ -16,7 +16,7 @@
 | [002](002-node-compatibility.md) | 版本化 Node/npm 兼容集合 | Accepted |
 | [003](003-ssr-isr.md) | 框架无关 SSR/ISR | Accepted |
 | [004](004-standard-governance.md) | 独立公开治理与发布 | Accepted |
-| [005](005-portable-guarantees.md) | 统一语义与资源保证下限 | Accepted |
+| [005](005-portable-guarantees.md) | 统一语义与资源保证下限 | Accepted；套餐基线部分由 ADR-022 取代 |
 | [006](006-provider-deployment-drivers.md) | 统一部署契约与 provider drivers | Accepted |
 | [007](007-initial-conformant-backends.md) | 首批一等后端 | Accepted |
 | [008](008-logical-resource-bindings.md) | 逻辑资源与环境绑定 | Accepted |
@@ -33,5 +33,6 @@
 | [019](019-coordinated-data-lifecycle.md) | 协调式数据生命周期 | Accepted |
 | [020](020-reference-vendor-intersection.md) | 参考供应商主流语义交集 | Accepted |
 | [021](021-conformance-evidence-and-certification.md) | 证据成熟度与合规认证 | Accepted |
+| [022](022-entry-plan-resource-baseline.md) | 最低免费或入门档共同资源基线 | Accepted；局部取代 ADR-005 |
 
 ADR 不原地改写已接受决策。方向改变时新增 superseding ADR，并在旧记录与索引中建立双向链接。

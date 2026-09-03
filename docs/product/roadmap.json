@@ -22,7 +22,7 @@
       "status": "active",
       "dependsOn": [],
       "exitCriteria": [
-        "21 份 Accepted ADR 在仓库内可追溯且无临时路径",
+        "22 份 Accepted ADR 在仓库内可追溯且无临时路径",
         "Edge Canon proposal、机器契约、schema 与 registry 经 CI 校验",
         "目标版本所有能力族的 API、错误、一致性、生命周期、保证、fixture 与 oracle 均达到 normative-complete",
         "compiler 只依据标准版本验证，不读取 provider capability profile",
@@ -32,7 +32,7 @@
       "workItems": [
         {
           "id": "P0-DEC-001",
-          "title": "迁移阶段分析并建立 21 份正式 ADR",
+          "title": "迁移阶段分析并建立 22 份正式 ADR",
           "owner": "deislet",
           "status": "done",
           "dependsOn": [],
@@ -49,8 +49,8 @@
           "status": "done",
           "dependsOn": ["P0-DEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/proposals/0001-unified-platform-contract/README.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/standard/contract.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/proposals/0001-unified-platform-contract/README.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/contract.json"}
           ],
           "verification": "在 Edge Canon commit 2df06b2 运行 python3 scripts/check-governance.py"
         },
@@ -61,8 +61,8 @@
           "status": "done",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/conformance/registry.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/schemas/conformance-registry.schema.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/conformance/registry.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/schemas/conformance-registry.schema.json"}
           ],
           "verification": "registry 中 proposal 不能 compliant，supported 必须蕴含 compliant"
         },
@@ -87,12 +87,12 @@
           "status": "active",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/standard/requirements.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/standard/requirements/web-fetch-events.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/conformance/kit.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/requirements.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/requirements/web-fetch-events.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/conformance/kit.json"}
           ],
-          "verification": "contract.json 的 15 个 definitionStatus 全部为 normative-complete"
+          "verification": "contract.json 强制最低免费/入门档共同资源基线，且 15 个 definitionStatus 全部为 normative-complete"
         },
         {
           "id": "P0-EVID-001",

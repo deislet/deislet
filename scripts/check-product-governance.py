@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_ADRS = list(range(1, 22))
+EXPECTED_ADRS = list(range(1, 23))
 EXPECTED_PHASES = [f"phase-{number}" for number in range(6)]
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 WORK_ID = re.compile(r"^P([0-5])-[A-Z]+-[0-9]{3}$")
@@ -46,7 +46,7 @@ def validate_adrs() -> None:
     adr_dir = ROOT / "docs/adr"
     files = sorted(adr_dir.glob("[0-9][0-9][0-9]-*.md"))
     numbers = [int(path.name[:3]) for path in files]
-    require(numbers == EXPECTED_ADRS, f"ADR set must be exactly 001..021, got {numbers}")
+    require(numbers == EXPECTED_ADRS, f"ADR set must be exactly 001..022, got {numbers}")
 
     for path, number in zip(files, EXPECTED_ADRS, strict=True):
         text = path.read_text(encoding="utf-8")
@@ -63,6 +63,10 @@ def validate_adrs() -> None:
     index = read_text("docs/adr/README.md")
     for number in EXPECTED_ADRS:
         require(f"| [{number:03d}](" in index, f"ADR index is missing {number:03d}")
+    adr_005 = read_text("docs/adr/005-portable-guarantees.md")
+    adr_022 = read_text("docs/adr/022-entry-plan-resource-baseline.md")
+    require("ADR-022" in adr_005, "ADR-005 must point at its superseding resource baseline decision")
+    require("ADR-005" in adr_022, "ADR-022 must point back at the decision it partially supersedes")
 
     analysis = read_text("docs/product/phase-analysis-2026-09-03.zh.md")
     require("/tmp/" not in analysis, "phase analysis still references /tmp")
@@ -81,6 +85,24 @@ def validate_standard_lock() -> str:
     require(standard.get("normativeRelease") is False, "proposal cannot be normative")
     require(standard.get("capabilityModel") == "single-standard", "only the single standard model is valid")
     require(standard.get("profiles") == [], "standard lock must not contain profiles")
+    resource_guarantees = standard.get("resourceGuarantees", {})
+    require(
+        resource_guarantees.get("referencePlanBaseline")
+        == "lowest-generally-available-free-or-entry-plan",
+        "standard lock must pin the lowest free/entry plan resource baseline",
+    )
+    require(
+        resource_guarantees.get("allReferenceVendorsMustMeetBaseline") is True,
+        "standard lock must require every reference vendor to meet the baseline",
+    )
+    require(
+        resource_guarantees.get("unknownPublicGuarantee") == "release-blocker",
+        "unknown public resource guarantees must block standard release",
+    )
+    require(
+        resource_guarantees.get("higherPlanCapacityIsPortable") is False,
+        "higher provider plan capacity must not be portable",
+    )
     expected_sources = {
         "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
         "contractPath": "standard/contract.json",
@@ -231,7 +253,7 @@ def main() -> int:
         return 1
 
     print(
-        "product governance validation passed: 21 ADRs, 6 roadmap phases, "
+        f"product governance validation passed: {len(EXPECTED_ADRS)} ADRs, 6 roadmap phases, "
         f"Edge Canon {commit[:7]} locked, no temporary paths"
     )
     return 0

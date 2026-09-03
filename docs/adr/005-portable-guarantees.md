@@ -1,10 +1,12 @@
 # ADR-005：统一语义与版本化资源保证下限
 
-- 状态：Accepted
+- 状态：Accepted（套餐基线与认证粒度部分由 [ADR-022](022-entry-plan-resource-baseline.md) 取代）
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-004
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/2df06b2c929b2a48728e40583e3f74f097938753/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/proposals/0001-unified-platform-contract/README.zh.md)
+
+> 历史说明：本文关于“不是当前最弱免费套餐的机械交集”、允许特定付费等级取得认证，以及“免费层不必天然合规”的结论，已被产品负责人后续选择取代。资源分类、计量、应用预算、超限语义、测试方法及更强后端能力不进入可移植契约等其余结论继续有效。当前规则以 ADR-022 为准。
 
 ## 背景
 

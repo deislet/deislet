@@ -1074,13 +1074,33 @@ Application/framework source + versioned build plan
 
 详细 ADR 草案：`../adr/021-conformance-evidence-and-certification.md`。
 
+### DEC-021：最低资源保证采用哪个套餐基线
+
+- A：允许每个 Edge Canon 版本声明各供应商达到合规所需的最低套餐/配置，并由 provider preflight 强制。
+- B：标准保证始终受所有参考供应商最低公开免费档或入门档的共同可实现能力约束；更高套餐只提供非可移植的运营余量。
+- 用户决定：**B**。
+- 对齐日期：2026-09-03。
+- 对齐状态：**已确认**。
+- 决定理由：同一标准应在参考供应商默认可获得的入门形态上成立；若依赖某家更高付费配置，统一抽象仍把关键可部署性差异转嫁给应用和用户。
+
+形成的约束：
+
+1. 供应商有一般可注册免费档时采用免费档；没有免费档时采用一般可购买的最低入门档。Private preview、企业特批和临时促销不进入基线。
+2. 每项标准保证取所有参考供应商该档位共同可持续兑现、且三个一等后端通过边界与故障测试的下限。
+3. 某家没有公开可依赖保证时，该维度保持 `pending` 并阻断发布；不把未说明解释为无限或零，也不以短期实测和其他平台上限代填。
+4. 更高套餐容量只进入 control/deploy/status 的运营信息，不进入应用 Context、canonical artifact、conformance fixture 或 provider profile。
+5. 若 10 ms CPU 等共同下限不足以支撑 SSR/ISR 等候选能力，应优化/重构语义、等待行业能力演进或阻断该版本发布，不能改用目标相关套餐和 capability detect。
+6. 此决策局部取代 ADR-005 允许付费档作为 provider 合规前提的结论；ADR-005 的计量、超限、预算和测试规则继续有效。
+
+正式 ADR：`../adr/022-entry-plan-resource-baseline.md`。Edge Canon 机器契约从 commit `336f388466bf958ec1a6c4b50ba5cd2990ad78e0` 起强制该策略。
+
 ## 7. 确认后的推进阶段及退出条件
 
 各阶段是工程推进顺序，不是较弱的合规等级。除非指定完整 Edge Canon 版本达到 DEC-020 的 `conformance-passed`，任何中间阶段都不能对外宣称该后端合规。
 
 ### 阶段 0：冻结事实基线与标准治理入口
 
-- 把 21 条确认决策记录（DEC-001 至 DEC-020，含 DEC-002B）转为仓库内正式 ADR/roadmap，并与 Edge Canon 独立仓库建立 proposal 链接。
+- 把 22 条确认决策记录（DEC-001 至 DEC-021，含 DEC-002B）转为仓库内正式 ADR/roadmap，并与 Edge Canon 独立仓库建立 proposal 链接。
 - 冻结首个目标 Edge Canon version 的 normative API、errors、consistency、lifecycle、guarantees、schema 与 compatibility policy。
 - 建立 reference-vendor evidence registry、完整 conformance kit、签名 certification record schema。
 - 把手工 `PlatformCapabilities`/comparison claims 拆为 normative registry、vendor evidence 和 backend implementation status。
@@ -1182,7 +1202,7 @@ Application/framework source + versioned build plan
 ## 10. 文档状态
 
 - 本文由临时工作文档原样迁入仓库，作为 2026-09-03 的事实与决策审计记录，不直接替代规范或当前实现文档。
-- DEC-001 至 DEC-020（含 DEC-002B，共 21 条记录）已全部完成产品对齐，并迁入 [`docs/adr`](../adr/README.md) 成为正式 ADR。
+- DEC-001 至 DEC-021（含 DEC-002B，共 22 条记录）已全部完成产品对齐，并迁入 [`docs/adr`](../adr/README.md) 成为正式 ADR。
 - 本文中的早期选项和当时现状保留用于审计；后续状态与实施顺序以[机器可读路线](roadmap.json)及其[人类可读视图](roadmap.zh.md)为准。
 - 应用规范由独立 Edge Canon 仓库治理；本仓库通过 [`standards/edge-canon.lock.json`](../../standards/edge-canon.lock.json) 锁定 proposal、契约和 registry 的精确来源。
 
@@ -1198,8 +1218,8 @@ Application/framework source + versioned build plan
 - Edge Canon 已新增 15 个 mandatory 能力族 × 8 个固定语义维度的机器可读需求注册表，以及一一对应的 conformance kit 索引。校验器要求契约、逐条要求、suite 状态、用例覆盖和发布阶段相互一致，不能只改一处状态制造“完成”外观。
 - `web-fetch-events` 基于 Cloudflare Workers/Pages、Tencent EdgeOne Makers/经典 FetchEvent 和 WHATWG Fetch 的官方材料形成首版候选文本。应用 ABI 只有一个默认导出的 `RequestHandler(context)`；Cloudflare 对象式 `fetch`、Pages 具名 `onRequest`、EdgeOne 默认函数和经典 `FetchEvent` 均由 provider adapter 映射，不成为应用 profile。
 - 当前登记 20 条稳定候选条款，覆盖 API、错误、并发、生命周期、安全、失败恢复和升级；11 个 provider-independent 草案用例覆盖全部已定义条款。这里的“稳定”仅指条款标识可供评审和测试引用，不表示语义已经成为不可变标准。
-- 最低资源保证仍为 `pending`。CPU、wall time、流大小、内存、子请求、并发和 `waitUntil` 宽限期必须从参考平台可持续兑现的公开保证中求得标准下限，不能把某个套餐的当前上限直接写进标准。
-- 公开资源证据进一步显示：Cloudflare 入门套餐单次 HTTP CPU 为 10 ms，而 EdgeOne Makers Edge Functions 为 200 ms；两者都公布 128 MB 运行内存，EdgeOne 请求 body 上限为 1 MB。EdgeOne 当前公开材料没有给出响应 body、HTTP wall time、`waitUntil` 宽限和子请求的可依赖保证。标准必须先决定以所有最低入门套餐为基线，还是允许版本化声明各供应商最低套餐/配置；这是影响 SSR 可用性、部署成本和 preflight 行为的产品决策，暂不代填。
+- 最低资源保证的套餐基线已经由 DEC-021 固定为所有参考供应商最低公开免费档或入门档的共同保证；具体维度仍为 `pending`。CPU、wall time、流大小、内存、子请求、并发和 `waitUntil` 宽限期必须从参考平台可持续兑现的公开保证中求得标准下限，不能把更高套餐的当前上限直接写进标准。
+- 公开资源证据进一步显示：Cloudflare 最低免费档单次 HTTP CPU 为 10 ms，而 EdgeOne Makers Edge Functions 为 200 ms；两者都公布 128 MB 运行内存，EdgeOne 请求 body 上限为 1 MB。依据 DEC-021，CPU 候选共同下限不高于 10 ms。EdgeOne 当前公开材料没有给出响应 body、HTTP wall time、`waitUntil` 宽限和子请求的可依赖保证，这些空白继续阻断规范；不能因套餐基线已决定就代填数值或宣称维度完成。
 - `web-platform-apis`、`environment-secrets`、`logical-resource-bindings` 和 canonical artifact 仍是未完成依赖；错误响应、断连行为及生命周期边界也需要两个独立实现的反馈和三个一等后端真实部署验证。
 - conformance harness 仍为 `planned`，其余 14 个能力族仍为 `pending`。因此 `edge-canon.next` 继续处于 proposal，registry 中所有后端继续为 `compliant=false`、`supported=false`，不得把草案用例或 artifact 生成解读成支持证明。
 
