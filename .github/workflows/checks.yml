@@ -46,6 +46,17 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
+  product-governance:
+    name: product decisions, standard lock and roadmap agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate product governance records
+        run: python3 scripts/check-product-governance.py
+
   document-path-literals:
     name: documents reference the path constants
     runs-on: ubuntu-latest

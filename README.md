@@ -8,6 +8,12 @@ The execution engine is Deno — `deno_core`, embedded, one V8 isolate per
 running application. The specification an application is written against is
 [Edge Canon](https://github.com/deislet/edge-canon).
 
+> **Product evolution:** the current code and demo implement the v0.1-era
+> contract described below. The next contract is a single capability set with
+> no provider profiles and is still a proposal; no backend is certified against
+> it yet. See the [product contract entry](docs/product/README.md),
+> [accepted ADRs](docs/adr/README.md), and [executable roadmap](docs/product/roadmap.zh.md).
+
 ```
 deis deploy ──► bundle.zip ──► control plane stores it as an immutable version
                                    │

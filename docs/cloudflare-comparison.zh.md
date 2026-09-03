@@ -1,5 +1,9 @@
 # 功能性评审：Deislet 对照 Cloudflare Workers / Pages
 
+> **文档边界（2026-09-03）：** 本文是基于旧提交的功能审查快照，不是跨后端
+> 合规矩阵。`edge-canon.next` 的证据成熟度与认证只能由独立 Edge Canon
+> conformance registry 给出；当前入口见 [`docs/product/README.md`](product/README.md)。
+
 日期：2026-08-31。对照的代码是 `3753cb2`。
 
 这份评审第一次写出来时对照的是 `fea1ab8`。之后四个提交改动了它的结论，全文按新代码逐条重核过：

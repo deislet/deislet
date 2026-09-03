@@ -1,5 +1,10 @@
 # Deislet 系统设计
 
+> **文档边界（2026-09-03）：** 本文解释当前 v0.4 实现。下一代统一标准和产品化
+> 架构由 [`docs/product/README.md`](product/README.md)、
+> [`docs/adr/README.md`](adr/README.md) 与 [`docs/product/roadmap.zh.md`](product/roadmap.zh.md)
+> 管理；本文中与新 ADR 冲突的部分是待迁移现状，不是另一套长期标准。
+
 > v0.4 · 2026-08-29
 > 定位：**mini 版 Cloudflare Workers + Pages，执行引擎换成 Deno（deno_core）**，面向自己/团队内部使用。
 > 配套 [`implementation-plan.zh.md`](implementation-plan.zh.md)：那份讲「照着写什么」，这份讲「为什么这么分」。

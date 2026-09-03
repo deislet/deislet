@@ -1,0 +1,382 @@
+{
+  "$schema": "roadmap.schema.json",
+  "schemaVersion": 1,
+  "roadmapId": "deislet-productization-2026-09",
+  "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
+  "status": "active",
+  "updatedAt": "2026-09-03T17:02:29+08:00",
+  "authorities": {
+    "decisionIndex": "docs/adr/README.md",
+    "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
+    "standardLock": "standards/edge-canon.lock.json"
+  },
+  "nextActions": [
+    "P0-SPEC-002",
+    "P0-EVID-001",
+    "P0-MODEL-001"
+  ],
+  "phases": [
+    {
+      "id": "phase-0",
+      "title": "事实基线、标准治理与共享契约",
+      "status": "active",
+      "dependsOn": [],
+      "exitCriteria": [
+        "21 份 Accepted ADR 在仓库内可追溯且无临时路径",
+        "Edge Canon proposal、机器契约、schema 与 registry 经 CI 校验",
+        "目标版本所有能力族的 API、错误、一致性、生命周期、保证、fixture 与 oracle 均达到 normative-complete",
+        "compiler 只依据标准版本验证，不读取 provider capability profile",
+        "README、CLI 和矩阵只从 registry 派生支持状态",
+        "canonical identity、operation、artifact、binding 与 provider driver 共享模型及迁移方案可执行"
+      ],
+      "workItems": [
+        {
+          "id": "P0-DEC-001",
+          "title": "迁移阶段分析并建立 21 份正式 ADR",
+          "owner": "deislet",
+          "status": "done",
+          "dependsOn": [],
+          "outputs": [
+            {"type": "local-path", "value": "docs/adr/README.md"},
+            {"type": "local-path", "value": "docs/product/phase-analysis-2026-09-03.zh.md"}
+          ],
+          "verification": "python3 scripts/check-product-governance.py"
+        },
+        {
+          "id": "P0-SPEC-001",
+          "title": "建立 Edge Canon next 统一标准 proposal 与机器契约",
+          "owner": "edge-canon",
+          "status": "done",
+          "dependsOn": ["P0-DEC-001"],
+          "outputs": [
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/proposals/0001-unified-platform-contract/README.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/standard/contract.json"}
+          ],
+          "verification": "在 Edge Canon commit 6599515 运行 python3 scripts/check-governance.py"
+        },
+        {
+          "id": "P0-CONF-001",
+          "title": "建立 conformance registry、认证状态约束与 schema",
+          "owner": "edge-canon",
+          "status": "done",
+          "dependsOn": ["P0-SPEC-001"],
+          "outputs": [
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/conformance/registry.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/65995156e4ce4dcf3c87e12f4171b254a34a020e/schemas/conformance-registry.schema.json"}
+          ],
+          "verification": "registry 中 proposal 不能 compliant，supported 必须蕴含 compliant"
+        },
+        {
+          "id": "P0-ROAD-001",
+          "title": "建立机器可读路线、标准锁定与 CI 门禁",
+          "owner": "deislet",
+          "status": "done",
+          "dependsOn": ["P0-SPEC-001", "P0-CONF-001"],
+          "outputs": [
+            {"type": "local-path", "value": "docs/product/roadmap.json"},
+            {"type": "local-path", "value": "docs/product/roadmap.schema.json"},
+            {"type": "local-path", "value": "standards/edge-canon.lock.json"},
+            {"type": "local-path", "value": "scripts/check-product-governance.py"}
+          ],
+          "verification": "python3 scripts/check-product-governance.py"
+        },
+        {
+          "id": "P0-SPEC-002",
+          "title": "逐能力族冻结 normative 语义、fixture 与 oracle",
+          "owner": "edge-canon",
+          "status": "active",
+          "dependsOn": ["P0-SPEC-001"],
+          "outputs": [
+            {"type": "planned-path", "value": "Edge Canon normative sections, fixtures and conformance kit"}
+          ],
+          "verification": "contract.json 的 15 个 definitionStatus 全部为 normative-complete"
+        },
+        {
+          "id": "P0-EVID-001",
+          "title": "把能力矩阵和支持文案迁移为 registry 派生视图",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P0-CONF-001"],
+          "outputs": [
+            {"type": "planned-path", "value": "generated README/CLI/Web target status views"}
+          ],
+          "verification": "仓库不再以 adapter 存在或 artifact 生成表示合规支持"
+        },
+        {
+          "id": "P0-MODEL-001",
+          "title": "定义 canonical ID、operation、artifact、binding 与 driver 共享模型及迁移计划",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P0-SPEC-001"],
+          "outputs": [
+            {"type": "planned-path", "value": "versioned shared schemas and migration fixtures"}
+          ],
+          "verification": "旧 name-based identity 与 provider-specific config 均有无停机迁移测试"
+        }
+      ]
+    },
+    {
+      "id": "phase-1",
+      "title": "统一构建、开发、预览与部署骨架",
+      "status": "queued",
+      "dependsOn": ["phase-0"],
+      "exitCriteria": [
+        "同一源码产生一个可验证 canonical digest，所有派生产物可追溯",
+        "Deislet、Cloudflare 与 EdgeOne test account 至少达到 deployed，但仍明确非合规",
+        "CLI/compiler/local dev 在 Linux、macOS、Windows 可重复运行"
+      ],
+      "workItems": [
+        {
+          "id": "P1-BUILD-001",
+          "title": "实现 source/framework adapter 到 canonical artifact 的统一构建链",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P0-MODEL-001", "P0-SPEC-002"],
+          "outputs": [{"type": "planned-path", "value": "canonical artifact crates, schemas and fixtures"}],
+          "verification": "跨三平台重复构建 digest 一致且 provenance 可验证"
+        },
+        {
+          "id": "P1-DEPLOY-001",
+          "title": "实现统一 provider driver API 与 CLI 生命周期",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P1-BUILD-001"],
+          "outputs": [{"type": "planned-path", "value": "prepare/verify/activate/status/rollback driver API"}],
+          "verification": "官方 vendor CLI/API 版本固定，错误和 operation 状态统一"
+        },
+        {
+          "id": "P1-PREVIEW-001",
+          "title": "实现不可变 version URL、环境/分支别名及安全 preview",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P1-DEPLOY-001"],
+          "outputs": [{"type": "planned-path", "value": "preview identity, auth and resource isolation"}],
+          "verification": "promote 复用精确 artifact，version URL 永不移动"
+        },
+        {
+          "id": "P1-PLAT-001",
+          "title": "建立 Linux/macOS/Windows 开发工具 CI 与实机 determinism",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P1-BUILD-001"],
+          "outputs": [{"type": "planned-path", "value": "cross-platform CI and s17/s67/s69 evidence"}],
+          "verification": "相同 fixture 在三种 OS 产生同一 canonical digest"
+        }
+      ]
+    },
+    {
+      "id": "phase-2",
+      "title": "完整统一运行与应用语义",
+      "status": "queued",
+      "dependsOn": ["phase-1"],
+      "exitCriteria": [
+        "三个首批后端实现全部应用层 mandatory semantics",
+        "同一 black-box suite 在三个后端全绿且应用无 target-specific branch",
+        "任何无法实现的能力阻断标准发布或后端认证，不形成 profile"
+      ],
+      "workItems": [
+        {
+          "id": "P2-WEB-001",
+          "title": "统一 HTTP、路由、资产、stream、WebSocket 与后台任务语义",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P1-BUILD-001", "P0-SPEC-002"],
+          "outputs": [{"type": "planned-path", "value": "web event black-box conformance suites"}],
+          "verification": "行为、错误、取消、backpressure 与 deadline suites 全绿"
+        },
+        {
+          "id": "P2-NODE-001",
+          "title": "实现 Node 24 LTS 版本化 subset 与 npm 构建解析",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P1-BUILD-001", "P0-SPEC-002"],
+          "outputs": [{"type": "planned-path", "value": "Node subset manifest and compatibility tests"}],
+          "verification": "仅标准清单 API 可用，缺失项在构建前给出规范错误"
+        },
+        {
+          "id": "P2-SSR-001",
+          "title": "实现框架无关 SSR/streaming SSR/ISR 与官方框架适配器",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P2-WEB-001", "P2-NODE-001"],
+          "outputs": [{"type": "planned-path", "value": "SSR/ISR contract and Next/Nuxt/SvelteKit adapters"}],
+          "verification": "revalidation、single-flight、invalidation 和失败恢复跨后端一致"
+        },
+        {
+          "id": "P2-DATA-001",
+          "title": "统一 env/secrets/KV/cache/SQL/blob/queue/cron/service binding",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P0-MODEL-001", "P1-DEPLOY-001"],
+          "outputs": [{"type": "planned-path", "value": "resource semantic and lifecycle suites"}],
+          "verification": "API、错误、一致性、限制与生命周期 mandatory suites 全绿"
+        },
+        {
+          "id": "P2-STATE-001",
+          "title": "实现 Stateful Object identity、ownership、storage 与迁移",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P2-DATA-001"],
+          "outputs": [{"type": "planned-path", "value": "native/composed/companion implementations and failure suites"}],
+          "verification": "owner、fencing、alarm、RPC、WebSocket 与 migration suites 全绿"
+        }
+      ]
+    },
+    {
+      "id": "phase-3",
+      "title": "自建后端生产化、安全与高可用",
+      "status": "queued",
+      "dependsOn": ["phase-2"],
+      "exitCriteria": [
+        "故障注入下发布、ownership 和回滚状态准确",
+        "安全、容量、备份恢复与 RPO/RTO 有自动证据",
+        "production readiness 对缺失前置条件 fail closed"
+      ],
+      "workItems": [
+        {
+          "id": "P3-RUNTIME-001",
+          "title": "实现 isolate pool、同 isolate 多 in-flight 与实际队列并发",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P2-WEB-001"],
+          "outputs": [{"type": "planned-path", "value": "runtime scheduler and isolation tests"}],
+          "verification": "慢 I/O、stream 与 queue 压测下无跨 invocation 状态污染"
+        },
+        {
+          "id": "P3-ROLL-001",
+          "title": "实现严格/渐进发布、亲和、drain 与可证明回滚",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P1-DEPLOY-001", "P3-RUNTIME-001"],
+          "outputs": [{"type": "planned-path", "value": "cluster deployment state machine"}],
+          "verification": "节点/网络故障下 control 状态与实际流量版本一致"
+        },
+        {
+          "id": "P3-SEC-001",
+          "title": "实现默认安全 production、per-node identity 与短期 capability",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P0-MODEL-001"],
+          "outputs": [{"type": "planned-path", "value": "mTLS, RBAC, envelope secrets and security gates"}],
+          "verification": "非 dev 配置缺少认证/密钥/隔离条件时拒绝启动"
+        },
+        {
+          "id": "P3-HA-001",
+          "title": "实现 embedded 与 production HA 持久层、备份恢复和迁移",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P2-DATA-001", "P2-STATE-001"],
+          "outputs": [{"type": "planned-path", "value": "PostgreSQL/S3-compatible reference topology"}],
+          "verification": "单节点/存储/网络故障满足声明的 RPO/RTO"
+        },
+        {
+          "id": "P3-OBS-001",
+          "title": "实现内置遥测、OTLP/Prometheus、配额与关联",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P3-HA-001"],
+          "outputs": [{"type": "planned-path", "value": "telemetry ingest/query/export workers"}],
+          "verification": "高基数、背压和 exporter 故障不拖垮请求路径"
+        }
+      ]
+    },
+    {
+      "id": "phase-4",
+      "title": "完整产品生命周期与控制台",
+      "status": "queued",
+      "dependsOn": ["phase-3"],
+      "exitCriteria": [
+        "创建到部署、观测、回滚、导出、删除、恢复、清除由同一 API 通过 CLI/Web 完成",
+        "长操作的断点、重试、权限和审计一致",
+        "所有数据类别有 retention、export、restore 与 purge 路径"
+      ],
+      "workItems": [
+        {
+          "id": "P4-API-001",
+          "title": "稳定 versioned Control API、错误、operation 与 OpenAPI",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P3-ROLL-001", "P3-SEC-001"],
+          "outputs": [{"type": "planned-path", "value": "versioned OpenAPI and generated clients"}],
+          "verification": "CLI JSON 和 Web 只调用同一公开 API/state machine"
+        },
+        {
+          "id": "P4-WEB-001",
+          "title": "完成应用级 Web 控制台与三层 RBAC",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P4-API-001", "P3-OBS-001"],
+          "outputs": [{"type": "planned-path", "value": "organization/application/environment console"}],
+          "verification": "Web 无 API/CLI 不可调用的隐藏业务操作"
+        },
+        {
+          "id": "P4-GIT-001",
+          "title": "实现 Git/Webhook build、审批、domain、resource 与 trigger 管理",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P4-API-001", "P1-PREVIEW-001"],
+          "outputs": [{"type": "planned-path", "value": "integrated application delivery workflow"}],
+          "verification": "Git 到 preview/promote 的 artifact identity 全程一致"
+        },
+        {
+          "id": "P4-LIFE-001",
+          "title": "实现软删除、导出、恢复与跨 provider purge coordinator",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P4-API-001", "P3-HA-001"],
+          "outputs": [{"type": "planned-path", "value": "data lifecycle coordinator and residual report"}],
+          "verification": "失败可重试且不可清除的 provider/backup residual 明确报告"
+        }
+      ]
+    },
+    {
+      "id": "phase-5",
+      "title": "三后端完整认证与产品 GA",
+      "status": "queued",
+      "dependsOn": ["phase-4"],
+      "exitCriteria": [
+        "三个首批后端均有未过期 conformance-passed 记录",
+        "mandatory suites 无 skip、quarantine 或语义 waiver",
+        "实现处于维护和安全支持窗口，部署与清理无未报告残留"
+      ],
+      "workItems": [
+        {
+          "id": "P5-KIT-001",
+          "title": "冻结完整标准版本与 conformance kit",
+          "owner": "edge-canon",
+          "status": "queued",
+          "dependsOn": ["P2-STATE-001", "P4-LIFE-001"],
+          "outputs": [{"type": "planned-path", "value": "immutable standard and signed test kit release"}],
+          "verification": "normative sections 与 tests/fixtures/oracles 双向链接"
+        },
+        {
+          "id": "P5-CERT-001",
+          "title": "在精确 plan/region/config 上认证三个首批后端",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P5-KIT-001", "P3-HA-001"],
+          "outputs": [{"type": "planned-path", "value": "signed Cloudflare, EdgeOne and Deislet certification records"}],
+          "verification": "registry 三个 first-class backend 均 valid、compliant、未过期"
+        },
+        {
+          "id": "P5-CANARY-001",
+          "title": "建立持续 canary、自动 stale/revoke 与部署 preflight",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P5-CERT-001"],
+          "outputs": [{"type": "planned-path", "value": "nightly evidence and provider change monitoring"}],
+          "verification": "provider/runtime/driver 变化自动使旧认证待复验"
+        },
+        {
+          "id": "P5-GA-001",
+          "title": "通过产品 GA 门槛并发布正式支持声明",
+          "owner": "joint",
+          "status": "queued",
+          "dependsOn": ["P5-CANARY-001", "P4-WEB-001"],
+          "outputs": [{"type": "planned-path", "value": "registry-derived GA release and support pages"}],
+          "verification": "支持声明只由未过期 valid certification 与维护状态派生"
+        }
+      ]
+    }
+  ]
+}

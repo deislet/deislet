@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/docs/product/roadmap.schema.json",
+  "title": "Deislet product roadmap",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "roadmapId", "goal", "status", "updatedAt", "authorities", "nextActions", "phases"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": 1},
+    "roadmapId": {"type": "string", "minLength": 1},
+    "goal": {"type": "string", "minLength": 1},
+    "status": {"enum": ["active", "paused", "complete"]},
+    "updatedAt": {"type": "string", "format": "date-time"},
+    "authorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decisionIndex", "phaseAnalysis", "standardLock"],
+      "properties": {
+        "decisionIndex": {"type": "string", "minLength": 1},
+        "phaseAnalysis": {"type": "string", "minLength": 1},
+        "standardLock": {"type": "string", "minLength": 1}
+      }
+    },
+    "nextActions": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^P[0-5]-[A-Z]+-[0-9]{3}$"}
+    },
+    "phases": {
+      "type": "array", "minItems": 6, "maxItems": 6,
+      "items": {"$ref": "#/$defs/phase"}
+    }
+  },
+  "$defs": {
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "status", "dependsOn", "exitCriteria", "workItems"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^phase-[0-5]$"},
+        "title": {"type": "string", "minLength": 1},
+        "status": {"enum": ["queued", "active", "blocked", "complete"]},
+        "dependsOn": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^phase-[0-5]$"}},
+        "exitCriteria": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "workItems": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/workItem"}}
+      }
+    },
+    "workItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "owner", "status", "dependsOn", "outputs", "verification"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^P[0-5]-[A-Z]+-[0-9]{3}$"},
+        "title": {"type": "string", "minLength": 1},
+        "owner": {"enum": ["edge-canon", "deislet", "joint"]},
+        "status": {"enum": ["queued", "active", "blocked", "done"]},
+        "dependsOn": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^P[0-5]-[A-Z]+-[0-9]{3}$"}},
+        "outputs": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["type", "value"],
+            "properties": {
+              "type": {"enum": ["local-path", "url", "planned-path"]},
+              "value": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "verification": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

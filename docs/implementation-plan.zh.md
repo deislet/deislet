@@ -1,5 +1,12 @@
 # Deislet 实现规格
 
+> **文档边界（2026-09-03）：** 本文是 v1.1 当前实现及旧契约的事实记录，不再是
+> 下一代产品方向的最高权威。统一标准、canonical artifact、逻辑资源、部署状态机和
+> 认证模型的迁移方向见 [`docs/product/README.md`](product/README.md)、
+> [`docs/adr/README.md`](adr/README.md) 与 [`docs/product/roadmap.zh.md`](product/roadmap.zh.md)。
+> 在迁移完成前，本文与新 ADR 的差异必须作为显式工作项处理，不能据此宣称
+> `edge-canon.next` 合规。
+
 > v1.1 · 2026-08-29
 > 配套 [`architecture.zh.md`](architecture.zh.md)。那份讲「为什么这么分」，这份讲「照着写什么」。
 > 多个实现者并行时，**以本文的数据模型、包格式、proto 契约为准**，不要各自发明。
