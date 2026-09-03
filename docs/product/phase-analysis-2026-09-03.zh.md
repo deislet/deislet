@@ -1198,5 +1198,6 @@ Application/framework source + versioned build plan
 - `web-fetch-events` 基于 Cloudflare Workers/Pages、Tencent EdgeOne Makers/经典 FetchEvent 和 WHATWG Fetch 的官方材料形成首版候选文本。应用 ABI 只有一个默认导出的 `RequestHandler(context)`；Cloudflare 对象式 `fetch`、Pages 具名 `onRequest`、EdgeOne 默认函数和经典 `FetchEvent` 均由 provider adapter 映射，不成为应用 profile。
 - 当前登记 20 条稳定候选条款，覆盖 API、错误、并发、生命周期、安全、失败恢复和升级；11 个 provider-independent 草案用例覆盖全部已定义条款。这里的“稳定”仅指条款标识可供评审和测试引用，不表示语义已经成为不可变标准。
 - 最低资源保证仍为 `pending`。CPU、wall time、流大小、内存、子请求、并发和 `waitUntil` 宽限期必须从参考平台可持续兑现的公开保证中求得标准下限，不能把某个套餐的当前上限直接写进标准。
+- 公开资源证据进一步显示：Cloudflare 入门套餐单次 HTTP CPU 为 10 ms，而 EdgeOne Makers Edge Functions 为 200 ms；两者都公布 128 MB 运行内存，EdgeOne 请求 body 上限为 1 MB。EdgeOne 当前公开材料没有给出响应 body、HTTP wall time、`waitUntil` 宽限和子请求的可依赖保证。标准必须先决定以所有最低入门套餐为基线，还是允许版本化声明各供应商最低套餐/配置；这是影响 SSR 可用性、部署成本和 preflight 行为的产品决策，暂不代填。
 - `web-platform-apis`、`environment-secrets`、`logical-resource-bindings` 和 canonical artifact 仍是未完成依赖；错误响应、断连行为及生命周期边界也需要两个独立实现的反馈和三个一等后端真实部署验证。
 - conformance harness 仍为 `planned`，其余 14 个能力族仍为 `pending`。因此 `edge-canon.next` 继续处于 proposal，registry 中所有后端继续为 `compliant=false`、`supported=false`，不得把草案用例或 artifact 生成解读成支持证明。
