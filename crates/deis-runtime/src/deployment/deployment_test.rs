@@ -216,6 +216,7 @@ fn order_for(
 ) -> DeploymentOrder {
     DeploymentOrder {
         app_id: key.app_id().to_string(),
+        canonical_tenant: None,
         version_id: version.to_string(),
         environment: key.environment().to_string(),
         bundle_url: url,

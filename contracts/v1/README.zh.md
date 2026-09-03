@@ -23,9 +23,11 @@
 
 ## 当前实现进度
 
-`deis-control` 已完成 identity 迁移的第一个可执行切片：`application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效/擦除，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
+`deis-control` 已完成 identity 迁移的前两个可执行切片。第一段让 `application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效/擦除，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
 
-该切片只完成 `allocate-canonical-ids` 的基础，不代表八阶段迁移完成：tenant/binding/capability 仍使用旧名称，尚未建立持久 migration operation、fence、dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone；旧主键仍是当前路由参数。列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+第二段新增共享 `deis-wire::CanonicalTenantId`，唯一逻辑拼写与本契约相同：`v1/<application UUIDv7>/<environment UUIDv7>`。Control 的 push 与 assignment list 现在同时发送两个 canonical ID；节点只允许“两者都缺失”的旧 Control 或“两者都有效”的新 Control，partial/UUIDv4/非规范拼写在 bundle 下载前失败关闭。节点把 identity 写入 installed record，已记录的 canonical tenant 不能被另一组合法 ID 重绑，旧 Control 的字段缺失也不能擦除它。Runtime placement/telemetry key 与 storage authority 已拆成两个输入，KV/SQL/blob 与 queue poller 共用后者，并有真实 store round-trip 测试证明两者不会混用。
+
+这些切片仍只完成 `allocate-canonical-ids` 与传输边界，不代表八阶段迁移完成。实际 storage namespace 与 HMAC token subject 仍是 `app.environment`，store/queue 仍拒绝 canonical tenant 字符串；binding 仍使用名称。运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位；installed record 写失败也尚无可恢复 product operation 接管。因此在持久 migration operation、inventory、revision/fence、dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 `storage_tenant` 切到 canonical key，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
 
 ## 六份机器契约
 

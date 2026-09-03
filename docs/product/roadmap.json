@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-03T21:34:19+08:00",
+  "updatedAt": "2026-09-04T00:24:27+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -116,10 +116,13 @@
             {"type": "local-path", "value": "contracts/v1/README.zh.md"},
             {"type": "local-path", "value": "scripts/check-shared-contracts.py"},
             {"type": "local-path", "value": "crates/deis-wire/src/canonical_id.rs"},
+            {"type": "local-path", "value": "crates/deis-wire/src/canonical_tenant.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/catalog/model.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"}
+            {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"},
+            {"type": "local-path", "value": "crates/deis-runtime/proto/management.proto"},
+            {"type": "local-path", "value": "crates/deis-runtime/src/deployment/store.rs"}
           ],
-          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-wire -p deis-control -p deis 已覆盖共享 UUIDv7 类型、新写入、旧库回填、幂等重启、旧 writer 兼容、非法数据库/API 值 fail closed；完成前仍须验证 canonical tenant/binding 双读、受 fencing 的 cutover、rollback/failure 与旧 capability 撤销"
+          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-wire -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment 传输、字段成对 fail closed、节点持久化、identity 不可重绑/擦除及 runtime placement/storage authority 分离；完成前仍须验证持久 migration operation、inventory、canonical tenant/binding 双读、受 fencing 的 copy/cutover、rollback/failure 与旧 capability 撤销"
         },
         {
           "id": "P0-CI-001",
@@ -130,7 +133,7 @@
           "outputs": [
             {"type": "local-path", "value": ".github/workflows/checks.yml"}
           ],
-          "verification": "python3 scripts/check-product-governance.py 固定 reviewed Node 24 majors；这些 revisions 的完整 checks run 成功且不再产生 Node 20 runtime annotation"
+          "verification": "python3 scripts/check-product-governance.py 固定 reviewed Node 24 majors；120 分钟 workspace ceiling 下完整 checks run 成功、workspace tests 非取消且不再产生 Node 20 runtime annotation"
         }
       ]
     },

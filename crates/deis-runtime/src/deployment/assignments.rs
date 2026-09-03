@@ -46,6 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use deis_wire::{CanonicalId, CanonicalTenantId, CanonicalTenantIdError};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
@@ -60,8 +61,14 @@ use crate::health::NodeHealth;
 #[derive(Clone, Deserialize)]
 pub struct Assignment {
     pub app_id: String,
+    /// Additive for a rolling upgrade. Both canonical fields must be present
+    /// together; an older control plane sends neither.
+    #[serde(default)]
+    pub canonical_application_id: Option<CanonicalId>,
     pub version_id: String,
     pub environment: String,
+    #[serde(default)]
+    pub canonical_environment_id: Option<CanonicalId>,
     pub bundle_url: String,
     pub bundle_sha: String,
     /// Variables, decrypted secrets and platform wiring, exactly as a push
@@ -104,8 +111,10 @@ impl std::fmt::Debug for Assignment {
         names.sort_unstable();
         f.debug_struct("Assignment")
             .field("app_id", &self.app_id)
+            .field("canonical_application_id", &self.canonical_application_id)
             .field("version_id", &self.version_id)
             .field("environment", &self.environment)
+            .field("canonical_environment_id", &self.canonical_environment_id)
             .field("bundle_url", &self.bundle_url)
             .field("bundle_sha", &self.bundle_sha)
             .field("env", &format_args!("{names:?} = <redacted>"))
@@ -116,7 +125,17 @@ impl std::fmt::Debug for Assignment {
 }
 
 impl Assignment {
-    fn into_order(self) -> DeploymentOrder {
+    fn into_order(self) -> Result<DeploymentOrder, CanonicalTenantIdError> {
+        let canonical_tenant = match (self.canonical_application_id, self.canonical_environment_id)
+        {
+            (Some(application), Some(environment)) => {
+                Some(CanonicalTenantId::new(application, environment))
+            }
+            (None, None) => None,
+            (None, Some(_)) => return Err(CanonicalTenantIdError::MissingApplicationId),
+            (Some(_), None) => return Err(CanonicalTenantIdError::MissingEnvironmentId),
+        };
+
         // Resolved here, per application, so that a declaration this build
         // cannot read costs only the cross-check in `install` and not the
         // whole list. Nothing is decided by dropping it: the order's copy
@@ -143,8 +162,9 @@ impl Assignment {
             }
         });
 
-        DeploymentOrder {
+        Ok(DeploymentOrder {
             app_id: self.app_id,
+            canonical_tenant,
             version_id: self.version_id,
             environment: self.environment,
             bundle_url: self.bundle_url,
@@ -152,7 +172,7 @@ impl Assignment {
             env: self.env,
             limits: self.limits,
             compatibility: resolved,
-        }
+        })
     }
 }
 
@@ -533,11 +553,21 @@ impl<'a> Reconciler<'a> {
             let app_id = assignment.app_id.clone();
             let environment = assignment.environment.clone();
             let version_id = assignment.version_id.clone();
-            match self
-                .deployer
-                .apply_from_assignment(assignment.into_order(), as_of)
-                .await
-            {
+            let order = match assignment.into_order() {
+                Ok(order) => order,
+                Err(error) => {
+                    outcome.failed += 1;
+                    error!(
+                        app_id = %app_id,
+                        environment = %environment,
+                        version_id = %version_id,
+                        error = %error,
+                        "Refusing an assignment with only half of its canonical identity; the running version, if any, is left untouched"
+                    );
+                    continue;
+                }
+            };
+            match self.deployer.apply_from_assignment(order, as_of).await {
                 Ok(Applied::Installed { reused_bundle }) => {
                     outcome.installed += 1;
                     info!(

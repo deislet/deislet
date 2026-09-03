@@ -27,15 +27,15 @@
 ## 当前进行中
 
 - `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 已形成 20 条候选条款和 11 个 provider-independent 草案用例。最低资源保证已固定采用所有参考供应商最低免费/入门档共同基线，但具体数值、计量和超限行为仍为 `pending`；执行 harness 仍为 `planned`，其余 14 个能力族尚未开始，故本项继续保持 `active`。
-- `P0-MODEL-001`：已建立 canonical identity、artifact、binding snapshot、operation、provider driver 和 identity migration 六份 Draft schema，配套 12 个正反 fixture 与可执行状态图校验。Rust/SQLite/API 已完成 application/environment/version/deployment 的增量 UUIDv7 分配、共享强类型验证、存量回填、唯一索引、非法 SQL 写入拒绝和旧 writer 兼容触发器；CLI 对旧 Control 保持字段缺省兼容，但拒绝伪 canonical ID。tenant/binding/capability、持久 migration operation 与受 fencing 的 cutover 尚未迁移，故本项继续保持 `active`。
-- `P0-CI-001`：已按 GitHub 官方 Node 24 版本迁移 checkout、setup-node、setup-python、cache 和 upload-artifact；等待完整 checks run 验证后才能标为 `complete`。
+- `P0-MODEL-001`：已建立 canonical identity、artifact、binding snapshot、operation、provider driver 和 identity migration 六份 Draft schema，配套 12 个正反 fixture 与可执行状态图校验。Rust/SQLite/API 已完成 application/environment/version/deployment 的增量 UUIDv7 分配、共享强类型验证、存量回填、唯一索引、非法 SQL 写入拒绝和旧 writer 兼容触发器；CLI 对旧 Control 保持字段缺省兼容，但拒绝伪 canonical ID。新增唯一语法的 `CanonicalTenantId`，Control push/assignment 已传输 canonical app/environment ID，节点成对 fail-closed 校验并持久化、拒绝 identity 重绑或旧 Control 擦除；runtime placement 与 storage authority 已分离，KV/SQL/blob/queue 统一从后者取身份。实际 namespace/token、binding、持久 migration operation 与受 fencing 的 cutover 尚未迁移，故本项继续保持 `active`。
+- `P0-CI-001`：已按 GitHub 官方 Node 24 版本迁移 checkout、setup-node、setup-python、cache 和 upload-artifact。`e80c29f` 的 workspace job 已通过 audit/format/clippy/build，但完整测试在运行中撞上原 60 分钟 job ceiling，被 runner 取消而非测试失败；现按实测把完整 workspace 上限调整为 120 分钟。仍须等待一轮完整 checks 成功且无 Node 20 annotation 才能标为 `complete`。
 
 ## 紧接着执行
 
 1. `P0-SPEC-002`：先完成 `web-fetch-events` 的最低资源保证、依赖类型和三后端可执行 harness，再按其闭环逐项完成其余 14 个 mandatory 能力族；`pending` 是发布阻断项。
-2. `P0-MODEL-001`：在已完成 ID 分配与旧库回填的基础上，实现完整 inventory 和 canonical tenant/binding 双读，随后验证受 fencing 的 copy/cutover、旧 token 撤销与 rollback。
+2. `P0-MODEL-001`：在已完成 ID 分配、旧库回填、canonical tenant 传输与 runtime 权限入口拆分的基础上，先实现持久 migration operation、完整 inventory 和 revision/fence，再启用 canonical tenant/binding 双读，随后验证 copy/cutover、旧 token 撤销与 rollback；fence 之前禁止切换写入或无约束双写。
 3. `P0-EVID-001`：删除手工维护的“支持”结论，让 README、CLI、Web 和矩阵从 registry 生成。
-4. `P0-CI-001`：观察 Node 24 action revisions 的首个完整 checks run，确认成功且不再产生 Node 20 runtime annotation 后关闭本项。
+4. `P0-CI-001`：观察 120 分钟上限与 Node 24 action revisions 的首个完整 checks run，确认 workspace tests 真正结束且不再产生 Node 20 runtime annotation 后关闭本项。
 
 ## 执行规则
 

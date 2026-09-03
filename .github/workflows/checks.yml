@@ -93,7 +93,12 @@ jobs:
   workspace:
     name: build, lint and test the workspace
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # A measured cold run reached Tests after 26 minutes and was still running
+    # when the former 60-minute job ceiling cancelled it. That produced no
+    # failing test, but also no complete evidence. Leave enough room for the
+    # full workspace on a cold hosted runner; a genuine hang still has this
+    # finite job-level bound.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 

@@ -74,16 +74,20 @@ pub use deis_wire::conventions::ASSIGNMENTS_WITHHELD_HEADER;
 #[derive(Debug, Serialize)]
 pub struct AssignmentView {
     pub app_id: String,
+    /// Permanent application identity used by the canonical tenant contract.
+    pub canonical_application_id: deis_wire::CanonicalId,
     pub version_id: String,
-    /// The environment *name*, `production` or a preview name. The
-    /// environment id stays inside the control plane: the node has no use
-    /// for it, and the runtime branches on the name.
+    /// The environment *name*, `production` or a preview name. Application
+    /// code and rolling-upgrade routing still branch on it; permanent storage
+    /// authority comes from the separate canonical id below.
     ///
     /// It is half of the identity of a running application: the node keys
     /// what it loads by `(app_id, environment)`, and builds its storage
     /// tenant from the same pair with `deis_wire::conventions::tenant_id`,
     /// so a preview cannot read or overwrite what production stored.
     pub environment: String,
+    /// Permanent environment identity used by the canonical tenant contract.
+    pub canonical_environment_id: deis_wire::CanonicalId,
     /// Absolute URL the node downloads the bundle from.
     pub bundle_url: String,
     /// Digest the node must verify after downloading.
@@ -161,29 +165,28 @@ pub async fn for_node(
         // this answer with the reason said out loud. The node then simply
         // does not run it, which is the same outcome a refused deployment
         // has, rather than running it with a hole in its environment.
-        let (env, limits, compatibility) = match state
-            .deliverer
-            .assignment_payload(assignment, &base)
-            .await
-        {
-            Ok(payload) => (
-                payload.env_for_wire(),
-                payload.limits.clone(),
-                payload.compatibility,
-            ),
-            Err(e) => {
-                error!(
-                    node = %node_id,
-                    app_id = %assignment.app_id,
-                    environment = %assignment.environment,
-                    version_id = %assignment.version_id,
-                    error = %e,
-                    "Could not build the environment for this assignment, so it is left out of the list; the list is marked incomplete so a node reconciling against it does not unload an application that is running fine, and this node will not start this application until the problem is fixed and it asks again"
-                );
-                withheld += 1;
-                continue;
-            }
-        };
+        let (env, limits, compatibility, canonical_application_id, canonical_environment_id) =
+            match state.deliverer.assignment_payload(assignment, &base).await {
+                Ok(payload) => (
+                    payload.env_for_wire(),
+                    payload.limits.clone(),
+                    payload.compatibility,
+                    payload.canonical_application_id,
+                    payload.canonical_environment_id,
+                ),
+                Err(e) => {
+                    error!(
+                        node = %node_id,
+                        app_id = %assignment.app_id,
+                        environment = %assignment.environment,
+                        version_id = %assignment.version_id,
+                        error = %e,
+                        "Could not build the environment for this assignment, so it is left out of the list; the list is marked incomplete so a node reconciling against it does not unload an application that is running fine, and this node will not start this application until the problem is fixed and it asks again"
+                    );
+                    withheld += 1;
+                    continue;
+                }
+            };
 
         views.push(AssignmentView {
             bundle_url: crate::delivery::bundle_url(
@@ -192,8 +195,10 @@ pub async fn for_node(
                 &assignment.version_id,
             ),
             app_id: assignment.app_id.clone(),
+            canonical_application_id,
             version_id: assignment.version_id.clone(),
             environment: assignment.environment.clone(),
+            canonical_environment_id,
             bundle_sha: assignment.bundle_sha.clone(),
             env,
             limits,

@@ -1020,6 +1020,14 @@ pub struct IsolateSpec {
     /// Values visible to the app through `Deno.env` / `ctx.env`.
     pub env: HashMap<String, String>,
 
+    /// Storage authority presented by KV, SQL, blob and queue clients.
+    ///
+    /// Kept separate from the runtime's `app_id`: the latter is the rolling-
+    /// upgrade placement and telemetry key, while this field is the data
+    /// boundary. `None` preserves callers that do not use the deployment
+    /// pipeline; deployed versions always set it explicitly.
+    pub storage_tenant: Option<String>,
+
     /// Net and env permissions granted to the isolate.
     pub permissions: AppPermissions,
 
@@ -1233,6 +1241,7 @@ impl AppRuntime {
         let IsolateSpec {
             entry_point,
             env,
+            storage_tenant,
             permissions: permissions_config,
             memory_limit_mb,
             resource_table_max,
@@ -1373,7 +1382,8 @@ impl AppRuntime {
         // that is not a tenant, fails the load outright rather than after V8
         // has been spun up. An address that is merely unreachable is not a
         // failure here: the channels are lazy.
-        let services = AppServices::connect(&app_id, wiring)?;
+        let storage_tenant = storage_tenant.as_deref().unwrap_or(&app_id);
+        let services = AppServices::connect(storage_tenant, wiring)?;
         if services.is_empty() && !wiring.declaration.is_empty() {
             tracing::warn!(
                 app_id = %app_id,

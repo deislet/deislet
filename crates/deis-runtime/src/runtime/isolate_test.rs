@@ -1232,11 +1232,20 @@ export default function handler(context: any): Response {
     /// Run one request against an app with the given wiring and hand back the
     /// response body.
     async fn body_of_one_request(app_id: &str, code: &str, wiring: &ServiceWiring) -> String {
+        body_of_one_request_with_spec(app_id, code, IsolateSpec::default(), wiring).await
+    }
+
+    async fn body_of_one_request_with_spec(
+        app_id: &str,
+        code: &str,
+        spec: IsolateSpec,
+        wiring: &ServiceWiring,
+    ) -> String {
         let mut runtime = AppRuntime::new(
             app_id.to_string(),
             code.to_string(),
             None,
-            IsolateSpec::default(),
+            spec,
             wiring,
             // No pool behind this isolate, so a service call it made would be
             // refused as "not deployed on this node", which is what it is.
@@ -1261,6 +1270,46 @@ export default function handler(context: any): Response {
         let body = body.unwrap_or_default();
         assert_eq!(status, 200, "{body}");
         body
+    }
+
+    #[tokio::test]
+    async fn runtime_placement_and_storage_authority_are_independent() {
+        let store = TestStore::start().await;
+        let writer = r#"
+            export default async function handler(ctx) {
+                await ctx.services.kv.put("proof", "separate-authority");
+                return new Response("written");
+            }
+        "#;
+        let spec = IsolateSpec {
+            storage_tenant: Some("storage-owner.production".to_string()),
+            ..IsolateSpec::default()
+        };
+        assert_eq!(
+            body_of_one_request_with_spec(
+                "routing-name.production",
+                writer,
+                spec,
+                &store.kv_wiring(),
+            )
+            .await,
+            "written"
+        );
+
+        let reader = r#"
+            export default async function handler(ctx) {
+                return new Response(JSON.stringify(await ctx.services.kv.get("proof")));
+            }
+        "#;
+        assert_eq!(
+            body_of_one_request("storage-owner.production", reader, &store.kv_wiring(),).await,
+            "\"separate-authority\""
+        );
+        assert_eq!(
+            body_of_one_request("routing-name.production", reader, &store.kv_wiring()).await,
+            "null",
+            "the runtime lookup name must not silently become the storage tenant"
+        );
     }
 
     #[tokio::test]

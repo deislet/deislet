@@ -947,6 +947,10 @@ struct ServingVersion {
 #[must_use = "a staged version holds a runtime thread until it is activated or discarded"]
 pub struct StagedVersion {
     tenant: String,
+    /// Storage authority of this version. It can change at a fenced cutover
+    /// without changing the runtime placement key or creating a second live
+    /// copy of the application.
+    storage_tenant: String,
     thread_id: usize,
     sender: mpsc::Sender<RuntimeMessage>,
     /// Which storage services this version declared and where they live; the
@@ -1492,6 +1496,10 @@ impl RuntimePool {
         replacing: bool,
     ) -> Result<StagedVersion> {
         let wiring = ServiceWiring::take_from_env(&mut spec.env);
+        let storage_tenant = spec
+            .storage_tenant
+            .clone()
+            .unwrap_or_else(|| tenant.clone());
         let execution_timeout = Duration::from_millis(spec.limits.timeout_ms);
 
         // Reserved before the isolate is built, so no second load can be sent
@@ -1535,6 +1543,7 @@ impl RuntimePool {
         match result {
             Ok(()) => Ok(StagedVersion {
                 tenant,
+                storage_tenant,
                 thread_id,
                 sender,
                 wiring,
@@ -1577,6 +1586,7 @@ impl RuntimePool {
     pub async fn activate(&self, staged: StagedVersion) -> Result<()> {
         let StagedVersion {
             tenant,
+            storage_tenant,
             thread_id,
             sender,
             wiring,
@@ -1616,7 +1626,7 @@ impl RuntimePool {
         // Stop before the old isolate goes away, so a batch already leased is
         // handed to the isolate that can still handle it.
         self.stop_consumers(&tenant).await;
-        self.start_consumers(&tenant, sender, &wiring, execution_timeout)
+        self.start_consumers(&tenant, &storage_tenant, sender, &wiring, execution_timeout)
             .await;
 
         match previous {
@@ -1713,6 +1723,7 @@ impl RuntimePool {
     async fn start_consumers(
         &self,
         tenant: &str,
+        storage_tenant: &str,
         sender: mpsc::Sender<RuntimeMessage>,
         wiring: &ServiceWiring,
         execution_timeout: Duration,
@@ -1730,21 +1741,24 @@ impl RuntimePool {
         // carrying the same capability token, so a preview leases only its own
         // messages and a deis-queue that checks the token answers the poller
         // instead of refusing it.
-        let client: Arc<dyn QueuePort> =
-            match consumer_queue_client(tenant, endpoint, wiring.storage_token.as_deref()) {
-                Ok(client) => Arc::new(client),
-                Err(e) => {
-                    tracing::error!(
-                        app_id = tenant,
-                        endpoint,
-                        error = %e,
-                        "Cannot build a queue client for {}; none of its queues will be \
-                         consumed and their messages will pile up in deis-queue",
-                        tenant
-                    );
-                    return;
-                }
-            };
+        let client: Arc<dyn QueuePort> = match consumer_queue_client(
+            storage_tenant,
+            endpoint,
+            wiring.storage_token.as_deref(),
+        ) {
+            Ok(client) => Arc::new(client),
+            Err(e) => {
+                tracing::error!(
+                    app_id = tenant,
+                    endpoint,
+                    error = %e,
+                    "Cannot build a queue client for {}; none of its queues will be \
+                     consumed and their messages will pile up in deis-queue",
+                    tenant
+                );
+                return;
+            }
+        };
 
         let mut handles = Vec::with_capacity(specs.len());
         for spec in specs {

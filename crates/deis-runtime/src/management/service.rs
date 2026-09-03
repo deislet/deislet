@@ -1,3 +1,4 @@
+use deis_wire::CanonicalTenantId;
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
@@ -120,6 +121,34 @@ impl RuntimeManagement for RuntimeManagementService {
             "Control plane asked this node to run a version"
         );
 
+        // Fields 9 and 10 are additive: an older control plane sends neither.
+        // Once either is present, both are an authority boundary and must be
+        // exact lowercase UUIDv7. Refuse before downloading the bundle rather
+        // than guessing the other half from a display name.
+        let canonical_tenant = match CanonicalTenantId::from_wire_fields(
+            &req.canonical_application_id,
+            &req.canonical_environment_id,
+        ) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                let key = AppKey::new(req.app_id.clone(), req.environment.clone());
+                let kept = self.running_version(&key);
+                error!(
+                    app_id = %req.app_id,
+                    environment = %req.environment,
+                    version_id = %req.version_id,
+                    kept_version = %kept,
+                    reason = %reason,
+                    "Refusing this deployment before download: its canonical application/environment identity is incomplete or malformed, so no storage authority can be selected safely"
+                );
+                return Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: reason.to_string(),
+                    version_id: kept,
+                }));
+            }
+        };
+
         let limits = req.limits.map(decode_limits);
         if let Some(limits) = &limits {
             info!(
@@ -180,6 +209,7 @@ impl RuntimeManagement for RuntimeManagementService {
 
         let order = DeploymentOrder {
             app_id: req.app_id.clone(),
+            canonical_tenant,
             version_id: req.version_id.clone(),
             environment: req.environment,
             bundle_url: req.bundle_url,

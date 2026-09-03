@@ -349,6 +349,8 @@ async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_an
                 date: "2099-01-01".to_string(),
                 flags: Vec::new(),
             }),
+            canonical_application_id: String::new(),
+            canonical_environment_id: String::new(),
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -399,6 +401,8 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_i
                 date: String::new(),
                 flags: vec!["behaviour_from_a_later_build".to_string()],
             }),
+            canonical_application_id: String::new(),
+            canonical_environment_id: String::new(),
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -420,6 +424,46 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_i
     );
 
     unload_all(&apps, "flag-app", &["production"]).await;
+    drop(guard);
+}
+
+#[tokio::test]
+async fn a_partial_canonical_identity_is_refused_before_the_bundle_is_fetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = test_host::take();
+    let (apps, service) = service_with(dir.path(), "identity-app", &["production"]).await;
+
+    let response = service
+        .apply_deployment(Request::new(ApplyDeploymentRequest {
+            app_id: "identity-app".to_string(),
+            version_id: "v9".to_string(),
+            environment: "production".to_string(),
+            // Unreachable on purpose. Identity validation must finish first.
+            bundle_url: "http://127.0.0.1:1/bundle".to_string(),
+            bundle_sha: "0".repeat(64),
+            env: Default::default(),
+            limits: None,
+            compatibility: None,
+            canonical_application_id: "018f2518-7e38-7f80-8000-000000000001".to_string(),
+            canonical_environment_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!response.success);
+    assert!(
+        response.message.contains("without an environment identity"),
+        "{}",
+        response.message
+    );
+    assert!(
+        response.message.contains("canonical application identity"),
+        "{}",
+        response.message
+    );
+
+    unload_all(&apps, "identity-app", &["production"]).await;
     drop(guard);
 }
 

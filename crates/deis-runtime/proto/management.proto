@@ -170,6 +170,20 @@ message ApplyDeploymentRequest {
     // what a restarting node reads out of
     // GET /api/nodes/{node_id}/assignments.
     CompatibilityDeclaration compatibility = 8;
+
+    // Permanent application identity used to derive storage authority. This
+    // is additive for rolling upgrades: both canonical fields are empty when
+    // the producer predates canonical identity. A node must accept both empty
+    // or validate both as lowercase UUIDv7; it must reject a one-sided or
+    // malformed pair rather than guess and attach data to the wrong tenant.
+    string canonical_application_id = 9;
+
+    // Permanent environment identity. Together with
+    // `canonical_application_id` it spells the logical tenant
+    // `v1/<application UUIDv7>/<environment UUIDv7>`. The human environment
+    // name in field 3 remains what application code sees and what rolling
+    // upgrade routing uses; it is no longer the future storage authority.
+    string canonical_environment_id = 10;
 }
 
 // A version's compatibility declaration, exactly as its manifest spells it.

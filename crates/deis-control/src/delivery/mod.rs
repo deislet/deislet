@@ -252,10 +252,17 @@ impl DeliveryReason {
 /// [`Self::to_request`], which is consumed immediately by the RPC.
 pub struct DeploymentPayload {
     pub app_id: String,
+    /// Permanent application identity. The legacy name above remains for
+    /// routing during a rolling migration; storage authority is derived from
+    /// this id and `canonical_environment_id` once the migration fence cuts
+    /// the environment over.
+    pub canonical_application_id: deis_wire::CanonicalId,
     pub version_id: String,
     /// Environment *name*, never the id: this is what application code
     /// branches on.
     pub environment: String,
+    /// Permanent identity of the environment row.
+    pub canonical_environment_id: deis_wire::CanonicalId,
     pub bundle_url: String,
     pub bundle_sha: String,
     /// Plain variables from the manifest merged with decrypted secrets.
@@ -305,8 +312,10 @@ impl std::fmt::Debug for DeploymentPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeploymentPayload")
             .field("app_id", &self.app_id)
+            .field("canonical_application_id", &self.canonical_application_id)
             .field("version_id", &self.version_id)
             .field("environment", &self.environment)
+            .field("canonical_environment_id", &self.canonical_environment_id)
             .field("bundle_url", &self.bundle_url)
             .field("bundle_sha", &self.bundle_sha)
             .field("variables", &self.variable_names())
@@ -377,6 +386,8 @@ impl DeploymentPayload {
             env: env.into_iter().collect(),
             limits: self.limits.as_ref().map(limits_to_wire),
             compatibility: Some(compatibility_to_wire(&self.compatibility)),
+            canonical_application_id: self.canonical_application_id.to_string(),
+            canonical_environment_id: self.canonical_environment_id.to_string(),
         }
     }
 }
@@ -539,6 +550,10 @@ impl DeploymentDeliverer {
         version: &Version,
         base_url: &str,
     ) -> CatalogResult<DeploymentPayload> {
+        // The legacy foreign key on the environment names the app row; read
+        // that durable row so the wire carries its permanent identity rather
+        // than deriving authority from the mutable display name.
+        let app = self.store.get_app(&env.app_id).await?;
         let version_id = version.id.as_str();
         let manifest = deis_bundle::Manifest::parse(&version.manifest).map_err(|e| {
             error!(
@@ -695,8 +710,10 @@ impl DeploymentDeliverer {
 
         Ok(DeploymentPayload {
             app_id: env.app_id.clone(),
+            canonical_application_id: app.canonical_id,
             version_id: version_id.to_string(),
             environment: env.name.clone(),
+            canonical_environment_id: env.canonical_id,
             bundle_url: bundle_url(base_url, &env.app_id, version_id),
             bundle_sha: version.bundle_sha.clone(),
             env: env_map,
@@ -1168,6 +1185,7 @@ mod tests {
     async fn payload_merges_manifest_variables_with_decrypted_secrets() {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
+        let app = store.get_app("demo").await.unwrap();
 
         let cipher = deliverer.secrets.cipher().unwrap();
         let blob = cipher
@@ -1181,7 +1199,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(payload.app_id, "demo");
+        assert_eq!(payload.canonical_application_id, app.canonical_id);
         assert_eq!(payload.environment, "production");
+        assert_eq!(payload.canonical_environment_id, env.canonical_id);
         assert_eq!(
             payload.bundle_url,
             "http://control.test/api/apps/demo/versions/v-1/bundle"
@@ -1194,6 +1214,14 @@ mod tests {
         // The secret wins over the placeholder the manifest carried.
         assert_eq!(request.env.get("API_KEY").unwrap(), "s3cr3t");
         assert_eq!(request.bundle_sha, "abc123");
+        assert_eq!(
+            request.canonical_application_id,
+            app.canonical_id.to_string()
+        );
+        assert_eq!(
+            request.canonical_environment_id,
+            env.canonical_id.to_string()
+        );
     }
 
     /// What a node has to be told before it downloads anything: which day's

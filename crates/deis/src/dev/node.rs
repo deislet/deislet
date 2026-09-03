@@ -195,6 +195,12 @@ impl DevNode {
                         .unwrap_or_default(),
                     flags: compatibility.flags,
                 }),
+                // Local dev has no catalog object from which to obtain
+                // permanent product identities. Both empty is the explicit
+                // additive/legacy form; one-sided identity would be refused
+                // by the node.
+                canonical_application_id: String::new(),
+                canonical_environment_id: String::new(),
             })
             .await
             .map_err(|e| {

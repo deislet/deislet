@@ -6,6 +6,7 @@
 //! depend on this crate for that module alone.
 
 pub mod canonical_id;
+pub mod canonical_tenant;
 pub mod client;
 pub mod config;
 pub mod conventions;
@@ -19,6 +20,7 @@ pub mod pb {
 
 // Re-export core types
 pub use canonical_id::{CanonicalId, CanonicalIdError};
+pub use canonical_tenant::{CANONICAL_TENANT_VERSION, CanonicalTenantId, CanonicalTenantIdError};
 pub use client::WireClient;
 pub use config::{ControlConfig, NodeInfo, NodeRole};
 pub use error::{SdkResult, WireError};

@@ -609,6 +609,7 @@ impl ApplicationManager {
         let spec = IsolateSpec {
             entry_point,
             env: config.env.clone(),
+            storage_tenant: Some(key.tenant_id()),
             permissions: config.permissions.clone(),
             memory_limit_mb: Some(self.effective_memory_limit_mb(&key, config.limits.as_ref())),
             resource_table_max: config.limits.as_ref().and_then(|l| l.resource_table_max),
@@ -787,6 +788,7 @@ impl ApplicationManager {
         IsolateSpec {
             entry_point: Some(record.entry_point.clone()),
             env: record.config.env.clone(),
+            storage_tenant: Some(key.tenant_id()),
             permissions: record.config.permissions.clone(),
             memory_limit_mb: Some(
                 self.effective_memory_limit_mb(key, record.config.limits.as_ref()),

@@ -328,15 +328,21 @@ fn an_assignment_carries_the_environment_a_push_would_have() {
     // that way until somebody deployed again.
     let assignment: Assignment = serde_json::from_value(serde_json::json!({
         "app_id": "demo",
+        "canonical_application_id": "018f2518-7e38-7f80-8000-000000000001",
         "version_id": "v1",
         "environment": "production",
+        "canonical_environment_id": "018f2518-7e38-7f80-8000-000000000002",
         "bundle_url": "http://control/bundle",
         "bundle_sha": "abc",
         "env": { "API_KEY": "s3cr3t", "DEIS_STORE_ENDPOINT": "http://127.0.0.1:8090" },
     }))
     .unwrap();
 
-    let order = assignment.into_order();
+    let order = assignment.into_order().unwrap();
+    assert_eq!(
+        order.canonical_tenant.unwrap().to_string(),
+        "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002"
+    );
     assert_eq!(order.env.get("API_KEY").unwrap(), "s3cr3t");
     assert_eq!(
         order.env.get(crate::runtime::STORE_ENDPOINT_KEY).unwrap(),
@@ -357,7 +363,43 @@ fn an_assignment_without_an_environment_still_loads() {
     }))
     .unwrap();
 
-    assert!(assignment.into_order().env.is_empty());
+    let order = assignment.into_order().unwrap();
+    assert!(order.env.is_empty());
+    assert!(order.canonical_tenant.is_none());
+}
+
+#[test]
+fn an_assignment_cannot_supply_only_half_of_canonical_identity() {
+    let assignment: Assignment = serde_json::from_value(serde_json::json!({
+        "app_id": "demo",
+        "canonical_application_id": "018f2518-7e38-7f80-8000-000000000001",
+        "version_id": "v1",
+        "environment": "production",
+        "bundle_url": "http://control/bundle",
+        "bundle_sha": "abc"
+    }))
+    .unwrap();
+
+    assert_eq!(
+        assignment.into_order().unwrap_err(),
+        deis_wire::CanonicalTenantIdError::MissingEnvironmentId
+    );
+}
+
+#[test]
+fn an_assignment_cannot_smuggle_a_non_v7_identity() {
+    let error = serde_json::from_value::<Assignment>(serde_json::json!({
+        "app_id": "demo",
+        "canonical_application_id": "550e8400-e29b-41d4-a716-446655440000",
+        "version_id": "v1",
+        "environment": "production",
+        "canonical_environment_id": "018f2518-7e38-7f80-8000-000000000002",
+        "bundle_url": "http://control/bundle",
+        "bundle_sha": "abc"
+    }))
+    .unwrap_err();
+
+    assert!(error.to_string().contains("UUIDv7"), "{error}");
 }
 
 #[test]
@@ -579,6 +621,7 @@ async fn a_refused_push_degrades_a_node_that_has_no_next_reconcile_pass() {
     // plane has already been told this node would run the version.
     let refused = DeploymentOrder {
         app_id: "demo".to_string(),
+        canonical_tenant: None,
         version_id: "v1".to_string(),
         environment: "production".to_string(),
         bundle_url: "http://127.0.0.1:1/bundle".to_string(),
@@ -1150,6 +1193,7 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_rolled_back() {
         deployer
             .apply(DeploymentOrder {
                 app_id: "demo".to_string(),
+                canonical_tenant: None,
                 version_id: "v2".to_string(),
                 environment: "production".to_string(),
                 bundle_url: format!("{}/bundle", plane.base()),
@@ -1203,6 +1247,7 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
         deployer
             .apply(DeploymentOrder {
                 app_id: "demo".to_string(),
+                canonical_tenant: None,
                 version_id: "v2".to_string(),
                 environment: "production".to_string(),
                 bundle_url: format!("{}/bundle", plane.base()),

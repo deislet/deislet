@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::app::AppKey;
+use deis_wire::{CanonicalId, CanonicalTenantId, CanonicalTenantIdError};
 
 /// Name of the file recording what this node has installed.
 const RECORD_FILE: &str = "installed.json";
@@ -41,8 +42,14 @@ const TEMP_DIR: &str = "incoming";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledRecord {
     pub app_id: String,
+    /// Additive during rolling upgrade. Both canonical fields must be present
+    /// together; older records have neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_application_id: Option<CanonicalId>,
     pub version_id: String,
     pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_environment_id: Option<CanonicalId>,
     pub bundle_sha: String,
 }
 
@@ -50,6 +57,19 @@ impl InstalledRecord {
     /// Which running application this line describes.
     pub fn key(&self) -> AppKey {
         AppKey::new(self.app_id.clone(), self.environment.clone())
+    }
+
+    /// Permanent tenant authority when this record came from a
+    /// canonical-aware control plane.
+    pub fn canonical_tenant(&self) -> Result<Option<CanonicalTenantId>, CanonicalTenantIdError> {
+        match (self.canonical_application_id, self.canonical_environment_id) {
+            (Some(application), Some(environment)) => {
+                Ok(Some(CanonicalTenantId::new(application, environment)))
+            }
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(CanonicalTenantIdError::MissingApplicationId),
+            (Some(_), None) => Err(CanonicalTenantIdError::MissingEnvironmentId),
+        }
     }
 }
 
@@ -270,6 +290,9 @@ impl BundleStore {
     /// line for that same pair and leaving the app's other environments alone.
     pub async fn remember(&self, record: InstalledRecord) {
         let mut records = self.records().await;
+        if records.iter().any(|existing| existing == &record) {
+            return;
+        }
         records.retain(|r| r.app_id != record.app_id || r.environment != record.environment);
         records.push(record);
         records.sort_by(|a, b| {
@@ -278,6 +301,36 @@ impl BundleStore {
                 .then_with(|| a.environment.cmp(&b.environment))
         });
         self.write_records(&records).await;
+    }
+
+    /// Keep a permanent tenant identity monotonic across rolling upgrades.
+    ///
+    /// An older control plane may omit canonical fields after this node has
+    /// already learned them; omission inherits the stored identity and never
+    /// erases it. A different complete identity is corruption or a catalog
+    /// split-brain and is refused before a bundle is downloaded.
+    pub async fn reconcile_canonical_tenant(
+        &self,
+        key: &AppKey,
+        incoming: &mut Option<CanonicalTenantId>,
+    ) -> Result<(), CanonicalTenantConflict> {
+        let records = self.records().await;
+        let Some(record) = records.iter().find(|record| record.key() == *key) else {
+            return Ok(());
+        };
+        let stored = record
+            .canonical_tenant()
+            .map_err(CanonicalTenantConflict::InvalidStoredIdentity)?;
+        match (stored, *incoming) {
+            (Some(stored), Some(received)) if stored != received => {
+                Err(CanonicalTenantConflict::Changed { stored, received })
+            }
+            (Some(stored), None) => {
+                *incoming = Some(stored);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// What this node installed last, as far as its own disk knows.
@@ -302,7 +355,21 @@ impl BundleStore {
         };
 
         match serde_json::from_str::<Vec<InstalledRecord>>(&text) {
-            Ok(records) => records,
+            Ok(records) => records
+                .into_iter()
+                .filter(|record| match record.canonical_tenant() {
+                    Ok(_) => true,
+                    Err(error) => {
+                        warn!(
+                            app_id = %record.app_id,
+                            environment = %record.environment,
+                            error = %error,
+                            "Ignoring an installed-version record with only half of its canonical identity; recovering it under a guessed storage authority could expose another tenant's data"
+                        );
+                        false
+                    }
+                })
+                .collect(),
             Err(e) => {
                 warn!(
                     path = %path.display(),
@@ -349,6 +416,31 @@ impl BundleStore {
         debug!(records = records.len(), "Installed-version record updated");
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalTenantConflict {
+    InvalidStoredIdentity(CanonicalTenantIdError),
+    Changed {
+        stored: CanonicalTenantId,
+        received: CanonicalTenantId,
+    },
+}
+
+impl std::fmt::Display for CanonicalTenantConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidStoredIdentity(error) => {
+                write!(formatter, "stored canonical tenant is invalid: {error}")
+            }
+            Self::Changed { stored, received } => write!(
+                formatter,
+                "canonical tenant changed from {stored} to {received}; permanent identity cannot be reassigned"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalTenantConflict {}
 
 #[cfg(test)]
 #[path = "store_test.rs"]

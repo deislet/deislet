@@ -14,6 +14,7 @@ EXPECTED_ADRS = list(range(1, 23))
 EXPECTED_PHASES = [f"phase-{number}" for number in range(6)]
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 WORK_ID = re.compile(r"^P([0-5])-[A-Z]+-[0-9]{3}$")
+EXPECTED_WORKSPACE_TIMEOUT_MINUTES = 120
 
 
 class ValidationError(RuntimeError):
@@ -207,6 +208,18 @@ def validate_integration() -> None:
     require((ROOT / "contracts/v1/registry.json").is_file(), "shared product contract registry is missing")
     require((ROOT / "contracts/v1/README.zh.md").is_file(), "shared product contract documentation is missing")
     require("cargo audit" in workflow, "CI dependency audit is missing")
+    workspace_job = re.search(
+        r"(?ms)^  workspace:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+        workflow,
+    )
+    require(workspace_job is not None, "CI workspace job is missing")
+    timeout = re.search(r"(?m)^    timeout-minutes:\s*([0-9]+)\s*$", workspace_job.group("body"))
+    require(timeout is not None, "CI workspace job must have a finite timeout")
+    require(
+        int(timeout.group(1)) == EXPECTED_WORKSPACE_TIMEOUT_MINUTES,
+        "CI workspace timeout must remain at the measured "
+        f"{EXPECTED_WORKSPACE_TIMEOUT_MINUTES}-minute ceiling",
+    )
     # These are the first official-action majors that run natively on Node
     # 24. Keep the set explicit: silently falling back to an older major
     # reintroduces the runner compatibility mode and its deprecation warning;

@@ -116,6 +116,7 @@ async fn a_bundled_site_is_served_from_its_assets_and_falls_through_on_a_miss() 
     deployer
         .apply(DeploymentOrder {
             app_id: "site".to_string(),
+            canonical_tenant: None,
             version_id: "v1".to_string(),
             environment: "production".to_string(),
             bundle_url: format!("http://{bundle_addr}/bundle"),

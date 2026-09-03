@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
+use deis_wire::CanonicalTenantId;
 use tracing::{debug, error, info, warn};
 
 use crate::app::types::{AppConfig, ResourceLimits};
@@ -54,7 +55,9 @@ pub use assignments::{
 pub use credential::NodeCredential;
 pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle};
 pub use registration::{NodeRegistrar, NodeRegistration, Registered, RegistrationError};
-pub use store::{check_identifier, BundleStore, InstalledRecord, InvalidIdentifier};
+pub use store::{
+    check_identifier, BundleStore, CanonicalTenantConflict, InstalledRecord, InvalidIdentifier,
+};
 
 /// One deployment the node has been told to run.
 ///
@@ -69,6 +72,10 @@ pub use store::{check_identifier, BundleStore, InstalledRecord, InvalidIdentifie
 /// decrypted.
 pub struct DeploymentOrder {
     pub app_id: String,
+    /// Permanent storage authority delivered by a canonical-aware control
+    /// plane. `None` is accepted only for rolling compatibility with an older
+    /// producer; it never means that the legacy name has become canonical.
+    pub canonical_tenant: Option<CanonicalTenantId>,
     pub version_id: String,
     pub environment: String,
     pub bundle_url: String,
@@ -117,6 +124,7 @@ impl std::fmt::Debug for DeploymentOrder {
         names.sort_unstable();
         f.debug_struct("DeploymentOrder")
             .field("app_id", &self.app_id)
+            .field("canonical_tenant", &self.canonical_tenant)
             .field("version_id", &self.version_id)
             .field("environment", &self.environment)
             .field("bundle_url", &self.bundle_url)
@@ -152,6 +160,9 @@ pub enum DeployError {
     /// message says both dates so an operator reads it as "upgrade this node",
     /// not "the application is broken".
     Compatibility(String),
+    /// The control plane tried to change a permanent tenant identity already
+    /// persisted for this application environment.
+    Identity(String),
     /// The isolate would not take the new code.
     Load(String),
 }
@@ -167,6 +178,7 @@ impl std::fmt::Display for DeployError {
             Self::Compatibility(m) => {
                 write!(f, "this node cannot honour what the version declares: {m}")
             }
+            Self::Identity(m) => write!(f, "canonical tenant identity was refused: {m}"),
             Self::Load(m) => write!(f, "the bundle would not load: {m}"),
         }
     }
@@ -193,6 +205,7 @@ impl DeployError {
             Self::Assets(_) => "its static files cannot be served as declared",
             Self::Storage(_) => "its bundle could not be put on this node's disk",
             Self::Compatibility(_) => "this node's build cannot honour what the version declares",
+            Self::Identity(_) => "its canonical tenant identity conflicts with this node's record",
             Self::Load(_) => "the isolate would not take the new code",
         }
     }
@@ -362,13 +375,20 @@ impl DeploymentManager {
     /// Always reloads, even when the version has not moved: a secret change
     /// produces no new version but does change what the isolate must see, and
     /// `context.env` is read when the isolate is built.
-    pub async fn apply(&self, order: DeploymentOrder) -> Result<Applied, DeployError> {
+    pub async fn apply(&self, mut order: DeploymentOrder) -> Result<Applied, DeployError> {
         let key = order.key();
         // Taken before `install` consumes the order, for the readiness below.
         let version_id = order.version_id.clone();
         let lock = self.lock_for(&key);
         let _guard = lock.lock().await;
-        let applied = self.install(order, false).await;
+        let applied = match self
+            .store
+            .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
+            .await
+        {
+            Ok(()) => self.install(order, false).await,
+            Err(error) => Err(DeployError::Identity(error.to_string())),
+        };
 
         // A push is a single instruction with no pass behind it to sum it up,
         // so it reports itself. A reconcile pass never installs through here -
@@ -428,7 +448,7 @@ impl DeploymentManager {
     /// while the node reported itself ready.
     pub async fn apply_from_assignment(
         &self,
-        order: DeploymentOrder,
+        mut order: DeploymentOrder,
         as_of: u64,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
@@ -454,6 +474,11 @@ impl DeploymentManager {
             return Ok(Applied::Superseded { running_version_id });
         }
 
+        self.store
+            .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
+            .await
+            .map_err(|error| DeployError::Identity(error.to_string()))?;
+
         if let Some(current) = self.app_manager.installed_version(&key) {
             if current.version_id == order.version_id {
                 // The version record is this node's memory of what it
@@ -465,6 +490,10 @@ impl DeploymentManager {
                 // assignment was satisfied on every pass, so the one thing
                 // that could have put the application back never ran.
                 if current.env_confirmed && self.app_manager.is_hosted(&key).await {
+                    // A node can learn canonical identity while the deployed
+                    // version stays unchanged. Persist that additive upgrade
+                    // even though there is no reason to rebuild the isolate.
+                    self.remember_order(&order).await;
                     debug!(
                         app_id = %key.app_id(),
                         environment = %key.environment(),
@@ -501,6 +530,21 @@ impl DeploymentManager {
         self.install(order, false).await
     }
 
+    async fn remember_order(&self, order: &DeploymentOrder) {
+        self.store.remember(Self::record_for_order(order)).await;
+    }
+
+    fn record_for_order(order: &DeploymentOrder) -> InstalledRecord {
+        InstalledRecord {
+            app_id: order.app_id.clone(),
+            canonical_application_id: order.canonical_tenant.map(|tenant| tenant.application_id()),
+            version_id: order.version_id.clone(),
+            environment: order.environment.clone(),
+            canonical_environment_id: order.canonical_tenant.map(|tenant| tenant.environment_id()),
+            bundle_sha: order.bundle_sha.clone(),
+        }
+    }
+
     /// Load whatever this node already has on disk.
     ///
     /// This is the answer to an unreachable control plane: the node keeps
@@ -517,6 +561,21 @@ impl DeploymentManager {
         let mut recovered = 0;
         for record in records {
             let key = record.key();
+            let canonical_tenant = match record.canonical_tenant() {
+                Ok(identity) => identity,
+                Err(error) => {
+                    // `BundleStore::records` already filters this shape. Keep
+                    // the check here as the authority boundary in case a
+                    // different record source is added later.
+                    error!(
+                        app_id = %record.app_id,
+                        environment = %record.environment,
+                        error = %error,
+                        "Refusing to recover a deployment with a partial canonical identity"
+                    );
+                    continue;
+                }
+            };
             let lock = self.lock_for(&key);
             let _guard = lock.lock().await;
 
@@ -526,6 +585,7 @@ impl DeploymentManager {
 
             let order = DeploymentOrder {
                 app_id: record.app_id.clone(),
+                canonical_tenant,
                 version_id: record.version_id.clone(),
                 environment: record.environment.clone(),
                 bundle_url: String::new(),
@@ -713,6 +773,7 @@ impl DeploymentManager {
         local_only: bool,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
+        let installed_record = (!local_only).then(|| Self::record_for_order(&order));
         // Taken before the rest of the order is consumed piece by piece below.
         let limits = order.limits.take();
         // Both halves of the key become a directory name here and a storage
@@ -956,15 +1017,8 @@ impl DeploymentManager {
             .await
             .map_err(|e| DeployError::Load(e.to_string()))?;
 
-        if !local_only {
-            self.store
-                .remember(InstalledRecord {
-                    app_id: order.app_id.clone(),
-                    version_id: order.version_id.clone(),
-                    environment: order.environment.clone(),
-                    bundle_sha: order.bundle_sha.clone(),
-                })
-                .await;
+        if let Some(record) = installed_record {
+            self.store.remember(record).await;
         }
         self.store.prune(&key, &order.version_id).await;
 
