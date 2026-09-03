@@ -159,6 +159,19 @@ def validate_integration() -> None:
         "python3 scripts/check-product-governance.py" in workflow,
         "CI does not run the product governance check",
     )
+    require("cargo audit" in workflow, "CI dependency audit is missing")
+    audit_policy = read_text(".cargo/audit.toml")
+    expected_advisories = {
+        "RUSTSEC-2026-0119",
+        "RUSTSEC-2026-0118",
+        "RUSTSEC-2024-0437",
+        "RUSTSEC-2023-0071",
+    }
+    recorded_advisories = set(re.findall(r'"(RUSTSEC-[0-9]{4}-[0-9]{4})"', audit_policy))
+    require(
+        recorded_advisories == expected_advisories,
+        "cargo audit exceptions must remain the four explicitly reviewed advisories",
+    )
     implementation = read_text("docs/implementation-plan.zh.md")
     require("文档边界（2026-09-03）" in implementation, "legacy implementation spec lacks its authority boundary")
     product = read_text("docs/product/README.md")

@@ -112,6 +112,17 @@
             {"type": "planned-path", "value": "versioned shared schemas and migration fixtures"}
           ],
           "verification": "旧 name-based identity 与 provider-specific config 均有无停机迁移测试"
+        },
+        {
+          "id": "P0-CI-001",
+          "title": "升级使用 Node 20 action runtime 的 GitHub Actions",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": ["P0-ROAD-001"],
+          "outputs": [
+            {"type": "planned-path", "value": "Node 24-native GitHub Action revisions"}
+          ],
+          "verification": "GitHub Actions 不再产生 Node 20 action runtime deprecation annotation"
         }
       ]
     },

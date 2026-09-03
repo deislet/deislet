@@ -1,0 +1,55 @@
+# What `cargo audit` still reports, and why each one stands.
+#
+# Every advisory here has been read and judged. An entry is a written decision
+# with a way out, not a way to make the tool quiet: it says where the crate
+# sits, whether an application can reach it, and what would clear it. Anything
+# not listed here is expected to be fixed, not ignored - the last three rounds
+# took the count from 17 to 4 by upgrading rather than by adding lines to this
+# file.
+#
+# Re-read this list whenever `deno_runtime` or `pingora` moves; three of the
+# four are waiting on exactly that.
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2, RUSTSEC-2026-0119: quadratic name compression while
+    # *encoding* a message, and RUSTSEC-2026-0118: an unbounded loop validating
+    # an NSEC3 closest-encloser proof, which has no fixed release at all.
+    #
+    # Linked, not reached. It arrives under `deno_net`, which offers
+    # `Deno.resolveDns` and `Deno.connect` - neither of which exists in an
+    # isolate here, because this runtime binds no `Deno` global. Outbound DNS
+    # for `fetch()` goes through `runtime::fetch_policy::PolicyResolver`, which
+    # resolves with `tokio::net::lookup_host` (the system resolver) so that the
+    # addresses a name produces can be put through the outbound policy; hickory
+    # is not on that path.
+    #
+    # Clearing it means deno_net requiring hickory-proto 0.26.1 or later. The
+    # requirement is `^0.25`, so no lock-file change here can do it.
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0118",
+
+    # protobuf 2.28, RUSTSEC-2024-0437: uncontrolled recursion while *parsing* a
+    # message. It comes from pingora-core -> prometheus 0.13, which only ever
+    # encodes with it. deis-proxy serves no metrics endpoint, and the gRPC on
+    # this platform is prost, so nothing hands that parser bytes from outside.
+    # Also written down at the pingora dependency in deis-proxy/Cargo.toml.
+    #
+    # Clearing it means pingora dropping prometheus 0.13.
+    "RUSTSEC-2024-0437",
+
+    # rsa 0.9.10, RUSTSEC-2023-0071: the Marvin attack, a timing side-channel in
+    # RSA decryption. No fixed release exists.
+    #
+    # The one advisory here an application can reach: it backs the RSA
+    # primitives of `crypto.subtle`, which this platform does bind. What the
+    # attack needs is many decryptions of chosen ciphertexts under one key with
+    # the timings measured, so the exposure is an application that decrypts
+    # with a long-lived RSA key on a request path an attacker can drive. An
+    # application in that position should use RSA-OAEP with a fresh key per
+    # session, or an elliptic-curve exchange, until the crate has a fix. The
+    # platform's own credentials are not affected: storage capability tokens
+    # are HMAC, and TLS is OpenSSL (deis-proxy) or rustls (deno), neither of
+    # which uses this crate.
+    "RUSTSEC-2023-0071",
+]

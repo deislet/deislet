@@ -29,6 +29,7 @@
 1. `P0-SPEC-002`：按 15 个 mandatory 能力族逐项写完 API、错误、一致性、生命周期、保证、fixture 和 oracle；`pending` 是发布阻断项。
 2. `P0-EVID-001`：删除手工维护的“支持”结论，让 README、CLI、Web 和矩阵从 registry 生成。
 3. `P0-MODEL-001`：冻结 canonical ID、operation、artifact、逻辑 binding 和 provider driver 共享 schema，并为旧数据设计迁移 fixture。
+4. `P0-CI-001`：升级仍以 Node 20 action runtime 发布的 GitHub Actions revision，清除 runner 的强制兼容警告。
 
 ## 执行规则
 

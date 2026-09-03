@@ -1185,3 +1185,9 @@ Application/framework source + versioned build plan
 - DEC-001 至 DEC-020（含 DEC-002B，共 21 条记录）已全部完成产品对齐，并迁入 [`docs/adr`](../adr/README.md) 成为正式 ADR。
 - 本文中的早期选项和当时现状保留用于审计；后续状态与实施顺序以[机器可读路线](roadmap.json)及其[人类可读视图](roadmap.zh.md)为准。
 - 应用规范由独立 Edge Canon 仓库治理；本仓库通过 [`standards/edge-canon.lock.json`](../../standards/edge-canon.lock.json) 锁定 proposal、契约和 registry 的精确来源。
+
+## 11. 阶段 0 迁移校验新增发现
+
+- Edge Canon 顶层入口已指向单一标准 proposal，但 v0.1 的 `SPECIFICATION`、`PRINCIPLES`、`COMPATIBILITY`、Basic/Extended 文档和平台矩阵仍可能被误读为下一版本规则。已在各入口明确版本边界，历史正文保留，下一版本只由 proposal、机器契约和 registry 推进。
+- GitHub Actions 的 Rust 审计步骤声称使用 `.cargo/audit.toml`，该文件却只存在于本机并被 `.git/info/exclude` 排除，导致 CI 无法取得四条已有详细论证的例外。本阶段已把文件正式纳入 Git，并让产品治理校验核对四个精确 advisory ID；后续删除或静默增加例外都会使 CI 失败。
+- GitHub Actions 报告若干 action revision 仍以已弃用的 Node 20 action runtime 发布，目前 runner 强制用 Node 24 执行且不阻断任务。该维护项记录为路线 `P0-CI-001`，验收标准是 annotation 消失，不以设置允许旧 runtime 的环境变量掩盖。
