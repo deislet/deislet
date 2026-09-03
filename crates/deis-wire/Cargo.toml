@@ -23,7 +23,7 @@ tracing = "0.1.41"
 # features are what `fmt` needs; `json` is a test-only addition below, for the
 # one test that checks what protects deis-control's `LOG_FORMAT=json` branch.
 tracing-subscriber = "0.3.18"
-uuid = { version = "1.17.0", features = ["v4", "serde"] }
+uuid = { version = "1.17.0", features = ["v4", "v7", "serde"] }
 yasm = { workspace = true }
 tonic = "0.12"
 prost = "0.13"

@@ -585,7 +585,8 @@ pub(crate) mod tests {
             let id = body["canonical_id"]
                 .as_str()
                 .expect("public catalog object must expose canonical_id");
-            assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 7);
+            id.parse::<deis_wire::CanonicalId>()
+                .expect("public canonical identity must be lowercase UUIDv7");
             id.to_string()
         };
 

@@ -5,6 +5,7 @@
 //! the platform must spell identically - including the storage services, which
 //! depend on this crate for that module alone.
 
+pub mod canonical_id;
 pub mod client;
 pub mod config;
 pub mod conventions;
@@ -17,6 +18,7 @@ pub mod pb {
 }
 
 // Re-export core types
+pub use canonical_id::{CanonicalId, CanonicalIdError};
 pub use client::WireClient;
 pub use config::{ControlConfig, NodeInfo, NodeRole};
 pub use error::{SdkResult, WireError};

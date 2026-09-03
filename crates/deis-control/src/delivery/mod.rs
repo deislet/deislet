@@ -1091,7 +1091,7 @@ mod tests {
     fn version(manifest: &str) -> Version {
         Version {
             id: "v-1".to_string(),
-            canonical_id: "018f2518-7e38-7f80-8000-000000000001".to_string(),
+            canonical_id: "018f2518-7e38-7f80-8000-000000000001".parse().unwrap(),
             app_id: "demo".to_string(),
             number: 1,
             bundle_sha: "abc123".to_string(),

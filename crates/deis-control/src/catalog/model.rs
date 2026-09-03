@@ -4,6 +4,7 @@
 //! Every timestamp in this module is Unix epoch seconds, matching the
 //! `INTEGER` columns declared in `database::schema`.
 
+use deis_wire::CanonicalId;
 use serde::Serialize;
 
 use super::CatalogError;
@@ -28,7 +29,7 @@ pub const MAX_PATH_PREFIX_LEN: usize = 512;
 #[derive(Debug, Clone, Serialize)]
 pub struct App {
     pub id: String,
-    pub canonical_id: String,
+    pub canonical_id: CanonicalId,
     pub created_at: i64,
 }
 
@@ -40,7 +41,7 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub struct Version {
     pub id: String,
-    pub canonical_id: String,
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     /// Per-app counter starting at 1. This is what a human calls "v3".
     pub number: i64,
@@ -57,7 +58,7 @@ pub struct Version {
 #[derive(Debug, Clone, Serialize)]
 pub struct Environment {
     pub id: String,
-    pub canonical_id: String,
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     pub name: String,
     pub created_at: i64,
@@ -68,7 +69,7 @@ pub struct Environment {
 #[derive(Debug, Clone, Serialize)]
 pub struct Deployment {
     pub id: String,
-    pub canonical_id: String,
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     pub env_id: String,
     pub version_id: String,

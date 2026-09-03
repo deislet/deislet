@@ -1,6 +1,6 @@
+use deis_wire::CanonicalId;
 use rusqlite::{Connection, Result};
 use tracing::info;
-use uuid::Uuid;
 
 /// Initialize database schema
 pub fn create_tables(conn: &Connection) -> Result<()> {
@@ -605,9 +605,49 @@ fn ensure_canonical_ids(conn: &Connection) -> Result<()> {
         // current Unix millisecond in the leading 48 bits, fixes the version
         // nibble to 7 and the RFC 4122 variant to 10xx, then supplies 74
         // random bits. It exists for old binaries only; current Rust writers
-        // use `Uuid::now_v7()`.
+        // use `CanonicalId::new_v7()`.
         conn.execute_batch(&format!(
             r#"
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_canonical_id_validate_insert_v1
+            BEFORE INSERT ON {table}
+            WHEN NEW.canonical_id IS NOT NULL
+             AND NEW.canonical_id != ''
+             AND NOT (
+                length(NEW.canonical_id) = 36
+                AND lower(NEW.canonical_id) = NEW.canonical_id
+                AND substr(NEW.canonical_id, 9, 1) = '-'
+                AND substr(NEW.canonical_id, 14, 1) = '-'
+                AND substr(NEW.canonical_id, 15, 1) = '7'
+                AND substr(NEW.canonical_id, 19, 1) = '-'
+                AND substr(NEW.canonical_id, 20, 1) GLOB '[89ab]'
+                AND substr(NEW.canonical_id, 24, 1) = '-'
+                AND length(replace(NEW.canonical_id, '-', '')) = 32
+                AND replace(NEW.canonical_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_canonical_id_validate_update_v1
+            BEFORE UPDATE OF canonical_id ON {table}
+            WHEN NEW.canonical_id IS NULL
+              OR NEW.canonical_id = ''
+              OR NOT (
+                length(NEW.canonical_id) = 36
+                AND lower(NEW.canonical_id) = NEW.canonical_id
+                AND substr(NEW.canonical_id, 9, 1) = '-'
+                AND substr(NEW.canonical_id, 14, 1) = '-'
+                AND substr(NEW.canonical_id, 15, 1) = '7'
+                AND substr(NEW.canonical_id, 19, 1) = '-'
+                AND substr(NEW.canonical_id, 20, 1) GLOB '[89ab]'
+                AND substr(NEW.canonical_id, 24, 1) = '-'
+                AND length(replace(NEW.canonical_id, '-', '')) = 32
+                AND replace(NEW.canonical_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
+            END;
+
             CREATE TRIGGER IF NOT EXISTS trg_{table}_canonical_id
             AFTER INSERT ON {table}
             WHEN NEW.canonical_id IS NULL OR NEW.canonical_id = ''
@@ -645,7 +685,7 @@ fn ensure_canonical_ids(conn: &Connection) -> Result<()> {
         for rowid in rowids {
             conn.execute(
                 &format!("UPDATE {table} SET canonical_id = ?1 WHERE rowid = ?2"),
-                rusqlite::params![Uuid::now_v7().to_string(), rowid],
+                rusqlite::params![CanonicalId::new_v7().to_string(), rowid],
             )?;
         }
 
@@ -1513,9 +1553,8 @@ mod tests {
         };
         let first = read_ids(&conn);
         for id in &first {
-            let uuid = Uuid::parse_str(id).expect("backfill must write a UUID");
-            assert_eq!(uuid.get_version_num(), 7, "{id} is not UUIDv7");
-            assert_eq!(uuid.to_string(), *id, "canonical UUID must be lowercase");
+            id.parse::<CanonicalId>()
+                .expect("backfill must write canonical lowercase UUIDv7");
         }
 
         create_tables(&conn).unwrap();
@@ -1535,17 +1574,37 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            Uuid::parse_str(&triggered).unwrap().get_version_num(),
-            7,
-            "compatibility trigger did not generate UUIDv7"
-        );
+        triggered
+            .parse::<CanonicalId>()
+            .expect("compatibility trigger must generate canonical lowercase UUIDv7");
 
         let duplicate = conn.execute(
             "UPDATE apps SET canonical_id = ?1 WHERE id = 'written-by-old-control'",
             [&first[0]],
         );
         assert!(duplicate.is_err(), "canonical identity was not unique");
+
+        let invalid_insert = conn.execute(
+            "INSERT INTO apps (id, canonical_id, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "explicit-invalid-id",
+                "550e8400-e29b-41d4-a716-446655440000",
+                3
+            ],
+        );
+        assert!(
+            invalid_insert.is_err(),
+            "database accepted a non-v7 canonical identity"
+        );
+
+        let invalid_update = conn.execute(
+            "UPDATE apps SET canonical_id = '' WHERE id = 'written-by-old-control'",
+            [],
+        );
+        assert!(
+            invalid_update.is_err(),
+            "database allowed a canonical identity to be erased"
+        );
     }
 
     /// Versions carry a per-app monotonic number; the schema itself must

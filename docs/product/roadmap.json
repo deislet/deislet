@@ -115,10 +115,11 @@
             {"type": "local-path", "value": "contracts/v1/registry.json"},
             {"type": "local-path", "value": "contracts/v1/README.zh.md"},
             {"type": "local-path", "value": "scripts/check-shared-contracts.py"},
+            {"type": "local-path", "value": "crates/deis-wire/src/canonical_id.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/catalog/model.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"}
           ],
-          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-control 已覆盖 UUIDv7 新写入、旧库回填、幂等重启和旧 writer 兼容；完成前仍须验证 canonical tenant/binding 双读、受 fencing 的 cutover、rollback/failure 与旧 capability 撤销"
+          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-wire -p deis-control -p deis 已覆盖共享 UUIDv7 类型、新写入、旧库回填、幂等重启、旧 writer 兼容、非法数据库/API 值 fail closed；完成前仍须验证 canonical tenant/binding 双读、受 fencing 的 cutover、rollback/failure 与旧 capability 撤销"
         },
         {
           "id": "P0-CI-001",

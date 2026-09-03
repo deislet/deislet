@@ -8,6 +8,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
+use deis_wire::CanonicalId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::io::ReaderStream;
@@ -24,7 +25,7 @@ use crate::identity::Principal;
 #[derive(Debug, Serialize)]
 pub struct VersionView {
     pub id: String,
-    pub canonical_id: String,
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     pub number: i64,
     pub bundle_sha: String,
@@ -80,7 +81,7 @@ impl From<&Version> for VersionView {
             });
         Self {
             id: version.id.clone(),
-            canonical_id: version.canonical_id.clone(),
+            canonical_id: version.canonical_id,
             app_id: version.app_id.clone(),
             number: version.number,
             bundle_sha: version.bundle_sha.clone(),

@@ -27,7 +27,7 @@
 ## 当前进行中
 
 - `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 已形成 20 条候选条款和 11 个 provider-independent 草案用例。最低资源保证已固定采用所有参考供应商最低免费/入门档共同基线，但具体数值、计量和超限行为仍为 `pending`；执行 harness 仍为 `planned`，其余 14 个能力族尚未开始，故本项继续保持 `active`。
-- `P0-MODEL-001`：已建立 canonical identity、artifact、binding snapshot、operation、provider driver 和 identity migration 六份 Draft schema，配套 12 个正反 fixture 与可执行状态图校验。Rust/SQLite/API 已完成 application/environment/version/deployment 的增量 UUIDv7 分配、存量回填、唯一索引和旧 writer 兼容触发器；tenant/binding/capability、持久 migration operation 与受 fencing 的 cutover 尚未迁移，故本项继续保持 `active`。
+- `P0-MODEL-001`：已建立 canonical identity、artifact、binding snapshot、operation、provider driver 和 identity migration 六份 Draft schema，配套 12 个正反 fixture 与可执行状态图校验。Rust/SQLite/API 已完成 application/environment/version/deployment 的增量 UUIDv7 分配、共享强类型验证、存量回填、唯一索引、非法 SQL 写入拒绝和旧 writer 兼容触发器；CLI 对旧 Control 保持字段缺省兼容，但拒绝伪 canonical ID。tenant/binding/capability、持久 migration operation 与受 fencing 的 cutover 尚未迁移，故本项继续保持 `active`。
 - `P0-CI-001`：已按 GitHub 官方 Node 24 版本迁移 checkout、setup-node、setup-python、cache 和 upload-artifact；等待完整 checks run 验证后才能标为 `complete`。
 
 ## 紧接着执行

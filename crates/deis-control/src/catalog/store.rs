@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use deis_wire::{CanonicalId, CanonicalIdError};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -143,7 +144,7 @@ impl CatalogStore {
     pub async fn create_app(&self, id: &str) -> CatalogResult<App> {
         validate_app_id(id)?;
         let id = id.to_string();
-        let canonical_id = Uuid::now_v7().to_string();
+        let canonical_id = CanonicalId::new_v7();
         let created_at = now_secs();
 
         let app = self
@@ -178,7 +179,7 @@ impl CatalogStore {
                 }
                 conn.execute(
                     "INSERT INTO apps (id, canonical_id, created_at) VALUES (?1, ?2, ?3)",
-                    params![id, canonical_id, created_at],
+                    params![id, canonical_id.to_string(), created_at],
                 )?;
                 Ok(App {
                     id,
@@ -580,7 +581,7 @@ impl CatalogStore {
                 )?;
                 let version = Version {
                     id: Uuid::new_v4().to_string(),
-                    canonical_id: Uuid::now_v7().to_string(),
+                    canonical_id: CanonicalId::new_v7(),
                     app_id,
                     number,
                     bundle_sha,
@@ -594,7 +595,7 @@ impl CatalogStore {
                     ),
                     params![
                         version.id,
-                        version.canonical_id,
+                        version.canonical_id.to_string(),
                         version.app_id,
                         version.number,
                         version.bundle_sha,
@@ -695,7 +696,7 @@ impl CatalogStore {
                 }
                 let env = Environment {
                     id: Uuid::new_v4().to_string(),
-                    canonical_id: Uuid::now_v7().to_string(),
+                    canonical_id: CanonicalId::new_v7(),
                     app_id,
                     name,
                     created_at: now_secs(),
@@ -706,7 +707,7 @@ impl CatalogStore {
                     ),
                     params![
                         env.id,
-                        env.canonical_id,
+                        env.canonical_id.to_string(),
                         env.app_id,
                         env.name,
                         env.created_at
@@ -771,7 +772,7 @@ impl CatalogStore {
                 let version = load_version(conn, &app_id, &version_id)?;
                 let deployment = Deployment {
                     id: Uuid::new_v4().to_string(),
-                    canonical_id: Uuid::now_v7().to_string(),
+                    canonical_id: CanonicalId::new_v7(),
                     app_id,
                     env_id,
                     version_id: version.id,
@@ -784,7 +785,7 @@ impl CatalogStore {
                     ),
                     params![
                         deployment.id,
-                        deployment.canonical_id,
+                        deployment.canonical_id.to_string(),
                         deployment.app_id,
                         deployment.env_id,
                         deployment.version_id,
@@ -1502,7 +1503,7 @@ impl CatalogStore {
 fn map_app(row: &Row<'_>) -> rusqlite::Result<App> {
     Ok(App {
         id: row.get(0)?,
-        canonical_id: row.get(1)?,
+        canonical_id: map_canonical_id(row, 1)?,
         created_at: row.get(2)?,
     })
 }
@@ -1510,7 +1511,7 @@ fn map_app(row: &Row<'_>) -> rusqlite::Result<App> {
 fn map_version(row: &Row<'_>) -> rusqlite::Result<Version> {
     Ok(Version {
         id: row.get(0)?,
-        canonical_id: row.get(1)?,
+        canonical_id: map_canonical_id(row, 1)?,
         app_id: row.get(2)?,
         number: row.get(3)?,
         bundle_sha: row.get(4)?,
@@ -1523,7 +1524,7 @@ fn map_version(row: &Row<'_>) -> rusqlite::Result<Version> {
 fn map_environment(row: &Row<'_>) -> rusqlite::Result<Environment> {
     Ok(Environment {
         id: row.get(0)?,
-        canonical_id: row.get(1)?,
+        canonical_id: map_canonical_id(row, 1)?,
         app_id: row.get(2)?,
         name: row.get(3)?,
         created_at: row.get(4)?,
@@ -1533,12 +1534,23 @@ fn map_environment(row: &Row<'_>) -> rusqlite::Result<Environment> {
 fn map_deployment(row: &Row<'_>) -> rusqlite::Result<Deployment> {
     Ok(Deployment {
         id: row.get(0)?,
-        canonical_id: row.get(1)?,
+        canonical_id: map_canonical_id(row, 1)?,
         app_id: row.get(2)?,
         env_id: row.get(3)?,
         version_id: row.get(4)?,
         created_at: row.get(5)?,
         note: row.get(6)?,
+    })
+}
+
+fn map_canonical_id(row: &Row<'_>, index: usize) -> rusqlite::Result<CanonicalId> {
+    let value: String = row.get(index)?;
+    value.parse().map_err(|error: CanonicalIdError| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
     })
 }
 
@@ -1829,12 +1841,6 @@ mod tests {
         version
     }
 
-    fn assert_uuid_v7(id: &str) {
-        let uuid = Uuid::parse_str(id).expect("canonical identity must parse as UUID");
-        assert_eq!(uuid.get_version_num(), 7, "{id} is not UUIDv7");
-        assert_eq!(uuid.to_string(), id, "canonical UUID must be lowercase");
-    }
-
     #[tokio::test]
     async fn new_catalog_objects_receive_distinct_canonical_identities() {
         let store = store().await;
@@ -1847,13 +1853,14 @@ mod tests {
         let deployment = store.deploy(&env, &version.id, None).await.unwrap();
 
         let ids = [
-            app.canonical_id.as_str(),
-            env.canonical_id.as_str(),
-            version.canonical_id.as_str(),
-            deployment.canonical_id.as_str(),
+            app.canonical_id,
+            env.canonical_id,
+            version.canonical_id,
+            deployment.canonical_id,
         ];
-        for id in ids {
-            assert_uuid_v7(id);
+        for id in &ids {
+            assert_eq!(id.as_uuid().get_version_num(), 7);
+            assert_eq!(id.to_string(), id.to_string().to_ascii_lowercase());
         }
         let unique = ids.into_iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), ids.len());
@@ -1864,6 +1871,36 @@ mod tests {
         assert_eq!(app.id, "demo");
         assert_eq!(env.name, "production");
         assert_eq!(version.id, deployment.version_id);
+    }
+
+    #[tokio::test]
+    async fn malformed_canonical_identity_in_the_catalog_fails_closed() {
+        let store = store().await;
+        store.create_app("demo").await.unwrap();
+        store
+            .with_conn(|conn| {
+                // Model a file created before the write guard existed, or
+                // altered outside this process. Current direct writes are
+                // rejected by the schema test; the reader must still refuse
+                // pre-existing corruption instead of trusting the label.
+                conn.execute_batch("DROP TRIGGER trg_apps_canonical_id_validate_update_v1;")?;
+                conn.execute(
+                    "UPDATE apps SET canonical_id = '550e8400-e29b-41d4-a716-446655440000' \
+                     WHERE id = 'demo'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let error = store.get_app("demo").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("canonical identity is not UUIDv7"),
+            "unexpected corruption error: {error}"
+        );
     }
 
     /// Version rows written by an earlier run name their bundle relative to

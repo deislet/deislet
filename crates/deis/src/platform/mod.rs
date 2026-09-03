@@ -9,6 +9,7 @@ pub mod storage;
 pub mod telemetry;
 
 use anyhow::{Context, Result, bail};
+use deis_wire::CanonicalId;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +27,7 @@ pub struct App {
     /// Permanent product identity. `None` only when talking to a control
     /// plane from before the canonical-identity migration.
     #[serde(default)]
-    pub canonical_id: Option<String>,
+    pub canonical_id: Option<CanonicalId>,
     pub created_at: i64,
 }
 
@@ -36,7 +37,7 @@ pub struct Version {
     pub id: String,
     /// Permanent product identity; absent only on an older control plane.
     #[serde(default)]
-    pub canonical_id: Option<String>,
+    pub canonical_id: Option<CanonicalId>,
     pub app_id: String,
     /// The per-application counter a person says out loud: "v3".
     pub number: i64,
@@ -76,7 +77,7 @@ pub struct Environment {
     pub id: String,
     /// Permanent product identity; absent only on an older control plane.
     #[serde(default)]
-    pub canonical_id: Option<String>,
+    pub canonical_id: Option<CanonicalId>,
     pub app_id: String,
     pub name: String,
     pub created_at: i64,
@@ -93,7 +94,7 @@ pub struct Deployment {
     pub id: String,
     /// Permanent product identity; absent only on an older control plane.
     #[serde(default)]
-    pub canonical_id: Option<String>,
+    pub canonical_id: Option<CanonicalId>,
     pub app_id: String,
     pub env_id: String,
     pub version_id: String,
@@ -111,6 +112,34 @@ pub struct DeploymentResponse {
     /// Absent when nothing was pushed, which is the case for a plain read.
     #[serde(default)]
     pub delivery: Option<DeliveryReport>,
+}
+
+#[cfg(test)]
+mod canonical_identity_tests {
+    use super::App;
+
+    #[test]
+    fn old_control_without_canonical_identity_remains_readable() {
+        let app: App = serde_json::from_str(r#"{"id":"demo","created_at":1}"#).unwrap();
+        assert!(app.canonical_id.is_none());
+    }
+
+    #[test]
+    fn present_canonical_identity_is_validated() {
+        let valid: App = serde_json::from_str(
+            r#"{"id":"demo","canonical_id":"018f2518-7e38-7f80-8000-000000000001","created_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            valid.canonical_id.unwrap().to_string(),
+            "018f2518-7e38-7f80-8000-000000000001"
+        );
+
+        let malformed = serde_json::from_str::<App>(
+            r#"{"id":"demo","canonical_id":"550e8400-e29b-41d4-a716-446655440000","created_at":1}"#,
+        );
+        assert!(malformed.is_err());
+    }
 }
 
 /// Where a version actually landed.
