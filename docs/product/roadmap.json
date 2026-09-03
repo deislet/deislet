@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-04T03:16:32+08:00",
+  "updatedAt": "2026-09-04T03:35:54+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -99,12 +99,17 @@
           "id": "P0-EVID-001",
           "title": "把能力矩阵和支持文案迁移为 registry 派生视图",
           "owner": "joint",
-          "status": "queued",
+          "status": "active",
           "dependsOn": ["P0-CONF-001"],
           "outputs": [
-            {"type": "planned-path", "value": "generated README/CLI/Web target status views"}
+            {"type": "local-path", "value": "standards/edge-canon.conformance-registry.json"},
+            {"type": "local-path", "value": "docs/product/target-status.schema.json"},
+            {"type": "local-path", "value": "docs/product/target-status.json"},
+            {"type": "local-path", "value": "docs/product/target-status.zh.md"},
+            {"type": "local-path", "value": "scripts/generate-target-status.py"},
+            {"type": "planned-path", "value": "CLI/Web target status views"}
           ],
-          "verification": "仓库不再以 adapter 存在或 artifact 生成表示合规支持"
+          "verification": "python3 scripts/generate-target-status.py --check 已保证离线 JSON/Markdown 状态严格派生自 SHA-256 锁定的 Edge Canon registry，proposal、compliant、supported 与 evidence maturity 不变量失败关闭；完成前仍须让 CLI/Web 使用同一 JSON，并把 compiler 的 provider implementation availability 与标准支持状态彻底分离"
         },
         {
           "id": "P0-MODEL-001",

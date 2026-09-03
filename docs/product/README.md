@@ -14,13 +14,13 @@
 
 - 标准模型：一个版本化能力集合，没有 provider profile 或可选扩展层。
 - 首批一等后端：Deislet、Cloudflare Workers/Pages、Tencent EdgeOne Makers；Deno 暂为实验目标。
-- 标准状态：`edge-canon.next` proposal。
-- 合规状态：没有后端通过该版本的完整 conformance suite。
-- 支持状态：没有后端可依据 `edge-canon.next` 宣称正式支持。
+- 标准、证据、合规和支持状态只读取[自动生成的人类视图](target-status.zh.md)或其[机器 JSON](target-status.json)。这两个文件由锁定的 Edge Canon conformance registry 快照生成；本页不复制状态值，以免形成第二个事实源。
 
 机器读取入口：
 
 - [标准锁定文件](../../standards/edge-canon.lock.json)
+- [锁定的 conformance registry 快照](../../standards/edge-canon.conformance-registry.json)
+- [registry 派生的目标状态 JSON](target-status.json)及其[人类视图](target-status.zh.md)
 - [共享产品契约](../../contracts/v1/README.zh.md)及其[机器 registry](../../contracts/v1/registry.json)
 - [执行路线 JSON](roadmap.json)
 - [路线 JSON Schema](roadmap.schema.json)

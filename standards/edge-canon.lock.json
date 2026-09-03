@@ -12,7 +12,9 @@
     "conformanceKitPath": "conformance/kit.json",
     "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
     "registryPath": "conformance/registry.json",
-    "registrySchemaPath": "schemas/conformance-registry.schema.json"
+    "registrySchemaPath": "schemas/conformance-registry.schema.json",
+    "registrySnapshotPath": "standards/edge-canon.conformance-registry.json",
+    "registrySha256": "0e748ea1d683c0f2ac91483e4e2d52b398ed0578ec1591fe6e6f49087549cd66"
   },
   "standard": {
     "contractId": "edge-canon.next",

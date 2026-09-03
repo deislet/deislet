@@ -3,17 +3,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
 import tomllib
 from pathlib import Path
 
+import jsonschema
+
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_ADRS = list(range(1, 23))
 EXPECTED_PHASES = [f"phase-{number}" for number in range(6)]
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 WORK_ID = re.compile(r"^P([0-5])-[A-Z]+-[0-9]{3}$")
 EXPECTED_WORKSPACE_TIMEOUT_MINUTES = 60
 EXPECTED_TEST_SHARD_TIMEOUT_MINUTES = 90
@@ -142,6 +146,7 @@ def validate_standard_lock() -> str:
         "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
         "registryPath": "conformance/registry.json",
         "registrySchemaPath": "schemas/conformance-registry.schema.json",
+        "registrySnapshotPath": "standards/edge-canon.conformance-registry.json",
     }
     for key, expected in expected_sources.items():
         require(source.get(key) == expected, f"standard lock {key} must be {expected}")
@@ -151,6 +156,25 @@ def validate_standard_lock() -> str:
     require(verification.get("expectedDraftClauses") == 20, "unexpected draft clause count")
     require(verification.get("expectedConformanceSuites") == 15, "unexpected conformance suite count")
     require(verification.get("expectedBackends") == 4, "unexpected backend record count")
+
+    registry_digest = source.get("registrySha256", "")
+    require(bool(SHA256.fullmatch(registry_digest)), "standard lock registrySha256 is not SHA-256")
+    registry_relative = source["registrySnapshotPath"]
+    try:
+        registry_bytes = (ROOT / registry_relative).read_bytes()
+    except OSError as error:
+        raise ValidationError(f"{registry_relative}: {error}") from error
+    actual_registry_digest = hashlib.sha256(registry_bytes).hexdigest()
+    require(
+        actual_registry_digest == registry_digest,
+        f"{registry_relative}: digest differs from the standard lock",
+    )
+    registry = load_json(registry_relative)
+    require(registry.get("standardId") == standard.get("contractId"), "registry standardId drifted")
+    require(
+        registry.get("standardReleaseStatus") == standard.get("releaseStatus"),
+        "registry release status drifted",
+    )
 
     pinned_documents = [
         "docs/adr/README.md",
@@ -222,6 +246,18 @@ def validate_roadmap() -> None:
         require(work[item_id].get("status") in {"active", "queued"}, f"{item_id}: invalid next-action status")
     require(work[next_actions[0]].get("status") == "active", "first next action must be active")
 
+    status_schema = load_json("docs/product/target-status.schema.json")
+    target_status = load_json("docs/product/target-status.json")
+    try:
+        jsonschema.validate(
+            instance=target_status,
+            schema=status_schema,
+            format_checker=jsonschema.FormatChecker(),
+        )
+    except jsonschema.ValidationError as error:
+        location = "/".join(str(part) for part in error.absolute_path) or "<root>"
+        raise ValidationError(f"target-status.json {location}: {error.message}") from error
+
 
 def validate_integration() -> None:
     workflow = read_text(".github/workflows/checks.yml")
@@ -232,6 +268,10 @@ def validate_integration() -> None:
     require(
         "python3 scripts/check-shared-contracts.py" in workflow,
         "CI does not execute the shared product contract fixtures",
+    )
+    require(
+        "python3 scripts/generate-target-status.py --check" in workflow,
+        "CI does not reject registry-derived target status drift",
     )
     require((ROOT / "contracts/v1/registry.json").is_file(), "shared product contract registry is missing")
     require((ROOT / "contracts/v1/README.zh.md").is_file(), "shared product contract documentation is missing")
@@ -321,7 +361,10 @@ def validate_integration() -> None:
     implementation = read_text("docs/implementation-plan.zh.md")
     require("文档边界（2026-09-03）" in implementation, "legacy implementation spec lacks its authority boundary")
     product = read_text("docs/product/README.md")
-    require("没有后端可依据 `edge-canon.next` 宣称正式支持" in product, "current support boundary is ambiguous")
+    require(
+        "target-status.zh.md" in product and "target-status.json" in product,
+        "product entry does not delegate support status to generated registry views",
+    )
 
 
 def main() -> int:
