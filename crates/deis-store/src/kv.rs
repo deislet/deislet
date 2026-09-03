@@ -19,6 +19,7 @@ use crate::proto::storage::{
 use crate::sqlite::{PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
 use crate::{prefix_upper_bound, unix_seconds};
+use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences};
 use rusqlite::OptionalExtension;
 use tonic::{Request, Response, Status};
 
@@ -96,11 +97,21 @@ impl From<KvListing> for KvEntry {
 #[derive(Clone)]
 pub struct KvService {
     pool: SqlitePool,
+    fences: TenantWriteFences,
 }
 
 impl KvService {
     /// Open `<data_dir>/kv.sqlite` and make sure the schema is there.
     pub async fn open(data_dir: &std::path::Path, connections: usize) -> StoreResult<Self> {
+        let fences = TenantWriteFences::open(data_dir.join("migration-fences.sqlite")).await?;
+        Self::open_with_fences(data_dir, connections, fences).await
+    }
+
+    pub(crate) async fn open_with_fences(
+        data_dir: &std::path::Path,
+        connections: usize,
+        fences: TenantWriteFences,
+    ) -> StoreResult<Self> {
         let pool = SqlitePool::new(data_dir.join("kv.sqlite"), "kv", PoolSize::new(connections));
         pool.migrate(|conn| {
             // Before anything is created: a kv.sqlite from before the tenant
@@ -123,7 +134,7 @@ impl KvService {
         })
         .await?;
         tracing::info!(path = %pool.path().display(), "kv store ready");
-        Ok(Self { pool })
+        Ok(Self { pool, fences })
     }
 
     /// Read one key, honouring expiry.
@@ -169,6 +180,7 @@ impl KvService {
         metadata: Option<String>,
         expires_at: Option<i64>,
     ) -> StoreResult<()> {
+        let _permit = self.fences.permit(tenant.as_str()).await?;
         let key = check_key(key)?;
         let tenant_id = tenant.as_str().to_string();
         self.pool
@@ -190,6 +202,7 @@ impl KvService {
     /// Remove one key. Removing a key that is not there is not an error.
     /// Returns whether a row was actually removed.
     pub async fn delete(&self, tenant: &TenantId, key: &str) -> StoreResult<bool> {
+        let _permit = self.fences.permit(tenant.as_str()).await?;
         let key = check_key(key)?;
         let tenant_id = tenant.as_str().to_string();
         self.pool
@@ -199,6 +212,61 @@ impl KvService {
                     rusqlite::params![tenant_id, key],
                 )?;
                 Ok(removed > 0)
+            })
+            .await
+    }
+
+    /// Deterministic evidence for the live KV rows present when the writer
+    /// fence was acquired. Entries already expired at that instant are
+    /// logically absent and are not migrated.
+    pub async fn inventory(&self, tenant: &TenantId) -> StoreResult<ComponentInventory> {
+        let (receipt, _fence) = self.fences.fenced_read(tenant.as_str()).await?;
+        self.inventory_with_fence_held(tenant, receipt.acquired_at_unix_seconds)
+            .await
+    }
+
+    /// Build inventory while the caller holds this tenant's fence read guard.
+    pub(crate) async fn inventory_with_fence_held(
+        &self,
+        tenant: &TenantId,
+        fence_acquired_at: i64,
+    ) -> StoreResult<ComponentInventory> {
+        let tenant_id = tenant.as_str().to_string();
+        self.pool
+            .with_conn(move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT key, value, metadata, expires_at
+                       FROM kv
+                      WHERE tenant = ?1
+                        AND (expires_at IS NULL OR expires_at > ?2)
+                      ORDER BY key",
+                )?;
+                let mut rows = statement.query(rusqlite::params![tenant_id, fence_acquired_at])?;
+                let mut hash = InventoryHasher::new("kv");
+                let mut count = 0u64;
+                let mut bytes = 0u64;
+                while let Some(row) = rows.next()? {
+                    let key: String = row.get(0)?;
+                    let value: Vec<u8> = row.get(1)?;
+                    let metadata: Option<String> = row.get(2)?;
+                    let expires_at: Option<i64> = row.get(3)?;
+                    hash.field(key.as_bytes());
+                    hash.field(&value);
+                    hash.optional_field(metadata.as_deref().map(str::as_bytes));
+                    match expires_at {
+                        Some(expires_at) => {
+                            hash.field(b"expires");
+                            hash.field(&expires_at.to_be_bytes());
+                        }
+                        None => hash.field(b"no-expiry"),
+                    }
+                    count += 1;
+                    bytes = bytes
+                        .saturating_add(key.len() as u64)
+                        .saturating_add(value.len() as u64)
+                        .saturating_add(metadata.as_ref().map_or(0, |value| value.len() as u64));
+                }
+                Ok(hash.finish("kv", count, bytes, 0, 0))
             })
             .await
     }
@@ -372,15 +440,42 @@ impl KvService {
     /// Returns how many rows went away.
     pub async fn sweep_expired(&self) -> StoreResult<usize> {
         let now = unix_seconds();
-        self.pool
+        let tenants = self
+            .pool
             .with_conn(move |conn| {
-                let removed = conn.execute(
-                    "DELETE FROM kv WHERE expires_at IS NOT NULL AND expires_at <= ?1",
-                    rusqlite::params![now],
+                let mut statement = conn.prepare(
+                    "SELECT DISTINCT tenant FROM kv
+                      WHERE expires_at IS NOT NULL AND expires_at <= ?1
+                      ORDER BY tenant",
                 )?;
-                Ok(removed)
+                let tenants = statement
+                    .query_map([now], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(tenants)
             })
-            .await
+            .await?;
+        let mut removed = 0usize;
+        for tenant in tenants {
+            let permit = match self.fences.permit(&tenant).await {
+                Ok(permit) => permit,
+                Err(deis_backend_migration::FenceError::Fenced(_)) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let scoped_tenant = tenant.clone();
+            removed += self
+                .pool
+                .with_conn(move |conn| {
+                    let count = conn.execute(
+                        "DELETE FROM kv
+                          WHERE tenant = ?1 AND expires_at IS NOT NULL AND expires_at <= ?2",
+                        rusqlite::params![scoped_tenant, now],
+                    )?;
+                    Ok(count)
+                })
+                .await?;
+            drop(permit);
+        }
+        Ok(removed)
     }
 }
 

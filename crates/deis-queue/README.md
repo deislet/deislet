@@ -7,6 +7,15 @@ is scoped by the `x-deis-tenant` header and, once an `auth_secret` is set, by
 a capability token for that tenant. The crate docs in `src/lib.rs` describe
 the design; `proto/queue.proto` is the contract.
 
+When `migration_admin_token` is configured, the process also exposes the
+shared `deis.backend.migration.v1.BackendMigration` management service. It
+accepts only `Authorization: Bearer <token>` and never the queue's application
+credential. A tenant fence drains earlier mutations, is durable across a
+restart in `migration-fences.sqlite`, and covers send, lease, ack, nack,
+dead-letter replay and retention. Inventory remains readable while writes are
+frozen. Leaving the setting absent means the management service is not
+registered.
+
 ## What one tenant can do to every other tenant
 
 **There is no per-tenant quota.** One message body, one batch and one pull

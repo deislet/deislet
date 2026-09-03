@@ -1,6 +1,6 @@
 # Deislet Architecture Decision Records
 
-本目录保存从 2026-09-03 产品梳理开始已接受的 22 项决策。`Accepted` 表示 Deislet 的产品与实现方向已经确定；涉及应用标准的条款仍须经 Edge Canon 独立治理进入某个不可变标准版本。
+本目录保存从 2026-09-03 产品梳理开始已接受的 23 项决策。`Accepted` 表示 Deislet 的产品与实现方向已经确定；涉及应用标准的条款仍须经 Edge Canon 独立治理进入某个不可变标准版本。
 
 - 决策事实与问题来源：[阶段分析](../product/phase-analysis-2026-09-03.zh.md)
 - 可执行工程路线：[产品级路线](../product/roadmap.zh.md)
@@ -34,5 +34,6 @@
 | [020](020-reference-vendor-intersection.md) | 参考供应商主流语义交集 | Accepted |
 | [021](021-conformance-evidence-and-certification.md) | 证据成熟度与合规认证 | Accepted |
 | [022](022-entry-plan-resource-baseline.md) | 最低免费或入门档共同资源基线 | Accepted；局部取代 ADR-005 |
+| [023](023-backend-migration-fence-and-inventory.md) | 后端迁移清单与真实写入栅栏 | Accepted |
 
 ADR 不原地改写已接受决策。方向改变时新增 superseding ADR，并在旧记录与索引中建立双向链接。

@@ -16,6 +16,7 @@ anyhow = { workspace = true }
 # Both are what keeps a tenant's SQL inside its own file; see `crate::database`.
 rusqlite = { workspace = true, features = ["hooks", "limits"] }
 deis-wire = { workspace = true }
+deis-backend-migration = { path = "../deis-backend-migration" }
 tonic = "0.12"
 tonic-health = "0.12"
 prost = "0.13"

@@ -31,9 +31,12 @@
 use crate::MAX_GRPC_MESSAGE_BYTES;
 use crate::auth::QueueAuth;
 use crate::config::Config;
+use crate::migration::QueueMigrationService;
 use crate::proto::queue::queue_server::QueueServer;
 use crate::queue::QueueService;
 use anyhow::{Context, Result};
+use deis_backend_migration::MigrationAuth;
+use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
 use std::future::Future;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -177,6 +180,21 @@ pub async fn serve(
     // Before the queue is even opened: an address this service must not serve
     // on is a refusal to start, not a request that fails later.
     let auth = QueueAuth::for_listener(&config, addr)?;
+    let migration_auth = match config.migration_admin_token.as_deref() {
+        Some(token) => {
+            if config.auth_secret.as_deref() == Some(token) {
+                anyhow::bail!(
+                    "migration_admin_token must not reuse auth_secret; the management service was not started"
+                );
+            }
+            Some(
+                MigrationAuth::new(token).context(
+                    "invalid migration_admin_token; the management service was not started",
+                )?,
+            )
+        }
+        None => None,
+    };
     let queue = open(&config).await?;
     let sweeper = spawn_dead_letter_sweeper(queue.clone(), config.dead_letter_sweep_interval_secs);
 
@@ -188,6 +206,31 @@ pub async fn serve(
     health_reporter
         .set_serving::<QueueServer<QueueService>>()
         .await;
+    if migration_auth.is_some() {
+        health_reporter
+            .set_serving::<BackendMigrationServer<QueueMigrationService>>()
+            .await;
+    }
+
+    let migration_service = match migration_auth {
+        Some(auth) => {
+            tracing::info!(
+                "queue migration management enabled with independent bearer authentication"
+            );
+            Some(InterceptedService::new(
+                BackendMigrationServer::new(QueueMigrationService::new(queue.clone()))
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+                auth,
+            ))
+        }
+        None => {
+            tracing::warn!(
+                "migration_admin_token is not configured, so queue inventory and writer-fence RPCs are not registered"
+            );
+            None
+        }
+    };
 
     info_ready(&config, addr, &auth);
 
@@ -206,6 +249,7 @@ pub async fn serve(
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
             &auth,
         ))
+        .add_optional_service(migration_service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await;
 
@@ -274,6 +318,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _queue = open(&config_for(&dir)).await.unwrap();
         assert!(dir.path().join("queue.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn migration_management_refuses_to_reuse_the_application_secret() {
+        let dir = TempDir::new().unwrap();
+        let secret = "one-secret-must-not-open-two-authentication-domains".to_string();
+        let config = Config {
+            auth_secret: Some(secret.clone()),
+            migration_admin_token: Some(secret),
+            data_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = serve(config, listener, async {}).await.unwrap_err();
+        assert!(error.to_string().contains("must not reuse auth_secret"));
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "credential validation must happen before the service creates durable state"
+        );
     }
 
     /// A queue.sqlite written before the tenant change holds messages that

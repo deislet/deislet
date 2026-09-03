@@ -11,6 +11,10 @@
 //! and one test pairs `app-one.production` with `app-one.preview` to check
 //! that two environments of the *same* application are also two namespaces.
 
+use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
+use deis_backend_migration::proto::{
+    AcquireWriteFenceRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
+};
 use deis_store::config::Config;
 use deis_store::proto::blob::{
     BlobInfo, PutHeader, PutRequest, blob_store_client::BlobStoreClient, get_response, put_request,
@@ -54,19 +58,26 @@ impl Harness {
     /// A server over a data directory the caller keeps, so the same one can
     /// be served twice.
     async fn start_on(data_dir: &std::path::Path) -> Self {
-        Self::start_over(None, data_dir.to_path_buf(), None).await
+        Self::start_over(None, data_dir.to_path_buf(), None, None).await
+    }
+
+    async fn start_migration_authenticated(token: &str) -> Self {
+        let data = TempDir::new().unwrap();
+        let data_dir = data.path().to_path_buf();
+        Self::start_over(Some(data), data_dir, None, Some(token.to_string())).await
     }
 
     async fn start_with(auth_secret: Option<String>) -> Self {
         let data = TempDir::new().unwrap();
         let data_dir = data.path().to_path_buf();
-        Self::start_over(Some(data), data_dir, auth_secret).await
+        Self::start_over(Some(data), data_dir, auth_secret, None).await
     }
 
     async fn start_over(
         owned: Option<TempDir>,
         data_dir: std::path::PathBuf,
         auth_secret: Option<String>,
+        migration_admin_token: Option<String>,
     ) -> Self {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
@@ -75,6 +86,7 @@ impl Harness {
             // enough for the multi-chunk object below.
             max_object_bytes: 8 * 1024 * 1024,
             auth_secret,
+            migration_admin_token,
             ..Config::default()
         };
         // Bind first, so the port is known before anything is spawned and no
@@ -121,6 +133,12 @@ impl Harness {
             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
+
+    async fn migration(&self) -> BackendMigrationClient<Channel> {
+        BackendMigrationClient::new(self.channel().await)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+    }
 }
 
 impl Drop for Harness {
@@ -137,6 +155,14 @@ fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     request
         .metadata_mut()
         .insert(TENANT_HEADER, tenant.parse().unwrap());
+    request
+}
+
+fn as_migration_admin<T>(token: &str, message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     request
 }
 
@@ -1725,4 +1751,105 @@ async fn a_single_chunk_above_the_message_ceiling_is_refused_not_an_internal_err
         .await
         .unwrap_err();
     assert_eq!(absent.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn migration_management_is_absent_by_default_and_independently_authenticated() {
+    const ADMIN: &str = "migration-admin-token-000000000000000001";
+    const MIGRATION: &str = "01990f44-1000-7000-8000-000000000050";
+    const FENCE: &str = "migration-fence-token-00000000000000001";
+    let request = || AcquireWriteFenceRequest {
+        tenant: "shop.production".to_string(),
+        migration_id: MIGRATION.to_string(),
+        expected_application_revision: 3,
+        fence_token: FENCE.to_string(),
+    };
+
+    let without_management = Harness::start().await;
+    let error = without_management
+        .migration()
+        .await
+        .acquire_write_fence(Request::new(request()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unimplemented);
+    drop(without_management);
+
+    let harness = Harness::start_migration_authenticated(ADMIN).await;
+    let mut migration = harness.migration().await;
+    let mut application_credential = Request::new(request());
+    application_credential
+        .metadata_mut()
+        .insert(STORAGE_TOKEN_HEADER, "not-an-admin-token".parse().unwrap());
+    assert_eq!(
+        migration
+            .acquire_write_fence(application_credential)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    let receipt = migration
+        .acquire_write_fence(as_migration_admin(ADMIN, request()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(receipt.tenant, "shop.production");
+    assert_eq!(receipt.receipt_sha256.len(), 64);
+
+    let error = harness
+        .kv()
+        .await
+        .set(as_tenant(
+            "shop.production",
+            SetRequest {
+                key: "blocked".to_string(),
+                value: b"value".to_vec(),
+                ttl_seconds: None,
+                metadata: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    let inventory = migration
+        .inspect_tenant(as_migration_admin(
+            ADMIN,
+            InspectTenantRequest {
+                tenant: "shop.production".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(inventory.backend, "deis-store");
+    assert_eq!(inventory.components.len(), 3);
+
+    let stale = ReleaseWriteFenceRequest {
+        tenant: "shop.production".to_string(),
+        migration_id: MIGRATION.to_string(),
+        expected_application_revision: 3,
+        fence_token: "different-fence-token-00000000000000002".to_string(),
+    };
+    assert_eq!(
+        migration
+            .release_write_fence(as_migration_admin(ADMIN, stale))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Aborted
+    );
+    migration
+        .release_write_fence(as_migration_admin(
+            ADMIN,
+            ReleaseWriteFenceRequest {
+                tenant: "shop.production".to_string(),
+                migration_id: MIGRATION.to_string(),
+                expected_application_revision: 3,
+                fence_token: FENCE.to_string(),
+            },
+        ))
+        .await
+        .unwrap();
 }

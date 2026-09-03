@@ -18,9 +18,12 @@ use crate::blob::BlobService;
 use crate::config::Config;
 use crate::database::{DatabaseService, SqlLimits, TransactionLimits};
 use crate::kv::KvService;
+use crate::migration::StoreMigrationService;
 use crate::proto::blob::blob_store_server::BlobStoreServer;
 use crate::proto::storage::{database_server::DatabaseServer, kv_store_server::KvStoreServer};
 use anyhow::{Context, Result};
+use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
+use deis_backend_migration::{MigrationAuth, TenantWriteFences};
 use std::future::Future;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -45,6 +48,7 @@ pub struct Stores {
     pub kv: KvService,
     pub database: DatabaseService,
     pub blob: BlobService,
+    pub(crate) fences: TenantWriteFences,
 }
 
 impl Stores {
@@ -52,19 +56,36 @@ impl Stores {
     pub async fn open(config: &Config) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("cannot create data dir {}", config.data_dir.display()))?;
-        let kv = KvService::open(&config.data_dir, config.shared_connections)
+        let fences = TenantWriteFences::open(config.data_dir.join("migration-fences.sqlite"))
             .await
-            .context("cannot open the KV store")?;
-        let database = DatabaseService::open(&config.data_dir, config.tenant_connections)
-            .context("cannot open the database service")?;
-        let blob = BlobService::open(
+            .context("cannot open the storage migration fence journal")?;
+        let kv = KvService::open_with_fences(
+            &config.data_dir,
+            config.shared_connections,
+            fences.clone(),
+        )
+        .await
+        .context("cannot open the KV store")?;
+        let database = DatabaseService::open_with_fences(
+            &config.data_dir,
+            config.tenant_connections,
+            fences.clone(),
+        )
+        .context("cannot open the database service")?;
+        let blob = BlobService::open_with_fences(
             &config.data_dir,
             config.shared_connections,
             config.blob_limits(),
+            fences.clone(),
         )
         .await
         .context("cannot open the blob store")?;
-        Ok(Self { kv, database, blob })
+        Ok(Self {
+            kv,
+            database,
+            blob,
+            fences,
+        })
     }
 }
 
@@ -164,6 +185,21 @@ pub async fn serve(
     // Before the stores are even opened: an address this service must not
     // serve on is a refusal to start, not a request that fails later.
     let auth = StorageAuth::for_listener(&config, addr)?;
+    let migration_auth = match config.migration_admin_token.as_deref() {
+        Some(token) => {
+            if config.auth_secret.as_deref() == Some(token) {
+                anyhow::bail!(
+                    "migration_admin_token must not reuse auth_secret; the management service was not started"
+                );
+            }
+            Some(
+                MigrationAuth::new(token).context(
+                    "invalid migration_admin_token; the management service was not started",
+                )?,
+            )
+        }
+        None => None,
+    };
     let stores = Stores::open(&config).await?;
     let sweeper = spawn_kv_sweeper(stores.kv.clone(), config.kv_sweep_interval_secs);
     let snapshots = spawn_snapshots(&config);
@@ -182,6 +218,31 @@ pub async fn serve(
     health_reporter
         .set_serving::<BlobStoreServer<BlobService>>()
         .await;
+    if migration_auth.is_some() {
+        health_reporter
+            .set_serving::<BackendMigrationServer<StoreMigrationService>>()
+            .await;
+    }
+
+    let migration_service = match migration_auth {
+        Some(auth) => {
+            tracing::info!(
+                "storage migration management enabled with independent bearer authentication"
+            );
+            Some(InterceptedService::new(
+                BackendMigrationServer::new(StoreMigrationService::new(stores.clone()))
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+                auth,
+            ))
+        }
+        None => {
+            tracing::warn!(
+                "migration_admin_token is not configured, so storage inventory and writer-fence RPCs are not registered"
+            );
+            None
+        }
+    };
 
     info_ready(
         &config,
@@ -211,6 +272,7 @@ pub async fn serve(
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
             &auth,
         ))
+        .add_optional_service(migration_service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await;
 
@@ -318,6 +380,25 @@ mod tests {
         assert!(dir.path().join("blob.sqlite").exists());
         assert!(dir.path().join("db").is_dir());
         assert!(dir.path().join("blob").is_dir());
+    }
+
+    #[tokio::test]
+    async fn migration_management_refuses_to_reuse_the_application_secret() {
+        let dir = TempDir::new().unwrap();
+        let secret = "one-secret-must-not-open-two-authentication-domains".to_string();
+        let config = Config {
+            auth_secret: Some(secret.clone()),
+            migration_admin_token: Some(secret),
+            data_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = serve(config, listener, async {}).await.unwrap_err();
+        assert!(error.to_string().contains("must not reuse auth_secret"));
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "credential validation must happen before the service creates durable state"
+        );
     }
 
     /// A data directory written before the tenant change holds data nothing

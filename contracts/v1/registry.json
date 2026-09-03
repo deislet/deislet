@@ -11,7 +11,8 @@
     {"id": "binding-snapshot", "schema": "contracts/v1/binding-snapshot.schema.json"},
     {"id": "operation", "schema": "contracts/v1/operation.schema.json"},
     {"id": "provider-driver", "schema": "contracts/v1/provider-driver.schema.json"},
-    {"id": "identity-migration", "schema": "contracts/v1/identity-migration.schema.json"}
+    {"id": "identity-migration", "schema": "contracts/v1/identity-migration.schema.json"},
+    {"id": "backend-migration-evidence", "schema": "contracts/v1/backend-migration-evidence.schema.json"}
   ],
   "operationTransitions": "contracts/v1/operation-transitions.json",
   "fixtures": "contracts/v1/fixtures.json",

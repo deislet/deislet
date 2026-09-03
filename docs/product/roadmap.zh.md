@@ -19,7 +19,7 @@
 
 ## 当前已完成
 
-- `P0-DEC-001`：22 份决策和阶段事实基线已迁入仓库；ADR-022 局部取代 ADR-005 的套餐基线，要求所有参考供应商最低免费/入门档都达到同一标准保证。
+- `P0-DEC-001`：23 份决策和阶段事实基线已迁入仓库；ADR-022 局部取代 ADR-005 的套餐基线，要求所有参考供应商最低免费/入门档都达到同一标准保证；ADR-023 固定后端 inventory 与 writer fence 必须位于真实提交边界并使用独立管理认证域。
 - `P0-SPEC-001`：Edge Canon `edge-canon.next` proposal 与单一标准契约已建立。
 - `P0-CONF-001`：公开 registry、证据成熟度和认证不变量已建立。
 - `P0-ROAD-001`：路线、标准锁定、跨文件校验和 CI 门禁已建立。
@@ -29,12 +29,12 @@
 ## 当前进行中
 
 - `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 已形成 20 条候选条款和 11 个 provider-independent 草案用例。最低资源保证已固定采用所有参考供应商最低免费/入门档共同基线，但具体数值、计量和超限行为仍为 `pending`；执行 harness 仍为 `planned`，其余 14 个能力族尚未开始，故本项继续保持 `active`。
-- `P0-MODEL-001`：已建立 canonical identity、artifact、binding snapshot、operation、provider driver 和 identity migration 六份 Draft schema，配套 12 个正反 fixture 与可执行状态图校验。Rust/SQLite/API 已完成 application/environment/version/deployment 的增量 UUIDv7、共享强类型、旧库回填和旧 writer 兼容，四类 identity 一经分配均拒绝擦除或改绑到另一合法 UUIDv7；`CanonicalTenantId` 经 Control push/assignment 传输，节点成对 fail-closed 持久化并拒绝重绑/擦除；runtime placement 与 storage authority 已分离。Control 内部又新增持久 migration/operation ID、规范且确定的 catalog inventory、绑定 canonical app/environment 归属的 binding ID、application revision 与 SQLite catalog fence：重复计划幂等，过期 token/revision、错误 manifest owner、跨应用引用、历史 binding 歧义和 fence 后的新旧 writer 均被拒绝，失败不留下部分 mapping。Deislet 后端现为逻辑 `v1/<app UUIDv7>/<environment UUIDv7>` 定义独立、版本化且可逆的单路径组件物理编码 `ct1_<app UUIDv7>_<environment UUIDv7>`；binding 后缀只用永久 UUIDv7。store 的 KV/SQL/blob、snapshot/restore/orphan scan 与 queue reopen 已验证 canonical 迁移目标和 legacy 数据相互隔离。该物理编码不是标准 wire identity，live request parser 仍拒绝逻辑和物理 canonical key；外部组件仍为 `pending`，内部记录也尚不是完整公共 Operation API，store/queue writer fence、token/binding cutover 均未完成，故本项继续保持 `active`。
+- `P0-MODEL-001`：七份 Draft schema 与 14 个正反 fixture 已覆盖 canonical identity/artifact/binding/operation/driver、identity migration 和 backend fence evidence。除 canonical ID、tenant transport、catalog inventory/fence 与物理 namespace 外，现已实现共享 `BackendMigration` gRPC、独立且默认关闭的管理认证、持久单调 per-tenant writer fence，以及 KV/SQL/blob/queue 的确定性 inventory。fence 等待在途写入和 SQL transaction 到真实提交点，覆盖 KV expiry、blob orphan scan、queue lease/ack/nack/replay/retention；重启恢复、错误凭证拒绝、应用 token 隔离和真实 gRPC 路径均有测试。该成果只把 Deislet store/queue 从 `pending` 推进到“可由 coordinator 捕获 evidence”的实现状态：Control 尚未编排/持久化 evidence，telemetry/stateful/provider 仍未实现，live parser、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 均未完成，故本项继续保持 `active`。
 
 ## 紧接着执行
 
 1. `P0-SPEC-002`：先完成 `web-fetch-events` 的最低资源保证、依赖类型和三后端可执行 harness，再按其闭环逐项完成其余 14 个 mandatory 能力族；`pending` 是发布阻断项。
-2. `P0-MODEL-001`：在已完成 ID 分配、canonical tenant 传输、catalog inventory/revision fence、runtime 权限入口拆分和 Deislet 物理 canonical namespace 编码的基础上，下一步为 KV/SQL/blob/queue/telemetry/provider 实现可证明的外部 inventory 与 storage-writer fence；之后才可启用 canonical-first dual-read，执行 copy/verify/cutover、旧 token 撤销与 rollback。catalog fence 不能冒充 storage fence，后端物理 key 也不能冒充标准逻辑身份或 capability subject。
+2. `P0-MODEL-001`：下一步由 Control 创建正式 migration Operation，使用独立管理凭证协调 catalog + store + queue fence 并持久化七份契约格式的 evidence；restore 必须成为新的 backend incarnation 并重新 fence/校验，而不是复制或丢弃旧 journal 后猜测；同时为 telemetry、Stateful Objects、provider resources 补同语义接口。只有所有必需 component 的 orphan/unchecked 都为零后，才进入 canonical-first dual-read、copy/verify/cutover、旧 token 撤销与 rollback。后端物理 key 仍不能冒充标准逻辑身份或 capability subject。
 
 ## 执行规则
 

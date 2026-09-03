@@ -31,6 +31,12 @@ listen = "127.0.0.1:8091"
 # Required as soon as `listen` is not a loopback address.
 # auth_secret = "put a long random string here"
 
+# Enables the separate BackendMigration gRPC service used by Control to
+# acquire durable queue writer fences and collect deterministic inventory.
+# Calls must send `Authorization: Bearer <token>` even on loopback. Do not
+# reuse auth_secret.
+# migration_admin_token = "put a different long random string here"
+
 # Directory holding queue.sqlite.
 #
 # A tenant is one application in one environment, spelled "<app>.<environment>"

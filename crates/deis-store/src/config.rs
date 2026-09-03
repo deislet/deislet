@@ -32,7 +32,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// On-disk configuration. Every field has a default so an empty file works.
-#[derive(Debug, Clone, Deserialize)]
+// Deliberately not `Debug`: this value owns two plaintext credentials and a
+// derived formatter would copy them into panic reports or diagnostic logs.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Address the gRPC server binds to.
@@ -58,6 +60,12 @@ pub struct Config {
     /// reasoning and the refusal.
     #[serde(default)]
     pub auth_secret: Option<String>,
+    /// Independent credential for backend migration inventory and writer
+    /// fencing. When absent, the management service is not registered at
+    /// all, including on loopback. It must never reuse `auth_secret`: an
+    /// application storage capability cannot become a migration authority.
+    #[serde(default)]
+    pub migration_admin_token: Option<String>,
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -206,6 +214,7 @@ impl Default for Config {
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
             auth_secret: None,
+            migration_admin_token: None,
             snapshot_dir: None,
             snapshot_interval_secs: default_snapshot_interval_secs(),
             snapshot_retention: default_snapshot_retention(),
@@ -268,6 +277,7 @@ mod tests {
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
         assert_eq!(parsed.auth_secret, defaults.auth_secret);
+        assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.snapshot_dir, defaults.snapshot_dir);
         assert_eq!(
             parsed.snapshot_interval_secs,
@@ -431,6 +441,7 @@ mod tests {
         let parsed: Config = toml::from_str(
             r#"
             auth_secret = "a-shared-secret"
+            migration_admin_token = "an-independent-migration-secret"
             snapshot_dir = "/var/backups/deis-store"
             snapshot_interval_secs = 3600
             snapshot_retention = 24
@@ -438,6 +449,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.auth_secret.as_deref(), Some("a-shared-secret"));
+        assert_eq!(
+            parsed.migration_admin_token.as_deref(),
+            Some("an-independent-migration-secret")
+        );
         let schedule = parsed.snapshot_schedule().unwrap();
         assert_eq!(schedule.interval, Duration::from_secs(3600));
         assert_eq!(schedule.retention, 24);

@@ -110,6 +110,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod legacy;
+pub mod migration;
 pub mod proto;
 pub mod queue;
 pub mod server;

@@ -1,0 +1,68 @@
+# ADR-023：后端迁移清单与写入栅栏必须位于真实提交边界
+
+- 状态：Accepted
+- 日期：2026-09-04
+- 决策者：产品负责人已确认的统一标准方向；本记录落实 ADR-019 的后端约束
+- 关联：[ADR-019](019-coordinated-data-lifecycle.md)、`../product/phase-analysis-2026-09-03.zh.md` 第 13 节、`../../contracts/v1/backend-migration-evidence.schema.json`
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/proposals/0001-unified-platform-contract/README.zh.md)
+
+## 决策
+
+名称身份迁移、删除、导出和恢复所需的后端清单与写入栅栏采用一份统一管理契约。Deislet 内置 store 和 queue、后续 HA 持久层以及 provider driver 可以有不同实现，但必须给出相同语义的证据：
+
+1. 管理面使用独立的 `migration-admin` 认证域。应用数据面的 `x-deis-storage-token` 不能调用、替代或派生迁移管理权限。
+2. 未显式配置管理凭证时，管理服务不注册；loopback 不构成绕过。配置后只接受 `Authorization: Bearer <token>`，凭证至少 32 bytes，不能写入日志、receipt 或 inventory。
+3. `AcquireWriteFence` 必须等待此前已获准的写入完成，在后端自己的持久 journal 中提交单调递增 epoch 后才返回。它不是 Control catalog 中的状态标记。
+4. 每次后端写入从获准开始到 durable commit 或 rollback 完成一直持有同一个租户许可。SQL 交互事务从 `BEGIN IMMEDIATE` 前一直持有到真实 `COMMIT/ROLLBACK` 后；queue 的 lease、ack、nack、dead-letter、replay 和 retention 也都是写入。
+5. fence 后允许只读 inventory/copy，但 inventory 在执行期间钉住 fence，`ReleaseWriteFence` 必须等待它完成，不能在三个 component 的 snapshot 之间恢复写入。
+6. `InspectTenant` 返回规范排序、length-delimited SHA-256、item count、logical bytes、orphan count 和 unchecked orphan count。无法读取、内容摘要不匹配、SQL WAL 未完全 checkpoint 或存在不可检查项时不得宣称 verified。
+7. acquire 的完全相同重试幂等；不同 migration ID、application revision 或 token 发生冲突。release 只接受获得当前 fence 的完全相同三元组，避免过期协调器解除新 fence。
+8. release 是 cutover 前 rollback 的入口。cutover 后由 Control 的迁移 operation 决定是否保留旧 namespace fence、何时撤销旧 capability 和写入 tombstone；后端不能自行猜测。
+
+## 线性化点
+
+```text
+old writer: permit ───────── durable commit ─ release permit
+                                      │
+AcquireWriteFence: wait ──────────────┼─ journal commit(epoch) ─ receipt
+                                                              │
+new writer:                            wait/read fence ────────┴─ refuse
+inventory:                                               pin ─── digest ─ unpin
+release:                                                 wait ─────────── journal release
+```
+
+“已 fence”只在 journal 的 acquire transaction 成功后成立。请求被取消时，负责状态转换的后端任务仍完成 journal 与内存 gate 的同步，不能出现“磁盘已 fence、当前进程仍放行”的窗口。服务重启先恢复全部 active fence，再开始接受应用请求。
+
+## Deislet embedded 实现
+
+- `deis-backend-migration` 定义共享 proto、Bearer interceptor、receipt、inventory digest 和 durable per-tenant gate。
+- `deis-store` 的 KV、SQL、blob 共用 `migration-fences.sqlite`；`deis-queue` 使用自己数据目录内的同名 journal。
+- journal 使用 SQLite `WAL + synchronous=FULL`，active fence 与 append-only acquire/release event 在同一 `BEGIN IMMEDIATE` transaction 更新。
+- KV inventory 以 fence 获得时刻判断 TTL，防止等待期间自然到期改变集合；KV expiry sweeper 跳过 fenced tenant。
+- SQL inventory 只在 `wal_checkpoint(TRUNCATE)` 完全成功后 hash tenant database file；Query endpoint 额外使用 SQLite `readonly` 分类，不能用返回 rows 的写语句绕过 Execute 的 fence。
+- blob inventory hash 有序 metadata，并逐一校验实际 content SHA-256；unreferenced content 与无法分类的目录项分别报告。
+- queue inventory 在一个 read transaction 中覆盖 ready/delayed/leased messages 与 dead letters；所有会改变 message state 的操作及 retention sweep 均受 fence。
+
+Embedded 模式仍是一份 data directory 对应一个 service process，多个进程同时打开同一 SQLite 数据目录不属于受支持拓扑。未来 HA driver 不能照搬进程内锁；它必须用该后端的共识/事务能力实现同样的 per-tenant 线性化点、持久 epoch 和可恢复 receipt，并通过相同 contract tests。
+
+## API 与证据
+
+共享 gRPC 服务为 `deis.backend.migration.v1.BackendMigration`：
+
+- `AcquireWriteFence`
+- `InspectTenant`
+- `ReleaseWriteFence`
+
+机器可读证据格式由 `contracts/v1/backend-migration-evidence.schema.json` 定义。proto 响应不返回 fence token，只返回其绑定后的 receipt digest。Control 持久 operation 后续负责把 backend response 转成该证据文档、签名/关联 attempt，并合并进 identity migration verification。
+
+## 尚未完成
+
+本 ADR 落地后，`P0-MODEL-001` 仍不能标记完成：
+
+- Control 尚未通过正式 Operation API 调用两个管理服务并持久化 per-backend attempt/evidence；
+- telemetry、Stateful Objects 与 provider resources 尚无同契约 inventory/fence；
+- deis-store snapshot/restore 不复制 migration fence journal，deis-queue 也尚无产品级 backup/restore；在 Control 能把 restore 建模为新 backend incarnation、重新取得 fence 并校验证据前，迁移/cutover 不得与 restore 重叠，也不能把普通备份恢复当成 fence 延续；
+- canonical-first dual-read、copy/verify、atomic cutover、旧 capability 撤销和 tombstone 尚未执行；
+- SQL 当前证据适合 embedded file copy/rename；跨引擎 HA SQL driver 必须产生规范 logical dump digest，不能拿供应商物理文件摘要冒充跨实现相等。
+
+因此当前允许执行的是“冻结旧 Deislet store/queue namespace并取得可检查证据”，不是开放 canonical live request parser，也不是宣称完整迁移完成。

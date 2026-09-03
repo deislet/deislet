@@ -251,11 +251,13 @@ use crate::proto::storage::{
 };
 use crate::sqlite::{self, PoolSize, PooledConnection, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
+use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences, WritePermit};
 use rusqlite::ffi;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -868,6 +870,9 @@ struct TransactionEntry {
     /// `BEGIN IMMEDIATE` has returned - time spent waiting for the write
     /// lock is not the caller's - and by then the entry is already shared.
     expires_at: Mutex<Instant>,
+    /// Keeps this transaction entirely before a later writer fence. It is
+    /// released only after COMMIT/ROLLBACK has finished and the entry drops.
+    _write_permit: WritePermit,
 }
 
 impl TransactionEntry {
@@ -1003,6 +1008,7 @@ impl TransactionRegistry {
         tenant: &TenantId,
         granted: Duration,
         limits: &TransactionLimits,
+        write_permit: WritePermit,
     ) -> StoreResult<(String, Arc<TransactionEntry>)> {
         let mut state = self.lock();
         if state.open.len() >= limits.max_open_total {
@@ -1043,6 +1049,7 @@ impl TransactionRegistry {
             // IMMEDIATE` has returned. This value only covers the window
             // before that, where nothing runs statements on the entry anyway.
             expires_at: Mutex::new(Instant::now() + granted),
+            _write_permit: write_permit,
         });
         state.open.insert(id.clone(), Arc::clone(&entry));
         Ok((id, entry))
@@ -1278,11 +1285,21 @@ pub struct DatabaseService {
     transactions: Arc<TransactionRegistry>,
     limits: TransactionLimits,
     sql: SqlLimits,
+    fences: TenantWriteFences,
 }
 
 impl DatabaseService {
     /// Prepare `<data_dir>/db/`. Nothing is opened until a tenant asks.
     pub fn open(data_dir: &std::path::Path, connections_per_tenant: usize) -> StoreResult<Self> {
+        let fences = TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?;
+        Self::open_with_fences(data_dir, connections_per_tenant, fences)
+    }
+
+    pub(crate) fn open_with_fences(
+        data_dir: &std::path::Path,
+        connections_per_tenant: usize,
+        fences: TenantWriteFences,
+    ) -> StoreResult<Self> {
         let root = data_dir.join("db");
         std::fs::create_dir_all(&root)?;
         // One file per tenant. A file named by a bare application id belongs
@@ -1315,6 +1332,7 @@ impl DatabaseService {
             transactions: Arc::new(TransactionRegistry::default()),
             limits: clamp_to_pool(TransactionLimits::default(), connections_per_tenant),
             sql: SqlLimits::default(),
+            fences,
         })
     }
 
@@ -1346,6 +1364,55 @@ impl DatabaseService {
     /// was stopped against in front of them.
     pub fn sql_limits(&self) -> SqlLimits {
         self.sql
+    }
+
+    /// Checkpoint and hash the fenced tenant database as one physical copy
+    /// unit. A busy checkpoint fails instead of certifying a main file while
+    /// committed pages still live only in its WAL.
+    pub async fn inventory(&self, tenant: &TenantId) -> StoreResult<ComponentInventory> {
+        let (_receipt, _fence) = self.fences.fenced_read(tenant.as_str()).await?;
+        self.inventory_with_fence_held(tenant).await
+    }
+
+    /// Build inventory while the caller holds this tenant's fence read guard.
+    pub(crate) async fn inventory_with_fence_held(
+        &self,
+        tenant: &TenantId,
+    ) -> StoreResult<ComponentInventory> {
+        let path = self.root.join(format!("{tenant}.sqlite"));
+        let tenant = tenant.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut hash = InventoryHasher::new("sql");
+            if !path.exists() {
+                return Ok(hash.finish("sql", 0, 0, 0, 0));
+            }
+            let connection = rusqlite::Connection::open(&path)?;
+            connection.busy_timeout(Duration::from_secs(5))?;
+            let (busy, remaining, checkpointed): (i64, i64, i64) = connection.query_row(
+                "PRAGMA wal_checkpoint(TRUNCATE)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if busy != 0 || remaining != checkpointed {
+                return Err(StoreError::Exhausted(format!(
+                    "cannot inventory SQL tenant {tenant}: WAL checkpoint remained busy ({checkpointed}/{remaining} pages); retry after readers finish"
+                )));
+            }
+            drop(connection);
+
+            let mut file = std::fs::File::open(&path)?;
+            let logical_bytes = file.metadata()?.len();
+            let mut buffer = vec![0u8; 1024 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hash.field(&buffer[..read]);
+            }
+            Ok(hash.finish("sql", 1, logical_bytes, 0, 0))
+        })
+        .await?
     }
 
     /// The pool for one tenant, opened on first use.
@@ -1392,6 +1459,7 @@ impl DatabaseService {
         sql: &str,
         params: &[SqlValue],
     ) -> StoreResult<ExecOutcome> {
+        let _permit = self.fences.permit(tenant.as_str()).await?;
         let sql = check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let params = params.to_vec();
         self.pool(tenant)
@@ -1413,12 +1481,19 @@ impl DatabaseService {
         sql: &str,
         params: &[SqlValue],
     ) -> StoreResult<ResultSet> {
+        let _permit = self.fences.read_permit(tenant.as_str()).await;
         let sql = check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let params = params.to_vec();
         let limits = self.sql;
         self.pool(tenant)
             .with_conn_within(limits.statement_deadline, move |conn| {
                 let mut stmt = conn.prepare(&sql)?;
+                if !stmt.readonly() {
+                    return Err(StoreError::Refused(
+                        "Query accepts only read-only SQL; use Execute for a statement that changes data"
+                            .to_string(),
+                    ));
+                }
                 collect_rows(&mut stmt, params, limits)
             })
             .await
@@ -1432,6 +1507,7 @@ impl DatabaseService {
         tenant: &TenantId,
         statements: Vec<(String, Vec<SqlValue>)>,
     ) -> StoreResult<Result<Vec<ExecOutcome>, BatchFailure>> {
+        let _permit = self.fences.permit(tenant.as_str()).await?;
         for (sql, _) in &statements {
             check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         }
@@ -1523,7 +1599,10 @@ impl DatabaseService {
         requested: Option<Duration>,
     ) -> StoreResult<TransactionHandle> {
         let granted = self.limits.grant(requested)?;
-        let (id, entry) = self.transactions.admit(tenant, granted, &self.limits)?;
+        let write_permit = self.fences.permit(tenant.as_str()).await?;
+        let (id, entry) = self
+            .transactions
+            .admit(tenant, granted, &self.limits, write_permit)?;
         // Every way out from here - an error, or the caller disappearing
         // mid-call - gives the slot back, because the guard's drop does.
         let slot = TransactionSlot {

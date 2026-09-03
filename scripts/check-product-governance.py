@@ -14,7 +14,7 @@ import jsonschema
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_ADRS = list(range(1, 23))
+EXPECTED_ADRS = list(range(1, 24))
 EXPECTED_PHASES = [f"phase-{number}" for number in range(6)]
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -30,8 +30,9 @@ EXPECTED_TEST_SHARDS = {
         "-p deis-build -p deis --no-fail-fast"
     ),
     "control-services-tests": (
-        "cargo test -p deis-wire -p deis-control -p deis-store -p deis-queue "
-        "-p deis-telemetry -p deis-proxy -p deislet-integration-tests --no-fail-fast"
+        "cargo test -p deis-wire -p deis-backend-migration -p deis-control -p deis-store "
+        "-p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests "
+        "--no-fail-fast"
     ),
 }
 EXPECTED_TEST_PREREQUISITES = {
@@ -79,7 +80,7 @@ def validate_adrs() -> None:
     adr_dir = ROOT / "docs/adr"
     files = sorted(adr_dir.glob("[0-9][0-9][0-9]-*.md"))
     numbers = [int(path.name[:3]) for path in files]
-    require(numbers == EXPECTED_ADRS, f"ADR set must be exactly 001..022, got {numbers}")
+    require(numbers == EXPECTED_ADRS, f"ADR set must be exactly 001..023, got {numbers}")
 
     for path, number in zip(files, EXPECTED_ADRS, strict=True):
         text = path.read_text(encoding="utf-8")

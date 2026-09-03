@@ -1982,6 +1982,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "deis-backend-migration"
+version = "0.1.0"
+dependencies = [
+ "deis-wire",
+ "prost 0.13.5",
+ "rusqlite",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tracing",
+]
+
+[[package]]
 name = "deis-build"
 version = "0.1.0"
 dependencies = [
@@ -2168,6 +2183,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
+ "deis-backend-migration",
  "deis-wire",
  "prost 0.13.5",
  "rusqlite",
@@ -2243,6 +2259,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
+ "deis-backend-migration",
  "deis-wire",
  "prost 0.13.5",
  "rusqlite",

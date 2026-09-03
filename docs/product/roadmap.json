@@ -31,7 +31,7 @@
       "workItems": [
         {
           "id": "P0-DEC-001",
-          "title": "迁移阶段分析并建立 22 份正式 ADR",
+          "title": "迁移阶段分析并建立 23 份正式 ADR",
           "owner": "deislet",
           "status": "done",
           "dependsOn": [],
@@ -128,9 +128,14 @@
             {"type": "local-path", "value": "crates/deis-control/src/catalog/identity_migration.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"},
             {"type": "local-path", "value": "crates/deis-runtime/proto/management.proto"},
-            {"type": "local-path", "value": "crates/deis-runtime/src/deployment/store.rs"}
+            {"type": "local-path", "value": "crates/deis-runtime/src/deployment/store.rs"},
+            {"type": "local-path", "value": "contracts/v1/backend-migration-evidence.schema.json"},
+            {"type": "local-path", "value": "crates/deis-backend-migration/proto/migration.proto"},
+            {"type": "local-path", "value": "crates/deis-backend-migration/src/lib.rs"},
+            {"type": "local-path", "value": "crates/deis-store/src/migration.rs"},
+            {"type": "local-path", "value": "crates/deis-queue/src/migration.rs"}
           ],
-          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-wire -p deis-store -p deis-queue -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment、节点持久化、四类 canonical ID 的有效值改绑/擦除拒绝、runtime placement/storage authority 分离、可逆且与 legacy 集合不相交的 Deislet 物理 tenant/binding key、canonical 迁移目标的 store snapshot/restore 与 queue reopen，以及持久 catalog migration plan、规范且幂等的 inventory refresh、canonical app/environment 所有权下的 binding ID、revision/token fence、旧 writer 拒绝、错误 manifest/cross-app 引用/历史歧义 fail closed 与失败事务无部分 mapping；live request parser 仍故意拒绝 logical/physical canonical key，完成前仍须验证完整公共 Operation、外部 inventory、storage-writer fence、canonical-first 双读、copy/cutover、rollback/failure 与旧 capability 撤销"
+          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-backend-migration -p deis-wire -p deis-store -p deis-queue -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment、节点持久化、catalog migration plan/revision fence、Deislet 物理 canonical namespace，以及独立默认关闭的 backend migration 管理认证、持久单调 per-tenant writer fence、在途 SQL transaction drain、KV/SQL/blob/queue inventory SHA-256/count/bytes/orphan evidence、应用 storage token 隔离、错误 token/revision/migration 拒绝、重启恢复与真实 gRPC 路径；live request parser 仍故意拒绝 logical/physical canonical key，完成前仍须验证正式公共 Operation/coordinator、restore/backend incarnation 重新 fencing、telemetry/stateful/provider inventory/fence、canonical-first 双读、copy/cutover、rollback/failure、旧 capability 撤销与 tombstone"
         },
         {
           "id": "P0-CI-001",

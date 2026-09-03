@@ -23,7 +23,7 @@
 
 ## 当前实现进度
 
-identity 迁移已完成四个可执行切片。第一段让 `application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效、擦除或从一个有效 UUIDv7 改绑到另一个有效 UUIDv7，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
+identity 迁移已完成五个可执行切片。第一段让 `application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效、擦除或从一个有效 UUIDv7 改绑到另一个有效 UUIDv7，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
 
 第二段新增共享 `deis-wire::CanonicalTenantId`，唯一逻辑拼写与本契约相同：`v1/<application UUIDv7>/<environment UUIDv7>`。Control 的 push 与 assignment list 现在同时发送两个 canonical ID；节点只允许“两者都缺失”的旧 Control 或“两者都有效”的新 Control，partial/UUIDv4/非规范拼写在 bundle 下载前失败关闭。节点把 identity 写入 installed record，已记录的 canonical tenant 不能被另一组合法 ID 重绑，旧 Control 的字段缺失也不能擦除它。Runtime placement/telemetry key 与 storage authority 已拆成两个输入，KV/SQL/blob 与 queue poller 共用后者，并有真实 store round-trip 测试证明两者不会混用。
 
@@ -31,9 +31,11 @@ identity 迁移已完成四个可执行切片。第一段让 `application`、`en
 
 第四段定义 Deislet 后端自己的 canonical persistence boundary。标准逻辑身份仍且只能是 `CanonicalTenantId` 的 `v1/<application UUIDv7>/<environment UUIDv7>`；store、queue、migration、snapshot 与 restore 共享的物理 tenant key 则是可逆的 `ct1_<application UUIDv7>_<environment UUIDv7>`，named namespace 只追加永久 `@<binding UUIDv7>`，不使用可改显示名。该集合与必含 `.` 的 legacy `application.environment[@binding]` 集合不相交，且是 Linux、macOS、Windows 均可用的单个路径组件。测试已覆盖规范/非规范解析、live metadata 拒绝、KV/SQL/blob snapshot/restore、legacy detection、orphan scan 及 queue reopen 隔离。物理 key 是 Deislet 实现细节，禁止写入 `x-deis-tenant`、禁止成为 HMAC subject；请求入口仍故意只接受 legacy grammar。
 
-这些切片仍不代表八阶段迁移完成。计划/获取 fence 目前只是内部 Rust 入口，没有 production API 或后台 coordinator 调用；内部记录也尚不是满足 `operation.schema.json` 全部 organization/actor/idempotency/child/provider 字段的公共 Operation API。catalog fence 尚未进入 deis-store/deis-queue 的写路径。实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`；运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在外部 inventory、storage-writer fence、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+第五段建立后端真实写入栅栏与外部 inventory。共享 `deis.backend.migration.v1.BackendMigration` 只在配置独立 `migration_admin_token` 时注册，且只接受 `Authorization: Bearer`；应用 storage token 不属于该认证域。store 的 KV/SQL/blob 共用持久 fence journal，queue 使用自己的 journal；acquire 等待已有写许可和 SQL 交互事务完成，再提交单调 epoch，重启先恢复 active fence。KV expiry、blob orphan sweep、queue lease/ack/nack/replay/retention 也受同一边界。inventory 产生规范 SHA-256/count/bytes/orphan evidence，SQL 必须完成 WAL checkpoint，blob 校验真实 content digest；错误 token/revision/migration 不能替换或释放 fence。共享 proto、Rust 测试和真实 gRPC 测试验证了默认不暴露、独立认证、在途事务 drain、四类 component 拒绝写入、重启保持和精确 rollback。
 
-## 六份机器契约
+这些切片仍不代表八阶段迁移完成。Control 的计划/获取 catalog fence 仍只有内部 Rust 入口，没有 production Operation API 或后台 coordinator 调用，也尚未调用两个 backend management service 并持久化返回的 evidence。telemetry、Stateful Objects 与 provider resources 仍无 inventory/fence；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+
+## 七份机器契约
 
 1. [`resource-identity.schema.json`](resource-identity.schema.json)：主要对象的 canonical ID、kind、scope、display name 和 revision。ID 是定位符，不是凭证。
 2. [`canonical-artifact.schema.json`](canonical-artifact.schema.json)：Edge Canon 版本、payload、输入、toolchain、SBOM、provenance、验证和签名。Proposal artifact 必须是 `deployable: false`；可部署产物必须锁定已发布标准、验证通过并有签名。
@@ -41,6 +43,7 @@ identity 迁移已完成四个可执行切片。第一段让 `application`、`en
 4. [`operation.schema.json`](operation.schema.json)：持久产品操作及其 scope、target、幂等摘要、revision、phase、progress、child/provider operation、错误和时间。
 5. [`provider-driver.schema.json`](provider-driver.schema.json)：driver/官方工具精确版本、凭证传递、安全约束、12 个 lifecycle 动作及内部 native/composed/companion 映射。映射不是应用 profile，也不产生支持声明。
 6. [`identity-migration.schema.json`](identity-migration.schema.json)：旧 name-based tenant 到 canonical identity 的 inventory、双读、复制/rename、验证、cutover、旧 capability 撤销和 tombstone。
+7. [`backend-migration-evidence.schema.json`](backend-migration-evidence.schema.json)：后端在持久 writer fence 下取得的 component count/bytes/digest/orphan evidence；明确认证域和 receipt，但禁止保存 fence token。
 
 UUIDv7 目前是 draft 实现选择：它标准化、可跨进程生成并按时间大致排序；其时间部分不是秘密，因此授权永远另行校验。若安全或存储评审否决该格式，必须在 v1 冻结前更新所有 schema/fixture；已发布后不得原地换格式。
 
@@ -88,7 +91,7 @@ inspect / reconcile / delete / cleanup
 
 ## 可执行校验
 
-[`fixtures.json`](fixtures.json) 同时登记每份 schema 的正、反例。反例从对应正例应用确定性 JSON Pointer mutation，证明以下情况会失败：名称冒充 ID、canonical artifact 携带 provider 字段、binding snapshot 含 secret value、终态 operation 没有完成时间、driver 缺生命周期动作、迁移继续使用名称 tenant key。
+[`fixtures.json`](fixtures.json) 同时登记每份 schema 的正、反例。反例从对应正例应用确定性 JSON Pointer mutation，证明以下情况会失败：名称冒充 ID、canonical artifact 携带 provider 字段、binding snapshot 含 secret value、终态 operation 没有完成时间、driver 缺生命周期动作、迁移继续使用名称 tenant key，以及 backend evidence 泄漏 fence token。
 
 运行：
 

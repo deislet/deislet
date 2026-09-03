@@ -17,7 +17,7 @@
     "standardLock": {"const": "standards/edge-canon.lock.json"},
     "identifierScheme": {"const": "uuidv7-lowercase"},
     "documents": {
-      "type": "array", "minItems": 6, "maxItems": 6,
+      "type": "array", "minItems": 7, "maxItems": 7,
       "items": {
         "type": "object", "additionalProperties": false,
         "required": ["id", "schema"],

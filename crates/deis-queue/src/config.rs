@@ -26,7 +26,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// On-disk configuration. Every field has a default so an empty file works.
-#[derive(Debug, Clone, Deserialize)]
+// Deliberately not `Debug`: this value owns two plaintext credentials and a
+// derived formatter would copy them into panic reports or diagnostic logs.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Address the gRPC server binds to.
@@ -52,6 +54,11 @@ pub struct Config {
     /// reasoning and the refusal.
     #[serde(default)]
     pub auth_secret: Option<String>,
+    /// Independent credential for migration inventory and writer fencing.
+    /// If absent, the management gRPC service does not exist; there is no
+    /// loopback bypass and this must not reuse the application data secret.
+    #[serde(default)]
+    pub migration_admin_token: Option<String>,
     /// Directory holding the SQLite database.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -166,6 +173,7 @@ impl Default for Config {
         Self {
             listen: default_listen(),
             auth_secret: None,
+            migration_admin_token: None,
             data_dir: default_data_dir(),
             connections: default_connections(),
             max_body_bytes: default_max_body_bytes(),
@@ -232,6 +240,7 @@ mod tests {
         let defaults = Config::default();
         assert_eq!(parsed.listen, defaults.listen);
         assert_eq!(parsed.auth_secret, defaults.auth_secret);
+        assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.connections, defaults.connections);
         assert_eq!(parsed.max_body_bytes, defaults.max_body_bytes);
@@ -312,8 +321,15 @@ mod tests {
 
     #[test]
     fn the_secret_is_read_from_a_file() {
-        let parsed: Config = toml::from_str("auth_secret = \"a-shared-secret\"").unwrap();
+        let parsed: Config = toml::from_str(
+            "auth_secret = \"a-shared-secret\"\nmigration_admin_token = \"an-independent-migration-secret\"",
+        )
+        .unwrap();
         assert_eq!(parsed.auth_secret.as_deref(), Some("a-shared-secret"));
+        assert_eq!(
+            parsed.migration_admin_token.as_deref(),
+            Some("an-independent-migration-secret")
+        );
         // Unset by default, which is what makes the loopback install work
         // with no configuration at all.
         assert_eq!(Config::default().auth_secret, None);

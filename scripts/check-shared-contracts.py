@@ -29,6 +29,7 @@ EXPECTED_DOCUMENTS = {
     "operation",
     "provider-driver",
     "identity-migration",
+    "backend-migration-evidence",
 }
 EXPECTED_PROVIDER_OPERATIONS = [
     "preflight",
@@ -257,6 +258,14 @@ def validate_cross_document_invariants(registry: dict) -> None:
     migration = load_json("contracts/v1/fixtures/valid/identity-migration.json")
     phase_names = [phase["name"] for phase in migration["phases"]]
     require(phase_names == EXPECTED_MIGRATION_PHASES, "migration fixture phases are incomplete or reordered")
+    backend_evidence = load_json("contracts/v1/fixtures/valid/backend-migration-evidence.json")
+    require(
+        backend_evidence.get("authenticationDomain") == "migration-admin",
+        "backend migration evidence must use the independent administrator domain",
+    )
+    require("fenceToken" not in backend_evidence.get("fence", {}), "backend evidence leaked a fence token")
+    components = [entry["component"] for entry in backend_evidence.get("components", [])]
+    require(len(components) == len(set(components)), "backend evidence repeats a component")
     for environment in migration["environments"]:
         expected_key = (
             f"v1/{migration['canonicalApplicationId']}/"

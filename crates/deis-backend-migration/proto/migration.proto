@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package deis.backend.migration.v1;
+
+// A backend-local management surface. It is deliberately separate from the
+// application data services and is registered only when an explicit
+// migration administrator credential is configured.
+service BackendMigration {
+  rpc AcquireWriteFence(AcquireWriteFenceRequest) returns (FenceReceipt);
+  rpc InspectTenant(InspectTenantRequest) returns (TenantInventory);
+  rpc ReleaseWriteFence(ReleaseWriteFenceRequest) returns (ReleaseWriteFenceResponse);
+}
+
+message AcquireWriteFenceRequest {
+  string tenant = 1;
+  string migration_id = 2;
+  uint64 expected_application_revision = 3;
+  string fence_token = 4;
+}
+
+message InspectTenantRequest {
+  string tenant = 1;
+}
+
+message ReleaseWriteFenceRequest {
+  string tenant = 1;
+  string migration_id = 2;
+  uint64 expected_application_revision = 3;
+  string fence_token = 4;
+}
+
+message ReleaseWriteFenceResponse {
+  bool released = 1;
+  uint64 fence_epoch = 2;
+}
+
+message FenceReceipt {
+  string tenant = 1;
+  string migration_id = 2;
+  uint64 expected_application_revision = 3;
+  uint64 fence_epoch = 4;
+  int64 acquired_at_unix_seconds = 5;
+  string receipt_sha256 = 6;
+}
+
+message ComponentInventory {
+  string component = 1;
+  uint64 item_count = 2;
+  uint64 logical_bytes = 3;
+  string sha256 = 4;
+  uint64 orphan_count = 5;
+  uint64 unchecked_orphan_count = 6;
+}
+
+message TenantInventory {
+  string backend = 1;
+  string tenant = 2;
+  FenceReceipt fence = 3;
+  repeated ComponentInventory components = 4;
+  int64 captured_at_unix_seconds = 5;
+}

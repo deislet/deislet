@@ -1,0 +1,53 @@
+{
+  "$schema": "../../backend-migration-evidence.schema.json",
+  "schemaVersion": 1,
+  "backend": "deis-store",
+  "tenant": "checkout-api.production",
+  "authenticationDomain": "migration-admin",
+  "fence": {
+    "migrationId": "01990f44-1000-7000-8000-000000000050",
+    "expectedApplicationRevision": 7,
+    "epoch": 12,
+    "acquiredAt": "2026-09-03T20:45:00Z",
+    "receiptDigest": {
+      "algorithm": "sha256",
+      "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  },
+  "components": [
+    {
+      "component": "kv",
+      "itemCount": 4,
+      "logicalBytes": 128,
+      "digest": {
+        "algorithm": "sha256",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "orphanCount": 0,
+      "uncheckedOrphanCount": 0
+    },
+    {
+      "component": "sql",
+      "itemCount": 1,
+      "logicalBytes": 4096,
+      "digest": {
+        "algorithm": "sha256",
+        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "orphanCount": 0,
+      "uncheckedOrphanCount": 0
+    },
+    {
+      "component": "blob",
+      "itemCount": 2,
+      "logicalBytes": 1024,
+      "digest": {
+        "algorithm": "sha256",
+        "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "orphanCount": 0,
+      "uncheckedOrphanCount": 0
+    }
+  ],
+  "capturedAt": "2026-09-03T20:45:01Z"
+}

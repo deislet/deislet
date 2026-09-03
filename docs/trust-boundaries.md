@@ -102,6 +102,7 @@ private network - not by the absence of a published address:
 | Node data port (`http_port`) | deis-proxy, and the control plane. Nothing else, and never the internet. |
 | Node management port, if `[management] listen` moved it | The control plane only. |
 | Control plane HTTP/gRPC port | Nodes, deis-proxy, and the operators' network. Never the internet - it is where the assignment list lives. |
+| deis-store/deis-queue gRPC ports | Runtime nodes, the control plane and the operators' network only. The optional migration service shares this listener but uses its own Bearer credential; neither backend belongs on the internet. |
 | deis-proxy's listeners | The internet. This is the only one that belongs there. |
 
 Setting `[management] listen` to a separate address takes the management and
@@ -129,6 +130,7 @@ the operator's to enforce:
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
 | Every node's configuration | `0600`, owned by the node's service user. It holds `[control] secret`. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same value, same consequences. |
+| deis-store and deis-queue configurations | `0600`, owned by the service user. They may hold both the application-data `auth_secret` and the independent `migration_admin_token`; possession of the latter can freeze and inventory any tenant in that backend. Never reuse one value for both domains. |
 | `.demo/*.toml` written by `scripts/demo.sh` | The demo writes every file it generates as `0600`: `state.env`, `secret.key`, the six service configurations (five of them carry a credential; deis-telemetry's carries none and gets the mode for uniformity) and the ACME-restart copy of the proxy configuration. It is still a workstation tool: it puts every process under one user, so the mode separates the demo from other accounts on the host and nothing else. Do not copy a `.demo/` configuration into a real deployment. |
 
 ## Rotating the credential
