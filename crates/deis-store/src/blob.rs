@@ -289,7 +289,7 @@ impl BlobService {
         let mut kept_unchecked = 0usize;
         for tenant_dir in tenants.flatten() {
             let name = tenant_dir.file_name().to_string_lossy().into_owned();
-            let Ok(tenant) = TenantId::parse(&name) else {
+            let Ok(tenant) = TenantId::parse_persisted(&name) else {
                 // Not a namespace this build wrote; `open` has already
                 // refused to start over a pre-tenant layout, so this is at
                 // most a stray directory an operator put here.

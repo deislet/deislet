@@ -1521,11 +1521,51 @@ mod tests {
         TenantId::parse(name).unwrap()
     }
 
+    fn canonical_tenant() -> TenantId {
+        TenantId::from_canonical(deis_wire::CanonicalTenantId::new(
+            "018f2518-7e38-7f80-8000-000000000001".parse().unwrap(),
+            "018f2518-7e38-7f80-8000-000000000002".parse().unwrap(),
+        ))
+    }
+
     fn bodies(messages: &[LeasedMessage]) -> Vec<String> {
         messages
             .iter()
             .map(|m| String::from_utf8(m.body.clone()).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn canonical_migration_target_rows_remain_separate_and_survive_reopen() {
+        let dir = TempDir::new().unwrap();
+        let canonical = canonical_tenant();
+        let legacy = tenant("shop.production");
+        {
+            let queue = QueueService::open(dir.path(), 4, QueueLimits::default())
+                .await
+                .unwrap();
+            queue
+                .send(&canonical, "jobs", b"canonical".to_vec())
+                .await
+                .unwrap();
+            queue
+                .send(&legacy, "jobs", b"legacy".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let decoded = TenantId::parse_persisted(canonical.as_str()).unwrap();
+        let queue = QueueService::open(dir.path(), 4, QueueLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            bodies(&queue.pull(&decoded, "jobs", None, None).await.unwrap()),
+            ["canonical"]
+        );
+        assert_eq!(
+            bodies(&queue.pull(&legacy, "jobs", None, None).await.unwrap()),
+            ["legacy"]
+        );
     }
 
     /// What a consumer answers with: the id it was handed and the token

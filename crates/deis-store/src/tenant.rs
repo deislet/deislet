@@ -2,8 +2,9 @@
 //!
 //! A tenant id arrives out of band in the `x-deis-tenant` gRPC metadata
 //! header, so the existing storage.proto messages need no tenant field. To
-//! this service the value is one opaque key: it is never taken apart, never
-//! interpreted, and nothing here knows or cares what its parts mean.
+//! the live service the value is one opaque legacy key. Migration and recovery
+//! code may also construct or decode the canonical backend key, but that path
+//! remains separate from request parsing.
 //!
 //! Its shape is nonetheless fixed, because the platform builds it from an
 //! application and an environment (`deis_wire::conventions::tenant_id`) and
@@ -45,22 +46,32 @@ pub use deis_wire::conventions::{BINDING_HEADER, TENANT_HEADER};
 
 use crate::error::StoreError;
 use deis_wire::conventions::{namespace_id, split_namespace};
+use deis_wire::{CanonicalId, CanonicalTenantId, DeisletCanonicalNamespaceKey};
 use std::fmt;
 use tonic::Request;
 
 /// A validated namespace id, safe to use as a single path component.
 ///
-/// The only way to build one is [`TenantId::parse`] or
-/// [`TenantId::of_binding`], so any `TenantId` in the code below is a legal
-/// tenant optionally followed by `@` and a legal binding name. Neither half
-/// holds a `.`, a path separator or anything else that would resolve outside
-/// the data directory, so `..` and `.` are not expressible.
+/// Live requests build one through [`TenantId::parse`] or
+/// [`TenantId::of_binding`]. Migration, snapshot and recovery paths may use
+/// [`TenantId::from_canonical`] or [`TenantId::parse_persisted`]. Both
+/// generations are one validated path component, so `..`, path separators and
+/// ambiguous cross-generation spellings are not expressible.
 ///
 /// Still named `TenantId` because that is what it is to every caller below: a
 /// single opaque key that partitions the data. The binding widens what a
 /// tenant may address inside itself; it never widens which tenant.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TenantId(String);
+pub struct TenantId {
+    /// The backend key used in SQLite columns and as one path component.
+    persistence_key: String,
+    /// The logical authority. Equal to `persistence_key` for legacy names;
+    /// `v1/<app UUIDv7>/<environment UUIDv7>` for canonical identities.
+    tenant: String,
+    /// Legacy logical binding name or canonical permanent binding UUIDv7.
+    binding: Option<String>,
+    canonical: bool,
+}
 
 impl TenantId {
     /// Validate `raw` with [`split_namespace`], keeping the whole value.
@@ -74,14 +85,60 @@ impl TenantId {
     /// per namespace, so nothing below may be tempted to treat two of them as
     /// one because they share a prefix.
     pub fn parse(raw: &str) -> Result<Self, StoreError> {
-        if split_namespace(raw).is_none() {
+        let Some((tenant, binding)) = split_namespace(raw) else {
             return Err(StoreError::Tenant(format!(
                 "{raw:?} is not a namespace id; it must be exactly two parts of ASCII letters, \
                  digits, '_' or '-', at most 64 bytes each, joined by '.', optionally followed \
                  by '@' and a binding name of the same character set"
             )));
+        };
+        Ok(Self {
+            persistence_key: raw.to_string(),
+            tenant: tenant.to_string(),
+            binding: binding.map(str::to_string),
+            canonical: false,
+        })
+    }
+
+    /// Build the future canonical migration target without opening it to a
+    /// request carrying a legacy tenant-wide capability.
+    ///
+    /// This is an internal persistence constructor, not a wire parser. Live
+    /// requests still enter through [`tenant_of`] and [`Self::parse`], both of
+    /// which accept only the legacy grammar until the storage writer fence and
+    /// binding-scoped capability contract are enforced.
+    #[must_use]
+    pub fn from_canonical(tenant: CanonicalTenantId, binding_id: Option<CanonicalId>) -> Self {
+        let persistence_key = DeisletCanonicalNamespaceKey::new(tenant, binding_id).to_string();
+        Self {
+            persistence_key,
+            tenant: tenant.to_string(),
+            binding: binding_id.map(|id| id.to_string()),
+            canonical: true,
         }
-        Ok(Self(raw.to_string()))
+    }
+
+    /// Decode a key already stored by this backend.
+    ///
+    /// Snapshot, restore and orphan scans need to understand both generations
+    /// once copy starts. This deliberately remains separate from [`Self::parse`]
+    /// so merely placing a canonical physical key in `x-deis-tenant` cannot
+    /// bypass the migration coordinator.
+    pub fn parse_persisted(raw: &str) -> Result<Self, StoreError> {
+        if let Ok(legacy) = Self::parse(raw) {
+            return Ok(legacy);
+        }
+        let canonical = raw
+            .parse::<DeisletCanonicalNamespaceKey>()
+            .map_err(|canonical_error| {
+                StoreError::Tenant(format!(
+                    "{raw:?} is neither a legacy namespace nor a canonical Deislet persistence key: {canonical_error}"
+                ))
+            })?;
+        Ok(Self::from_canonical(
+            canonical.tenant(),
+            canonical.binding_id(),
+        ))
     }
 
     /// One binding's namespace inside a tenant.
@@ -95,28 +152,32 @@ impl TenantId {
 
     /// The id as it appears on disk and in the `tenant` column.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.persistence_key
     }
 
     /// The `app.environment` half: what the capability token authorises, and
     /// what a log line should name when it is talking about the tenant rather
     /// than about one of its namespaces.
     pub fn tenant(&self) -> &str {
-        split_namespace(&self.0)
-            .map(|(tenant, _)| tenant)
-            .unwrap_or(&self.0)
+        &self.tenant
     }
 
     /// The binding this namespace belongs to, or `None` for the tenant's
     /// unnamed one.
     pub fn binding(&self) -> Option<&str> {
-        split_namespace(&self.0).and_then(|(_, binding)| binding)
+        self.binding.as_deref()
+    }
+
+    /// Whether this value names the canonical migration target generation.
+    #[must_use]
+    pub const fn is_canonical(&self) -> bool {
+        self.canonical
     }
 }
 
 impl fmt::Display for TenantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.persistence_key)
     }
 }
 
@@ -180,6 +241,17 @@ mod tests {
     use super::*;
     use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
 
+    const CANONICAL_APP: &str = "018f2518-7e38-7f80-8000-000000000001";
+    const CANONICAL_ENV: &str = "018f2518-7e38-7f80-8000-000000000002";
+    const CANONICAL_BINDING: &str = "018f2518-7e38-7f80-8000-000000000003";
+
+    fn canonical_tenant() -> CanonicalTenantId {
+        CanonicalTenantId::new(
+            CANONICAL_APP.parse().unwrap(),
+            CANONICAL_ENV.parse().unwrap(),
+        )
+    }
+
     #[test]
     fn accepts_what_the_platform_builds() {
         for id in [
@@ -235,6 +307,38 @@ mod tests {
         let preview = TenantId::parse(&tenant_id("shop", "preview-7")).unwrap();
         assert_ne!(production, preview);
         assert_ne!(production.as_str(), preview.as_str());
+    }
+
+    #[test]
+    fn canonical_target_is_disjoint_path_safe_and_persistently_decodable() {
+        let binding_id = CANONICAL_BINDING.parse().unwrap();
+        let target = TenantId::from_canonical(canonical_tenant(), Some(binding_id));
+        assert_eq!(
+            target.as_str(),
+            format!("ct1_{CANONICAL_APP}_{CANONICAL_ENV}@{CANONICAL_BINDING}")
+        );
+        assert_eq!(
+            target.tenant(),
+            format!("v1/{CANONICAL_APP}/{CANONICAL_ENV}")
+        );
+        assert_eq!(target.binding(), Some(CANONICAL_BINDING));
+        assert!(target.is_canonical());
+        assert!(!target.as_str().contains('/'));
+        assert_eq!(TenantId::parse_persisted(target.as_str()).unwrap(), target);
+        assert_ne!(target.as_str(), "ct1.production@HOT");
+    }
+
+    #[test]
+    fn canonical_keys_are_not_accepted_from_live_request_parsers_yet() {
+        let physical = TenantId::from_canonical(canonical_tenant(), None);
+        assert!(TenantId::parse(physical.as_str()).is_err());
+        assert!(TenantId::parse(&canonical_tenant().to_string()).is_err());
+
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert(TENANT_HEADER, physical.as_str().parse().unwrap());
+        assert!(matches!(tenant_of(&request), Err(StoreError::Tenant(_))));
     }
 
     #[test]

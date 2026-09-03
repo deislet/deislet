@@ -50,6 +50,7 @@
 //! one being guarded against.
 
 use crate::error::{StoreError, StoreResult};
+use deis_wire::DeisletCanonicalNamespaceKey;
 use deis_wire::conventions::{is_valid_tenant_part, split_namespace};
 use rusqlite::Connection;
 use std::path::Path;
@@ -103,7 +104,9 @@ enum Naming {
 /// stored under `app.environment@BINDING`, and that is as ordinary a name
 /// here as the unnamed namespace it sits beside.
 fn naming_of(candidate: &str) -> Naming {
-    if split_namespace(candidate).is_some() {
+    if split_namespace(candidate).is_some()
+        || candidate.parse::<DeisletCanonicalNamespaceKey>().is_ok()
+    {
         Naming::Current
     } else if is_valid_tenant_part(candidate) {
         // One legal part and no separator at all: an application id with no
@@ -397,6 +400,29 @@ mod tests {
             reject_pre_tenant_blob_dirs(blob.path()).is_ok(),
             "a named binding's content directory is written by this build"
         );
+    }
+
+    #[test]
+    fn canonical_migration_targets_are_current_not_pre_tenant_data() {
+        const APP: &str = "018f2518-7e38-7f80-8000-000000000001";
+        const ENV: &str = "018f2518-7e38-7f80-8000-000000000002";
+        const BINDING: &str = "018f2518-7e38-7f80-8000-000000000003";
+        let plain = format!("ct1_{APP}_{ENV}");
+        let named = format!("{plain}@{BINDING}");
+
+        for current in [&plain, &named] {
+            assert!(matches!(naming_of(current), Naming::Current));
+        }
+
+        let db = TempDir::new().unwrap();
+        std::fs::write(db.path().join(format!("{plain}.sqlite")), b"").unwrap();
+        std::fs::write(db.path().join(format!("{named}.sqlite-wal")), b"").unwrap();
+        assert!(reject_pre_tenant_database_files(db.path()).is_ok());
+
+        let blob = TempDir::new().unwrap();
+        std::fs::create_dir(blob.path().join(plain)).unwrap();
+        std::fs::create_dir(blob.path().join(named)).unwrap();
+        assert!(reject_pre_tenant_blob_dirs(blob.path()).is_ok());
     }
 
     /// A companion SQLite has not invented yet must not be able to take a

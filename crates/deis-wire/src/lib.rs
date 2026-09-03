@@ -10,6 +10,7 @@ pub mod canonical_tenant;
 pub mod client;
 pub mod config;
 pub mod conventions;
+pub mod deislet_storage_key;
 pub mod error;
 pub mod logging;
 pub mod models;
@@ -23,6 +24,10 @@ pub use canonical_id::{CanonicalId, CanonicalIdError};
 pub use canonical_tenant::{CANONICAL_TENANT_VERSION, CanonicalTenantId, CanonicalTenantIdError};
 pub use client::WireClient;
 pub use config::{ControlConfig, NodeInfo, NodeRole};
+pub use deislet_storage_key::{
+    DEISLET_CANONICAL_TENANT_KEY_PREFIX, DeisletCanonicalNamespaceKey, DeisletCanonicalTenantKey,
+    DeisletStorageKeyError,
+};
 pub use error::{SdkResult, WireError};
 
 // The log sink every binary installs. Named here as well as in its module

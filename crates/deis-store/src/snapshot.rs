@@ -410,7 +410,7 @@ fn copy_content_of(data_dir: &Path, out: &Path) -> StoreResult<ContentCopy> {
         // The tenant and the digest become path components, so they are
         // checked rather than trusted, exactly as they are on the serving
         // path. Nothing that went through the service can fail this.
-        let tenant = TenantId::parse(&tenant).map_err(|e| {
+        let tenant = TenantId::parse_persisted(&tenant).map_err(|e| {
             StoreError::Corrupt(format!("blob metadata holds an unusable tenant: {e}"))
         })?;
         if !is_sha256(&sha256) {
@@ -890,6 +890,82 @@ mod tests {
         assert_eq!(
             blob.get_all(&media, "photo").await.unwrap().unwrap(),
             b"binding bytes"
+        );
+    }
+
+    /// Copy will create canonical physical keys before live requests are
+    /// allowed to address them. Snapshot and restore must therefore preserve
+    /// those keys while the writer fence still keeps them internal; otherwise
+    /// the first backup taken during migration would silently omit the target
+    /// generation or restore it into an unusable data directory.
+    #[tokio::test]
+    async fn a_canonical_migration_target_survives_snapshot_and_restore() {
+        let application = "018f2518-7e38-7f80-8000-000000000001".parse().unwrap();
+        let environment = "018f2518-7e38-7f80-8000-000000000002".parse().unwrap();
+        let binding = "018f2518-7e38-7f80-8000-000000000003".parse().unwrap();
+        let logical = deis_wire::CanonicalTenantId::new(application, environment);
+        let target = TenantId::from_canonical(logical, Some(binding));
+        let expected_key = target.as_str().to_string();
+
+        let source = TempDir::new().unwrap();
+        let kv = KvService::open(source.path(), 4).await.unwrap();
+        kv.set(&target, "k", b"canonical kv".to_vec(), None, None)
+            .await
+            .unwrap();
+        let db = crate::database::DatabaseService::open(source.path(), 2).unwrap();
+        db.exec_statement(&target, "CREATE TABLE t(v TEXT)", &[])
+            .await
+            .unwrap();
+        db.exec_statement(&target, "INSERT INTO t VALUES('canonical sql')", &[])
+            .await
+            .unwrap();
+        let blob = BlobService::open(source.path(), 4, limits()).await.unwrap();
+        blob.store_object(
+            &target,
+            "object",
+            None,
+            None,
+            chunks(vec![b"canonical blob".to_vec()]),
+        )
+        .await
+        .unwrap();
+
+        let held = TempDir::new().unwrap();
+        let snapshot = held.path().join("snapshot");
+        let manifest = take(source.path(), &snapshot).unwrap();
+        assert!(
+            manifest
+                .databases
+                .contains(&format!("db/{expected_key}.sqlite"))
+        );
+        assert_eq!(manifest.objects, 1);
+
+        let target_dir = TempDir::new().unwrap();
+        let restored = target_dir.path().join("data");
+        restore(&snapshot, &restored).unwrap();
+
+        // Decode the key from durable state rather than retaining the
+        // in-memory constructor: this is the exact route a later inventory or
+        // recovery process takes.
+        let decoded = TenantId::parse_persisted(&expected_key).unwrap();
+        assert_eq!(decoded, target);
+        let kv = KvService::open(&restored, 4).await.unwrap();
+        assert_eq!(
+            kv.get(&decoded, "k").await.unwrap().unwrap().value,
+            b"canonical kv"
+        );
+        let db = crate::database::DatabaseService::open(&restored, 2).unwrap();
+        assert_eq!(
+            db.fetch_rows(&decoded, "SELECT v FROM t", &[])
+                .await
+                .unwrap()
+                .rows,
+            serde_json::json!([{ "v": "canonical sql" }])
+        );
+        let blob = BlobService::open(&restored, 4, limits()).await.unwrap();
+        assert_eq!(
+            blob.get_all(&decoded, "object").await.unwrap().unwrap(),
+            b"canonical blob"
         );
     }
 

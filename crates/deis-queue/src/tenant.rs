@@ -2,8 +2,9 @@
 //!
 //! A tenant id arrives out of band in the `x-deis-tenant` gRPC metadata
 //! header, so the existing queue.proto messages need no tenant field. To this
-//! service the value is one opaque key: it is never taken apart, never
-//! interpreted, and nothing here knows or cares what its parts mean.
+//! the live service the value is one opaque legacy key. Migration and durable
+//! recovery code may also construct or decode the canonical backend key, but
+//! that path remains separate from request parsing.
 //!
 //! The rules are character-for-character the ones deis-store applies to the
 //! bare tenant form: this service calls
@@ -28,16 +29,22 @@ pub use deis_wire::conventions::TENANT_HEADER;
 
 use crate::error::QueueError;
 use deis_wire::conventions::split_tenant;
+use deis_wire::{CanonicalTenantId, DeisletCanonicalTenantKey};
 use std::fmt;
 use tonic::Request;
 
 /// A validated tenant id.
 ///
-/// The only way to build one is [`TenantId::parse`], so any `TenantId` below
-/// is already known to be printable, bounded, and made of exactly two parts
-/// that hold no separator of their own.
+/// Live requests build one only through [`TenantId::parse`]. Migration and
+/// recovery paths may use [`TenantId::from_canonical`] or
+/// [`TenantId::parse_persisted`]. Either generation is printable, bounded and
+/// validated before it reaches a queue query.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TenantId(String);
+pub struct TenantId {
+    persistence_key: String,
+    logical_tenant: String,
+    canonical: bool,
+}
 
 impl TenantId {
     /// Validate `raw` with [`split_tenant`], keeping the whole value.
@@ -52,18 +59,60 @@ impl TenantId {
                  digits, '_' or '-', at most 64 bytes each, joined by '.'"
             )));
         }
-        Ok(Self(raw.to_string()))
+        Ok(Self {
+            persistence_key: raw.to_string(),
+            logical_tenant: raw.to_string(),
+            canonical: false,
+        })
+    }
+
+    /// Build the canonical migration target used in the queue's tenant
+    /// column. Live metadata remains legacy-only until writer fencing and
+    /// canonical capabilities are installed by the migration coordinator.
+    #[must_use]
+    pub fn from_canonical(tenant: CanonicalTenantId) -> Self {
+        Self {
+            persistence_key: DeisletCanonicalTenantKey::new(tenant).to_string(),
+            logical_tenant: tenant.to_string(),
+            canonical: true,
+        }
+    }
+
+    /// Decode either generation from durable queue state without making the
+    /// canonical physical spelling a valid wire credential.
+    pub fn parse_persisted(raw: &str) -> Result<Self, QueueError> {
+        if let Ok(legacy) = Self::parse(raw) {
+            return Ok(legacy);
+        }
+        let canonical = raw
+            .parse::<DeisletCanonicalTenantKey>()
+            .map_err(|canonical_error| {
+                QueueError::Tenant(format!(
+                    "{raw:?} is neither a legacy tenant nor a canonical Deislet persistence key: {canonical_error}"
+                ))
+            })?;
+        Ok(Self::from_canonical(canonical.tenant()))
     }
 
     /// The id as it appears in metadata and in the `tenant` column.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.persistence_key
+    }
+
+    /// The logical authority represented by this backend key.
+    pub fn logical_tenant(&self) -> &str {
+        &self.logical_tenant
+    }
+
+    #[must_use]
+    pub const fn is_canonical(&self) -> bool {
+        self.canonical
     }
 }
 
 impl fmt::Display for TenantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.persistence_key)
     }
 }
 
@@ -107,6 +156,16 @@ pub fn tenant_of<T>(request: &Request<T>) -> Result<TenantId, QueueError> {
 mod tests {
     use super::*;
     use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
+
+    const CANONICAL_APP: &str = "018f2518-7e38-7f80-8000-000000000001";
+    const CANONICAL_ENV: &str = "018f2518-7e38-7f80-8000-000000000002";
+
+    fn canonical_tenant() -> CanonicalTenantId {
+        CanonicalTenantId::new(
+            CANONICAL_APP.parse().unwrap(),
+            CANONICAL_ENV.parse().unwrap(),
+        )
+    }
 
     #[test]
     fn accepts_what_the_platform_builds() {
@@ -163,6 +222,35 @@ mod tests {
         let preview = TenantId::parse(&tenant_id("shop", "preview-7")).unwrap();
         assert_ne!(production, preview);
         assert_ne!(production.as_str(), preview.as_str());
+    }
+
+    #[test]
+    fn canonical_target_is_disjoint_and_persistently_decodable() {
+        let target = TenantId::from_canonical(canonical_tenant());
+        assert_eq!(
+            target.as_str(),
+            format!("ct1_{CANONICAL_APP}_{CANONICAL_ENV}")
+        );
+        assert_eq!(
+            target.logical_tenant(),
+            format!("v1/{CANONICAL_APP}/{CANONICAL_ENV}")
+        );
+        assert!(target.is_canonical());
+        assert!(!target.as_str().contains(['.', '/']));
+        assert_eq!(TenantId::parse_persisted(target.as_str()).unwrap(), target);
+    }
+
+    #[test]
+    fn canonical_keys_are_not_accepted_from_live_request_parsers_yet() {
+        let physical = TenantId::from_canonical(canonical_tenant());
+        assert!(TenantId::parse(physical.as_str()).is_err());
+        assert!(TenantId::parse(&canonical_tenant().to_string()).is_err());
+
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert(TENANT_HEADER, physical.as_str().parse().unwrap());
+        assert!(matches!(tenant_of(&request), Err(QueueError::Tenant(_))));
     }
 
     #[test]
