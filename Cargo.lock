@@ -2220,6 +2220,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2 0.6.5",
  "sys_traits",
  "tempfile",
  "thiserror 1.0.69",

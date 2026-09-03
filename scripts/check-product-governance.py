@@ -30,6 +30,9 @@ EXPECTED_TEST_SHARDS = {
         "-p deis-telemetry -p deis-proxy -p deislet-integration-tests --no-fail-fast"
     ),
 }
+EXPECTED_TEST_PREREQUISITES = {
+    "runtime-tests": "cargo build -p deis-proxy",
+}
 
 
 class ValidationError(RuntimeError):
@@ -265,6 +268,12 @@ def validate_integration() -> None:
             f"{EXPECTED_TEST_SHARD_TIMEOUT_MINUTES}-minute ceiling",
         )
         require(command in shard.group("body"), f"CI test shard {job_id} command drifted")
+        prerequisite = EXPECTED_TEST_PREREQUISITES.get(job_id)
+        if prerequisite is not None:
+            require(
+                prerequisite in shard.group("body"),
+                f"CI test shard {job_id} lacks required integration-test prerequisite {prerequisite}",
+            )
     assigned_packages = [
         package
         for command in EXPECTED_TEST_SHARDS.values()

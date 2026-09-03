@@ -142,6 +142,10 @@ hyper = "1.7"
 tower = "0.5"
 tempfile = "3"
 http-body-util = "0.1"
+# Resolver order may send `localhost` to IPv4 or IPv6. The hostname-policy
+# WebSocket test needs one dual-stack listener so it verifies policy rather
+# than whichever address family a given CI image listed first.
+socket2 = "0.6"
 
 [lib]
 name = "deis_runtime"

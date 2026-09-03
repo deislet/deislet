@@ -198,6 +198,12 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
+      # Two runtime integration cases start the real proxy binary. A package
+      # test does not build binaries from another workspace package, and jobs
+      # do not share the static workspace job's target directory.
+      - name: Build the proxy exercised by runtime integration tests
+        run: cargo build -p deis-proxy
+
       - name: Runtime tests
         run: cargo test -p deis-runtime --no-fail-fast
 

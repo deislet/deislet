@@ -26,10 +26,52 @@ use crate::runtime::FetchPolicy;
 /// connects successfully has proved the allowed path rather than a hole.
 async fn an_echo_server() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_echo(listener)
+}
+
+/// A loopback echo server reachable through either address family used by
+/// the hostname `localhost`.
+///
+/// `/etc/hosts` ordering is not portable: GitHub's Linux image resolves
+/// `localhost` to `::1` first, while the old test listened only on 127.0.0.1.
+/// The policy was correct but the connection was refused before it could be
+/// exercised. A dual-stack listener makes the test about retaining hostname
+/// policy rather than resolver ordering. Systems without IPv6 fall back to
+/// IPv4, where `localhost` necessarily does too.
+async fn a_localhost_echo_server() -> SocketAddr {
+    if let Some(listener) = dual_stack_loopback_listener() {
+        return serve_echo(listener);
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_echo(listener)
+}
+
+fn dual_stack_loopback_listener() -> Option<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).ok()?;
+    socket.set_only_v6(false).ok()?;
+    socket
+        .bind(&"[::]:0".parse::<SocketAddr>().unwrap().into())
+        .ok()?;
+    socket.listen(128).ok()?;
+    socket.set_nonblocking(true).ok()?;
+    tokio::net::TcpListener::from_std(socket.into()).ok()
+}
+
+fn serve_echo(listener: tokio::net::TcpListener) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
+        while let Ok((stream, peer)) = listener.accept().await {
+            // The dual-stack socket has to bind the unspecified IPv6 address
+            // in order to accept IPv4-mapped loopback connections as well as
+            // ::1. Keep the test service loopback-only at the application
+            // boundary even if a runner exposes that ephemeral port.
+            if !is_loopback_peer(peer) {
+                continue;
+            }
             tokio::spawn(async move {
                 let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
                     return;
@@ -50,6 +92,28 @@ async fn an_echo_server() -> SocketAddr {
     });
 
     addr
+}
+
+fn is_loopback_peer(peer: SocketAddr) -> bool {
+    match peer.ip() {
+        std::net::IpAddr::V4(address) => address.is_loopback(),
+        std::net::IpAddr::V6(address) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+    }
+}
+
+#[test]
+fn the_dual_stack_echo_server_serves_only_loopback_address_forms() {
+    for accepted in ["127.0.0.1:7", "[::1]:7", "[::ffff:127.0.0.1]:7"] {
+        assert!(is_loopback_peer(accepted.parse().unwrap()), "{accepted}");
+    }
+    for refused in ["10.0.0.1:7", "192.0.2.1:7", "[2001:db8::1]:7"] {
+        assert!(!is_loopback_peer(refused.parse().unwrap()), "{refused}");
+    }
 }
 
 /// A server that accepts the connection and then says nothing at all.
@@ -340,7 +404,7 @@ async fn an_allowlisted_private_websocket_name_keeps_its_hostname_policy() {
     // The second, connect-time check must retain this hostname and port. If it
     // converts the answer to a bare IP, the name the operator explicitly
     // opened can never match and every private hostname is unusable.
-    let addr = an_echo_server().await;
+    let addr = a_localhost_echo_server().await;
     let policy =
         FetchPolicy::new([format!("localhost:{}", addr.port())], Vec::<String>::new()).unwrap();
 
