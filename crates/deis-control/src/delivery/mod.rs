@@ -722,14 +722,13 @@ impl DeploymentDeliverer {
         assignment: &crate::catalog::Assignment,
         base_url: &str,
     ) -> CatalogResult<DeploymentPayload> {
-        let env = Environment {
-            id: assignment.environment_id.clone(),
-            app_id: assignment.app_id.clone(),
-            name: assignment.environment.clone(),
-            // Not read by `payload`; the row's own timestamp is of no use to
-            // a node and is deliberately not carried in the assignment.
-            created_at: 0,
-        };
+        // Load the durable row instead of synthesising a partial Environment:
+        // once canonical identity exists, even an internal model value must
+        // not carry an empty or invented identity.
+        let env = self
+            .store
+            .get_environment(&assignment.app_id, &assignment.environment)
+            .await?;
         let version = self
             .store
             .get_version(&assignment.app_id, &assignment.version_id)
@@ -1092,6 +1091,7 @@ mod tests {
     fn version(manifest: &str) -> Version {
         Version {
             id: "v-1".to_string(),
+            canonical_id: "018f2518-7e38-7f80-8000-000000000001".to_string(),
             app_id: "demo".to_string(),
             number: 1,
             bundle_sha: "abc123".to_string(),

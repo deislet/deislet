@@ -23,6 +23,10 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct App {
     pub id: String,
+    /// Permanent product identity. `None` only when talking to a control
+    /// plane from before the canonical-identity migration.
+    #[serde(default)]
+    pub canonical_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -30,6 +34,9 @@ pub struct App {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Version {
     pub id: String,
+    /// Permanent product identity; absent only on an older control plane.
+    #[serde(default)]
+    pub canonical_id: Option<String>,
     pub app_id: String,
     /// The per-application counter a person says out loud: "v3".
     pub number: i64,
@@ -67,6 +74,9 @@ pub struct UploadResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Environment {
     pub id: String,
+    /// Permanent product identity; absent only on an older control plane.
+    #[serde(default)]
+    pub canonical_id: Option<String>,
     pub app_id: String,
     pub name: String,
     pub created_at: i64,
@@ -81,6 +91,9 @@ pub struct EnvironmentsResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Deployment {
     pub id: String,
+    /// Permanent product identity; absent only on an older control plane.
+    #[serde(default)]
+    pub canonical_id: Option<String>,
     pub app_id: String,
     pub env_id: String,
     pub version_id: String,

@@ -31,10 +31,11 @@ use super::model::{
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
-const APP_COLUMNS: &str = "id, created_at";
-const VERSION_COLUMNS: &str = "id, app_id, number, bundle_sha, bundle_path, manifest, created_at";
-const ENVIRONMENT_COLUMNS: &str = "id, app_id, name, created_at";
-const DEPLOYMENT_COLUMNS: &str = "id, app_id, env_id, version_id, created_at, note";
+const APP_COLUMNS: &str = "id, canonical_id, created_at";
+const VERSION_COLUMNS: &str =
+    "id, canonical_id, app_id, number, bundle_sha, bundle_path, manifest, created_at";
+const ENVIRONMENT_COLUMNS: &str = "id, canonical_id, app_id, name, created_at";
+const DEPLOYMENT_COLUMNS: &str = "id, canonical_id, app_id, env_id, version_id, created_at, note";
 const ROUTE_COLUMNS: &str = "id, app_id, env_id, host, path_prefix, priority";
 const RETIRED_NAME_COLUMNS: &str = "app_id, retired_at, environments, released_at";
 const DOMAIN_GRANT_COLUMNS: &str = "pattern, app_id, environment, created_at, note";
@@ -142,6 +143,7 @@ impl CatalogStore {
     pub async fn create_app(&self, id: &str) -> CatalogResult<App> {
         validate_app_id(id)?;
         let id = id.to_string();
+        let canonical_id = Uuid::now_v7().to_string();
         let created_at = now_secs();
 
         let app = self
@@ -175,10 +177,14 @@ impl CatalogStore {
                     )));
                 }
                 conn.execute(
-                    "INSERT INTO apps (id, created_at) VALUES (?1, ?2)",
-                    params![id, created_at],
+                    "INSERT INTO apps (id, canonical_id, created_at) VALUES (?1, ?2, ?3)",
+                    params![id, canonical_id, created_at],
                 )?;
-                Ok(App { id, created_at })
+                Ok(App {
+                    id,
+                    canonical_id,
+                    created_at,
+                })
             })
             .await?;
 
@@ -574,6 +580,7 @@ impl CatalogStore {
                 )?;
                 let version = Version {
                     id: Uuid::new_v4().to_string(),
+                    canonical_id: Uuid::now_v7().to_string(),
                     app_id,
                     number,
                     bundle_sha,
@@ -583,10 +590,11 @@ impl CatalogStore {
                 };
                 tx.execute(
                     &format!(
-                        "INSERT INTO versions ({VERSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                        "INSERT INTO versions ({VERSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
                     ),
                     params![
                         version.id,
+                        version.canonical_id,
                         version.app_id,
                         version.number,
                         version.bundle_sha,
@@ -687,15 +695,22 @@ impl CatalogStore {
                 }
                 let env = Environment {
                     id: Uuid::new_v4().to_string(),
+                    canonical_id: Uuid::now_v7().to_string(),
                     app_id,
                     name,
                     created_at: now_secs(),
                 };
                 conn.execute(
                     &format!(
-                        "INSERT INTO environments ({ENVIRONMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4)"
+                        "INSERT INTO environments ({ENVIRONMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5)"
                     ),
-                    params![env.id, env.app_id, env.name, env.created_at],
+                    params![
+                        env.id,
+                        env.canonical_id,
+                        env.app_id,
+                        env.name,
+                        env.created_at
+                    ],
                 )?;
                 Ok(env)
             })
@@ -756,6 +771,7 @@ impl CatalogStore {
                 let version = load_version(conn, &app_id, &version_id)?;
                 let deployment = Deployment {
                     id: Uuid::new_v4().to_string(),
+                    canonical_id: Uuid::now_v7().to_string(),
                     app_id,
                     env_id,
                     version_id: version.id,
@@ -764,10 +780,11 @@ impl CatalogStore {
                 };
                 conn.execute(
                     &format!(
-                        "INSERT INTO deployments ({DEPLOYMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                        "INSERT INTO deployments ({DEPLOYMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
                     ),
                     params![
                         deployment.id,
+                        deployment.canonical_id,
                         deployment.app_id,
                         deployment.env_id,
                         deployment.version_id,
@@ -1485,39 +1502,43 @@ impl CatalogStore {
 fn map_app(row: &Row<'_>) -> rusqlite::Result<App> {
     Ok(App {
         id: row.get(0)?,
-        created_at: row.get(1)?,
+        canonical_id: row.get(1)?,
+        created_at: row.get(2)?,
     })
 }
 
 fn map_version(row: &Row<'_>) -> rusqlite::Result<Version> {
     Ok(Version {
         id: row.get(0)?,
-        app_id: row.get(1)?,
-        number: row.get(2)?,
-        bundle_sha: row.get(3)?,
-        bundle_path: row.get(4)?,
-        manifest: row.get(5)?,
-        created_at: row.get(6)?,
+        canonical_id: row.get(1)?,
+        app_id: row.get(2)?,
+        number: row.get(3)?,
+        bundle_sha: row.get(4)?,
+        bundle_path: row.get(5)?,
+        manifest: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
 fn map_environment(row: &Row<'_>) -> rusqlite::Result<Environment> {
     Ok(Environment {
         id: row.get(0)?,
-        app_id: row.get(1)?,
-        name: row.get(2)?,
-        created_at: row.get(3)?,
+        canonical_id: row.get(1)?,
+        app_id: row.get(2)?,
+        name: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }
 
 fn map_deployment(row: &Row<'_>) -> rusqlite::Result<Deployment> {
     Ok(Deployment {
         id: row.get(0)?,
-        app_id: row.get(1)?,
-        env_id: row.get(2)?,
-        version_id: row.get(3)?,
-        created_at: row.get(4)?,
-        note: row.get(5)?,
+        canonical_id: row.get(1)?,
+        app_id: row.get(2)?,
+        env_id: row.get(3)?,
+        version_id: row.get(4)?,
+        created_at: row.get(5)?,
+        note: row.get(6)?,
     })
 }
 
@@ -1806,6 +1827,43 @@ mod tests {
             .unwrap();
         assert!(created);
         version
+    }
+
+    fn assert_uuid_v7(id: &str) {
+        let uuid = Uuid::parse_str(id).expect("canonical identity must parse as UUID");
+        assert_eq!(uuid.get_version_num(), 7, "{id} is not UUIDv7");
+        assert_eq!(uuid.to_string(), id, "canonical UUID must be lowercase");
+    }
+
+    #[tokio::test]
+    async fn new_catalog_objects_receive_distinct_canonical_identities() {
+        let store = store().await;
+        let app = store.create_app("demo").await.unwrap();
+        let env = store
+            .create_environment("demo", "production")
+            .await
+            .unwrap();
+        let version = version(&store, "demo", "sha-1").await;
+        let deployment = store.deploy(&env, &version.id, None).await.unwrap();
+
+        let ids = [
+            app.canonical_id.as_str(),
+            env.canonical_id.as_str(),
+            version.canonical_id.as_str(),
+            deployment.canonical_id.as_str(),
+        ];
+        for id in ids {
+            assert_uuid_v7(id);
+        }
+        let unique = ids.into_iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), ids.len());
+
+        // Compatibility identifiers are intentionally unchanged in this
+        // phase; routes and name-based tenants still resolve while callers
+        // can begin persisting the canonical identities exposed by the API.
+        assert_eq!(app.id, "demo");
+        assert_eq!(env.name, "production");
+        assert_eq!(version.id, deployment.version_id);
     }
 
     /// Version rows written by an earlier run name their bundle relative to

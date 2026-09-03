@@ -21,6 +21,12 @@
 
 这些是迁移输入，不因 schema 文件出现而自动修复。路线中的 `P0-MODEL-001` 只有在代码采用共享类型、旧数据迁移 fixture 可实际运行、且无停机 cutover 测试通过后才能完成。
 
+## 当前实现进度
+
+`deis-control` 已完成 identity 迁移的第一个可执行切片：`application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID；兼容触发器会为滚动升级期间仍按旧列集合写入的进程补齐 UUIDv7。REST 响应已增量暴露该字段，新 CLI 允许连接尚未提供该字段的旧 Control。
+
+该切片只完成 `allocate-canonical-ids` 的基础，不代表八阶段迁移完成：tenant/binding/capability 仍使用旧名称，尚未建立持久 migration operation、fence、dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone；旧主键仍是当前路由参数。列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+
 ## 六份机器契约
 
 1. [`resource-identity.schema.json`](resource-identity.schema.json)：主要对象的 canonical ID、kind、scope、display name 和 revision。ID 是定位符，不是凭证。

@@ -16,8 +16,10 @@ pub const MAX_SECRET_NAME_LEN: usize = 128;
 /// Longest accepted route path prefix.
 pub const MAX_PATH_PREFIX_LEN: usize = 512;
 
-/// An application. `id` is the app name; it is one half of what identifies
-/// a running application, the other being the environment.
+/// An application. During the identity migration, `id` remains the legacy
+/// app name used by existing routes and tenants while `canonical_id` is the
+/// permanent product identity. New code must not derive authority or storage
+/// isolation from the display name.
 ///
 /// The dumb services (deis-store, deis-queue) see a single opaque tenant id
 /// built from the pair by `deis_wire::conventions::tenant_id`, so a preview
@@ -26,6 +28,7 @@ pub const MAX_PATH_PREFIX_LEN: usize = 512;
 #[derive(Debug, Clone, Serialize)]
 pub struct App {
     pub id: String,
+    pub canonical_id: String,
     pub created_at: i64,
 }
 
@@ -37,6 +40,7 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub struct Version {
     pub id: String,
+    pub canonical_id: String,
     pub app_id: String,
     /// Per-app counter starting at 1. This is what a human calls "v3".
     pub number: i64,
@@ -53,6 +57,7 @@ pub struct Version {
 #[derive(Debug, Clone, Serialize)]
 pub struct Environment {
     pub id: String,
+    pub canonical_id: String,
     pub app_id: String,
     pub name: String,
     pub created_at: i64,
@@ -63,6 +68,7 @@ pub struct Environment {
 #[derive(Debug, Clone, Serialize)]
 pub struct Deployment {
     pub id: String,
+    pub canonical_id: String,
     pub app_id: String,
     pub env_id: String,
     pub version_id: String,

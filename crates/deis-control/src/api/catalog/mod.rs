@@ -581,8 +581,15 @@ pub(crate) mod tests {
     async fn full_deploy_and_rollback_loop() {
         let h = harness(true).await;
         let router = &h.router;
+        let canonical_id = |body: &Value| {
+            let id = body["canonical_id"]
+                .as_str()
+                .expect("public catalog object must expose canonical_id");
+            assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 7);
+            id.to_string()
+        };
 
-        let (status, _) = json(
+        let (status, app_body) = json(
             router,
             "POST",
             "/api/apps",
@@ -590,6 +597,7 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        canonical_id(&app_body);
 
         // Same name twice is a conflict, not a silent overwrite.
         let (status, _) = json(
@@ -611,6 +619,7 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED, "upload failed: {body}");
         let v1 = body["version"]["id"].as_str().unwrap().to_string();
+        canonical_id(&body["version"]);
         assert_eq!(body["version"]["number"], 1);
         assert_eq!(body["version"]["manifest"]["app"], "demo");
 
@@ -629,6 +638,7 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let v2 = body["version"]["id"].as_str().unwrap().to_string();
+        canonical_id(&body["version"]);
         assert_eq!(body["version"]["number"], 2);
 
         let (status, body) = json(router, "GET", "/api/apps/demo/versions", Value::Null).await;
@@ -646,7 +656,7 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
-        let (status, _) = json(
+        let (status, environment_body) = json(
             router,
             "POST",
             "/api/apps/demo/environments",
@@ -654,6 +664,7 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        canonical_id(&environment_body);
 
         // Nothing is deployed yet, so no assignment exists.
         let (status, body) =
@@ -669,6 +680,7 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "deploy failed: {body}");
+        canonical_id(&body["deployment"]);
 
         let (status, body) = json(
             router,

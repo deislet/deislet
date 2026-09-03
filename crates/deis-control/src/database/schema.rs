@@ -1,5 +1,6 @@
 use rusqlite::{Connection, Result};
 use tracing::info;
+use uuid::Uuid;
 
 /// Initialize database schema
 pub fn create_tables(conn: &Connection) -> Result<()> {
@@ -214,8 +215,9 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute(
         r#"
         CREATE TABLE IF NOT EXISTS apps (
-            id          TEXT PRIMARY KEY,
-            created_at  INTEGER NOT NULL
+            id           TEXT PRIMARY KEY,
+            canonical_id TEXT,
+            created_at   INTEGER NOT NULL
         )
         "#,
         [],
@@ -265,13 +267,14 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute(
         r#"
         CREATE TABLE IF NOT EXISTS versions (
-            id          TEXT PRIMARY KEY,
-            app_id      TEXT NOT NULL REFERENCES apps(id),
-            number      INTEGER NOT NULL,
-            bundle_sha  TEXT NOT NULL,
-            bundle_path TEXT NOT NULL,
-            manifest    TEXT NOT NULL,
-            created_at  INTEGER NOT NULL,
+            id           TEXT PRIMARY KEY,
+            canonical_id TEXT,
+            app_id       TEXT NOT NULL REFERENCES apps(id),
+            number       INTEGER NOT NULL,
+            bundle_sha   TEXT NOT NULL,
+            bundle_path  TEXT NOT NULL,
+            manifest     TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
             UNIQUE(app_id, number)
         )
         "#,
@@ -296,10 +299,11 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute(
         r#"
         CREATE TABLE IF NOT EXISTS environments (
-            id          TEXT PRIMARY KEY,
-            app_id      TEXT NOT NULL REFERENCES apps(id),
-            name        TEXT NOT NULL,
-            created_at  INTEGER NOT NULL,
+            id           TEXT PRIMARY KEY,
+            canonical_id TEXT,
+            app_id       TEXT NOT NULL REFERENCES apps(id),
+            name         TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
             UNIQUE(app_id, name)
         )
         "#,
@@ -318,12 +322,13 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute(
         r#"
         CREATE TABLE IF NOT EXISTS deployments (
-            id          TEXT PRIMARY KEY,
-            app_id      TEXT NOT NULL,
-            env_id      TEXT NOT NULL REFERENCES environments(id),
-            version_id  TEXT NOT NULL REFERENCES versions(id),
-            created_at  INTEGER NOT NULL,
-            note        TEXT
+            id           TEXT PRIMARY KEY,
+            canonical_id TEXT,
+            app_id       TEXT NOT NULL,
+            env_id       TEXT NOT NULL REFERENCES environments(id),
+            version_id   TEXT NOT NULL REFERENCES versions(id),
+            created_at   INTEGER NOT NULL,
+            note         TEXT
         )
         "#,
         [],
@@ -341,6 +346,14 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_deployments_app ON deployments(app_id)",
         [],
     )?;
+
+    // Phase one of the canonical-identity migration is deliberately
+    // additive. Existing names and UUIDv4 primary keys remain readable by an
+    // older control plane while every durable product object gains a UUIDv7.
+    // The helper also installs compatibility triggers: if an older process
+    // writes a row during a rolling upgrade without naming `canonical_id`,
+    // the database fills it before a newer process can observe a NULL.
+    ensure_canonical_ids(conn)?;
 
     // Routes bind a host plus path prefix to one environment of one app.
     // A NULL host matches any domain.
@@ -564,6 +577,86 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(found > 0)
+}
+
+/// Add and backfill canonical UUIDv7 identity without changing legacy keys.
+///
+/// The columns stay nullable for binary compatibility with an older writer.
+/// A per-table `AFTER INSERT` trigger gives such writes a well-formed UUIDv7,
+/// while current code supplies the value explicitly. A later migration may
+/// rebuild these tables with `NOT NULL` only after legacy writers and lookup
+/// paths have been retired.
+fn ensure_canonical_ids(conn: &Connection) -> Result<()> {
+    for table in ["apps", "versions", "environments", "deployments"] {
+        let has_column = conn
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "canonical_id");
+        if !has_column {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN canonical_id TEXT"),
+                [],
+            )?;
+        }
+
+        // SQLite has no built-in UUID function. This expression encodes the
+        // current Unix millisecond in the leading 48 bits, fixes the version
+        // nibble to 7 and the RFC 4122 variant to 10xx, then supplies 74
+        // random bits. It exists for old binaries only; current Rust writers
+        // use `Uuid::now_v7()`.
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_canonical_id
+            AFTER INSERT ON {table}
+            WHEN NEW.canonical_id IS NULL OR NEW.canonical_id = ''
+            BEGIN
+                UPDATE {table}
+                SET canonical_id = (
+                    SELECT lower(
+                        substr(timestamp_hex, 1, 8) || '-' ||
+                        substr(timestamp_hex, 9, 4) || '-7' || random_a || '-' ||
+                        variant || random_b_head || '-' || random_b_tail
+                    )
+                    FROM (
+                        SELECT
+                            printf(
+                                '%012x',
+                                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+                            ) AS timestamp_hex,
+                            substr(hex(randomblob(2)), 2, 3) AS random_a,
+                            substr('89ab', (random() & 3) + 1, 1) AS variant,
+                            substr(hex(randomblob(2)), 2, 3) AS random_b_head,
+                            hex(randomblob(6)) AS random_b_tail
+                    )
+                )
+                WHERE rowid = NEW.rowid;
+            END;
+            "#
+        ))?;
+
+        let rowids = conn
+            .prepare(&format!(
+                "SELECT rowid FROM {table} WHERE canonical_id IS NULL OR canonical_id = ''"
+            ))?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>>>()?;
+        for rowid in rowids {
+            conn.execute(
+                &format!("UPDATE {table} SET canonical_id = ?1 WHERE rowid = ?2"),
+                rusqlite::params![Uuid::now_v7().to_string(), rowid],
+            )?;
+        }
+
+        conn.execute(
+            &format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_canonical_id ON {table}(canonical_id)"
+            ),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Write down, once, what this installation is already serving.
@@ -1355,6 +1448,104 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// The first identity migration is an additive rolling upgrade: rows
+    /// already on disk gain permanent UUIDv7 identities, a second start does
+    /// not rewrite them, and an older writer that omits the new column is
+    /// still assigned one by the compatibility trigger.
+    #[test]
+    fn canonical_ids_backfill_once_and_cover_legacy_writes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE apps (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE versions (
+                id TEXT PRIMARY KEY,
+                app_id TEXT NOT NULL REFERENCES apps(id),
+                number INTEGER NOT NULL,
+                bundle_sha TEXT NOT NULL,
+                bundle_path TEXT NOT NULL,
+                manifest TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(app_id, number)
+            );
+            CREATE TABLE environments (
+                id TEXT PRIMARY KEY,
+                app_id TEXT NOT NULL REFERENCES apps(id),
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(app_id, name)
+            );
+            CREATE TABLE deployments (
+                id TEXT PRIMARY KEY,
+                app_id TEXT NOT NULL,
+                env_id TEXT NOT NULL REFERENCES environments(id),
+                version_id TEXT NOT NULL REFERENCES versions(id),
+                created_at INTEGER NOT NULL,
+                note TEXT
+            );
+            INSERT INTO apps VALUES ('legacy', 1);
+            INSERT INTO versions VALUES ('version-v4', 'legacy', 1, 'sha', 'path', '{}', 1);
+            INSERT INTO environments VALUES ('environment-v4', 'legacy', 'production', 1);
+            INSERT INTO deployments
+                VALUES ('deployment-v4', 'legacy', 'environment-v4', 'version-v4', 1, NULL);
+            "#,
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+        let read_ids = |conn: &Connection| -> Vec<String> {
+            ["apps", "versions", "environments", "deployments"]
+                .iter()
+                .map(|table| {
+                    conn.query_row(
+                        &format!("SELECT canonical_id FROM {table} LIMIT 1"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        let first = read_ids(&conn);
+        for id in &first {
+            let uuid = Uuid::parse_str(id).expect("backfill must write a UUID");
+            assert_eq!(uuid.get_version_num(), 7, "{id} is not UUIDv7");
+            assert_eq!(uuid.to_string(), *id, "canonical UUID must be lowercase");
+        }
+
+        create_tables(&conn).unwrap();
+        assert_eq!(read_ids(&conn), first, "restart rewrote durable identities");
+
+        // This is the INSERT shape used by a binary from before the column
+        // existed. It must keep working during a rolling upgrade.
+        conn.execute(
+            "INSERT INTO apps (id, created_at) VALUES ('written-by-old-control', 2)",
+            [],
+        )
+        .unwrap();
+        let triggered: String = conn
+            .query_row(
+                "SELECT canonical_id FROM apps WHERE id = 'written-by-old-control'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Uuid::parse_str(&triggered).unwrap().get_version_num(),
+            7,
+            "compatibility trigger did not generate UUIDv7"
+        );
+
+        let duplicate = conn.execute(
+            "UPDATE apps SET canonical_id = ?1 WHERE id = 'written-by-old-control'",
+            [&first[0]],
+        );
+        assert!(duplicate.is_err(), "canonical identity was not unique");
     }
 
     /// Versions carry a per-app monotonic number; the schema itself must

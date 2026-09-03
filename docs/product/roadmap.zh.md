@@ -27,12 +27,12 @@
 ## 当前进行中
 
 - `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 已形成 20 条候选条款和 11 个 provider-independent 草案用例。最低资源保证仍为 `pending`、执行 harness 仍为 `planned`，其余 14 个能力族尚未开始，故本项继续保持 `active`。
-- `P0-MODEL-001`：已建立 canonical identity、artifact、binding snapshot、operation、provider driver 和 identity migration 六份 Draft schema，配套 12 个正反 fixture 与可执行状态图校验。现有 Rust/SQLite/API 尚未迁移，故本项继续保持 `active`。
+- `P0-MODEL-001`：已建立 canonical identity、artifact、binding snapshot、operation、provider driver 和 identity migration 六份 Draft schema，配套 12 个正反 fixture 与可执行状态图校验。Rust/SQLite/API 已完成 application/environment/version/deployment 的增量 UUIDv7 分配、存量回填、唯一索引和旧 writer 兼容触发器；tenant/binding/capability、持久 migration operation 与受 fencing 的 cutover 尚未迁移，故本项继续保持 `active`。
 
 ## 紧接着执行
 
 1. `P0-SPEC-002`：先完成 `web-fetch-events` 的最低资源保证、依赖类型和三后端可执行 harness，再按其闭环逐项完成其余 14 个 mandatory 能力族；`pending` 是发布阻断项。
-2. `P0-MODEL-001`：实现 shared schema 对应的代码类型和 SQLite migration，先做 inventory/ID 分配/双读 fixture，再验证受 fencing 的 copy/cutover、旧 token 撤销与 rollback。
+2. `P0-MODEL-001`：在已完成 ID 分配与旧库回填的基础上，实现完整 inventory 和 canonical tenant/binding 双读，随后验证受 fencing 的 copy/cutover、旧 token 撤销与 rollback。
 3. `P0-EVID-001`：删除手工维护的“支持”结论，让 README、CLI、Web 和矩阵从 registry 生成。
 4. `P0-CI-001`：升级仍以 Node 20 action runtime 发布的 GitHub Actions revision，清除 runner 的强制兼容警告。
 
