@@ -21,7 +21,20 @@ fn stage(project: &Path) {
 
           export default function handler() {
             const digest = createHash("sha256").update(Buffer.from("edge-canon")).digest("hex");
-            return new Response(JSON.stringify({ digest, platform, version, node: versions.node }));
+            const providerGlobals = ["Web" + "Socket", ["WebSocket", "Pair"].join(""), ["WebSocket", "Server"].join("")]
+              .map(name => {
+                const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+                return {
+                  name,
+                  type: typeof globalThis[name],
+                  owned: descriptor !== undefined,
+                  valueIsUndefined: descriptor?.value === undefined,
+                  writable: descriptor?.writable,
+                  enumerable: descriptor?.enumerable,
+                  configurable: descriptor?.configurable,
+                };
+              });
+            return new Response(JSON.stringify({ digest, platform, version, node: versions.node, providerGlobals }));
           }
         "#,
     )
@@ -102,7 +115,12 @@ async fn compiler_output_runs_on_the_deislet_node_compatibility_layer() {
           "digest": "175811799a9da49a1cd8fc30f26d1e1d6b3d677108d76108309b5900dbf44ab0",
           "platform": "linux",
           "version": "v24.20.0",
-          "node": "24.20.0"
+          "node": "24.20.0",
+          "providerGlobals": [
+            {"name":"WebSocket","type":"undefined","owned":true,"valueIsUndefined":true,"writable":false,"enumerable":false,"configurable":false},
+            {"name":"WebSocketPair","type":"undefined","owned":true,"valueIsUndefined":true,"writable":false,"enumerable":false,"configurable":false},
+            {"name":"WebSocketServer","type":"undefined","owned":true,"valueIsUndefined":true,"writable":false,"enumerable":false,"configurable":false}
+          ]
         })
     );
 }

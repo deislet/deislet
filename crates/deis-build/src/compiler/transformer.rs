@@ -17,13 +17,23 @@ impl Transformer {
         &self,
         code: &str,
         _filename: &str,
-        _vendor: &str,
+        vendor: &str,
         _config: &ProjectConfig,
     ) -> anyhow::Result<String> {
         // Since we moved Context bridging and Adapter logic to the entry point (index.ts/main.ts),
         // and we use Rolldown for bundling, the Transformer no longer needs to wrap user code.
         // It should just pass through the code, or optionally perform SWC transforms (e.g. for strip types).
         // But since Rolldown handles TS, we can just pass through.
+        if vendor == deis_build_adapter_deno::VENDOR {
+            // The Web Deno target ships modules instead of bundling them. Put
+            // the isolation boundary into every reachable source module so a
+            // leaf dependency also runs it before its own top-level code.
+            return Ok(format!(
+                "{}{}",
+                deis_build_core::provider_global_isolation_prelude(),
+                code
+            ));
+        }
         Ok(code.to_string())
     }
 

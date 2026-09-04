@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-05T03:56:56+08:00",
+  "resolvedAt": "2026-09-05T04:14:33+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "90897c134b649de4868aa41beebff1f23f346081",
+    "sourceCommit": "9f1f7b50647f9a8af45d6d2ca5906fdf5722a7f0",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "contractPath": "standard/contract.json",
     "contractSchemaPath": "schemas/standard-contract.schema.json",
@@ -21,7 +21,7 @@
     "routingPlatformEvidencePath": "conformance/evidence/routing-static-assets-platforms-2026-09-04.json",
     "streamsRequirementsPath": "standard/requirements/streams-websockets-background-work.zh.md",
     "streamsSchemaPath": "schemas/streams-websockets-background-work.schema.json",
-    "streamsSchemaSha256": "47613579475e6d6157d102fb40882a21408f5b886131d37d0bab38d7cda726b7",
+    "streamsSchemaSha256": "83d68dc31563f81dfae0abf2800cb59c4f75013cafc5a7bc37d539f681e1e521",
     "streamsHarnessPath": "conformance/harness/streams-websockets-background-work/harness.json",
     "streamsPlatformEvidencePath": "conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json",
     "nodeNpmRequirementsPath": "standard/requirements/node-npm-subset.zh.md",

@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-002
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/90897c134b649de4868aa41beebff1f23f346081/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/9f1f7b50647f9a8af45d6d2ca5906fdf5722a7f0/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 背景
 
@@ -59,7 +59,7 @@ Edge Canon 不承诺“完整 Node 主机”。它承诺一组明确列举、版
 - `node:util`
 - `node:zlib`
 
-完整清单与逐 export 定义由锁定标准的 [`node-npm-subset` requirements](https://github.com/deislet/edge-canon/blob/90897c134b649de4868aa41beebff1f23f346081/standard/requirements/node-npm-subset.zh.md) 和 [schema](https://github.com/deislet/edge-canon/blob/90897c134b649de4868aa41beebff1f23f346081/schemas/node-npm-subset.schema.json) 唯一定义；ADR 不复制第二份清单。`Buffer`、受限 `process`、`setImmediate` 与 `clearImmediate` 同时是标准 global。
+完整清单与逐 export 定义由锁定标准的 [`node-npm-subset` requirements](https://github.com/deislet/edge-canon/blob/9f1f7b50647f9a8af45d6d2ca5906fdf5722a7f0/standard/requirements/node-npm-subset.zh.md) 和 [schema](https://github.com/deislet/edge-canon/blob/9f1f7b50647f9a8af45d6d2ca5906fdf5722a7f0/schemas/node-npm-subset.schema.json) 唯一定义；ADR 不复制第二份清单。`Buffer`、受限 `process`、`setImmediate` 与 `clearImmediate` 同时是标准 global。
 
 方法级能力同样遵守交集规则。首版 `AsyncLocalStorage` 只保证 Cloudflare、EdgeOne、Deislet 和参考 Node 均能恰当实现的 `run/getStore/exit`；Cloudflare 明确排除的 `enterWith/disable` 不属于统一应用标准。后端存在同名额外方法不能扩大应用契约，行业实现变化可在后续标准版本重新评估。
 

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use rolldown::{
-    Bundler, BundlerOptions, CodeSplittingMode, InjectImport, InputItem, OutputFormat, Platform,
-    RawMinifyOptions, ResolveOptions, SourceMapType,
+    AddonOutputOption, Bundler, BundlerOptions, CodeSplittingMode, InjectImport, InputItem,
+    OutputFormat, Platform, RawMinifyOptions, ResolveOptions, SourceMapType,
 };
 use rolldown_common::Output;
 
@@ -87,6 +87,13 @@ impl BuildBundler {
             }]),
             platform: platform_opt,
             format,
+            // The banner is emitted before every bundled module body. Static
+            // analysis catches ordinary references with source coordinates;
+            // this runtime boundary also closes computed/reflection access to
+            // provider globals that are outside the standard intersection.
+            banner: Some(AddonOutputOption::String(Some(
+                crate::provider_global_isolation_prelude().to_string(),
+            ))),
             // Keep npm packages fully bundled. Platform::Node would
             // externalize runtime machinery on the bundler's behalf (for
             // example node:module for an otherwise portable CommonJS

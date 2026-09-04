@@ -181,7 +181,7 @@ impl HandlerVisitor {
     }
 
     fn record_provider_only_global(&mut self, name: &str, span: Span) {
-        if !matches!(name, "WebSocket" | "WebSocketPair") {
+        if !deis_build_core::PROVIDER_ONLY_GLOBALS.contains(&name) {
             return;
         }
         let location = self.source_map.lookup_char_pos(span.lo());
@@ -711,11 +711,12 @@ export default async function handler() { return new Response(String(value)); }
                  const harmless = 'WebSocketPair'; // new WebSocket('ignored')\n\
                  const one = new WebSocket(url);\n\
                  const two = globalThis['WebSocketPair'];\n\
-                 export default function handler() { return new Response(harmless + one + two); }\n",
+                 const three = self.WebSocketServer;\n\
+                 export default function handler() { return new Response(harmless + one + two + three); }\n",
                 "functions/index.ts",
             )
             .expect("module parses");
-        assert_eq!(info.provider_only_global_references.len(), 2);
+        assert_eq!(info.provider_only_global_references.len(), 3);
         assert_eq!(info.provider_only_global_references[0].name, "WebSocket");
         assert_eq!(info.provider_only_global_references[0].line, 3);
         assert!(info.provider_only_global_references[0].column > 0);
@@ -725,6 +726,11 @@ export default async function handler() { return new Response(String(value)); }
         );
         assert_eq!(info.provider_only_global_references[1].line, 4);
         assert!(info.provider_only_global_references[1].column > 0);
+        assert_eq!(
+            info.provider_only_global_references[2].name,
+            "WebSocketServer"
+        );
+        assert_eq!(info.provider_only_global_references[2].line, 5);
     }
 
     #[test]

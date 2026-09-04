@@ -3,6 +3,7 @@
 //! exists, including when the reference comes from a local dependency.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use deis_build::{Compiler, CompilerOptions};
@@ -63,7 +64,7 @@ async fn every_target_rejects_provider_websocket_globals_with_one_code() {
         stage(
             project.path(),
             vendor,
-            "export default function handler() { return new WebSocket('wss://example.invalid'); }\n",
+            "export default function handler() { void WebSocketPair; void WebSocketServer; return new WebSocket('wss://example.invalid'); }\n",
         );
         let error = build(project.path(), vendor)
             .await
@@ -74,6 +75,8 @@ async fn every_target_rejects_provider_websocket_globals_with_one_code() {
             "{vendor}: {error}"
         );
         assert!(error.contains("WebSocket"), "{vendor}: {error}");
+        assert!(error.contains("WebSocketPair"), "{vendor}: {error}");
+        assert!(error.contains("WebSocketServer"), "{vendor}: {error}");
         assert!(error.contains("index.ts:1:"), "{vendor}: {error}");
         for entry in deployable_entries(project.path(), vendor) {
             assert!(
@@ -120,4 +123,49 @@ async fn comments_strings_and_erased_types_do_not_become_runtime_references() {
     build(project.path(), "deislet")
         .await
         .expect("non-runtime text must remain portable");
+}
+
+#[tokio::test]
+async fn every_generated_target_seals_reflective_provider_global_access() {
+    let prelude = deis_build_core::provider_global_isolation_prelude();
+    for vendor in VENDORS {
+        let project = tempfile::tempdir().expect("temporary project");
+        stage(
+            project.path(),
+            vendor,
+            "const names = ['Web' + 'Socket', ['WebSocket', 'Pair'].join(''), ['WebSocket', 'Server'].join('')];\nexport default function handler() { return Response.json(names.map(name => typeof globalThis[name])); }\n",
+        );
+        build(project.path(), vendor)
+            .await
+            .unwrap_or_else(|error| panic!("{vendor} reflective-isolation build: {error}"));
+
+        let root = project.path().join("dist").join(vendor);
+        let entry = match vendor {
+            "cloudflare" => fs::read_to_string(root.join("index.js")).expect("Cloudflare entry"),
+            "tencent" => {
+                fs::read_to_string(root.join("edge-functions/index.js")).expect("EdgeOne entry")
+            }
+            "deno" => fs::read_to_string(root.join("project/functions/index.ts"))
+                .expect("Deno staged application module"),
+            "deislet" => {
+                let file = fs::File::open(root.join("bundle.zip")).expect("Deislet bundle");
+                let mut archive = zip::ZipArchive::new(file).expect("Deislet ZIP");
+                let mut code = String::new();
+                archive
+                    .by_name("worker/index.js")
+                    .expect("Deislet worker entry")
+                    .read_to_string(&mut code)
+                    .expect("Deislet worker is UTF-8");
+                code
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            entry.starts_with(prelude),
+            "{vendor} does not execute provider-global isolation before application code"
+        );
+        for name in deis_build_core::PROVIDER_ONLY_GLOBALS {
+            assert!(entry.contains(name), "{vendor} does not seal {name}");
+        }
+    }
 }

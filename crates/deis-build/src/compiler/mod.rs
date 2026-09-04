@@ -1044,16 +1044,15 @@ impl Compiler {
                 let bytes = fs::read(&dependency)?;
                 let mirror_path =
                     Self::project_mirror_path(&build_dir, &project_root, &dependency)?;
-                Self::write_staged_file(&mirror_path, &bytes)?;
                 let project_relative = dependency.strip_prefix(&project_root)?;
                 files.push(dependency.to_string_lossy().to_string());
-                total_size += bytes.len();
 
                 if let Ok(code) = std::str::from_utf8(&bytes) {
-                    if matches!(
+                    let is_script = matches!(
                         dependency.extension().and_then(|value| value.to_str()),
                         Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
-                    ) {
+                    );
+                    if is_script {
                         let name = dependency.to_string_lossy().to_string();
                         let parsed = self.parser.parse(code, &name)?;
                         Self::refuse_non_literal_module_loads(&name, &parsed)?;
@@ -1062,13 +1061,27 @@ impl Compiler {
                         handler_specifiers.push((name, parsed.imports.clone()));
                         module_queue.push_back((dependency.clone(), parsed.imports));
                     }
+                    let staged_code = if is_script && vendor == deis_build_adapter_deno::VENDOR {
+                        format!(
+                            "{}{}",
+                            deis_build_core::provider_global_isolation_prelude(),
+                            code
+                        )
+                    } else {
+                        code.to_string()
+                    };
+                    Self::write_staged_file(&mirror_path, staged_code.as_bytes())?;
+                    total_size += staged_code.len();
                     if should_collect_memory {
                         let key = format!(
                             "project/{}",
                             project_relative.to_string_lossy().replace('\\', "/")
                         );
-                        memory_source_files.insert(key, code.to_string());
+                        memory_source_files.insert(key, staged_code);
                     }
+                } else {
+                    Self::write_staged_file(&mirror_path, &bytes)?;
+                    total_size += bytes.len();
                 }
             }
         }
