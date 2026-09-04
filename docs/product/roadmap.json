@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-04T09:50:00+08:00",
+  "updatedAt": "2026-09-04T11:48:22+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -48,10 +48,10 @@
           "status": "done",
           "dependsOn": ["P0-DEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/proposals/0001-unified-platform-contract/README.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/contract.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/proposals/0001-unified-platform-contract/README.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/standard/contract.json"}
           ],
-          "verification": "在 Edge Canon commit 336f388466bf958ec1a6c4b50ba5cd2990ad78e0 运行 python3 scripts/check-governance.py"
+          "verification": "在 Edge Canon commit d0f54dd257789604257eba973b364588ca5496a3 运行 python3 scripts/check-governance.py"
         },
         {
           "id": "P0-CONF-001",
@@ -60,8 +60,8 @@
           "status": "done",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/conformance/registry.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/schemas/conformance-registry.schema.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/conformance/registry.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/schemas/conformance-registry.schema.json"}
           ],
           "verification": "registry 中 proposal 不能 compliant，supported 必须蕴含 compliant"
         },
@@ -86,10 +86,12 @@
           "status": "active",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/requirements.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/requirements/web-fetch-events.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/conformance/kit.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/standard/requirements.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/standard/requirements/web-fetch-events.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/conformance/kit.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/conformance/harness/web-fetch-events/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/conformance/harness/web-fetch-events/oracle.mjs"}
           ],
           "verification": "contract.json 强制最低免费/入门档共同资源基线，且 15 个 definitionStatus 全部为 normative-complete"
         },

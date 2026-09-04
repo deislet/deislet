@@ -15,9 +15,9 @@
   },
   "standard": {
     "contractId": "edge-canon.next",
-    "version": "next@336f388466bf958ec1a6c4b50ba5cd2990ad78e0",
+    "version": "next@d0f54dd257789604257eba973b364588ca5496a3",
     "releaseStatus": "proposal",
-    "sourceCommit": "336f388466bf958ec1a6c4b50ba5cd2990ad78e0",
+    "sourceCommit": "d0f54dd257789604257eba973b364588ca5496a3",
     "contractDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
   },
   "source": {
