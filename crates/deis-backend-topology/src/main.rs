@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use deis_backend_topology::{
-    TopologyConfig, capture_restore_set, execute_restore, inspect_restore,
+    TopologyConfig, capture_restore_set, execute_restore, inspect_restore, recover_snapshot_capture,
 };
 use deis_wire::{BackendRestoreSet, CanonicalId};
 
@@ -28,6 +28,8 @@ enum Command {
         #[arg(long)]
         installation_id: CanonicalId,
     },
+    /// Recover and, when complete, publish an interrupted snapshot capture.
+    RecoverSnapshotSet,
     /// Execute or resume one coordinated embedded-backend restore.
     Restore {
         #[arg(long)]
@@ -63,6 +65,12 @@ async fn main() -> Result<()> {
             let restore_set =
                 capture_restore_set(&config, &out, organization_id, installation_id).await?;
             println!("{}", serde_json::to_string(&restore_set)?);
+            Ok(())
+        }
+        Command::RecoverSnapshotSet => {
+            if let Some(restore_set) = recover_snapshot_capture(&config).await? {
+                println!("{}", serde_json::to_string(&restore_set)?);
+            }
             Ok(())
         }
         Command::Restore {

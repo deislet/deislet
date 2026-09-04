@@ -1358,4 +1358,13 @@ Application/framework source + versioned build plan
 - Topology config 的 live data 与 snapshot root 也逐级拒绝已有 symlink ancestor；此前只约束词法绝对路径和最终目录，受信任 config 中一个看似固定但经中间 symlink 重定向的路径仍可能绕过目录边界。Unix 回归测试覆盖该重定向。
 - 跨语言复核发现 `restoreSetSha256` 原先隐含依赖 Rust struct 的 JSON 字段顺序；语义相同的 Go/JavaScript/vendor driver 可能得到不同摘要。共享类型、fixture 和治理检查现统一采用 RFC 8785 JCS，再计算 SHA-256；schema `$comment` 与 ADR 同步规定该算法，不再把实现细节当协议。
 - 本地针对性证据已通过：共享契约检查；Control restore catalog/API、租约、成功/unknown/rollback/cancel 测试；topology 的 snapshot-set→restore、exact retry、tamper-before-mutation、post-switch rollback、四个 rename crash window 与全局锁测试；相关 crates `clippy --all-targets -D warnings`。这不是远端 CI 或真实演练证据。
-- 仍明确欠缺：canary/production topology config 与受限执行身份、破坏隔离环境的真实恢复演练；snapshot-set 捕获流程自身的崩溃 journal/自动复原；snapshot 加密、异地复制、retention/cleanup、定期 restore verification 与 RPO/RTO policy；Stateful Objects/provider resources 的 inventory/fence/backup/restore；identity migration canonical-first dual-read、copy/verify/cutover、旧 capability revoke/tombstone；其他 ProductOperation producer。因此 `P0-MODEL-001` 继续 active。
+- 仍明确欠缺：canary/production topology config 与受限执行身份、破坏隔离环境的真实恢复演练；无人值守 backup ProductOperation/scheduler；snapshot 加密、异地复制、retention/cleanup、定期 restore verification 与 RPO/RTO policy；Stateful Objects/provider resources 的 inventory/fence/backup/restore；identity migration canonical-first dual-read、copy/verify/cutover、旧 capability revoke/tombstone；其他 ProductOperation producer。因此 `P0-MODEL-001` 继续 active。
+
+## 26. P0-MODEL-001 snapshot-set 捕获崩溃恢复
+
+- 深审确认此前 `snapshot-set` 只有 restore 侧的持久 journal：进程若在 writer admission 已关闭或三个服务已停止后退出，没有事实记录可判断是否形成完整集合，也没有统一恢复入口，可能把 installation 长时间留在停写或停服状态。
+- topology driver 现在必须在任何 admission/service mutation 前建立 installation-wide singleton capture journal，并持久推进 `planning`、`admission-closed`、`stopped`、`captured`、`completed`/`aborted`。journal 固定绑定 capture、organization、installation、输出目录和 topology driver build；损坏、未知字段、越界路径、symlink 或集合绑定不一致均失败关闭。
+- 下一条 mutating topology command 会先处理非终态 capture，也提供显式 `recover-snapshot-set`。若三份 snapshot 与 restore set 已持久完成，恢复流程先幂等启动/探测三个服务并开放 writer admission，再复核 artifact envelope、幂等发布原集合并标记 completed；若集合未完整持久，则同样先恢复平台，保留局部输出作诊断并标记 aborted。启动、探测或开放入口失败时保持原非终态，允许下一次继续恢复，不能谎报终止。
+- 同一输出/scope 的 completed 请求返回完全相同的 restore set；restore 在取得全局锁后会先恢复遗留 capture，read-only restore status 遇到非终态 capture 则拒绝给出可能失真的物理判断。journal 与临时文件均原子写入并同步父目录，broken symlink 也不能被当作“不存在”绕过。
+- 本地回归覆盖完整集合中断后发布、不完整集合中断后保留现场、恢复命令失败后保持非终态并重试、broken journal symlink 拒绝，以及 completed 请求精确幂等；`deis-backend-topology` 共 18 项测试通过。远端 CI 需以包含本切片的新提交重新取证。
+- 仍未关闭的是“无人值守立即恢复”产品层：当前要等下一条 topology mutation 或显式命令触发，没有持续运行的 backup ProductOperation/scheduler；artifact 加密、异地复制、retention/cleanup、定期 restore drill 与 RPO/RTO policy 也未完成。上述项以及 Stateful Objects/provider、canonical migration 和其他 Operation producer 继续列为 P0。

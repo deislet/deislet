@@ -31,6 +31,8 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 
 const JOURNAL_VERSION: u32 = 1;
+const SNAPSHOT_CAPTURE_JOURNAL_VERSION: u32 = 1;
+const SNAPSHOT_CAPTURE_JOURNAL: &str = "snapshot-capture.json";
 const FENCE_JOURNAL: &str = "migration-fences.sqlite";
 const MANIFEST_NAME: &str = "snapshot.json";
 
@@ -102,6 +104,36 @@ enum RestorePhase {
     Verified,
     RollingBack,
     RolledBack,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SnapshotCapturePhase {
+    Planning,
+    AdmissionClosed,
+    Stopped,
+    Captured,
+    Completed,
+    Aborted,
+}
+
+impl SnapshotCapturePhase {
+    const fn terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Aborted)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotCaptureJournal {
+    schema_version: u32,
+    capture_id: CanonicalId,
+    output_dir: PathBuf,
+    organization_id: CanonicalId,
+    installation_id: CanonicalId,
+    phase: SnapshotCapturePhase,
+    restore_set: Option<BackendRestoreSet>,
+    last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -253,6 +285,33 @@ pub async fn capture_restore_set(
     capture_restore_set_inner(config, out, organization_id, installation_id, true, true).await
 }
 
+/// Recover an interrupted snapshot capture without beginning a restore or a
+/// second capture. If all three snapshots were durably recorded, recovery
+/// reopens the platform and publishes that exact restore set; otherwise it
+/// reopens the platform, retains partial output for diagnosis, and marks the
+/// capture aborted.
+pub async fn recover_snapshot_capture(
+    config: &TopologyConfig,
+) -> Result<Option<BackendRestoreSet>> {
+    config.validate()?;
+    let executable = std::env::current_exe().context("cannot locate topology driver executable")?;
+    ensure!(
+        file_sha256(&executable)? == config.distribution_sha256,
+        "running topology driver distribution digest differs from its config"
+    );
+    ensure_secure_state_dir(&config.state_dir)?;
+    let _topology_lock = acquire_lock(
+        &config.state_dir.join("topology.lock"),
+        "another topology operation is changing embedded backend state",
+    )?;
+    recover_interrupted_snapshot_capture_locked(
+        config,
+        &config.state_dir.join(SNAPSHOT_CAPTURE_JOURNAL),
+        true,
+    )
+    .await
+}
+
 async fn capture_restore_set_inner(
     config: &TopologyConfig,
     out: &Path,
@@ -270,20 +329,50 @@ async fn capture_restore_set_inner(
             "running topology driver distribution digest differs from its config"
         );
     }
-    validate_snapshot_root(config, out)?;
-    prepare_empty_directory(out, "snapshot-set output")?;
     ensure_secure_state_dir(&config.state_dir)?;
     let _topology_lock = acquire_lock(
         &config.state_dir.join("topology.lock"),
         "another topology operation is changing embedded backend state",
     )?;
-
-    if let Err(error) = run_command(&config.writer_admission.close).await {
-        let _ = run_command(&config.writer_admission.open).await;
-        return Err(error.context("could not close backend writer admission"));
+    let capture_journal_path = config.state_dir.join(SNAPSHOT_CAPTURE_JOURNAL);
+    recover_interrupted_snapshot_capture_locked(config, &capture_journal_path, probe_after_start)
+        .await?;
+    if path_entry_exists(&capture_journal_path)? {
+        let existing = load_snapshot_capture_journal(config, &capture_journal_path)?;
+        if existing.phase == SnapshotCapturePhase::Completed
+            && existing.output_dir == out
+            && existing.organization_id == organization_id
+            && existing.installation_id == installation_id
+        {
+            let restore_set = existing
+                .restore_set
+                .context("completed snapshot capture has no restore set")?;
+            publish_or_verify_restore_set(out, &restore_set)?;
+            return Ok(restore_set);
+        }
     }
-    let writer_admission_closed_at = Utc::now();
+
+    validate_snapshot_root(config, out)?;
+    prepare_empty_directory(out, "snapshot-set output")?;
+    let mut journal = SnapshotCaptureJournal {
+        schema_version: SNAPSHOT_CAPTURE_JOURNAL_VERSION,
+        capture_id: CanonicalId::new_v7(),
+        output_dir: out.to_path_buf(),
+        organization_id,
+        installation_id,
+        phase: SnapshotCapturePhase::Planning,
+        restore_set: None,
+        last_error: None,
+    };
+    persist_snapshot_capture_journal(&capture_journal_path, &journal)?;
+
     let capture = async {
+        run_command(&config.writer_admission.close)
+            .await
+            .context("could not close backend writer admission")?;
+        let writer_admission_closed_at = Utc::now();
+        journal.phase = SnapshotCapturePhase::AdmissionClosed;
+        persist_snapshot_capture_journal(&capture_journal_path, &journal)?;
         for (_, service) in config.services().into_iter().rev() {
             run_command(&service.stop).await?;
         }
@@ -308,6 +397,8 @@ async fn capture_restore_set_inner(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        journal.phase = SnapshotCapturePhase::Stopped;
+        persist_snapshot_capture_journal(&capture_journal_path, &journal)?;
         let snapshot_dirs = [
             out.join(RestoreBackend::DeisStore.as_str()),
             out.join(RestoreBackend::DeisQueue.as_str()),
@@ -381,31 +472,219 @@ async fn capture_restore_set_inner(
             created_at: Utc::now(),
         };
         restore_set.validate()?;
+        journal.phase = SnapshotCapturePhase::Captured;
+        journal.restore_set = Some(restore_set.clone());
+        persist_snapshot_capture_journal(&capture_journal_path, &journal)?;
         Ok::<_, anyhow::Error>(restore_set)
     }
     .await;
 
-    let reopen = restart_services_and_open_admission(config, probe_after_start).await;
-    let restore_set = match (capture, reopen) {
-        (Ok(restore_set), Ok(())) => restore_set,
-        (Err(capture_error), Ok(())) => {
-            return Err(capture_error.context(
-                "snapshot set was not published; services and writer admission were restored",
+    match capture {
+        Ok(_) => recover_interrupted_snapshot_capture_locked(
+            config,
+            &capture_journal_path,
+            probe_after_start,
+        )
+        .await?
+        .context("captured snapshot journal did not produce a restore set"),
+        Err(capture_error) => {
+            match recover_interrupted_snapshot_capture_locked(
+                config,
+                &capture_journal_path,
+                probe_after_start,
+            )
+            .await
+            {
+                Ok(_) => Err(capture_error.context(
+                    "snapshot set was not published; services and writer admission were restored",
+                )),
+                Err(recovery_error) => Err(capture_error.context(format!(
+                    "snapshot capture failed and platform recovery also failed: {recovery_error:#}"
+                ))),
+            }
+        }
+    }
+}
+
+async fn recover_interrupted_snapshot_capture_locked(
+    config: &TopologyConfig,
+    journal_path: &Path,
+    probe_after_start: bool,
+) -> Result<Option<BackendRestoreSet>> {
+    if !path_entry_exists(journal_path)? {
+        return Ok(None);
+    }
+    let mut journal = load_snapshot_capture_journal(config, journal_path)?;
+    match journal.phase {
+        SnapshotCapturePhase::Completed => return Ok(journal.restore_set),
+        SnapshotCapturePhase::Aborted => return Ok(None),
+        _ => {}
+    }
+
+    restart_services_and_open_admission(config, probe_after_start)
+        .await
+        .context("could not recover services and writer admission after snapshot capture")?;
+    if let Some(restore_set) = journal.restore_set.clone() {
+        if let Err(error) = verify_snapshot_artifact_envelopes(config, &restore_set) {
+            journal.phase = SnapshotCapturePhase::Aborted;
+            journal.restore_set = None;
+            journal.last_error = Some(
+                "captured snapshot artifacts failed envelope verification after platform recovery; output was retained"
+                    .to_string(),
+            );
+            persist_snapshot_capture_journal(journal_path, &journal)?;
+            return Err(error.context(
+                "captured snapshot artifacts changed before the restore set could be published",
             ));
         }
-        (Ok(_), Err(reopen_error)) => {
-            return Err(reopen_error.context(
-                "snapshots were captured but the platform could not be safely reopened; no restore set was published",
-            ));
+        publish_or_verify_restore_set(&journal.output_dir, &restore_set)?;
+        journal.phase = SnapshotCapturePhase::Completed;
+        journal.last_error = None;
+        persist_snapshot_capture_journal(journal_path, &journal)?;
+        Ok(Some(restore_set))
+    } else {
+        journal.phase = SnapshotCapturePhase::Aborted;
+        journal.last_error = Some(
+            "snapshot capture ended before a complete restore set was durably recorded; partial output was retained"
+                .to_string(),
+        );
+        persist_snapshot_capture_journal(journal_path, &journal)?;
+        Ok(None)
+    }
+}
+
+fn load_snapshot_capture_journal(
+    config: &TopologyConfig,
+    path: &Path,
+) -> Result<SnapshotCaptureJournal> {
+    reject_symlink(path, "snapshot capture journal")?;
+    let journal: SnapshotCaptureJournal = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        journal.schema_version == SNAPSHOT_CAPTURE_JOURNAL_VERSION,
+        "unknown snapshot capture journal schema"
+    );
+    validate_snapshot_root(config, &journal.output_dir)
+        .context("snapshot capture journal output path is no longer trusted")?;
+    ensure!(
+        journal.phase.terminal() || journal.last_error.is_none(),
+        "non-terminal snapshot capture journal must not claim a terminal error"
+    );
+    ensure!(
+        (journal.phase == SnapshotCapturePhase::Aborted) == journal.last_error.is_some(),
+        "snapshot capture journal phase and terminal error disagree"
+    );
+    if let Some(error) = &journal.last_error {
+        ensure!(
+            !error.is_empty() && error.len() <= 2048 && !error.chars().any(char::is_control),
+            "snapshot capture journal error is not a bounded printable diagnostic"
+        );
+    }
+    ensure!(
+        matches!(
+            journal.phase,
+            SnapshotCapturePhase::Captured | SnapshotCapturePhase::Completed
+        ) == journal.restore_set.is_some(),
+        "snapshot capture journal phase and restore set disagree"
+    );
+    if let Some(restore_set) = &journal.restore_set {
+        restore_set.validate()?;
+        ensure!(
+            restore_set.scope.organization_id == journal.organization_id
+                && restore_set.scope.installation_id == journal.installation_id,
+            "snapshot capture journal scope and restore set disagree"
+        );
+        ensure!(
+            restore_set.topology_driver.id == config.driver_id
+                && restore_set.topology_driver.version == config.driver_version
+                && restore_set.topology_driver.distribution_digest.value
+                    == config.distribution_sha256,
+            "snapshot capture journal is pinned to another topology driver build"
+        );
+        for component in &restore_set.components {
+            ensure!(
+                component.snapshot_uri
+                    == format!(
+                        "file://{}",
+                        journal
+                            .output_dir
+                            .join(component.backend.as_str())
+                            .display()
+                    ),
+                "snapshot capture journal restore set points outside its output directory"
+            );
         }
-        (Err(capture_error), Err(reopen_error)) => {
-            return Err(capture_error.context(format!(
-                "snapshot capture failed and platform reopening also failed: {reopen_error:#}"
-            )));
+    }
+    Ok(journal)
+}
+
+fn persist_snapshot_capture_journal(path: &Path, journal: &SnapshotCaptureJournal) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("snapshot capture journal has no parent")?;
+    reject_symlink(parent, "snapshot capture journal directory")?;
+    let temporary = parent.join(".snapshot-capture.tmp");
+    prepare_atomic_temporary(&temporary, "snapshot capture journal")?;
+    let bytes = serde_json::to_vec_pretty(journal)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    sync_parent_directory(path)?;
+    Ok(())
+}
+
+fn publish_or_verify_restore_set(out: &Path, restore_set: &BackendRestoreSet) -> Result<()> {
+    let manifest_path = out.join("restore-set.json");
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "published restore set must be a regular file"
+            );
+            let published: BackendRestoreSet = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+            ensure!(
+                published == *restore_set,
+                "published restore set differs from its capture journal"
+            );
+            Ok(())
         }
-    };
-    persist_restore_set(&out.join("restore-set.json"), &restore_set)?;
-    Ok(restore_set)
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            persist_restore_set(&manifest_path, restore_set)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn verify_snapshot_artifact_envelopes(
+    config: &TopologyConfig,
+    restore_set: &BackendRestoreSet,
+) -> Result<()> {
+    for component in &restore_set.components {
+        let snapshot = local_snapshot_path(config, &component.snapshot_uri)?;
+        reject_existing_ancestor_symlinks(&snapshot, "snapshot artifact path")?;
+        reject_tree_symlinks(&snapshot)?;
+        let manifest = snapshot.join(MANIFEST_NAME);
+        ensure!(
+            manifest.is_file()
+                && file_sha256(&manifest)? == component.snapshot_manifest_digest.value,
+            "{} snapshot manifest changed after capture",
+            component.backend.as_str()
+        );
+        ensure!(
+            tree_bytes(&snapshot)? == component.size_bytes,
+            "{} snapshot byte count changed after capture",
+            component.backend.as_str()
+        );
+    }
+    Ok(())
 }
 
 /// Execute or resume one restore. Reusing the operation ID with different
@@ -453,6 +732,16 @@ fn inspect_restore_inner(
         &config.state_dir.join("topology.lock"),
         "another topology operation is changing embedded backend state",
     )?;
+    let capture_journal_path = config.state_dir.join(SNAPSHOT_CAPTURE_JOURNAL);
+    if path_entry_exists(&capture_journal_path)? {
+        let capture = load_snapshot_capture_journal(config, &capture_journal_path)?;
+        ensure!(
+            capture.phase.terminal(),
+            "snapshot capture {} is {:?}; a mutating topology command must recover it before restore status can be trusted",
+            capture.capture_id,
+            capture.phase
+        );
+    }
     let lock_path = config
         .state_dir
         .join(format!("restore-{operation_id}.lock"));
@@ -528,6 +817,12 @@ async fn execute_restore_inner(
         &config.state_dir.join("topology.lock"),
         "another topology operation is changing embedded backend state",
     )?;
+    recover_interrupted_snapshot_capture_locked(
+        config,
+        &config.state_dir.join(SNAPSHOT_CAPTURE_JOURNAL),
+        probe_after_start,
+    )
+    .await?;
     let lock_path = config
         .state_dir
         .join(format!("restore-{operation_id}.lock"));
@@ -1452,17 +1747,7 @@ fn persist_journal(path: &Path, journal: &RestoreJournal) -> Result<()> {
     fs::create_dir_all(parent)?;
     reject_symlink(parent, "restore journal directory")?;
     let temporary = parent.join(format!(".{}.tmp", journal.operation_id));
-    match fs::symlink_metadata(&temporary) {
-        Ok(metadata) => {
-            ensure!(
-                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-                "restore journal temporary path must be a regular file"
-            );
-            fs::remove_file(&temporary)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    prepare_atomic_temporary(&temporary, "restore journal")?;
     let bytes = serde_json::to_vec_pretty(journal)?;
     let mut options = OpenOptions::new();
     // create_new maps to an exclusive create: a same-account process racing
@@ -1480,6 +1765,21 @@ fn persist_journal(path: &Path, journal: &RestoreJournal) -> Result<()> {
     file.sync_all()?;
     fs::rename(&temporary, path)?;
     sync_parent_directory(path)?;
+    Ok(())
+}
+
+fn prepare_atomic_temporary(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "{label} temporary path must be a regular file"
+            );
+            fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -1580,10 +1880,18 @@ fn reject_existing_ancestor_symlinks(path: &Path, label: &str) -> Result<()> {
 }
 
 fn reject_symlink_if_present(path: &Path, label: &str) -> Result<()> {
-    if path.exists() {
+    if path_entry_exists(path)? {
         reject_symlink(path, label)?;
     }
     Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn reject_symlink(path: &Path, label: &str) -> Result<()> {
@@ -1975,6 +2283,17 @@ mod tests {
         )
         .await
         .unwrap();
+        let exact_retry = capture_restore_set_inner(
+            &fixture.config,
+            &output,
+            organization_id,
+            installation_id,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exact_retry, restore_set);
         restore_set.validate().unwrap();
         assert_eq!(restore_set.scope.organization_id, organization_id);
         assert_eq!(restore_set.scope.installation_id, installation_id);
@@ -2014,6 +2333,152 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(report.state, BackendRestoreExecutionState::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn interrupted_complete_capture_reopens_and_publishes_from_its_journal() {
+        let fixture = fixture();
+        let output = fixture.config.snapshot_roots[0].join("recoverable-capture");
+        let restore_set = capture_restore_set_inner(
+            &fixture.config,
+            &output,
+            CanonicalId::new_v7(),
+            CanonicalId::new_v7(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let journal_path = fixture.config.state_dir.join(SNAPSHOT_CAPTURE_JOURNAL);
+        let mut journal = load_snapshot_capture_journal(&fixture.config, &journal_path).unwrap();
+        journal.phase = SnapshotCapturePhase::Captured;
+        fs::remove_file(output.join("restore-set.json")).unwrap();
+        persist_snapshot_capture_journal(&journal_path, &journal).unwrap();
+
+        let recovered =
+            recover_interrupted_snapshot_capture_locked(&fixture.config, &journal_path, false)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(recovered, restore_set);
+        assert_eq!(
+            load_snapshot_capture_journal(&fixture.config, &journal_path)
+                .unwrap()
+                .phase,
+            SnapshotCapturePhase::Completed
+        );
+        assert_eq!(
+            serde_json::from_slice::<BackendRestoreSet>(
+                &fs::read(output.join("restore-set.json")).unwrap()
+            )
+            .unwrap(),
+            restore_set
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_incomplete_capture_is_reopened_and_marked_aborted() {
+        let fixture = fixture();
+        ensure_secure_state_dir(&fixture.config.state_dir).unwrap();
+        let output = fixture.config.snapshot_roots[0].join("partial-capture");
+        prepare_empty_directory(&output, "test snapshot output").unwrap();
+        fs::write(output.join("partial"), b"diagnostic evidence").unwrap();
+        let journal_path = fixture.config.state_dir.join(SNAPSHOT_CAPTURE_JOURNAL);
+        let journal = SnapshotCaptureJournal {
+            schema_version: SNAPSHOT_CAPTURE_JOURNAL_VERSION,
+            capture_id: CanonicalId::new_v7(),
+            output_dir: output.clone(),
+            organization_id: CanonicalId::new_v7(),
+            installation_id: CanonicalId::new_v7(),
+            phase: SnapshotCapturePhase::Stopped,
+            restore_set: None,
+            last_error: None,
+        };
+        persist_snapshot_capture_journal(&journal_path, &journal).unwrap();
+
+        assert!(
+            recover_interrupted_snapshot_capture_locked(&fixture.config, &journal_path, false,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let recovered = load_snapshot_capture_journal(&fixture.config, &journal_path).unwrap();
+        assert_eq!(recovered.phase, SnapshotCapturePhase::Aborted);
+        assert!(recovered.last_error.unwrap().contains("partial output"));
+        assert_eq!(
+            fs::read(output.join("partial")).unwrap(),
+            b"diagnostic evidence"
+        );
+        assert!(!output.join("restore-set.json").exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_recovery_failure_stays_nonterminal_until_retried() {
+        let mut fixture = fixture();
+        ensure_secure_state_dir(&fixture.config.state_dir).unwrap();
+        let output = fixture.config.snapshot_roots[0].join("retry-capture-recovery");
+        prepare_empty_directory(&output, "test snapshot output").unwrap();
+        let journal_path = fixture.config.state_dir.join(SNAPSHOT_CAPTURE_JOURNAL);
+        let journal = SnapshotCaptureJournal {
+            schema_version: SNAPSHOT_CAPTURE_JOURNAL_VERSION,
+            capture_id: CanonicalId::new_v7(),
+            output_dir: output,
+            organization_id: CanonicalId::new_v7(),
+            installation_id: CanonicalId::new_v7(),
+            phase: SnapshotCapturePhase::AdmissionClosed,
+            restore_set: None,
+            last_error: None,
+        };
+        persist_snapshot_capture_journal(&journal_path, &journal).unwrap();
+        fixture.config.store.start.executable = PathBuf::from("/bin/false");
+        assert!(
+            recover_interrupted_snapshot_capture_locked(&fixture.config, &journal_path, false,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recover services")
+        );
+        assert_eq!(
+            load_snapshot_capture_journal(&fixture.config, &journal_path)
+                .unwrap()
+                .phase,
+            SnapshotCapturePhase::AdmissionClosed
+        );
+
+        fixture.config.store.start = command();
+        assert!(
+            recover_interrupted_snapshot_capture_locked(&fixture.config, &journal_path, false,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            load_snapshot_capture_journal(&fixture.config, &journal_path)
+                .unwrap()
+                .phase,
+            SnapshotCapturePhase::Aborted
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_broken_capture_journal_symlink_cannot_hide_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture();
+        ensure_secure_state_dir(&fixture.config.state_dir).unwrap();
+        let journal_path = fixture.config.state_dir.join(SNAPSHOT_CAPTURE_JOURNAL);
+        symlink(
+            fixture.config.state_dir.join("missing-journal-target"),
+            &journal_path,
+        )
+        .unwrap();
+
+        let error =
+            recover_interrupted_snapshot_capture_locked(&fixture.config, &journal_path, false)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
     }
 
     #[tokio::test]

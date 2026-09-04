@@ -11,7 +11,7 @@
 Deislet embedded 模式的 store、queue、telemetry 恢复是一项 installation 范围的正式 `ProductOperation(kind=restore)`，不是三个相互独立的文件复制命令。所有实现必须满足同一产品语义：
 
 1. 一个 restore set 必须包含规范顺序的 store、queue、telemetry 三个 component，并绑定 organization、installation、源 backend incarnation、snapshot manifest SHA-256、完整目录字节数和固定 topology driver build。
-2. 三份 snapshot 必须在同一个 `full-platform-outage` 屏障内生成。拓扑驱动先用显式、幂等命令关闭所有应用写入入口，再停止并探测三个 embedded backend 均不可达；只有此后才能依次生成 snapshot。服务全部恢复且可达、写入入口重新开放后，才原子发布 `restore-set.json`。
+2. 三份 snapshot 必须在同一个 `full-platform-outage` 屏障内生成。拓扑驱动在关闭入口前先持久建立 singleton capture journal，再用显式、幂等命令关闭所有应用写入入口，停止并探测三个 embedded backend 均不可达；只有此后才能依次生成 snapshot。服务全部恢复且可达、写入入口重新开放后，才原子发布 `restore-set.json`。进程中断后，下一次 mutating topology command 或显式 `recover-snapshot-set` 必须先重放恢复：完整集合复核后发布，不完整集合保留现场并标为 aborted，恢复失败保持非终态继续重试。
 3. restore 请求先验证并持久冻结 restore set、幂等请求事实与 installation revision。它与 identity migration 互斥；同一 installation 最多存在一个非终态 restore。
 4. topology driver 在停止 live backend 前完成三份 snapshot 的 digest、size、source incarnation 和内容完整性验证，并恢复到三个 staging directory；每个 staging tree 的规范摘要随 incarnation 写入 journal，在恢复续跑和最终 switch 前都必须重算匹配。任何 staging 失败或后续改动均不得进入 live data。
 5. 切换前再次关闭写入入口、停止三个 backend、探测端口不可达并复核 live incarnation 未变。每次同父目录 rename 后先同步对应父目录，随后才推进持久 journal；同一 operation 重试必须识别“第一次 rename 后停止”和“第二次 rename 后、journal 更新前停止”两类窗口。
@@ -46,7 +46,7 @@ HTTPS snapshot URI 属于共享契约允许的可移植输入；当前 embedded 
 本 ADR 关闭 embedded 三后端一致 restore 的语义与执行骨架，但不关闭整个 `P0-MODEL-001`：
 
 - canary/production 安装仍需生成真实 digest 的 topology config、受限执行身份与 writer-admission 命令，并完成一次破坏隔离环境中的恢复演练；
-- snapshot-set 捕获自身还没有与 restore 对称的崩溃 journal/自动复原；artifact 的加密、异地复制、保留/清理、定期验证、RPO/RTO policy 和恢复演练调度尚未产品化；
+- snapshot artifact 的加密、异地复制、保留/清理、定期验证、RPO/RTO policy 和恢复演练调度尚未产品化；capture journal 已可由下一条 topology 命令恢复，但尚未接入持续运行的 backup scheduler/ProductOperation 来保证无人值守立即触发；
 - Stateful Objects 与 provider resources 仍需进入统一 inventory/fence/backup/restore 语义；
 - identity migration 的 canonical-first dual-read、copy/verify/cutover、旧 capability revoke 与 tombstone 仍未完成；
 - 其他 build/deploy/lifecycle producer 仍需统一使用 ProductOperation。
