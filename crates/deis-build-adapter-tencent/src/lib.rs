@@ -102,14 +102,27 @@ fn generate_router_code(routes: &[(String, String)], _has_kv: bool, node_runtime
     for (i, (route, import_path)) in routes.iter().enumerate() {
         imports.push_str(&format!("import handler{i} from '{import_path}';\n"));
 
+        let invocation = if node_runtime {
+            format!(
+                "runWithEdgeCanonNodeEnv(context.env || {{}}, () => handler{i}(enhancedContext))"
+            )
+        } else {
+            format!("handler{i}(enhancedContext)")
+        };
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(pathname, '{route}')) {{
     const enhancedContext = buildEnhancedContext(context, '{route}');
-    return handler{i}(enhancedContext);
+    return {invocation};
   }}
 "#
         ));
     }
+
+    let node_runtime_import = if node_runtime {
+        "import { runWithEdgeCanonNodeEnv } from 'edge-canon:node-runtime';\n"
+    } else {
+        ""
+    };
 
     format!(
         r#"/**
@@ -123,7 +136,7 @@ fn generate_router_code(routes: &[(String, String)], _has_kv: bool, node_runtime
  */
 
 import {{ buildEnhancedContext }} from './adapters/context-builder';
-{imports}
+{node_runtime_import}{imports}
 
 // Main entry point as per EdgeOne spec (line 847)
 export function onRequest(context) {{

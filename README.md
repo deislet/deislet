@@ -395,9 +395,13 @@ order it is likely to matter:
   `DecompressionStream`, `EventSource`, `FileReader` and `reportError` remain
   unbound as well, simply not yet taken up. See §12 of the architecture
   document.
-- **No Node.js built-ins and no npm resolution yet**, and therefore no
-  framework SSR. These are tracked product gaps, not a claim that supported
-  targets may expose different application standards.
+- **The versioned Node/npm subset is implemented, but framework SSR is not.**
+  A locked npm graph is installed and audited at build time; Cloudflare,
+  EdgeOne and Deno artifacts receive the same selected built-ins and virtual
+  process/path identity, while the self-hosted runtime exposes that contract
+  through its own compatibility layer. Live-provider EC-NODE evidence and
+  framework adapters remain release gaps, so this is not yet a compatibility
+  or certification claim.
 - **Only the node ships logs.** deis-proxy, deis-store, deis-queue and
   deis-control write to their own stdout, so request counts and latency —
   which deis-proxy is the natural source of — can only be inferred from the

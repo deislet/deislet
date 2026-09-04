@@ -2,6 +2,7 @@ pub mod bundler;
 pub mod config;
 pub mod error;
 pub mod node_npm;
+mod provider_node_facade;
 pub mod routes;
 pub mod target_artifact_coverage;
 pub mod types;

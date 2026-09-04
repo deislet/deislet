@@ -2064,7 +2064,7 @@ export default function handler(context: any): Response {
             import { Readable, Transform, Writable } from "node:stream";
             import { pipeline } from "node:stream/promises";
             import { StringDecoder } from "node:string_decoder";
-            import { domainToASCII, domainToUnicode, pathToFileURL } from "node:url";
+            import { domainToASCII, domainToUnicode, fileURLToPath, pathToFileURL } from "node:url";
             import { format as formatValue, inspect, stripVTControlCharacters } from "node:util";
             import {
               brotliCompressSync, brotliDecompressSync, deflateSync, gzipSync,
@@ -2165,6 +2165,8 @@ export default function handler(context: any): Response {
                   ascii: domainToASCII("例え.テスト"),
                   unicode: domainToUnicode("xn--r8jz45g.xn--zckzah"),
                   virtualFile: pathToFileURL("asset.txt").href,
+                  posixFile: fileURLToPath("file:///asset%20space.txt"),
+                  windowsFile: fileURLToPath("file:///C:/asset%20space.txt", { windows: true }),
                 },
                 denoVisibleAfterBuiltin: "Deno" in globalThis,
                 query: { stringified: stringify({ a: "x y", b: ["1", "2"] }), parsed: parseQuery("a=x%20y&b=1&b=2") },
@@ -2250,7 +2252,9 @@ export default function handler(context: any): Response {
             serde_json::json!({
                 "ascii": "xn--r8jz45g.xn--zckzah",
                 "unicode": "例え.テスト",
-                "virtualFile": "file:///asset.txt"
+                "virtualFile": "file:///asset.txt",
+                "posixFile": "/asset space.txt",
+                "windowsFile": "C:\\asset space.txt"
             })
         );
         assert_eq!(value["denoVisibleAfterBuiltin"], false);

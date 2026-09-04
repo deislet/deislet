@@ -66,7 +66,7 @@ pub fn generate_with_node_compat(
     };
 
     // 3. Generate Router Code
-    let router_code = generate_router_code(routes, has_kv);
+    let router_code = generate_router_code(routes, has_kv, node_compat);
 
     // 4. Generate Config Files
     let mut config_files = Vec::new();
@@ -177,7 +177,7 @@ database_id = ""    # Add your D1 database ID
     })
 }
 
-fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
+fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: bool) -> String {
     let mut imports = String::new();
     let mut route_handlers = String::new();
 
@@ -185,10 +185,15 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
         // Use provided import path directly (absolute path handled by Compiler)
         imports.push_str(&format!("import handler{i} from '{import_path}';\n"));
 
+        let invocation = if node_compat {
+            format!("runWithEdgeCanonNodeEnv(env, () => handler{i}(context))")
+        } else {
+            format!("handler{i}(context)")
+        };
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(url.pathname, '{route}')) {{
     const context = buildContext(request, '{route}');
-    return handler{i}(context);
+    return {invocation};
   }}
 "#
         ));
@@ -196,6 +201,11 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
 
     let _kv_import = if has_kv {
         "import { createKVAdapter } from './adapters/kv-adapter';\n"
+    } else {
+        ""
+    };
+    let node_runtime_import = if node_compat {
+        "import { runWithEdgeCanonNodeEnv } from 'edge-canon:node-runtime';\n"
     } else {
         ""
     };
@@ -214,7 +224,7 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
  */
 
 import {{ createContextBuilder }} from './adapters/context-builder';
-{imports}
+{node_runtime_import}{imports}
 
 export default {{
   async fetch(request, env, ctx) {{

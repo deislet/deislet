@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-002
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/91f3f7b52f679654981d7671b54e95a8c9becc4b/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/fb29df6048792484f6691f7f43a25437ef126531/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 背景
 
@@ -59,7 +59,7 @@ Edge Canon 不承诺“完整 Node 主机”。它承诺一组明确列举、版
 - `node:util`
 - `node:zlib`
 
-完整清单与逐 export 定义由锁定标准的 [`node-npm-subset` requirements](https://github.com/deislet/edge-canon/blob/91f3f7b52f679654981d7671b54e95a8c9becc4b/standard/requirements/node-npm-subset.zh.md) 和 [schema](https://github.com/deislet/edge-canon/blob/91f3f7b52f679654981d7671b54e95a8c9becc4b/schemas/node-npm-subset.schema.json) 唯一定义；ADR 不复制第二份清单。`Buffer`、受限 `process`、`setImmediate` 与 `clearImmediate` 同时是标准 global。
+完整清单与逐 export 定义由锁定标准的 [`node-npm-subset` requirements](https://github.com/deislet/edge-canon/blob/fb29df6048792484f6691f7f43a25437ef126531/standard/requirements/node-npm-subset.zh.md) 和 [schema](https://github.com/deislet/edge-canon/blob/fb29df6048792484f6691f7f43a25437ef126531/schemas/node-npm-subset.schema.json) 唯一定义；ADR 不复制第二份清单。`Buffer`、受限 `process`、`setImmediate` 与 `clearImmediate` 同时是标准 global。
 
 需要在后续规范版本单独验证的模块：
 

@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use rolldown::{
-    Bundler, BundlerOptions, CodeSplittingMode, InputItem, OutputFormat, Platform,
+    Bundler, BundlerOptions, CodeSplittingMode, InjectImport, InputItem, OutputFormat, Platform,
     RawMinifyOptions, ResolveOptions, SourceMapType,
 };
 use rolldown_common::Output;
@@ -36,6 +37,7 @@ pub enum TargetPlatform {
 pub struct BuildBundler {
     options: BundlerOptions,
     allowed_externals: BTreeSet<String>,
+    provider_node_facade: bool,
 }
 
 impl BuildBundler {
@@ -53,13 +55,18 @@ impl BuildBundler {
             | TargetPlatform::DeisletNode => (Some(Platform::Browser), Some(OutputFormat::Esm)),
         };
 
-        let allowed_externals: BTreeSet<String> = if matches!(
+        let node_target = matches!(
             platform,
             TargetPlatform::CloudflareNode
                 | TargetPlatform::EdgeOneNode
                 | TargetPlatform::DenoNode
                 | TargetPlatform::DeisletNode
-        ) {
+        );
+        let provider_node_facade = matches!(
+            platform,
+            TargetPlatform::CloudflareNode | TargetPlatform::EdgeOneNode | TargetPlatform::DenoNode
+        );
+        let allowed_externals: BTreeSet<String> = if node_target {
             crate::NODE_BUILTIN_MODULES
                 .iter()
                 .flat_map(|canonical| {
@@ -85,8 +92,23 @@ impl BuildBundler {
             // example node:module for an otherwise portable CommonJS
             // package), expanding the runtime surface behind the standard.
             // Only the exact validated builtin list may survive the bundle.
-            external: (!allowed_externals.is_empty())
+            // Provider Node targets are resolved through the façade plugin;
+            // only its private native edges become external. Deislet keeps
+            // canonical imports for its runtime loader to rewrite.
+            external: (node_target && !provider_node_facade)
                 .then(|| allowed_externals.iter().cloned().collect::<Vec<_>>().into()),
+            inject: provider_node_facade.then(|| {
+                ["process", "Buffer", "setImmediate", "clearImmediate"]
+                    .into_iter()
+                    .map(|name| {
+                        InjectImport::named(
+                            name.to_string(),
+                            None,
+                            super::provider_node_facade::NODE_RUNTIME_SPECIFIER.to_string(),
+                        )
+                    })
+                    .collect()
+            }),
             // Rolldown adds `import` or `require`, `browser`, and `default`
             // for the selected resolver path. These are the two Edge Canon
             // conditions that must additionally be active for every backend.
@@ -120,6 +142,7 @@ impl BuildBundler {
         Self {
             options,
             allowed_externals,
+            provider_node_facade,
         }
     }
 
@@ -178,7 +201,16 @@ impl BuildBundler {
     /// build wants to tell the author, instead of being the one advisory that
     /// only exists in scrollback.
     pub async fn generate(&self) -> Result<(String, Vec<String>)> {
-        let mut bundler = Bundler::new(self.options.clone())?;
+        let mut bundler = if self.provider_node_facade {
+            Bundler::with_plugins(
+                self.options.clone(),
+                vec![Arc::new(
+                    super::provider_node_facade::ProviderNodeFacadePlugin,
+                )],
+            )?
+        } else {
+            Bundler::new(self.options.clone())?
+        };
         let result = bundler.generate().await?;
         let advisories = Self::refuse_broken_references(&result.warnings)?;
         Ok((self.single_js_chunk(result.assets)?, advisories))

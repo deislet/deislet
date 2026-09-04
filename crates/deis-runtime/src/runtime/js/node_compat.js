@@ -26,6 +26,7 @@ const stringSlice = String.prototype.slice;
 const stringSplit = String.prototype.split;
 const stringStartsWith = String.prototype.startsWith;
 const arrayJoin = Array.prototype.join;
+const decodeUrlComponent = decodeURIComponent;
 const encodeUrlComponent = encodeURIComponent;
 const toString = String;
 const PlatformURL = URL;
@@ -237,6 +238,35 @@ function protectSelectedValue(canonical, name, value) {
   if (canonical === "node:path" && (name === "posix" || name === "win32")) {
     return pathFlavor(value, name === "win32");
   }
+  if (canonical === "node:url" && name === "fileURLToPath") {
+    return function (url, options) {
+      if (options?.windows !== true) {
+        return reflectApply(value, this, [url, { windows: false }]);
+      }
+      const parsed = url instanceof PlatformURL ? url : new PlatformURL(url);
+      if (
+        parsed.protocol !== "file:" ||
+        reflectApply(regExpTest, /%2f|%5c/i, [parsed.pathname])
+      ) {
+        return reflectApply(value, this, [url, { windows: true }]);
+      }
+      const pathname = decodeUrlComponent(parsed.pathname);
+      const windowsPath = reflectApply(
+        arrayJoin,
+        reflectApply(stringSplit, pathname, ["/"]),
+        ["\\"],
+      );
+      if (parsed.hostname && parsed.hostname !== "localhost") {
+        return `\\\\${parsed.hostname}${windowsPath}`;
+      }
+      if (!reflectApply(regExpTest, /^\/[A-Za-z]:/, [pathname])) {
+        const error = new TypeError("File URL path must be absolute");
+        defineProperty(error, "code", { value: "ERR_INVALID_FILE_URL_PATH" });
+        throw error;
+      }
+      return reflectApply(stringSlice, windowsPath, [1]);
+    };
+  }
   if (canonical === "node:url" && name === "pathToFileURL") {
     const pathModule = withInternalDeno(() => core.createLazyLoader("node:path")());
     return function (path, options) {
@@ -250,7 +280,15 @@ function protectSelectedValue(canonical, name, value) {
         if (reflectApply(stringStartsWith, absolute, ["\\"])) {
           absolute = `C:${absolute}`;
         }
-        return reflectApply(value, this, [absolute, options]);
+        const parts = reflectApply(stringSplit, absolute, ["\\"]);
+        if (reflectApply(stringStartsWith, absolute, ["\\\\"])) {
+          const host = parts[2];
+          const encoded = parts.slice(3).map(encodeUrlComponent);
+          return new PlatformURL(`file://${host}/${reflectApply(arrayJoin, encoded, ["/"])}`);
+        }
+        const drive = parts.shift();
+        const encoded = parts.map(encodeUrlComponent);
+        return new PlatformURL(`file:///${drive}/${reflectApply(arrayJoin, encoded, ["/"])}`);
       }
 
       let absolute = reflectApply(pathModule.posix.resolve, pathModule.posix, [

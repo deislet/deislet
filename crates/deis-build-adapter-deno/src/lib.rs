@@ -119,10 +119,15 @@ fn generate_router_code(
     for (i, (route, import_path)) in routes.iter().enumerate() {
         imports.push_str(&format!("import handler{i} from '{import_path}';\n"));
 
+        let invocation = if bundled_at_root {
+            format!("runWithEdgeCanonNodeEnv(context.env, () => handler{i}(context))")
+        } else {
+            format!("handler{i}(context)")
+        };
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(url.pathname, '{route}')) {{
     const context = buildContext(request, '{route}');
-    return handler{i}(context);
+    return {invocation};
   }}
 "#
         ));
@@ -136,6 +141,11 @@ fn generate_router_code(
 
     let context_builder_import =
         "import { createContextBuilder } from './adapters/context-builder.ts';\n";
+    let node_runtime_import = if bundled_at_root {
+        "import { runWithEdgeCanonNodeEnv } from 'edge-canon:node-runtime';\n"
+    } else {
+        ""
+    };
     let kv_comment = if has_kv { "" } else { "undefined; // " };
 
     // The static files, as a table rather than as a directory listing at
@@ -175,7 +185,7 @@ fn generate_router_code(
  * See: https://docs.deno.com/deploy/
  */
 
-{imports}{kv_import}{context_builder_import}
+{node_runtime_import}{imports}{kv_import}{context_builder_import}
 
 // Initialize Deno KV database
 const kv = {kv_comment}await Deno.openKv();
