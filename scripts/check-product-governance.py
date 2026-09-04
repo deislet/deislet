@@ -24,7 +24,7 @@ EXPECTED_TEST_SHARD_TIMEOUT_MINUTES = 90
 EXPECTED_TEST_SHARDS = {
     "runtime-tests": "cargo test -p deis-runtime --no-fail-fast",
     "compiler-cli-tests": (
-        "cargo test -p deis-bundle -p deis-build-core "
+        "cargo test -p deis-bundle -p deis-node-contract -p deis-build-core "
         "-p deis-build-adapter-cloudflare -p deis-build-adapter-deislet "
         "-p deis-build-adapter-deno -p deis-build-adapter-tencent "
         "-p deis-build -p deis --no-fail-fast"

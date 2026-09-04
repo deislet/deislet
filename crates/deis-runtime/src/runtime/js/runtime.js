@@ -36,6 +36,11 @@
 (() => {
 
 const DenoCore = Deno.core;
+const runWithNodeProcessEnv = globalThis.__deis_node_run_with_env;
+delete globalThis.__deis_node_run_with_env;
+if (typeof runWithNodeProcessEnv !== "function") {
+  throw new Error("EC_NODE_ARTIFACT_INCOMPLETE: process.env invocation context is unavailable");
+}
 delete globalThis.Deno;
 delete globalThis.__bootstrap;
 
@@ -3637,7 +3642,7 @@ function createServiceContext() {
   // ships a variable of that name has already had it removed on the Rust side,
   // and one that assigns over it here in strict mode -- which every ES module
   // is -- gets a TypeError rather than a silently disconnected binding.
-  const env = DenoCore.ops.op_get_env() || {};
+  const env = DenoCore.ops.op_deis_get_env() || {};
   ObjectDefineProperty(env, ASSETS_BINDING_NAME, {
     value: assetsBinding,
     enumerable: true,
@@ -4726,6 +4731,31 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
 
 globalThis.user_module = {}; globalThis.__deis_runtime_set_response = (json) => DenoCore.ops.op_set_response(json);
 
+// Start every public invocation runner inside a fresh process.env snapshot.
+// AsyncLocalStorage carries that exact object into Promise/timer/stream work,
+// so an interleaved request cannot replace a long response producer's view.
+for (const name of [
+  "__deis_runtime_invoke",
+  "__deis_runtime_invoke_queue",
+  "__deis_runtime_invoke_scheduled",
+]) {
+  const runner = globalThis[name];
+  globalThis[name] = (...args) => runWithNodeProcessEnv(() => runner(...args));
+}
+
+globalThis.__deis_runtime_invoke_ws_message = (wsId, message) =>
+  runWithNodeProcessEnv(() => {
+    const ws = globalThis.__deis_runtime_ws_servers?.[wsId];
+    if (ws && typeof ws._handleMessage === "function") ws._handleMessage(message);
+  });
+
+globalThis.__deis_runtime_invoke_ws_close = (wsId, code, reason) =>
+  runWithNodeProcessEnv(() => {
+    const ws = globalThis.__deis_runtime_ws_servers?.[wsId];
+    if (ws && typeof ws._handleClose === "function") ws._handleClose(code, reason);
+    delete globalThis.__deis_runtime_ws_servers[wsId];
+  });
+
 // The names the Rust side calls by, sealed in one place now that they all
 // exist.
 //
@@ -4749,6 +4779,8 @@ for (const name of [
   "__deis_runtime_stream_release_all",
   "__deis_runtime_invoke_queue",
   "__deis_runtime_invoke_scheduled",
+  "__deis_runtime_invoke_ws_message",
+  "__deis_runtime_invoke_ws_close",
   "__deis_runtime_wait_until_all",
   "__deis_runtime_set_response",
   "__deis_runtime_ws_servers",

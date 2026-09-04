@@ -34,7 +34,7 @@ mod tests {
 
         let code = r#"
             (async () => {
-                const env = Deno.core.ops.op_get_env();
+                const env = Deno.core.ops.op_deis_get_env();
                 Deno.core.ops.op_set_response(JSON.stringify(env));
             })()
         "#;

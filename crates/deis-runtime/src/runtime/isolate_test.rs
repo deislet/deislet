@@ -1729,6 +1729,627 @@ export default function handler(context: any): Response {
     }
 
     #[tokio::test]
+    async fn edge_canon_node_facade_executes_and_resets_process_env() {
+        let code = r#"
+            import { Buffer } from "node:buffer";
+            import { createHash } from "node:crypto";
+            import {
+              env, getBuiltinModule, platform, version, versions,
+            } from "node:process";
+
+            export default function handler() {
+              const before = env.TRANSIENT ?? null;
+              env.TRANSIENT = "this invocation only";
+              const crypto = getBuiltinModule("crypto");
+              return new Response(JSON.stringify({
+                before,
+                deployment: env.DEPLOYMENT_VALUE,
+                digest: createHash("sha256").update(Buffer.from("edge-canon")).digest("hex"),
+                globals: [typeof Buffer, typeof process, typeof setImmediate, typeof clearImmediate],
+                platform,
+                version,
+                nodeVersion: versions.node,
+                cryptoExports: Object.keys(crypto).sort(),
+                fsVisible: getBuiltinModule("node:fs") !== undefined,
+                hostPidVisible: "pid" in process,
+              }));
+            }
+        "#;
+        let mut runtime = AppRuntime::new(
+            "node_facade.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec {
+                env: HashMap::from([("DEPLOYMENT_VALUE".to_string(), "configured".to_string())]),
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        for path in ["/first", "/second"] {
+            let (status, _, body) = answer_to(&mut runtime, path).await;
+            assert_eq!(status, 200);
+            let value: serde_json::Value =
+                serde_json::from_str(&text(body).expect("JSON response")).unwrap();
+            assert_eq!(value["before"], serde_json::Value::Null);
+            assert_eq!(value["deployment"], "configured");
+            assert_eq!(
+                value["digest"],
+                "175811799a9da49a1cd8fc30f26d1e1d6b3d677108d76108309b5900dbf44ab0"
+            );
+            assert_eq!(
+                value["globals"],
+                serde_json::json!(["function", "object", "function", "function"])
+            );
+            assert_eq!(value["platform"], "linux");
+            assert_eq!(value["version"], "v24.20.0");
+            assert_eq!(value["nodeVersion"], "24.20.0");
+            assert_eq!(value["fsVisible"], false);
+            assert_eq!(value["hostPidVisible"], false);
+            assert_eq!(
+                value["cryptoExports"],
+                serde_json::json!([
+                    "createHash",
+                    "createHmac",
+                    "randomBytes",
+                    "randomUUID",
+                    "timingSafeEqual",
+                    "webcrypto"
+                ])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_snapshot_survives_a_second_process_with_the_node_facade() {
+        const CHILD_MARKER: &str = "DEIS_RUNTIME_SNAPSHOT_TEST_CHILD";
+        const SNAPSHOT_PATH: &str = "DEIS_RUNTIME_SNAPSHOT_PATH";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let code = r#"
+                import { Buffer } from "node:buffer";
+                import { createHash } from "node:crypto";
+
+                export default function handler() {
+                  return new Response(JSON.stringify({
+                    digest: createHash("sha256").update(Buffer.from("snapshot")).digest("hex"),
+                    version: process.version,
+                  }));
+                }
+            "#;
+            let mut runtime = AppRuntime::new(
+                "node_snapshot.production".to_string(),
+                code.to_string(),
+                None,
+                IsolateSpec::default(),
+                &ServiceWiring::default(),
+                ServiceRouter::detached(),
+            )
+            .expect("the child creates or restores the startup snapshot");
+            runtime.init_module().await.unwrap();
+            let (status, _, body) = answer_to(&mut runtime, "/").await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                text(body).as_deref(),
+                Some(
+                    r#"{"digest":"16a0eeb0791b6c92451fd284dd9f599e0a7dbe7f6ebea6e2d2d06c7f74aec112","version":"v24.20.0"}"#
+                )
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = directory.path().join("runtime.snapshot");
+        let executable = std::env::current_exe().unwrap();
+        let exact_name = concat!(
+            "runtime::isolate::isolate_test::tests::",
+            "startup_snapshot_survives_a_second_process_with_the_node_facade"
+        );
+
+        let mut first = std::process::Command::new(&executable)
+            .args(["--exact", exact_name, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env(SNAPSHOT_PATH, &snapshot)
+            .spawn()
+            .expect("spawn the cold snapshot process");
+        let mut concurrent = std::process::Command::new(&executable)
+            .args(["--exact", exact_name, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env(SNAPSHOT_PATH, &snapshot)
+            .spawn()
+            .expect("spawn a concurrent cold snapshot process");
+        assert!(
+            first.wait().unwrap().success(),
+            "the cold snapshot process must pass"
+        );
+        assert!(
+            concurrent.wait().unwrap().success(),
+            "the concurrent process must wait for and restore the same complete snapshot"
+        );
+        let original = std::fs::read(&snapshot).expect("the cold process writes the snapshot");
+        assert!(!original.is_empty());
+
+        let second = std::process::Command::new(&executable)
+            .args(["--exact", exact_name, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env(SNAPSHOT_PATH, &snapshot)
+            .status()
+            .expect("spawn the restore process");
+        assert!(second.success(), "the restore process must pass");
+        assert_eq!(
+            std::fs::read(&snapshot).unwrap(),
+            original,
+            "restoring the snapshot must not rewrite it"
+        );
+
+        let mut incompatible = original.clone();
+        let fingerprint_offset = b"DEIS_RUNTIME_SNAPSHOT\0V1\n".len();
+        incompatible[fingerprint_offset] ^= 0xff;
+        std::fs::write(&snapshot, &incompatible).unwrap();
+        let repaired = std::process::Command::new(&executable)
+            .args(["--exact", exact_name, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env(SNAPSHOT_PATH, &snapshot)
+            .status()
+            .expect("spawn the incompatible-cache recovery process");
+        assert!(
+            repaired.success(),
+            "an incompatible cache must be rebuilt before V8 sees it"
+        );
+        assert_ne!(
+            std::fs::read(snapshot).unwrap(),
+            incompatible,
+            "recovery must replace the incompatible cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_process_env_stays_with_its_stream_while_requests_interleave() {
+        let code = r#"
+            let produced = 0;
+
+            export default function handler(ctx) {
+              const path = new URL(ctx.request.url).pathname;
+              if (path === "/probe") {
+                const inherited = process.env.LOCAL ?? null;
+                process.env.LOCAL = "probe";
+                return new Response(JSON.stringify({ inherited }));
+              }
+
+              process.env.LOCAL = "stream";
+              return new Response(new ReadableStream({
+                async pull(controller) {
+                  await new Promise(resolve => setTimeout(resolve, 5));
+                  produced += 1;
+                  controller.enqueue(
+                    `${process.env.LOCAL}|${process.env.DEPLOYMENT_VALUE}|${produced}\n`,
+                  );
+                  if (produced === 2) controller.close();
+                },
+              }));
+            }
+        "#;
+        let mut runtime = AppRuntime::new(
+            "node_stream_env.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec {
+                env: HashMap::from([("DEPLOYMENT_VALUE".to_string(), "configured".to_string())]),
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (_, _, body) = answer_to(&mut runtime, "/stream").await;
+        let ResponseBody::Stream(mut reader) = body else {
+            panic!("the Node env fixture must keep producing after its response head");
+        };
+        let first = tokio::select! {
+            chunk = std::future::poll_fn(|cx| reader.poll_chunk(cx)) => chunk,
+            () = runtime.pump_response_streams() => panic!("the stream ended before its first chunk"),
+        };
+        assert_eq!(first.as_deref(), Some(&b"stream|configured|1\n"[..]));
+
+        let (_, _, probe) = answer_to(&mut runtime, "/probe").await;
+        assert_eq!(text(probe).as_deref(), Some(r#"{"inherited":null}"#));
+
+        let read = async {
+            let mut rest = Vec::new();
+            while let Some(chunk) = std::future::poll_fn(|cx| reader.poll_chunk(cx)).await {
+                rest.extend_from_slice(&chunk);
+            }
+            (rest, reader.failure())
+        };
+        let ((rest, failure), ()) = tokio::join!(read, runtime.pump_response_streams());
+        assert_eq!(failure, None);
+        assert_eq!(rest, b"stream|configured|2\n");
+    }
+
+    #[tokio::test]
+    async fn edge_canon_node_async_order_and_context_match_the_baseline() {
+        let code = r#"
+            import { AsyncLocalStorage } from "node:async_hooks";
+            import { EventEmitter } from "node:events";
+            import { nextTick } from "node:process";
+            import { setImmediate } from "node:timers";
+            import { setTimeout as sleep } from "node:timers/promises";
+
+            export default async function handler() {
+              const scheduleOrder = await new Promise((resolve) => {
+                setImmediate(() => {
+                  const order = ["callback"];
+                  nextTick(() => order.push("nextTick"));
+                  Promise.resolve().then(() => order.push("promise"));
+                  setImmediate(() => {
+                    order.push("immediate");
+                    resolve(order);
+                  });
+                });
+              });
+
+              const storage = new AsyncLocalStorage();
+              async function probe(label, delay) {
+                return storage.run({ label }, async () => {
+                  const values = [storage.getStore().label];
+                  await Promise.resolve();
+                  values.push(storage.getStore().label);
+                  await new Promise((resolve) => nextTick(() => {
+                    values.push(storage.getStore().label);
+                    resolve();
+                  }));
+                  await sleep(delay);
+                  values.push(storage.getStore().label);
+                  const emitter = new EventEmitter();
+                  emitter.on("check", () => values.push(storage.getStore().label));
+                  emitter.emit("check");
+                  return values;
+                });
+              }
+              const [a, b] = await Promise.all([probe("A", 2), probe("B", 1)]);
+              storage.disable();
+              return new Response(JSON.stringify({
+                scheduleOrder,
+                contexts: { A: a, B: b },
+                storeAfterDisable: storage.getStore() ?? null,
+              }));
+            }
+        "#;
+        let mut runtime = AppRuntime::new(
+            "node_async.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (status, _, body) = answer_to(&mut runtime, "/").await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value =
+            serde_json::from_str(&text(body).expect("JSON response")).unwrap();
+        assert_eq!(
+            value["scheduleOrder"],
+            serde_json::json!(["callback", "nextTick", "promise", "immediate"])
+        );
+        assert_eq!(
+            value["contexts"]["A"],
+            serde_json::json!(["A", "A", "A", "A", "A"])
+        );
+        assert_eq!(
+            value["contexts"]["B"],
+            serde_json::json!(["B", "B", "B", "B", "B"])
+        );
+        assert_eq!(value["storeAfterDisable"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn edge_canon_selected_node_modules_execute_real_semantics() {
+        let code = r#"
+            import { deepStrictEqual, rejects } from "node:assert/strict";
+            import { Buffer } from "node:buffer";
+            import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+            import { channel, hasSubscribers } from "node:diagnostics_channel";
+            import { EventEmitter, once } from "node:events";
+            import { posix, resolve as resolvePath, toNamespacedPath, win32 } from "node:path";
+            import { getBuiltinModule } from "node:process";
+            import { parse as parseQuery, stringify } from "node:querystring";
+            import { Readable, Transform, Writable } from "node:stream";
+            import { pipeline } from "node:stream/promises";
+            import { StringDecoder } from "node:string_decoder";
+            import { domainToASCII, domainToUnicode, pathToFileURL } from "node:url";
+            import { format as formatValue, inspect, stripVTControlCharacters } from "node:util";
+            import {
+              brotliCompressSync, brotliDecompressSync, deflateSync, gzipSync,
+              gunzipSync, inflateSync,
+            } from "node:zlib";
+
+            const selected = [
+              "node:assert", "node:assert/strict", "node:async_hooks", "node:buffer",
+              "node:crypto", "node:diagnostics_channel", "node:events", "node:path",
+              "node:process", "node:querystring", "node:stream", "node:stream/promises",
+              "node:string_decoder", "node:timers", "node:timers/promises", "node:url",
+              "node:util", "node:zlib",
+            ];
+
+            export default async function handler() {
+              const original = Buffer.from("edge-canon", "utf8");
+              const view = original.subarray(5);
+              view[0] = 0x43;
+              let assertionError;
+              try { deepStrictEqual({ value: 1 }, { value: 2 }); }
+              catch (error) {
+                assertionError = {
+                  name: error.name, code: error.code, actual: error.actual.value,
+                  expected: error.expected.value, operator: error.operator,
+                };
+              }
+              await rejects(Promise.reject(Object.assign(new Error("expected"), {
+                code: "E_FIXTURE",
+              })), { code: "E_FIXTURE" });
+
+              const input = Buffer.from("edge-canon-node-24", "utf8");
+              const digest = createHash("sha256").update(input).digest("hex");
+              const hmac = createHmac("sha256", "fixed-key").update(input).digest("hex");
+              const unequal = digest.replace(/^./, digest[0] === "0" ? "1" : "0");
+              const compression = {
+                gzip: gunzipSync(gzipSync(input)).toString("utf8"),
+                deflate: inflateSync(deflateSync(input)).toString("utf8"),
+                brotli: brotliDecompressSync(brotliCompressSync(input)).toString("utf8"),
+              };
+
+              const emitter = new EventEmitter();
+              const events = [];
+              emitter.on("value", (value) => events.push(`first-${value}`));
+              emitter.on("value", (value) => events.push(`second-${value}`));
+              const onceValue = once(emitter, "once");
+              emitter.emit("value", 7);
+              emitter.emit("once", "only");
+
+              const diagnostics = [];
+              const diagnosticChannel = channel("edge-canon.deislet.runtime");
+              const subscriber = (message, name) => diagnostics.push({ message, name });
+              diagnosticChannel.subscribe(subscriber);
+              diagnosticChannel.publish({ value: 1 });
+              diagnosticChannel.unsubscribe(subscriber);
+              diagnosticChannel.publish({ value: 2 });
+
+              const decoder = new StringDecoder("utf8");
+              const emoji = Buffer.from("A😀B", "utf8");
+              const decoded = decoder.write(emoji.subarray(0, 3)) +
+                decoder.write(emoji.subarray(3, 5)) + decoder.end(emoji.subarray(5));
+              const streamed = [];
+              await pipeline(
+                Readable.from([Buffer.from("edge"), Buffer.from("canon")]),
+                new Transform({ transform(chunk, _encoding, callback) {
+                  callback(null, Buffer.from(chunk.toString().toUpperCase()));
+                }}),
+                new Writable({ write(chunk, _encoding, callback) {
+                  streamed.push(chunk.toString()); callback();
+                }}),
+              );
+
+              return new Response(JSON.stringify({
+                inventory: Object.fromEntries(selected.map((name) => [
+                  name, Object.keys(getBuiltinModule(name)).sort(),
+                ])),
+                buffer: { utf8: original.toString("utf8"), aliases: original[5] === 0x43 },
+                assertionError,
+                crypto: {
+                  digest, hmac,
+                  equal: timingSafeEqual(Buffer.from(digest), Buffer.from(digest)),
+                  unequal: timingSafeEqual(Buffer.from(digest), Buffer.from(unequal)),
+                },
+                compression,
+                events,
+                onceValue: await onceValue,
+                diagnostics,
+                diagnosticsAfter: hasSubscribers("edge-canon.deislet.runtime"),
+                path: {
+                  posix: posix.normalize("/a//b/../c"),
+                  win32: win32.normalize("C:\\a\\b\\..\\c"),
+                  relative: posix.relative("/a/b", "/a/c/d"),
+                  virtualRoot: resolvePath("a", "../b"),
+                  posixVirtualRoot: posix.resolve("a"),
+                  win32VirtualRoot: win32.resolve("a"),
+                  namespacedRelative: toNamespacedPath("relative"),
+                },
+                url: {
+                  ascii: domainToASCII("例え.テスト"),
+                  unicode: domainToUnicode("xn--r8jz45g.xn--zckzah"),
+                  virtualFile: pathToFileURL("asset.txt").href,
+                },
+                denoVisibleAfterBuiltin: "Deno" in globalThis,
+                query: { stringified: stringify({ a: "x y", b: ["1", "2"] }), parsed: parseQuery("a=x%20y&b=1&b=2") },
+                util: {
+                  formatted: formatValue("%s:%d:%j", "value", 7, { ok: true }),
+                  stripped: stripVTControlCharacters("\u001b[31mred\u001b[0m"),
+                  inspected: inspect({ b: 2, a: 1 }, { sorted: true }),
+                },
+                decoded,
+                streamed,
+              }));
+            }
+        "#;
+        let mut runtime = AppRuntime::new(
+            "node_modules.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (status, _, body) = answer_to(&mut runtime, "/").await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value =
+            serde_json::from_str(&text(body).expect("JSON response")).unwrap();
+
+        for builtin in deis_node_contract::NODE_BUILTIN_MODULES {
+            let observed: Vec<&str> = value["inventory"][builtin]
+                .as_array()
+                .expect("builtin inventory")
+                .iter()
+                .map(|name| name.as_str().unwrap())
+                .collect();
+            let mut expected = deis_node_contract::builtin_exports(builtin)
+                .unwrap()
+                .to_vec();
+            expected.sort_unstable();
+            assert_eq!(observed, expected, "{builtin} export inventory drifted");
+        }
+        assert_eq!(
+            value["buffer"],
+            serde_json::json!({ "utf8": "edge-Canon", "aliases": true })
+        );
+        assert_eq!(
+            value["assertionError"],
+            serde_json::json!({ "name": "AssertionError", "code": "ERR_ASSERTION", "actual": 1, "expected": 2, "operator": "deepStrictEqual" })
+        );
+        assert_eq!(
+            value["crypto"]["digest"],
+            "cfa7d671d5f577ea4f8847ef508612bd3af792071334dcf00ffb1dfe57d2489c"
+        );
+        assert_eq!(
+            value["crypto"]["hmac"],
+            "511dc83d6a37511e6a7da6a06e644dd1cfcf9392da2100b137d73fc0f114405b"
+        );
+        assert_eq!(value["crypto"]["equal"], true);
+        assert_eq!(value["crypto"]["unequal"], false);
+        assert_eq!(
+            value["compression"],
+            serde_json::json!({ "gzip": "edge-canon-node-24", "deflate": "edge-canon-node-24", "brotli": "edge-canon-node-24" })
+        );
+        assert_eq!(value["events"], serde_json::json!(["first-7", "second-7"]));
+        assert_eq!(value["onceValue"], serde_json::json!(["only"]));
+        assert_eq!(value["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(value["diagnosticsAfter"], false);
+        assert_eq!(
+            value["path"],
+            serde_json::json!({
+                "posix": "/a/c",
+                "win32": "C:\\a\\c",
+                "relative": "../c/d",
+                "virtualRoot": "/b",
+                "posixVirtualRoot": "/a",
+                "win32VirtualRoot": "\\a",
+                "namespacedRelative": "relative"
+            })
+        );
+        assert_eq!(
+            value["url"],
+            serde_json::json!({
+                "ascii": "xn--r8jz45g.xn--zckzah",
+                "unicode": "例え.テスト",
+                "virtualFile": "file:///asset.txt"
+            })
+        );
+        assert_eq!(value["denoVisibleAfterBuiltin"], false);
+        assert_eq!(
+            value["query"],
+            serde_json::json!({ "stringified": "a=x%20y&b=1&b=2", "parsed": { "a": "x y", "b": ["1", "2"] } })
+        );
+        assert_eq!(
+            value["util"],
+            serde_json::json!({ "formatted": "value:7:{\"ok\":true}", "stripped": "red", "inspected": "{ a: 1, b: 2 }" })
+        );
+        assert_eq!(value["decoded"], "A😀B");
+        assert_eq!(value["streamed"], serde_json::json!(["EDGE", "CANON"]));
+    }
+
+    #[tokio::test]
+    async fn every_selected_node_builtin_instantiates_from_an_application_import() {
+        let mut imports = String::new();
+        for (index, builtin) in deis_node_contract::NODE_BUILTIN_MODULES.iter().enumerate() {
+            let selected_exports = deis_node_contract::builtin_exports(builtin).unwrap();
+            imports.push_str("import { ");
+            for (export_index, selected_export) in selected_exports.iter().enumerate() {
+                imports.push_str(&format!(
+                    "{selected_export} as selected{index}_{export_index}, "
+                ));
+            }
+            imports.push_str(&format!("}} from {builtin:?};\n"));
+            let code = format!(
+                "{imports}\nexport default function handler() {{ return new Response('ok'); }}"
+            );
+            let mut runtime = AppRuntime::new(
+                format!("node_import_{index}.production"),
+                code,
+                None,
+                IsolateSpec::default(),
+                &ServiceWiring::default(),
+                ServiceRouter::detached(),
+            )
+            .unwrap_or_else(|error| panic!("{builtin} runtime construction failed: {error}"));
+            runtime
+                .init_module()
+                .await
+                .unwrap_or_else(|error| panic!("{builtin} import failed: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_a_tampered_artifact_with_an_unselected_node_builtin() {
+        for specifier in ["node:fs", "fs"] {
+            let code = format!(
+                "import {{ readFile }} from {specifier:?};\n\
+                 export default function handler() {{ return new Response(String(readFile)); }}"
+            );
+            let error = AppRuntime::new(
+                "node_tamper.production".to_string(),
+                code,
+                None,
+                IsolateSpec::default(),
+                &ServiceWiring::default(),
+                ServiceRouter::detached(),
+            )
+            .err()
+            .expect("tampered artifact must be refused")
+            .to_string();
+            assert!(
+                error.contains("EC_NODE_ARTIFACT_INCOMPLETE") && error.contains(specifier),
+                "the runtime must reject a bypassed build artifact before application code: {error}"
+            );
+        }
+
+        for (source, detail) in [
+            (
+                "import { scrypt } from 'node:crypto'; export default function handler() {}",
+                "scrypt",
+            ),
+            (
+                "import * as crypto from 'node:crypto'; export default function handler() { return crypto; }",
+                "namespace-producing",
+            ),
+        ] {
+            let error = AppRuntime::new(
+                "node_tamper.production".to_string(),
+                source.to_string(),
+                None,
+                IsolateSpec::default(),
+                &ServiceWiring::default(),
+                ServiceRouter::detached(),
+            )
+            .err()
+            .expect("tampered artifact must be refused")
+            .to_string();
+            assert!(
+                error.contains("EC_NODE_ARTIFACT_INCOMPLETE") && error.contains(detail),
+                "runtime artifact validation must match the selected export surface: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_execute_fetch_error_handling() {
         let code = r#"
             export default function handler() {
@@ -2159,6 +2780,10 @@ export default function handler(context: any): Response {
         "TransformStream",
         "setInterval",
         "clearInterval",
+        "Buffer",
+        "process",
+        "setImmediate",
+        "clearImmediate",
     ];
 
     /// Names section 8.1 requires that this platform does NOT provide.
@@ -5695,6 +6320,10 @@ export default function handler(context: any): Response {
             ..ExecutionLimits::default()
         };
 
+        // Snapshot construction is process startup work, not part of an
+        // invocation's execution budget. Warm it outside the wall-clock
+        // assertion so this test remains order-independent when run alone.
+        crate::runtime::snapshot::load_or_create_startup_snapshot().unwrap();
         let started = std::time::Instant::now();
         let seen = probe_with_limits(
             "budget-hang.production",

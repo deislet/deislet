@@ -249,7 +249,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
       - name: Compiler, adapters and CLI tests
-        run: cargo test -p deis-bundle -p deis-build-core -p deis-build-adapter-cloudflare -p deis-build-adapter-deislet -p deis-build-adapter-deno -p deis-build-adapter-tencent -p deis-build -p deis --no-fail-fast
+        run: cargo test -p deis-bundle -p deis-node-contract -p deis-build-core -p deis-build-adapter-cloudflare -p deis-build-adapter-deislet -p deis-build-adapter-deno -p deis-build-adapter-tencent -p deis-build -p deis --no-fail-fast
 
   control-services-tests:
     name: control plane and service tests

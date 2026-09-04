@@ -73,7 +73,10 @@ const ATTACK_THEN_READ: &str = r#"
         }
 
         // Redefinition, which was not.
-        for (const name of ["performance", "navigator", "crypto"]) {
+        for (const name of [
+            "performance", "navigator", "crypto", "Buffer", "process",
+            "setImmediate", "clearImmediate",
+        ]) {
             try {
                 Object.defineProperty(globalThis, name, {
                     value: { now: () => 1234.5678, timeOrigin: 999, userAgent: "REPLACED" },
@@ -88,7 +91,10 @@ const ATTACK_THEN_READ: &str = r#"
 
         // Deletion, which was not either: a deleted global is a global the
         // next request finds missing.
-        for (const name of ["performance", "navigator", "crypto"]) {
+        for (const name of [
+            "performance", "navigator", "crypto", "Buffer", "process",
+            "setImmediate", "clearImmediate",
+        ]) {
             try {
                 out["delete_" + name] = delete globalThis[name];
             } catch (e) {
@@ -142,6 +148,15 @@ const ATTACK_THEN_READ: &str = r#"
             scopeClaim: globalThis.__deis_runtime_claim_stream_scope() === null
                 ? "null"
                 : "handed over",
+            node: {
+                buffer: typeof Buffer,
+                process: typeof process,
+                version: process.version,
+                platform: process.platform,
+                pidVisible: "pid" in process,
+                immediate: typeof setImmediate,
+                clearImmediate: typeof clearImmediate,
+            },
             // Proof that both requests ran in one isolate: an ordinary global
             // an application writes does survive, and is meant to.
             stash: globalThis.__stash ?? "none",
@@ -162,7 +177,15 @@ async fn a_platform_global_cannot_be_redefined_or_deleted() {
     let attacked = request(&mut runtime, "/attack").await;
 
     assert_eq!(attacked["assign"], "threw:TypeError");
-    for name in ["performance", "navigator", "crypto"] {
+    for name in [
+        "performance",
+        "navigator",
+        "crypto",
+        "Buffer",
+        "process",
+        "setImmediate",
+        "clearImmediate",
+    ] {
         assert_eq!(
             attacked[format!("define_{name}")],
             "threw:TypeError",
@@ -222,6 +245,13 @@ async fn a_second_request_sees_the_platforms_objects_and_not_the_previous_reques
     );
     assert_eq!(seen["navigatorFrozen"], true);
     assert_eq!(seen["hasGetRandomValues"], true);
+    assert_eq!(seen["node"]["buffer"], "function");
+    assert_eq!(seen["node"]["process"], "object");
+    assert_eq!(seen["node"]["version"], "v24.20.0");
+    assert_eq!(seen["node"]["platform"], "linux");
+    assert_eq!(seen["node"]["pidVisible"], false);
+    assert_eq!(seen["node"]["immediate"], "function");
+    assert_eq!(seen["node"]["clearImmediate"], "function");
     assert_eq!(
         seen["sweepIsPlatforms"], true,
         "the invocation sweep is not the platform's function any more"

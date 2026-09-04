@@ -1289,6 +1289,10 @@ function propSealed(value) {
 function propSealedNonEnumerable(value) {
   return { value, writable: false, enumerable: false, configurable: false };
 }
+
+function propSealedGetter(get) {
+  return { get, set: undefined, enumerable: true, configurable: false };
+}
 //
 // What is deliberately *not* here is as much a decision as what is, and each
 // name left out has its own reason rather than a shared one: `Deno` and
@@ -1315,7 +1319,10 @@ ObjectDefineProperties(globalThis, {
   // there on the next request through this isolate, and everything that then
   // asked for a random number -- a session id, a nonce, a token -- would get
   // the application's number instead.
-  crypto: propSealed(crypto.crypto),
+  // deno_crypto's singleton is cppgc-backed. Keep the binding sealed but
+  // mint the object on first application access, when a normal isolate owns
+  // a CppHeap; V8 snapshot creation intentionally has no CppHeap.
+  crypto: propSealedGetter(() => crypto.crypto),
 
   // Section 8.1: the stream types. The readers, writers, controllers and
   // queuing strategies are not bound as globals: an application reaches them

@@ -267,9 +267,10 @@
             {"type": "path", "value": "standards/edge-canon.lock.json"},
             {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/5950a4de9abc8c0933661cf25d1ab95bf526d9b2/standard/requirements/node-npm-subset.zh.md"},
             {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/5950a4de9abc8c0933661cf25d1ab95bf526d9b2/conformance/harness/node-npm-subset/harness.json"},
-            {"type": "planned-path", "value": "production npm resolver and Deislet Node compatibility layer"}
+            {"type": "path", "value": "crates/deis-build-core/src/node_npm.rs"},
+            {"type": "path", "value": "crates/deis-runtime/src/runtime/node_compat.rs"}
           ],
-          "verification": "标准 Node 24.20.0 逐 export lock 与 15 个 reference cases 已建立；生产 compiler 已统一拒绝清单外 builtin/export、namespace/default 扩张、动态解析和不合规 package-lock v3，四 target 负向回归通过。构建期固定 Node 24.20.0/npm 11.19.0，以隔离 npm ci 安装并复核 SHA-512 cache、lifecycle/native/path/link/跨文件系统冲突及资源上限；CommonJS/ESM package 完整内联，只有标准 builtin external。Cloudflare nodejs_compat、EdgeOne Build Output v3 Node API 与 Deno bundled Node 输出已有正向 artifact；官方 Deno 2.9.6 check 和真实 HTTP 探针通过。完成仍要求解包期间资源中止、独立 conditional exports evidence、标准 process/global facade、Deislet compatibility layer、三个一等后端 mandatory suite 与真实 provider 运行"
+          "verification": "标准 Node 24.20.0 逐 export lock 与 15 个 reference cases 已建立；生产 compiler 已统一拒绝清单外 builtin/export、namespace/default 扩张、动态解析和不合规 package-lock v3，四 target 负向回归通过。构建期固定 Node 24.20.0/npm 11.19.0，以隔离 npm ci 安装并复核 SHA-512 cache、lifecycle/native/path/link/跨文件系统冲突及资源上限；CommonJS/ESM package 完整内联，只有标准 builtin external。Cloudflare nodejs_compat、EdgeOne Build Output v3 Node API 与 Deno bundled Node 输出已有正向 artifact；官方 Deno 2.9.6 check 和真实 HTTP 探针通过。Deislet 自建运行时已由共享契约驱动实现 18 个标准模块、受限 process、Buffer、Node 调度函数、逐调用 process.env 隔离和构建产物反向校验，并有真实 bundle、异步交错与启动快照恢复回归。完成仍要求解包期间资源中止、独立 conditional exports evidence、三个一等后端 mandatory suite 与真实 provider 运行"
         },
         {
           "id": "P2-SSR-001",

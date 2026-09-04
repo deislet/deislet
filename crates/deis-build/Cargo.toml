@@ -53,5 +53,6 @@ swc_ecma_parser = "33.0"
 swc_ecma_visit = "20.0"
 
 [dev-dependencies]
+deis-runtime = { path = "../deis-runtime" }
 tempfile = "3"
 zip = "0.6"

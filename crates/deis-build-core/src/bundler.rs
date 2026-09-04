@@ -28,6 +28,9 @@ pub enum TargetPlatform {
     /// deis-runtime: a deno_core isolate with Web APIs and no Node built-ins,
     /// loading one ESM entry point.
     Deislet,
+    /// deis-runtime with the Edge Canon selected Node builtins. npm packages
+    /// have already been folded into the same static ESM artifact.
+    DeisletNode,
 }
 
 pub struct BuildBundler {
@@ -46,12 +49,16 @@ impl BuildBundler {
             }
             TargetPlatform::CloudflareNode
             | TargetPlatform::EdgeOneNode
-            | TargetPlatform::DenoNode => (Some(Platform::Browser), Some(OutputFormat::Esm)),
+            | TargetPlatform::DenoNode
+            | TargetPlatform::DeisletNode => (Some(Platform::Browser), Some(OutputFormat::Esm)),
         };
 
         let allowed_externals: BTreeSet<String> = if matches!(
             platform,
-            TargetPlatform::CloudflareNode | TargetPlatform::EdgeOneNode | TargetPlatform::DenoNode
+            TargetPlatform::CloudflareNode
+                | TargetPlatform::EdgeOneNode
+                | TargetPlatform::DenoNode
+                | TargetPlatform::DeisletNode
         ) {
             crate::NODE_BUILTIN_MODULES
                 .iter()

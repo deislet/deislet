@@ -44,8 +44,10 @@ DEIS_RUNTIME_CONFIG=/etc/deis/deis-runtime.toml cargo run -p deis-runtime
 就写在 [`deis-runtime.toml`](deis-runtime.toml) 里，每一项也都有对应的环境变量：把
 TOML 路径大写、用下划线连起来、前面加 `DEIS_RUNTIME_`。
 
-启动快照只在 `DEIS_RUNTIME_SNAPSHOT_PATH` 指了文件时才做：第一次启动写出来，之后
-启动读它。这个变量没设就完全不做快照。
+启动快照始终只构建一次并由进程内全部 isolate 共用。`DEIS_RUNTIME_SNAPSHOT_PATH`
+指向文件时，第一次启动还会持久化快照，之后的进程直接恢复而不再构建。磁盘文件带有
+当前 runtime、依赖锁和实际 lazy source 的构建指纹及长度校验；旧版本、截断或损坏的
+缓存会在跨进程锁内重建，不会直接交给 V8。缓存路径不能是符号链接。
 
 想要一个完整平台来指：仓库根的 `scripts/demo.sh start` 会起六个进程并部署一个示例应用。
 
@@ -168,6 +170,8 @@ chunk 就是一次 op 派发，所以照默认值，一个生产者一秒最多�
 客户端 `WebSocket`（走的是和 `fetch` 同一道出网策略，见下文）、`Blob`、`File`、
 `FormData`、`URLPattern`、`structuredClone`、`performance`、`navigator`、
 `TextEncoder`、`TextDecoder`、`atob`、`btoa`。
+选定的 Node 应用面另外提供 `Buffer`、受限 `process` facade、`setImmediate`
+与 `clearImmediate`。
 
 **没有：** `Deno`、`__bootstrap`、`BroadcastChannel`、`addEventListener`、
 `MessageChannel`、`MessagePort`、`CompressionStream`、`DecompressionStream`、
@@ -192,6 +196,15 @@ Isolate 的时间侧信道——这个节点上好几个租户的 Isolate 共用
 （走 `runtime/ws_client_ops.rs`，每个目标都过一遍 `fetch` 也在过的那道
 `fetch_policy.rs` 判定，而不是 deno_websocket 自己的连接器）。这条线仍然是有意
 画的——不是「deno_web 装了什么就给什么」——只是比单纯的第 8.1 节长一些。
+
+Node 兼容同样是显式清单。运行时只暴露 Edge Canon `node-npm-subset` 锁定的 18 个
+`node:` specifier 与逐项 named export；即使 bundle 绕过编译器或在编译后被篡改，第二道
+artifact validator 也会在应用执行前拒绝。`process.version`、
+`process.versions.node` 与 `process.platform` 是规范值而非宿主指纹。`process.env`
+是每次 invocation 各自的可写快照，通过 async context 随 Promise、timer、WebSocket
+回调及流式响应继续传播；同一 isolate 中穿插执行下一请求也不会覆盖它，写入不会进入宿主或
+后续 invocation。npm 解析和 CommonJS 转换只发生在 `deis-build`；运行时不安装、下载或
+修复 package，也不提供通用 `require()`。
 
 这份清单不是一次性探针的结果。`src/runtime/isolate_test.rs` 里的
 `the_isolate_global_surface_is_the_one_the_documents_describe` 会在真 Isolate 里

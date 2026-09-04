@@ -1,6 +1,6 @@
 # Deislet 系统设计
 
-> **文档边界（2026-09-03）：** 本文解释当前 v0.4 实现。下一代统一标准和产品化
+> **文档边界（2026-09-05）：** 本文解释当前 v0.4 实现。下一代统一标准和产品化
 > 架构由 [`docs/product/README.md`](product/README.md)、
 > [`docs/adr/README.md`](adr/README.md) 与 [`docs/product/roadmap.zh.md`](product/roadmap.zh.md)
 > 管理；本文中与新 ADR 冲突的部分是待迁移现状，不是另一套长期标准。
@@ -1151,7 +1151,7 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | WebAssembly | 成立 | V8 自带 |
 | WebSocket | 成立 | 服务端（`WebSocketPair` 桥接）与客户端（走 `fetch_policy.rs` 出网策略的 `WebSocket` 全局）都有；HTTP 升级、经过 deis-proxy 的一跳、文本帧与二进制帧都有真测试覆盖（`websocket_bridging_test.rs`、`websocket_through_proxy_test.rs`，见 §11） |
 | BroadcastChannel | **不成立** | `deno_web` 带着 `01_broadcast_channel.js` 被 import 进来了，但没有把 `BroadcastChannel` 装到 `globalThis` 上——8.1 节没要求它，`bootstrap.js` 补全局时就没带上。探针实测：`typeof BroadcastChannel === "undefined"`。真要开还有一层要想清楚：进程内广播是跨应用的，得先按 (应用, 环境) 隔离 |
-| Node.js 运行时 | 不成立（形态上没有） | `build_runtime_extensions()` 里没有 `deno_node`，只从中借了一个 TLS op。`require`、`Buffer`、`node:` 模块都不可用 |
+| 版本化 Node/npm 子集 | 部分成立，产品项仍 active | 构建器已按统一 Node 24.20.0 契约校验并内联锁定 npm 依赖；自建 runtime 以受限 façade 提供 18 个标准模块、`Buffer`、受限 `process` 与调度函数，且不暴露宿主 cwd/PID/Deno。运行时通用 `require`、文件系统和清单外 builtin 仍明确不可用；三个一等后端的同源 mandatory suite 与真实 provider evidence 尚未完成，不能据此宣称完整 Node runtime 或后端合规 |
 | 服务端渲染 | 不成立（形态上没有） | 处理函数当然可以自己拼 HTML，但没有框架挂钩，也没有 npm 生态 |
 | 增量静态再生 | 不成立（形态上没有） | 同上 |
 | Durable Objects | 不成立（形态上没有） | 全量复制模型下没有「唯一可寻址实例」这回事 |

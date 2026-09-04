@@ -1240,6 +1240,7 @@ impl Compiler {
                 deis_build_adapter_tencent::VENDOR if uses_node_npm => TargetPlatform::EdgeOneNode,
                 deis_build_adapter_tencent::VENDOR => TargetPlatform::EdgeOne,
                 deis_build_adapter_deno::VENDOR if uses_node_npm => TargetPlatform::DenoNode,
+                deis_build_adapter_deislet::VENDOR if uses_node_npm => TargetPlatform::DeisletNode,
                 deis_build_adapter_deislet::VENDOR => TargetPlatform::Deislet,
                 other => {
                     return Err(anyhow::anyhow!(

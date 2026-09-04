@@ -7,6 +7,7 @@ authors = ["kookyleo <kookyleo@gmail.com>"]
 
 [dependencies]
 deis-wire = { workspace = true }
+deis-node-contract = { path = "../deis-node-contract" }
 # The command line. Every other component of this platform takes `-c`, and a
 # binary that read no arguments at all answered `-c /etc/deis-runtime.toml`
 # and `--help` by starting an unconfigured node on default ports and calling
@@ -24,10 +25,16 @@ tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Deno Runtime
-deno_runtime = "0.266"
+deno_runtime = { version = "0.266", features = ["transpile"] }
 
 # Deno Core (for op2 macro compatibility)
 deno_core = "0.411"
+
+# These are already part of deno_runtime's graph. Deislet names them directly
+# to initialize the selected Edge Canon surface without enabling a general
+# runtime npm resolver.
+deno_node_crypto = "0.28"
+deno_resolver = "0.89"
 
 # System Traits (for permissions)
 sys_traits = "0.1.22"
@@ -117,11 +124,18 @@ hex = "0.4"
 # ZIP archive handling
 zip = "0.6"
 parking_lot = "0.12.5"
-deno_ast = { version = "0.52.0", features = ["transpiling"] }
+fs2 = "0.4"
+deno_ast = { version = "0.52.0", features = ["transpiling", "visit"] }
 deno_error = "0.7.1"
 
 [build-dependencies]
 tonic-build = "0.12"
+deno_core = "0.411"
+deno_runtime = { version = "0.266", features = ["transpile"] }
+deno_node_crypto = "0.28"
+deno_resolver = "0.89"
+sys_traits = "0.1.22"
+sha2 = "0.10"
 
 [dev-dependencies]
 # Test dependencies

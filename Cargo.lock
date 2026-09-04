@@ -2033,6 +2033,7 @@ dependencies = [
  "deis-build-adapter-tencent",
  "deis-build-core",
  "deis-bundle",
+ "deis-runtime",
  "hex",
  "indicatif",
  "pathdiff",
@@ -2106,6 +2107,7 @@ name = "deis-build-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "deis-node-contract",
  "rolldown",
  "rolldown_common",
  "rolldown_error",
@@ -2177,6 +2179,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "deis-node-contract"
+version = "0.1.0"
+
+[[package]]
 name = "deis-proxy"
 version = "0.1.0"
 dependencies = [
@@ -2243,13 +2249,17 @@ dependencies = [
  "clap 4.6.6",
  "dashmap 5.5.3",
  "deis-bundle",
+ "deis-node-contract",
  "deis-store",
  "deis-telemetry",
  "deis-wire",
  "deno_ast 0.52.0",
  "deno_core",
  "deno_error",
+ "deno_node_crypto",
+ "deno_resolver",
  "deno_runtime",
+ "fs2",
  "futures-util",
  "hex",
  "hostname",
@@ -3428,6 +3438,7 @@ dependencies = [
  "base64 0.22.1",
  "boxed_error",
  "color-print",
+ "deno_ast 0.53.3",
  "deno_bundle_runtime",
  "deno_cache",
  "deno_canvas",

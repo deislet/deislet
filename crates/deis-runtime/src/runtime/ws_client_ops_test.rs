@@ -843,6 +843,10 @@ async fn opening_a_socket_is_bounded_by_the_invocation_s_execution_budget() {
     let (addr, _endings) = a_server_that_never_answers().await;
     let policy = FetchPolicy::new([addr.to_string()], Vec::<String>::new()).unwrap();
 
+    // Process-level snapshot construction precedes application invocations;
+    // keep it outside the execution-budget measurement when this test is run
+    // in isolation.
+    crate::runtime::snapshot::load_or_create_startup_snapshot().unwrap();
     let started = std::time::Instant::now();
     let body = body_of(
         "ws-budget.production",

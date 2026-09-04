@@ -786,7 +786,7 @@ pub type EnvStore = Rc<RefCell<HashMap<String, String>>>;
 /// Internal op: get environment variables
 #[op2]
 #[serde]
-fn op_get_env(state: &mut OpState) -> HashMap<String, String> {
+fn op_deis_get_env(state: &mut OpState) -> HashMap<String, String> {
     let env_store = state.borrow::<EnvStore>().clone();
     let map = env_store.borrow().clone();
     map
@@ -805,7 +805,7 @@ extension!(
         op_set_response,
         op_deis_take_request_body,
         op_deis_set_response_body,
-        op_get_env
+        op_deis_get_env
     ],
 );
 

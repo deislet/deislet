@@ -77,9 +77,13 @@ Every setting is documented inline in
 whose name is the TOML path with `DEIS_RUNTIME_` in front, upper-cased and
 joined by underscores.
 
-A startup snapshot is built and reused only when `DEIS_RUNTIME_SNAPSHOT_PATH`
-names a file: the first start writes it, later starts load it. With the
-variable unset the runtime does not snapshot at all.
+A startup snapshot is always built once and shared by every isolate in the
+process. When `DEIS_RUNTIME_SNAPSHOT_PATH` names a file, the first start also
+persists it and later starts restore it instead of rebuilding it. The file
+carries a build fingerprint over the runtime, dependency lock, and actual lazy
+sources, plus a payload length. An old, truncated, or damaged cache is rebuilt
+under a cross-process lock before V8 can see it. The cache path cannot be a
+symbolic link.
 
 For a whole platform to point this at, `scripts/demo.sh start` at the
 repository root brings up six processes with an example application deployed.
@@ -233,6 +237,8 @@ Measured inside a real isolate by asking `typeof globalThis[name]`:
 egress policy as `fetch` — see below), `Blob`, `File`, `FormData`,
 `URLPattern`, `structuredClone`, `performance`, `navigator`, `TextEncoder`,
 `TextDecoder`, `atob`, `btoa`.
+The selected Node surface also adds `Buffer`, the restricted `process`
+facade, `setImmediate` and `clearImmediate`.
 
 **Absent:** `Deno`, `__bootstrap`, `BroadcastChannel`, `addEventListener`,
 `MessageChannel`, `MessagePort`, `CompressionStream`, `DecompressionStream`,
@@ -264,6 +270,18 @@ node), `navigator` (this runtime's own frozen object, one property,
 `fetch_policy.rs` decision point `fetch` does, rather than deno_websocket's
 own connector). The line is still deliberate — not "whatever deno_web
 happens to load" — it is just longer than section 8.1 alone.
+
+Node compatibility is equally explicit. The runtime exposes only the 18
+`node:` specifiers and named exports locked by Edge Canon's
+`node-npm-subset`; a second artifact validator rejects a bundle that bypassed
+or was changed after the compiler. `process.version`,
+`process.versions.node` and `process.platform` are the canonical values rather
+than host fingerprints. `process.env` is a writable snapshot per invocation,
+carried by async context into promises, timers, WebSocket callbacks and a
+streaming response even while another request runs in the same isolate.
+Writes never reach the host or a later invocation. npm resolution and
+CommonJS conversion happen only in `deis-build`; the runtime never installs,
+downloads or repairs packages, and it provides no general `require()`.
 
 That measurement is not a one-off. `the_isolate_global_surface_is_the_one_the_documents_describe`
 in `src/runtime/isolate_test.rs` drives a real isolate and asserts **both

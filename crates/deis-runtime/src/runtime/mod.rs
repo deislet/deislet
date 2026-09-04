@@ -13,6 +13,7 @@ pub mod isolate;
 mod kv_client;
 pub mod loader;
 pub mod metrics;
+mod node_compat;
 mod op_metrics;
 mod ops;
 mod pool;
@@ -29,7 +30,6 @@ mod snapshot;
 mod tenant;
 #[cfg(test)]
 pub(crate) mod test_store;
-mod tls_ops;
 mod ws_server_ops;
 
 pub use bindings::{
@@ -69,7 +69,6 @@ pub use service_call::{
 pub use service_ops::{init_service_extension, ServiceRouter};
 pub use snapshot::load_or_create_startup_snapshot;
 pub use tenant::Tenant;
-pub use tls_ops::init_tls_ops_extension;
 pub use ws_server_ops::{
     create_ws_server_manager, init_ws_server_extension, WsClientSink, WsServerManager,
     WsServerMessage,

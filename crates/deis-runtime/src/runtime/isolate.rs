@@ -9,6 +9,7 @@ use super::metrics::{
     now_us, recorder, InvocationKind, InvocationOutcome, InvocationTrace, MetricsRegistry,
     RequestFacts, RequestOutcome, RATE_LIMIT_CUTOFFS_TOTAL,
 };
+use super::node_compat::{rewrite_node_artifact, NodeProcessEnvStore};
 use super::ops::{
     new_trace_id, AppId, CurrentTrace, EnvStore, ExecutionDeadline, PendingRequestBody,
     PendingResponseBody, ResponseStore, SubrequestBudget,
@@ -1159,6 +1160,11 @@ pub struct AppRuntime {
     /// [`Self::begin_invocation`]; see [`SubrequestBudget`] for why fan-out
     /// needs a ceiling none of the other budgets provides.
     subrequest_budget: Rc<SubrequestBudget>,
+    /// The invocation-local view behind the restricted `process.env` facade.
+    /// It is populated and cleared at the same hard boundary as the other
+    /// per-invocation resources, so writes cannot reach the deployment config
+    /// or the next request through this reused isolate.
+    node_process_env: NodeProcessEnvStore,
     /// How many stretches of application code this isolate has begun or
     /// finished, shared with the isolate's `OpState`.
     ///
@@ -1284,7 +1290,7 @@ impl AppRuntime {
             .to_string();
         let specifier =
             deno_core::ModuleSpecifier::parse(&format!("deis:///apps/{}/{}", app_id, entry_path))?;
-        deno_ast::parse_module(ParseParams {
+        let parsed_entry = deno_ast::parse_module(ParseParams {
             specifier: specifier.clone(),
             text: code.clone().into(),
             media_type: MediaType::TypeScript,
@@ -1293,6 +1299,7 @@ impl AppRuntime {
             maybe_syntax: None,
         })
         .map_err(|e| anyhow::anyhow!(e))?;
+        let code = rewrite_node_artifact(&parsed_entry).map_err(anyhow::Error::msg)?;
 
         let module_loader = Rc::new(DbModuleLoader::new(
             app_id.clone(),
@@ -1345,7 +1352,12 @@ impl AppRuntime {
             // bound what an application costs on the bookkeeping that makes it
             // safe is the wrong way round: it took a streaming response over a
             // 50 op/s ceiling before its producer had written a byte.
-            let charged = op_name != "op_cache_invocation";
+            // Loading an extension's own lazily bundled source is runtime
+            // bootstrap work. The application cannot dispatch this op after
+            // bootstrap removes `Deno`, and charging it would make the first
+            // invocation consume a different allowance depending on which
+            // platform module happened to initialize first.
+            let charged = op_name != "op_cache_invocation" && op_name != "op_load_ext_script";
 
             let callback = move |ctx: &_,
                                  event: deno_core::OpMetricsEvent,
@@ -1396,12 +1408,25 @@ impl AppRuntime {
         }
 
         let startup_snapshot = load_or_create_startup_snapshot()?;
+        let (residual_lazy_js_sources, residual_lazy_esm_sources) = if startup_snapshot.is_some() {
+            (
+                super::runtime_init::RESIDUAL_LAZY_JS_SOURCES,
+                super::runtime_init::RESIDUAL_LAZY_ESM_SOURCES,
+            )
+        } else {
+            (&[][..], &[][..])
+        };
         let mut runtime = JsRuntime::new(RuntimeOptions {
             create_params: Some(create_params),
             module_loader: Some(module_loader),
             op_metrics_factory_fn: Some(op_metrics_factory),
             startup_snapshot,
+            residual_lazy_js_sources,
+            residual_lazy_esm_sources,
             extensions: build_runtime_extensions(),
+            extension_transpiler: Some(Rc::new(|specifier, source| {
+                deno_runtime::transpile::maybe_transpile_source(specifier, source)
+            })),
             ..Default::default()
         });
 
@@ -1410,6 +1435,7 @@ impl AppRuntime {
 
         let execution_deadline: ExecutionDeadline = Rc::new(Cell::new(None));
         let subrequest_budget = Rc::new(SubrequestBudget::new(max_subrequests));
+        let node_process_env: NodeProcessEnvStore = Rc::new(RefCell::new(None));
         let invocations = InvocationCounter::default();
         let call_path: CallPath = Rc::new(RefCell::new(Vec::new()));
         let current_trace: CurrentTrace = Rc::new(RefCell::new(String::new()));
@@ -1471,7 +1497,7 @@ impl AppRuntime {
 
             // `allow_env` stays deny-by-default deliberately: nothing in this
             // runtime serves `Deno.env`, which is what that permission gates.
-            // An application's variables arrive through `op_get_env`, which is
+            // An application's variables arrive through `op_deis_get_env`, which is
             // this crate's own op and is scoped to the application by
             // construction.
             let allow_env = if permissions_config.allow_env.is_empty()
@@ -1537,6 +1563,7 @@ impl AppRuntime {
 
             let env_store: EnvStore = Rc::new(RefCell::new(env));
             state.put(env_store);
+            state.put(node_process_env.clone());
 
             // Empty until an invocation arms it. `terminate_execution` is what
             // enforces the timeout, and it does not reach a Rust operation that
@@ -1710,6 +1737,7 @@ impl AppRuntime {
             metrics,
             execution_deadline,
             subrequest_budget,
+            node_process_env,
             invocations,
             call_path,
             trace: current_trace,
@@ -1809,6 +1837,13 @@ impl AppRuntime {
     /// its caller's, and a cold start belongs to the request that paid for it.
     fn begin_invocation(&mut self, trace_id: String) {
         *self.trace.borrow_mut() = trace_id;
+        let deployment_env = {
+            let op_state = self.runtime.op_state();
+            let state = op_state.borrow();
+            let snapshot = state.borrow::<EnvStore>().borrow().clone();
+            snapshot
+        };
+        *self.node_process_env.borrow_mut() = Some(deployment_env);
         self.timers_swept = false;
         // A name for the stretch about to run, so that what `js/runtime.js`
         // states about the request being answered is readable only inside it.
@@ -1846,6 +1881,7 @@ impl AppRuntime {
         // that runs in it may read what this invocation said it was answering.
         // The step is what ends that statement; see [`Self::begin_invocation`].
         self.invocations.step();
+        self.node_process_env.borrow_mut().take();
         // Before anything else that can fail: a line written after this point
         // is the node speaking about the invocation, not the invocation
         // speaking, and stamping it with the id would put it in a trace it is
@@ -1904,8 +1940,9 @@ impl AppRuntime {
 
         const SOURCE: &str = r#"
             (() => {
-                if (typeof globalThis.__deis_runtime_sweep_invocation !== "function") return;
-                globalThis.__deis_runtime_sweep_invocation();
+                if (typeof globalThis.__deis_runtime_sweep_invocation === "function") {
+                    globalThis.__deis_runtime_sweep_invocation();
+                }
             })()
         "#;
 
@@ -3764,16 +3801,10 @@ impl AppRuntime {
         let code = format!(
             r#"
             (async () => {{
-                if (globalThis.__deis_runtime_ws_servers && globalThis.__deis_runtime_ws_servers["{}"] !== undefined) {{
-                    const ws = globalThis.__deis_runtime_ws_servers["{}"];
-                    if (ws && typeof ws._handleMessage === "function") {{
-                        ws._handleMessage({});
-                    }}
-                }}
+                await __deis_runtime_invoke_ws_message({}, {});
             }})()
             "#,
-            ws_id,
-            ws_id,
+            serde_json::to_string(&ws_id)?,
             serde_json::to_string(&message)?
         );
 
@@ -3846,20 +3877,12 @@ impl AppRuntime {
         let js_code = format!(
             r#"
             (async () => {{
-                if (globalThis.__deis_runtime_ws_servers && globalThis.__deis_runtime_ws_servers["{}"] !== undefined) {{
-                    const ws = globalThis.__deis_runtime_ws_servers["{}"];
-                    if (ws && typeof ws._handleClose === "function") {{
-                        ws._handleClose({}, {});
-                    }}
-                    delete globalThis.__deis_runtime_ws_servers["{}"];
-                }}
+                await __deis_runtime_invoke_ws_close({}, {}, {});
             }})()
             "#,
-            ws_id,
-            ws_id,
+            serde_json::to_string(&ws_id)?,
             code,
             serde_json::to_string(&reason)?,
-            ws_id
         );
 
         self.begin_invocation(new_trace_id());

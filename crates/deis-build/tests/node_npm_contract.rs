@@ -21,7 +21,7 @@ fn stage(project: &Path, vendor: &str, source: &str) {
               "runtime": "standard-v1",
               "language": "typescript",
               "functionRoot": "./functions",
-              "compatibilityDate": "2026-09-04",
+              "compatibilityDate": "2026-09-01",
               "vendors": {{ "{vendor}": {{ "enabled": true }} }},
               "build": {{ "outDir": "./dist" }}
             }}"#
@@ -102,12 +102,12 @@ async fn an_allowed_builtin_survives_only_as_the_same_standard_import() {
                     return new Response(createHash('sha256').update('edge-canon').digest('hex'));\n\
                   }\n";
 
-    for vendor in ["cloudflare", "deno", "tencent"] {
+    for vendor in VENDORS {
         let project = tempfile::tempdir().expect("temp project");
         stage(project.path(), vendor, source);
         let compiler = Compiler::with_options(CompilerOptions {
             project_dir: project.path().to_string_lossy().to_string(),
-            output_mode: OutputMode::Memory,
+            output_mode: OutputMode::Both,
             ..Default::default()
         });
         let result = compiler
@@ -142,6 +142,9 @@ async fn an_allowed_builtin_survives_only_as_the_same_standard_import() {
                 assert!(artifacts
                     .config_files
                     .contains_key("cloud-functions/api-node/config.json"));
+            }
+            "deislet" => {
+                assert_eq!(artifacts.entry_filename, "worker/index.js");
             }
             _ => unreachable!(),
         }
