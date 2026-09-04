@@ -1,0 +1,8 @@
+[Unit]
+Description=Deislet platform
+Documentation=https://github.com/deislet/deislet
+Requires=deis-telemetry.service deis-store.service deis-queue.service deis-control.service deis-runtime.service deis-proxy.service
+After=deis-telemetry.service deis-store.service deis-queue.service deis-control.service deis-runtime.service deis-proxy.service
+
+[Install]
+WantedBy=multi-user.target

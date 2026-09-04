@@ -442,6 +442,16 @@ Current evidence, compliance and support status comes only from the
 | coraza | A Rust port of the Coraza WAF engine, intended to run in front of deis-proxy. |
 | capkit | Capability-based multi-cloud abstraction, used for provisioning external resources. |
 
+## LAN canary
+
+The s90 canary is released from this tree. After a change that should go live:
+
+```bash
+./scripts/canary-release.sh release
+```
+
+That rebuilds the six services and `deis`, copies them to the host, restarts systemd, and leaves `/etc/deis` keys and `/var/lib/deis` data in place. First install, or to also push the example apps: `./scripts/canary-release.sh release --apps`. `./scripts/canary-release.sh --help` lists the rest.
+
 ## License
 
 Apache-2.0

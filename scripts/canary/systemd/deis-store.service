@@ -1,0 +1,30 @@
+[Unit]
+Description=Deislet store (KV, SQL, blob)
+Documentation=https://github.com/deislet/deislet
+After=network-online.target
+Wants=network-online.target
+PartOf=deislet.target
+
+[Service]
+Type=simple
+User=deis
+Group=deis
+WorkingDirectory=/var/lib/deis/store
+ExecStart=/usr/local/bin/deis-store -c /etc/deis/store.toml
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deis-store
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/deis/store /var/lib/deis/store-snapshots
+
+[Install]
+WantedBy=deislet.target

@@ -1,0 +1,33 @@
+[Unit]
+Description=Deislet runtime node
+Documentation=https://github.com/deislet/deislet
+After=network-online.target deis-control.service deis-telemetry.service
+Wants=network-online.target deis-control.service deis-telemetry.service
+PartOf=deislet.target
+
+[Service]
+Type=simple
+User=deis
+Group=deis
+WorkingDirectory=/var/lib/deis/runtime
+ExecStart=/usr/local/bin/deis-runtime -c /etc/deis/runtime.toml
+Restart=always
+RestartSec=3
+TimeoutStopSec=45
+KillSignal=SIGTERM
+LimitNOFILE=65536
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deis-runtime
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# JS sources for the isolate are loaded from the compile-time cargo/crate
+# paths (deno_core LoadedFromFsDuringSnapshot). Those currently live under
+# /home/l/.cargo and /ext/deislet on this host.
+ProtectHome=false
+ReadWritePaths=/var/lib/deis/runtime
+
+[Install]
+WantedBy=deislet.target

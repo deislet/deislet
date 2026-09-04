@@ -1,0 +1,30 @@
+[Unit]
+Description=Deislet control plane
+Documentation=https://github.com/deislet/deislet
+After=network-online.target deis-store.service deis-queue.service
+Wants=network-online.target deis-store.service deis-queue.service
+PartOf=deislet.target
+
+[Service]
+Type=simple
+User=deis
+Group=deis
+WorkingDirectory=/var/lib/deis/control
+ExecStart=/usr/local/bin/deis-control -c /etc/deis/control.toml --database /var/lib/deis/control/deis-control.db
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deis-control
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/deis/control
+
+[Install]
+WantedBy=deislet.target
