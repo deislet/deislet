@@ -27,6 +27,19 @@ removed from configuration. `/metrics` exposes the rejected record totals by
 signal and `retention_sweeps_skipped_fenced_total`, so this controlled pause
 is distinguishable from malformed producer data or a failed database.
 
+## Backup and restore
+
+`deis-telemetry snapshot --out DIR` writes a consistent `telemetry.sqlite`
+with `VACUUM INTO`, then records its SHA-256, byte size, logs/metrics/traces
+counts and source backend incarnation in `snapshot.json`. Do not copy the
+live WAL-mode database with `cp`.
+
+`deis-telemetry restore --from DIR` accepts only an absent or empty target
+(`--into DIR`, or the configured `data_dir`). It verifies SQLite integrity,
+digest and counts before and after copying. The migration fence journal is
+not part of a snapshot: a restored data directory receives a fresh backend
+incarnation, so old receipts and inventory evidence fail closed.
+
 ## What one caller can do to every other caller
 
 Two limits are absent on purpose, as product decisions that have not been

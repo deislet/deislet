@@ -5,9 +5,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
-use clap::Parser;
-use deis_telemetry::{config, server};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use deis_telemetry::{config, server, snapshot};
 
 #[derive(Parser)]
 #[command(name = "deis-telemetry", about = "Deislet log aggregation and metrics")]
@@ -15,6 +15,27 @@ struct Cli {
     /// Path to the TOML configuration file.
     #[arg(short, long, default_value = "deis-telemetry.toml")]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Serve telemetry. This is also the default with no subcommand.
+    Serve,
+    /// Write a consistent, verifiable telemetry snapshot into an empty directory.
+    Snapshot {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Restore a telemetry snapshot into an absent or empty data directory.
+    Restore {
+        #[arg(long)]
+        from: PathBuf,
+        /// Defaults to `data_dir` from the telemetry configuration.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -34,6 +55,65 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = config::Config::load(&cli.config)?;
-    let running = server::start(&config).await?;
-    running.wait_for_signal().await
+    match cli.command {
+        None | Some(Command::Serve) => {
+            let running = server::start(&config).await?;
+            running.wait_for_signal().await
+        }
+        Some(Command::Snapshot { out }) => {
+            let manifest = snapshot::take(&config.data_dir, &out).with_context(|| {
+                format!(
+                    "cannot snapshot telemetry {} into {}",
+                    config.data_dir.display(),
+                    out.display()
+                )
+            })?;
+            println!(
+                "telemetry snapshot written to {}\n  backend: {}\n  logs:    {}\n  metrics: {}\n  traces:  {}\n  restore: {}",
+                out.display(),
+                manifest.source_backend_incarnation_id,
+                manifest
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.logs),
+                manifest
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.metrics),
+                manifest
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.traces),
+                manifest.restore_with
+            );
+            Ok(())
+        }
+        Some(Command::Restore { from, into }) => {
+            let target = into.unwrap_or_else(|| config.data_dir.clone());
+            let report = snapshot::restore(&from, &target).with_context(|| {
+                format!(
+                    "cannot restore telemetry {} into {}",
+                    from.display(),
+                    target.display()
+                )
+            })?;
+            println!(
+                "telemetry restored from {} into {}\n  source backend:   {}\n  restored backend: {}\n  logs:              {}\n  metrics:           {}\n  traces:            {}",
+                from.display(),
+                target.display(),
+                report.source_backend_incarnation_id,
+                report.restored_backend_incarnation_id,
+                report.database.as_ref().map_or(0, |database| database.logs),
+                report
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.metrics),
+                report
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.traces)
+            );
+            Ok(())
+        }
+    }
 }

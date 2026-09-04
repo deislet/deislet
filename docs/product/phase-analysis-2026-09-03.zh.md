@@ -1320,3 +1320,11 @@ Application/framework source + versioned build plan
 - Control 新增 `telemetry_endpoint` 与脱敏的 `telemetry_migration_admin_token`，要求 store/queue/telemetry 三份管理凭证互不相同且不复用 storage、node 或 human API credential；协调、恢复、waiting evidence 复核和取消 release 现在覆盖第三个 backend。Telemetry component 已从 blocking finding 中移除，Stateful Objects 与 provider resources 仍保持 pending。
 - 本地完整验证已通过：`deis-backend-migration` 8 项单元测试、`deis-telemetry` 130 项单元测试与 20 项集成测试、`deis-control` 395 项单元测试及其 API/文档/diagram/fleet 集成测试全部成功；全工作区 `clippy --all-targets -D warnings`、build、产品治理、共享契约、registry 派生状态和文档路径门禁均成功。本条是本地证据，不冒充尚未完成的远端 CI。
 - 仍未完成且不得被本切片掩盖：当前 coordinator 取得 fence 后仍停在 `waiting`，此时应用 storage/queue 写会失败、目标 tenant 的 telemetry 会被明确拒绝并计数；在 quiesce/redirect、copy 与 cutover 闭环前不能把该管理 API 当成可长期停留的生产迁移流程。telemetry 尚无与 store/queue 对称的 verified snapshot/restore；live telemetry identity、认证与 OTLP resource model 仍是 legacy app/name 表达；Stateful Objects/provider inventory/fence、正式 Restore ProductOperation、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 继续阻断 `P0-MODEL-001`。
+
+## 22. P0-MODEL-001 Telemetry verified snapshot/restore
+
+- `deis-telemetry snapshot --out DIR` 现通过 SQLite `VACUUM INTO` 从 live 或 stopped WAL database 生成单文件一致视图，不能再把 `cp telemetry.sqlite` 当成备份。严格 manifest 记录格式版本、创建时间、源数据目录、源 backend incarnation，以及 `telemetry.sqlite` 的规范 SHA-256、字节数和 logs/metrics/traces 三类行数。
+- 行数遍历所有合法 `logs_YYYYMMDD` 与 `traces_YYYYMMDD` 分区并单独统计 metrics；伪装成分区却不是合法日期的表使快照失败，而不是被计数遗漏。文件摘要绑定整个 SQLite 内容，因此未知表或索引也不能在 manifest 验证后被静默改动。
+- `deis-telemetry restore --from DIR [--into DIR]` 只接受不存在或空目标；复制前复核源 SQLite `integrity_check`、摘要和三类 count，复制后对目标重复相同验证。缺失文件、追加字节、manifest 未知字段/格式、非法摘要、count 漂移或已占用目标均失败关闭。
+- `migration-fences.sqlite` 明确不进入快照。restore 在目标目录创建全新 fence journal 和 backend incarnation，并检查它不同于 manifest 的源 incarnation；旧 receipt、inventory 与 coordinator attempt 因而不能跨恢复继续有效。三个 embedded 数据后端至此都有同语义的本地可验证 snapshot/restore 原语。
+- 新增 4 项 snapshot 回归，覆盖 logs/metrics/traces 全量恢复、源/目标 identity 不同、围栏 journal 排除、恢复后正常查询、空目录、目标占用、文件篡改与畸形分区失败关闭；`deis-telemetry` 当前 134 项单元测试和 20 项集成测试通过。正式 Control Restore ProductOperation、服务停止/目录切换 topology driver、跨三个后端的一致恢复点与回滚仍未完成，本切片不把离线 CLI 冒充产品恢复闭环。

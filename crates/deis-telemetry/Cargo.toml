@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"
 uuid = { version = "1.12", features = ["v4"] }
+sha2 = "0.10"
 
 [build-dependencies]
 tonic-build = "0.12"

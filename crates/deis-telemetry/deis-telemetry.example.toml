@@ -48,13 +48,14 @@ metrics_listen = "127.0.0.1:8093"
 #   openssl rand -hex 32
 # migration_admin_token = "put an independent migration token here"
 
-# Directory holding telemetry.sqlite: the logs, the traces and the metric
-# series. It runs in WAL mode, so back it up with
-# `sqlite3 telemetry.sqlite ".backup out.db"` rather than `cp` - a copy of a
-# WAL-mode database can be missing the last commits, or simply corrupt, and
-# neither shows up until the day it is restored. Losing it loses history, not
-# the ability to serve; see crates/deis-control/DEPLOYMENT.md for what the
-# rest of the platform needs backed up.
+# Directory holding telemetry.sqlite: the logs, traces and metric series.
+# It runs in WAL mode, so never back it up with `cp`: a plain copy can omit
+# committed WAL pages. Use `deis-telemetry snapshot --out DIR`; restore with
+# `deis-telemetry restore --from DIR` while the destination service is
+# stopped. The verified snapshot excludes migration-fences.sqlite, and a
+# restore creates a fresh backend incarnation. Losing this directory loses
+# history, not the ability to serve; see crates/deis-control/DEPLOYMENT.md for
+# what the rest of the platform needs backed up.
 data_dir = "./data"
 
 # Days of logs to keep. Logs live in one table per UTC day and the sweeper

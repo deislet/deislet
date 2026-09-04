@@ -85,6 +85,7 @@
 //! - [`prom`]    exposition-format rendering
 //! - [`stats`]   this process's own counters
 //! - [`server`]  wiring: listeners, retention sweeper, shutdown
+//! - [`snapshot`] consistent, verified offline backup and restore
 
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
@@ -98,6 +99,7 @@ pub mod migration;
 pub mod prom;
 pub mod server;
 pub mod service;
+pub mod snapshot;
 pub mod stats;
 pub mod store;
 pub mod tail;
