@@ -24,7 +24,7 @@ STAGE="${STAGE:-${TMPDIR:-/tmp}/deislet-canary-${SSH_HOST}}"
 REMOTE_STAGE="${REMOTE_STAGE:-/var/tmp/deislet-canary}"
 REWRITE_CONFIG=0
 WITH_APPS=0
-BINS=(deis-control deis-runtime deis-proxy deis-store deis-queue deis-telemetry deis)
+BINS=(deis-control deis-runtime deis-proxy deis-store deis-queue deis-telemetry deis-backend-topology deis)
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -99,7 +99,7 @@ cmd_build() {
     cd "${ROOT}"
     cargo build --release --locked \
       -p deis-control -p deis-runtime -p deis-proxy \
-      -p deis-store -p deis-queue -p deis-telemetry -p deis
+      -p deis-store -p deis-queue -p deis-telemetry -p deis-backend-topology -p deis
   )
   local name
   for name in "${BINS[@]}"; do

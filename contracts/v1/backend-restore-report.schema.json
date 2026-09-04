@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/backend-restore-report.schema.json",
+  "title": "Verified backend restore execution report",
+  "$comment": "restoreSetSha256 is SHA-256 over the referenced restore set serialized with RFC 8785 JCS",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema", "schemaVersion", "operationId", "restoreSetId",
+    "restoreSetSha256", "state", "components"
+  ],
+  "properties": {
+    "$schema": {"const": "https://github.com/deislet/deislet/contracts/v1/backend-restore-report.schema.json"},
+    "schemaVersion": {"const": 1},
+    "operationId": {"$ref": "#/$defs/canonicalId"},
+    "restoreSetId": {"$ref": "#/$defs/canonicalId"},
+    "restoreSetSha256": {"$ref": "#/$defs/digest"},
+    "state": {"enum": ["succeeded", "rolled-back"]},
+    "components": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {"allOf": [{"$ref": "#/$defs/component"}, {"properties": {"backend": {"const": "deis-store"}}}]},
+        {"allOf": [{"$ref": "#/$defs/component"}, {"properties": {"backend": {"const": "deis-queue"}}}]},
+        {"allOf": [{"$ref": "#/$defs/component"}, {"properties": {"backend": {"const": "deis-telemetry"}}}]}
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": {"const": "sha256"},
+        "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend", "previousIncarnationId", "restoredIncarnationId"],
+      "properties": {
+        "backend": {"enum": ["deis-store", "deis-queue", "deis-telemetry"]},
+        "previousIncarnationId": {"$ref": "#/$defs/canonicalId"},
+        "restoredIncarnationId": {"$ref": "#/$defs/canonicalId"}
+      }
+    }
+  }
+}

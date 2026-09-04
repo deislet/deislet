@@ -1,0 +1,58 @@
+schema_version = 1
+driver_id = "deislet.topology.systemd"
+driver_version = "0.1.0-draft.1"
+# SHA-256 of the installed, reviewed driver distribution. Restore sets pin
+# this value, so replacing the executable cannot silently reinterpret a plan.
+distribution_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+state_dir = "/var/lib/deislet/topology"
+# Local restore artifacts are accepted only below one of these roots. Keep
+# them outside topology state and all live backend data directories.
+snapshot_roots = ["/var/lib/deislet/backups"]
+
+# These idempotent commands must close every application/runtime path that
+# can write store, queue or telemetry before any backend is stopped. The open
+# command runs only after all three services expose one verified topology.
+[writer_admission.close]
+executable = "/usr/bin/systemctl"
+args = ["stop", "deis-runtime.service", "deis-proxy.service"]
+timeout_seconds = 30
+[writer_admission.open]
+executable = "/usr/bin/systemctl"
+args = ["start", "deis-runtime.service", "deis-proxy.service"]
+timeout_seconds = 30
+
+[store]
+data_dir = "/var/lib/deislet/store"
+listen = "127.0.0.1:8090"
+[store.stop]
+executable = "/usr/bin/systemctl"
+args = ["stop", "deis-store.service"]
+timeout_seconds = 30
+[store.start]
+executable = "/usr/bin/systemctl"
+args = ["start", "deis-store.service"]
+timeout_seconds = 30
+
+[queue]
+data_dir = "/var/lib/deislet/queue"
+listen = "127.0.0.1:8091"
+[queue.stop]
+executable = "/usr/bin/systemctl"
+args = ["stop", "deis-queue.service"]
+timeout_seconds = 30
+[queue.start]
+executable = "/usr/bin/systemctl"
+args = ["start", "deis-queue.service"]
+timeout_seconds = 30
+
+[telemetry]
+data_dir = "/var/lib/deislet/telemetry"
+listen = "127.0.0.1:8092"
+[telemetry.stop]
+executable = "/usr/bin/systemctl"
+args = ["stop", "deis-telemetry.service"]
+timeout_seconds = 30
+[telemetry.start]
+executable = "/usr/bin/systemctl"
+args = ["start", "deis-telemetry.service"]
+timeout_seconds = 30

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sys
 from collections import defaultdict, deque
@@ -30,6 +31,8 @@ EXPECTED_DOCUMENTS = {
     "provider-driver",
     "identity-migration",
     "backend-migration-evidence",
+    "backend-restore-set",
+    "backend-restore-report",
 }
 EXPECTED_PROVIDER_OPERATIONS = [
     "preflight",
@@ -266,6 +269,39 @@ def validate_cross_document_invariants(registry: dict) -> None:
     require("fenceToken" not in backend_evidence.get("fence", {}), "backend evidence leaked a fence token")
     components = [entry["component"] for entry in backend_evidence.get("components", [])]
     require(len(components) == len(set(components)), "backend evidence repeats a component")
+    restore_set = load_json("contracts/v1/fixtures/valid/backend-restore-set.json")
+    restore_components = restore_set.get("components", [])
+    require(
+        [entry.get("backend") for entry in restore_components]
+        == ["deis-store", "deis-queue", "deis-telemetry"],
+        "backend restore set must contain store, queue and telemetry exactly once in canonical order",
+    )
+    require(
+        not any(entry.get("containsFenceJournal") for entry in restore_components),
+        "backend restore set must never copy a migration fence journal",
+    )
+    require(
+        restore_set["consistencyBarrier"].get("kind") == "full-platform-outage",
+        "backend restore set must carry a full-platform outage barrier",
+    )
+    restore_report = load_json("contracts/v1/fixtures/valid/backend-restore-report.json")
+    require(
+        [entry.get("backend") for entry in restore_report.get("components", [])]
+        == ["deis-store", "deis-queue", "deis-telemetry"],
+        "backend restore report must use canonical component order",
+    )
+    require(
+        restore_report.get("restoreSetId") == restore_set.get("restoreSetId"),
+        "backend restore report fixture must bind the restore set fixture",
+    )
+    restore_set_canonical = json.dumps(
+        restore_set, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    require(
+        restore_report.get("restoreSetSha256", {}).get("value")
+        == hashlib.sha256(restore_set_canonical).hexdigest(),
+        "backend restore report fixture must bind canonical restore set bytes",
+    )
     for environment in migration["environments"]:
         expected_key = (
             f"v1/{migration['canonicalApplicationId']}/"

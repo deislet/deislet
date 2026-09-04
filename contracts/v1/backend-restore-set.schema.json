@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/backend-restore-set.schema.json",
+  "title": "Coordinated backend restore set",
+  "$comment": "restoreSetSha256 is SHA-256 over this document serialized with RFC 8785 JCS",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema", "schemaVersion", "restoreSetId", "scope", "consistencyBarrier",
+    "topologyDriver", "components", "createdAt"
+  ],
+  "properties": {
+    "$schema": {"const": "https://github.com/deislet/deislet/contracts/v1/backend-restore-set.schema.json"},
+    "schemaVersion": {"const": 1},
+    "restoreSetId": {"$ref": "#/$defs/canonicalId"},
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "organizationId", "installationId"],
+      "properties": {
+        "kind": {"const": "installation"},
+        "organizationId": {"$ref": "#/$defs/canonicalId"},
+        "installationId": {"$ref": "#/$defs/canonicalId"}
+      }
+    },
+    "consistencyBarrier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "barrierId", "writerAdmissionClosedAt", "allServicesStoppedAt",
+        "snapshotCompletedAt"
+      ],
+      "properties": {
+        "kind": {"const": "full-platform-outage"},
+        "barrierId": {"$ref": "#/$defs/canonicalId"},
+        "writerAdmissionClosedAt": {"type": "string", "format": "date-time"},
+        "allServicesStoppedAt": {"type": "string", "format": "date-time"},
+        "snapshotCompletedAt": {"type": "string", "format": "date-time"}
+      }
+    },
+    "topologyDriver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "distributionDigest"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},
+        "distributionDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "components": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {"allOf": [{"$ref": "#/$defs/component"}, {"properties": {"backend": {"const": "deis-store"}}}]},
+        {"allOf": [{"$ref": "#/$defs/component"}, {"properties": {"backend": {"const": "deis-queue"}}}]},
+        {"allOf": [{"$ref": "#/$defs/component"}, {"properties": {"backend": {"const": "deis-telemetry"}}}]}
+      ],
+      "items": false
+    },
+    "createdAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": {"const": "sha256"},
+        "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend", "snapshotArtifactId", "snapshotUri", "snapshotManifestDigest",
+        "sourceBackendIncarnationId", "sizeBytes", "capturedAt", "containsFenceJournal"
+      ],
+      "properties": {
+        "backend": {"enum": ["deis-store", "deis-queue", "deis-telemetry"]},
+        "snapshotArtifactId": {"$ref": "#/$defs/canonicalId"},
+        "snapshotUri": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 2048,
+          "pattern": "^(?:file:///[^\\s?#]+|https://(?![^/]*@)[^\\s/?#]+/[^\\s?#]+)$"
+        },
+        "snapshotManifestDigest": {"$ref": "#/$defs/digest"},
+        "sourceBackendIncarnationId": {"$ref": "#/$defs/canonicalId"},
+        "sizeBytes": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "capturedAt": {"type": "string", "format": "date-time"},
+        "containsFenceJournal": {"const": false}
+      }
+    }
+  }
+}

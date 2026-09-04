@@ -24,7 +24,7 @@ QUEUE_PORT="${QUEUE_PORT:-8091}"
 TELEMETRY_PORT="${TELEMETRY_PORT:-8092}"
 TELEMETRY_METRICS_PORT="${TELEMETRY_METRICS_PORT:-8093}"
 
-BINS=(deis-control deis-runtime deis-proxy deis-store deis-queue deis-telemetry deis)
+BINS=(deis-control deis-runtime deis-proxy deis-store deis-queue deis-telemetry deis-backend-topology deis)
 
 usage() {
   cat <<'EOF'

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://github.com/deislet/deislet/contracts/v1/backend-restore-set.schema.json",
+  "schemaVersion": 1,
+  "restoreSetId": "01990f44-1000-7000-8000-000000000060",
+  "scope": {
+    "kind": "installation",
+    "organizationId": "01990f44-1000-7000-8000-000000000000",
+    "installationId": "01990f44-1000-7000-8000-000000000061"
+  },
+  "consistencyBarrier": {
+    "kind": "full-platform-outage",
+    "barrierId": "01990f44-1000-7000-8000-000000000062",
+    "writerAdmissionClosedAt": "2026-09-03T20:50:00Z",
+    "allServicesStoppedAt": "2026-09-03T20:50:10Z",
+    "snapshotCompletedAt": "2026-09-03T20:51:00Z"
+  },
+  "topologyDriver": {
+    "id": "deislet.topology.systemd",
+    "version": "0.1.0-draft.1",
+    "distributionDigest": {
+      "algorithm": "sha256",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "components": [
+    {
+      "backend": "deis-store",
+      "snapshotArtifactId": "01990f44-1000-7000-8000-000000000063",
+      "snapshotUri": "file:///var/lib/deislet/backups/set-60/store",
+      "snapshotManifestDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+      "sourceBackendIncarnationId": "01990f44-1000-7000-8000-000000000064",
+      "sizeBytes": 4096,
+      "capturedAt": "2026-09-03T20:50:30Z",
+      "containsFenceJournal": false
+    },
+    {
+      "backend": "deis-queue",
+      "snapshotArtifactId": "01990f44-1000-7000-8000-000000000065",
+      "snapshotUri": "file:///var/lib/deislet/backups/set-60/queue",
+      "snapshotManifestDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+      "sourceBackendIncarnationId": "01990f44-1000-7000-8000-000000000066",
+      "sizeBytes": 2048,
+      "capturedAt": "2026-09-03T20:50:40Z",
+      "containsFenceJournal": false
+    },
+    {
+      "backend": "deis-telemetry",
+      "snapshotArtifactId": "01990f44-1000-7000-8000-000000000067",
+      "snapshotUri": "file:///var/lib/deislet/backups/set-60/telemetry",
+      "snapshotManifestDigest": {"algorithm": "sha256", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+      "sourceBackendIncarnationId": "01990f44-1000-7000-8000-000000000068",
+      "sizeBytes": 8192,
+      "capturedAt": "2026-09-03T20:50:50Z",
+      "containsFenceJournal": false
+    }
+  ],
+  "createdAt": "2026-09-03T20:51:00Z"
+}

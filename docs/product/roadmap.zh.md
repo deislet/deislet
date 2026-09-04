@@ -19,7 +19,7 @@
 
 ## 当前已完成
 
-- `P0-DEC-001`：23 份决策和阶段事实基线已迁入仓库；ADR-022 局部取代 ADR-005 的套餐基线，要求所有参考供应商最低免费/入门档都达到同一标准保证；ADR-023 固定后端 inventory 与 writer fence 必须位于真实提交边界并使用独立管理认证域。
+- `P0-DEC-001`：24 份决策和阶段事实基线已迁入仓库；ADR-022 局部取代 ADR-005 的套餐基线，要求所有参考供应商最低免费/入门档都达到同一标准保证；ADR-023 固定后端 inventory 与 writer fence 必须位于真实提交边界并使用独立管理认证域；ADR-024 固定 embedded 三后端在同一停机屏障下 snapshot/restore、可对账 topology driver 与 Control 租约语义。
 - `P0-SPEC-001`：Edge Canon `edge-canon.next` proposal 与单一标准契约已建立。
 - `P0-CONF-001`：公开 registry、证据成熟度和认证不变量已建立。
 - `P0-ROAD-001`：路线、标准锁定、跨文件校验和 CI 门禁已建立。
@@ -29,12 +29,12 @@
 ## 当前进行中
 
 - `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 现有 23 条候选条款和 14 个 provider-independent 草案用例。官方资料已支持 10 ms HTTP CPU、50 次外部子请求与 6 个同时等待响应头外连的 Draft 共同下限；响应大小、wall time、内存归属、`waitUntil` 宽限和超限错误仍阻断冻结。统一 fixture、observation schema 与独立 oracle 已执行化 T001–T005 并有 6 项正反自测，但三个真实 provider adapter 及 T006–T014 尚未完成；其余 14 个能力族尚未开始，故本项继续保持 `active`。
-- `P0-MODEL-001`：七份 Draft schema 与 14 个正反 fixture 已覆盖 canonical identity/artifact/binding/operation/driver、identity migration 和 backend fence evidence。除 canonical ID、tenant transport、catalog inventory/fence 与物理 namespace 外，现已实现共享 `BackendMigration` gRPC、独立且默认关闭的管理认证、持久单调 per-tenant writer fence，以及 KV/SQL/blob/queue/telemetry 的确定性 inventory。Telemetry 把三种 signal 的旧 app/environment 表达统一映射到 tenant，混合应用批次只拒绝被 fence 的 tenant，全局 retention 在任一 tenant 被 fence 时整轮跳过；Control 现以第三份独立管理凭证共同协调并持久化其 evidence。每份后端数据具有持久不可变的 incarnation UUIDv7；Control 在 attempt、acquire/receipt/evidence、已捕获状态复核和 cancel/release 全链路绑定该 ID，同一 endpoint 下 restore/替换也会失败关闭。deis-store、deis-queue 与 deis-telemetry 均有一致、digest/integrity/count 验证的 snapshot/restore，记录源 ID但不复制 fence journal，restore 立即生成并报告新 ID。迁移已返回包含 organization/actor/幂等摘要/request/correlation/child/provider 字段的正式公共 Operation，以唯一状态图、`ETag`/`If-Match` 和可恢复 backend fence release 完成取消；终态历史保留且每个 application 最多一个非终态迁移。当前操作只进入 `waiting`：Stateful Objects/provider、正式 restore Operation、live parser、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 仍未完成，故本项继续保持 `active`。
+- `P0-MODEL-001`：九份 Draft schema 与 20 组正反 fixture 已覆盖 canonical identity/artifact/binding/operation/driver、identity migration、backend fence evidence、三后端 restore set 和 execution report。共享 `BackendMigration`、独立管理认证、持久 per-tenant writer fence，以及 KV/SQL/blob/queue/telemetry inventory 已落地；backend incarnation 贯穿 discovery、attempt、receipt/evidence、重试和 release。三后端 verified snapshot 现由正式 Restore ProductOperation 与 `deis-backend-topology` 协调：同一 outage barrier 生成 restore set，本地 artifact 受 `snapshot_roots` 约束，staging 绑定 tree digest，目录路径从可信 config 重建，rename 先同步父目录再推进 journal；随后关闭 writer admission、停止/复核、切换、启动/验证，失败则在证明服务不可达后完整 rollback。status 持全局锁且只报告物理复验的共享终态 report。Control 以持久 owner lease/心跳支持多实例接管，并在三端 live incarnation 复核后原子推进 installation/plan/Operation；`waiting` 的未知物理状态不得直接取消。迁移 Operation 的幂等、并发取消与历史同样保留。snapshot-set 崩溃自动复原、Stateful Objects/provider、其他 Operation producer、live parser、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 仍未完成，故本项继续保持 `active`。
 
 ## 紧接着执行
 
 1. `P0-SPEC-002`：先补齐 `web-fetch-events` 的其余最低资源保证与依赖类型，把 T006–T014 接入同一 oracle，并实现 Deislet/Cloudflare/EdgeOne 三个固定版本 adapter；再按其闭环逐项完成其余 14 个 mandatory 能力族。任何 `pending` 都是发布阻断项。
-2. `P0-MODEL-001`：下一步把三个内置数据后端已可验证、可识别新 incarnation 的 restore 纳入正式 ProductOperation 与互斥协调；同时为 Stateful Objects、provider resources 补同语义接口，并让 build/deploy/lifecycle producer 复用同一 Operation。只有所有必需 component 的 orphan/unchecked 都为零后，才进入 canonical-first dual-read、copy/verify/cutover、旧 token 撤销与 rollback。后端物理 key 仍不能冒充标准逻辑身份或 capability subject。
+2. `P0-MODEL-001`：下一步为 Stateful Objects、provider resources 补同语义 inventory/fence/backup/restore，并让 build/deploy/lifecycle producer 复用同一 Operation；随后进入 canonical-first dual-read、copy/verify/cutover、旧 token 撤销与 tombstone。并行补齐 topology canary 配置、隔离恢复演练、snapshot 加密/异地复制/retention 与 RPO/RTO policy。后端物理 key 仍不能冒充标准逻辑身份或 capability subject。
 
 ## 执行规则
 

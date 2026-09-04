@@ -92,6 +92,15 @@ impl OperationRequestContext {
         );
         self
     }
+
+    /// Bind a canonical body fact without retaining the request body itself.
+    /// Lifecycle producers use this before [`Self::for_target`] so an
+    /// idempotency key cannot replay a different immutable manifest.
+    pub(super) fn for_request_fact(mut self, label: &str, value: &str) -> Self {
+        self.request_fingerprint_sha256 =
+            sha256_hex(format!("{}\n{label}:{value}", self.request_fingerprint_sha256).as_bytes());
+        self
+    }
 }
 
 impl CatalogStore {
@@ -222,6 +231,14 @@ pub(super) fn find_migration_operation_request_tx(
     connection: &Connection,
     context: &OperationRequestContext,
 ) -> CatalogResult<Option<CanonicalId>> {
+    find_operation_request_tx(connection, OperationKind::Migrate, context)
+}
+
+pub(super) fn find_operation_request_tx(
+    connection: &Connection,
+    kind: OperationKind,
+    context: &OperationRequestContext,
+) -> CatalogResult<Option<CanonicalId>> {
     let organization_id = default_organization_id(connection)?;
     let actor_id = connection
         .query_row(
@@ -237,11 +254,12 @@ pub(super) fn find_migration_operation_request_tx(
         .query_row(
             "SELECT operation_id, request_fingerprint_sha256
                FROM product_operations
-              WHERE organization_id = ?1 AND actor_id = ?2 AND kind = 'migrate'
-                AND idempotency_key_sha256 = ?3",
+              WHERE organization_id = ?1 AND actor_id = ?2 AND kind = ?3
+                AND idempotency_key_sha256 = ?4",
             params![
                 organization_id.to_string(),
                 actor_id,
+                kind.as_str(),
                 context.idempotency_key_sha256
             ],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -347,7 +365,7 @@ pub(super) fn transition_operation_tx(
     Ok(())
 }
 
-fn default_organization_id(connection: &Connection) -> CatalogResult<CanonicalId> {
+pub(super) fn default_organization_id(connection: &Connection) -> CatalogResult<CanonicalId> {
     let text: String = connection.query_row(
         "SELECT organization_id FROM product_organizations WHERE slug = 'default'",
         [],
@@ -360,7 +378,11 @@ fn default_organization_id(connection: &Connection) -> CatalogResult<CanonicalId
     })
 }
 
-fn actor_id(connection: &Connection, subject: &str, created_at: i64) -> CatalogResult<CanonicalId> {
+pub(super) fn actor_id(
+    connection: &Connection,
+    subject: &str,
+    created_at: i64,
+) -> CatalogResult<CanonicalId> {
     if let Some(text) = connection
         .query_row(
             "SELECT actor_id FROM operation_actors WHERE subject = ?1",
@@ -393,6 +415,13 @@ fn load_operation(
         )
         .optional()
         .map_err(Into::into)
+}
+
+pub(super) fn load_operation_tx(
+    connection: &Connection,
+    operation_id: CanonicalId,
+) -> CatalogResult<Option<ProductOperation>> {
+    load_operation(connection, operation_id)
 }
 
 fn map_operation(row: &Row<'_>) -> rusqlite::Result<ProductOperation> {

@@ -381,6 +381,30 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         )
         .changes_state(),
 
+        // A backend restore replaces the physical data incarnation for every
+        // application on this installation. Its scope can therefore never be
+        // narrowed to an application or environment credential.
+        ["api", "installation"] => Requirement::new(
+            "installation.get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "backend-restores"] => Requirement::new(
+            "backend_restore.start",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state(),
+        ["api", "backend-restores", restore_id] => Requirement::new(
+            "backend_restore.get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(restore_id),
+
         // Operation IDs are globally unique, but the path alone does not
         // reveal their application/environment scope to this pure route
         // classifier. Until authorization can load that scope before the

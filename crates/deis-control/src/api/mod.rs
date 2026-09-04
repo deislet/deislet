@@ -15,6 +15,7 @@ pub mod middleware;
 pub mod migrations;
 pub mod nodes;
 pub mod registration;
+pub mod restores;
 pub mod static_files;
 
 use axum::{
@@ -126,6 +127,8 @@ pub fn build_api_router(
     let migration_state =
         migrations::MigrationApiState::new(Arc::clone(&catalog_state.store), &config);
     migration_state.resume_on_start();
+    let restore_state = restores::RestoreApiState::new(Arc::clone(&catalog_state.store), &config);
+    restore_state.resume_on_start();
 
     let auth_config = middleware::AuthConfig::from_control_config(&config);
 
@@ -241,6 +244,7 @@ pub fn build_api_router(
         // finished router rather than threaded through the chain above.
         .merge(catalog::router(catalog_state.clone()))
         .merge(migrations::router(migration_state))
+        .merge(restores::router(restore_state))
         .layer(axum_middleware::from_fn_with_state(
             authz_state.clone(),
             authz::authorize,

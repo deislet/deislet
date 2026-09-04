@@ -28,6 +28,8 @@
 //!   cheap as a deploy.
 
 pub mod backend_migration;
+pub mod backend_restore;
+pub mod backend_restore_driver;
 pub mod bundle;
 pub mod compatibility;
 pub mod domains;
@@ -137,3 +139,5 @@ impl CatalogError {
 }
 
 pub type CatalogResult<T> = Result<T, CatalogError>;
+pub use backend_restore::{BackendRestorePlan, BackendRestoreState, ProductInstallation};
+pub use backend_restore_driver::{BackendRestoreCoordinator, BackendRestoreCoordinatorError};

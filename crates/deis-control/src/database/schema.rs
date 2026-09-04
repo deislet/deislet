@@ -1279,6 +1279,37 @@ fn ensure_product_operation_schema(conn: &Connection) -> Result<()> {
               AND replace(actor_id, '-', '') NOT GLOB '*[^0-9a-f]*')
         );
 
+        CREATE TABLE IF NOT EXISTS product_installations (
+            singleton       INTEGER PRIMARY KEY CHECK(singleton = 1),
+            installation_id TEXT NOT NULL UNIQUE,
+            organization_id TEXT NOT NULL REFERENCES product_organizations(organization_id),
+            revision        INTEGER NOT NULL CHECK(revision >= 1),
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            CHECK(length(installation_id) = 36
+              AND lower(installation_id) = installation_id
+              AND substr(installation_id, 9, 1) = '-'
+              AND substr(installation_id, 14, 1) = '-'
+              AND substr(installation_id, 15, 1) = '7'
+              AND substr(installation_id, 19, 1) = '-'
+              AND substr(installation_id, 20, 1) GLOB '[89ab]'
+              AND substr(installation_id, 24, 1) = '-'
+              AND length(replace(installation_id, '-', '')) = 32
+              AND replace(installation_id, '-', '') NOT GLOB '*[^0-9a-f]*')
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_product_installation_fenced_update_v1
+        BEFORE UPDATE ON product_installations
+        WHEN NEW.singleton != OLD.singleton
+          OR NEW.installation_id != OLD.installation_id
+          OR NEW.organization_id != OLD.organization_id
+          OR NEW.created_at != OLD.created_at
+          OR NEW.revision != OLD.revision + 1
+          OR NEW.updated_at < OLD.updated_at
+        BEGIN
+            SELECT RAISE(ABORT, 'product installation updates must preserve identity and advance one revision');
+        END;
+
         CREATE TABLE IF NOT EXISTS product_operations (
             operation_id             TEXT PRIMARY KEY,
             kind                     TEXT NOT NULL
@@ -1425,6 +1456,93 @@ fn ensure_product_operation_schema(conn: &Connection) -> Result<()> {
         BEGIN
             SELECT RAISE(ABORT, 'product operation identity and request are immutable');
         END;
+
+        CREATE TABLE IF NOT EXISTS backend_restore_plans (
+            restore_id                    TEXT PRIMARY KEY,
+            operation_id                  TEXT NOT NULL UNIQUE
+                                          REFERENCES product_operations(operation_id),
+            restore_set_id                TEXT NOT NULL,
+            installation_id               TEXT NOT NULL
+                                          REFERENCES product_installations(installation_id),
+            expected_installation_revision INTEGER NOT NULL CHECK(expected_installation_revision >= 1),
+            restore_set_sha256             TEXT NOT NULL,
+            restore_set_json               TEXT NOT NULL CHECK(json_valid(restore_set_json)),
+            state                          TEXT NOT NULL
+                                           CHECK(state IN ('planned', 'staging', 'waiting',
+                                                           'switching', 'verifying', 'succeeded',
+                                                           'failed', 'cancelled')),
+            attempt_count                  INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+            coordinator_id                 TEXT,
+            lease_expires_at               INTEGER CHECK(lease_expires_at IS NULL OR
+                                                          lease_expires_at >= 0),
+            execution_report_json          TEXT CHECK(execution_report_json IS NULL OR
+                                                       json_valid(execution_report_json)),
+            last_error                     TEXT CHECK(last_error IS NULL OR
+                                                     length(last_error) BETWEEN 1 AND 2048),
+            created_at                     INTEGER NOT NULL,
+            updated_at                     INTEGER NOT NULL,
+            CHECK(length(restore_id) = 36
+              AND lower(restore_id) = restore_id
+              AND substr(restore_id, 9, 1) = '-'
+              AND substr(restore_id, 14, 1) = '-'
+              AND substr(restore_id, 15, 1) = '7'
+              AND substr(restore_id, 19, 1) = '-'
+              AND substr(restore_id, 20, 1) GLOB '[89ab]'
+              AND substr(restore_id, 24, 1) = '-'
+              AND length(replace(restore_id, '-', '')) = 32
+              AND replace(restore_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(restore_set_id) = 36
+              AND lower(restore_set_id) = restore_set_id
+              AND substr(restore_set_id, 9, 1) = '-'
+              AND substr(restore_set_id, 14, 1) = '-'
+              AND substr(restore_set_id, 15, 1) = '7'
+              AND substr(restore_set_id, 19, 1) = '-'
+              AND substr(restore_set_id, 20, 1) GLOB '[89ab]'
+              AND substr(restore_set_id, 24, 1) = '-'
+              AND length(replace(restore_set_id, '-', '')) = 32
+              AND replace(restore_set_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(restore_set_sha256) = 64
+              AND lower(restore_set_sha256) = restore_set_sha256
+              AND restore_set_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK((coordinator_id IS NULL AND lease_expires_at IS NULL)
+               OR (coordinator_id IS NOT NULL AND lease_expires_at IS NOT NULL)),
+            CHECK(coordinator_id IS NULL OR
+                 (length(coordinator_id) = 36
+                  AND lower(coordinator_id) = coordinator_id
+                  AND substr(coordinator_id, 9, 1) = '-'
+                  AND substr(coordinator_id, 14, 1) = '-'
+                  AND substr(coordinator_id, 15, 1) = '7'
+                  AND substr(coordinator_id, 19, 1) = '-'
+                  AND substr(coordinator_id, 20, 1) GLOB '[89ab]'
+                  AND substr(coordinator_id, 24, 1) = '-'
+                  AND length(replace(coordinator_id, '-', '')) = 32
+                  AND replace(coordinator_id, '-', '') NOT GLOB '*[^0-9a-f]*')),
+            CHECK((state IN ('staging', 'switching', 'verifying')
+                   AND coordinator_id IS NOT NULL)
+               OR (state NOT IN ('staging', 'switching', 'verifying')
+                   AND coordinator_id IS NULL))
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_backend_restore_one_active
+            ON backend_restore_plans(installation_id)
+            WHERE state NOT IN ('succeeded', 'failed', 'cancelled');
+
+        CREATE TRIGGER IF NOT EXISTS trg_backend_restore_identity_immutable_v1
+        BEFORE UPDATE OF restore_id, operation_id, restore_set_id, installation_id,
+                         expected_installation_revision, restore_set_sha256,
+                         restore_set_json, created_at
+        ON backend_restore_plans
+        WHEN NEW.restore_id != OLD.restore_id
+          OR NEW.operation_id != OLD.operation_id
+          OR NEW.restore_set_id != OLD.restore_set_id
+          OR NEW.installation_id != OLD.installation_id
+          OR NEW.expected_installation_revision != OLD.expected_installation_revision
+          OR NEW.restore_set_sha256 != OLD.restore_set_sha256
+          OR NEW.restore_set_json != OLD.restore_set_json
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'backend restore input is immutable');
+        END;
         "#,
     )?;
 
@@ -1451,6 +1569,20 @@ fn ensure_product_operation_schema(conn: &Connection) -> Result<()> {
         "SELECT organization_id FROM product_organizations WHERE slug = 'default'",
         [],
         |row| row.get(0),
+    )?;
+    let installation_candidate = conn
+        .query_row(
+            "SELECT installation_id FROM product_installations WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| CanonicalId::new_v7().to_string());
+    conn.execute(
+        "INSERT OR IGNORE INTO product_installations
+             (singleton, installation_id, organization_id, revision, created_at, updated_at)
+         VALUES (1, ?1, ?2, 1, ?3, ?3)",
+        rusqlite::params![installation_candidate, organization_id, now],
     )?;
 
     const LEGACY_ACTOR_SUBJECT: &str = "system:legacy-operation-adoption";

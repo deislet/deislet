@@ -291,7 +291,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
       - name: Control plane and service tests
-        run: cargo test -p deis-wire -p deis-backend-migration -p deis-control -p deis-store -p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests --no-fail-fast
+        run: cargo test -p deis-wire -p deis-backend-migration -p deis-backend-topology -p deis-control -p deis-store -p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests --no-fail-fast
 
   demo:
     name: the demo runs end to end

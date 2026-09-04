@@ -21,7 +21,7 @@
       "status": "active",
       "dependsOn": [],
       "exitCriteria": [
-        "23 份 Accepted ADR 在仓库内可追溯且无临时路径",
+        "24 份 Accepted ADR 在仓库内可追溯且无临时路径",
         "Edge Canon proposal、机器契约、schema 与 registry 经 CI 校验",
         "目标版本所有能力族的 API、错误、一致性、生命周期、保证、fixture 与 oracle 均达到 normative-complete",
         "compiler 只依据标准版本验证，不读取 provider capability profile",
@@ -31,7 +31,7 @@
       "workItems": [
         {
           "id": "P0-DEC-001",
-          "title": "迁移阶段分析并建立 23 份正式 ADR",
+          "title": "迁移阶段分析并建立 24 份正式 ADR",
           "owner": "deislet",
           "status": "done",
           "dependsOn": [],
@@ -144,9 +144,19 @@
             {"type": "local-path", "value": "crates/deis-control/src/catalog/backend_migration.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/catalog/operation.rs"},
             {"type": "local-path", "value": "crates/deis-wire/src/operation.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/migrations.rs"}
+            {"type": "local-path", "value": "crates/deis-control/src/api/migrations.rs"},
+            {"type": "local-path", "value": "contracts/v1/backend-restore-set.schema.json"},
+            {"type": "local-path", "value": "contracts/v1/backend-restore-report.schema.json"},
+            {"type": "local-path", "value": "crates/deis-wire/src/backend_restore.rs"},
+            {"type": "local-path", "value": "crates/deis-backend-topology/src/lib.rs"},
+            {"type": "local-path", "value": "crates/deis-backend-topology/src/main.rs"},
+            {"type": "local-path", "value": "config/deis-backend-topology.example.toml"},
+            {"type": "local-path", "value": "crates/deis-control/src/catalog/backend_restore.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/catalog/backend_restore_driver.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/api/restores.rs"},
+            {"type": "local-path", "value": "docs/adr/024-coordinated-embedded-backend-restore.md"}
           ],
-          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-backend-migration -p deis-wire -p deis-store -p deis-queue -p deis-telemetry -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment、节点持久化、catalog migration plan/revision fence、Deislet 物理 canonical namespace、独立默认关闭的 backend migration 管理认证、持久单调 per-tenant writer fence、在途 SQL transaction drain、KV/SQL/blob/queue/telemetry inventory，以及 Control 使用三个独立 per-backend 管理凭证的异步协调、网络调用前后 attempt journal、部分获取失败恢复、严格 evidence 验证、客户端断开后继续、启动恢复和脱敏 GET；telemetry 的 logs/metrics/traces 环境归属、混合租户批次与全局 retention 均经过同一 fence；backend incarnation UUIDv7 已贯穿 discovery、attempt、fence receipt/evidence、重试和 release，store/queue/telemetry snapshot/restore 都验证 digest/integrity/count、证明源/目标身份不同且同址替换失败关闭；identity migration 已返回 operation.schema.json 全字段与唯一状态图的公共 Operation，覆盖幂等摘要、request/correlation、乐观并发、可恢复取消与旧记录接管。live request parser 仍故意拒绝 logical/physical canonical key，完成前仍须验证正式 restore Operation、stateful/provider inventory/fence、其余 producer 复用 Operation、canonical-first 双读、copy/cutover、rollback/failure、旧 capability 撤销与 tombstone"
+          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-backend-migration -p deis-backend-topology -p deis-wire -p deis-store -p deis-queue -p deis-telemetry -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、catalog migration/restore plan 与 revision fence、Deislet 物理 canonical namespace、独立 backend 管理认证、持久 per-tenant writer fence、KV/SQL/blob/queue/telemetry inventory、三后端协调 evidence、backend incarnation discovery/receipt/retry/release，以及 operation.schema.json 全字段、唯一状态图、幂等、并发取消和旧记录接管。store/queue/telemetry verified snapshot 现由正式 Restore ProductOperation 与 topology driver 在同一 outage barrier 下生成/恢复；覆盖 writer admission、全局锁、受 snapshot_roots 约束的本地 artifact、staged tree digest、journal path 重新推导、持久目录 rename、switch/rollback 四个 crash window、status 对账、Control owner lease/接管和三端 live incarnation 原子完成。live request parser 仍故意拒绝 logical/physical canonical key；完成前仍须验证 stateful/provider inventory/fence/restore、其余 producer 复用 Operation、canonical-first 双读、copy/verify/cutover、旧 capability 撤销与 tombstone，并补齐 snapshot-set 崩溃恢复、真实恢复演练、artifact 加密/异地复制/retention 与 RPO/RTO policy"
         },
         {
           "id": "P0-CI-001",

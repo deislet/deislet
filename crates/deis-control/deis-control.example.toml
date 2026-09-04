@@ -311,6 +311,15 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # queue_migration_admin_token = "put the deis-queue migration token here"
 # telemetry_migration_admin_token = "put the deis-telemetry migration token here"
 
+# Coordinated platform restore remains unavailable unless both absolute paths
+# are configured. Control starts the fixed executable directly, sends the
+# immutable restore set on stdin, and waits at most this many seconds. The
+# driver's own example config names systemd units, data directories and its
+# durable journal directory.
+# backend_restore_driver_executable = "/usr/local/bin/deis-backend-topology"
+# backend_restore_driver_config = "/etc/deislet/deis-backend-topology.toml"
+# backend_restore_driver_timeout_secs = 900
+
 # Seconds between cron scheduler ticks (1..=60). A tick rebuilds the task
 # list from the catalog and fires whatever came due, so the default means a
 # newly deployed schedule is noticed within a minute and fires within a

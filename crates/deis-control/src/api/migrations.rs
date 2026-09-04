@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     routing::get,
 };
-use deis_wire::{CanonicalId, ProductOperation};
+use deis_wire::{CanonicalId, OperationKind, ProductOperation};
 use serde::Serialize;
 use tracing::{error, info, warn};
 
@@ -391,21 +391,45 @@ pub async fn cancel_operation(
     Path(operation_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
-    let coordinator = state.ready()?;
     let operation_id = operation_id.parse().map_err(|error| {
         ApiError::BadRequest(format!("operation ID must be a canonical UUIDv7: {error}"))
     })?;
     let expected_revision = required_if_match(&headers)?;
-    let plan = state
-        .store
-        .request_identity_migration_cancellation(operation_id, expected_revision)
-        .await?;
-    let operation = state
+    let current = state
         .store
         .product_operation(operation_id)
         .await?
-        .ok_or_else(|| ApiError::InternalError(format!("operation {operation_id} is missing")))?;
-    state.launch_abort(coordinator, plan.migration_id);
+        .ok_or_else(|| ApiError::NotFound(format!("operation {operation_id} not found")))?;
+    let operation = match current.kind {
+        OperationKind::Migrate => {
+            let coordinator = state.ready()?;
+            let plan = state
+                .store
+                .request_identity_migration_cancellation(operation_id, expected_revision)
+                .await?;
+            let operation = state
+                .store
+                .product_operation(operation_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::InternalError(format!("operation {operation_id} is missing"))
+                })?;
+            state.launch_abort(coordinator, plan.migration_id);
+            operation
+        }
+        OperationKind::Restore => {
+            state
+                .store
+                .cancel_planned_backend_restore(operation_id, expected_revision)
+                .await?
+        }
+        kind => {
+            return Err(ApiError::Conflict(format!(
+                "{} operation {operation_id} has no cancellation controller",
+                kind.as_str()
+            )));
+        }
+    };
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         header::LOCATION,

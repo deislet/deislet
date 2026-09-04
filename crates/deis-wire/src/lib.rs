@@ -5,6 +5,7 @@
 //! the platform must spell identically - including the storage services, which
 //! depend on this crate for that module alone.
 
+pub mod backend_restore;
 pub mod canonical_id;
 pub mod canonical_tenant;
 pub mod client;
@@ -21,6 +22,13 @@ pub mod pb {
 }
 
 // Re-export core types
+pub use backend_restore::{
+    BACKEND_RESTORE_REPORT_SCHEMA_V1, BACKEND_RESTORE_SET_SCHEMA_V1, BackendRestoreExecutionReport,
+    BackendRestoreExecutionState, BackendRestoreSet, BackendRestoreSetError,
+    BackendRestoredComponent, RestoreBackend, RestoreBarrierKind, RestoreComponent,
+    RestoreConsistencyBarrier, RestoreDigest, RestoreScope, RestoreScopeKind,
+    RestoreTopologyDriver,
+};
 pub use canonical_id::{CanonicalId, CanonicalIdError};
 pub use canonical_tenant::{CANONICAL_TENANT_VERSION, CanonicalTenantId, CanonicalTenantIdError};
 pub use client::WireClient;

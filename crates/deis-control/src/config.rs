@@ -185,6 +185,19 @@ pub struct ControlConfig {
     /// credential configured here.
     #[serde(default)]
     pub telemetry_migration_admin_token: Option<String>,
+    /// Absolute path of the reviewed embedded-backend topology driver. When
+    /// paired with `backend_restore_driver_config`, Control may execute or
+    /// resume a durable Restore Operation. Arguments are fixed by Control;
+    /// restore input travels over stdin and no shell is involved.
+    #[serde(default)]
+    pub backend_restore_driver_executable: Option<PathBuf>,
+    /// Absolute path of the topology driver's own service/data-dir config.
+    #[serde(default)]
+    pub backend_restore_driver_config: Option<PathBuf>,
+    /// Hard ceiling for one driver invocation. Timeout leaves the operation
+    /// waiting for reconciliation rather than guessing whether data moved.
+    #[serde(default = "default_backend_restore_driver_timeout_secs")]
+    pub backend_restore_driver_timeout_secs: u64,
     /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).
     ///
     /// A tick does two things: it rebuilds the task list from the catalog,
@@ -228,6 +241,10 @@ fn default_deis_runtime_poll_interval() -> u64 {
 
 fn default_bundle_dir() -> PathBuf {
     PathBuf::from("data/bundles")
+}
+
+fn default_backend_restore_driver_timeout_secs() -> u64 {
+    900
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +291,9 @@ impl Default for ControlConfig {
             store_migration_admin_token: None,
             queue_migration_admin_token: None,
             telemetry_migration_admin_token: None,
+            backend_restore_driver_executable: None,
+            backend_restore_driver_config: None,
+            backend_restore_driver_timeout_secs: default_backend_restore_driver_timeout_secs(),
             cron_tick_seconds: default_cron_tick_seconds(),
             node_registration_ttl_secs: default_node_registration_ttl(),
         }
@@ -334,6 +354,18 @@ impl std::fmt::Debug for ControlConfig {
                     .telemetry_migration_admin_token
                     .as_ref()
                     .map(|_| "<redacted>"),
+            )
+            .field(
+                "backend_restore_driver_executable",
+                &self.backend_restore_driver_executable,
+            )
+            .field(
+                "backend_restore_driver_config",
+                &self.backend_restore_driver_config,
+            )
+            .field(
+                "backend_restore_driver_timeout_secs",
+                &self.backend_restore_driver_timeout_secs,
             )
             .field("cron_tick_seconds", &self.cron_tick_seconds)
             .field(

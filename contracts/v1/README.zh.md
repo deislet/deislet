@@ -39,9 +39,11 @@ identity 迁移已完成八个可执行切片。第一段让 `application`、`en
 
 第八段为每份物理 store/queue/telemetry 数据建立持久、不可变的 backend incarnation UUIDv7。统一管理协议新增 `GetBackendInfo`，acquire/release 必须携带 expected incarnation，receipt v2 把它纳入 SHA-256；因此 endpoint 不变但数据目录被 restore 或替换时也不能重放旧 fence。Control 在任何远端变更前持久绑定首次发现的 ID，并在恢复、已捕获 evidence 复核和取消 release 时逐次失败关闭。旧 journal 可保留活动 v1 receipt 原位升级。deis-store、deis-queue 与 deis-telemetry snapshot manifest 都记录源 ID但不复制 fence journal，restore 会验证 digest/integrity/count、立即生成并打印新 ID；测试证明源/目标不同且目标重启保持不变。
 
-这些切片仍不代表八阶段迁移完成。当前迁移已经是满足 `operation.schema.json` 全字段与通用状态图的正式公共 Operation，但还不是所有 build/deploy/lifecycle 工作的通用 producer；其 child/provider operation 只有在真实下游操作存在时才允许填充。Stateful Objects 与 provider resources 仍无 inventory/fence；三个 embedded backend 的 snapshot/restore 仍是本地 operator command，尚未成为统一、受权限和审计约束的 ProductOperation。实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+第九段把三份 snapshot 原语组合成一个 installation 级恢复点与正式 Restore ProductOperation。`deis-backend-topology snapshot-set` 在关闭 writer admission、停止三个 backend 的同一 outage barrier 下取样；restore 先完整 staging，再 journaled switch，失败时恢复全部 prior incarnation。Control 以持久租约协调多实例、从 driver status 对账未知退出，并在三个 live management endpoint 证明新 incarnation 后原子推进 installation revision、plan 与 Operation。restore set 使用 RFC 8785 JSON Canonicalization Scheme 生成跨语言一致字节，再计算 `restoreSetSha256`；数值字段限于 I-JSON 安全整数范围。execution report、幂等请求和 topology driver digest 都被持久绑定，不能依赖 Rust struct 或某个供应商 JSON encoder 的字段顺序。
 
-## 七份机器契约
+这些切片仍不代表八阶段 identity 迁移完成。当前迁移与 restore 已是满足 `operation.schema.json` 全字段与通用状态图的正式公共 Operation，但还不是所有 build/deploy/lifecycle 工作的通用 producer；其 child/provider operation 只有在真实下游操作存在时才允许填充。Stateful Objects 与 provider resources 仍无 inventory/fence/restore；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+
+## 九份机器契约
 
 1. [`resource-identity.schema.json`](resource-identity.schema.json)：主要对象的 canonical ID、kind、scope、display name 和 revision。ID 是定位符，不是凭证。
 2. [`canonical-artifact.schema.json`](canonical-artifact.schema.json)：Edge Canon 版本、payload、输入、toolchain、SBOM、provenance、验证和签名。Proposal artifact 必须是 `deployable: false`；可部署产物必须锁定已发布标准、验证通过并有签名。
@@ -50,6 +52,8 @@ identity 迁移已完成八个可执行切片。第一段让 `application`、`en
 5. [`provider-driver.schema.json`](provider-driver.schema.json)：driver/官方工具精确版本、凭证传递、安全约束、12 个 lifecycle 动作及内部 native/composed/companion 映射。映射不是应用 profile，也不产生支持声明。
 6. [`identity-migration.schema.json`](identity-migration.schema.json)：旧 name-based tenant 到 canonical identity 的 inventory、双读、复制/rename、验证、cutover、旧 capability 撤销和 tombstone。
 7. [`backend-migration-evidence.schema.json`](backend-migration-evidence.schema.json)：后端在持久 writer fence 下取得的 component count/bytes/digest/orphan evidence；明确认证域、backend incarnation 和 receipt，但禁止保存 fence token。
+8. [`backend-restore-set.schema.json`](backend-restore-set.schema.json)：把 store、queue、telemetry 三份本地快照绑定到同一个全平台停写/停服屏障、固定 topology driver 和不可变 snapshot digest；明确禁止复制 migration fence journal。缺少任一组件、只具有各自一致点或无法证明 outage barrier 的集合不能进入平台级 Restore Operation。
+9. [`backend-restore-report.schema.json`](backend-restore-report.schema.json)：topology driver 对同一 operation/restore set 的可对账终态证据，只允许 `succeeded` 或 `rolled-back`，并按固定顺序记录三后端切换前后的 incarnation。`restoreSetSha256` 统一是 restore set 的 RFC 8785 JCS 字节摘要；进程退出、timeout 或中间阶段不属于 report 状态。
 
 UUIDv7 目前是 draft 实现选择：它标准化、可跨进程生成并按时间大致排序；其时间部分不是秘密，因此授权永远另行校验。若安全或存储评审否决该格式，必须在 v1 冻结前更新所有 schema/fixture；已发布后不得原地换格式。
 
@@ -97,7 +101,7 @@ inspect / reconcile / delete / cleanup
 
 ## 可执行校验
 
-[`fixtures.json`](fixtures.json) 同时登记每份 schema 的正、反例。反例从对应正例应用确定性 JSON Pointer mutation，证明以下情况会失败：名称冒充 ID、canonical artifact 携带 provider 字段、binding snapshot 含 secret value、终态 operation 没有完成时间、driver 缺生命周期动作、迁移继续使用名称 tenant key，以及 backend evidence 泄漏 fence token。
+[`fixtures.json`](fixtures.json) 同时登记每份 schema 的正、反例。反例从对应正例应用确定性 JSON Pointer mutation，证明以下情况会失败：名称冒充 ID、canonical artifact 携带 provider 字段、binding snapshot 含 secret value、终态 operation 没有完成时间、driver 缺生命周期动作、迁移继续使用名称 tenant key、backend evidence 泄漏 fence token，以及 restore set 缺少 component 或复制 fence journal。
 
 运行：
 
@@ -106,4 +110,4 @@ python3 -m pip install -r scripts/governance-requirements.txt
 python3 scripts/check-shared-contracts.py
 ```
 
-校验器还检查 UUIDv7 规则在 schema 间不漂移、operation 图可达且终态不可逆、binding declaration/resolution 一一对应、proposal artifact 不可部署、driver 没有宣称支持未发布标准，以及迁移 tenant key 只由 canonical ID 构成。
+校验器还检查 UUIDv7 规则在 schema 间不漂移、operation 图可达且终态不可逆、binding declaration/resolution 一一对应、proposal artifact 不可部署、driver 没有宣称支持未发布标准、迁移 tenant key 只由 canonical ID 构成，以及 restore set 恰好包含三个内置后端并由同一个全平台 outage barrier 约束。
