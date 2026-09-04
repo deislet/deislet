@@ -82,14 +82,19 @@ impl Feature {
     pub fn target_implementation_name(&self, platform: Platform) -> Option<&'static str> {
         match (self, platform) {
             (Feature::SQLDatabase, Platform::Cloudflare) => Some("D1 Database"),
-            (Feature::SQLDatabase, Platform::Deno) => Some("Postgres (via integration)"),
+            // No database declaration or connection wiring is generated in
+            // the Deno artifact today.
+            (Feature::SQLDatabase, Platform::Deno) => None,
             (Feature::SQLDatabase, Platform::Tencent) => None,
             // deis-store serves one SQLite database per tenant over gRPC, and
             // deis-runtime builds the client in `runtime/bindings.rs` from the
             // manifest's logical bindings, so `context.env.<NAME>` reaches it.
             (Feature::SQLDatabase, Platform::Deislet) => Some("Per-app SQLite in deis-store"),
 
-            (Feature::ObjectStorage, Platform::Cloudflare) => Some("R2 Buckets"),
+            // No R2 declaration or binding plan is emitted by the current
+            // Cloudflare packager. Naming the vendor product here used to
+            // turn an absent implementation into apparent coverage.
+            (Feature::ObjectStorage, Platform::Cloudflare) => None,
             (Feature::ObjectStorage, Platform::Deno) => None,
             (Feature::ObjectStorage, Platform::Tencent) => None,
             // Same shape as the database: deis-store serves the blobs and
@@ -98,14 +103,18 @@ impl Feature {
                 Some("Content-addressed blobs in deis-store")
             }
 
-            (Feature::NodeRuntime, Platform::Cloudflare) => None,
+            (Feature::NodeRuntime, Platform::Cloudflare) => {
+                Some("locked Node façade plus nodejs_compat")
+            }
             (Feature::NodeRuntime, Platform::Deno) => Some("Node.js compatibility layer"),
             (Feature::NodeRuntime, Platform::Tencent) => Some("Node Functions"),
-            // deis-runtime is bare deno_core: no node built-ins, no npm loader.
-            (Feature::NodeRuntime, Platform::Deislet) => None,
+            (Feature::NodeRuntime, Platform::Deislet) => Some("locked Node façade in deis-runtime"),
 
-            (Feature::CronJobs, Platform::Cloudflare) => Some("Cron Triggers"),
-            (Feature::CronJobs, Platform::Deno) => Some("Deno.cron"),
+            // The products expose similarly named facilities, but these
+            // packagers do not yet emit their trigger declarations or event
+            // wrappers. Product availability is not artifact coverage.
+            (Feature::CronJobs, Platform::Cloudflare) => None,
+            (Feature::CronJobs, Platform::Deno) => None,
             (Feature::CronJobs, Platform::Tencent) => None,
             // A bundle carries `cron`; the control plane keeps one schedule per
             // (app_id, environment) and calls a node's `Trigger.OnScheduled`
@@ -114,7 +123,7 @@ impl Feature {
                 Some("Scheduled by deis-control, run on one node")
             }
 
-            (Feature::Queues, Platform::Cloudflare) => Some("Queues"),
+            (Feature::Queues, Platform::Cloudflare) => None,
             (Feature::Queues, Platform::Deno) => None,
             (Feature::Queues, Platform::Tencent) => None,
             // deis-queue is its own process; a declared queue binding's `send`
@@ -256,13 +265,12 @@ mod tests {
     fn cloudflare_packager_coverage_is_explicit() {
         let caps = TargetArtifactCoverage::new(Platform::Cloudflare);
 
-        // Extended features
+        // Only mappings the current packager actually writes.
         assert!(caps.implements(Feature::SQLDatabase));
-        assert!(caps.implements(Feature::ObjectStorage));
-        assert!(caps.implements(Feature::CronJobs));
-        assert!(caps.implements(Feature::Queues));
-
-        assert!(!caps.implements(Feature::NodeRuntime));
+        assert!(caps.implements(Feature::NodeRuntime));
+        assert!(!caps.implements(Feature::ObjectStorage));
+        assert!(!caps.implements(Feature::CronJobs));
+        assert!(!caps.implements(Feature::Queues));
     }
 
     #[test]
@@ -270,10 +278,9 @@ mod tests {
         let caps = TargetArtifactCoverage::new(Platform::Deno);
 
         // Extended features
-        assert!(caps.implements(Feature::SQLDatabase));
         assert!(caps.implements(Feature::NodeRuntime));
-        assert!(caps.implements(Feature::CronJobs));
-
+        assert!(!caps.implements(Feature::SQLDatabase));
+        assert!(!caps.implements(Feature::CronJobs));
         assert!(!caps.implements(Feature::ObjectStorage));
         assert!(!caps.implements(Feature::Queues));
     }
@@ -306,17 +313,16 @@ mod tests {
         assert!(caps.implements(Feature::Queues));
         assert!(caps.implements(Feature::CronJobs));
 
-        // No current Deislet artifact mapping exists for these declarations.
-        assert!(!caps.implements(Feature::NodeRuntime));
+        assert!(caps.implements(Feature::NodeRuntime));
     }
 
     #[test]
     fn missing_mappings_are_hard_build_failures() {
-        let caps = TargetArtifactCoverage::new(Platform::Deislet);
+        let caps = TargetArtifactCoverage::new(Platform::Tencent);
         let blocking = caps.missing(ALL_FEATURES);
         assert!(
-            blocking.iter().any(|b| b.feature == Feature::NodeRuntime),
-            "a declared Node runtime has to be a hard stop"
+            blocking.iter().any(|b| b.feature == Feature::Queues),
+            "a declared queue has to be a hard stop when no target mapping exists"
         );
     }
 

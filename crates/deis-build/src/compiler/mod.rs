@@ -1169,6 +1169,15 @@ impl Compiler {
             }
         }
 
+        // A root `_queue` or `_scheduled` file is an event handler, not an
+        // HTTP route. Deislet's bundle has explicit named exports and manifest
+        // declarations for those families. The other packagers do not yet
+        // emit the provider trigger plus event wrapper, so letting their
+        // ordinary router consume these entries would publish `/_queue` or
+        // `/_scheduled` as public HTTP endpoints while claiming the event was
+        // deployed. Fail before generating any provider configuration.
+        Self::refuse_unimplemented_event_handlers(vendor, &routes)?;
+
         while let Some((importer, specifiers)) = module_queue.pop_front() {
             for specifier in specifiers {
                 let Some(dependency) =
@@ -1698,6 +1707,45 @@ impl Compiler {
              ReferenceError as the target loads it, and the entire application serves nothing - \
              not just this route. Add `export default async function handler(context)`, or move \
              the file out of the function root if it is a helper rather than a handler"
+        ))
+    }
+
+    /// Refuse an event file on a target whose packager has no event mapping.
+    ///
+    /// This is deliberately separate from the project declaration coverage
+    /// table: a forgotten `queues` or `cron` declaration must not turn the
+    /// root event file into HTTP. The diagnostic names only project-relative
+    /// handler paths, never the build host's absolute directory.
+    fn refuse_unimplemented_event_handlers(
+        vendor: &str,
+        routes: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        if vendor == deis_build_adapter_deislet::VENDOR {
+            return Ok(());
+        }
+
+        let mut event_handlers = routes
+            .iter()
+            .filter_map(|(_, import_path)| {
+                let kind = deis_build_core::routes::handler_kind(import_path);
+                (kind != deis_build_core::routes::HandlerKind::Http).then(|| {
+                    format!(
+                        "{} ({kind:?})",
+                        deis_build_core::routes::staged_handler_path(import_path)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if event_handlers.is_empty() {
+            return Ok(());
+        }
+        event_handlers.sort();
+
+        Err(anyhow::anyhow!(
+            "EC_EVENT_TARGET_UNIMPLEMENTED: the {vendor} packager cannot encode the event \
+             handler(s) {}; it has no generated trigger declaration or event wrapper. They were \
+             not exposed as HTTP routes and no deployable provider artifact was produced",
+            event_handlers.join(", ")
         ))
     }
 
