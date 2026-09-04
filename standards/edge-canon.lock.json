@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-05T04:32:13+08:00",
+  "resolvedAt": "2026-09-05T05:24:00+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "f423c92b86aa1f485d119d8b501fa4c1bd27081f",
+    "sourceCommit": "8a209c9a003fbbf9328f80fb77acf39b850d88fe",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "contractPath": "standard/contract.json",
     "contractSchemaPath": "schemas/standard-contract.schema.json",
@@ -24,6 +24,11 @@
     "streamsSchemaSha256": "83d68dc31563f81dfae0abf2800cb59c4f75013cafc5a7bc37d539f681e1e521",
     "streamsHarnessPath": "conformance/harness/streams-websockets-background-work/harness.json",
     "streamsPlatformEvidencePath": "conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json",
+    "streamsProviderRuntimeProtocolPath": "conformance/harness/streams-websockets-background-work/provider-runtime-protocol.zh.md",
+    "streamsProviderRuntimeFixturePath": "conformance/harness/streams-websockets-background-work/provider-runtime-fixture.mjs",
+    "streamsProviderRuntimeFixtureSha256": "cccf284de7fbefff0d27240cd3f8ddeadb97fb4105f408c0d0ca01eca690a241",
+    "streamsProviderRuntimeCollectorPath": "conformance/harness/streams-websockets-background-work/provider-runtime-collect.mjs",
+    "streamsProviderRuntimeOraclePath": "conformance/harness/streams-websockets-background-work/provider-runtime-oracle.mjs",
     "nodeNpmRequirementsPath": "standard/requirements/node-npm-subset.zh.md",
     "nodeNpmSchemaPath": "schemas/node-npm-subset.schema.json",
     "nodeNpmSchemaSha256": "819fd75a3aefd36ceb283d1d6f0c9f3e07ff126646015003d4cca83b5461fe92",

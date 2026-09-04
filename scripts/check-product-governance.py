@@ -159,6 +159,10 @@ def validate_standard_lock() -> str:
         "streamsSchemaPath": "schemas/streams-websockets-background-work.schema.json",
         "streamsHarnessPath": "conformance/harness/streams-websockets-background-work/harness.json",
         "streamsPlatformEvidencePath": "conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json",
+        "streamsProviderRuntimeProtocolPath": "conformance/harness/streams-websockets-background-work/provider-runtime-protocol.zh.md",
+        "streamsProviderRuntimeFixturePath": "conformance/harness/streams-websockets-background-work/provider-runtime-fixture.mjs",
+        "streamsProviderRuntimeCollectorPath": "conformance/harness/streams-websockets-background-work/provider-runtime-collect.mjs",
+        "streamsProviderRuntimeOraclePath": "conformance/harness/streams-websockets-background-work/provider-runtime-oracle.mjs",
         "nodeNpmRequirementsPath": "standard/requirements/node-npm-subset.zh.md",
         "nodeNpmSchemaPath": "schemas/node-npm-subset.schema.json",
         "nodeNpmHarnessPath": "conformance/harness/node-npm-subset/harness.json",
@@ -186,6 +190,17 @@ def validate_standard_lock() -> str:
     require(
         bool(SHA256.fullmatch(source.get("streamsSchemaSha256", ""))),
         "standard lock streams schema digest is not SHA-256",
+    )
+    streams_fixture_digest = source.get("streamsProviderRuntimeFixtureSha256", "")
+    require(
+        bool(SHA256.fullmatch(streams_fixture_digest)),
+        "standard lock streams provider runtime fixture digest is not SHA-256",
+    )
+    local_streams_fixture = ROOT / "standards/fixtures/edge-canon-stream-provider-runtime.mjs"
+    require(local_streams_fixture.is_file(), "vendored streams provider runtime fixture is missing")
+    require(
+        hashlib.sha256(local_streams_fixture.read_bytes()).hexdigest() == streams_fixture_digest,
+        "vendored streams provider runtime fixture differs from the standard lock",
     )
     require(
         bool(SHA256.fullmatch(source.get("nodeNpmSchemaSha256", ""))),

@@ -113,7 +113,14 @@ fn generate_router_code(
     let mut route_handlers = String::new();
 
     for (i, (route, import_path)) in routes.iter().enumerate() {
-        imports.push_str(&format!("import handler{i} from '{import_path}';\n"));
+        let import_literal = serde_json::to_string(import_path).expect("serialize import path");
+        let route_literal = serde_json::to_string(route).expect("serialize route");
+        let wildcard_name = deis_build_core::routes::wildcard_name(
+            deis_build_core::routes::staged_handler_path(import_path),
+        )
+        .map(|name| serde_json::to_string(&name).expect("serialize wildcard name"))
+        .unwrap_or_else(|| "null".to_string());
+        imports.push_str(&format!("import handler{i} from {import_literal};\n"));
 
         let invocation = if bundled_at_root {
             format!("runWithEdgeCanonNodeEnv(context.env, () => handler{i}(context))")
@@ -121,8 +128,8 @@ fn generate_router_code(
             format!("handler{i}(context)")
         };
         route_handlers.push_str(&format!(
-            r#"  if (matchRoute(url.pathname, '{route}')) {{
-    const context = buildContext(request, '{route}');
+            r#"  if (matchRoute(url.pathname, {route_literal})) {{
+    const context = buildContext(request, {route_literal}, {wildcard_name});
     return {invocation};
   }}
 "#
@@ -215,19 +222,21 @@ Deno.serve(async (request: Request): Promise<Response> => {{
 }});
 
 function matchRoute(pathname: string, route: string): boolean {{
-  // Exact match
-  if (pathname === route) return true;
+  const routeParts = route.split('/').filter(Boolean);
+  const pathParts = pathname.split('/').filter(Boolean);
+  for (let i = 0; i < routeParts.length; i++) {{
+    const part = routeParts[i];
+    if (part === '*') return i === routeParts.length - 1;
+    if (i >= pathParts.length) return false;
+    if (part.startsWith(':')) continue;
+    if (decodeSegment(part) !== decodeSegment(pathParts[i])) return false;
+  }}
+  return routeParts.length === pathParts.length;
+}}
 
-  // Dynamic parameter match (e.g., /users/:id)
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
-
-  if (routeParts.length !== pathParts.length) return false;
-
-  return routeParts.every((part, i) => {{
-    if (part.startsWith(':')) return true;
-    return part === pathParts[i];
-  }});
+function decodeSegment(segment: string): string {{
+  try {{ return decodeURIComponent(segment); }}
+  catch (_) {{ return segment; }}
 }}
 
 // The static files this build carried, and the media type each one is served
@@ -290,7 +299,7 @@ fn generate_context_builder_code(has_kv: bool) -> String {
 {kv_import}
 
 export function createContextBuilder(kv?: Deno.Kv) {{
-  return function buildContext(request: Request, route: string = '/') {{
+  return function buildContext(request: Request, route: string = '/', wildcardName: string | null = null) {{
     const url = new URL(request.url);
 
     return {{
@@ -299,7 +308,7 @@ export function createContextBuilder(kv?: Deno.Kv) {{
       env: Deno.env.toObject(),  // All environment variables
 
       // Convenience fields
-      params: extractParams(url.pathname, route),
+      params: extractParams(url.pathname, route, wildcardName),
       path: url.pathname,
       method: request.method,
       query: Object.fromEntries(url.searchParams),
@@ -335,19 +344,28 @@ export function createContextBuilder(kv?: Deno.Kv) {{
   }};
 }}
 
-function extractParams(pathname: string, route: string): Record<string, string> {{
+function extractParams(pathname: string, route: string, wildcardName: string | null): Record<string, string> {{
   const params: Record<string, string> = {{}};
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
+  const routeParts = route.split('/').filter(Boolean);
+  const pathParts = pathname.split('/').filter(Boolean);
 
   routeParts.forEach((part, i) => {{
-    if (part.startsWith(':')) {{
+    if (part === '*') {{
+      const rest = pathParts.slice(i).map(decodeSegment).join('/');
+      params['*'] = rest;
+      if (wildcardName !== null) params[wildcardName] = rest;
+    }} else if (part.startsWith(':')) {{
       const paramName = part.slice(1);
-      params[paramName] = pathParts[i] || '';
+      params[paramName] = decodeSegment(pathParts[i] || '');
     }}
   }});
 
   return params;
+}}
+
+function decodeSegment(segment: string): string {{
+  try {{ return decodeURIComponent(segment); }}
+  catch (_) {{ return segment; }}
 }}
 
 function parseCookies(request: Request): any {{
