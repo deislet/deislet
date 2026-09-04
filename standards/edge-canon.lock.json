@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-04T20:19:06+08:00",
+  "resolvedAt": "2026-09-04T20:55:21+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "01d03d39d52691e0dde732357e0fd32c8011cac1",
+    "sourceCommit": "5950a4de9abc8c0933661cf25d1ab95bf526d9b2",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "contractPath": "standard/contract.json",
     "contractSchemaPath": "schemas/standard-contract.schema.json",
@@ -24,6 +24,11 @@
     "streamsSchemaSha256": "47613579475e6d6157d102fb40882a21408f5b886131d37d0bab38d7cda726b7",
     "streamsHarnessPath": "conformance/harness/streams-websockets-background-work/harness.json",
     "streamsPlatformEvidencePath": "conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json",
+    "nodeNpmRequirementsPath": "standard/requirements/node-npm-subset.zh.md",
+    "nodeNpmSchemaPath": "schemas/node-npm-subset.schema.json",
+    "nodeNpmSchemaSha256": "819fd75a3aefd36ceb283d1d6f0c9f3e07ff126646015003d4cca83b5461fe92",
+    "nodeNpmHarnessPath": "conformance/harness/node-npm-subset/harness.json",
+    "nodeNpmPlatformEvidencePath": "conformance/evidence/node-npm-subset-platforms-2026-09-04.json",
     "webPlatformApisRequirementsPath": "standard/requirements/web-platform-apis.zh.md",
     "webPlatformApisSchemaPath": "schemas/web-platform-apis.schema.json",
     "webPlatformApisSchemaSha256": "acf54baaec48031686f0984eeda519d7bcafc6d1f52db048e47aafbd15e136cb",
@@ -54,7 +59,7 @@
     "upstreamCommand": "python3 scripts/check-governance.py",
     "upstreamResult": "passed",
     "expectedCapabilityFamilies": 15,
-    "expectedDraftClauses": 118,
+    "expectedDraftClauses": 149,
     "expectedConformanceSuites": 15,
     "expectedBackends": 4
   }

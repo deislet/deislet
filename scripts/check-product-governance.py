@@ -159,6 +159,10 @@ def validate_standard_lock() -> str:
         "streamsSchemaPath": "schemas/streams-websockets-background-work.schema.json",
         "streamsHarnessPath": "conformance/harness/streams-websockets-background-work/harness.json",
         "streamsPlatformEvidencePath": "conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json",
+        "nodeNpmRequirementsPath": "standard/requirements/node-npm-subset.zh.md",
+        "nodeNpmSchemaPath": "schemas/node-npm-subset.schema.json",
+        "nodeNpmHarnessPath": "conformance/harness/node-npm-subset/harness.json",
+        "nodeNpmPlatformEvidencePath": "conformance/evidence/node-npm-subset-platforms-2026-09-04.json",
         "webPlatformApisRequirementsPath": "standard/requirements/web-platform-apis.zh.md",
         "webPlatformApisSchemaPath": "schemas/web-platform-apis.schema.json",
         "webPlatformApisHarnessPath": "conformance/harness/web-platform-apis/harness.json",
@@ -184,13 +188,17 @@ def validate_standard_lock() -> str:
         "standard lock streams schema digest is not SHA-256",
     )
     require(
+        bool(SHA256.fullmatch(source.get("nodeNpmSchemaSha256", ""))),
+        "standard lock Node/npm schema digest is not SHA-256",
+    )
+    require(
         bool(SHA256.fullmatch(source.get("webPlatformApisSchemaSha256", ""))),
         "standard lock Web Platform APIs schema digest is not SHA-256",
     )
     verification = lock.get("verification", {})
     require(verification.get("upstreamResult") == "passed", "locked upstream governance check did not pass")
     require(verification.get("expectedCapabilityFamilies") == 15, "unexpected capability family count")
-    require(verification.get("expectedDraftClauses") == 118, "unexpected draft clause count")
+    require(verification.get("expectedDraftClauses") == 149, "unexpected draft clause count")
     require(verification.get("expectedConformanceSuites") == 15, "unexpected conformance suite count")
     require(verification.get("expectedBackends") == 4, "unexpected backend record count")
 

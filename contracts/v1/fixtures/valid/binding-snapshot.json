@@ -8,7 +8,7 @@
   "providerTargetId": "01990f44-1000-7000-8000-000000000030",
   "revision": 1,
   "createdAt": "2026-09-03T13:02:00Z",
-  "standardVersion": "edge-canon.next@01d03d39d52691e0dde732357e0fd32c8011cac1",
+  "standardVersion": "edge-canon.next@5950a4de9abc8c0933661cf25d1ab95bf526d9b2",
   "declarations": [
     {"bindingId": "01990f44-1000-7000-8000-000000000021", "name": "SESSIONS", "kind": "kv", "interfaceVersion": "edge-canon.kv.next", "permissions": ["read", "write", "delete"]}
   ],
@@ -25,7 +25,7 @@
       "ownership": "platform-owned",
       "lifecycle": {"deleteWithEnvironment": true, "retentionPolicy": "preview-7d"},
       "resolvedGuarantee": {
-        "standardVersion": "edge-canon.next@01d03d39d52691e0dde732357e0fd32c8011cac1",
+        "standardVersion": "edge-canon.next@5950a4de9abc8c0933661cf25d1ab95bf526d9b2",
         "capabilityFamily": "kv-cache-sql-blob",
         "requirementsDigest": {"algorithm": "sha256", "value": "9999999999999999999999999999999999999999999999999999999999999999"}
       }
