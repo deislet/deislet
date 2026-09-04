@@ -48,10 +48,10 @@
           "status": "done",
           "dependsOn": ["P0-DEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/proposals/0001-unified-platform-contract/README.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/standard/contract.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/proposals/0001-unified-platform-contract/README.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/standard/contract.json"}
           ],
-          "verification": "在 Edge Canon commit d0f54dd257789604257eba973b364588ca5496a3 运行 python3 scripts/check-governance.py"
+          "verification": "在 Edge Canon commit c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1 运行 python3 scripts/check-governance.py"
         },
         {
           "id": "P0-CONF-001",
@@ -60,8 +60,8 @@
           "status": "done",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/conformance/registry.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/schemas/conformance-registry.schema.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/conformance/registry.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/schemas/conformance-registry.schema.json"}
           ],
           "verification": "registry 中 proposal 不能 compliant，supported 必须蕴含 compliant"
         },
@@ -86,14 +86,14 @@
           "status": "active",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/standard/requirements.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/standard/requirements/web-fetch-events.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/conformance/kit.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/conformance/harness/web-fetch-events/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/d0f54dd257789604257eba973b364588ca5496a3/conformance/harness/web-fetch-events/oracle.mjs"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/standard/requirements.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/standard/requirements/web-fetch-events.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/conformance/kit.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/conformance/harness/web-fetch-events/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/conformance/harness/web-fetch-events/oracle.mjs"}
           ],
-          "verification": "contract.json 强制最低免费/入门档共同资源基线，且 15 个 definitionStatus 全部为 normative-complete"
+          "verification": "Edge Canon commit c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1 运行 python3 scripts/check-governance.py，并以 Node 24 执行 conformance/harness/web-fetch-events/*.test.mjs；当前 EC-WEB T001–T014 的同源 fixture/oracle 与 18 项正反自测完成。工作项仍 active，退出仍要求 15 个能力族全部 normative-complete、三个一等后端 adapter 全用同一 oracle 取得有效证据"
         },
         {
           "id": "P0-EVID-001",

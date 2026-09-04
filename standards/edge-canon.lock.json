@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-04T11:48:22+08:00",
+  "resolvedAt": "2026-09-04T15:03:00+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "d0f54dd257789604257eba973b364588ca5496a3",
+    "sourceCommit": "c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "contractPath": "standard/contract.json",
     "contractSchemaPath": "schemas/standard-contract.schema.json",
@@ -14,7 +14,7 @@
     "registryPath": "conformance/registry.json",
     "registrySchemaPath": "schemas/conformance-registry.schema.json",
     "registrySnapshotPath": "standards/edge-canon.conformance-registry.json",
-    "registrySha256": "0e748ea1d683c0f2ac91483e4e2d52b398ed0578ec1591fe6e6f49087549cd66"
+    "registrySha256": "2b3ea506ba41d5cb73cc2109cfb282f43f829cd227735593488a4522e7b4aee6"
   },
   "standard": {
     "contractId": "edge-canon.next",

@@ -1368,3 +1368,12 @@ Application/framework source + versioned build plan
 - 同一输出/scope 的 completed 请求返回完全相同的 restore set；restore 在取得全局锁后会先恢复遗留 capture，read-only restore status 遇到非终态 capture 则拒绝给出可能失真的物理判断。journal 与临时文件均原子写入并同步父目录，broken symlink 也不能被当作“不存在”绕过。
 - 本地回归覆盖完整集合中断后发布、不完整集合中断后保留现场、恢复命令失败后保持非终态并重试、broken journal symlink 拒绝，以及 completed 请求精确幂等；`deis-backend-topology` 共 18 项测试通过。远端 CI 需以包含本切片的新提交重新取证。
 - 仍未关闭的是“无人值守立即恢复”产品层：当前要等下一条 topology mutation 或显式命令触发，没有持续运行的 backup ProductOperation/scheduler；artifact 加密、异地复制、retention/cleanup、定期 restore drill 与 RPO/RTO policy 也未完成。上述项以及 Stateful Objects/provider、canonical migration 和其他 Operation producer 继续列为 P0。
+
+## 27. P0-SPEC-002 EC-WEB 全 Draft 用例执行化与标准缺陷修正
+
+- Edge Canon commit `5d6118e763ca0f5c241087cdcd62a23558155fb9` 把同一 `fixture.mjs`/oracle 从 T001–T005 扩至 T001–T014；覆盖并发上下文隔离、响应流、后台任务独立结算、关闭后的 `waitUntil`、客户端断开、精确标准/产物血缘、10 ms CPU、50 个子请求和 6 个等待响应头连接。新增可机读 fixture dependency、标准 CPU workload 与基于 process CPU 的 8–10 ms 校准脚本，oracle 要求后端 CPU 证据，拒绝 wall time 冒充。
+- 实施中修正两项用例自身错误。T013 原写 49 个直连再加一个发生一次重定向的 fetch，实际为 51 个子请求；现固定为 48 个直连 + 1 个初始重定向请求 + 1 个跳转，即 49 次 Fetch API 调用、50 个子请求。T009 原要求被关闭 `waitUntil` 拒绝的 Promise 不产生副作用，但 Promise 在作为参数传入前已经开始，运行时只能拒绝把它登记进后台集合；oracle 现检查登记数不增加，不承诺取消已启动 Promise。
+- 同轮修正三项隐藏漂移：EC-WEB-LIFE-003 现在定义稳定 `EC_BACKGROUND_REJECTED`，不再由测试凭空发明 failure code；T010 不再强制客户端断开一定取消 response/background，只允许并记录标准明确许可的多种终态，同时严格禁止重跑、事务回滚宣称和后续上下文污染；backend standard version 必须固定成 `edge-canon.next@<40 位 commit>`，浮动 `next` 不能作为 exact-version 证据。
+- 上游治理脚本过去只读取 JSON Schema 而没有执行 schema validation；现固定 `jsonschema==4.25.1`，用 Draft 2020-12 加 format checker 校验 contract、requirements、kit、cases、harness、sample observation 与 registry。Node 24 下 fixture/oracle 共 18 项正反自测、本地治理与 schema 门禁通过。
+- registry 仍写“没有 executable harness”也已随 commit `c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1` 修正为准确阻断：EC-WEB 缺三个 provider adapter，其余 14 个 suite 尚不可执行。上游 runs [`33846683048`](https://github.com/deislet/edge-canon/actions/runs/33846683048) 与 [`33846777280`](https://github.com/deislet/edge-canon/actions/runs/33846777280) 均成功。Deislet 标准锁迁到该 commit，registry 快照 SHA-256 为 `2b3ea506ba41d5cb73cc2109cfb282f43f829cd227735593488a4522e7b4aee6`；任何后端的 maturity/compliance/support 均未因此提升。
+- 仍明确欠缺：Deislet、Cloudflare、EdgeOne 的固定版本真实部署 adapter 与原始观测；响应/request body、wall time、内存、`waitUntil` 宽限和超限后流式错误语义；所依赖的 Web API/env/binding/canonical artifact 定义；其余 14 个能力族。因此 `P0-SPEC-002` 保持 active。
