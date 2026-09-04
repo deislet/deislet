@@ -5,7 +5,7 @@
 ## 权威顺序
 
 1. 已发布的 [Edge Canon](https://github.com/deislet/edge-canon) 版本定义应用可依赖的标准。
-2. `edge-canon.next` 当前只是[统一平台契约 proposal](https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/proposals/0001-unified-platform-contract/README.zh.md)，其[逐条要求](https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/standard/requirements.json)和[测试入口](https://github.com/deislet/edge-canon/blob/c9470b21d27bfd1dc493c8dd33d9390ffb8fa3d1/conformance/kit.json)仍在起草，尚不是 normative release。
+2. `edge-canon.next` 当前只是[统一平台契约 proposal](https://github.com/deislet/edge-canon/blob/82c77542b209ee2bf96f1e888a0bd51fd1f804f6/proposals/0001-unified-platform-contract/README.zh.md)，其[逐条要求](https://github.com/deislet/edge-canon/blob/82c77542b209ee2bf96f1e888a0bd51fd1f804f6/standard/requirements.json)和[测试入口](https://github.com/deislet/edge-canon/blob/82c77542b209ee2bf96f1e888a0bd51fd1f804f6/conformance/kit.json)仍在起草，尚不是 normative release。
 3. [ADR 决策集](../adr/README.md)记录 Deislet 已接受的产品与架构方向；ADR 是标准提案的实现输入，不替代独立标准治理。
 4. [阶段分析](phase-analysis-2026-09-03.zh.md)保留审查发现和决策过程；[执行路线](roadmap.zh.md)维护工作状态与退出条件。
 5. `docs/implementation-plan.zh.md`、`docs/architecture.zh.md` 和代码描述当前实现。它们与新方向冲突时，应建立迁移任务，不能静默改写事实。
