@@ -1,7 +1,7 @@
 # Deislet 共享产品契约 v1（Draft）
 
 - 契约版本：`1.0.0-draft.1`
-- 状态：Draft；不是已实现 API，也不是 Edge Canon 合规证明
+- 状态：Draft；部分对象已有实现，但不是 Edge Canon 合规证明
 - 机器入口：[`registry.json`](registry.json)
 - 上游标准锁定：[`standards/edge-canon.lock.json`](../../standards/edge-canon.lock.json)
 
@@ -23,7 +23,7 @@
 
 ## 当前实现进度
 
-identity 迁移已完成六个可执行切片。第一段让 `application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效、擦除或从一个有效 UUIDv7 改绑到另一个有效 UUIDv7，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
+identity 迁移已完成七个可执行切片。第一段让 `application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效、擦除或从一个有效 UUIDv7 改绑到另一个有效 UUIDv7，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
 
 第二段新增共享 `deis-wire::CanonicalTenantId`，唯一逻辑拼写与本契约相同：`v1/<application UUIDv7>/<environment UUIDv7>`。Control 的 push 与 assignment list 现在同时发送两个 canonical ID；节点只允许“两者都缺失”的旧 Control 或“两者都有效”的新 Control，partial/UUIDv4/非规范拼写在 bundle 下载前失败关闭。节点把 identity 写入 installed record，已记录的 canonical tenant 不能被另一组合法 ID 重绑，旧 Control 的字段缺失也不能擦除它。Runtime placement/telemetry key 与 storage authority 已拆成两个输入，KV/SQL/blob 与 queue poller 共用后者，并有真实 store round-trip 测试证明两者不会混用。
 
@@ -35,7 +35,9 @@ identity 迁移已完成六个可执行切片。第一段让 `application`、`en
 
 第六段由 Control 使用分别配置、禁止复用的 store/queue 管理凭证协调 catalog 与每个 legacy tenant 的 backend fence。`identity_migration_backend_attempts` 在每次网络调用前后记录 endpoint digest、revision、状态、attempt count、回执和契约 evidence；Control 若在远端取得 fence 后崩溃，下一次以相同 migration/revision/token 重放，而不是猜测。受管理员权限保护的 `POST /api/apps/:app/identity-migration` 在持久 plan 后返回 `202` 并后台执行，客户端断开不会取消；启动时恢复 `planned/running`，GET 在管理凭证移除后仍可读取脱敏状态。错误 backend/tenant、缺失或变化的 receipt、组件缺失/重复、非规范摘要或时间均失败关闭。当前只捕获 store 的 KV/SQL/blob 与 queue，操作进入 `waiting` 且明确列出 telemetry、Stateful Objects、provider resources 缺口，不会冒充 ready-for-copy。
 
-这些切片仍不代表八阶段迁移完成。当前 API 虽已有稳定 migration/operation ID、异步执行和崩溃恢复，但还不是满足 `operation.schema.json` 全字段与通用状态图的正式公共 Operation：organization、actor、idempotency、request/correlation、child/provider operation 尚未建模。telemetry、Stateful Objects 与 provider resources 仍无 inventory/fence；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+第七段把迁移接入共享 `deis-wire::ProductOperation` 与 `operation-transitions.json` 的唯一状态图。POST 必须提供 `Idempotency-Key`，Control 只持久化其 SHA-256，并把稳定 organization、actor、request/correlation UUIDv7、scope、target、revision、phase 和完整时间字段写入 operation；只有同 actor、同 key、同 canonical target 的重放会返回原 Operation，包括终态重放与同名 application 重建的隔离。响应返回 `Location`、`ETag`，可由统一 `GET /api/operations/:id` 读取。取消必须携带单个强 `If-Match`：缺失为 428、旧 revision 为 412；接受后先进入 `cancelling`。后台按已记录的 backend incarnation 与原 fence token 精确调用 `ReleaseWriteFence`，全部成功后才进入 `cancelled` 并解除 catalog fence，重启会继续未完成的 release。当前迁移没有真实 child/provider operation，数组保持诚实的空值。终态迁移保留历史且同一 application 最多只有一个非终态迁移；启动迁移会原子升级旧唯一约束并接管此前没有正式 Operation 记录的在途迁移。
+
+这些切片仍不代表八阶段迁移完成。当前迁移已经是满足 `operation.schema.json` 全字段与通用状态图的正式公共 Operation，但还不是所有 build/deploy/lifecycle 工作的通用 producer；其 child/provider operation 只有在真实下游操作存在时才允许填充。telemetry、Stateful Objects 与 provider resources 仍无 inventory/fence，restore 也尚未作为新 backend incarnation 重新 fencing；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
 
 ## 七份机器契约
 

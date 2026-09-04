@@ -29,12 +29,12 @@
 ## 当前进行中
 
 - `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 已形成 20 条候选条款和 11 个 provider-independent 草案用例。最低资源保证已固定采用所有参考供应商最低免费/入门档共同基线，但具体数值、计量和超限行为仍为 `pending`；执行 harness 仍为 `planned`，其余 14 个能力族尚未开始，故本项继续保持 `active`。
-- `P0-MODEL-001`：七份 Draft schema 与 14 个正反 fixture 已覆盖 canonical identity/artifact/binding/operation/driver、identity migration 和 backend fence evidence。除 canonical ID、tenant transport、catalog inventory/fence 与物理 namespace 外，现已实现共享 `BackendMigration` gRPC、独立且默认关闭的管理认证、持久单调 per-tenant writer fence，以及 KV/SQL/blob/queue 的确定性 inventory。Control 现使用彼此独立且不与应用/节点/API 认证复用的管理凭证，为每个 legacy tenant 协调 catalog + store + queue fence；每次网络调用前后都持久记录 attempt、endpoint digest、receipt 与契约 evidence，部分获取失败和进程重启以同一请求恢复。受管理员权限保护的异步 POST 不随客户端断开取消，GET 即使凭证被移除仍能读取脱敏证据。当前操作只进入 `waiting`：正式 Operation 的 organization/actor/idempotency/request/correlation/child/provider 字段、telemetry/stateful/provider、restore/incarnation、live parser、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 仍未完成，故本项继续保持 `active`。
+- `P0-MODEL-001`：七份 Draft schema 与 14 个正反 fixture 已覆盖 canonical identity/artifact/binding/operation/driver、identity migration 和 backend fence evidence。除 canonical ID、tenant transport、catalog inventory/fence 与物理 namespace 外，现已实现共享 `BackendMigration` gRPC、独立且默认关闭的管理认证、持久单调 per-tenant writer fence，以及 KV/SQL/blob/queue 的确定性 inventory。Control 现使用彼此独立且不与应用/节点/API 认证复用的管理凭证，为每个 legacy tenant 协调 catalog + store + queue fence；每次网络调用前后都持久记录 attempt、endpoint digest、receipt 与契约 evidence，部分获取失败和进程重启以同一请求恢复。迁移已返回包含 organization/actor/幂等摘要/request/correlation/child/provider 字段的正式公共 Operation，以唯一状态图、`ETag`/`If-Match` 和可恢复 backend fence release 完成取消；终态历史保留且每个 application 最多一个非终态迁移。当前操作只进入 `waiting`：telemetry/stateful/provider、restore/incarnation、live parser、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 仍未完成，故本项继续保持 `active`。
 
 ## 紧接着执行
 
 1. `P0-SPEC-002`：先完成 `web-fetch-events` 的最低资源保证、依赖类型和三后端可执行 harness，再按其闭环逐项完成其余 14 个 mandatory 能力族；`pending` 是发布阻断项。
-2. `P0-MODEL-001`：下一步把现有稳定 migration/operation ID、异步执行和恢复入口补成满足 `operation.schema.json` 的通用公共 Operation，增加 organization/actor/idempotency/request/correlation/child/provider 字段和受约束状态转换；随后把 restore 建模为新的 backend incarnation 并重新 fence/校验，而不是复制或丢弃旧 journal 后猜测，同时为 telemetry、Stateful Objects、provider resources 补同语义接口。只有所有必需 component 的 orphan/unchecked 都为零后，才进入 canonical-first dual-read、copy/verify/cutover、旧 token 撤销与 rollback。后端物理 key 仍不能冒充标准逻辑身份或 capability subject。
+2. `P0-MODEL-001`：下一步把 restore 建模为新的 backend incarnation 并重新 fence/校验，而不是复制或丢弃旧 journal 后猜测，同时为 telemetry、Stateful Objects、provider resources 补同语义接口，并让 build/deploy/lifecycle producer 复用同一 Operation。只有所有必需 component 的 orphan/unchecked 都为零后，才进入 canonical-first dual-read、copy/verify/cutover、旧 token 撤销与 rollback。后端物理 key 仍不能冒充标准逻辑身份或 capability subject。
 
 ## 执行规则
 

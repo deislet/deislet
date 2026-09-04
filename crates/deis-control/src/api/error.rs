@@ -10,6 +10,10 @@ use serde_json::json;
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
+    /// A mutation requires a resource revision but the caller omitted it.
+    PreconditionRequired(String),
+    /// The supplied resource revision is stale.
+    PreconditionFailed(String),
     /// The request is well formed but clashes with existing state, for
     /// instance creating an app that already exists.
     Conflict(String),
@@ -44,6 +48,8 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::PreconditionRequired(msg) => (StatusCode::PRECONDITION_REQUIRED, msg),
+            ApiError::PreconditionFailed(msg) => (StatusCode::PRECONDITION_FAILED, msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             ApiError::NotConfigured(msg) => (StatusCode::CONFLICT, msg),
@@ -78,6 +84,7 @@ impl From<crate::catalog::CatalogError> for ApiError {
         match err {
             CatalogError::NotFound(_) => ApiError::NotFound(message),
             CatalogError::Conflict(_) => ApiError::Conflict(message),
+            CatalogError::RevisionConflict(_) => ApiError::PreconditionFailed(message),
             CatalogError::Invalid(_) => ApiError::BadRequest(message),
             CatalogError::Forbidden(_) => ApiError::Forbidden(message),
             CatalogError::BundleStorage(_) => ApiError::InternalError(message),

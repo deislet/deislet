@@ -381,6 +381,25 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         )
         .changes_state(),
 
+        // Operation IDs are globally unique, but the path alone does not
+        // reveal their application/environment scope to this pure route
+        // classifier. Until authorization can load that scope before the
+        // handler, reading one remains a platform-administrator operation.
+        ["api", "operations", _operation_id] if !writing => Requirement::new(
+            "operation.get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "operations", operation_id, "cancel"] => Requirement::new(
+            "operation.cancel",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(operation_id)
+        .changes_state(),
+
         // ---- names of deleted applications --------------------------------
         //
         // Reading the list names every application that was ever deleted on
@@ -1364,8 +1383,20 @@ mod tests {
             ),
             (
                 "POST",
+                "/api/operations/01990f44-1000-7000-8000-000000000040/cancel",
+                "operation.cancel",
+                Verb::Admin,
+            ),
+            (
+                "POST",
                 "/api/apps/demo/identity-migration",
                 "identity_migration.start",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/operations/01990f44-1000-7000-8000-000000000040",
+                "operation.get",
                 Verb::Admin,
             ),
             ("GET", "/api/retired-apps", "retired_app.list", Verb::Admin),

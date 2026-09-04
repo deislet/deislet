@@ -14,6 +14,7 @@ pub mod deislet_storage_key;
 pub mod error;
 pub mod logging;
 pub mod models;
+pub mod operation;
 
 pub mod pb {
     tonic::include_proto!("deis.control");
@@ -33,6 +34,11 @@ pub use error::{SdkResult, WireError};
 // The log sink every binary installs. Named here as well as in its module
 // because it is a thing every `main` reaches for, not a wire type.
 pub use logging::{LineSafe, escape_control};
+pub use operation::{
+    OPERATION_SCHEMA_V1, OperationDigest, OperationError, OperationEvent, OperationKind,
+    OperationScope, OperationState, OperationTarget, ProductOperation, ProviderOperation,
+    ProviderOperationState, transition as transition_operation,
+};
 
 // Re-export the cross-component conventions.
 //

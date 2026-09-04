@@ -17,9 +17,9 @@ use deis_backend_migration::MIGRATION_AUTH_HEADER;
 use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
 use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, ComponentInventory, FenceReceipt, InspectTenantRequest,
-    TenantInventory,
+    ReleaseWriteFenceRequest, TenantInventory,
 };
-use deis_wire::CanonicalId;
+use deis_wire::{CanonicalId, OperationEvent};
 use rusqlite::{OptionalExtension, Row, params, types::Type};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,6 +32,7 @@ use crate::config::ControlConfig;
 
 use super::identity_migration::{IdentityMigrationPlan, IdentityMigrationState};
 use super::model::now_secs;
+use super::operation::transition_operation_tx;
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
 
@@ -292,6 +293,29 @@ impl IdentityMigrationCoordinator {
             .catalog
             .plan_identity_migration(application_name)
             .await?;
+        if planned.state == IdentityMigrationState::Waiting {
+            let attempts = self.backend_attempts(planned.migration_id).await?;
+            let expected_attempts =
+                planned.catalog_inventory.environments.len() * self.targets.len();
+            if attempts.len() == expected_attempts
+                && planned
+                    .catalog_inventory
+                    .environments
+                    .iter()
+                    .all(|environment| {
+                        self.targets.iter().all(|target| {
+                            attempts.iter().any(|attempt| {
+                                attempt.tenant == environment.legacy_tenant_key
+                                    && attempt.backend == target.backend
+                                    && attempt.target_endpoint_sha256 == target.endpoint_sha256
+                                    && attempt.state == BackendAttemptState::Captured
+                            })
+                        })
+                    })
+            {
+                return Ok(summarize_identity_migration(planned, attempts));
+            }
+        }
         let plan = match planned.state {
             IdentityMigrationState::Planned => {
                 self.catalog
@@ -301,7 +325,12 @@ impl IdentityMigrationCoordinator {
                     )
                     .await?
             }
-            IdentityMigrationState::Running | IdentityMigrationState::Waiting => planned,
+            IdentityMigrationState::Running => planned,
+            IdentityMigrationState::Waiting => {
+                self.catalog
+                    .resume_identity_migration_backend_pass(planned.migration_id)
+                    .await?
+            }
             state => {
                 return Err(MigrationCoordinatorError::Catalog(CatalogError::conflict(
                     format!(
@@ -321,12 +350,17 @@ impl IdentityMigrationCoordinator {
 
         for environment in &plan.catalog_inventory.environments {
             for target in &self.targets {
-                self.coordinate_target(&plan, revision, &environment.legacy_tenant_key, target)
-                    .await?;
+                if let Err(failure) = self
+                    .coordinate_target(&plan, revision, &environment.legacy_tenant_key, target)
+                    .await
+                {
+                    self.move_to_waiting(plan.migration_id, false).await?;
+                    return Err(failure);
+                }
             }
         }
 
-        self.mark_waiting(plan.migration_id).await?;
+        self.move_to_waiting(plan.migration_id, true).await?;
         let plan = self
             .catalog
             .identity_migration(application_name)
@@ -378,6 +412,68 @@ impl IdentityMigrationCoordinator {
             results.push((migration_id, result));
         }
         results
+    }
+
+    /// Release every backend fence possibly acquired by this migration and
+    /// only then make the cancellation terminal. A `FailedPrecondition` from
+    /// release means the exact target has no active fence; `Aborted` means a
+    /// different owner holds it and remains a hard conflict.
+    pub async fn abort(
+        &self,
+        migration_id: CanonicalId,
+    ) -> Result<IdentityMigrationRun, MigrationCoordinatorError> {
+        let plan = self
+            .catalog
+            .identity_migration_by_id(migration_id)
+            .await?
+            .ok_or_else(|| {
+                MigrationCoordinatorError::Catalog(CatalogError::not_found(format!(
+                    "identity migration {migration_id}"
+                )))
+            })?;
+        let revision = u64::try_from(plan.expected_application_revision).map_err(|_| {
+            MigrationCoordinatorError::Catalog(CatalogError::invalid(format!(
+                "identity migration {} has an invalid application revision {}",
+                plan.migration_id, plan.expected_application_revision
+            )))
+        })?;
+        let attempts = self.backend_attempts(migration_id).await?;
+        for attempt in attempts {
+            if attempt.state == BackendAttemptState::Released {
+                continue;
+            }
+            let target = self
+                .targets
+                .iter()
+                .find(|target| target.backend == attempt.backend)
+                .ok_or_else(|| MigrationCoordinatorError::Protocol {
+                    backend: attempt.backend.clone(),
+                    tenant: attempt.tenant.clone(),
+                    message:
+                        "the recovery journal names a backend this coordinator does not implement"
+                            .to_string(),
+                })?;
+            if attempt.target_endpoint_sha256 != target.endpoint_sha256 {
+                return Err(MigrationCoordinatorError::Configuration(format!(
+                    "cannot release {} tenant {} through a changed endpoint; restore the recorded backend incarnation configuration",
+                    attempt.backend, attempt.tenant
+                )));
+            }
+            self.release_target(&plan, revision, &attempt, target)
+                .await?;
+        }
+        self.catalog.finalize_cancelled(&plan).await?;
+        let plan = self
+            .catalog
+            .identity_migration_by_id(migration_id)
+            .await?
+            .ok_or_else(|| {
+                MigrationCoordinatorError::Catalog(CatalogError::not_found(format!(
+                    "identity migration {migration_id}"
+                )))
+            })?;
+        let attempts = self.backend_attempts(migration_id).await?;
+        Ok(summarize_identity_migration(plan, attempts))
     }
 
     async fn coordinate_target(
@@ -467,6 +563,95 @@ impl IdentityMigrationCoordinator {
             }
         };
         self.mark_captured(plan.migration_id, target.backend, tenant, &evidence)
+            .await
+    }
+
+    async fn release_target(
+        &self,
+        plan: &IdentityMigrationPlan,
+        revision: u64,
+        attempt: &BackendMigrationAttempt,
+        target: &BackendTarget,
+    ) -> Result<(), MigrationCoordinatorError> {
+        self.catalog
+            .mark_release_requested(plan.migration_id, target.backend, &attempt.tenant)
+            .await?;
+        let endpoint = Endpoint::from_shared(target.endpoint.clone())
+            .map_err(|error| backend_error(target, &attempt.tenant, error.to_string()))?
+            .connect_timeout(self.rpc_timeout)
+            .timeout(self.rpc_timeout);
+        let channel = match endpoint.connect().await {
+            Ok(channel) => channel,
+            Err(error) => {
+                let failure = backend_error(target, &attempt.tenant, error.to_string());
+                self.record_failure(plan.migration_id, target.backend, &attempt.tenant, &failure)
+                    .await?;
+                return Err(failure);
+            }
+        };
+        let mut client = BackendMigrationClient::new(channel);
+        let request = ReleaseWriteFenceRequest {
+            tenant: attempt.tenant.clone(),
+            migration_id: plan.migration_id.to_string(),
+            expected_application_revision: revision,
+            fence_token: plan.fence_token().to_string(),
+        };
+        let released_epoch = match client
+            .release_write_fence(authed_request(request, target))
+            .await
+        {
+            Ok(response) => {
+                let response = response.into_inner();
+                if !response.released || response.fence_epoch == 0 {
+                    let failure = protocol_error(
+                        target,
+                        &attempt.tenant,
+                        "release response did not prove a positive fence epoch",
+                    );
+                    self.record_failure(
+                        plan.migration_id,
+                        target.backend,
+                        &attempt.tenant,
+                        &failure,
+                    )
+                    .await?;
+                    return Err(failure);
+                }
+                if attempt
+                    .fence_epoch
+                    .is_some_and(|expected| expected != response.fence_epoch)
+                {
+                    let failure = protocol_error(
+                        target,
+                        &attempt.tenant,
+                        "release response changed the acquired fence epoch",
+                    );
+                    self.record_failure(
+                        plan.migration_id,
+                        target.backend,
+                        &attempt.tenant,
+                        &failure,
+                    )
+                    .await?;
+                    return Err(failure);
+                }
+                Some(response.fence_epoch)
+            }
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => None,
+            Err(status) => {
+                let failure = status_error(target, &attempt.tenant, status);
+                self.record_failure(plan.migration_id, target.backend, &attempt.tenant, &failure)
+                    .await?;
+                return Err(failure);
+            }
+        };
+        self.catalog
+            .mark_released(
+                plan.migration_id,
+                target.backend,
+                &attempt.tenant,
+                released_epoch,
+            )
             .await
     }
 
@@ -660,25 +845,39 @@ impl IdentityMigrationCoordinator {
             .map_err(Into::into)
     }
 
-    async fn mark_waiting(
+    async fn move_to_waiting(
         &self,
         migration_id: CanonicalId,
+        require_all_captured: bool,
     ) -> Result<(), MigrationCoordinatorError> {
         self.catalog
             .database()
             .with_connection(move |connection| {
-                let not_captured: i64 = connection.query_row(
-                    "SELECT count(*) FROM identity_migration_backend_attempts
-                      WHERE migration_id = ?1 AND state != 'captured'",
+                let transaction = connection.unchecked_transaction()?;
+                if require_all_captured {
+                    let not_captured: i64 = transaction.query_row(
+                        "SELECT count(*) FROM identity_migration_backend_attempts
+                          WHERE migration_id = ?1 AND state != 'captured'",
+                        [migration_id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    if not_captured != 0 {
+                        return Err(CatalogError::conflict(format!(
+                            "identity migration {migration_id} still has {not_captured} backend attempt(s) without captured evidence"
+                        )));
+                    }
+                }
+                let operation_id: String = transaction.query_row(
+                    "SELECT operation_id FROM identity_migrations WHERE migration_id = ?1",
                     [migration_id.to_string()],
                     |row| row.get(0),
                 )?;
-                if not_captured != 0 {
-                    return Err(CatalogError::conflict(format!(
-                        "identity migration {migration_id} still has {not_captured} backend attempt(s) without captured evidence"
-                    )));
-                }
-                let changed = connection.execute(
+                let operation_id = operation_id.parse().map_err(|error| {
+                    CatalogError::invalid(format!(
+                        "identity migration {migration_id} has invalid operation identity: {error}"
+                    ))
+                })?;
+                let changed = transaction.execute(
                     "UPDATE identity_migrations
                         SET state = 'waiting', record_revision = record_revision + 1,
                             updated_at = ?2
@@ -686,7 +885,7 @@ impl IdentityMigrationCoordinator {
                     params![migration_id.to_string(), now_secs()],
                 )?;
                 if changed == 0 {
-                    let state: Option<String> = connection
+                    let state: Option<String> = transaction
                         .query_row(
                             "SELECT state FROM identity_migrations WHERE migration_id = ?1",
                             [migration_id.to_string()],
@@ -694,6 +893,7 @@ impl IdentityMigrationCoordinator {
                         )
                         .optional()?;
                     if state.as_deref() == Some("waiting") {
+                        transaction.commit()?;
                         return Ok(());
                     }
                 }
@@ -702,6 +902,15 @@ impl IdentityMigrationCoordinator {
                         "identity migration {migration_id} could not enter waiting"
                     )));
                 }
+                transition_operation_tx(
+                    &transaction,
+                    operation_id,
+                    None,
+                    OperationEvent::Wait,
+                    "inventory",
+                    None,
+                )?;
+                transaction.commit()?;
                 Ok(())
             })
             .await
@@ -732,6 +941,119 @@ impl CatalogStore {
                 rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
             })
             .await
+    }
+
+    async fn mark_release_requested(
+        &self,
+        migration_id: CanonicalId,
+        backend: &str,
+        tenant: &str,
+    ) -> Result<(), MigrationCoordinatorError> {
+        let backend = backend.to_string();
+        let tenant = tenant.to_string();
+        self.database()
+            .with_connection(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE identity_migration_backend_attempts
+                    SET state = 'release-requested', last_error_code = NULL,
+                        last_error_message = NULL, updated_at = ?4
+                  WHERE migration_id = ?1 AND backend = ?2 AND tenant = ?3
+                    AND state != 'released'",
+                    params![migration_id.to_string(), backend, tenant, now_secs()],
+                )?;
+                if changed != 1 {
+                    return Err(CatalogError::conflict(format!(
+                        "backend migration release transition changed {changed} rows instead of one"
+                    )));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_released(
+        &self,
+        migration_id: CanonicalId,
+        backend: &str,
+        tenant: &str,
+        released_epoch: Option<u64>,
+    ) -> Result<(), MigrationCoordinatorError> {
+        let backend = backend.to_string();
+        let tenant = tenant.to_string();
+        self.database()
+            .with_connection(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE identity_migration_backend_attempts
+                    SET state = 'released', fence_epoch = coalesce(?4, fence_epoch),
+                        last_error_code = NULL, last_error_message = NULL, updated_at = ?5
+                  WHERE migration_id = ?1 AND backend = ?2 AND tenant = ?3
+                    AND state = 'release-requested'",
+                    params![
+                        migration_id.to_string(),
+                        backend,
+                        tenant,
+                        released_epoch,
+                        now_secs()
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(CatalogError::conflict(format!(
+                        "backend migration release completion changed {changed} rows instead of one"
+                    )));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn finalize_cancelled(
+        &self,
+        plan: &IdentityMigrationPlan,
+    ) -> Result<(), MigrationCoordinatorError> {
+        let migration_id = plan.migration_id;
+        let operation_id = plan.operation_id;
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let unreleased: i64 = transaction.query_row(
+                    "SELECT count(*) FROM identity_migration_backend_attempts
+                      WHERE migration_id = ?1 AND state != 'released'",
+                    [migration_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if unreleased != 0 {
+                    return Err(CatalogError::conflict(format!(
+                        "identity migration {migration_id} still has {unreleased} backend fence(s) without release proof"
+                    )));
+                }
+                let changed = transaction.execute(
+                    "UPDATE identity_migrations
+                        SET state = 'failed', error_code = 'OPERATION_CANCELLED',
+                            record_revision = record_revision + 1, updated_at = ?2
+                      WHERE migration_id = ?1
+                        AND state IN ('planned', 'running', 'waiting')",
+                    params![migration_id.to_string(), now_secs()],
+                )?;
+                if changed != 1 {
+                    return Err(CatalogError::conflict(format!(
+                        "identity migration {migration_id} cannot finish cancellation from its current state"
+                    )));
+                }
+                transition_operation_tx(
+                    &transaction,
+                    operation_id,
+                    None,
+                    OperationEvent::Cancelled,
+                    "release-fences",
+                    None,
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -1143,6 +1465,7 @@ mod tests {
         components: Vec<ComponentInventory>,
         request: Arc<Mutex<Option<AcquireWriteFenceRequest>>>,
         acquire_calls: Arc<AtomicUsize>,
+        release_calls: Arc<AtomicUsize>,
     }
 
     impl FakeBackend {
@@ -1153,6 +1476,7 @@ mod tests {
                 components,
                 request: Arc::new(Mutex::new(None)),
                 acquire_calls: Arc::new(AtomicUsize::new(0)),
+                release_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1236,9 +1560,30 @@ mod tests {
 
         async fn release_write_fence(
             &self,
-            _request: Request<ReleaseWriteFenceRequest>,
+            request: Request<ReleaseWriteFenceRequest>,
         ) -> Result<Response<ReleaseWriteFenceResponse>, Status> {
-            Err(Status::unimplemented("test does not cut over or abort"))
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
+            self.authorize(&request)?;
+            let release = request.into_inner();
+            let mut recorded = self
+                .request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(acquired) = recorded.as_ref() else {
+                return Err(Status::failed_precondition("tenant is not fenced"));
+            };
+            if acquired.tenant != release.tenant
+                || acquired.migration_id != release.migration_id
+                || acquired.expected_application_revision != release.expected_application_revision
+                || acquired.fence_token != release.fence_token
+            {
+                return Err(Status::aborted("release request changed"));
+            }
+            *recorded = None;
+            Ok(Response::new(ReleaseWriteFenceResponse {
+                released: true,
+                fence_epoch: 7,
+            }))
         }
     }
 
@@ -1325,7 +1670,16 @@ mod tests {
         assert!(error.to_string().contains("gRPC Unauthenticated"));
 
         let plan = catalog.identity_migration("shop").await.unwrap().unwrap();
-        assert_eq!(plan.state, IdentityMigrationState::Running);
+        assert_eq!(plan.state, IdentityMigrationState::Waiting);
+        assert_eq!(
+            catalog
+                .product_operation(plan.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            deis_wire::OperationState::Waiting
+        );
         let partial = coordinator
             .backend_attempts(plan.migration_id)
             .await
@@ -1344,6 +1698,15 @@ mod tests {
                 .with_rpc_timeout(Duration::from_secs(2));
         let run = coordinator.coordinate("shop").await.unwrap();
         assert_eq!(run.plan.state, IdentityMigrationState::Waiting);
+        assert_eq!(
+            catalog
+                .product_operation(run.plan.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            deis_wire::OperationState::Waiting
+        );
         assert_eq!(run.captured_components, ["blob", "kv", "queue", "sql"]);
         assert!(!run.ready_for_copy);
         assert_eq!(run.attempts.len(), 2);
@@ -1384,11 +1747,11 @@ mod tests {
             resumed
                 .attempts
                 .iter()
-                .all(|attempt| attempt.attempt_count == 3),
-            "each pass must leave a durable before-network attempt"
+                .all(|attempt| attempt.attempt_count == 2),
+            "a completed waiting operation must not make another network attempt"
         );
-        assert_eq!(store_calls.load(Ordering::SeqCst), 3);
-        assert_eq!(queue_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(store_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(queue_calls.load(Ordering::SeqCst), 2);
 
         let retargeted = config(
             "http://127.0.0.1:1".to_string(),
@@ -1413,6 +1776,102 @@ mod tests {
 
         let _ = stop_store.send(());
         let _ = stop_queue.send(());
+        store_handle.await.unwrap();
+        queue_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_each_backend_before_unlocking_the_catalog() {
+        let directory = TempDir::new().unwrap();
+        let database = Arc::new(
+            Database::init(directory.path().join("control.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStore::new(database));
+        catalog.create_app("shop").await.unwrap();
+        catalog
+            .create_environment("shop", "production")
+            .await
+            .unwrap();
+
+        let store = FakeBackend::new(
+            "deis-store",
+            STORE_TOKEN,
+            vec![
+                component("kv", 'c'),
+                component("sql", 'd'),
+                component("blob", 'e'),
+            ],
+        );
+        let queue = FakeBackend::new("deis-queue", QUEUE_TOKEN, vec![component("queue", 'f')]);
+        let store_releases = Arc::clone(&store.release_calls);
+        let queue_releases = Arc::clone(&queue.release_calls);
+        let (store_endpoint, stop_store, store_handle) = serve(store).await;
+        let (queue_endpoint, stop_queue, queue_handle) = serve(queue).await;
+        let coordinator = IdentityMigrationCoordinator::from_config(
+            Arc::clone(&catalog),
+            &config(store_endpoint, queue_endpoint, QUEUE_TOKEN),
+        )
+        .unwrap()
+        .with_rpc_timeout(Duration::from_secs(2));
+
+        let run = coordinator.coordinate("shop").await.unwrap();
+        let operation = catalog
+            .product_operation(run.plan.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.state, deis_wire::OperationState::Waiting);
+        catalog
+            .request_identity_migration_cancellation(operation.operation_id, operation.revision)
+            .await
+            .unwrap();
+        let cancelling = catalog
+            .product_operation(operation.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelling.state, deis_wire::OperationState::Cancelling);
+        assert!(
+            catalog
+                .create_environment("shop", "preview")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("catalog fence is active")
+        );
+
+        let cancelled = coordinator.abort(run.plan.migration_id).await.unwrap();
+        assert_eq!(cancelled.plan.state, IdentityMigrationState::Failed);
+        assert_eq!(
+            cancelled.plan.error_code.as_deref(),
+            Some("OPERATION_CANCELLED")
+        );
+        assert!(
+            cancelled
+                .attempts
+                .iter()
+                .all(|attempt| attempt.state == BackendAttemptState::Released)
+        );
+        let operation = catalog
+            .product_operation(operation.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.state, deis_wire::OperationState::Cancelled);
+        assert!(operation.finished_at.is_some());
+        assert!(!operation.cancellable);
+        assert_eq!(store_releases.load(Ordering::SeqCst), 1);
+        assert_eq!(queue_releases.load(Ordering::SeqCst), 1);
+        catalog.create_environment("shop", "preview").await.unwrap();
+        let replacement = catalog.plan_identity_migration("shop").await.unwrap();
+        assert_ne!(replacement.migration_id, run.plan.migration_id);
+        assert_ne!(replacement.operation_id, run.plan.operation_id);
+        assert_eq!(replacement.state, IdentityMigrationState::Planned);
+
+        stop_store.send(()).unwrap();
+        stop_queue.send(()).unwrap();
         store_handle.await.unwrap();
         queue_handle.await.unwrap();
     }

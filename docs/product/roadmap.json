@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-04T08:50:24+08:00",
+  "updatedAt": "2026-09-04T09:50:00+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -135,9 +135,11 @@
             {"type": "local-path", "value": "crates/deis-store/src/migration.rs"},
             {"type": "local-path", "value": "crates/deis-queue/src/migration.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/catalog/backend_migration.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/catalog/operation.rs"},
+            {"type": "local-path", "value": "crates/deis-wire/src/operation.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/api/migrations.rs"}
           ],
-          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-backend-migration -p deis-wire -p deis-store -p deis-queue -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment、节点持久化、catalog migration plan/revision fence、Deislet 物理 canonical namespace、独立默认关闭的 backend migration 管理认证、持久单调 per-tenant writer fence、在途 SQL transaction drain、KV/SQL/blob/queue inventory，以及 Control 使用独立 per-backend 管理凭证的异步协调、网络调用前后 attempt journal、部分获取失败恢复、严格 evidence 验证、客户端断开后继续、启动恢复和脱敏 GET；live request parser 仍故意拒绝 logical/physical canonical key，完成前仍须验证满足 operation.schema.json 全字段与通用状态图的公共 Operation、restore/backend incarnation 重新 fencing、telemetry/stateful/provider inventory/fence、canonical-first 双读、copy/cutover、rollback/failure、旧 capability 撤销与 tombstone"
+          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-backend-migration -p deis-wire -p deis-store -p deis-queue -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment、节点持久化、catalog migration plan/revision fence、Deislet 物理 canonical namespace、独立默认关闭的 backend migration 管理认证、持久单调 per-tenant writer fence、在途 SQL transaction drain、KV/SQL/blob/queue inventory，以及 Control 使用独立 per-backend 管理凭证的异步协调、网络调用前后 attempt journal、部分获取失败恢复、严格 evidence 验证、客户端断开后继续、启动恢复和脱敏 GET；identity migration 已返回 operation.schema.json 全字段与唯一状态图的公共 Operation，覆盖幂等摘要、request/correlation、乐观并发、可恢复取消与旧记录接管。live request parser 仍故意拒绝 logical/physical canonical key，完成前仍须验证 restore/backend incarnation 重新 fencing、telemetry/stateful/provider inventory/fence、其余 producer 复用 Operation、canonical-first 双读、copy/cutover、rollback/failure、旧 capability 撤销与 tombstone"
         },
         {
           "id": "P0-CI-001",

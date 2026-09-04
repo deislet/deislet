@@ -1,5 +1,6 @@
 use deis_wire::CanonicalId;
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OptionalExtension, Result};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 /// Initialize database schema
@@ -573,6 +574,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // deis-queue yet: those services need the same token in their write path
     // before a data cutover can start.
     ensure_identity_migration_schema(conn)?;
+    ensure_product_operation_schema(conn)?;
 
     info!("Database tables created successfully");
     Ok(())
@@ -743,7 +745,7 @@ fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
             migration_id                 TEXT PRIMARY KEY,
             operation_id                 TEXT NOT NULL UNIQUE,
             app_id                       TEXT NOT NULL,
-            canonical_application_id     TEXT NOT NULL UNIQUE,
+            canonical_application_id     TEXT NOT NULL,
             state                        TEXT NOT NULL
                                                  CHECK(state IN
                                                    ('planned', 'running', 'waiting', 'verified',
@@ -914,6 +916,48 @@ fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
 
+    migrate_identity_migration_history(conn)?;
+
+    conn.execute_batch(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_migrations_active_application
+            ON identity_migrations(canonical_application_id)
+            WHERE state NOT IN ('completed', 'failed');
+
+        CREATE INDEX IF NOT EXISTS idx_identity_migrations_state
+            ON identity_migrations(state, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_identity_migrations_legacy_name
+            ON identity_migrations(app_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_identity_migration_backend_attempts_state
+            ON identity_migration_backend_attempts(migration_id, state, updated_at);
+
+        CREATE TRIGGER IF NOT EXISTS trg_identity_migrations_identity_immutable_v1
+        BEFORE UPDATE OF migration_id, operation_id, app_id,
+                         canonical_application_id, created_at
+        ON identity_migrations
+        WHEN NEW.migration_id != OLD.migration_id
+          OR NEW.operation_id != OLD.operation_id
+          OR NEW.app_id != OLD.app_id
+          OR NEW.canonical_application_id != OLD.canonical_application_id
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'identity migration identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_identity_migration_apps_delete_fence_v1
+        BEFORE DELETE ON apps
+        WHEN EXISTS (
+            SELECT 1 FROM identity_migrations
+            WHERE canonical_application_id = OLD.canonical_id
+              AND state IN ('running', 'waiting', 'verified', 'cutover')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'identity migration catalog fence is active');
+        END;
+        "#,
+    )?;
+
     // These five tables are the complete input to the catalog inventory:
     // environments name tenants, versions declare bindings, deployments say
     // which declaration is live, routes must move in the same cutover, and
@@ -991,6 +1035,501 @@ fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The first identity-migration slice made `canonical_application_id`
+/// permanently UNIQUE. That preserved one current row, but it also made a
+/// cancelled/completed operation impossible to retain while starting a new
+/// one. Rebuild the two related tables once so history is append-only and a
+/// partial unique index enforces the real rule: at most one non-terminal
+/// migration per application.
+fn migrate_identity_migration_history(conn: &Connection) -> Result<()> {
+    let unique_indexes = conn
+        .prepare("PRAGMA index_list(identity_migrations)")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    let mut has_legacy_unique = false;
+    for (index, unique, origin, partial) in unique_indexes {
+        if !unique || partial || origin != "u" {
+            continue;
+        }
+        let columns = conn
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?
+            .query_map([index], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>>>()?;
+        if columns == ["canonical_application_id"] {
+            has_legacy_unique = true;
+            break;
+        }
+    }
+    if !has_legacy_unique {
+        return Ok(());
+    }
+
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS trg_identity_migration_apps_delete_fence_v1;
+
+        CREATE TABLE identity_migrations_history_v2 (
+            migration_id                 TEXT PRIMARY KEY,
+            operation_id                 TEXT NOT NULL UNIQUE,
+            app_id                       TEXT NOT NULL,
+            canonical_application_id     TEXT NOT NULL,
+            state                        TEXT NOT NULL
+                                                 CHECK(state IN
+                                                   ('planned', 'running', 'waiting', 'verified',
+                                                    'cutover', 'completed', 'failed')),
+            record_revision              INTEGER NOT NULL CHECK(record_revision >= 1),
+            expected_application_revision INTEGER NOT NULL
+                                                   CHECK(expected_application_revision >= 1),
+            fence_token                  TEXT NOT NULL CHECK(length(fence_token) >= 32),
+            catalog_inventory            TEXT NOT NULL CHECK(json_valid(catalog_inventory)),
+            error_code                   TEXT,
+            created_at                   INTEGER NOT NULL,
+            updated_at                   INTEGER NOT NULL,
+            CHECK(length(migration_id) = 36
+              AND lower(migration_id) = migration_id
+              AND substr(migration_id, 9, 1) = '-'
+              AND substr(migration_id, 14, 1) = '-'
+              AND substr(migration_id, 15, 1) = '7'
+              AND substr(migration_id, 19, 1) = '-'
+              AND substr(migration_id, 20, 1) GLOB '[89ab]'
+              AND substr(migration_id, 24, 1) = '-'
+              AND length(replace(migration_id, '-', '')) = 32
+              AND replace(migration_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(operation_id) = 36
+              AND lower(operation_id) = operation_id
+              AND substr(operation_id, 9, 1) = '-'
+              AND substr(operation_id, 14, 1) = '-'
+              AND substr(operation_id, 15, 1) = '7'
+              AND substr(operation_id, 19, 1) = '-'
+              AND substr(operation_id, 20, 1) GLOB '[89ab]'
+              AND substr(operation_id, 24, 1) = '-'
+              AND length(replace(operation_id, '-', '')) = 32
+              AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(canonical_application_id) = 36
+              AND lower(canonical_application_id) = canonical_application_id
+              AND substr(canonical_application_id, 9, 1) = '-'
+              AND substr(canonical_application_id, 14, 1) = '-'
+              AND substr(canonical_application_id, 15, 1) = '7'
+              AND substr(canonical_application_id, 19, 1) = '-'
+              AND substr(canonical_application_id, 20, 1) GLOB '[89ab]'
+              AND substr(canonical_application_id, 24, 1) = '-'
+              AND length(replace(canonical_application_id, '-', '')) = 32
+              AND replace(canonical_application_id, '-', '') NOT GLOB '*[^0-9a-f]*')
+        );
+
+        INSERT INTO identity_migrations_history_v2
+        SELECT migration_id, operation_id, app_id, canonical_application_id, state,
+               record_revision, expected_application_revision, fence_token,
+               catalog_inventory, error_code, created_at, updated_at
+          FROM identity_migrations;
+
+        CREATE TABLE identity_migration_backend_attempts_history_v2 (
+            migration_id                  TEXT NOT NULL,
+            backend                       TEXT NOT NULL CHECK(length(backend) BETWEEN 1 AND 128),
+            tenant                        TEXT NOT NULL CHECK(length(tenant) BETWEEN 1 AND 256),
+            expected_application_revision INTEGER NOT NULL
+                                                    CHECK(expected_application_revision >= 1),
+            target_endpoint_sha256         TEXT NOT NULL
+                                                    CHECK(length(target_endpoint_sha256) = 64
+                                                      AND lower(target_endpoint_sha256) = target_endpoint_sha256
+                                                      AND target_endpoint_sha256 NOT GLOB '*[^0-9a-f]*'),
+            state                         TEXT NOT NULL
+                                                  CHECK(state IN
+                                                    ('acquiring', 'fenced', 'inspecting', 'captured',
+                                                     'release-requested', 'released')),
+            attempt_count                 INTEGER NOT NULL CHECK(attempt_count >= 1),
+            fence_epoch                   INTEGER CHECK(fence_epoch IS NULL OR fence_epoch >= 1),
+            acquired_at                   INTEGER,
+            receipt_sha256                TEXT
+                CHECK(receipt_sha256 IS NULL OR
+                      (length(receipt_sha256) = 64
+                       AND lower(receipt_sha256) = receipt_sha256
+                       AND receipt_sha256 NOT GLOB '*[^0-9a-f]*')),
+            evidence_json                 TEXT
+                CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
+            last_error_code               TEXT,
+            last_error_message            TEXT,
+            created_at                    INTEGER NOT NULL,
+            updated_at                    INTEGER NOT NULL,
+            PRIMARY KEY(migration_id, backend, tenant),
+            FOREIGN KEY(migration_id) REFERENCES identity_migrations_history_v2(migration_id)
+                ON DELETE RESTRICT
+        );
+
+        INSERT INTO identity_migration_backend_attempts_history_v2
+        SELECT migration_id, backend, tenant, expected_application_revision,
+               target_endpoint_sha256, state, attempt_count, fence_epoch, acquired_at,
+               receipt_sha256, evidence_json, last_error_code, last_error_message,
+               created_at, updated_at
+          FROM identity_migration_backend_attempts;
+
+        DROP TABLE identity_migration_backend_attempts;
+        DROP TABLE identity_migrations;
+        ALTER TABLE identity_migrations_history_v2 RENAME TO identity_migrations;
+        ALTER TABLE identity_migration_backend_attempts_history_v2
+            RENAME TO identity_migration_backend_attempts;
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Install the shared durable-operation model and adopt migration operations
+/// created by the previous additive identity-migration slice.
+///
+/// Deislet currently has one implicit organization. It is persisted here as
+/// a real canonical resource rather than manufacturing an ID in API output;
+/// adding organization membership later therefore keeps every operation's
+/// original scope stable. Actor subjects are likewise mapped once to UUIDv7
+/// IDs without storing credentials.
+fn ensure_product_operation_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS product_organizations (
+            organization_id TEXT PRIMARY KEY,
+            slug            TEXT NOT NULL UNIQUE,
+            created_at      INTEGER NOT NULL,
+            CHECK(length(organization_id) = 36
+              AND lower(organization_id) = organization_id
+              AND substr(organization_id, 9, 1) = '-'
+              AND substr(organization_id, 14, 1) = '-'
+              AND substr(organization_id, 15, 1) = '7'
+              AND substr(organization_id, 19, 1) = '-'
+              AND substr(organization_id, 20, 1) GLOB '[89ab]'
+              AND substr(organization_id, 24, 1) = '-'
+              AND length(replace(organization_id, '-', '')) = 32
+              AND replace(organization_id, '-', '') NOT GLOB '*[^0-9a-f]*')
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_actors (
+            actor_id   TEXT PRIMARY KEY,
+            subject    TEXT NOT NULL UNIQUE CHECK(length(subject) BETWEEN 1 AND 512),
+            created_at INTEGER NOT NULL,
+            CHECK(length(actor_id) = 36
+              AND lower(actor_id) = actor_id
+              AND substr(actor_id, 9, 1) = '-'
+              AND substr(actor_id, 14, 1) = '-'
+              AND substr(actor_id, 15, 1) = '7'
+              AND substr(actor_id, 19, 1) = '-'
+              AND substr(actor_id, 20, 1) GLOB '[89ab]'
+              AND substr(actor_id, 24, 1) = '-'
+              AND length(replace(actor_id, '-', '')) = 32
+              AND replace(actor_id, '-', '') NOT GLOB '*[^0-9a-f]*')
+        );
+
+        CREATE TABLE IF NOT EXISTS product_operations (
+            operation_id             TEXT PRIMARY KEY,
+            kind                     TEXT NOT NULL
+                                      CHECK(kind IN ('build', 'provision', 'deploy', 'promote',
+                                                     'rollback', 'migrate', 'export', 'delete',
+                                                     'restore', 'purge', 'provider')),
+            organization_id          TEXT NOT NULL REFERENCES product_organizations(organization_id),
+            application_id           TEXT,
+            environment_id           TEXT,
+            target_kind              TEXT NOT NULL
+                                      CHECK(length(target_kind) >= 2
+                                        AND substr(target_kind, 1, 1) GLOB '[a-z]'
+                                        AND target_kind NOT GLOB '*[^a-z-]*'),
+            target_id                TEXT NOT NULL,
+            expected_revision        INTEGER NOT NULL CHECK(expected_revision >= 0),
+            state                    TEXT NOT NULL
+                                      CHECK(state IN ('queued', 'running', 'waiting', 'cancelling',
+                                                      'succeeded', 'failed', 'cancelled')),
+            phase                    TEXT NOT NULL
+                                      CHECK(length(phase) >= 1
+                                        AND substr(phase, 1, 1) GLOB '[a-z]'
+                                        AND phase NOT GLOB '*[^a-z0-9-]*'),
+            revision                 INTEGER NOT NULL CHECK(revision >= 1),
+            idempotency_key_sha256   TEXT NOT NULL,
+            request_fingerprint_sha256 TEXT NOT NULL,
+            actor_id                 TEXT NOT NULL REFERENCES operation_actors(actor_id),
+            request_id               TEXT NOT NULL,
+            correlation_id           TEXT NOT NULL,
+            progress                 INTEGER CHECK(progress BETWEEN 0 AND 10000),
+            cancellable              INTEGER NOT NULL CHECK(cancellable IN (0, 1)),
+            retryable                INTEGER NOT NULL CHECK(retryable IN (0, 1)),
+            child_operation_ids      TEXT NOT NULL CHECK(json_valid(child_operation_ids)),
+            provider_operations      TEXT NOT NULL CHECK(json_valid(provider_operations)),
+            error_json               TEXT CHECK(error_json IS NULL OR json_valid(error_json)),
+            created_at               INTEGER NOT NULL,
+            started_at               INTEGER,
+            updated_at               INTEGER NOT NULL,
+            finished_at              INTEGER,
+            CHECK(length(idempotency_key_sha256) = 64
+              AND lower(idempotency_key_sha256) = idempotency_key_sha256
+              AND idempotency_key_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(request_fingerprint_sha256) = 64
+              AND lower(request_fingerprint_sha256) = request_fingerprint_sha256
+              AND request_fingerprint_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(operation_id) = 36
+              AND lower(operation_id) = operation_id
+              AND substr(operation_id, 9, 1) = '-'
+              AND substr(operation_id, 14, 1) = '-'
+              AND substr(operation_id, 15, 1) = '7'
+              AND substr(operation_id, 19, 1) = '-'
+              AND substr(operation_id, 20, 1) GLOB '[89ab]'
+              AND substr(operation_id, 24, 1) = '-'
+              AND length(replace(operation_id, '-', '')) = 32
+              AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(application_id IS NULL OR
+                  (length(application_id) = 36
+                   AND lower(application_id) = application_id
+                   AND substr(application_id, 9, 1) = '-'
+                   AND substr(application_id, 14, 1) = '-'
+                   AND substr(application_id, 15, 1) = '7'
+                   AND substr(application_id, 19, 1) = '-'
+                   AND substr(application_id, 20, 1) GLOB '[89ab]'
+                   AND substr(application_id, 24, 1) = '-'
+                   AND length(replace(application_id, '-', '')) = 32
+                   AND replace(application_id, '-', '') NOT GLOB '*[^0-9a-f]*')),
+            CHECK(environment_id IS NULL OR
+                  (length(environment_id) = 36
+                   AND lower(environment_id) = environment_id
+                   AND substr(environment_id, 9, 1) = '-'
+                   AND substr(environment_id, 14, 1) = '-'
+                   AND substr(environment_id, 15, 1) = '7'
+                   AND substr(environment_id, 19, 1) = '-'
+                   AND substr(environment_id, 20, 1) GLOB '[89ab]'
+                   AND substr(environment_id, 24, 1) = '-'
+                   AND length(replace(environment_id, '-', '')) = 32
+                   AND replace(environment_id, '-', '') NOT GLOB '*[^0-9a-f]*')),
+            CHECK(length(target_id) = 36
+              AND lower(target_id) = target_id
+              AND substr(target_id, 9, 1) = '-'
+              AND substr(target_id, 14, 1) = '-'
+              AND substr(target_id, 15, 1) = '7'
+              AND substr(target_id, 19, 1) = '-'
+              AND substr(target_id, 20, 1) GLOB '[89ab]'
+              AND substr(target_id, 24, 1) = '-'
+              AND length(replace(target_id, '-', '')) = 32
+              AND replace(target_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(request_id) = 36
+              AND lower(request_id) = request_id
+              AND substr(request_id, 9, 1) = '-'
+              AND substr(request_id, 14, 1) = '-'
+              AND substr(request_id, 15, 1) = '7'
+              AND substr(request_id, 19, 1) = '-'
+              AND substr(request_id, 20, 1) GLOB '[89ab]'
+              AND substr(request_id, 24, 1) = '-'
+              AND length(replace(request_id, '-', '')) = 32
+              AND replace(request_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(correlation_id) = 36
+              AND lower(correlation_id) = correlation_id
+              AND substr(correlation_id, 9, 1) = '-'
+              AND substr(correlation_id, 14, 1) = '-'
+              AND substr(correlation_id, 15, 1) = '7'
+              AND substr(correlation_id, 19, 1) = '-'
+              AND substr(correlation_id, 20, 1) GLOB '[89ab]'
+              AND substr(correlation_id, 24, 1) = '-'
+              AND length(replace(correlation_id, '-', '')) = 32
+              AND replace(correlation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(progress IS NULL OR progress BETWEEN 0 AND 10000),
+            CHECK((state IN ('succeeded', 'failed', 'cancelled')
+                   AND finished_at IS NOT NULL AND cancellable = 0)
+               OR (state NOT IN ('succeeded', 'failed', 'cancelled')
+                   AND finished_at IS NULL)),
+            CHECK((state = 'failed' AND error_json IS NOT NULL)
+               OR (state != 'failed' AND error_json IS NULL)),
+            CHECK((state = 'queued' AND started_at IS NULL)
+               OR (state != 'queued' AND started_at IS NOT NULL)),
+            UNIQUE(organization_id, actor_id, kind, idempotency_key_sha256)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_product_operations_scope
+            ON product_operations(organization_id, application_id, environment_id,
+                                  created_at, operation_id);
+        CREATE INDEX IF NOT EXISTS idx_product_operations_state
+            ON product_operations(state, updated_at, operation_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_product_operations_identity_immutable_v1
+        BEFORE UPDATE OF operation_id, kind, organization_id, application_id,
+                         environment_id, target_kind, target_id, actor_id,
+                         request_id, correlation_id, idempotency_key_sha256,
+                         request_fingerprint_sha256, created_at
+        ON product_operations
+        WHEN NEW.operation_id != OLD.operation_id
+          OR NEW.kind != OLD.kind
+          OR NEW.organization_id != OLD.organization_id
+          OR NEW.application_id IS NOT OLD.application_id
+          OR NEW.environment_id IS NOT OLD.environment_id
+          OR NEW.target_kind != OLD.target_kind
+          OR NEW.target_id != OLD.target_id
+          OR NEW.actor_id != OLD.actor_id
+          OR NEW.request_id != OLD.request_id
+          OR NEW.correlation_id != OLD.correlation_id
+          OR NEW.idempotency_key_sha256 != OLD.idempotency_key_sha256
+          OR NEW.request_fingerprint_sha256 != OLD.request_fingerprint_sha256
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'product operation identity and request are immutable');
+        END;
+        "#,
+    )?;
+
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .try_into()
+        .unwrap_or(i64::MAX);
+    let organization_candidate = conn
+        .query_row(
+            "SELECT organization_id FROM product_organizations WHERE slug = 'default'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| CanonicalId::new_v7().to_string());
+    conn.execute(
+        "INSERT OR IGNORE INTO product_organizations (organization_id, slug, created_at)
+         VALUES (?1, 'default', ?2)",
+        rusqlite::params![organization_candidate, now],
+    )?;
+    let organization_id: String = conn.query_row(
+        "SELECT organization_id FROM product_organizations WHERE slug = 'default'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    const LEGACY_ACTOR_SUBJECT: &str = "system:legacy-operation-adoption";
+    let legacy_actor_candidate = conn
+        .query_row(
+            "SELECT actor_id FROM operation_actors WHERE subject = ?1",
+            [LEGACY_ACTOR_SUBJECT],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| CanonicalId::new_v7().to_string());
+    conn.execute(
+        "INSERT OR IGNORE INTO operation_actors (actor_id, subject, created_at)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![legacy_actor_candidate, LEGACY_ACTOR_SUBJECT, now],
+    )?;
+    let legacy_actor_id: String = conn.query_row(
+        "SELECT actor_id FROM operation_actors WHERE subject = ?1",
+        [LEGACY_ACTOR_SUBJECT],
+        |row| row.get(0),
+    )?;
+
+    let migrations = conn
+        .prepare(
+            "SELECT operation_id, canonical_application_id, state,
+                    expected_application_revision, error_code, created_at, updated_at
+               FROM identity_migrations
+              WHERE operation_id NOT IN (SELECT operation_id FROM product_operations)",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    for (
+        operation_id,
+        application_id,
+        migration_state,
+        expected_revision,
+        error_code,
+        created_at,
+        updated_at,
+    ) in migrations
+    {
+        let (state, started_at, finished_at, cancellable, retryable, error_json) =
+            match migration_state.as_str() {
+                "planned" => ("queued", None, None, 1, 1, None),
+                "running" => ("running", Some(created_at), None, 1, 1, None),
+                "completed" => ("succeeded", Some(created_at), Some(updated_at), 0, 0, None),
+                "failed" if error_code.as_deref() == Some("OPERATION_CANCELLED") => {
+                    ("cancelled", Some(created_at), Some(updated_at), 0, 0, None)
+                }
+                "failed" => (
+                    "failed",
+                    Some(created_at),
+                    Some(updated_at),
+                    0,
+                    1,
+                    Some(
+                        serde_json::json!({
+                            "code": error_code
+                                .filter(|value| valid_operation_error_code(value))
+                                .unwrap_or_else(|| "MIGRATION_FAILED".to_string()),
+                            "message": "An adopted identity migration had already failed",
+                            "retryable": true,
+                            "retryAfterSeconds": null,
+                            "remediation": "Inspect the identity migration evidence before retrying"
+                        })
+                        .to_string(),
+                    ),
+                ),
+                _ => ("waiting", Some(created_at), None, 1, 1, None),
+            };
+        let idempotency_digest = format!(
+            "{:x}",
+            Sha256::digest(format!("legacy-operation:{operation_id}").as_bytes())
+        );
+        let request_fingerprint = format!(
+            "{:x}",
+            Sha256::digest(format!("migrate:{application_id}:{expected_revision}").as_bytes())
+        );
+        let request_id = CanonicalId::new_v7().to_string();
+        let correlation_id = CanonicalId::new_v7().to_string();
+        conn.execute(
+            "INSERT INTO product_operations
+               (operation_id, kind, organization_id, application_id, environment_id,
+                target_kind, target_id, expected_revision, state, phase, revision,
+                idempotency_key_sha256, request_fingerprint_sha256, actor_id,
+                request_id, correlation_id, progress, cancellable, retryable,
+                child_operation_ids, provider_operations, error_json,
+                created_at, started_at, updated_at, finished_at)
+             VALUES (?1, 'migrate', ?2, ?3, NULL, 'application', ?3, ?4, ?5,
+                     'inventory', 1, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12,
+                     '[]', '[]', ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![
+                operation_id,
+                organization_id,
+                application_id,
+                expected_revision,
+                state,
+                idempotency_digest,
+                request_fingerprint,
+                legacy_actor_id,
+                request_id,
+                correlation_id,
+                cancellable,
+                retryable,
+                error_json,
+                created_at,
+                started_at,
+                updated_at,
+                finished_at,
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn valid_operation_error_code(value: &str) -> bool {
+    value.len() >= 2
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_uppercase() || (index > 0 && (byte.is_ascii_digit() || byte == b'_'))
+        })
 }
 
 /// Write down, once, what this installation is already serving.
@@ -1375,6 +1914,124 @@ mod tests {
     use super::*;
     use rusqlite::OptionalExtension;
 
+    #[test]
+    fn legacy_single_migration_table_becomes_append_only_terminal_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE identity_migrations (
+                migration_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL UNIQUE,
+                app_id TEXT NOT NULL,
+                canonical_application_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
+                record_revision INTEGER NOT NULL,
+                expected_application_revision INTEGER NOT NULL,
+                fence_token TEXT NOT NULL,
+                catalog_inventory TEXT NOT NULL,
+                error_code TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE identity_migration_backend_attempts (
+                migration_id TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                tenant TEXT NOT NULL,
+                expected_application_revision INTEGER NOT NULL,
+                target_endpoint_sha256 TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                fence_epoch INTEGER,
+                acquired_at INTEGER,
+                receipt_sha256 TEXT,
+                evidence_json TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(migration_id, backend, tenant),
+                FOREIGN KEY(migration_id) REFERENCES identity_migrations(migration_id)
+            );
+            "#,
+        )
+        .unwrap();
+        let application_id = CanonicalId::new_v7().to_string();
+        let legacy_migration_id = CanonicalId::new_v7().to_string();
+        conn.execute(
+            "INSERT INTO identity_migrations
+               (migration_id, operation_id, app_id, canonical_application_id, state,
+                record_revision, expected_application_revision, fence_token,
+                catalog_inventory, error_code, created_at, updated_at)
+             VALUES (?1, ?2, 'shop', ?3, 'failed', 4, 7, ?4, '{}',
+                     'LEGACY_FAILURE', 10, 11)",
+            rusqlite::params![
+                legacy_migration_id,
+                CanonicalId::new_v7().to_string(),
+                application_id,
+                "f".repeat(32),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO identity_migration_backend_attempts
+               (migration_id, backend, tenant, expected_application_revision,
+                target_endpoint_sha256, state, attempt_count, created_at, updated_at)
+             VALUES (?1, 'deis-store', 'shop.production', 7, ?2, 'captured', 2, 10, 11)",
+            rusqlite::params![legacy_migration_id, "a".repeat(64)],
+        )
+        .unwrap();
+        create_tables(&conn).unwrap();
+
+        let insert = |state: &str| {
+            conn.execute(
+                "INSERT INTO identity_migrations
+                   (migration_id, operation_id, app_id, canonical_application_id, state,
+                    record_revision, expected_application_revision, fence_token,
+                    catalog_inventory, created_at, updated_at)
+                 VALUES (?1, ?2, 'shop', ?3, ?4, 1, 1, ?5, '{}', 1, 1)",
+                rusqlite::params![
+                    CanonicalId::new_v7().to_string(),
+                    CanonicalId::new_v7().to_string(),
+                    application_id,
+                    state,
+                    "f".repeat(32),
+                ],
+            )
+        };
+        insert("failed").unwrap();
+        insert("failed").unwrap();
+        insert("planned").unwrap();
+        assert!(
+            insert("running")
+                .unwrap_err()
+                .to_string()
+                .contains("UNIQUE")
+        );
+        let history: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM identity_migrations WHERE canonical_application_id = ?1",
+                [application_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, 4);
+        let preserved_attempts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM identity_migration_backend_attempts WHERE migration_id = ?1",
+                [legacy_migration_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_attempts, 1);
+        let foreign_key_violations: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+    }
+
     /// A platform that has been routing traffic without a registry, meeting
     /// the rule that says a hostname nobody granted may be claimed by nobody.
     ///
@@ -1705,6 +2362,9 @@ mod tests {
             "domain_grants",
             "identity_migrations",
             "identity_migration_backend_attempts",
+            "product_organizations",
+            "operation_actors",
+            "product_operations",
             "canonical_binding_ids",
         ] {
             assert!(

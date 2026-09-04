@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use deis_wire::{CanonicalId, CanonicalTenantId};
+use deis_wire::{CanonicalId, CanonicalTenantId, OperationEvent};
 use rand::RngCore;
 use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,10 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use super::model::now_secs;
+use super::operation::{
+    OperationRequestContext, create_migration_operation_tx, ensure_migration_operation_request_tx,
+    find_migration_operation_request_tx, transition_operation_tx,
+};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
 
@@ -229,14 +233,57 @@ impl CatalogStore {
         &self,
         app_id: &str,
     ) -> CatalogResult<IdentityMigrationPlan> {
+        self.plan_identity_migration_inner(app_id, None).await
+    }
+
+    /// Accept a public migration request with its durable operation context.
+    /// The raw idempotency key has already been reduced to a digest.
+    pub async fn plan_identity_migration_with_operation(
+        &self,
+        app_id: &str,
+        context: OperationRequestContext,
+    ) -> CatalogResult<IdentityMigrationPlan> {
+        self.plan_identity_migration_inner(app_id, Some(context))
+            .await
+    }
+
+    async fn plan_identity_migration_inner(
+        &self,
+        app_id: &str,
+        context: Option<OperationRequestContext>,
+    ) -> CatalogResult<IdentityMigrationPlan> {
         let app_id = app_id.to_string();
         self.database()
             .with_connection(move |conn| {
                 let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
                 let (canonical_application_id, application_revision) = load_application(&tx, &app_id)?;
-                let existing = load_plan_by_app(&tx, &app_id)?;
+                let context = context.map(|context| {
+                    context.for_target("application", canonical_application_id)
+                });
+                if let Some(context) = &context
+                    && let Some(operation_id) =
+                        find_migration_operation_request_tx(&tx, context)?
+                {
+                    let plan = load_plan_by_operation(&tx, operation_id)?.ok_or_else(|| {
+                        CatalogError::invalid(format!(
+                            "idempotent operation {operation_id} has no identity migration record"
+                        ))
+                    })?;
+                    if plan.canonical_application_id != canonical_application_id {
+                        return Err(CatalogError::conflict(format!(
+                            "the Idempotency-Key belongs to operation {operation_id} for another canonical application"
+                        )));
+                    }
+                    validate_binding_rows(&tx, &plan)?;
+                    tx.commit()?;
+                    return Ok(plan);
+                }
+                let existing = load_active_plan_by_app(&tx, &app_id)?;
 
                 if let Some(plan) = &existing {
+                    if let Some(context) = &context {
+                        ensure_migration_operation_request_tx(&tx, plan.operation_id, context)?;
+                    }
                     if plan.expected_application_revision == application_revision {
                         validate_binding_rows(&tx, plan)?;
                         tx.commit()?;
@@ -305,12 +352,30 @@ impl CatalogStore {
                                 plan.updated_at,
                             ],
                         )?;
+                        tx.execute(
+                            "UPDATE product_operations
+                                SET expected_revision = ?2, revision = revision + 1,
+                                    updated_at = ?3
+                              WHERE operation_id = ?1 AND state = 'queued'",
+                            params![
+                                plan.operation_id.to_string(),
+                                plan.expected_application_revision,
+                                plan.updated_at,
+                            ],
+                        )?;
                         plan
                     }
                     None => {
+                        let operation_id = CanonicalId::new_v7();
+                        let operation_context = context.unwrap_or_else(|| {
+                            OperationRequestContext::system_for_migration(
+                                canonical_application_id,
+                                application_revision,
+                            )
+                        });
                         let plan = IdentityMigrationPlan {
                             migration_id: CanonicalId::new_v7(),
-                            operation_id: CanonicalId::new_v7(),
+                            operation_id,
                             application_name: app_id.clone(),
                             canonical_application_id,
                             state: IdentityMigrationState::Planned,
@@ -322,6 +387,14 @@ impl CatalogStore {
                             created_at: updated_at,
                             updated_at,
                         };
+                        create_migration_operation_tx(
+                            &tx,
+                            operation_id,
+                            canonical_application_id,
+                            application_revision,
+                            updated_at,
+                            &operation_context,
+                        )?;
                         tx.execute(
                             "INSERT INTO identity_migrations
                                (migration_id, operation_id, app_id, canonical_application_id,
@@ -376,6 +449,36 @@ impl CatalogStore {
             .await
     }
 
+    pub async fn identity_migration_by_id(
+        &self,
+        migration_id: CanonicalId,
+    ) -> CatalogResult<Option<IdentityMigrationPlan>> {
+        self.database()
+            .with_connection(move |conn| {
+                let plan = load_plan_by_id(conn, migration_id)?;
+                if let Some(plan) = &plan {
+                    validate_binding_rows(conn, plan)?;
+                }
+                Ok(plan)
+            })
+            .await
+    }
+
+    pub async fn identity_migration_by_operation(
+        &self,
+        operation_id: CanonicalId,
+    ) -> CatalogResult<Option<IdentityMigrationPlan>> {
+        self.database()
+            .with_connection(move |conn| {
+                let plan = load_plan_by_operation(conn, operation_id)?;
+                if let Some(plan) = &plan {
+                    validate_binding_rows(conn, plan)?;
+                }
+                Ok(plan)
+            })
+            .await
+    }
+
     /// Plans left before backend coordination completed. A Control process
     /// calls this at startup so closing the initiating client or restarting
     /// Control cannot cancel a durable migration operation.
@@ -385,6 +488,11 @@ impl CatalogStore {
                 let mut statement = conn.prepare(&format!(
                     "SELECT {MIGRATION_COLUMNS} FROM identity_migrations
                       WHERE state IN ('planned', 'running')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM product_operations
+                             WHERE product_operations.operation_id = identity_migrations.operation_id
+                               AND product_operations.state = 'cancelling'
+                        )
                       ORDER BY created_at, migration_id"
                 ))?;
                 let plans = statement
@@ -394,6 +502,83 @@ impl CatalogStore {
                     validate_binding_rows(conn, plan)?;
                 }
                 Ok(plans)
+            })
+            .await
+    }
+
+    /// Migration records whose generic operation was already moved to
+    /// `cancelling` but whose backend fences were not all released before a
+    /// Control process stopped.
+    pub async fn cancelling_identity_migrations(
+        &self,
+    ) -> CatalogResult<Vec<IdentityMigrationPlan>> {
+        self.database()
+            .with_connection(|conn| {
+                let migration_columns = MIGRATION_COLUMNS.replace(", ", ", migration.");
+                let mut statement = conn.prepare(&format!(
+                    "SELECT migration.{migration_columns}
+                       FROM identity_migrations AS migration
+                       JOIN product_operations AS operation
+                         ON operation.operation_id = migration.operation_id
+                      WHERE operation.state = 'cancelling'
+                      ORDER BY migration.created_at, migration.migration_id"
+                ))?;
+                let plans = statement
+                    .query_map([], map_plan)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for plan in &plans {
+                    validate_binding_rows(conn, plan)?;
+                }
+                Ok(plans)
+            })
+            .await
+    }
+
+    /// Atomically accept a cancellation request against the public
+    /// operation revision. The migration stays in its current underlying
+    /// state until every possibly acquired backend fence is released.
+    pub async fn request_identity_migration_cancellation(
+        &self,
+        operation_id: CanonicalId,
+        expected_operation_revision: u64,
+    ) -> CatalogResult<IdentityMigrationPlan> {
+        self.database()
+            .with_connection(move |conn| {
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let plan = load_plan_by_operation(&tx, operation_id)?.ok_or_else(|| {
+                    CatalogError::not_found(format!(
+                        "identity migration for operation {operation_id}"
+                    ))
+                })?;
+                let (operation_state, operation_revision): (String, i64) = tx.query_row(
+                    "SELECT state, revision FROM product_operations WHERE operation_id = ?1",
+                    [operation_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let operation_revision = u64::try_from(operation_revision).map_err(|_| {
+                    CatalogError::invalid(format!(
+                        "operation {operation_id} has an invalid revision"
+                    ))
+                })?;
+                if operation_revision != expected_operation_revision {
+                    return Err(CatalogError::revision_conflict(format!(
+                        "operation {operation_id} is revision {operation_revision}, not the If-Match revision {expected_operation_revision}"
+                    )));
+                }
+                if operation_state == "cancelling" {
+                    tx.commit()?;
+                    return Ok(plan);
+                }
+                transition_operation_tx(
+                    &tx,
+                    operation_id,
+                    Some(expected_operation_revision),
+                    OperationEvent::CancelRequested,
+                    "release-fences",
+                    None,
+                )?;
+                tx.commit()?;
+                Ok(plan)
             })
             .await
     }
@@ -461,6 +646,14 @@ impl CatalogStore {
                         plan.updated_at
                     ],
                 )?;
+                transition_operation_tx(
+                    &tx,
+                    plan.operation_id,
+                    None,
+                    OperationEvent::Start,
+                    "inventory",
+                    None,
+                )?;
                 tx.commit()?;
                 info!(
                     app_id = %plan.application_name,
@@ -468,6 +661,56 @@ impl CatalogStore {
                     application_revision = plan.expected_application_revision,
                     "Acquired the identity-migration catalog fence; backend writer fences and complete evidence are still required before copy or cutover"
                 );
+                Ok(plan)
+            })
+            .await
+    }
+
+    /// Resume an explicitly retried backend pass. A normal backend refusal
+    /// leaves both records waiting; a process crash can leave them running
+    /// and startup resumes that state directly.
+    pub async fn resume_identity_migration_backend_pass(
+        &self,
+        migration_id: CanonicalId,
+    ) -> CatalogResult<IdentityMigrationPlan> {
+        self.database()
+            .with_connection(move |conn| {
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let mut plan = load_plan_by_id(&tx, migration_id)?.ok_or_else(|| {
+                    CatalogError::not_found(format!("identity migration {migration_id}"))
+                })?;
+                if plan.state == IdentityMigrationState::Running {
+                    tx.commit()?;
+                    return Ok(plan);
+                }
+                if plan.state != IdentityMigrationState::Waiting {
+                    return Err(CatalogError::conflict(format!(
+                        "identity migration {migration_id} is {:?}, not waiting",
+                        plan.state
+                    )));
+                }
+                plan.state = IdentityMigrationState::Running;
+                plan.record_revision += 1;
+                plan.updated_at = now_secs();
+                tx.execute(
+                    "UPDATE identity_migrations
+                        SET state = 'running', record_revision = ?2, updated_at = ?3
+                      WHERE migration_id = ?1 AND state = 'waiting'",
+                    params![
+                        migration_id.to_string(),
+                        plan.record_revision,
+                        plan.updated_at
+                    ],
+                )?;
+                transition_operation_tx(
+                    &tx,
+                    plan.operation_id,
+                    None,
+                    OperationEvent::Resume,
+                    "inventory",
+                    None,
+                )?;
+                tx.commit()?;
                 Ok(plan)
             })
             .await
@@ -497,12 +740,48 @@ fn load_plan_by_app(
                 "SELECT {MIGRATION_COLUMNS} FROM identity_migrations
                  WHERE app_id = ?1
                    AND canonical_application_id =
-                       (SELECT canonical_id FROM apps WHERE id = ?1)"
+                       (SELECT canonical_id FROM apps WHERE id = ?1)
+                 ORDER BY CASE WHEN state IN ('completed', 'failed') THEN 1 ELSE 0 END,
+                          created_at DESC, migration_id DESC
+                 LIMIT 1"
             ),
             [app_id],
             map_plan,
         )
         .optional()?)
+}
+
+fn load_active_plan_by_app(
+    conn: &rusqlite::Connection,
+    app_id: &str,
+) -> CatalogResult<Option<IdentityMigrationPlan>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {MIGRATION_COLUMNS} FROM identity_migrations
+                 WHERE app_id = ?1
+                   AND canonical_application_id =
+                       (SELECT canonical_id FROM apps WHERE id = ?1)
+                   AND state NOT IN ('completed', 'failed')
+                 LIMIT 1"
+            ),
+            [app_id],
+            map_plan,
+        )
+        .optional()?)
+}
+
+fn load_plan_by_operation(
+    conn: &rusqlite::Connection,
+    operation_id: CanonicalId,
+) -> CatalogResult<Option<IdentityMigrationPlan>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT {MIGRATION_COLUMNS} FROM identity_migrations WHERE operation_id = ?1"
+    ))?;
+    let plan = statement
+        .query_row([operation_id.to_string()], map_plan)
+        .optional()?;
+    Ok(plan)
 }
 
 fn load_plan_by_id(

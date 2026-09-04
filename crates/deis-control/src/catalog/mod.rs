@@ -34,6 +34,7 @@ pub mod domains;
 pub mod identity_migration;
 pub mod limits;
 pub mod model;
+pub mod operation;
 pub mod secrets;
 pub mod store;
 
@@ -59,6 +60,7 @@ pub use model::{
     App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, RetiredAppName, Route,
     SecretMeta, Version,
 };
+pub use operation::OperationRequestContext;
 pub use secrets::{SecretCipher, SecretsBackend};
 pub use store::{BundlePathRepair, CatalogStore};
 
@@ -77,6 +79,12 @@ pub enum CatalogError {
 
     #[error("{0}")]
     Conflict(String),
+
+    /// A state-changing request named an old resource/operation revision.
+    /// This is distinct from a domain conflict so the HTTP layer can return
+    /// 412 for an `If-Match` failure without inspecting an error string.
+    #[error("{0}")]
+    RevisionConflict(String),
 
     #[error("{0}")]
     Invalid(String),
@@ -113,6 +121,10 @@ impl CatalogError {
 
     pub fn conflict(what: impl Into<String>) -> Self {
         CatalogError::Conflict(what.into())
+    }
+
+    pub fn revision_conflict(what: impl Into<String>) -> Self {
+        CatalogError::RevisionConflict(what.into())
     }
 
     pub fn invalid(what: impl Into<String>) -> Self {
