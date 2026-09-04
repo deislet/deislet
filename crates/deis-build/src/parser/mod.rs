@@ -1,6 +1,6 @@
 use deis_build_core::{
     HandlerInfo, ModuleReference, ModuleReferenceKind, ModuleSourcePosition,
-    ProviderOnlyGlobalReference,
+    NonPortableStreamConstructorReference, ProviderOnlyGlobalReference,
 };
 use swc_common::{
     sync::Lrc, FileName, Globals, Mark, SourceMap, Span, Spanned, SyntaxContext, GLOBALS,
@@ -70,6 +70,7 @@ impl TypeScriptParser {
             non_literal_module_loads: visitor.non_literal_module_loads,
             non_literal_module_load_positions: visitor.non_literal_module_load_positions,
             provider_only_global_references: visitor.provider_only_global_references,
+            non_portable_stream_constructors: visitor.non_portable_stream_constructors,
         })
     }
 
@@ -114,6 +115,7 @@ struct HandlerVisitor {
     non_literal_module_loads: usize,
     non_literal_module_load_positions: Vec<ModuleSourcePosition>,
     provider_only_global_references: Vec<ProviderOnlyGlobalReference>,
+    non_portable_stream_constructors: Vec<NonPortableStreamConstructorReference>,
 }
 
 impl HandlerVisitor {
@@ -129,6 +131,7 @@ impl HandlerVisitor {
             non_literal_module_loads: 0,
             non_literal_module_load_positions: Vec::new(),
             provider_only_global_references: Vec::new(),
+            non_portable_stream_constructors: Vec::new(),
         }
     }
 
@@ -224,6 +227,63 @@ impl HandlerVisitor {
                 }
             }
             PropName::Num(_) | PropName::BigInt(_) => {}
+        }
+    }
+
+    /// Return the statically named application global used by an expression.
+    /// Resolver context distinguishes a true runtime global from a local or
+    /// imported binding with the same spelling. Parenthesized and TypeScript-
+    /// only wrappers do not change the runtime callee.
+    fn static_global_name(&self, expression: &Expr) -> Option<(String, Span)> {
+        match expression {
+            Expr::Ident(ident) if ident.ctxt == self.unresolved_context => {
+                Some((ident.sym.to_string(), ident.span))
+            }
+            Expr::Member(member) if self.is_global_object(&member.obj) => match &member.prop {
+                MemberProp::Ident(ident) => Some((ident.sym.to_string(), ident.span)),
+                MemberProp::Computed(computed) => match &*computed.expr {
+                    Expr::Lit(Lit::Str(value)) => {
+                        Some((value.value.to_string_lossy().into_owned(), value.span))
+                    }
+                    _ => None,
+                },
+                MemberProp::PrivateName(_) => None,
+            },
+            Expr::Paren(value) => self.static_global_name(&value.expr),
+            Expr::TsAs(value) => self.static_global_name(&value.expr),
+            Expr::TsTypeAssertion(value) => self.static_global_name(&value.expr),
+            Expr::TsNonNull(value) => self.static_global_name(&value.expr),
+            Expr::TsInstantiation(value) => self.static_global_name(&value.expr),
+            Expr::TsSatisfies(value) => self.static_global_name(&value.expr),
+            _ => None,
+        }
+    }
+
+    fn record_non_portable_stream_constructor(&mut self, expression: &NewExpr) {
+        let Some((name, span)) = self.static_global_name(&expression.callee) else {
+            return;
+        };
+        let direct = matches!(name.as_str(), "ReadableStream" | "WritableStream");
+        let configured_transform = name == "TransformStream"
+            && expression
+                .args
+                .as_ref()
+                .is_some_and(|arguments| !arguments.is_empty());
+        if !direct && !configured_transform {
+            return;
+        }
+        let location = self.source_map.lookup_char_pos(span.lo());
+        let reference = NonPortableStreamConstructorReference {
+            name,
+            line: location.line,
+            column: location.col_display + 1,
+        };
+        if !self
+            .non_portable_stream_constructors
+            .iter()
+            .any(|existing| existing == &reference)
+        {
+            self.non_portable_stream_constructors.push(reference);
         }
     }
 }
@@ -406,6 +466,10 @@ impl Visit for HandlerVisitor {
                 MemberProp::PrivateName(_) => {}
             },
             _ => {}
+        }
+
+        if let Expr::New(expression) = n {
+            self.record_non_portable_stream_constructor(expression);
         }
 
         // These literal forms resolve files just as a static import does.
@@ -765,6 +829,49 @@ export default async function handler() { return new Response(String(value)); }
             info.provider_only_global_references[1].name,
             "WebSocketPair"
         );
+    }
+
+    #[test]
+    fn non_portable_stream_constructors_are_scope_resolved() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "const readable = new ReadableStream();\n\
+                 const writable = new self['WritableStream']();\n\
+                 const transformed = new globalThis.TransformStream({ transform() {} });\n\
+                 const identity = new TransformStream();\n\
+                 export default function handler() { return new Response(String(readable) + writable + transformed + identity); }\n",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        let names = info
+            .non_portable_stream_constructors
+            .iter()
+            .map(|reference| reference.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["ReadableStream", "WritableStream", "TransformStream"]
+        );
+        assert_eq!(info.non_portable_stream_constructors[0].line, 1);
+        assert_eq!(info.non_portable_stream_constructors[1].line, 2);
+        assert_eq!(info.non_portable_stream_constructors[2].line, 3);
+    }
+
+    #[test]
+    fn local_stream_constructor_names_are_not_standard_globals() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "class ReadableStream {}\n\
+                 class WritableStream {}\n\
+                 class TransformStream { constructor(_transformer: unknown) {} }\n\
+                 const values = [new ReadableStream(), new WritableStream(), new TransformStream({})];\n\
+                 export default function handler() { return new Response(String(values.length)); }\n",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        assert!(info.non_portable_stream_constructors.is_empty());
     }
 
     #[test]

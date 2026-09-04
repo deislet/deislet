@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-05T04:14:33+08:00",
+  "resolvedAt": "2026-09-05T04:32:13+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "9f1f7b50647f9a8af45d6d2ca5906fdf5722a7f0",
+    "sourceCommit": "f423c92b86aa1f485d119d8b501fa4c1bd27081f",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "contractPath": "standard/contract.json",
     "contractSchemaPath": "schemas/standard-contract.schema.json",
@@ -59,7 +59,7 @@
     "upstreamCommand": "python3 scripts/check-governance.py",
     "upstreamResult": "passed",
     "expectedCapabilityFamilies": 15,
-    "expectedDraftClauses": 149,
+    "expectedDraftClauses": 151,
     "expectedConformanceSuites": 15,
     "expectedBackends": 4
   }

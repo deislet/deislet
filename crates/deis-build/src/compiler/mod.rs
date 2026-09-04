@@ -603,6 +603,26 @@ impl Compiler {
         ))
     }
 
+    fn refuse_external_runtime_module_edges(path: &str, info: &HandlerInfo) -> anyhow::Result<()> {
+        let mut references = info
+            .module_references
+            .iter()
+            .filter_map(|reference| {
+                deis_build_core::external_runtime_module_kind(&reference.specifier)
+                    .map(|kind| format!("{kind} at {path}:{}:{}", reference.line, reference.column))
+            })
+            .collect::<Vec<_>>();
+        if references.is_empty() {
+            return Ok(());
+        }
+        references.sort();
+        references.dedup();
+        Err(anyhow::anyhow!(
+            "EC_ARTIFACT_MODULE_EXTERNAL: {}. Edge Canon requires every runtime module edge to close over build-carried files or an exact selected standard runtime module; provider URL, filesystem, npm:, and jsr: resolvers cannot remain in application source. Vendor the module locally or declare a bare npm dependency in package.json with package-lock.json so the build can verify and bundle it",
+            references.join(", ")
+        ))
+    }
+
     fn refuse_provider_only_globals(path: &str, info: &HandlerInfo) -> anyhow::Result<()> {
         if info.provider_only_global_references.is_empty() {
             return Ok(());
@@ -621,6 +641,56 @@ impl Compiler {
         Err(anyhow::anyhow!(
             "EC_STREAM_WEBSOCKET_NONPORTABLE: {references}. The current Edge Canon standard has no portable WebSocket/WebSocketPair application API, so every target rejects these references before deployment"
         ))
+    }
+
+    fn refuse_non_portable_stream_constructors(
+        path: &str,
+        info: &HandlerInfo,
+    ) -> anyhow::Result<()> {
+        let direct = info
+            .non_portable_stream_constructors
+            .iter()
+            .filter(|reference| {
+                matches!(reference.name.as_str(), "ReadableStream" | "WritableStream")
+            })
+            .collect::<Vec<_>>();
+        if !direct.is_empty() {
+            let references = direct
+                .iter()
+                .map(|reference| {
+                    format!(
+                        "{} at {path}:{}:{}",
+                        reference.name, reference.line, reference.column
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(anyhow::anyhow!(
+                "EC_STREAM_DIRECT_CONSTRUCTOR_NONPORTABLE: {references}. Edge Canon v1 exposes readable and writable streams through Request, Response, and the identity TransformStream; it does not define direct ReadableStream or WritableStream construction"
+            ));
+        }
+
+        let transforms = info
+            .non_portable_stream_constructors
+            .iter()
+            .filter(|reference| reference.name == "TransformStream")
+            .collect::<Vec<_>>();
+        if !transforms.is_empty() {
+            let references = transforms
+                .iter()
+                .map(|reference| {
+                    format!(
+                        "{} at {path}:{}:{}",
+                        reference.name, reference.line, reference.column
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(anyhow::anyhow!(
+                "EC_STREAM_TRANSFORMER_NONPORTABLE: {references}. Edge Canon v1 defines only new TransformStream() with no arguments; transformer and queuing-strategy arguments are not portable"
+            ));
+        }
+        Ok(())
     }
 
     /// Stop a build over a handler whose name contains a backslash.
@@ -971,7 +1041,9 @@ impl Compiler {
             let parsed = self.parser.parse(&code, &handler_path)?;
             Self::refuse_a_handler_with_no_default_export(&handler_path, Some(&parsed))?;
             Self::refuse_non_literal_module_loads(&handler_path, &parsed)?;
+            Self::refuse_external_runtime_module_edges(&handler_path, &parsed)?;
             Self::refuse_provider_only_globals(&handler_path, &parsed)?;
+            Self::refuse_non_portable_stream_constructors(&handler_path, &parsed)?;
             module_references.push((handler_path.clone(), parsed.module_references.clone()));
             handler_specifiers.push((handler_path.clone(), parsed.imports.clone()));
             module_queue.push_back((source_path.clone(), parsed.imports));
@@ -1056,7 +1128,9 @@ impl Compiler {
                         let name = dependency.to_string_lossy().to_string();
                         let parsed = self.parser.parse(code, &name)?;
                         Self::refuse_non_literal_module_loads(&name, &parsed)?;
+                        Self::refuse_external_runtime_module_edges(&name, &parsed)?;
                         Self::refuse_provider_only_globals(&name, &parsed)?;
+                        Self::refuse_non_portable_stream_constructors(&name, &parsed)?;
                         module_references.push((name.clone(), parsed.module_references.clone()));
                         handler_specifiers.push((name, parsed.imports.clone()));
                         module_queue.push_back((dependency.clone(), parsed.imports));
@@ -1322,7 +1396,9 @@ impl Compiler {
                     // artifact.
                     let derived_path = format!("<derived {vendor} bundle>");
                     let derived = self.parser.parse(&bundled_code, &derived_path)?;
+                    Self::refuse_external_runtime_module_edges(&derived_path, &derived)?;
                     Self::refuse_provider_only_globals(&derived_path, &derived)?;
+                    Self::refuse_non_portable_stream_constructors(&derived_path, &derived)?;
                     validate_node_npm_project(
                         &project_root,
                         &[(derived_path, derived.module_references)],
@@ -1549,13 +1625,13 @@ impl Compiler {
     /// there is nothing to resolve it to, so the whole application is down
     /// rather than the one route.
     ///
-    /// Not the bundler's rule copied over. The two resolve differently on
-    /// purpose - Deno reads `npm:` and `jsr:` specifiers the bundler cannot,
-    /// and the bundler reads `node_modules` Deno Deploy has no copy of - so
-    /// this is the deno rule, checked against the import map **this build
-    /// actually generated**. It is handed `deno.json` rather than a list
-    /// written out here, so an adapter that starts mapping a name does not
-    /// leave a second copy of the allow-list disagreeing with it.
+    /// Not the bundler's rule copied over. This is the Deno import-map rule,
+    /// checked against the file **this build actually generated**. External
+    /// URL/npm/jsr/file resolution has already been rejected by the shared
+    /// module-closure gate; a Node/npm project instead takes the bundled Deno
+    /// path. It is handed `deno.json` rather than a list written out here, so
+    /// an adapter that starts mapping a portable name does not leave a second
+    /// copy of the allow-list disagreeing with it.
     ///
     /// Only bare specifiers. A relative or absolute path is Deno's own
     /// resolution against the staged tree and is left to `deno check`, which
@@ -1600,9 +1676,9 @@ impl Compiler {
             "the deno target would ship {} import(s) Deno cannot resolve:\n  {}\n\nA bare \
              specifier is not a path and this build's deno.json maps nothing to it, so Deno \
              refuses the module as it loads - the whole application, not the route the import is \
-             in. Write the dependency as a `npm:` specifier (`import {{ v4 }} from \
-             \"npm:uuid@^9\"`) or a URL, or vendor the file into the project and import it by \
-             path.",
+             in. Declare an npm dependency in the root package.json/package-lock.json and use its \
+             bare package name so every target can verify and bundle it, or vendor the file into \
+             the project and import it by path.",
             unresolvable.len(),
             unresolvable.join("\n  ")
         ))
@@ -1631,10 +1707,10 @@ impl Compiler {
 
     /// Whether a specifier is a bare name rather than a path or a URL.
     ///
-    /// The scheme list is Deno's: these are the ones its resolver handles with
-    /// no map entry. Anything else with a `:` in it - `foo:bar` - is a scheme
-    /// Deno does not know and is treated as bare, which is the safe way round:
-    /// it is refused with a message rather than shipped.
+    /// Scheme spellings are not bare; the shared module-closure gate rejects
+    /// all but selected `node:` modules before this Deno-only check runs.
+    /// Anything else with `:` that is not a syntactically valid scheme is
+    /// treated as bare and refused unless the generated import map covers it.
     fn is_bare_specifier(specifier: &str) -> bool {
         const RESOLVED_BY_DENO: [&str; 7] = [
             "npm:", "jsr:", "node:", "http://", "https://", "data:", "file://",

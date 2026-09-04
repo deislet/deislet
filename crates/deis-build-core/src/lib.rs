@@ -1,6 +1,7 @@
 pub mod bundler;
 pub mod config;
 pub mod error;
+mod module_closure;
 pub mod node_npm;
 pub mod portable_globals;
 mod provider_node_facade;
@@ -11,6 +12,7 @@ pub mod types;
 pub use bundler::*;
 pub use config::*;
 pub use error::*;
+pub use module_closure::*;
 pub use node_npm::*;
 pub use portable_globals::*;
 pub use routes::*;

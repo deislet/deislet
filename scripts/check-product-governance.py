@@ -198,7 +198,7 @@ def validate_standard_lock() -> str:
     verification = lock.get("verification", {})
     require(verification.get("upstreamResult") == "passed", "locked upstream governance check did not pass")
     require(verification.get("expectedCapabilityFamilies") == 15, "unexpected capability family count")
-    require(verification.get("expectedDraftClauses") == 149, "unexpected draft clause count")
+    require(verification.get("expectedDraftClauses") == 151, "unexpected draft clause count")
     require(verification.get("expectedConformanceSuites") == 15, "unexpected conformance suite count")
     require(verification.get("expectedBackends") == 4, "unexpected backend record count")
 

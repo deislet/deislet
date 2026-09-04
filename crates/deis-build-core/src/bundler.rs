@@ -12,9 +12,9 @@ use rolldown_common::Output;
 /// The targets whose artefact is a single bundled module.
 ///
 /// There is deliberately no `Deno` variant. The deno target ships the
-/// generated router and the author's handlers as they were written, with a
-/// `deno.json` beside them - Deno resolves and type-checks them itself, and
-/// its runtime reads `npm:` and `jsr:` specifiers this bundler cannot. A
+/// generated router and the author's closed local module graph as staged, with
+/// a `deno.json` beside it. External resolver spellings are rejected before
+/// this point, while Node/npm projects use `DenoNode` and are bundled. A
 /// variant existed and nothing ever constructed it, which read as "deno can be
 /// bundled" while `deis_build::compiler` sent that target somewhere else
 /// entirely. What stands behind a deno artefact instead is
@@ -208,16 +208,14 @@ impl BuildBundler {
     /// build wants to tell the author, instead of being the one advisory that
     /// only exists in scrollback.
     pub async fn generate(&self) -> Result<(String, Vec<String>)> {
-        let mut bundler = if self.provider_node_facade {
-            Bundler::with_plugins(
-                self.options.clone(),
-                vec![Arc::new(
-                    super::provider_node_facade::ProviderNodeFacadePlugin,
-                )],
-            )?
-        } else {
-            Bundler::new(self.options.clone())?
-        };
+        let mut plugins: Vec<rolldown::plugin::__inner::SharedPluginable> =
+            vec![Arc::new(super::module_closure::ModuleClosurePlugin)];
+        if self.provider_node_facade {
+            plugins.push(Arc::new(
+                super::provider_node_facade::ProviderNodeFacadePlugin,
+            ));
+        }
+        let mut bundler = Bundler::with_plugins(self.options.clone(), plugins)?;
         let result = bundler.generate().await?;
         let advisories = Self::refuse_broken_references(&result.warnings)?;
         Ok((self.single_js_chunk(result.assets)?, advisories))
@@ -451,5 +449,35 @@ mod tests {
                 assert!(!artifact.contains(rejected), "{platform:?}: {artifact}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_dependency_cannot_delegate_module_loading_to_a_provider_url() {
+        let project = tempfile::tempdir().expect("temp project");
+        let entry = project.path().join("entry.mjs");
+        let dependency = project.path().join("dependency.mjs");
+        fs::write(
+            &entry,
+            r#"import value from "./dependency.mjs"; export default value;"#,
+        )
+        .expect("entry module");
+        fs::write(
+            &dependency,
+            r#"import value from "https://user:EC_MODULE_SECRET@example.invalid/value.mjs"; export default value;"#,
+        )
+        .expect("dependency module");
+
+        let error = BuildBundler::new(
+            entry.to_str().expect("UTF-8 entry"),
+            TargetPlatform::Cloudflare,
+        )
+        .with_cwd(project.path().to_path_buf())
+        .generate()
+        .await
+        .expect_err("provider URL must be stopped before a bundle exists")
+        .to_string();
+        assert!(error.contains("EC_ARTIFACT_MODULE_EXTERNAL"), "{error}");
+        assert!(error.contains("https-scheme"), "{error}");
+        assert!(!error.contains("EC_MODULE_SECRET"), "{error}");
     }
 }

@@ -113,6 +113,11 @@ pub struct HandlerInfo {
     /// comments, string contents and erased TypeScript types do not trigger a
     /// source-policy failure.
     pub provider_only_global_references: Vec<ProviderOnlyGlobalReference>,
+    /// Direct construction of stream globals that the current portable
+    /// surface does not define. Resolution context and source coordinates are
+    /// preserved so a local class with the same spelling remains valid and a
+    /// rejected build can point at the author's expression.
+    pub non_portable_stream_constructors: Vec<NonPortableStreamConstructorReference>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +128,13 @@ pub struct ModuleSourcePosition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderOnlyGlobalReference {
+    pub name: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonPortableStreamConstructorReference {
     pub name: String,
     pub line: usize,
     pub column: usize,

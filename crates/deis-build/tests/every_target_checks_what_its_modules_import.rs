@@ -49,6 +49,23 @@ async fn build(dir: &Path, vendor: &str) -> anyhow::Result<deis_build::Compilati
     compiler.compile(dir, vec![vendor.to_string()], false).await
 }
 
+fn deployable_entries(project: &Path, vendor: &str) -> Vec<std::path::PathBuf> {
+    let root = project.join("dist").join(vendor);
+    match vendor {
+        "cloudflare" => vec![root.join("index.js")],
+        "tencent" => vec![
+            root.join("edge-functions/index.js"),
+            root.join("cloud-functions/api-node/index.mjs"),
+        ],
+        "deno" => vec![
+            root.join("deno.json"),
+            root.join("_deis_internal/router.ts"),
+        ],
+        "deislet" => vec![root.join("bundle.zip")],
+        _ => unreachable!(),
+    }
+}
+
 /// The handler from `examples/hello-world`, reduced to the line that matters.
 const IMPORTS_A_BARE_NAME: &str = "import { v4 as uuidv4 } from 'uuid';\n\
      export default async function handler(_c: any) { return new Response(uuidv4()); }\n";
@@ -123,10 +140,77 @@ async fn a_deno_npm_specifier_is_refused_by_the_unified_standard() {
         .await
         .expect_err("a provider-only runtime resolver cannot be portable")
         .to_string();
-    assert!(error.contains("EC_NPM_PACKAGE_UNRESOLVED"), "{error}");
+    assert!(error.contains("EC_ARTIFACT_MODULE_EXTERNAL"), "{error}");
+    assert!(error.contains("npm-scheme"), "{error}");
     assert!(error.contains("package.json"), "{error}");
-    assert!(error.contains("bare package name"), "{error}");
     assert!(!project.path().join("dist/deno/deno.json").exists());
+}
+
+#[tokio::test]
+async fn every_target_rejects_provider_resolved_runtime_modules_without_leaking_urls() {
+    let source = r#"
+import "http://example.invalid/http.mjs";
+import "https://user:EC_MODULE_SECRET@example.invalid/https.mjs";
+import "data:text/javascript,export default 1";
+import "file:///host/file.mjs";
+import "npm:package@1";
+import "jsr:@scope/package@1";
+export default function handler() { return new Response("unreachable"); }
+"#;
+    for vendor in ["cloudflare", "tencent", "deno", "deislet"] {
+        let project = tempfile::tempdir().expect("a temporary project");
+        stage(project.path(), vendor, source);
+        let error = build(project.path(), vendor)
+            .await
+            .expect_err("runtime module graph must close before provider packaging")
+            .to_string();
+        assert!(
+            error.contains("EC_ARTIFACT_MODULE_EXTERNAL"),
+            "{vendor}: {error}"
+        );
+        for kind in [
+            "http-scheme",
+            "https-scheme",
+            "data-scheme",
+            "file-scheme",
+            "npm-scheme",
+            "jsr-scheme",
+        ] {
+            assert!(error.contains(kind), "{vendor} omitted {kind}: {error}");
+        }
+        assert!(!error.contains("EC_MODULE_SECRET"), "{vendor}: {error}");
+        for entry in deployable_entries(project.path(), vendor) {
+            assert!(
+                !entry.exists(),
+                "{vendor} left deployable {}",
+                entry.display()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_local_dependency_cannot_hide_an_external_runtime_module() {
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage(
+        project.path(),
+        "cloudflare",
+        "import value from '../shared/value.ts';\nexport default function handler() { return new Response(String(value)); }\n",
+    );
+    fs::create_dir_all(project.path().join("shared")).expect("shared directory");
+    fs::write(
+        project.path().join("shared/value.ts"),
+        "export { default } from 'https://user:EC_MODULE_SECRET@example.invalid/value.mjs';\n",
+    )
+    .expect("dependency");
+
+    let error = build(project.path(), "cloudflare")
+        .await
+        .expect_err("dependency URL must be rejected")
+        .to_string();
+    assert!(error.contains("EC_ARTIFACT_MODULE_EXTERNAL"), "{error}");
+    assert!(error.contains("shared/value.ts:1:"), "{error}");
+    assert!(!error.contains("EC_MODULE_SECRET"), "{error}");
 }
 
 /// A relative import is Deno's own business and must not be caught by the bare
