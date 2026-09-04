@@ -280,6 +280,32 @@ impl TenantWriteFences {
         Ok(WritePermit { _guard: guard })
     }
 
+    /// Admit one mutation that spans more than one tenant.
+    ///
+    /// Locks are always taken in lexical tenant order. That makes two
+    /// concurrent multi-tenant operations agree on their acquisition order
+    /// and avoids deadlock. Duplicate tenant names acquire only one guard.
+    /// If any tenant is already fenced, every guard acquired before it is
+    /// dropped before the error returns.
+    pub async fn permits<I, S>(&self, tenants: I) -> Result<Vec<WritePermit>, FenceError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut tenants: Vec<String> = tenants
+            .into_iter()
+            .map(|tenant| tenant.as_ref().to_string())
+            .collect();
+        tenants.sort_unstable();
+        tenants.dedup();
+
+        let mut permits = Vec::with_capacity(tenants.len());
+        for tenant in tenants {
+            permits.push(self.permit(&tenant).await?);
+        }
+        Ok(permits)
+    }
+
     /// Keep an operation ordered with fence acquisition without rejecting a
     /// tenant that is already fenced. SQL query endpoints use this together
     /// with SQLite's `readonly` classification: reads remain available for

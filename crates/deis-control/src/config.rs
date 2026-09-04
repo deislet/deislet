@@ -141,6 +141,12 @@ pub struct ControlConfig {
     /// consumers never start, so messages pile up in deis-queue unread.
     #[serde(default)]
     pub queue_endpoint: Option<String>,
+    /// gRPC address of deis-telemetry's ingest/query and optional backend
+    /// migration service. It is not handed to application code by Control;
+    /// the migration coordinator uses it to inventory the same environment
+    /// identity across logs, metrics and traces.
+    #[serde(default)]
+    pub telemetry_endpoint: Option<String>,
     /// Shared secret the storage capability tokens are derived from. It must
     /// be the identical string that deis-store and deis-queue carry as their
     /// own `auth_secret`.
@@ -174,6 +180,11 @@ pub struct ControlConfig {
     /// rotation and deployment lifecycles to differ.
     #[serde(default)]
     pub queue_migration_admin_token: Option<String>,
+    /// Independent administrator credential for deis-telemetry migration
+    /// management. It must differ from every storage, queue, node and human
+    /// credential configured here.
+    #[serde(default)]
+    pub telemetry_migration_admin_token: Option<String>,
     /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).
     ///
     /// A tick does two things: it rebuilds the task list from the catalog,
@@ -258,9 +269,11 @@ impl Default for ControlConfig {
             secret_key_file: None,
             store_endpoint: None,
             queue_endpoint: None,
+            telemetry_endpoint: None,
             storage_auth_secret: None,
             store_migration_admin_token: None,
             queue_migration_admin_token: None,
+            telemetry_migration_admin_token: None,
             cron_tick_seconds: default_cron_tick_seconds(),
             node_registration_ttl_secs: default_node_registration_ttl(),
         }
@@ -296,6 +309,7 @@ impl std::fmt::Debug for ControlConfig {
             .field("secret_key_file", &self.secret_key_file)
             .field("store_endpoint", &self.store_endpoint)
             .field("queue_endpoint", &self.queue_endpoint)
+            .field("telemetry_endpoint", &self.telemetry_endpoint)
             .field(
                 "storage_auth_secret",
                 &self.storage_auth_secret.as_ref().map(|_| "<redacted>"),
@@ -311,6 +325,13 @@ impl std::fmt::Debug for ControlConfig {
                 "queue_migration_admin_token",
                 &self
                     .queue_migration_admin_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field(
+                "telemetry_migration_admin_token",
+                &self
+                    .telemetry_migration_admin_token
                     .as_ref()
                     .map(|_| "<redacted>"),
             )

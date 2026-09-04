@@ -430,6 +430,10 @@ service_stats! {
         "retention_sweeps_failed_total",
         "Retention sweeps that failed or did not complete; expired logs, traces and samples \
          stay on disk and the database keeps growing until a sweep succeeds";
+    retention_sweeps_skipped_fenced: Counter =
+        "retention_sweeps_skipped_fenced_total",
+        "Retention sweeps deliberately skipped because at least one telemetry tenant was \
+         write-fenced for migration; data stays on disk until the fence is released";
     metric_scrapes: Counter = "metric_scrapes_total", "Prometheus scrapes served on /metrics";
     metric_samples_dropped_from_export: Counter =
         "metric_samples_dropped_from_export_total",
@@ -450,7 +454,10 @@ service_stats! {
     log_pushes: Counter = "log_pushes_total", "PushLogs calls served";
     logs_accepted: Counter = "logs_accepted_total", "Log entries written to storage";
     logs_rejected: Counter =
-        "logs_rejected_total", "Log entries refused as malformed and never stored";
+        "logs_rejected_total", "Log entries refused as malformed or write-fenced and never stored";
+    logs_write_fenced: Counter =
+        "logs_write_fenced_total",
+        "Otherwise valid log entries refused because their tenant was write-fenced for migration";
     logs_truncated: Counter =
         "logs_truncated_total", "Log entries stored with their message cut short";
     log_queries: Counter = "log_queries_total", "Query calls served";
@@ -468,7 +475,10 @@ service_stats! {
     trace_pushes: Counter = "trace_pushes_total", "PushTraces calls served";
     traces_accepted: Counter = "traces_accepted_total", "Trace records written to storage";
     traces_rejected: Counter =
-        "traces_rejected_total", "Trace records refused as malformed and never stored";
+        "traces_rejected_total", "Trace records refused as malformed or write-fenced and never stored";
+    traces_write_fenced: Counter =
+        "traces_write_fenced_total",
+        "Otherwise valid trace records refused because their tenant was write-fenced for migration";
     traces_truncated: Counter =
         "traces_truncated_total",
         "Trace records stored with an oversized target or error message cut short";
@@ -491,7 +501,10 @@ service_stats! {
     metric_samples_accepted: Counter =
         "metric_samples_accepted_total", "Metric samples written to storage";
     metric_samples_rejected: Counter =
-        "metric_samples_rejected_total", "Metric samples refused as malformed and never stored";
+        "metric_samples_rejected_total", "Metric samples refused as malformed or write-fenced and never stored";
+    metric_samples_write_fenced: Counter =
+        "metric_samples_write_fenced_total",
+        "Otherwise valid metric samples refused because their tenant was write-fenced for migration";
     metric_queries: Counter = "metric_queries_total", "QueryMetrics calls served";
     retention_partitions_dropped: Counter =
         "retention_partitions_dropped_total", "Expired daily log partitions dropped since start";

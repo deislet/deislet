@@ -4,9 +4,10 @@
 //! can prove today: a deterministic catalog inventory, permanent binding IDs,
 //! a persisted migration/operation identity, and an atomic revision fence.
 //! The catalog half deliberately cannot advance a migration by itself. The
-//! backend coordinator uses the same token against deis-store and deis-queue,
-//! persists their evidence, and may then move the record to `waiting`.
-//! Telemetry, Stateful Objects and provider resources are still missing, so
+//! backend coordinator uses the same one-use fence token against deis-store,
+//! deis-queue and deis-telemetry under three independent administrator
+//! credentials, persists their evidence, and may then move the record to
+//! `waiting`. Stateful Objects and provider resources are still missing, so
 //! calling the current state verified or starting copy/cutover would be false.
 
 use std::collections::{BTreeMap, BTreeSet};

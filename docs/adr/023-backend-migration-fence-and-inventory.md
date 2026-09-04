@@ -38,13 +38,14 @@ release:                                                 wait ──────
 ## Deislet embedded 实现
 
 - `deis-backend-migration` 定义共享 proto、Bearer interceptor、receipt、inventory digest 和 durable per-tenant gate。
-- `deis-store` 的 KV、SQL、blob 共用 `migration-fences.sqlite`；`deis-queue` 使用自己数据目录内的同名 journal。
+- `deis-store` 的 KV、SQL、blob 共用 `migration-fences.sqlite`；`deis-queue` 与 `deis-telemetry` 分别使用自己数据目录内的同名 journal。
 - journal 使用 SQLite `WAL + synchronous=FULL`，active fence 与 append-only acquire/release event 在同一 `BEGIN IMMEDIATE` transaction 更新。
 - journal 的 singleton metadata 保存 backend incarnation UUIDv7，并以 trigger 禁止原位改绑。相同 journal 重启保持 ID；新数据目录获得新 ID。
 - KV inventory 以 fence 获得时刻判断 TTL，防止等待期间自然到期改变集合；KV expiry sweeper 跳过 fenced tenant。
 - SQL inventory 只在 `wal_checkpoint(TRUNCATE)` 完全成功后 hash tenant database file；Query endpoint 额外使用 SQLite `readonly` 分类，不能用返回 rows 的写语句绕过 Execute 的 fence。
 - blob inventory hash 有序 metadata，并逐一校验实际 content SHA-256；unreferenced content 与无法分类的目录项分别报告。
 - queue inventory 在一个 read transaction 中覆盖 ready/delayed/leased messages 与 dead letters；所有会改变 message state 的操作及 retention sweep 均受 fence。
+- telemetry inventory 在一个 SQLite read snapshot 中按完整规范内容排序并覆盖 logs/metrics/traces。旧 producer 缺失或传空 environment 时明确映射为 `production`；非法 identity 在 ingest 拒绝，损坏的历史 JSON 计入 unchecked orphan。混合应用批次只拒绝已 fence tenant，其余 tenant 仍在同一事务提交；全局 retention 必须先持有当前全部 tenant permit，任一 tenant 已 fence 时整轮跳过。
 
 Embedded 模式仍是一份 data directory 对应一个 service process，多个进程同时打开同一 SQLite 数据目录不属于受支持拓扑。未来 HA driver 不能照搬进程内锁；它必须用该后端的共识/事务能力实现同样的 per-tenant 线性化点、持久 epoch 和可恢复 receipt，并通过相同 contract tests。
 
@@ -63,10 +64,10 @@ Embedded 模式仍是一份 data directory 对应一个 service process，多个
 
 本 ADR 落地后，`P0-MODEL-001` 仍不能标记完成：
 
-- Control 已通过受管理员权限保护的异步 API 调用两个管理服务并持久化 per-backend/tenant attempt 与契约 evidence，能在客户端断开或 Control 重启后按同一请求恢复；migration 已返回满足 `operation.schema.json` 的公共 Operation，并以 `Idempotency-Key`、`ETag`/`If-Match` 与唯一状态图处理幂等和并发取消。取消只有在所有已取得的 backend fence 精确释放后才进入 `cancelled` 并解除 catalog fence；
-- telemetry、Stateful Objects 与 provider resources 尚无同契约 inventory/fence；
+- Control 已通过受管理员权限保护的异步 API 调用 store、queue、telemetry 三个管理服务并持久化 per-backend/tenant attempt 与契约 evidence，能在客户端断开或 Control 重启后按同一请求恢复；migration 已返回满足 `operation.schema.json` 的公共 Operation，并以 `Idempotency-Key`、`ETag`/`If-Match` 与唯一状态图处理幂等和并发取消。取消只有在所有已取得的 backend fence 精确释放后才进入 `cancelled` 并解除 catalog fence；
+- Stateful Objects 与 provider resources 尚无同契约 inventory/fence；
 - deis-store 与 deis-queue snapshot manifest 都记录源 incarnation，restore 不复制 migration fence journal并立即生成、报告一个新 incarnation；两者分别验证内容摘要/SQLite integrity 与 item count，Control 因而能识别同一 endpoint 下的数据替换并拒绝沿用旧 evidence/fence。restore 本身仍未成为受权限、幂等和审计约束的正式 ProductOperation；完成前，迁移/cutover 仍不得与 restore 重叠，也不能把普通备份恢复当成 fence 延续；
 - canonical-first dual-read、copy/verify、atomic cutover、旧 capability 撤销和 tombstone 尚未执行；
 - SQL 当前证据适合 embedded file copy/rename；跨引擎 HA SQL driver 必须产生规范 logical dump digest，不能拿供应商物理文件摘要冒充跨实现相等。
 
-因此当前允许执行的是“冻结旧 Deislet store/queue namespace并取得可检查证据”，不是开放 canonical live request parser，也不是宣称完整迁移完成。
+因此当前允许执行的是“冻结旧 Deislet store/queue/telemetry tenant 并取得可检查证据”，不是开放 canonical live request parser，也不是宣称完整迁移完成。

@@ -196,10 +196,9 @@ impl fmt::Debug for BackendTarget {
     }
 }
 
-/// Coordinates the currently implemented Deislet store and queue management
-/// surfaces. It intentionally stops at `waiting`: telemetry, Stateful Objects
-/// and provider resources still need the same contract before copy or cutover
-/// can begin.
+/// Coordinates every currently implemented Deislet data backend management
+/// surface. It intentionally stops at `waiting`: Stateful Objects and provider
+/// resources still need the same contract before copy or cutover can begin.
 pub struct IdentityMigrationCoordinator {
     catalog: Arc<CatalogStore>,
     targets: Vec<BackendTarget>,
@@ -217,7 +216,7 @@ impl fmt::Debug for IdentityMigrationCoordinator {
 }
 
 impl IdentityMigrationCoordinator {
-    /// Build a coordinator only when both mandatory backend management
+    /// Build a coordinator only when every mandatory backend management
     /// targets have independent, non-application credentials.
     pub fn from_config(
         catalog: Arc<CatalogStore>,
@@ -235,6 +234,12 @@ impl IdentityMigrationCoordinator {
             config.queue_migration_admin_token.as_deref(),
             &["queue"],
         )?;
+        let telemetry = target_from_config(
+            "deis-telemetry",
+            config.telemetry_endpoint.as_deref(),
+            config.telemetry_migration_admin_token.as_deref(),
+            &["telemetry"],
+        )?;
 
         let store_token = configured_secret(
             "store_migration_admin_token",
@@ -244,16 +249,23 @@ impl IdentityMigrationCoordinator {
             "queue_migration_admin_token",
             config.queue_migration_admin_token.as_deref(),
         )?;
-        if store_token == queue_token {
+        let telemetry_token = configured_secret(
+            "telemetry_migration_admin_token",
+            config.telemetry_migration_admin_token.as_deref(),
+        )?;
+        let distinct_tokens: BTreeSet<&str> = [store_token, queue_token, telemetry_token]
+            .into_iter()
+            .collect();
+        if distinct_tokens.len() != 3 {
             return Err(MigrationCoordinatorError::Configuration(
-                "store_migration_admin_token and queue_migration_admin_token must be different"
+                "store, queue and telemetry migration administrator credentials must be different from each other"
                     .to_string(),
             ));
         }
         if config
             .storage_auth_secret
             .as_deref()
-            .is_some_and(|secret| secret == store_token || secret == queue_token)
+            .is_some_and(|secret| distinct_tokens.contains(secret))
         {
             return Err(MigrationCoordinatorError::Configuration(
                 "migration administrator credentials must not reuse storage_auth_secret"
@@ -264,7 +276,7 @@ impl IdentityMigrationCoordinator {
             .node_preshared_keys
             .iter()
             .chain(config.api_keys.iter())
-            .any(|secret| secret == store_token || secret == queue_token)
+            .any(|secret| distinct_tokens.contains(secret.as_str()))
         {
             return Err(MigrationCoordinatorError::Configuration(
                 "migration administrator credentials must not reuse a node or human API credential"
@@ -274,7 +286,7 @@ impl IdentityMigrationCoordinator {
 
         Ok(Self {
             catalog,
-            targets: vec![store, queue],
+            targets: vec![store, queue, telemetry],
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
         })
     }
@@ -1284,6 +1296,7 @@ fn target_from_config(
     let token_name = match backend {
         "deis-store" => "store_migration_admin_token",
         "deis-queue" => "queue_migration_admin_token",
+        "deis-telemetry" => "telemetry_migration_admin_token",
         _ => "migration_admin_token",
     };
     let token = configured_secret(token_name, token)?;
@@ -1710,6 +1723,7 @@ mod tests {
 
     const STORE_TOKEN: &str = "store-migration-administrator-token-000001";
     const QUEUE_TOKEN: &str = "queue-migration-administrator-token-000001";
+    const TELEMETRY_TOKEN: &str = "telemetry-migration-administrator-token-001";
     const WRONG_QUEUE_TOKEN: &str = "wrong-queue-administrator-token-000001";
 
     #[derive(Clone)]
@@ -1903,13 +1917,20 @@ mod tests {
         (format!("http://{address}"), shutdown_tx, handle)
     }
 
-    fn config(store_endpoint: String, queue_endpoint: String, queue_token: &str) -> ControlConfig {
+    fn config(
+        store_endpoint: String,
+        queue_endpoint: String,
+        telemetry_endpoint: String,
+        queue_token: &str,
+    ) -> ControlConfig {
         ControlConfig {
             store_endpoint: Some(store_endpoint),
             queue_endpoint: Some(queue_endpoint),
+            telemetry_endpoint: Some(telemetry_endpoint),
             storage_auth_secret: Some("application-storage-capability-root-000001".to_string()),
             store_migration_admin_token: Some(STORE_TOKEN.to_string()),
             queue_migration_admin_token: Some(queue_token.to_string()),
+            telemetry_migration_admin_token: Some(TELEMETRY_TOKEN.to_string()),
             ..ControlConfig::default()
         }
     }
@@ -1939,15 +1960,22 @@ mod tests {
             ],
         );
         let queue = FakeBackend::new("deis-queue", QUEUE_TOKEN, vec![component("queue", 'f')]);
+        let telemetry = FakeBackend::new(
+            "deis-telemetry",
+            TELEMETRY_TOKEN,
+            vec![component("telemetry", 'a')],
+        );
         let store_calls = Arc::clone(&store.acquire_calls);
         let queue_calls = Arc::clone(&queue.acquire_calls);
         let store_incarnation = Arc::clone(&store.backend_incarnation_id);
         let (store_endpoint, stop_store, store_handle) = serve(store).await;
         let (queue_endpoint, stop_queue, queue_handle) = serve(queue).await;
+        let (telemetry_endpoint, stop_telemetry, telemetry_handle) = serve(telemetry).await;
 
         let wrong_config = config(
             store_endpoint.clone(),
             queue_endpoint.clone(),
+            telemetry_endpoint.clone(),
             WRONG_QUEUE_TOKEN,
         );
         let coordinator =
@@ -1979,7 +2007,12 @@ mod tests {
         assert_eq!(partial[1].backend, "deis-store");
         assert_eq!(partial[1].state, BackendAttemptState::Captured);
 
-        let correct_config = config(store_endpoint.clone(), queue_endpoint.clone(), QUEUE_TOKEN);
+        let correct_config = config(
+            store_endpoint.clone(),
+            queue_endpoint.clone(),
+            telemetry_endpoint.clone(),
+            QUEUE_TOKEN,
+        );
         let coordinator =
             IdentityMigrationCoordinator::from_config(Arc::clone(&catalog), &correct_config)
                 .unwrap()
@@ -1995,16 +2028,19 @@ mod tests {
                 .state,
             deis_wire::OperationState::Waiting
         );
-        assert_eq!(run.captured_components, ["blob", "kv", "queue", "sql"]);
+        assert_eq!(
+            run.captured_components,
+            ["blob", "kv", "queue", "sql", "telemetry"]
+        );
         assert!(!run.ready_for_copy);
-        assert_eq!(run.attempts.len(), 2);
+        assert_eq!(run.attempts.len(), 3);
         assert!(
             run.attempts
                 .iter()
                 .all(|attempt| attempt.state == BackendAttemptState::Captured)
         );
         assert!(
-            run.blocking_findings
+            !run.blocking_findings
                 .iter()
                 .any(|finding| finding.contains("telemetry"))
         );
@@ -2032,10 +2068,14 @@ mod tests {
         let resumed = coordinator.coordinate("shop").await.unwrap();
         assert_eq!(resumed.plan.record_revision, record_revision);
         assert!(
-            resumed
-                .attempts
-                .iter()
-                .all(|attempt| attempt.attempt_count == 2),
+            resumed.attempts.iter().all(|attempt| {
+                let expected = if attempt.backend == "deis-telemetry" {
+                    1
+                } else {
+                    2
+                };
+                attempt.attempt_count == expected
+            }),
             "a completed waiting operation must not make another network attempt"
         );
         assert_eq!(store_calls.load(Ordering::SeqCst), 2);
@@ -2067,6 +2107,7 @@ mod tests {
         let retargeted = config(
             "http://127.0.0.1:1".to_string(),
             queue_endpoint,
+            telemetry_endpoint,
             QUEUE_TOKEN,
         );
         let retargeted =
@@ -2082,13 +2123,16 @@ mod tests {
         let config_debug = format!("{correct_config:?}");
         assert!(!config_debug.contains(STORE_TOKEN));
         assert!(!config_debug.contains(QUEUE_TOKEN));
+        assert!(!config_debug.contains(TELEMETRY_TOKEN));
         assert!(!config_debug.contains("application-storage-capability-root-000001"));
         assert!(config_debug.contains("<redacted>"));
 
         let _ = stop_store.send(());
         let _ = stop_queue.send(());
+        let _ = stop_telemetry.send(());
         store_handle.await.unwrap();
         queue_handle.await.unwrap();
+        telemetry_handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -2116,13 +2160,25 @@ mod tests {
             ],
         );
         let queue = FakeBackend::new("deis-queue", QUEUE_TOKEN, vec![component("queue", 'f')]);
+        let telemetry = FakeBackend::new(
+            "deis-telemetry",
+            TELEMETRY_TOKEN,
+            vec![component("telemetry", 'a')],
+        );
         let store_releases = Arc::clone(&store.release_calls);
         let queue_releases = Arc::clone(&queue.release_calls);
+        let telemetry_releases = Arc::clone(&telemetry.release_calls);
         let (store_endpoint, stop_store, store_handle) = serve(store).await;
         let (queue_endpoint, stop_queue, queue_handle) = serve(queue).await;
+        let (telemetry_endpoint, stop_telemetry, telemetry_handle) = serve(telemetry).await;
         let coordinator = IdentityMigrationCoordinator::from_config(
             Arc::clone(&catalog),
-            &config(store_endpoint, queue_endpoint, QUEUE_TOKEN),
+            &config(
+                store_endpoint,
+                queue_endpoint,
+                telemetry_endpoint,
+                QUEUE_TOKEN,
+            ),
         )
         .unwrap()
         .with_rpc_timeout(Duration::from_secs(2));
@@ -2175,6 +2231,7 @@ mod tests {
         assert!(!operation.cancellable);
         assert_eq!(store_releases.load(Ordering::SeqCst), 1);
         assert_eq!(queue_releases.load(Ordering::SeqCst), 1);
+        assert_eq!(telemetry_releases.load(Ordering::SeqCst), 1);
         catalog.create_environment("shop", "preview").await.unwrap();
         let replacement = catalog.plan_identity_migration("shop").await.unwrap();
         assert_ne!(replacement.migration_id, run.plan.migration_id);
@@ -2183,8 +2240,10 @@ mod tests {
 
         stop_store.send(()).unwrap();
         stop_queue.send(()).unwrap();
+        stop_telemetry.send(()).unwrap();
         store_handle.await.unwrap();
         queue_handle.await.unwrap();
+        telemetry_handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -2195,6 +2254,7 @@ mod tests {
         let mut reused = config(
             "http://127.0.0.1:8090".to_string(),
             "http://127.0.0.1:8091".to_string(),
+            "http://127.0.0.1:8092".to_string(),
             STORE_TOKEN,
         );
         let error =
@@ -2203,7 +2263,13 @@ mod tests {
 
         reused.queue_migration_admin_token = Some(QUEUE_TOKEN.to_string());
         reused.storage_auth_secret = Some(STORE_TOKEN.to_string());
-        let error = IdentityMigrationCoordinator::from_config(catalog, &reused).unwrap_err();
+        let error =
+            IdentityMigrationCoordinator::from_config(Arc::clone(&catalog), &reused).unwrap_err();
         assert!(error.to_string().contains("storage_auth_secret"));
+
+        reused.storage_auth_secret = None;
+        reused.telemetry_migration_admin_token = Some(QUEUE_TOKEN.to_string());
+        let error = IdentityMigrationCoordinator::from_config(catalog, &reused).unwrap_err();
+        assert!(error.to_string().contains("different from each other"));
     }
 }

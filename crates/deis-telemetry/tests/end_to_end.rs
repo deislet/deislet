@@ -5,6 +5,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
+use deis_backend_migration::proto::{
+    AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
+};
 use deis_telemetry::config::Config;
 use deis_telemetry::proto::log_service_client::LogServiceClient;
 use deis_telemetry::proto::metric_service_client::MetricServiceClient;
@@ -60,6 +64,21 @@ async fn connect_traces(server: &RunningServer) -> TraceServiceClient<Channel> {
     TraceServiceClient::new(channel(server).await)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+}
+
+async fn connect_migration(server: &RunningServer) -> BackendMigrationClient<Channel> {
+    BackendMigrationClient::new(channel(server).await)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+}
+
+fn managed<T>(message: T, token: &str) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("valid metadata"),
+    );
+    request
 }
 
 /// `InvocationKind::HttpRequest`.
@@ -1143,4 +1162,228 @@ async fn entries_older_than_the_retention_window_are_refused_not_partitioned() {
     assert_eq!(response.accepted_count, 1);
 
     server.shutdown().await.expect("shutdown must succeed");
+}
+
+#[tokio::test]
+async fn migration_management_is_independently_authenticated_and_fences_only_its_tenant() {
+    const TOKEN: &str = "telemetry-migration-admin-token-00000001";
+    const MIGRATION: &str = "01990f44-1000-7000-8000-000000000099";
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = Config {
+        migration_admin_token: Some(TOKEN.to_string()),
+        ..test_config(dir.path())
+    };
+    let server = server::start(&config).await.expect("service must start");
+    let mut logs = connect(&server).await;
+    logs.push_logs(PushLogsRequest {
+        entries: vec![entry("shop", 3, "before fence", now_us())],
+        metadata: HashMap::new(),
+    })
+    .await
+    .expect("initial telemetry must be stored");
+
+    let mut migration = connect_migration(&server).await;
+    let unauthenticated = migration
+        .get_backend_info(GetBackendInfoRequest {})
+        .await
+        .expect_err("the application channel must not open management");
+    assert_eq!(unauthenticated.code(), tonic::Code::Unauthenticated);
+    let info = migration
+        .get_backend_info(managed(GetBackendInfoRequest {}, TOKEN))
+        .await
+        .expect("the independent management credential must work")
+        .into_inner();
+    assert_eq!(info.backend, "deis-telemetry");
+    assert!(!info.backend_incarnation_id.is_empty());
+
+    migration
+        .acquire_write_fence(managed(
+            AcquireWriteFenceRequest {
+                tenant: "shop.production".to_string(),
+                migration_id: MIGRATION.to_string(),
+                expected_application_revision: 9,
+                fence_token: "one-use-fence-token-0000000000000001".to_string(),
+                expected_backend_incarnation_id: info.backend_incarnation_id.clone(),
+            },
+            TOKEN,
+        ))
+        .await
+        .expect("fence must be acquired");
+
+    let pushed = logs
+        .push_logs(PushLogsRequest {
+            entries: vec![
+                entry("shop", 3, "blocked", now_us()),
+                entry("clock", 3, "still flowing", now_us()),
+            ],
+            metadata: HashMap::new(),
+        })
+        .await
+        .expect("a mixed batch returns a partial-success response")
+        .into_inner();
+    assert_eq!(pushed.accepted_count, 1);
+    assert_eq!(pushed.rejected_count, 1);
+    assert!(pushed.error_message.contains("write-fenced"));
+
+    let shop = logs
+        .query(QueryRequest {
+            app_id: "shop".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(shop.entries.len(), 1);
+    assert_eq!(shop.entries[0].message, "before fence");
+    let clock = logs
+        .query(QueryRequest {
+            app_id: "clock".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(clock.entries.len(), 1);
+    assert_eq!(clock.entries[0].message, "still flowing");
+
+    let mut metrics = connect_metrics(&server).await;
+    let metric_result = metrics
+        .push_metrics(PushMetricsRequest {
+            samples: vec![
+                MetricSample {
+                    name: "requests".to_string(),
+                    app_id: "shop".to_string(),
+                    labels: HashMap::new(),
+                    value: 1.0,
+                    timestamp_us: now_us(),
+                },
+                MetricSample {
+                    name: "requests".to_string(),
+                    app_id: "clock".to_string(),
+                    labels: HashMap::new(),
+                    value: 1.0,
+                    timestamp_us: now_us(),
+                },
+            ],
+            metadata: HashMap::new(),
+        })
+        .await
+        .expect("metric batches also report a tenant-scoped partial success")
+        .into_inner();
+    assert_eq!(metric_result.accepted_count, 1);
+    assert_eq!(metric_result.rejected_count, 1);
+
+    let mut traces = connect_traces(&server).await;
+    let trace_result = traces
+        .push_traces(PushTracesRequest {
+            records: vec![
+                invocation("shop", OUTCOME_OK, "/blocked", now_us()),
+                invocation("clock", OUTCOME_OK, "/flowing", now_us() + 1),
+            ],
+            sampled_out: 0,
+            dropped: 0,
+            metadata: HashMap::new(),
+        })
+        .await
+        .expect("trace batches also report a tenant-scoped partial success")
+        .into_inner();
+    assert_eq!(trace_result.accepted_count, 1);
+    assert_eq!(trace_result.rejected_count, 1);
+    assert_eq!(
+        deis_telemetry::stats::ServiceStats::get(&server.stats.logs_write_fenced),
+        1
+    );
+    assert_eq!(
+        deis_telemetry::stats::ServiceStats::get(&server.stats.metric_samples_write_fenced),
+        1
+    );
+    assert_eq!(
+        deis_telemetry::stats::ServiceStats::get(&server.stats.traces_write_fenced),
+        1
+    );
+
+    let inventory = migration
+        .inspect_tenant(managed(
+            InspectTenantRequest {
+                tenant: "shop.production".to_string(),
+            },
+            TOKEN,
+        ))
+        .await
+        .expect("a fenced tenant can be inventoried")
+        .into_inner();
+    assert_eq!(inventory.tenant, "shop.production");
+    assert_eq!(inventory.components[0].component, "telemetry");
+    assert_eq!(inventory.components[0].item_count, 1);
+    assert_eq!(inventory.components[0].unchecked_orphan_count, 0);
+
+    migration
+        .release_write_fence(managed(
+            ReleaseWriteFenceRequest {
+                tenant: "shop.production".to_string(),
+                migration_id: MIGRATION.to_string(),
+                expected_application_revision: 9,
+                fence_token: "one-use-fence-token-0000000000000001".to_string(),
+                expected_backend_incarnation_id: info.backend_incarnation_id,
+            },
+            TOKEN,
+        ))
+        .await
+        .expect("the exact fence credential must release it");
+    let resumed = logs
+        .push_logs(PushLogsRequest {
+            entries: vec![entry("shop", 3, "after release", now_us())],
+            metadata: HashMap::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resumed.accepted_count, 1);
+
+    server.shutdown().await.expect("shutdown must succeed");
+}
+
+#[tokio::test]
+async fn invalid_or_reused_migration_credentials_fail_before_creating_backend_state() {
+    for (auth_secret, migration_admin_token, expected) in [
+        (None, "short".to_string(), "at least 32 bytes"),
+        (
+            Some("same-secret-used-for-both-auth-domains-01".to_string()),
+            "same-secret-used-for-both-auth-domains-01".to_string(),
+            "must not reuse auth_secret",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = Config {
+            auth_secret,
+            migration_admin_token: Some(migration_admin_token),
+            ..test_config(dir.path())
+        };
+        let error = match server::start(&config).await {
+            Ok(server) => {
+                server.shutdown().await.unwrap();
+                panic!("invalid management credential must refuse startup")
+            }
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains(expected), "unexpected refusal: {error}");
+        assert!(!dir.path().join("telemetry.sqlite").exists());
+        assert!(!dir.path().join("migration-fences.sqlite").exists());
+    }
+}
+
+#[tokio::test]
+async fn migration_management_is_not_registered_by_default() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()))
+        .await
+        .expect("ordinary telemetry service must start");
+    let mut migration = connect_migration(&server).await;
+    let status = migration
+        .get_backend_info(GetBackendInfoRequest {})
+        .await
+        .expect_err("management must not have a loopback bypass");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    server.shutdown().await.unwrap();
 }

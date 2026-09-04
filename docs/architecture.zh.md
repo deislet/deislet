@@ -646,9 +646,11 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 
 ### 观测的维度：应用，环境只是一个字段
 
-隔离是存储的事，观测不需要。能连到 deis-telemetry 端口的人本来就能读写任何应用的
-日志，把租户串（`demo.production`）原样当 `app_id` 换不来隔离，却会毁掉唯一有人问的
-那个问题——「把这个应用的日志给我看」，指的是它全部环境的。
+日常查询按应用聚合，不能把租户串（`demo.production`）原样当 `app_id`：那不会让共享
+telemetry credential 变成租户凭证，反而会毁掉「把这个应用全部环境的日志给我看」这
+个问题。数据面认证的租户隔离仍是待办；迁移管理则必须识别环境边界，现通过独立凭证把
+三种 signal 的 app/environment 映射回 tenant，并在真实 SQLite commit 边界执行 writer
+fence，不把这种管理能力交给普通 producer/reader。
 
 所以节点在投递时把租户拆开：日志的 `app_id` 是应用、`fields.environment` 是环境；
 指标的 `app_id` 是应用、`environment` 是普通标签。于是 `sum by (app_id)` 能把一个

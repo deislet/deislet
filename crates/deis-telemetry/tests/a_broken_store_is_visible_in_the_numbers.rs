@@ -286,10 +286,11 @@ async fn a_scrape_that_cannot_read_the_store_is_counted_and_said_out_loud() {
         .expect("the service starts");
     let stats = server.stats.clone();
 
-    // A metric table missing the column the export reads. The read fails and
-    // nothing else does - the retention sweep still deletes by `timestamp_us`
-    // - so the number below is the export's failure alone and not a second
-    // one racing it from the startup sweep.
+    // A metric table missing the column the export reads. Both export and the
+    // retention preflight inventory need the labels column; if the startup
+    // sweep overlaps this injection, both correctly report the same broken
+    // database. The scrape-specific counter below proves this request was
+    // one of the failures without assuming task scheduling order.
     let conn = rusqlite::Connection::open(dir.path().join("telemetry.sqlite"))
         .expect("the test can open the same database the service opened");
     conn.execute_batch(
@@ -311,9 +312,8 @@ async fn a_scrape_that_cannot_read_the_store_is_counted_and_said_out_loud() {
     );
     assert_eq!(ServiceStats::get(&stats.metric_scrapes), 1);
     assert_eq!(ServiceStats::get(&stats.metric_scrapes_failed), 1);
-    assert_eq!(
-        ServiceStats::get(&stats.storage_failures),
-        1,
+    assert!(
+        ServiceStats::get(&stats.storage_failures) >= 1,
         "the export reads the same database as everything else, and the total that says the \
          database is broken has to include it"
     );

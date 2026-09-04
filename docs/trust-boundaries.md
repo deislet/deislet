@@ -126,7 +126,7 @@ the operator's to enforce:
 
 | File | Required |
 |---|---|
-| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `node_preshared_keys`, `api_keys`, `storage_auth_secret`, `store_migration_admin_token` and `queue_migration_admin_token`. The two migration values must be different from each other and every other credential. |
+| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `node_preshared_keys`, `api_keys`, `storage_auth_secret`, `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`. The three migration values must be different from each other and every other credential. |
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
 | Every node's configuration | `0600`, owned by the node's service user. It holds `[control] secret`. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same value, same consequences. |

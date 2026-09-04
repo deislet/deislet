@@ -2289,6 +2289,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap 4.6.6",
+ "deis-backend-migration",
  "deis-wire",
  "prost 0.13.5",
  "rusqlite",

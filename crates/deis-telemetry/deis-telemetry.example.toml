@@ -1,13 +1,15 @@
 # deis-telemetry configuration. Every key is optional; the values below are
 # the defaults, so an empty file starts a working service.
 
-# gRPC endpoint. Four services share it: LogService (PushLogs / Query /
+# gRPC endpoint. Four always-on services share it: LogService (PushLogs / Query /
 # Tail), TraceService (PushTraces / QueryTraces / TailTraces), MetricService
 # (PushMetrics / QueryMetrics) and the standard grpc.health.v1 service, which
 # is the only health surface this process offers. That one answers NOT_SERVING
 # whenever the database underneath has stopped taking writes or reads, so a
 # probe on it is worth having: a collector that reports healthy while
-# refusing every log line is worse than one that reports broken.
+# refusing every log line is worse than one that reports broken. An optional
+# fifth BackendMigration service appears only when migration_admin_token is
+# configured and uses that independent credential.
 #
 # Loopback on purpose, because the auth_secret line below is commented out.
 # With no auth_secret, anything that can reach these two ports may read every
@@ -36,6 +38,15 @@ metrics_listen = "127.0.0.1:8093"
 #
 # Required as soon as either address above is not a loopback address.
 # auth_secret = "put a long random string here"
+
+# Independent bearer credential for the optional BackendMigration management
+# service. This is never the auth_secret above: telemetry producers and
+# readers must not be able to freeze, inventory or release a tenant. When
+# absent, management RPCs are not registered. The durable fence journal is
+# still enforced, so removing this setting cannot bypass an active fence.
+#
+#   openssl rand -hex 32
+# migration_admin_token = "put an independent migration token here"
 
 # Directory holding telemetry.sqlite: the logs, the traces and the metric
 # series. It runs in WAL mode, so back it up with

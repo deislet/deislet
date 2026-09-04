@@ -5,9 +5,10 @@
 //! Whether a caller is authenticated at all is decided by `auth_secret`, and
 //! what happens when it is absent depends on where the two ports are bound:
 //!
-//! * `auth_secret` set: every gRPC call and every scrape must carry the
-//!   capability token for this service, wherever it is bound. See
-//!   [`crate::auth`].
+//! * `auth_secret` set: every application telemetry gRPC call and every
+//!   scrape must carry the capability token for this service, wherever it is
+//!   bound. Health is public and optional migration management has its own
+//!   credential. See [`crate::auth`].
 //! * No `auth_secret`, both ports on loopback: the service runs exactly as it
 //!   did before tokens existed - callers are believed, and what keeps one
 //!   application's logs away from an unrelated client is that the client
@@ -24,7 +25,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 /// On-disk configuration. Every field has a default so an empty file works.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Address the gRPC server binds to.
@@ -57,6 +58,15 @@ pub struct Config {
     /// has the reasoning and the refusal.
     #[serde(default)]
     pub auth_secret: Option<String>,
+    /// Independent bearer credential for the backend migration management
+    /// RPCs. When absent those RPCs are not registered; ingest still opens
+    /// and enforces the durable fence journal so removing this credential
+    /// cannot bypass an already acquired fence.
+    ///
+    /// This must not equal `auth_secret`: application telemetry callers must
+    /// never inherit authority to freeze, inventory or release a tenant.
+    #[serde(default)]
+    pub migration_admin_token: Option<String>,
     /// How many days of logs to keep. Logs live in one table per UTC day;
     /// the sweeper drops whole tables older than this.
     #[serde(default = "default_log_retention_days")]
@@ -158,6 +168,7 @@ impl Default for Config {
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
             auth_secret: None,
+            migration_admin_token: None,
             log_retention_days: default_log_retention_days(),
             metric_retention_days: default_metric_retention_days(),
             trace_retention_days: default_trace_retention_days(),
@@ -168,6 +179,40 @@ impl Default for Config {
             query_max_limit: default_query_max_limit(),
             metrics_export_window_secs: default_metrics_export_window_secs(),
         }
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("metrics_listen", &self.metrics_listen)
+            .field("data_dir", &self.data_dir)
+            .field(
+                "auth_secret",
+                &self.auth_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "migration_admin_token",
+                &self.migration_admin_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("log_retention_days", &self.log_retention_days)
+            .field("metric_retention_days", &self.metric_retention_days)
+            .field("trace_retention_days", &self.trace_retention_days)
+            .field(
+                "retention_sweep_interval_secs",
+                &self.retention_sweep_interval_secs,
+            )
+            .field("tail_capacity", &self.tail_capacity)
+            .field("trace_tail_capacity", &self.trace_tail_capacity)
+            .field("query_default_limit", &self.query_default_limit)
+            .field("query_max_limit", &self.query_max_limit)
+            .field(
+                "metrics_export_window_secs",
+                &self.metrics_export_window_secs,
+            )
+            .finish()
     }
 }
 
@@ -266,6 +311,22 @@ mod tests {
             err.to_string().contains("retention_days"),
             "error should name the unknown key, got: {err}"
         );
+    }
+
+    #[test]
+    fn credentials_are_parsed_but_never_printed_by_debug() {
+        let config: Config = toml::from_str(
+            "auth_secret = \"application-telemetry-secret\"\nmigration_admin_token = \"migration-administrator-secret-000001\"",
+        )
+        .unwrap();
+        assert_eq!(
+            config.migration_admin_token.as_deref(),
+            Some("migration-administrator-secret-000001")
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("application-telemetry-secret"));
+        assert!(!debug.contains("migration-administrator-secret-000001"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

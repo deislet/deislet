@@ -615,8 +615,10 @@ mod tests {
         let config = ControlConfig {
             store_endpoint: Some("http://127.0.0.1:9".to_string()),
             queue_endpoint: Some("http://127.0.0.1:10".to_string()),
+            telemetry_endpoint: Some("http://127.0.0.1:11".to_string()),
             store_migration_admin_token: Some("s".repeat(32)),
             queue_migration_admin_token: Some("q".repeat(32)),
+            telemetry_migration_admin_token: Some("t".repeat(32)),
             ..Default::default()
         };
         let api = router(MigrationApiState::new(store, &config));
@@ -728,8 +730,10 @@ mod tests {
         let config = ControlConfig {
             store_endpoint: Some("http://127.0.0.1:9".to_string()),
             queue_endpoint: Some("http://127.0.0.1:10".to_string()),
+            telemetry_endpoint: Some("http://127.0.0.1:11".to_string()),
             store_migration_admin_token: Some("s".repeat(32)),
             queue_migration_admin_token: Some("q".repeat(32)),
+            telemetry_migration_admin_token: Some("t".repeat(32)),
             ..Default::default()
         };
         let api = router(MigrationApiState::new(Arc::clone(&store), &config));

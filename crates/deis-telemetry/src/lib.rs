@@ -19,9 +19,12 @@
 //! `deis_telemetry_traces_sampled_out_total` and
 //! `deis_telemetry_traces_dropped_by_producer_total`.
 //!
-//! This service is deliberately "dumb": it knows only `app_id` as an
-//! application dimension, and knows nothing about versions, environments or
-//! deployments. Those concepts live in deis-control and deis-runtime.
+//! This service is deliberately "dumb": its ingest and query model uses
+//! `app_id` as the application dimension and makes no health, version or
+//! deployment decision. Environment stays a record attribute. The migration
+//! management surface is the narrow exception: it maps those attributes back
+//! to the platform tenant identity solely to fence and inventory one
+//! application environment.
 //!
 //! deis-runtime does run production and preview environments of one
 //! application side by side, and it names them apart everywhere it stores
@@ -90,6 +93,8 @@ pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 pub mod auth;
 pub mod config;
 pub mod http;
+mod identity;
+pub mod migration;
 pub mod prom;
 pub mod server;
 pub mod service;

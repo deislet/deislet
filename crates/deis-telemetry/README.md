@@ -6,6 +6,27 @@ traces live in one table per UTC day so retention is a `DROP TABLE`; queries
 page newest first by cursor. The crate docs in `src/lib.rs` are the full
 description; `proto/telemetry.proto` is the contract.
 
+## Migration fence and inventory
+
+When `migration_admin_token` is configured, the shared
+`deis.backend.migration.v1.BackendMigration` service is registered on the
+gRPC port behind its own bearer credential. It exposes the stable physical
+backend incarnation, a durable per-`<app>.<environment>` write fence, and one
+deterministic `telemetry` inventory spanning logs, metrics and traces. Missing
+environment fields from legacy producers mean `production`; malformed tenant
+parts are rejected at ingest and corrupt persisted rows appear as unchecked
+orphans rather than disappearing from evidence.
+
+Every ingest transaction holds its tenant permit through SQLite commit. A
+mixed batch filters only records belonging to a fenced tenant, so migration
+of one application does not stop telemetry for another. Retention is global
+in this embedded layout, therefore a sweep first acquires permits for every
+stored tenant and skips the entire sweep while any one is fenced. The fence
+journal remains enforced even when the management credential is later
+removed from configuration. `/metrics` exposes the rejected record totals by
+signal and `retention_sweeps_skipped_fenced_total`, so this controlled pause
+is distinguishable from malformed producer data or a failed database.
+
 ## What one caller can do to every other caller
 
 Two limits are absent on purpose, as product decisions that have not been
