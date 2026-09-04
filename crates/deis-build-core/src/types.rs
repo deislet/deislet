@@ -98,9 +98,48 @@ pub struct HandlerInfo {
     pub named_exports: Vec<String>,
     pub used_services: Vec<String>,
     pub imports: Vec<String>,
+    /// Runtime module edges with enough information to validate an exact
+    /// application surface. `imports` above remains the deduplicated graph
+    /// used by staging; these records deliberately preserve how a module was
+    /// accessed, because `import { createHash }` and `import * as crypto`
+    /// expose different Node APIs even though they name the same specifier.
+    pub module_references: Vec<ModuleReference>,
     /// `import(expr)` / `require(expr)` edges whose target is not a string
     /// literal and therefore cannot be put into a self-contained artifact.
     pub non_literal_module_loads: usize,
+    pub non_literal_module_load_positions: Vec<ModuleSourcePosition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleSourcePosition {
+    pub line: usize,
+    pub column: usize,
+}
+
+/// The syntax that caused a runtime module edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleReferenceKind {
+    StaticImport,
+    ReExport,
+    DynamicImport,
+    Require,
+}
+
+/// One statically named runtime module edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleReference {
+    pub specifier: String,
+    /// Export names read from the dependency. The original name is recorded
+    /// for a renamed import/re-export (`x as y` reads `x`). `default` is kept
+    /// explicit because the Edge Canon Node surface has no implicit default.
+    pub requested_exports: Vec<String>,
+    /// Namespace-producing syntax (`import *`, `export *`, `import()` or
+    /// `require()`) can expose more than the named allow-list.
+    pub loads_namespace: bool,
+    pub kind: ModuleReferenceKind,
+    /// One-based source coordinates for stable pre-deploy diagnostics.
+    pub line: usize,
+    pub column: usize,
 }
 
 /// One static file the project ships, as an adapter needs to know it.

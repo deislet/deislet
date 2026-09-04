@@ -38,3 +38,6 @@ rolldown_common = { git = "https://github.com/rolldown/rolldown", tag = "v1.0.0-
 # upgrade, and a renamed code would then stop matching in silence - see
 # `BuildBundler::refuse_broken_references`.
 rolldown_error = { git = "https://github.com/rolldown/rolldown", tag = "v1.0.0-rc.1" }
+
+[dev-dependencies]
+tempfile = "3"

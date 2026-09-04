@@ -53,8 +53,9 @@ async fn build(dir: &Path, vendor: &str) -> anyhow::Result<deis_build::Compilati
 const IMPORTS_A_BARE_NAME: &str = "import { v4 as uuidv4 } from 'uuid';\n\
      export default async function handler(_c: any) { return new Response(uuidv4()); }\n";
 
-/// The same dependency written the way Deno resolves it with no map entry,
-/// which is what the deno adapter's own documentation tells an author to do.
+/// A provider-specific dependency spelling that the old Deno target accepted.
+/// The unified standard instead requires a root package.json/package-lock and
+/// the same bare import on every target.
 const IMPORTS_AN_NPM_SPECIFIER: &str = "import { v4 as uuidv4 } from 'npm:uuid@^9';\n\
      export default async function handler(_c: any) { return new Response(uuidv4()); }\n";
 
@@ -110,19 +111,22 @@ async fn the_bundled_targets_and_deno_agree_about_the_same_source() {
     }
 }
 
-/// The check must not be in the way of the spelling the deno adapter tells
-/// authors to use. `npm:` needs no import-map entry and Deno resolves it
-/// itself, so a build carrying one is correct and has to stay green.
+/// `npm:` delegates resolution to one provider at runtime, so it cannot be the
+/// source contract for a multi-backend application. It must fail before any
+/// Deno-only artifact exists and say how to write the portable input.
 #[tokio::test]
-async fn an_npm_specifier_still_builds_for_deno() {
+async fn a_deno_npm_specifier_is_refused_by_the_unified_standard() {
     let project = tempfile::tempdir().expect("a temporary project");
     stage(project.path(), "deno", IMPORTS_AN_NPM_SPECIFIER);
 
-    let result = build(project.path(), "deno")
+    let error = build(project.path(), "deno")
         .await
-        .expect("`npm:` is how the deno adapter says to name a dependency");
-    assert!(result.success);
-    assert!(project.path().join("dist/deno/deno.json").exists());
+        .expect_err("a provider-only runtime resolver cannot be portable")
+        .to_string();
+    assert!(error.contains("EC_NPM_PACKAGE_UNRESOLVED"), "{error}");
+    assert!(error.contains("package.json"), "{error}");
+    assert!(error.contains("bare package name"), "{error}");
+    assert!(!project.path().join("dist/deno/deno.json").exists());
 }
 
 /// A relative import is Deno's own business and must not be caught by the bare

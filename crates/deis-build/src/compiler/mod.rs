@@ -583,9 +583,15 @@ impl Compiler {
         if info.non_literal_module_loads == 0 {
             return Ok(());
         }
+        let locations = info
+            .non_literal_module_load_positions
+            .iter()
+            .map(|position| format!("{}:{}", position.line, position.column))
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(anyhow::anyhow!(
-            "{path} contains {} import()/require() call(s) whose module name is not a string literal. This build cannot enumerate or carry those files, so accepting it could produce a deployable that fails only when that branch runs. Use one literal module specifier per branch",
-            info.non_literal_module_loads
+            "EC_NPM_DYNAMIC_RESOLUTION_UNSUPPORTED: {path}:{locations}: contains {} import()/require() call(s) whose module name is not a string literal. This build cannot enumerate or carry those files, so accepting it could produce a deployable that fails only when that branch runs. Use one literal module specifier per branch",
+            info.non_literal_module_loads,
         ))
     }
 
@@ -901,6 +907,11 @@ impl Compiler {
         // Deno resolver check, because helpers can import a bare name just as
         // a route handler can.
         let mut handler_specifiers: Vec<(String, Vec<String>)> = Vec::new();
+        // Unlike the graph-only list above, these records preserve the exact
+        // imported export and source coordinate. Every provider consumes one
+        // validation result so a native Node implementation cannot silently
+        // expose more application API than a shimmed one.
+        let mut module_references: Vec<(String, Vec<ModuleReference>)> = Vec::new();
         let mut module_queue: VecDeque<(PathBuf, Vec<String>)> = VecDeque::new();
         let mut staged_modules: HashSet<PathBuf> = HashSet::new();
 
@@ -932,6 +943,7 @@ impl Compiler {
             let parsed = self.parser.parse(&code, &handler_path)?;
             Self::refuse_a_handler_with_no_default_export(&handler_path, Some(&parsed))?;
             Self::refuse_non_literal_module_loads(&handler_path, &parsed)?;
+            module_references.push((handler_path.clone(), parsed.module_references.clone()));
             handler_specifiers.push((handler_path.clone(), parsed.imports.clone()));
             module_queue.push_back((source_path.clone(), parsed.imports));
             staged_modules.insert(source_path.clone());
@@ -1016,6 +1028,7 @@ impl Compiler {
                         let name = dependency.to_string_lossy().to_string();
                         let parsed = self.parser.parse(code, &name)?;
                         Self::refuse_non_literal_module_loads(&name, &parsed)?;
+                        module_references.push((name.clone(), parsed.module_references.clone()));
                         handler_specifiers.push((name, parsed.imports.clone()));
                         module_queue.push_back((dependency.clone(), parsed.imports));
                     }
@@ -1029,6 +1042,13 @@ impl Compiler {
                 }
             }
         }
+
+        // This is deliberately before provider adapter generation. A source
+        // graph is either valid for the single Edge Canon Node/npm contract
+        // or invalid for every target; provider selection cannot turn an
+        // unsupported builtin/export or an unlocked dependency into a
+        // deployable artifact.
+        validate_node_npm_project(&project_root, &module_references)?;
 
         // The project's static files, read once for whatever this target does
         // with them.

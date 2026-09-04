@@ -2109,6 +2109,7 @@ dependencies = [
  "rolldown_error",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

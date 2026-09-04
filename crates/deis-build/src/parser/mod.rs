@@ -1,5 +1,5 @@
-use deis_build_core::HandlerInfo;
-use swc_common::{sync::Lrc, FileName, SourceMap};
+use deis_build_core::{HandlerInfo, ModuleReference, ModuleReferenceKind, ModuleSourcePosition};
+use swc_common::{sync::Lrc, FileName, SourceMap, Span, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -39,7 +39,7 @@ impl TypeScriptParser {
             .parse_module()
             .map_err(|e| anyhow::anyhow!("Parse error: {e:?}"))?;
 
-        let mut visitor = HandlerVisitor::new();
+        let mut visitor = HandlerVisitor::new(self.source_map.clone());
         module.visit_with(&mut visitor);
 
         Ok(HandlerInfo {
@@ -49,7 +49,9 @@ impl TypeScriptParser {
             named_exports: visitor.named_exports,
             used_services: visitor.used_services,
             imports: visitor.imports,
+            module_references: visitor.module_references,
             non_literal_module_loads: visitor.non_literal_module_loads,
+            non_literal_module_load_positions: visitor.non_literal_module_load_positions,
         })
     }
 
@@ -84,21 +86,27 @@ impl TypeScriptParser {
 }
 
 struct HandlerVisitor {
+    source_map: Lrc<SourceMap>,
     has_default_export: bool,
     named_exports: Vec<String>,
     used_services: Vec<String>,
     imports: Vec<String>,
+    module_references: Vec<ModuleReference>,
     non_literal_module_loads: usize,
+    non_literal_module_load_positions: Vec<ModuleSourcePosition>,
 }
 
 impl HandlerVisitor {
-    fn new() -> Self {
+    fn new(source_map: Lrc<SourceMap>) -> Self {
         Self {
+            source_map,
             has_default_export: false,
             named_exports: Vec::new(),
             used_services: Vec::new(),
             imports: Vec::new(),
+            module_references: Vec::new(),
             non_literal_module_loads: 0,
+            non_literal_module_load_positions: Vec::new(),
         }
     }
 
@@ -129,6 +137,25 @@ impl HandlerVisitor {
         if !self.imports.iter().any(|existing| existing == specifier) {
             self.imports.push(specifier.to_string());
         }
+    }
+
+    fn record_module_reference(
+        &mut self,
+        specifier: &str,
+        requested_exports: Vec<String>,
+        loads_namespace: bool,
+        kind: ModuleReferenceKind,
+        span: Span,
+    ) {
+        let location = self.source_map.lookup_char_pos(span.lo());
+        self.module_references.push(ModuleReference {
+            specifier: specifier.to_string(),
+            requested_exports,
+            loads_namespace,
+            kind,
+            line: location.line,
+            column: location.col_display + 1,
+        });
     }
 }
 
@@ -204,16 +231,84 @@ impl Visit for HandlerVisitor {
             }
         }
         if let Some(source) = &n.src {
-            self.record_import(&source.value.to_string_lossy());
+            let source = source.value.to_string_lossy();
+            self.record_import(&source);
+            if !n.type_only {
+                let mut requested_exports = Vec::new();
+                let mut loads_namespace = false;
+                for specifier in &n.specifiers {
+                    match specifier {
+                        ExportSpecifier::Named(named) if !named.is_type_only => {
+                            requested_exports.push(export_name(&named.orig));
+                        }
+                        ExportSpecifier::Namespace(_) => loads_namespace = true,
+                        ExportSpecifier::Default(_) => {
+                            requested_exports.push("default".to_string());
+                        }
+                        ExportSpecifier::Named(_) => {}
+                    }
+                }
+                if !requested_exports.is_empty() || loads_namespace || n.specifiers.is_empty() {
+                    self.record_module_reference(
+                        &source,
+                        requested_exports,
+                        loads_namespace,
+                        ModuleReferenceKind::ReExport,
+                        n.span(),
+                    );
+                }
+            }
         }
     }
 
     fn visit_import_decl(&mut self, n: &ImportDecl) {
-        self.record_import(&n.src.value.to_string_lossy());
+        let source = n.src.value.to_string_lossy();
+        self.record_import(&source);
+        if n.type_only {
+            return;
+        }
+
+        let mut requested_exports = Vec::new();
+        let mut loads_namespace = false;
+        for specifier in &n.specifiers {
+            match specifier {
+                ImportSpecifier::Named(named) if !named.is_type_only => {
+                    requested_exports.push(
+                        named
+                            .imported
+                            .as_ref()
+                            .map(export_name)
+                            .unwrap_or_else(|| named.local.sym.to_string()),
+                    );
+                }
+                ImportSpecifier::Default(_) => requested_exports.push("default".to_string()),
+                ImportSpecifier::Namespace(_) => loads_namespace = true,
+                ImportSpecifier::Named(_) => {}
+            }
+        }
+        if !requested_exports.is_empty() || loads_namespace || n.specifiers.is_empty() {
+            self.record_module_reference(
+                &source,
+                requested_exports,
+                loads_namespace,
+                ModuleReferenceKind::StaticImport,
+                n.span(),
+            );
+        }
     }
 
     fn visit_export_all(&mut self, n: &ExportAll) {
-        self.record_import(&n.src.value.to_string_lossy());
+        let source = n.src.value.to_string_lossy();
+        self.record_import(&source);
+        if !n.type_only {
+            self.record_module_reference(
+                &source,
+                Vec::new(),
+                true,
+                ModuleReferenceKind::ReExport,
+                n.span(),
+            );
+        }
     }
 
     fn visit_expr(&mut self, n: &Expr) {
@@ -224,21 +319,46 @@ impl Visit for HandlerVisitor {
         // They belong in the staged module graph as well; otherwise a build
         // can ship its eager path and leave its lazy or CommonJS path behind.
         if let Expr::Call(call) = n {
-            let imports_module = matches!(call.callee, Callee::Import(_))
-                || matches!(
-                    &call.callee,
-                    Callee::Expr(callee)
-                        if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
-                );
+            let dynamic_import = matches!(call.callee, Callee::Import(_));
+            let require = matches!(
+                &call.callee,
+                Callee::Expr(callee)
+                    if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
+            );
+            let imports_module = dynamic_import || require;
             if imports_module {
                 if let Some(argument) = call.args.first() {
                     if let Expr::Lit(Lit::Str(specifier)) = &*argument.expr {
-                        self.record_import(&specifier.value.to_string_lossy());
+                        let specifier = specifier.value.to_string_lossy();
+                        self.record_import(&specifier);
+                        self.record_module_reference(
+                            &specifier,
+                            Vec::new(),
+                            true,
+                            if dynamic_import {
+                                ModuleReferenceKind::DynamicImport
+                            } else {
+                                ModuleReferenceKind::Require
+                            },
+                            call.span(),
+                        );
                     } else {
                         self.non_literal_module_loads += 1;
+                        let location = self.source_map.lookup_char_pos(call.span().lo());
+                        self.non_literal_module_load_positions
+                            .push(ModuleSourcePosition {
+                                line: location.line,
+                                column: location.col_display + 1,
+                            });
                     }
                 } else {
                     self.non_literal_module_loads += 1;
+                    let location = self.source_map.lookup_char_pos(call.span().lo());
+                    self.non_literal_module_load_positions
+                        .push(ModuleSourcePosition {
+                            line: location.line,
+                            column: location.col_display + 1,
+                        });
                 }
             }
         }
@@ -399,6 +519,62 @@ export default async function handler() { return new Response(String(value)); }
     }
 
     #[test]
+    fn module_edges_preserve_the_export_surface_and_source_position() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "import crypto, { createHash as hash, type KeyObject } from 'node:crypto';\n\
+                 import * as path from 'node:path';\n\
+                 import 'node:diagnostics_channel';\n\
+                 export { EventEmitter as Events } from 'node:events';\n\
+                 export * from 'node:buffer';\n\
+                 const timers = require('node:timers');\n\
+                 const streams = import('node:stream');\n\
+                 export default async function handler() { return new Response(String(hash)); }\n",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+
+        assert_eq!(info.module_references.len(), 7);
+        assert_eq!(
+            info.module_references[0].requested_exports,
+            vec!["default", "createHash"]
+        );
+        assert!(!info.module_references[0].loads_namespace);
+        assert_eq!(info.module_references[0].line, 1);
+        assert_eq!(info.module_references[0].column, 1);
+        assert!(info.module_references[1].loads_namespace);
+        assert!(info.module_references[2].requested_exports.is_empty());
+        assert!(!info.module_references[2].loads_namespace);
+        assert_eq!(
+            info.module_references[3].requested_exports,
+            vec!["EventEmitter"]
+        );
+        assert!(info.module_references[4].loads_namespace);
+        assert_eq!(info.module_references[5].kind, ModuleReferenceKind::Require);
+        assert_eq!(
+            info.module_references[6].kind,
+            ModuleReferenceKind::DynamicImport
+        );
+    }
+
+    #[test]
+    fn type_only_edges_do_not_become_runtime_surface_claims() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "import type { KeyObject } from 'node:crypto';\n\
+                 export type { EventEmitter } from 'node:events';\n\
+                 export default function handler() {}\n",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+
+        assert!(info.module_references.is_empty());
+        assert_eq!(info.imports, vec!["node:crypto", "node:events"]);
+    }
+
+    #[test]
     fn computed_module_loads_are_counted_for_a_fail_closed_build() {
         let parser = TypeScriptParser::new();
         let info = parser
@@ -408,6 +584,8 @@ export default async function handler() { return new Response(String(value)); }
             )
             .expect("module parses");
         assert_eq!(info.non_literal_module_loads, 2);
+        assert_eq!(info.non_literal_module_load_positions.len(), 2);
+        assert_eq!(info.non_literal_module_load_positions[0].line, 1);
     }
 
     #[test]
