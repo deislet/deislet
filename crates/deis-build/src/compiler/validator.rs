@@ -25,10 +25,45 @@ impl Validator {
         &self,
         code: &str,
         handler_info: &HandlerInfo,
+        handler_kind: deis_build_core::routes::HandlerKind,
         _config: &ProjectConfig,
         _strict: bool,
         result: &mut ValidationResult,
     ) -> anyhow::Result<()> {
+        if handler_kind == deis_build_core::routes::HandlerKind::Http {
+            for reference in &handler_info.non_standard_context_references {
+                let suggestion = match reference.field.as_str() {
+                    "path" | "query" => "Parse context.request.url with new URL(...)".to_string(),
+                    "method" | "headers" => {
+                        format!("Use context.request.{}", reference.field)
+                    }
+                    "log" => "Use console.debug/info/warn/error".to_string(),
+                    "services" | "bindings" => {
+                        "Declare a logical binding and use context.env.<NAME>".to_string()
+                    }
+                    "cookies" => {
+                        "Read and parse context.request.headers.get('cookie')".to_string()
+                    }
+                    _ => {
+                        "Use only context.request, context.env, context.params, and context.waitUntil"
+                            .to_string()
+                    }
+                };
+                result.add_error(ValidationError {
+                    file: handler_info.path.clone(),
+                    line: reference.line,
+                    column: reference.column,
+                    message: format!(
+                        "context.{} is outside the selected Edge Canon HTTP context",
+                        reference.field
+                    ),
+                    code: "EC_WEB_CONTEXT_FIELD_NONSTANDARD".to_string(),
+                    severity: Severity::Error,
+                    suggestion: Some(suggestion),
+                });
+            }
+        }
+
         // The default export, and only the default export.
         //
         // This used to accept named exports instead, and a file with named
@@ -136,7 +171,7 @@ impl<'a> Visit for ValidationVisitor<'a> {
                 1, // Line number would need span information
                 "Platform-specific code detected: You cannot check for platform type".to_string(),
                 "PLATFORM_DETECTION".to_string(),
-                Some("Use unified interfaces from context.services instead".to_string()),
+                Some("Use the selected Edge Canon context and Web APIs".to_string()),
             );
         }
     }
@@ -165,7 +200,7 @@ impl<'a> Visit for ValidationVisitor<'a> {
                             1,
                             format!("Platform-specific API detected: {}.env", obj.sym),
                             "PLATFORM_API".to_string(),
-                            Some("Use context.env or context.services instead".to_string()),
+                            Some("Use context.env instead".to_string()),
                         );
                     }
                 }
@@ -191,6 +226,7 @@ mod tests {
             non_literal_module_load_positions: vec![],
             provider_only_global_references: vec![],
             non_portable_stream_constructors: vec![],
+            non_standard_context_references: vec![],
         }
     }
 
@@ -223,6 +259,7 @@ export default async function handler(context) {
             .validate(
                 code,
                 &handler_info,
+                deis_build_core::routes::HandlerKind::Http,
                 &create_mock_config(),
                 false,
                 &mut result,
@@ -247,6 +284,7 @@ function handler(context) {
             .validate(
                 code,
                 &handler_info,
+                deis_build_core::routes::HandlerKind::Http,
                 &create_mock_config(),
                 false,
                 &mut result,
@@ -268,11 +306,12 @@ function handler(context) {
         let validator = Validator::new();
         let code = r#"
 export default async function handler(context) {
-    const kv = context.services.kv;
+    const request = context.request;
     const env = context.env;
     const params = context.params;
+    context.waitUntil(Promise.resolve());
 
-    return new Response("OK");
+    return new Response(request.url + env + params);
 }
 "#;
         let handler_info = create_mock_handler_info("test.ts", true);
@@ -282,6 +321,7 @@ export default async function handler(context) {
             .validate(
                 code,
                 &handler_info,
+                deis_build_core::routes::HandlerKind::Http,
                 &create_mock_config(),
                 false,
                 &mut result,
@@ -310,6 +350,7 @@ export function middleware(req) { return req; }
             .validate(
                 code,
                 &handler_info,
+                deis_build_core::routes::HandlerKind::Http,
                 &create_mock_config(),
                 false,
                 &mut result,
@@ -348,6 +389,7 @@ function notExported() {
             .validate(
                 code,
                 &handler_info,
+                deis_build_core::routes::HandlerKind::Http,
                 &create_mock_config(),
                 false,
                 &mut result,
@@ -356,5 +398,33 @@ function notExported() {
 
         assert!(!result.errors.is_empty());
         assert_eq!(result.errors[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn event_contexts_are_not_misclassified_as_http_contexts() {
+        let validator = Validator::new();
+        let code = "export default function handler(context) { return context.scheduledTime; }";
+        let mut handler_info = create_mock_handler_info("_scheduled.ts", true);
+        handler_info
+            .non_standard_context_references
+            .push(NonStandardContextReference {
+                field: "scheduledTime".to_string(),
+                line: 1,
+                column: 60,
+            });
+        let mut result = ValidationResult::new();
+
+        validator
+            .validate(
+                code,
+                &handler_info,
+                deis_build_core::routes::HandlerKind::Scheduled,
+                &create_mock_config(),
+                false,
+                &mut result,
+            )
+            .unwrap();
+
+        assert!(result.errors.is_empty());
     }
 }

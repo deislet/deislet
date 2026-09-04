@@ -48,7 +48,16 @@ fn generated_handler_boundary_awaits_and_returns_the_fixed_non_leaking_error() {
     assert!(artifacts
         .router_code
         .contains("return await invokeEdgeCanonHandler"));
-    assert!(runtime.contains("const result = await invoke()"));
+    assert!(artifacts
+        .router_code
+        .contains("const lifecycle = buildContext"));
+    assert!(artifacts
+        .router_code
+        .contains("invokeEdgeCanonHandler(lifecycle"));
+    assert!(runtime.contains("result = await invoke()"));
+    assert!(runtime.contains("createEdgeCanonContext"));
+    assert!(runtime.contains("EC_WAIT_UNTIL_PROMISE_REQUIRED"));
+    assert!(runtime.contains("EC_WAIT_UNTIL_CLOSED"));
     assert!(runtime.contains("EC_HANDLER_THROWN"));
     assert!(runtime.contains("EC_HANDLER_RESULT_INVALID"));
     assert!(runtime.contains("'content-type': 'text/plain; charset=utf-8'"));

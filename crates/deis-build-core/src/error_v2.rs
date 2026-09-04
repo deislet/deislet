@@ -453,7 +453,7 @@ mod tests {
         let spec_err = SpecComplianceError::PlatformDetection {
             location: location.clone(),
             detected_code: "typeof Deno !== 'undefined'".to_string(),
-            suggestion: "Use context.services instead".to_string(),
+            suggestion: "Use the selected Edge Canon context and Web APIs".to_string(),
         };
 
         assert_eq!(spec_err.error_code(), "SPEC_PLATFORM_DETECTION");

@@ -33,7 +33,7 @@ deis init  →  写代码  →  deis dev  →  deis deploy
                                     ↓                   ↓
                              静态资产命中           Isolate 执行
                                                         ↓
-                                context.services.{kv,database,blob,queue,cache}
+                                context.env.<逻辑资源名> / caches.default
                                                         ↓
                                           deis-store / deis-queue
                                                         ↓
@@ -183,16 +183,15 @@ assets/                  # 静态资产，原样保留目录结构
   上照样 `Ok`。
 - `secrets` 只列名字，值永远不进包。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
-- `services` 的四个键是**种类**，管的是那个租户**不带名字**的那一份命名空间——
-  `ctx.services.kv` 拿到的就是它。同种类的第二份是 `bindings` 里的一条，靠作者给的
-  名字取用。
+- `services` 的四个键是 schema 1 的旧式无名资源声明，只为迁移既有 bundle 与数据保留；
+  新标准应用只声明 `bindings`，生成的 HTTP context 不暴露 `context.services`。
 - `bindings` 是一张**平表**：名字 → `{ "kind": ... }`，`kind` 五选一
   （`kv` / `database` / `blob` / `queue` / `service`）。前四种是本租户内部又一个命名
   空间（租户边界一点没动：绑定名是验过能力令牌之后用
   `deis_wire::conventions::namespace_id` 拼到租户后面的，`shop.production@HOT`）；
   `service` 是**打给另一个应用**的调用，多带一个 `app`，可选的 `environment` 省略时
-  就是调用方自己所在的那个环境。名字在 `context.bindings.<名字>` 和 `env.<名字>` 上
-  是同一个对象；判重不分大小写，因为它会变成 deis-store 里的目录名与文件名。形状与
+  就是调用方自己所在的那个环境。标准 HTTP 应用从 `context.env.<名字>` 访问；判重不分
+  大小写，因为它会变成 deis-store 里的目录名与文件名。形状与
   校验只在 `deis_bundle::bindings` 一处，构建 / 控制面 / 节点 / isolate 四方共用。
 - `callable_by` 是**被调方**的同意书，写在被调方自己的包里，跟着它自己的代码走版本。
   调用方在 `bindings` 里点名只是**在问**；这里才是答复，节点每次调用都从被调方当前
@@ -394,7 +393,7 @@ GET  deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE   // "/api/nodes/:id/assignm
 看的，会不会过期以 `crates/deis-wire/src/conventions.rs` 为准——本文档此前把登记接口
 写成 `POST .../register`，而代码里一直是 `PUT .../registration`，正是这类抄写造成的。
 
-`env` 与 `ApplyDeployment.env` 是同一张表（manifest 变量 + 当场解密的密钥 + 存储地址），因为**重启回来的节点必须拿到和推送时一样的环境**：只发指针的话，声明了密钥的应用会带着空密钥跑，声明了存储的应用连 deis-store 的地址都没有，而后者的唯一症状是每次 `ctx.services.*` 调用失败。某个环境的密钥解不开时，该行被整条剔出清单并打 error，而不是发一份残缺环境下去。
+`env` 与 `ApplyDeployment.env` 是同一张表（manifest 变量 + 当场解密的密钥 + 存储地址），因为**重启回来的节点必须拿到和推送时一样的环境**：只发指针的话，声明了密钥的应用会带着空密钥跑，声明了存储的应用连 deis-store 的地址都没有，而后者的唯一症状是每次 `context.env.<binding>` 调用失败。某个环境的密钥解不开时，该行被整条剔出清单并打 error，而不是发一份残缺环境下去。
 
 拉完、加载完才向控制面报 healthy。
 
@@ -451,12 +450,12 @@ deis-store 与 deis-queue 按**租户**隔离数据，租户 id 是 `conventions
   `QueryInTransaction` / `CommitTransaction` / `RollbackTransaction` 是**交互式事务**
   ——deis-store 把一条连接钉在这个事务上，所以「读—判断—写」能在一个事务里走完，
   这是本平台比 Cloudflare D1 多出来的那一件（`cloudflare-comparison.zh.md` §5.2）。
-  一次一句、一次一批和交互式事务这三样应用都能用（`ctx.services.database` 的
+  一次一句、一次一批和交互式事务这三样应用都能用（声明的 `context.env.<DATABASE_BINDING>` 的
   `execute` / `query` / `batch` / `transaction`）；预编译语句那三个**只到 op 这一层
   为止**，JS 侧一处都没有调，见「仍然开着的」。
 - **Blob**：内容落 `<data>/blob/<tenant>/<sha256 前两级分片>`，元数据表
   `blob(tenant, key, sha256, size, content_type, created_at)`。**不止 put / get /
-  delete**，`BlobStore` 是五个方法，四件事都一路接到了应用手里（`ctx.services.blob`
+  delete**，`BlobStore` 是五个方法，四件事都一路接到了应用手里（声明的 `context.env.<BLOB_BINDING>`
   与 `deis blob` 两头都能用）：
   - `Put` / `Get` 流式分块，块大小是 `deis_wire::conventions::STREAM_CHUNK_BYTES`
     （1 MiB），两边都不许假设整个正文装得进一条消息；
@@ -656,7 +655,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
   一个不 `await` 任何东西、纯占 CPU 的 `while (true)` 已经管得住——此前是
   `tokio::spawn` 一个定时器，同一条线程上的 JS 不 `await` 就永远轮不到它，实测量到
   跑了 75 秒还没停。没关的是另一半：看守线程打断的是 V8 正在跑的字节码，一个卡在
-  `await ctx.services.kv.get(...)` 上、背后那次 gRPC 调用自己没配超时的 handler，
+  `await context.env.KV.get(...)` 上、背后那次 gRPC 调用自己没配超时的 handler，
   此刻根本没有字节码在跑，裁断打不到它身上，这条运行时线程还是会一直等下去——真正
   的解法是给 deis-store / deis-queue 的每次调用配自己的超时。模块顶层求值另外多了
   一条应用怎么覆盖都碰不到的硬上限（5 秒，`MODULE_EVALUATION_BUDGET_MS`，不进

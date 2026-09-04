@@ -118,6 +118,12 @@ pub struct HandlerInfo {
     /// preserved so a local class with the same spelling remains valid and a
     /// rejected build can point at the author's expression.
     pub non_portable_stream_constructors: Vec<NonPortableStreamConstructorReference>,
+    /// Static reads of fields outside the exact four-field HTTP context.
+    ///
+    /// The parser resolves the default handler's parameter binding first, so
+    /// an unrelated local object called `context` is not mistaken for the
+    /// platform context. Simple immutable aliases are followed as well.
+    pub non_standard_context_references: Vec<NonStandardContextReference>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +135,14 @@ pub struct ModuleSourcePosition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderOnlyGlobalReference {
     pub name: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonStandardContextReference {
+    /// Static property name, or `<dynamic>` when the source computes it.
+    pub field: String,
     pub line: usize,
     pub column: usize,
 }

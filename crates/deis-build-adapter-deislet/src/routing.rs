@@ -22,21 +22,11 @@
 //! of the rule, which is what deis-runtime ranks the manifest's patterns by
 //! too.
 
-use deis_build_core::routes::{staged_handler_path, wildcard_is_reachable, wildcard_name};
+use deis_build_core::routes::{
+    handler_kind, wildcard_is_reachable, wildcard_name, HandlerKind, QUEUE_HANDLER_STEM,
+    SCHEDULED_HANDLER_STEM,
+};
 use deis_bundle::sort_by_specificity;
-
-/// Handler file, at the function root, holding this app's queue consumer.
-///
-/// deis-runtime looks for a named `queue` export on the entry module
-/// (`user_module.queue`) and hands it a whole batch at a time. A file tree has
-/// no place to say "this one is not a route", so the name carries that: a
-/// leading underscore is not a URL segment anyone would write, and the entry
-/// module re-exports this file instead of routing to it.
-pub const QUEUE_HANDLER_STEM: &str = "_queue";
-
-/// Handler file, at the function root, holding this app's cron handler.
-/// Same convention as [`QUEUE_HANDLER_STEM`]; exported as `scheduled`.
-pub const SCHEDULED_HANDLER_STEM: &str = "_scheduled";
 
 /// One handler and the requests it answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,16 +66,16 @@ pub fn plan_routes(routes: &[(String, String)]) -> RoutePlan {
     let mut entries: Vec<RouteEntry> = Vec::with_capacity(routes.len());
 
     for (pattern, import_path) in routes {
-        match reserved_stem(import_path) {
-            Some(stem) if stem == QUEUE_HANDLER_STEM => {
+        match handler_kind(import_path) {
+            HandlerKind::Queue => {
                 plan.queue = Some(import_path.clone());
                 continue;
             }
-            Some(stem) if stem == SCHEDULED_HANDLER_STEM => {
+            HandlerKind::Scheduled => {
                 plan.scheduled = Some(import_path.clone());
                 continue;
             }
-            Some(_) => {
+            HandlerKind::Reserved => {
                 plan.warnings.push(format!(
                     "{import_path} starts with an underscore, so it is not published as a \
                      route; the platform only calls {QUEUE_HANDLER_STEM} and \
@@ -93,7 +83,7 @@ pub fn plan_routes(routes: &[(String, String)]) -> RoutePlan {
                 ));
                 continue;
             }
-            None => {}
+            HandlerKind::Http => {}
         }
         entries.push(RouteEntry {
             pattern: pattern.clone(),
@@ -123,32 +113,6 @@ pub fn plan_routes(routes: &[(String, String)]) -> RoutePlan {
     }
 
     plan
-}
-
-/// The file's own name when it begins with an underscore, which marks a
-/// handler the platform calls rather than one a request routes to.
-///
-/// Only the function root counts: `functions/admin/_queue.ts` is a nested file
-/// with no special meaning, and treating it as this app's queue consumer would
-/// silently pick the wrong one in a project that has both.
-///
-/// "At the function root" is decided by [`staged_handler_path`], which takes
-/// the compiler's staging prefix off exactly once. Taking it off repeatedly -
-/// which is what `trim_start_matches` does - read `functions/src/_queue.ts` as
-/// if it were `functions/_queue.ts`, so an ordinary page in an ordinary
-/// directory called `src` became the whole application's queue consumer, lost
-/// its own route, and started receiving batches its author never wrote it to
-/// handle. Nothing in the build said so.
-fn reserved_stem(import_path: &str) -> Option<&str> {
-    let relative = staged_handler_path(import_path);
-    if relative.contains('/') {
-        return None;
-    }
-    let stem = relative
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(relative);
-    stem.starts_with('_').then_some(stem)
 }
 
 #[cfg(test)]

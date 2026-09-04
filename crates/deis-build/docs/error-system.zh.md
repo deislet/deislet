@@ -148,7 +148,7 @@ let error = SpecComplianceError::PlatformDetection {
         column: 3,
     },
     detected_code: "typeof Deno !== 'undefined'".to_string(),
-    suggestion: "Use unified context.services instead of platform detection".to_string(),
+    suggestion: "Use the selected Edge Canon context and Web APIs".to_string(),
 };
 
 // 2. 平台错误
@@ -402,7 +402,7 @@ Error: SPEC_PLATFORM_DETECTION
 
   Detected: typeof Deno !== 'undefined'
 
-  Suggestion: Use unified context.services instead of platform detection
+  Suggestion: Use the selected Edge Canon context and Web APIs
 
   Learn more: https://github.com/deislet/spec#no-platform-detection
 ```
@@ -422,7 +422,7 @@ Error: SPEC_PLATFORM_DETECTION
     },
     "message": "Platform detection code detected",
     "detected_code": "typeof Deno !== 'undefined'",
-    "suggestion": "Use unified context.services instead",
+    "suggestion": "Use the selected Edge Canon context and Web APIs",
     "severity": "error"
   }
 }

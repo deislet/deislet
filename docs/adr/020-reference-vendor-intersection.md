@@ -91,7 +91,7 @@ Released immutable standard version
 - lifecycle/provision/import/delete；
 - error/observability semantics。
 
-标准抽取上述共同语义，不复制 `env.MY_KV`、`context.services.kv` 或供应商控制台字段。
+标准抽取上述共同语义；EC-WEB 只固定 `context.env` 这一容器，具体逻辑 binding 名称和接口由对应能力族定义，不复制供应商控制台字段或另造 `context.services` ABI。
 
 反过来，两家都写“支持缓存”也不自动构成交集。如果一家的 `put` 是全局 eventual cache，另一家是单机强一致 map，而应用可观察差异未定义，就必须先缩小/重构语义，不能用一个 Cache checkbox 掩盖冲突。
 

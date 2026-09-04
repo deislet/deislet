@@ -28,7 +28,7 @@ cd my-app
 
 ```
 my-app/
-├── .config.json        # what to build, which services, which vendors
+├── .config.json        # what to build and which vendors
 ├── functions/          # one file per route
 │   ├── index.ts        #   → /
 │   └── api/hello.ts    #   → /api/hello
@@ -41,13 +41,15 @@ A handler is a function of one `Context`:
 // functions/users/[id].ts  →  /users/:id
 export default async function handler(context: Context): Promise<Response> {
   const id = context.params.id;
-  const stored = await context.services.kv.get(`user:${id}`);
-  if (!stored) return new Response("Not found", { status: 404 });
-  return new Response(stored, {
+  return new Response(JSON.stringify({ id }), {
     headers: { "content-type": "application/json; charset=utf-8" },
   });
 }
 ```
+
+The context has exactly `request`, `env`, `params`, and `waitUntil`. Declared
+logical resources appear under `context.env.<NAME>`; provider or Deislet
+convenience fields are not part of this API.
 
 Two file names under `functions/` are not routes but handlers the platform
 calls itself: `_scheduled.ts` (cron) and `_queue.ts` (queue messages).
@@ -74,9 +76,8 @@ Serving
 Editing a file rebuilds and reloads. A build that fails is reported and the
 previous one keeps serving.
 
-The banner also says what is *not* there. Storage is a separate process, so
-until you point at one, `ctx.services.*` fails the same way it would on a
-misconfigured node:
+The banner also says what is *not* there. Storage is a separate process, so a
+declared storage binding cannot work until you point the runtime at one:
 
 ```bash
 cargo build -p deis-store -p deis-queue

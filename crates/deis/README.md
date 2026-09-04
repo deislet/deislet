@@ -299,7 +299,8 @@ half of that; `scripts/demo.sh` runs the same commands against a live store.
 
 One shape is deliberately missing, because it is a session rather than a call:
 `deis db` has no `batch` or interactive transaction — an application gets both
-through `context.services.database`, the command line does not.
+through its declared `context.env.<DATABASE_BINDING>`, the command line does
+not.
 
 ### `deis config set|get|unset|list`
 

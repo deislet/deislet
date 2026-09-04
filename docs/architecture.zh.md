@@ -11,8 +11,8 @@
 
 **现在这套东西是通的。** 波次 A 与波次 B 已经合入：`deis build --vendor deislet`
 产出应用包，控制面把它存成不可变版本，环境指针指向版本，节点自己把包拉下来对外服务；
-静态资产先于任何 Isolate 命中；`ctx.services.{kv,database,blob,queue}` 真的走到
-deis-store 与 deis-queue；cron 到点在**一个**节点上执行；日志进 deis-telemetry；
+静态资产先于任何 Isolate 命中；`context.env.<binding>` 的 KV、Database、Blob、Queue
+真的走到 deis-store 与 deis-queue；cron 到点在**一个**节点上执行；日志进 deis-telemetry；
 回滚就是把指针挪回去。同一个应用的两个环境能在同一台节点上并行，各用各的版本与存储。
 `scripts/demo.sh` 走完这一整条线，并逐项验证十二条性质。
 
@@ -98,8 +98,8 @@ flowchart TB
     deis-build --产出应用包--> deis-control
 
     deis-proxy --转发--> deis-runtime
-    deis-runtime --"ctx.services.{kv,database,blob}"--> deis-store
-    deis-runtime --"ctx.services.queue 与轮询消费"--> deis-queue
+    deis-runtime --"context.env 的 KV/Database/Blob binding"--> deis-store
+    deis-runtime --"context.env 的 Queue binding 与轮询消费"--> deis-queue
     deis-proxy <-->|"deis-wire gRPC"| deis-control
     deis-control --"ApplyDeployment（只发指针）/ 查状态 / cron 触发"--> deis-runtime
     deis-runtime --"启动拉 assignments + HTTP 自取包"--> deis-control
@@ -681,7 +681,7 @@ fence，不把这种管理能力交给普通 producer/reader。
 ```
 
 节点按这份声明构造对应的客户端放进 Isolate 的 `OpState`；没声明的服务连接都不建，
-`ctx.services.<那个>` 就是「不可用」。地址来自控制面下发的环境表里的保留键
+对应的 `context.env.<binding>` 就是「不可用」。地址来自控制面下发的环境表里的保留键
 （`DEIS_STORE_ENDPOINT` / `DEIS_QUEUE_ENDPOINT` / `DEIS_SERVICES` /
 `DEIS_QUEUE_CONSUMERS`），这些键在进 Isolate 之前被取走。
 
@@ -701,13 +701,14 @@ fence，不把这种管理能力交给普通 producer/reader。
 
 `kind` 有五种：`kv` / `database` / `blob` / `queue` 是**本租户内部的一个命名空间**，
 `service` 是**另一个应用**（见 §12 的「应用间调用」一行）。名字在
-`context.bindings.<名字>` 和 `env.<名字>` 上拿到同一个对象。
+标准 HTTP handler 中只从 `context.env.<名字>` 取得。
 
 **租户边界一点没动**：绑定名是在能力令牌验过之后、由
 `deis_wire::conventions::namespace_id` 拼到租户后面的（`shop.production@HOT`），
 分隔符 `@` 在租户两段和绑定名里都非法，所以这个拼法是单射的——没有哪一对
-`(租户, 绑定)` 能拼出另一对的命名空间。不带名字的 `context.services.*` 仍是那个**无名**
-命名空间，调用不带 `x-deis-binding` 头，所以早先部署的应用数据原地不动。绑定名判重
+`(租户, 绑定)` 能拼出另一对的命名空间。schema 1 原生 bundle 仍能读取旧的无名
+`services` 声明，使既有部署与数据可迁移；生成的标准 HTTP context 不暴露这套入口。
+绑定名判重
 不分大小写（它会变成 deis-store 里的目录名和文件名），`ASSETS` 和 `DEIS_` 开头的名字
 是保留的。队列绑定不需要这套拼法：deis-queue 本来就是按 `(租户, 队列名, id)` 存的。
 
@@ -797,7 +798,7 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
 
 - **一次没有自己超时的原生调用真卡死时，看守线程也救不回那条运行时线程**。
   看守线程能立刻打断的，是 V8 正在跑的字节码；一个处理函数卡在
-  `await ctx.services.kv.get(...)` 上，如果背后那次到 deis-store 的 gRPC 调用
+  `await context.env.KV.get(...)` 上，如果背后那次到 deis-store 的 gRPC 调用
   自己没配超时、永远不应答，此刻根本没有字节码在跑，看守线程到期调用
   `terminate_execution()` 也没有字节码可打断——这条运行时线程会一直陪着这个
   永远不会完成的 `await` 等下去。这和上面的问题是两类：上面是「JS 忙着不肯
@@ -907,8 +908,8 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
 - ~~**请求与响应体是 `String`**~~ **已补齐**：`JsRequest.body` / `JsResponse.body`
   过 Rust/JS 边界时是 `Option<Vec<u8>>`（`ops.rs::PendingRequestBody` /
   `PendingResponseBody`，op 边界上是 `#[buffer]` / `ToJsBuffer`），二进制主体原样
-  穿过 Isolate 边界。`context.services.kv`、`context.services.blob`、Cache API 与
-  `context.services.queue` 同一轮也都改成了按字节走，理由与做法都写在
+  穿过 Isolate 边界。具名 KV、Blob、Queue binding 与 Cache API
+  同一轮也都改成了按字节走，理由与做法都写在
   `blob_ops.rs` 的模块注释里：`#[serde] Vec<u8>` 在两个方向上都是错的类型，
   serde_v8 不认定型数组。
 - ~~**Web 标准的全局大半没装上，`fetch` 也在其中**~~ **已补齐**。
@@ -925,7 +926,7 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
   线程，所以一个不 `await` 任何东西、纯占 CPU 的 `while (true)` 已经管得住。
   没解决的是另一半：
   看守线程能打断的是 V8 正在跑的字节码，一个卡在
-  `await ctx.services.kv.get(...)` 上、背后那次到 deis-store 的 gRPC 调用
+  `await context.env.KV.get(...)` 上、背后那次到 deis-store 的 gRPC 调用
   自己没配超时的处理函数，此刻根本没有字节码在跑，裁断打不到它身上——这条运行时线程
   会一直陪着这个不会完成的 await 等下去。`fetch` 不在此列：出站调用另有一套
   按剩余执行预算武装的 `AbortSignal`（见 §12「出网这一格」），到期直接把 op
@@ -982,8 +983,8 @@ Edge Canon 合规或正式支持；这些当前状态只来自
 | 环境变量 | 成立 | 控制面下发的 `env` 表注入 `context.env`，平台保留键先被取走 |
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
 | KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本。读写删之外还有四样：`put` 可带 `expirationTtl`（从写入起算的相对秒数）与一段不透明的 `metadata`；`get` 可以按 `type: text / json / arrayBuffer` 取；`getWithMetadata` 一次把值、metadata 和到期时刻取回来（它们本来就是同一行的三列）；`list({ prefix, limit, cursor })` 按游标翻页，每条自带 metadata 与到期时刻。服务端另有一个 `Has`，**目前没有任何调用方**——op 表、JS 绑定和命令行都够不到它，只有 `KvClient` 自己的测试在调 |
-| Cache API | 成立 | 标准入口是 `context.services.cache`，`globalThis.caches.default` 指向同一个实例；`caches.open(name)` 另开一个互不串门的命名空间（键在 Rust 侧按名字长度前缀合成，两个名字不可能撞在一起）；`caches.scope` 把这个 store 的身份和起始时刻交给应用，好让它分清「这一条被淘汰了」和「整个 store 换了一个」——后者才是发版那天会让应用重做已经做过的事的那一种。后端是 moka 进程内缓存，`Cache-Control` 的 `max-age` / `s-maxage` 决定过期。语义上是单 Isolate 缓存：换节点、换版本都读不到。**此前这一格是有保留的**：body 过边界是字符串，写入前先当 UTF-8 解码，`0x80..=0xff` 的字节一律变成 `ef bf bd`——`caches.default` 是每个 Isolate 自带的，一张放进去的图片会在读出来时静默损坏，没有任何报错。现已改成按字节走（`op_cache_set` 收 `#[buffer] JsBuffer`，`op_cache_get` 答 `ToJsBuffer`），status/headers 仍是文本，因为那部分确实是文本 |
-| 生命周期 `waitUntil` | 成立，有一处例外 | `runtime.js` 的 `__deis_runtime_wait_until_all`。例外：WebSocket 消息处理器里登记的 `waitUntil` 会被**丢弃**（附带一条应用可见的 warn），不是延后执行——那条派发路径（`isolate.rs` 的 `dispatch_ws_message`）没有收尾步骤，而收进别的调用去等，等于把别人的预算和 trace 记在它头上。此前它们会被下一个恰好走到收尾的调用捎带着跑掉，账记错但确实跑了；现在不跑了，这是一个明知的取舍 |
+| Cache API | 成立 | 标准应用入口是 `globalThis.caches.default`；`caches.open(name)` 另开一个互不串门的命名空间。原生迁移对象 `context.services.cache` 指向同一实例，但不会穿过标准 HTTP 桥。后端是 moka 进程内缓存，语义上是单 Isolate 缓存；body 已按字节传递 |
+| 生命周期 `waitUntil` | HTTP Draft 语义已落实；其他事件待独立能力族 | HTTP context 在 handler 与响应 body 生命周期结束后关闭登记；多任务 all-settled，拒绝不截断同伴，短响应流结束也不会清掉仍被后台任务使用的定时器。后台宽限仍未冻结。WebSocket 消息处理器没有标准 tail，登记项会被丢弃并记录 warn，不能把该路径算作 HTTP 合规证据 |
 | 结构化日志 | 成立 | 环形缓冲 + `LogShipper` → deis-telemetry，`Query` 能查回来 |
 | Web 标准 | 成立（8.1 节的部分） | 见下方「Web 标准这一格的实情」 |
 | 出网 `fetch` | 成立，且受策略约束 | 见下方「出网这一格」 |
@@ -1043,7 +1044,7 @@ deno_websocket 自己的连接器）。这条线仍然是有意划的：**8.1 �
 全局比不挂更坏；`BroadcastChannel` 真的没实现——一个 Isolate 是一个
 `(应用, 环境)`，两个 Isolate 不共享内存，deno_web 的实现装在扩展里、挂上去也能跑，
 但那是每个 Isolate 单独一份，挂上去的结果是「每次 `postMessage` 都成功、任何地方
-都收不到」，比缺席更坏；替代用 `context.services.queue`。
+都收不到」，比缺席更坏；可靠跨调用工作应使用未来冻结的标准 queue binding。
 
 `TextEncoder` / `TextDecoder` / `atob` / `btoa` 仍是 `runtime.js` 里手写的，**只做
 UTF-8**，没有换成 deno_web 那一套。这是有意收窄，理由写在 `runtime.js` 和
@@ -1142,11 +1143,11 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | 特性 | 实况 | 依据 |
 |---|---|---|
 | SQL 数据库 | 成立 | deis-store 的 `Database` 服务，每租户一个 SQLite 文件；节点按 manifest 建 `DbClient` |
-| 对象存储 | 成立 | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；Isolate 侧 `context.services.blob` 收字符串 / `ArrayBuffer` / `ArrayBufferView`，有顶着真 deis-store 的端到端测试。读写之外还有三样：`list({ prefix, delimiter, limit, cursor })` 按游标翻页、按分隔符把键卷成一层层「目录」；`head(key)` 只取元数据不取正文；`get(key, { range })` 取一段——`range` 收 HTTP `Range` 头原文，也收 `{ offset, length }` / `{ suffix }`。写和删可以带条件：`onlyIf: { ifMatch }` / `{ ifNoneMatch }` 比的是对象的 sha256，`{ ifNoneMatch: "*" }` 就是「只创建一次」。条件写没抢到时 `put()` 返回 `null`（不是抛异常），所以「读—改—写」是应用自己能写出来的一个循环——**这是本平台唯一的原子协调原语**。`deis blob list` / `head` / `get --offset` / `put --if-match` 是命令行这一侧的同一套 |
+| 对象存储 | Deislet 实现成立，标准仍 Draft | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；标准 HTTP 应用从声明的 `context.env.<BLOB_BINDING>` 取得。读写之外还有 `list`、`head`、范围读取与条件写；当前接口仍等待 Edge Canon `logical-resource-bindings` 能力族冻结，不能只凭本地端到端测试宣称跨平台合规 |
 | 消息队列 | 成立 | deis-queue 的 `Send`/`SendBatch`/`Pull`/`Ack`/`Nack`/`ListDeadLetters`/`ReplayDeadLetters` + 节点的 `queue_consumer` 轮询任务；`sendBatch()` 一次投一批，落库是一个事务，所以整批要么都进去要么一条都没有，失败之后原样重发是安全的；试过太多次的消息进死信表，`deis queue dead-letters` 能看、`deis queue replay` 能放回；消息体按字节走（`queue.proto` 的 `body` 是 `bytes`），`send()` 接受字符串、普通对象或 `ArrayBuffer`/`ArrayBufferView`；消费端 `message.body` 是发送时的原文，body 不是合法 UTF-8 时为 `null`，只能靠 `message.bytes()` 读 |
 | 定时任务 | 成立 | 控制面按 `(app, environment)` 调度 → 节点 `Trigger.OnScheduled` → 跑 `scheduled` 导出 |
-| 具名绑定 | 成立 | manifest 的 `bindings` 块（形状在 `deis-bundle`，构建 / 控制面 / 节点 / isolate 四方共用一份）。一个应用可以声明任意多个 `kv` / `database` / `blob` / `queue` 绑定，各取一个名字，在 `context.bindings.<名字>` 和 `env.<名字>` 上拿到同一个对象。**租户边界一点没动**：绑定名是在能力令牌验过之后、用 `deis_wire::conventions::namespace_id` 拼到租户后面的（`shop.production@HOT`），分隔符 `@` 在租户两段和绑定名里都非法，所以这个拼法单射——没有哪一对 `(租户, 绑定)` 能拼出另一对的命名空间。不带名字的 `context.services.*` 还是那个**无名**命名空间，调用不带 `x-deis-binding` 头，早先部署的应用数据原地不动。绑定名判重不分大小写，因为它会变成 deis-store 里的目录名和文件名。队列绑定不需要这套拼法：deis-queue 本来就是按 `(租户, 队列名, id)` 存的 |
-| 应用间调用（service bindings） | 成立 | `bindings` 里 `"kind": "service"` 的那一种，`context.bindings.AUTH.fetch(...)`。**不带任何地址**——没有主机、端口、URL 或要解析的名字——派发是节点进程内部的一条消息（`RuntimeMessage::ExecuteServiceCall`）送到托管被调方 isolate 的那条运行时线程，所以 `fetch_policy` 既不参与也放不开。两道闸：被调方在自己 bundle 的 `callableBy` 里同意（节点按被调方**当前那一版**逐次查），上传方在作用域里持有 `read:<被调方>/<环境>`（控制面上传时查一次并进审计）。默认调**调用方自己那个环境**，因为 `(应用, 环境)` 就是租户。一次调用花一个 subrequest 配额，链路深度上限 4，成环当场拒（A→B→A 会让 A 的线程等一条它自己读不到的消息，那是死锁不是慢）。被调方跑的是它自己的 invocation：自己的超时、CPU、内存、日志、轨迹；调用方另按自己剩下的预算等，两种超时在消息里是两句不同的话。只在本节点内：被调方不在这台机器上时，调用方得到的就是这句话 |
+| 具名绑定 | Deislet 实现成立，标准仍 Draft | manifest 的 `bindings` 块由构建、控制面、节点、isolate 共用。标准 HTTP 应用只从 `context.env.<名字>` 取得；`context.bindings` / `context.services` 不属于四字段 ABI。租户与命名空间隔离已实现，但跨平台资源接口和部署映射仍须由 Edge Canon 能力族及真实供应商证据冻结 |
+| 应用间调用（service bindings） | Deislet 实现成立，标准仍 Draft | `bindings` 里 `"kind": "service"` 的那一种，标准 HTTP 入口为 `context.env.AUTH.fetch(...)`。节点内无地址派发、双方授权、默认同环境、子请求计费、深度上限 4 与环拒绝均已实现；跨平台语义仍等待对应能力族冻结 |
 | 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match`。站点自己的规则也在：`_redirects`（按作者顺序，首条命中者胜；200 是改写、404 是带 404 状态返回目标）、`_headers`（所有命中的块叠加、靠后的覆盖靠前的，同一个块里一个名字写两遍就发两条——`Link` 与 `Set-Cookie` 不许合并成一条，`! 名字` 去掉前面设过的该名字的全部取值）、以及 `assets.notFound` 三选一的兜底（`none` / `404-page` / `single-page-app`）。三样都在构建期解析、写错就构建失败并报出行号，在节点装载那一版时编译成表。函数想主动取包里的文件走 `env.ASSETS.fetch()`——`ASSETS` 是保留键，应用设不了同名变量把它顶掉 |
 | WebAssembly | 成立 | V8 自带 |
 | WebSocket | 成立 | 服务端（`WebSocketPair` 桥接）与客户端（走 `fetch_policy.rs` 出网策略的 `WebSocket` 全局）都有；HTTP 升级、经过 deis-proxy 的一跳、文本帧与二进制帧都有真测试覆盖（`websocket_bridging_test.rs`、`websocket_through_proxy_test.rs`，见 §11） |

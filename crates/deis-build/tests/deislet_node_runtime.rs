@@ -2,12 +2,13 @@
 //! the exact worker bytes emitted by the compiler must load and execute in the
 //! self-hosted runtime.
 
+use std::future::poll_fn;
 use std::io::Read;
 use std::path::Path;
 
 use deis_build::{Compiler, CompilerOptions};
 use deis_runtime::runtime::isolate::AppRuntime;
-use deis_runtime::runtime::{IsolateSpec, ServiceRouter, ServiceWiring};
+use deis_runtime::runtime::{IsolateSpec, ResponseBody, ServiceRouter, ServiceWiring};
 use tokio::sync::oneshot;
 
 fn stage(project: &Path) {
@@ -109,6 +110,25 @@ fn worker_from_bundle(path: &Path) -> String {
     worker
 }
 
+async fn collect_body(runtime: &mut AppRuntime, body: ResponseBody) -> Vec<u8> {
+    match body {
+        ResponseBody::None => Vec::new(),
+        ResponseBody::Bytes(bytes) => bytes,
+        ResponseBody::Stream(mut reader) => {
+            let read = async {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = poll_fn(|cx| reader.poll_chunk(cx)).await {
+                    bytes.extend_from_slice(&chunk);
+                }
+                (bytes, reader.failure())
+            };
+            let ((bytes, failure), ()) = tokio::join!(read, runtime.pump_response_streams());
+            assert_eq!(failure, None, "compiled response stream failed");
+            bytes
+        }
+    }
+}
+
 #[tokio::test]
 async fn compiler_output_runs_on_the_deislet_node_compatibility_layer() {
     let project = tempfile::tempdir().unwrap();
@@ -149,7 +169,7 @@ async fn compiler_output_runs_on_the_deislet_node_compatibility_layer() {
         .await
         .expect("execute compiled worker");
     let (status, _, body) = rx.await.unwrap().unwrap();
-    let body = String::from_utf8(body.into_bytes().unwrap()).unwrap();
+    let body = String::from_utf8(collect_body(&mut runtime, body).await).unwrap();
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap(),

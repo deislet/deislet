@@ -29,9 +29,9 @@ export default async function handler(context: any): Promise<Response> {
   // check watching for an out-of-heap ending is watching this environment for
   // one, and any caller who can reach this route produces one.
   const tag = new URL(context.request.url).searchParams.get("tag") ?? "";
-  if (tag !== "") context.log.info("heap witness " + tag);
+  if (tag !== "") console.log("heap witness " + tag);
 
-  context.log.warn("allocating until this isolate reaches its heap ceiling");
+  console.warn("allocating until this isolate reaches its heap ceiling");
   for (let i = 0; i < 100_000; i++) {
     held.push(new Array(64 * 1024).fill(i));
   }

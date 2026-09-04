@@ -11,12 +11,12 @@
 //
 // The signature is the one Edge Canon fixes for a queue consumer
 // (SPECIFICATION_EXT.md section 3.2): `queue(batch, env, context)`. The
-// bindings table is the second parameter and the platform context the third;
-// taking only two would read `context.services` off the environment table.
+// environment/bindings table is the second parameter and invocation controls
+// are the third; taking only two would read resources from the wrong object.
 export default async function queue(
   batch: any,
-  _env: any,
-  context: any,
+  env: any,
+  _context: any,
 ): Promise<void> {
   for (const message of batch.messages) {
     let job: any;
@@ -31,7 +31,7 @@ export default async function queue(
     }
 
     try {
-      await context.services.kv.put(`job:${job.key}`, job.value);
+      await env.KV.put(`job:${job.key}`, job.value);
       console.log(`queue ${batch.queue}: handled ${job.key} on attempt ${message.attempts}`);
     } catch (e) {
       // Ask for this one back rather than the whole batch: the others may

@@ -40,9 +40,10 @@ mod site;
 
 pub use archive::{bundle_sha256, write_bundle, BUNDLE_FILE_NAME};
 pub use assets::{collect_assets, StagedAsset};
+pub use deis_build_core::routes::{QUEUE_HANDLER_STEM, SCHEDULED_HANDLER_STEM};
 pub use entry::generate_entry_module;
 pub use manifest::{build_manifest, RUNTIME_PROFILE, WORKER_ENTRY};
-pub use routing::{plan_routes, RouteEntry, RoutePlan, QUEUE_HANDLER_STEM, SCHEDULED_HANDLER_STEM};
+pub use routing::{plan_routes, RouteEntry, RoutePlan};
 pub use site::{build_site_config, is_site_file};
 
 use deis_build_core::{AdapterArtifacts, ProjectConfig, StaticAsset};

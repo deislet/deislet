@@ -37,6 +37,39 @@
 /// it apart again to find out whether a file sits *at* the function root.
 pub const STAGED_HANDLER_PREFIX: &str = "../src/";
 
+/// The invocation surface selected by a handler file's position and name.
+/// Queue and scheduled handlers are distinct standard event families; their
+/// context must never be validated as an EC-WEB request context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerKind {
+    Http,
+    Queue,
+    Scheduled,
+    Reserved,
+}
+
+pub const QUEUE_HANDLER_STEM: &str = "_queue";
+pub const SCHEDULED_HANDLER_STEM: &str = "_scheduled";
+
+/// Classify a handler path relative to the configured function root.
+///
+/// Only a root file is special. `admin/_queue.ts` remains the ordinary HTTP
+/// route `/admin/_queue`; repeatedly stripping a staging prefix would silently
+/// turn such a route into the application's queue consumer.
+pub fn handler_kind(relative_path: &str) -> HandlerKind {
+    let relative = staged_handler_path(relative_path).replace('\\', "/");
+    if relative.contains('/') {
+        return HandlerKind::Http;
+    }
+    let stem = strip_handler_extension(&relative);
+    match stem {
+        QUEUE_HANDLER_STEM => HandlerKind::Queue,
+        SCHEDULED_HANDLER_STEM => HandlerKind::Scheduled,
+        value if value.starts_with('_') => HandlerKind::Reserved,
+        _ => HandlerKind::Http,
+    }
+}
+
 /// Encode an application-controlled value as a JavaScript string literal.
 ///
 /// Route names and import specifiers come from the project file tree. They
@@ -93,27 +126,189 @@ const JAVASCRIPT_ROUTE_DECODER: &str = r#"function decodeRouteSegment(segment) {
   catch (_) { return segment; }
 }"#;
 
-/// The common Edge Canon handler boundary used by provider entry modules.
+/// The common Edge Canon context, handler and response-lifecycle boundary used
+/// by provider entry modules.
 ///
-/// It deliberately records only the stable failure code. Application error
-/// messages can contain secrets and must not become response data (or an
-/// adapter-authored log field). A provider evidence collector can associate
-/// the structured code with its invocation without parsing an error page.
-pub const JAVASCRIPT_HANDLER_BOUNDARY: &str = r#"export async function invokeEdgeCanonHandler(invoke) {
-  try {
-    const result = await invoke();
-    if (!(result instanceof Response)) {
-      return edgeCanonFailureResponse('EC_HANDLER_RESULT_INVALID');
+/// It deliberately records only stable codes and bounded task numbers.
+/// Application error messages can contain secrets and must not become response
+/// data (or an adapter-authored log field). A provider evidence collector can
+/// associate these structured records with an invocation without parsing an
+/// error page.
+pub const JAVASCRIPT_HANDLER_BOUNDARY: &str = r#"const EdgeCanonObject = globalThis.Object;
+const EdgeCanonPromise = globalThis.Promise;
+const EdgeCanonReadableStream = globalThis.ReadableStream;
+const EdgeCanonResponse = globalThis.Response;
+const EdgeCanonTypeError = globalThis.TypeError;
+const edgeCanonObjectAssign = EdgeCanonObject.assign.bind(EdgeCanonObject);
+const edgeCanonObjectDefineProperty = EdgeCanonObject.defineProperty.bind(EdgeCanonObject);
+const edgeCanonObjectFreeze = EdgeCanonObject.freeze.bind(EdgeCanonObject);
+const edgeCanonPromiseCatch = globalThis.Function.prototype.call.bind(EdgeCanonPromise.prototype.catch);
+const edgeCanonPromiseResolve = EdgeCanonPromise.resolve.bind(EdgeCanonPromise);
+const edgeCanonConsoleError = globalThis.console && typeof globalThis.console.error === 'function'
+  ? globalThis.console.error.bind(globalThis.console)
+  : () => {};
+
+function edgeCanonRecordFailure(failureCode, fields = undefined) {
+  const record = fields === undefined
+    ? { failureCode }
+    : edgeCanonObjectAssign({ failureCode }, fields);
+  edgeCanonConsoleError('Edge Canon invocation failure', record);
+}
+
+function edgeCanonTypeError(failureCode, message) {
+  const error = new EdgeCanonTypeError(message);
+  edgeCanonObjectDefineProperty(error, 'code', {
+    value: failureCode,
+    enumerable: false,
+    configurable: false,
+    writable: false
+  });
+  return error;
+}
+
+function copiedRecord(value) {
+  return edgeCanonObjectFreeze(edgeCanonObjectAssign({}, value || {}));
+}
+
+export function createEdgeCanonContext(request, environment, params, nativeWaitUntil) {
+  if (typeof nativeWaitUntil !== 'function') {
+    throw edgeCanonTypeError(
+      'EC_PROVIDER_CONTEXT_INVALID',
+      'the provider context has no waitUntil implementation'
+    );
+  }
+
+  let closed = false;
+  let registeredBackgroundTaskCount = 0;
+  const context = {
+    request,
+    env: copiedRecord(environment),
+    params: copiedRecord(params),
+    waitUntil(promise) {
+      if (closed) {
+        edgeCanonRecordFailure('EC_WAIT_UNTIL_CLOSED');
+        throw edgeCanonTypeError(
+          'EC_WAIT_UNTIL_CLOSED',
+          'waitUntil cannot register work after the response lifecycle closed'
+        );
+      }
+
+      let then;
+      try {
+        then = promise == null ? undefined : promise.then;
+      } catch (_) {
+        then = undefined;
+      }
+      if (typeof then !== 'function') {
+        edgeCanonRecordFailure('EC_WAIT_UNTIL_PROMISE_REQUIRED');
+        throw edgeCanonTypeError(
+          'EC_WAIT_UNTIL_PROMISE_REQUIRED',
+          'waitUntil requires a Promise or thenable'
+        );
+      }
+
+      registeredBackgroundTaskCount += 1;
+      const taskNumber = registeredBackgroundTaskCount;
+      const tracked = edgeCanonPromiseCatch(edgeCanonPromiseResolve(promise), () => {
+        edgeCanonRecordFailure('EC_BACKGROUND_REJECTED', { taskNumber });
+      });
+      nativeWaitUntil(tracked);
     }
-    return result;
+  };
+
+  return {
+    context,
+    close() {
+      closed = true;
+    },
+    failure(failureCode) {
+      edgeCanonRecordFailure(failureCode);
+    }
+  };
+}
+
+function edgeCanonLifecycleResponse(response, lifecycle) {
+  if (response.body === null) {
+    lifecycle.close();
+    return response;
+  }
+  if (typeof EdgeCanonReadableStream !== 'function') {
+    lifecycle.close();
+    throw edgeCanonTypeError(
+      'EC_STREAM_RUNTIME_INCOMPATIBLE',
+      'the provider runtime has no ReadableStream implementation'
+    );
+  }
+
+  let reader;
+  try {
+    reader = response.body.getReader();
   } catch (_) {
-    return edgeCanonFailureResponse('EC_HANDLER_THROWN');
+    lifecycle.close();
+    throw edgeCanonTypeError(
+      'EC_HANDLER_RESULT_INVALID',
+      'the handler response body cannot be consumed'
+    );
+  }
+
+  const body = new EdgeCanonReadableStream({
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          lifecycle.close();
+          controller.close();
+        } else {
+          controller.enqueue(result.value);
+        }
+      } catch (error) {
+        lifecycle.close();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        lifecycle.close();
+      }
+    }
+  });
+
+  return new EdgeCanonResponse(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
+}
+
+export async function invokeEdgeCanonHandler(lifecycle, invoke) {
+  let result;
+  try {
+    result = await invoke();
+  } catch (_) {
+    lifecycle.failure('EC_HANDLER_THROWN');
+    result = edgeCanonFailureResponse();
+  }
+  if (!(result instanceof EdgeCanonResponse)) {
+    lifecycle.failure('EC_HANDLER_RESULT_INVALID');
+    result = edgeCanonFailureResponse();
+  }
+  try {
+    return edgeCanonLifecycleResponse(result, lifecycle);
+  } catch (error) {
+    const failureCode = error && error.code === 'EC_STREAM_RUNTIME_INCOMPATIBLE'
+      ? 'EC_STREAM_RUNTIME_INCOMPATIBLE'
+      : 'EC_HANDLER_RESULT_INVALID';
+    lifecycle.failure(failureCode);
+    lifecycle.close();
+    return edgeCanonFailureResponse();
   }
 }
 
-export function edgeCanonFailureResponse(failureCode) {
-  console.error('Edge Canon invocation failure', { failureCode });
-  return new Response('Internal Server Error\n', {
+export function edgeCanonFailureResponse(failureCode = undefined) {
+  if (failureCode !== undefined) edgeCanonRecordFailure(failureCode);
+  return new EdgeCanonResponse('Internal Server Error\n', {
     status: 500,
     headers: {
       'content-type': 'text/plain; charset=utf-8',
@@ -360,8 +555,13 @@ mod tests {
         assert!(JAVASCRIPT_ROUTE_PARAM_EXTRACTOR.contains("params['*'] = rest"));
         assert!(JAVASCRIPT_ROUTE_PARAM_EXTRACTOR.contains("params[wildcardName] = rest"));
         assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("await invoke()"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("createEdgeCanonContext"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("new EdgeCanonReadableStream"));
         assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("EC_HANDLER_THROWN"));
         assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("EC_HANDLER_RESULT_INVALID"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("EC_BACKGROUND_REJECTED"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("EC_WAIT_UNTIL_CLOSED"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("EC_WAIT_UNTIL_PROMISE_REQUIRED"));
         assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("Internal Server Error\\n"));
         assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("'cache-control': 'no-store'"));
     }
@@ -532,6 +732,16 @@ mod tests {
     #[test]
     fn a_specifier_without_the_staging_prefix_is_left_alone() {
         assert_eq!(staged_handler_path("./index.ts"), "./index.ts");
+    }
+
+    #[test]
+    fn only_root_event_files_leave_the_http_surface() {
+        assert_eq!(handler_kind("_queue.ts"), HandlerKind::Queue);
+        assert_eq!(handler_kind("../src/_scheduled.js"), HandlerKind::Scheduled);
+        assert_eq!(handler_kind("_unused.ts"), HandlerKind::Reserved);
+        assert_eq!(handler_kind("admin/_queue.ts"), HandlerKind::Http);
+        assert_eq!(handler_kind("../src/src/_queue.ts"), HandlerKind::Http);
+        assert_eq!(handler_kind("admin\\_scheduled.ts"), HandlerKind::Http);
     }
 
     #[test]

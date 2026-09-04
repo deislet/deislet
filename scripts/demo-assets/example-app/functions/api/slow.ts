@@ -16,7 +16,7 @@ export default async function handler(context: any): Promise<Response> {
   }
   const spent = Date.now() - started;
 
-  context.log.info(`slow handler finished after ${spent}ms`);
+  console.log(`slow handler finished after ${spent}ms`);
   return new Response(JSON.stringify({ requestedMs: ms, spentMs: spent }), {
     headers: { "content-type": "application/json; charset=utf-8" },
   });

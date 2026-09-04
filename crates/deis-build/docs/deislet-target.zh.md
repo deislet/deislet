@@ -140,14 +140,16 @@ deis-runtime 在装载这一版时编译一次，之后每个「没命中资产�
 
 ## 入口模块做什么
 
-deis-runtime 只认一个默认导出，每个请求调一次，并且**它自己构造 context**（`request` / `env` / `services` / `waitUntil`）——它不知道一个应用里有多个 handler。所以生成的入口模块负责：
+deis-runtime 只认一个默认导出，每个请求调一次。生成的入口模块把原生对象收窄成 Edge Canon 精确 HTTP context（`request` / `env` / `params` / `waitUntil`），并负责把文件树变成应用：
 
 1. 按路径挑中 handler；
 2. 自己解析占位符填 `context.params`：运行时那侧匹配的是同一批模式、通配段也认，但 manifest 里的模式只留一个 `*`，所以它能保证的键只有 `params['*']`；入口模块还知道这个文件写的是 `[[catch]]`，会把捕获到的尾巴再按这个名字放一份；
-3. 补上 edge-canon 约定的便利字段：`path`、`method`、`query`、`cookies`、`log`；
-4. 谁都没匹配上时返回 404。
+3. 复制并冻结 `env` 与 `params`，把 `waitUntil` 绑定到本次调用，不暴露供应商或 Deislet 便利字段；
+4. 只有 handler 与响应正文生命周期都结束后才关闭 `waitUntil` 登记；已登记任务逐项独立结算；
+5. 谁都没匹配上时返回 404。
 
-`context.env`、`context.services`、`context.waitUntil` 原样透传，不包装。
+具名逻辑资源从 `context.env.<NAME>` 访问。原生遗留的 `context.services`、
+`context.bindings`，以及 `context.path` 等便利字段不会进入标准 context。
 
 ## `.config.json` 里与本目标相关的字段
 

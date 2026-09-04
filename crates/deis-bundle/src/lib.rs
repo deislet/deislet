@@ -188,10 +188,12 @@ pub struct Manifest {
     pub runtime: Option<String>,
     /// Which platform services the app declares it uses. Absent means false.
     ///
-    /// The four keys are kinds, not names: this is what turns `ctx.services.kv`
-    /// on, and it is the tenant's *unnamed* namespace. A second namespace of
-    /// the same kind is a [`Self::bindings`] entry and is reached by the name
-    /// the author gave it.
+    /// Legacy unnamed service declarations carried for older native bundles.
+    ///
+    /// The standard HTTP context does not expose `context.services`; its
+    /// logical resources are named [`Self::bindings`] entries reached through
+    /// `context.env.<NAME>`. These flags remain part of schema 1 so an older
+    /// bundle and its unnamed data can still be loaded during migration.
     #[serde(default)]
     pub services: BTreeMap<String, bool>,
 

@@ -31,8 +31,8 @@
 // and leaves the record something no unauthenticated caller can produce.
 export default async function scheduled(
   event: any,
-  _env: any,
-  context: any,
+  env: any,
+  _context: any,
 ): Promise<void> {
   const at = new Date(event.scheduledTime).toISOString();
 
@@ -42,7 +42,7 @@ export default async function scheduled(
   // tick 1.
   let previousTick = 0;
   try {
-    const previous = await context.services.kv.get("cron:last-run");
+    const previous = await env.KV.get("cron:last-run");
     if (previous) {
       const parsed = JSON.parse(previous);
       if (typeof parsed.tick === "number" && Number.isFinite(parsed.tick)) {
@@ -59,7 +59,7 @@ export default async function scheduled(
   // `cron:last-run` first and the per-tick key second, so that a reader which
   // waits for `cron:tick:<n>` to appear and then reads `cron:last-run` never
   // finds the second one older than the tick it just waited for.
-  await context.services.kv.put("cron:last-run", record);
-  await context.services.kv.put(`cron:tick:${tick}`, record);
+  await env.KV.put("cron:last-run", record);
+  await env.KV.put(`cron:tick:${tick}`, record);
   console.log(`scheduled run for ${event.cron} due at ${at} (tick ${tick})`);
 }

@@ -91,6 +91,12 @@ const ObjectAssign = Object.assign;
 const ObjectCreate = Object.create;
 const ObjectDefineProperty = Object.defineProperty;
 const ObjectFreeze = Object.freeze;
+const ArrayIsArray = Array.isArray;
+const ArrayPrototypePush = Function.prototype.call.bind(Array.prototype.push);
+const ArrayPrototypeSome = Function.prototype.call.bind(Array.prototype.some);
+const NativePromise = Promise;
+const NativePromiseAllSettled = NativePromise.allSettled.bind(NativePromise);
+const NativePromiseCatch = Function.prototype.call.bind(NativePromise.prototype.catch);
 const NativeWeakSet = WeakSet;
 const NativeMap = Map;
 const NativeSet = Set;
@@ -1580,10 +1586,10 @@ function notSafeForAStranger(request, vary, served) {
 // for different users, cache the answer -- served the first user's page to
 // everybody who came after.
 function selectedBy(stored, request) {
-  if (!Array.isArray(stored) || stored.length === 0) return true;
+  if (!ArrayIsArray(stored) || stored.length === 0) return true;
   const names = [];
   for (const entry of stored) {
-    if (!Array.isArray(entry) || entry.length !== 2) return false;
+    if (!ArrayIsArray(entry) || entry.length !== 2) return false;
     names.push(entry[0]);
   }
   const asked = varySelector(names, request);
@@ -2714,7 +2720,7 @@ class NativeDB {
   // Reach for `batch` first. Use `transaction` when, and only when, a later
   // statement depends on what an earlier one returned.
   async batch(statements) {
-    if (!Array.isArray(statements)) {
+    if (!ArrayIsArray(statements)) {
       throw new TypeError(
         "database.batch: expects an array of { sql, params } statements, got " +
           (statements === null ? "null" : typeof statements)
@@ -2730,7 +2736,7 @@ class NativeDB {
         );
       }
       const params = optionOf(statement, "params");
-      if (params !== undefined && params !== null && !Array.isArray(params)) {
+      if (params !== undefined && params !== null && !ArrayIsArray(params)) {
         throw new TypeError(
           "database.batch: statement " + index +
             " has params that are not an array; they bind to the statement's ? " +
@@ -3226,7 +3232,7 @@ class Queue {
   // makes the two readings impossible to confuse, and a bare value is refused
   // with a message that says what to write instead.
   async sendBatch(messages) {
-    if (!Array.isArray(messages)) {
+    if (!ArrayIsArray(messages)) {
       throw new TypeError(
         "queue.sendBatch: expected an array of messages, got " + typeof messages
       );
@@ -3291,7 +3297,7 @@ const SENSITIVE_KEYS = /pass|secret|token|key|pwd|authorization/i;
 
 function redact(obj) {
   if (!obj || typeof obj !== 'object') return obj;
-  if (Array.isArray(obj)) return obj.map(redact);
+  if (ArrayIsArray(obj)) return obj.map(redact);
   const newObj = {};
   for (const key in obj) {
     if (SENSITIVE_KEYS.test(key)) {
@@ -3704,8 +3710,16 @@ function createServiceContext() {
     // own statement about the request being answered in force. See
     // `__deis_runtime_wait_until_all`.
     waitUntil: (promise) => {
-      if (!globalThis.__pending_wait_until) globalThis.__pending_wait_until = [];
-      globalThis.__pending_wait_until.push({ stretch: stretchNow(), promise });
+      // A native Promise may reject before the response has been returned and
+      // the Rust side starts the tail. Attach a handler at registration time so
+      // V8 does not report it as an unhandled invocation error in that gap;
+      // keep the original value in the queue so the all-settled tail still
+      // observes its outcome. Do not Promise.resolve an arbitrary thenable
+      // here: assimilation invokes its `then` immediately, even if this stretch
+      // has no tail (for example a WebSocket message) and the work must be
+      // discarded rather than run inside a later request.
+      if (promise instanceof NativePromise) NativePromiseCatch(promise, () => {});
+      ArrayPrototypePush(pendingWaitUntil, { stretch: stretchNow(), promise });
     }
   };
 }
@@ -3744,63 +3758,69 @@ function createContext(requestData) {
   });
 }
 
+let waitUntilTailActive = false;
+let pendingWaitUntil = [];
+
+function currentInvocationHasBackgroundWork() {
+  if (waitUntilTailActive) return true;
+  const now = stretchNow();
+  return ArrayPrototypeSome(pendingWaitUntil, (item) =>
+    item && typeof item === "object" && item.stretch === now
+  );
+}
+
 globalThis.__deis_runtime_wait_until_all = async function() {
   // The tail is the invocation's own work, not the work of any stream that
   // invocation left open: what it starts is swept below, with the invocation.
   StreamScope.leave();
-  if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
-    const queued = globalThis.__pending_wait_until;
-    globalThis.__pending_wait_until = [];
-    // This invocation's tail is this invocation's work. Anything handed over
-    // by a stretch of code that has since ended is dropped rather than awaited
-    // here: awaiting it would spend this invocation's budget on another one's
-    // work, stamp its log lines with this trace, and run it with this
-    // invocation's statement about the request being answered in force -- so a
-    // `Cache.put` from a request that was cut off would have been judged
-    // against the queue batch that happened to run next.
-    //
-    // Reached by an invocation that did not get to its tail (a cut-off), and by
-    // one that has none at all: a WebSocket message handler can call
-    // `waitUntil` through a context it captured at the upgrade, and nothing
-    // runs a tail for it.
-    const now = stretchNow();
-    const promises = [];
-    let orphaned = 0;
-    // The array is `globalThis.__pending_wait_until` and an application can
-    // write anything into it, so nothing here trusts its shape.
-    for (const item of Array.isArray(queued) ? queued : []) {
-      if (item && typeof item === "object" && item.stretch === now) {
-        promises.push(item.promise);
-      } else {
-        orphaned++;
+  waitUntilTailActive = true;
+  try {
+    while (pendingWaitUntil.length > 0) {
+      const queued = pendingWaitUntil;
+      pendingWaitUntil = [];
+      // This invocation's tail is this invocation's work. Anything handed over
+      // by a stretch of code that has since ended is dropped rather than awaited
+      // here: awaiting it would spend this invocation's budget on another one's
+      // work, stamp its log lines with this trace, and run it with this
+      // invocation's statement about the request being answered in force -- so a
+      // `Cache.put` from a request that was cut off would have been judged
+      // against the queue batch that happened to run next.
+      //
+      // Reached by an invocation that did not get to its tail (a cut-off), and by
+      // one that has none at all: a WebSocket message handler can call
+      // `waitUntil` through a context it captured at the upgrade, and nothing
+      // runs a tail for it.
+      const now = stretchNow();
+      const promises = [];
+      let orphaned = 0;
+      for (const item of queued) {
+        if (item && typeof item === "object" && item.stretch === now) {
+          ArrayPrototypePush(promises, item.promise);
+        } else {
+          orphaned++;
+        }
+      }
+      if (orphaned > 0) {
+        platformConsole.warn(
+          orphaned + " waitUntil promise(s) were handed over by work that has since ended -- an " +
+          "invocation that was cut off, or a WebSocket message handler, which has no tail to run " +
+          "them in -- and were dropped rather than awaited inside this invocation, whose budget " +
+          "and whose trace they are not part of"
+        );
+      }
+      const outcomes = await NativePromiseAllSettled(promises);
+      for (const outcome of outcomes) {
+        if (outcome.status === "rejected") {
+          platformConsole.error("Error in waitUntil promise:", outcome.reason);
+        }
       }
     }
-    if (orphaned > 0) {
-      platformConsole.warn(
-        orphaned + " waitUntil promise(s) were handed over by work that has since ended -- an " +
-        "invocation that was cut off, or a WebSocket message handler, which has no tail to run " +
-        "them in -- and were dropped rather than awaited inside this invocation, whose budget " +
-        "and whose trace they are not part of"
-      );
-    }
-    try {
-        await Promise.all(promises);
-    } catch (e) {
-        platformConsole.error("Error in waitUntil promise:", e);
-    }
-    if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
-      await globalThis.__deis_runtime_wait_until_all();
-      // The recursive call already swept; sweeping twice would report the
-      // same intervals to the application a second time.
-      return;
-    }
-  }
 
-  // Last thing on every path the Rust side runs -- request, queue batch and
-  // cron tick all end here, after waitUntil work has been awaited.
-  //
-  // Three kinds of thing come back at once, and only two of them are worth
-  // telling the application about. The outbound-call deadlines are this
+    // Last thing on every path the Rust side runs -- request, queue batch and
+    // cron tick all end here, after waitUntil work has been awaited.
+    //
+    // Three kinds of thing come back at once, and only two of them are worth
+    // telling the application about. The outbound-call deadlines are this
   // runtime's own bookkeeping, one per fetch, and an invocation that ends with
   // one still armed has done nothing wrong -- so they are ended silently.
   //
@@ -3808,19 +3828,22 @@ globalThis.__deis_runtime_wait_until_all = async function() {
   // every later request this isolate serves, which is why it is named with its
   // count. See the timers section of js/bootstrap.js for why that is unbounded
   // for both kinds of timer, the self-rescheduling `setTimeout` included.
-  const swept = globalThis.__deis_runtime_sweep_invocation();
-  const left = [];
-  if (swept.intervals > 0) left.push(swept.intervals + " interval(s)");
-  if (swept.timeouts > 0) left.push(swept.timeouts + " timeout(s)");
-  if (left.length > 0) {
-    platformConsole.warn(
-      left.join(" and ") + " were still armed when this invocation ended, and have been " +
-      "cleared. An isolate is reused across requests, so a timer that outlives the request " +
-      "that created it keeps firing inside later ones -- a setTimeout whose callback arms " +
-      "the next one before it returns is an interval written in two lines. Clear it before " +
-      "returning, do the work in the request itself, or hand the promise to " +
-      "context.waitUntil, which is awaited before this sweep runs"
-    );
+    const swept = globalThis.__deis_runtime_sweep_invocation();
+    const left = [];
+    if (swept.intervals > 0) left.push(swept.intervals + " interval(s)");
+    if (swept.timeouts > 0) left.push(swept.timeouts + " timeout(s)");
+    if (left.length > 0) {
+      platformConsole.warn(
+        left.join(" and ") + " were still armed when this invocation ended, and have been " +
+        "cleared. An isolate is reused across requests, so a timer that outlives the request " +
+        "that created it keeps firing inside later ones -- a setTimeout whose callback arms " +
+        "the next one before it returns is an interval written in two lines. Clear it before " +
+        "returning, do the work in the request itself, or hand the promise to " +
+        "context.waitUntil, which is awaited before this sweep runs"
+      );
+    }
+  } finally {
+    waitUntilTailActive = false;
   }
 };
 
@@ -4077,7 +4100,7 @@ function respond(status, headers, body) {
 // still gets the bytes it was written against. This side's job is only to stop
 // throwing the information away before anyone can choose.
 function headerPairs(headers) {
-  if (Array.isArray(headers)) return headers;
+  if (ArrayIsArray(headers)) return headers;
   // A `Headers` first, because it is the one form that carries repeats and the
   // one form `Object.keys` cannot read at all: its entries live behind the
   // prototype, so the plain-object branch below would answer with an empty
@@ -4229,13 +4252,22 @@ function retireStream(id, entry) {
   if (entry.closed) return false;
   entry.closed = true;
   openStreams.delete(id);
-  const held = StreamScope.release(entry.owner);
+  const preserved = currentInvocationHasBackgroundWork();
+  const held = StreamScope.release(entry.owner, preserved);
   if (held.calls > 0 || held.intervals > 0 || held.timeouts > 0) {
-    platformConsole.debug(
-      "Response stream " + id + " ended holding " + held.calls + " outbound call(s), " +
-      held.intervals + " interval(s) and " + held.timeouts + " timeout(s); all of them ended " +
-      "with it, so none outlives the stream that owned them"
-    );
+    if (preserved) {
+      platformConsole.debug(
+        "Response stream " + id + " ended holding " + held.calls + " outbound call(s), " +
+        held.intervals + " interval(s) and " + held.timeouts + " timeout(s); waitUntil work " +
+        "from the same invocation is still active, so the invocation owns them until its tail ends"
+      );
+    } else {
+      platformConsole.debug(
+        "Response stream " + id + " ended holding " + held.calls + " outbound call(s), " +
+        held.intervals + " interval(s) and " + held.timeouts + " timeout(s); all of them ended " +
+        "with it, so none outlives the stream that owned them"
+      );
+    }
   }
   return true;
 }
@@ -4533,7 +4565,7 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     let resp;
     resp = await handler(ctx);
     
-    if (!(resp instanceof Response)) {
+    if (!(resp instanceof ResponseCtor)) {
        return respond(500, {}, "Handler did not return a Response object");
     }
 

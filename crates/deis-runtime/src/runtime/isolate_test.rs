@@ -6766,6 +6766,65 @@ export default function handler(context: any): Response {
         );
     }
 
+    #[tokio::test]
+    async fn a_stream_ending_does_not_cancel_wait_until_and_one_rejection_does_not_short_circuit() {
+        // A streaming response takes ownership of the timers and outbound
+        // calls the handler left open, because those often feed the body. A
+        // waitUntil promise is eager, however, and can have armed one of the
+        // same timers before it was registered. If the short body finishes
+        // while the tail is active, releasing the stream must hand those
+        // resources back to the invocation rather than cancel them. The
+        // rejected sibling is deliberate: all registered tasks settle
+        // independently, so it cannot make the tail stop awaiting the timer.
+        let code = r#"
+            let markers = [];
+
+            export default function handler(ctx) {
+                if (new URL(ctx.request.url).pathname === "/seen") {
+                    return new Response(JSON.stringify(markers));
+                }
+
+                markers = [];
+                ctx.waitUntil(Promise.reject(new Error("expected rejection")));
+                ctx.waitUntil(new Promise((resolve) => setTimeout(() => {
+                    markers.push("delayed task finished");
+                    resolve();
+                }, 10)));
+                return new Response(new ReadableStream({
+                    start(controller) {
+                        controller.enqueue(new TextEncoder().encode("streamed"));
+                        controller.close();
+                    }
+                }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "wait-until-stream-owner.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (status, _, body) = answer_to(&mut runtime, "/").await;
+        assert_eq!(status, 200);
+        let (body, failure) = drain_stream(&mut runtime, body).await;
+        assert_eq!(failure, None);
+        assert_eq!(body, b"streamed");
+
+        let (status, _, body) = answer_to(&mut runtime, "/seen").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            text(body).as_deref(),
+            Some(r#"["delayed task finished"]"#),
+            "a rejected task must not cancel or short-circuit a registered sibling"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_websocket_message_that_never_finishes_is_cut_off() {
         // A message dispatched into an isolate runs the application's own

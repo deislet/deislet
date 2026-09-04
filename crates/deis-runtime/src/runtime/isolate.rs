@@ -2042,7 +2042,6 @@ impl AppRuntime {
         let outcome = self
             .settle_script(script_name, "__deis_runtime_wait_until_all()".to_string())
             .await;
-
         let fired = cut_off.disarm();
         self.disarm_execution_budget();
         self.clear_termination();

@@ -22,7 +22,7 @@ deis deploy ──► bundle.zip ──► control plane stores it as an immutab
                      the node fetches the bundle and serves it
                                    │
      request ──► deis-proxy ──► deis-runtime ──┬── static asset, no isolate
-                                               └── isolate ──► ctx.services.*
+                                               └── isolate ──► context.env.<binding>
                                                                     │
                                                        deis-store / deis-queue
 ```
@@ -71,17 +71,17 @@ consecutive checks:
 | `deis secret list` never prints a value | names and times only, in both human and `--json` output |
 | the environment's secret reached the isolate | delivered decrypted, in memory |
 | the decrypted secret is written nowhere | the data directories and logs are grepped for it |
-| `context.services.kv` round-trips | through deis-store, in this tenant's rows |
+| `context.env.KV` round-trips | through the declared logical binding into deis-store |
 | a storage call presenting no capability token is refused | deis-store answers Unauthenticated before touching any data |
 | the storage-token endpoint refuses a caller with no API key | 401 and nothing handed out; that token works directly against deis-store and does not expire, so it goes through the same door a deploy does |
 | `deis kv` reads what the application wrote | the CLI asks the control plane for this tenant's token, then talks to deis-store with it; it never sees `storage_auth_secret` |
-| two named `kv` bindings of one application never see each other | `context.bindings.HOT`, `context.bindings.COLD` and the unnamed `context.services.kv` hold three different values for one key, and the unnamed one is where it always was |
+| three named `kv` bindings of one application never see each other | `context.env.KV`, `context.env.HOT` and `context.env.COLD` hold three different values for one key |
 | a binding name cannot be made to address another tenant | five hostile names are refused before anything touches disk, and a token for one tenant cannot name another's namespace |
 | `deis kv --binding` reads the namespace a binding names | and prints `demo.production@HOT` rather than the tenant alone |
 | a query with no end is stopped, and says which ceiling stopped it | what a tenant's SQL may cost, as opposed to what it may touch |
 | one cell cannot be made larger than a row is allowed to be | the same ceiling on the way in as on the way out |
 | one tenant's SQL cannot read another tenant's tables, or name its file | the database is one file per tenant, and neither the schema nor the path is reachable from inside a query |
-| `context.services.blob` lists a page and rolls a folder up at a delimiter | prefix, delimiter, limit and cursor, against a real deis-store |
+| `context.env.BLOB` lists a page and rolls a folder up at a delimiter | prefix, delimiter, limit and cursor, against a real deis-store |
 | `blob.head` reads an object's size and etag without its body | which is how a handler learns an object's shape without paying for the object |
 | a handler forwards a `Range` header into `blob.get` and answers a correct 206 | the range grammar is parsed in one place, on the Rust side |
 | two conditional writes of one key: one lands, the other is told it lost | `onlyIf: { ifMatch }` against the object's own sha256 — this platform's one atomic coordination primitive |
@@ -136,7 +136,7 @@ protocol.
 | Component | What it does |
 |---|---|
 | [`deis-control`](crates/deis-control) | The control plane, and the only authority on metadata. Holds applications, immutable versions, environments, deployment pointers, routes, encrypted secrets, accounts, scoped tokens and an append-only audit log in SQLite; serves the bundle download and each node's assignment list; owns the cron schedule; mints the per-tenant storage capability tokens the CLI uses; exports Prometheus metrics; and runs the React console, which covers dashboard, nodes, control channels, commands, events, node configuration, and registry-derived target evidence. The catalog half has no console page: applications, versions, environments, deployments, secrets and routes are reached through `deis` or the REST API. |
-| [`deis-runtime`](crates/deis-runtime) | A node. Runs every application of every environment it is assigned, one isolate per `(app, environment)` on its own OS thread. Serves static assets from the bundle before starting an isolate — through the version's own `_redirects`, `_headers` and not-found rules — injects `context.env` (including the `ASSETS` binding), the storage clients and the application's named `context.bindings`, dispatches a `service` binding to another application in this same process without an address anywhere, streams a response body out as it is produced, polls the queues an app declares, and ships logs, metrics and one trace per invocation to deis-telemetry. What an application may assume is pinned to its `compatibilityDate`. |
+| [`deis-runtime`](crates/deis-runtime) | A node. Runs every application of every environment it is assigned, one isolate per `(app, environment)` on its own OS thread. Serves static assets from the bundle before starting an isolate — through the version's own `_redirects`, `_headers` and not-found rules — injects the exact four-field HTTP context and publishes static assets, storage and service bindings under `context.env.<NAME>`, dispatches a `service` binding to another application in this same process without an address anywhere, streams a response body out as it is produced, polls the queues an app declares, and ships logs, metrics and one trace per invocation to deis-telemetry. What an application may assume is pinned to its selected Edge Canon and compatibility versions. |
 | [`deis-proxy`](crates/deis-proxy) | Traffic entry, built on Pingora. Terminates TLS and picks the certificate by SNI, resolves the application by `x-deis-app-id` or by host **and path prefix** against the routing table it polls from the control plane, stamps `x-deis-app-id` and `x-deis-environment` onto the upstream request, load-balances across nodes, obtains and renews its own certificates over ACME when `[tls.acme]` is on, and upgrades its own binary without dropping connections. |
 | [`deis-store`](crates/deis-store) | KV, per-tenant SQL and content-addressed blobs, as three gRPC services in one process on SQLite and the local disk. The object store does more than put/get/delete: listing with a prefix, a delimiter and a cursor, `Head`, ranged reads, and writes and deletes made conditional on an object's sha256 — the platform's one atomic coordination primitive. Consistent backups are `deis-store snapshot` / `restore`. Knows nothing about versions, deployments or environments. |
 | [`deis-queue`](crates/deis-queue) | A durable queue with lease-based consumption: `Send` and `SendBatch`, `Pull` under a lease, `Ack`, `Nack` with a delay, and a dead-letter table once a message has been tried too often - with the reason it was given up on, which `deis queue dead-letters` reads and `deis queue replay` acts on. Nodes poll it; it never pushes. Consistent, digest-verified backups use `deis-queue snapshot` / `restore`. |
@@ -429,7 +429,7 @@ order it is likely to matter:
   or in a container with `/proc` hidden. A node that cannot read that clock
   says so once at `error` on startup and runs with the wall clock alone.
 - **A native call that hangs still holds its thread.** The watchdog interrupts
-  V8 bytecode; a handler parked on `await ctx.services.kv.get(...)` is not
+  V8 bytecode; a handler parked on `await context.env.KV.get(...)` is not
   running any. `fetch` is covered — every outbound call is armed with an
   `AbortSignal` on what is left of the budget — but the kv, SQL, blob and
   queue clients have no per-call timeout of their own, so a deis-store that

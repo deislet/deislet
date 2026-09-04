@@ -93,10 +93,6 @@ import type { Context } from '@edge-canon/types';
 export default async function handler(context: Context): Promise<Response> {
   const name = new URL(context.request.url).searchParams.get('name') || 'World';
 
-  // Using basic service - KV Storage
-  const { kv } = context.services;
-  await kv.put('last-visitor', name);
-
   return new Response(JSON.stringify({
     message: `Hello, ${name}!`,
     timestamp: new Date().toISOString()
@@ -105,6 +101,10 @@ export default async function handler(context: Context): Promise<Response> {
   });
 }
 ```
+
+The portable context has only `request`, `env`, `params`, and `waitUntil`.
+Declare logical resources explicitly and access them as
+`context.env.<BINDING_NAME>`; see [Logical resources](basic-services.md).
 
 ## Using Build
 
@@ -247,7 +247,7 @@ See [Library Usage Guide](./library-usage.md) for details.
 - 📖 Read [the deislet target](./deislet-target.md) for what a bundle contains,
   and [architecture.zh.md](../../../docs/architecture.zh.md) for the platform
 - 📖 Check [Output Modes](./output-modes.md) to learn about Files/Memory/Both modes
-- 📖 Read [Basic Services](./basic-services.md) to learn about KV and Cache usage
+- 📖 Read [Logical resources](./basic-services.md) to learn about KV and Cache usage
 - 📖 Review [Edge Canon Specification](https://github.com/deislet/edge-canon)
 
 ## Common Questions

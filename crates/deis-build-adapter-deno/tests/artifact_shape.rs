@@ -124,31 +124,35 @@ fn test_research_snapshot_reference_in_comments() {
 
     // Preserve a pointer to the artifact research snapshot.
     assert!(result.router_code.contains("spec.mdc"));
-    assert!(result.context_builder_code.contains("spec.mdc"));
+    assert!(result.router_code.contains("spec.mdc"));
 }
 
 #[test]
-fn test_cache_api_wrapper() {
+fn context_does_not_invent_a_provider_specific_cache_field() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify Cache API wrapper (per spec.mdc - Web Platform APIs)
-    assert!(result.context_builder_code.contains("cache:"));
-    assert!(result.context_builder_code.contains("caches.open"));
+    assert!(!result.context_builder_code.contains("cache:"));
+    assert!(!result.context_builder_code.contains("services:"));
+    assert!(result
+        .context_builder_code
+        .contains("createEdgeCanonContext"));
 }
 
 #[test]
-fn test_wait_until_polyfill() {
+fn standard_wait_until_uses_the_shared_lifecycle_boundary() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify waitUntil polyfill (Deno Deploy doesn't have native waitUntil)
-    assert!(result.context_builder_code.contains("waitUntil:"));
-    assert!(result.context_builder_code.contains("promise.catch"));
+    assert!(result.context_builder_code.contains("void promise"));
+    let runtime = &result.support_files[0].1;
+    assert!(runtime.contains("EC_WAIT_UNTIL_CLOSED"));
+    assert!(runtime.contains("EC_WAIT_UNTIL_PROMISE_REQUIRED"));
+    assert!(runtime.contains("EC_BACKGROUND_REJECTED"));
 }
 
 #[test]

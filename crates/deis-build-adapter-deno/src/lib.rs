@@ -135,8 +135,9 @@ fn generate_router_code(
         };
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(url.pathname, {route_literal})) {{
-    const context = buildContext(request, {route_literal}, {wildcard_name});
-    return await invokeEdgeCanonHandler(() => {invocation});
+    const lifecycle = buildContext(request, {route_literal}, {wildcard_name});
+    const context = lifecycle.context;
+    return await invokeEdgeCanonHandler(lifecycle, () => {invocation});
   }}
 "#
         ));
@@ -256,88 +257,33 @@ fn generate_context_builder_code(has_kv: bool) -> String {
         ""
     };
 
-    let kv_service_code = if has_kv {
-        "kv: kv ? createKVAdapter(kv) : undefined,"
+    let kv_binding = if has_kv {
+        "if (kv) standardEnv.KV = createKVAdapter(kv);"
     } else {
-        "kv: undefined,"
+        ""
     };
     format!(
         r#"/**
- * Deno Deploy Context Builder
+ * Edge Canon context bridge for Deno Deploy.
  *
- * Artifact assumptions: deis-build-adapter-deno/spec.mdc (research snapshot)
- * - Uses Deno.env.toObject() for environment variables
- * - Provides Deno.Kv access through services.kv
- * - Implements Cache API via caches.open()
- * - waitUntil implementation logs errors but doesn't block response
- *
- * See: https://docs.deno.com/deploy/api/runtime-request
+ * Deno has no request-scoped waitUntil primitive; its server execution keeps
+ * already-started promises alive. The shared boundary still tracks each task,
+ * isolates rejection and closes registration with the response body.
  */
 
-{kv_import}import {{ extractParams }} from '../edge-canon-runtime.js';
+{kv_import}import {{ createEdgeCanonContext, extractParams }} from '../edge-canon-runtime.js';
 
 export function createContextBuilder(kv?: Deno.Kv) {{
   return function buildContext(request: Request, route: string = '/', wildcardName: string | null = null) {{
     const url = new URL(request.url);
-
-    return {{
-      // Core Deno Deploy context
+    const standardEnv: Record<string, unknown> = Deno.env.toObject();
+    {kv_binding}
+    return createEdgeCanonContext(
       request,
-      env: Deno.env.toObject(),  // All environment variables
-
-      // Convenience fields
-      params: extractParams(url.pathname, route, wildcardName),
-      path: url.pathname,
-      method: request.method,
-      query: Object.fromEntries(url.searchParams),
-      headers: request.headers,
-      cookies: parseCookies(request),
-
-      // Services
-      services: {{
-        {kv_service_code}
-      }},
-
-      // Logging utilities
-      log: {{
-        debug: (...args: any[]) => console.debug(...args),
-        info: (...args: any[]) => console.info(...args),
-        warn: (...args: any[]) => console.warn(...args),
-        error: (...args: any[]) => console.error(...args),
-      }},
-
-      // Cache API wrapper
-      cache: {{
-        match: async (req: Request | string) => caches.open('v1').then(c => c.match(req)),
-        put: async (req: Request | string, res: Response) => caches.open('v1').then(c => c.put(req, res)),
-        delete: async (req: Request | string) => caches.open('v1').then(c => c.delete(req)),
-      }},
-
-      // waitUntil polyfill (Deno Deploy doesn't have native waitUntil)
-      waitUntil: (promise: Promise<any>) => {{
-        // Run async work without blocking response
-        promise.catch(err => console.error('Background task error:', err));
-      }},
-    }};
-  }};
-}}
-
-function parseCookies(request: Request): any {{
-  const cookies: Record<string, string> = {{}};
-  const cookieHeader = request.headers.get('Cookie');
-
-  if (cookieHeader) {{
-    cookieHeader.split(';').forEach(cookie => {{
-      const [name, ...rest] = cookie.split('=');
-      cookies[name.trim()] = rest.join('=').trim();
-    }});
-  }}
-
-  return {{
-    get(name: string) {{ return cookies[name]; }},
-    set(name: string, value: string) {{ cookies[name] = value; }},
-    delete(name: string) {{ delete cookies[name]; }},
-    getAll() {{ return {{ ...cookies }}; }}
+      standardEnv,
+      extractParams(url.pathname, route, wildcardName),
+      (promise: Promise<unknown>) => {{ void promise; }}
+    );
   }};
 }}
 "#

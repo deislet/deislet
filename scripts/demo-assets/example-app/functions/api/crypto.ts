@@ -23,7 +23,7 @@ export default async function handler(context: any): Promise<Response> {
     });
 
   if (!present.crypto) {
-    context.log.error("crypto is not defined in this isolate");
+    console.error("crypto is not defined in this isolate");
     return answer({ present, error: "crypto is not defined in this isolate" });
   }
 
@@ -66,6 +66,6 @@ export default async function handler(context: any): Promise<Response> {
     out.digestError = String(e);
   }
 
-  context.log.info("web crypto exercised");
+  console.log("web crypto exercised");
   return answer(out);
 }

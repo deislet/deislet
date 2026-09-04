@@ -204,8 +204,9 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: 
         };
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(url.pathname, {route_literal})) {{
-    const context = buildContext(request, {route_literal}, {wildcard_name});
-    return await invokeEdgeCanonHandler(() => {invocation});
+    const lifecycle = buildContext(request, {route_literal}, {wildcard_name});
+    const context = lifecycle.context;
+    return await invokeEdgeCanonHandler(lifecycle, () => {invocation});
   }}
 "#
         ));
@@ -263,85 +264,32 @@ fn generate_context_builder_code(has_kv: bool) -> String {
     } else {
         ""
     };
+    let kv_binding = if has_kv {
+        "if (env && env.KV) standardEnv.KV = createKVAdapter(env.KV);"
+    } else {
+        ""
+    };
     format!(
         r#"/**
- * Cloudflare Workers Context Builder
+ * Edge Canon context bridge for Cloudflare Workers.
  *
- * Artifact assumptions: deis-build-adapter-cloudflare/spec.mdc (research snapshot)
- * - Passes through env (all bindings: KV, D1, R2, DO, vars, secrets)
- * - Passes through ctx (execution context with waitUntil, passThroughOnException)
- * - Exposes request.cf (Cloudflare-specific data)
- * - Provides utility methods for common operations
- *
- * See: https://developers.cloudflare.com/workers/runtime-apis/handlers/fetch/
+ * Provider objects remain behind this bridge. The application receives only
+ * request, env, params and waitUntil, as required by EC-WEB v1.
  */
 
-{kv_import}import {{ extractParams }} from '../edge-canon-runtime.js';
+{kv_import}import {{ createEdgeCanonContext, extractParams }} from '../edge-canon-runtime.js';
 
 export function createContextBuilder(env: any, ctx: any) {{
   return function buildContext(request: Request, route: string = '/', wildcardName: string | null = null) {{
     const url = new URL(request.url);
-
-    return {{
-      // Core Cloudflare context (per spec.mdc)
+    const standardEnv: Record<string, unknown> = Object.assign({{}}, env || {{}});
+    {kv_binding}
+    return createEdgeCanonContext(
       request,
-      env,  // Pass through all environment bindings
-      ctx,  // Execution context
-
-      // Cloudflare-specific request properties
-      cf: request.cf,  // Cloudflare data (colo, country, city, etc.)
-
-      // Convenience fields
-      params: extractParams(url.pathname, route, wildcardName),
-      path: url.pathname,
-      method: request.method,
-      query: Object.fromEntries(url.searchParams),
-      headers: request.headers,
-      cookies: parseCookies(request),
-
-      // Services (backwards compatibility)
-      services: {{
-        kv: env.KV ? createKVAdapter(env.KV) : undefined,
-      }},
-
-      // Logging utilities
-      log: {{
-        debug: (...args: any[]) => console.debug(...args),
-        info: (...args: any[]) => console.info(...args),
-        warn: (...args: any[]) => console.warn(...args),
-        error: (...args: any[]) => console.error(...args),
-      }},
-
-      // Cache API wrapper
-      cache: {{
-        match: async (req: Request | string) => caches.default.match(req),
-        put: async (req: Request | string, res: Response) => caches.default.put(req, res),
-        delete: async (req: Request | string) => caches.default.delete(req),
-      }},
-
-      // Context methods
-      waitUntil: (promise: Promise<any>) => ctx.waitUntil(promise),
-      passThroughOnException: () => ctx.passThroughOnException(),
-    }};
-  }};
-}}
-
-function parseCookies(request: Request): any {{
-  const cookies: Record<string, string> = {{}};
-  const cookieHeader = request.headers.get('Cookie');
-
-  if (cookieHeader) {{
-    cookieHeader.split(';').forEach(cookie => {{
-      const [name, ...rest] = cookie.split('=');
-      cookies[name.trim()] = rest.join('=').trim();
-    }});
-  }}
-
-  return {{
-    get(name: string) {{ return cookies[name]; }},
-    set(name: string, value: string) {{ cookies[name] = value; }},
-    delete(name: string) {{ delete cookies[name]; }},
-    getAll() {{ return {{ ...cookies }}; }}
+      standardEnv,
+      extractParams(url.pathname, route, wildcardName),
+      ctx && typeof ctx.waitUntil === 'function' ? ctx.waitUntil.bind(ctx) : undefined
+    );
   }};
 }}
 "#

@@ -110,6 +110,11 @@ impl Compiler {
 
         // Discover handler files
         let handlers = self.discover_handlers(project_dir, &config)?;
+        let function_root = if handlers.is_empty() {
+            None
+        } else {
+            Some(fs::canonicalize(project_dir.join(&config.function_root))?)
+        };
 
         let mut result = ValidationResult::new();
 
@@ -123,10 +128,23 @@ impl Compiler {
 
             // Parse handler
             let handler_info = self.parser.parse(&code, &handler_path)?;
+            let relative_path = Path::new(&handler_path).strip_prefix(
+                function_root
+                    .as_deref()
+                    .expect("a discovered handler has a function root"),
+            )?;
+            let handler_kind =
+                deis_build_core::routes::handler_kind(&relative_path.to_string_lossy());
 
             // Validate handler
-            self.validator
-                .validate(&code, &handler_info, &config, strict, &mut result)?;
+            self.validator.validate(
+                &code,
+                &handler_info,
+                handler_kind,
+                &config,
+                strict,
+                &mut result,
+            )?;
         }
 
         Ok(result)
@@ -717,6 +735,26 @@ impl Compiler {
         Ok(())
     }
 
+    fn refuse_non_standard_context_fields(path: &str, info: &HandlerInfo) -> anyhow::Result<()> {
+        if info.non_standard_context_references.is_empty() {
+            return Ok(());
+        }
+        let references = info
+            .non_standard_context_references
+            .iter()
+            .map(|reference| {
+                format!(
+                    "context.{} at {path}:{}:{}",
+                    reference.field, reference.line, reference.column
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(anyhow::anyhow!(
+            "EC_WEB_CONTEXT_FIELD_NONSTANDARD: {references}. The selected Edge Canon HTTP context has exactly request, env, params, and waitUntil. Read method and headers from context.request; parse path and query from new URL(context.request.url); use console for logs; and declare logical resources under context.env.<NAME>"
+        ))
+    }
+
     /// Stop a build over a handler whose name contains a backslash.
     ///
     /// `\` is a directory separator on Windows and an ordinary character in a
@@ -1068,6 +1106,11 @@ impl Compiler {
             Self::refuse_external_runtime_module_edges(&handler_path, &parsed)?;
             Self::refuse_provider_only_globals(&handler_path, &parsed)?;
             Self::refuse_non_portable_stream_constructors(&handler_path, &parsed)?;
+            if deis_build_core::routes::handler_kind(&relative_path.to_string_lossy())
+                == deis_build_core::routes::HandlerKind::Http
+            {
+                Self::refuse_non_standard_context_fields(&handler_path, &parsed)?;
+            }
             module_references.push((handler_path.clone(), parsed.module_references.clone()));
             handler_specifiers.push((handler_path.clone(), parsed.imports.clone()));
             module_queue.push_back((source_path.clone(), parsed.imports));
@@ -1445,6 +1488,7 @@ impl Compiler {
                     Self::refuse_external_runtime_module_edges(&derived_path, &derived)?;
                     Self::refuse_provider_only_globals(&derived_path, &derived)?;
                     Self::refuse_non_portable_stream_constructors(&derived_path, &derived)?;
+                    Self::refuse_non_standard_context_fields(&derived_path, &derived)?;
                     validate_node_npm_project(
                         &project_root,
                         &[(derived_path, derived.module_references)],

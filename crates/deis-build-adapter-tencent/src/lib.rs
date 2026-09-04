@@ -117,15 +117,16 @@ fn generate_router_code(routes: &[(String, String)], _has_kv: bool, node_runtime
 
         let invocation = if node_runtime {
             format!(
-                "runWithEdgeCanonNodeEnv(context.env || {{}}, () => handler{i}(enhancedContext))"
+                "runWithEdgeCanonNodeEnv(enhancedContext.env, () => handler{i}(enhancedContext))"
             )
         } else {
             format!("handler{i}(enhancedContext)")
         };
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(pathname, {route_literal})) {{
-    const enhancedContext = buildEnhancedContext(context, {route_literal}, {wildcard_name});
-    return await invokeEdgeCanonHandler(() => {invocation});
+    const lifecycle = buildEnhancedContext(context, {route_literal}, {wildcard_name});
+    const enhancedContext = lifecycle.context;
+    return await invokeEdgeCanonHandler(lifecycle, () => {invocation});
   }}
 "#
         ));
@@ -247,97 +248,28 @@ fn generate_context_builder_code(has_kv: bool) -> String {
     };
     format!(
         r#"/**
- * EdgeOne Context Builder
+ * Edge Canon context bridge for EdgeOne.
  *
- * Artifact assumptions: spec.mdc research snapshot
- * - EdgeOne context provides: request, env, params (line 819-822)
- * - Only uses approved Web APIs (line 899-928)
- * - Avoids unsupported syntax (no spread operators, Object.fromEntries, etc)
+ * Provider fields and globals remain behind this bridge. The application sees
+ * exactly request, env, params and waitUntil.
  */
-{kv_import}import {{ extractParams }} from '../edge-canon-runtime.js';
-// Build enhanced context with utility methods
+{kv_import}import {{ createEdgeCanonContext, extractParams }} from '../edge-canon-runtime.js';
+
 export function buildEnhancedContext(context, route, wildcardName) {{
   const request = context.request;
   const url = new URL(request.url);
 {kv_init}
-
-  // Parse query parameters without Object.fromEntries (not in spec)
-  const query = {{}};
-  const searchParams = url.searchParams;
-  searchParams.forEach(function(value, key) {{
-    query[key] = value;
-  }});
-
-  // Extract route params
+  const standardEnv = Object.assign({{}}, context.env || {{}});
+  if (kv !== undefined) standardEnv.KV = kv;
   const params = extractParams(url.pathname, route, wildcardName);
-
-  // Build enhanced context following EdgeOne structure
-  return {{
-    // Core EdgeOne context fields (line 819-822)
-    request: request,
-    env: context.env || {{}},
-    params: params,
-
-    // Additional convenience fields
-    path: url.pathname,
-    method: request.method,
-    query: query,
-    headers: request.headers,
-    cookies: parseCookies(request),
-
-    // Services
-    services: {{
-      kv: kv
-    }},
-
-    // Utilities
-    log: console,
-    waitUntil: function(promise) {{
-      if (typeof context.waitUntil === 'function') {{
-        context.waitUntil(promise);
-      }}
-    }}
-  }};
-}}
-
-// Parse cookies from request
-function parseCookies(request) {{
-  const cookies = {{}};
-  const cookieHeader = request.headers.get('Cookie');
-
-  if (cookieHeader) {{
-    const cookiePairs = cookieHeader.split(';');
-    for (let i = 0; i < cookiePairs.length; i++) {{
-      const cookie = cookiePairs[i];
-      const eqIndex = cookie.indexOf('=');
-      if (eqIndex > 0) {{
-        const name = cookie.slice(0, eqIndex).trim();
-        const value = cookie.slice(eqIndex + 1).trim();
-        cookies[name] = value;
-      }}
-    }}
-  }}
-
-  return {{
-    get: function(name) {{
-      return cookies[name];
-    }},
-    set: function(name, value) {{
-      cookies[name] = value;
-    }},
-    delete: function(name) {{
-      delete cookies[name];
-    }},
-    getAll: function() {{
-      const result = {{}};
-      for (const key in cookies) {{
-        if (cookies.hasOwnProperty(key)) {{
-          result[key] = cookies[key];
-        }}
-      }}
-      return result;
-    }}
-  }};
+  return createEdgeCanonContext(
+    request,
+    standardEnv,
+    params,
+    context && typeof context.waitUntil === 'function'
+      ? context.waitUntil.bind(context)
+      : undefined
+  );
 }}
 "#
     )

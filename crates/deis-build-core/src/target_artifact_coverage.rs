@@ -86,7 +86,7 @@ impl Feature {
             (Feature::SQLDatabase, Platform::Tencent) => None,
             // deis-store serves one SQLite database per tenant over gRPC, and
             // deis-runtime builds the client in `runtime/bindings.rs` from the
-            // manifest's `services`, so `context.services.database` reaches it.
+            // manifest's logical bindings, so `context.env.<NAME>` reaches it.
             (Feature::SQLDatabase, Platform::Deislet) => Some("Per-app SQLite in deis-store"),
 
             (Feature::ObjectStorage, Platform::Cloudflare) => Some("R2 Buckets"),
@@ -117,7 +117,7 @@ impl Feature {
             (Feature::Queues, Platform::Cloudflare) => Some("Queues"),
             (Feature::Queues, Platform::Deno) => None,
             (Feature::Queues, Platform::Tencent) => None,
-            // deis-queue is its own process; `context.services.queue.send`
+            // deis-queue is its own process; a declared queue binding's `send`
             // reaches it through the client deis-runtime builds, and a node
             // polls it for every queue the manifest declares a consumer for.
             (Feature::Queues, Platform::Deislet) => Some("deis-queue, consumed by polling"),

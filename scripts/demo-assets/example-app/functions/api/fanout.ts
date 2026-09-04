@@ -46,7 +46,7 @@ export default async function handler(context: any): Promise<Response> {
     // specification says a refused call is. The message is reported verbatim
     // because it is the thing worth reading: it names the ceiling and says
     // that redirect hops count towards it.
-    context.log.warn(`fanout stopped after ${completed} of ${wanted} call(s): ${e}`);
+    console.warn(`fanout stopped after ${completed} of ${wanted} call(s): ${e}`);
     return answer({ requested: wanted, completed, lastStatus, error: String(e) });
   }
 

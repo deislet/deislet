@@ -80,10 +80,9 @@ fn test_emitted_web_apis_match_research_snapshot() {
     // ✅ Allowed: console.*
     assert!(result.support_files[0].1.contains("console.error"));
 
-    // Verify forEach usage (compatible alternative to Object.fromEntries)
     assert!(result
         .context_builder_code
-        .contains("forEach(function(value, key)"));
+        .contains("createEdgeCanonContext"));
 }
 
 #[test]
@@ -93,30 +92,28 @@ fn test_context_structure() {
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify EdgeOne context structure (per spec.mdc line 819-822)
-    // The builder aliases `const request = context.request` and then
-    // exposes it as `request: request`; assert on both halves.
     assert!(result
         .context_builder_code
         .contains("const request = context.request"));
-    assert!(result.context_builder_code.contains("request: request"));
-    assert!(result.context_builder_code.contains("env: context.env"));
-    assert!(result.context_builder_code.contains("params:"));
+    assert!(result
+        .context_builder_code
+        .contains("Object.assign({}, context.env || {})"));
+    assert!(result.context_builder_code.contains("extractParams"));
+    assert!(!result.context_builder_code.contains("services:"));
+    assert!(!result.context_builder_code.contains("cookies:"));
+    assert!(!result.context_builder_code.contains("path:"));
 }
 
 #[test]
-fn test_cookie_parsing_shape() {
+fn provider_convenience_fields_are_not_part_of_the_standard_context() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify cookie parsing uses indexOf/slice (not destructuring)
-    assert!(result.context_builder_code.contains("indexOf('=')"));
-    assert!(result.context_builder_code.contains("slice(0, eqIndex)"));
-
-    // Verify NO rest parameters in cookie parsing
-    assert!(!result.context_builder_code.contains("...rest"));
+    for field in ["cookies:", "query:", "headers:", "method:", "log:"] {
+        assert!(!result.context_builder_code.contains(field), "{field}");
+    }
 }
 
 #[test]
@@ -172,22 +169,18 @@ fn test_research_snapshot_reference_in_comments() {
     assert!(
         result.router_code.contains("pages-llms.mdc") || result.router_code.contains("spec.mdc")
     );
-    assert!(
-        result.context_builder_code.contains("pages-llms.mdc")
-            || result.context_builder_code.contains("spec.mdc")
-    );
+    assert!(result.router_code.contains("spec.mdc"));
 }
 
 #[test]
-fn test_traditional_loops_only() {
+fn context_bridge_avoids_object_spread_syntax() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify traditional for loops are used (maximum compatibility)
-    assert!(result.context_builder_code.contains("for (let i"));
-    assert!(result.context_builder_code.contains("for (const key in"));
+    assert!(!result.context_builder_code.contains("...context"));
+    assert!(result.context_builder_code.contains("Object.assign"));
 }
 
 #[test]

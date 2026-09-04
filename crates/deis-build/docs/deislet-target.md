@@ -207,22 +207,26 @@ as an exception every handler would have to invent a response for.
 
 ## What the entry module does
 
-deis-runtime keeps one default export per app and calls it once per request,
-and it **builds the context itself** (`request`, `env`, `services`,
-`waitUntil`) - it has no idea an app has more than one handler. So the
-generated entry module is what turns a file tree into an app:
+deis-runtime keeps one default export per app and calls it once per request.
+The generated entry module narrows that native object to the exact Edge Canon
+HTTP context (`request`, `env`, `params`, `waitUntil`) and turns a file tree
+into an app:
 
 1. picks the handler whose pattern fits the path;
 2. fills `context.params` from its own match. The runtime matches the same
    patterns, catch-all included, but a manifest pattern keeps only the `*`, so
    `params['*']` is the only key it can promise; this module still knows the
    file was written `[[catch]]`, and publishes the tail under that name too;
-3. adds the conveniences edge-canon promises: `path`, `method`, `query`,
-   `cookies`, `log`;
-4. answers 404 when nothing matched.
+3. copies and freezes `env` and `params`, binds `waitUntil` to this invocation,
+   and exposes no provider or Deislet convenience fields;
+4. closes `waitUntil` registration only when the handler and response body
+   lifecycle have both ended, while already registered tasks settle
+   independently;
+5. answers 404 when nothing matched.
 
-`context.env`, `context.services` and `context.waitUntil` are passed through
-untouched.
+Named logical resources are reached as `context.env.<NAME>`. Legacy native
+`context.services` and `context.bindings`, and conveniences such as
+`context.path`, are deliberately not copied into the standard context.
 
 ## The `.config.json` keys this target reads
 

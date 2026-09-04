@@ -36,7 +36,7 @@ export default async function handler(context: any): Promise<Response> {
   }
 
   if (!available) {
-    context.log.error("fetch is not defined in this isolate");
+    console.error("fetch is not defined in this isolate");
     return answer({
       available,
       target,
@@ -50,7 +50,7 @@ export default async function handler(context: any): Promise<Response> {
     // Bounded on purpose: this body is printed by the verification, and a
     // destination that answers with a megabyte should not fill a terminal.
     const body = (await response.text()).slice(0, 500);
-    context.log.info(`fetched ${target} -> ${response.status}`);
+    console.log(`fetched ${target} -> ${response.status}`);
     return answer({
       available,
       target,
@@ -62,7 +62,7 @@ export default async function handler(context: any): Promise<Response> {
     // A refusal arrives here as an ordinary failed fetch, which is what the
     // canon says it should be: the platform declines, the application sees a
     // rejected promise and decides what to do about it.
-    context.log.warn(`fetch to ${target} did not happen: ${e}`);
+    console.warn(`fetch to ${target} did not happen: ${e}`);
     return answer({
       available,
       target,

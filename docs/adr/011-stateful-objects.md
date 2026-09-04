@@ -60,7 +60,7 @@ canonical key
 普通 Worker 通过 named binding 获取 namespace：
 
 ```ts
-const room = context.bindings.ROOMS.get(roomId)
+const room = context.env.ROOMS.get(roomId)
 const response = await room.fetch(request)
 ```
 

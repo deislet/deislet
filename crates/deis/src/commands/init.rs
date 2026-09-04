@@ -29,17 +29,12 @@ pub async fn execute(name: String, template: String) -> Result<()> {
         "runtime": "standard-v1",
         "language": "typescript",
         "functionRoot": "./functions",
+        "compatibilityDate": "2026-09-01",
         "environment": {
             "variables": {
                 "LOG_LEVEL": "info"
             },
             "secrets": []
-        },
-        "services": {
-            "kv": { "enabled": true },
-            "database": { "enabled": false },
-            "blob": { "enabled": false },
-            "queue": { "enabled": false }
         },
         // Static files carried inside the version bundle. A request whose
         // path names one of them is answered from it without starting an
@@ -108,15 +103,9 @@ export default async function handler(context: Context): Promise<Response> {
 
 interface Context {
   request: Request;
-  env: Record<string, string>;
-  params: Record<string, string>;
-  path: string;
-  method: string;
-  query: Record<string, string | string[]>;
-  services: {
-    kv?: any;
-    database?: any;
-  };
+  env: Readonly<Record<string, string>>;
+  params: Readonly<Record<string, string>>;
+  waitUntil(promise: Promise<unknown>): void;
 }
 "#;
 
@@ -128,13 +117,13 @@ interface Context {
  * Route: /api/hello
  */
 export default async function handler(context: Context): Promise<Response> {
-  const { query } = context;
-  const name = query.name || 'World';
+  const url = new URL(context.request.url);
+  const name = url.searchParams.get('name') || 'World';
 
   const response = {
     message: `Hello, ${name}!`,
     timestamp: new Date().toISOString(),
-    path: context.path
+    path: url.pathname
   };
 
   return new Response(JSON.stringify(response, null, 2), {
@@ -144,15 +133,9 @@ export default async function handler(context: Context): Promise<Response> {
 
 interface Context {
   request: Request;
-  env: Record<string, string>;
-  params: Record<string, string>;
-  path: string;
-  method: string;
-  query: Record<string, string | string[]>;
-  services: {
-    kv?: any;
-    database?: any;
-  };
+  env: Readonly<Record<string, string>>;
+  params: Readonly<Record<string, string>>;
+  waitUntil(promise: Promise<unknown>): void;
 }
 "#;
 

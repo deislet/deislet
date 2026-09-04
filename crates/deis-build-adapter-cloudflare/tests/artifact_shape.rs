@@ -78,30 +78,35 @@ fn test_context_includes_env_bindings() {
 }
 
 #[test]
-fn test_context_includes_cf_property() {
+fn standard_context_does_not_expose_cloudflare_objects() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify request.cf is exposed (per spec.mdc - Cloudflare-specific data)
-    assert!(result.context_builder_code.contains("cf: request.cf"));
+    assert!(!result.context_builder_code.contains("request.cf"));
+    assert!(!result
+        .context_builder_code
+        .contains("passThroughOnException"));
+    assert!(result
+        .context_builder_code
+        .contains("createEdgeCanonContext"));
 }
 
 #[test]
-fn test_context_execution_methods() {
+fn standard_wait_until_is_backed_by_the_native_execution_context() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    // Verify waitUntil is present (per spec.mdc)
-    assert!(result.context_builder_code.contains("waitUntil"));
-
-    // Verify passThroughOnException is present (per spec.mdc)
     assert!(result
         .context_builder_code
-        .contains("passThroughOnException"));
+        .contains("ctx.waitUntil.bind(ctx)"));
+    let runtime = &result.support_files[0].1;
+    assert!(runtime.contains("EC_WAIT_UNTIL_CLOSED"));
+    assert!(runtime.contains("EC_WAIT_UNTIL_PROMISE_REQUIRED"));
+    assert!(runtime.contains("EC_BACKGROUND_REJECTED"));
 }
 
 #[test]
@@ -170,7 +175,7 @@ fn test_research_snapshot_reference_in_comments() {
 
     // Preserve a pointer to the artifact research snapshot.
     assert!(result.router_code.contains("spec.mdc"));
-    assert!(result.context_builder_code.contains("spec.mdc"));
+    assert!(result.router_code.contains("spec.mdc"));
 }
 
 #[test]

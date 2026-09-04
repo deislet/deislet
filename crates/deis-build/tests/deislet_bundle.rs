@@ -315,12 +315,12 @@ async fn the_platform_handlers_become_exports_and_never_routes() {
     let functions = project.path().join("functions");
     std::fs::write(
         functions.join("_queue.ts"),
-        "export default async function queue(batch: any) { void batch; }",
+        "export default async function queue(batch: any) { void batch.messages; void batch.queue; }",
     )
     .expect("write the queue handler");
     std::fs::write(
         functions.join("_scheduled.ts"),
-        "export default async function scheduled(event: any) { void event; }",
+        "export default async function scheduled(event: any) { void event.scheduledTime; void event.cron; }",
     )
     .expect("write the cron handler");
 
@@ -414,14 +414,14 @@ async fn an_application_the_bundler_would_split_is_carried_whole() {
     std::fs::write(
         functions.join("report.ts"),
         "export function render(path: string): string {\n  return 'lazy-chunk-marker:' + path;\n}\n\
-         export default function report(context: any) {\n  return new Response(render(context.path));\n}\n",
+         export default function report(context: any) {\n  return new Response(render(new URL(context.request.url).pathname));\n}\n",
     )
     .expect("write the lazily imported handler");
     std::fs::write(
         functions.join("index.ts"),
         "export default async function root(context: any): Promise<Response> {\n  \
            const lazy = await import('./report.ts');\n  \
-           return new Response(lazy.render(context.path));\n}\n",
+           return new Response(lazy.render(new URL(context.request.url).pathname));\n}\n",
     )
     .expect("write the handler that splits the bundle");
 

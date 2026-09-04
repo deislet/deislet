@@ -34,9 +34,12 @@ pub use deis_bundle::WORKER_ENTRY;
 /// bindings deis-runtime has to hand the isolate. There is one profile today.
 pub const RUNTIME_PROFILE: &str = "standard-v1";
 
-/// The four services a bundle can declare. Named exactly as they appear on
-/// `context.services` in a handler, so a developer reading the manifest sees
-/// the names they wrote.
+/// The four legacy unnamed services a bundle can declare.
+///
+/// They remain in the native manifest for bundles from before named logical
+/// resources existed. The standard HTTP context has exactly four fields and
+/// does not expose `context.services`; new applications declare a binding and
+/// receive it as `context.env.<NAME>`.
 const SERVICE_NAMES: [&str; 4] = ["kv", "database", "blob", "queue"];
 
 /// Assemble the manifest for one build.

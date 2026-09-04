@@ -145,7 +145,7 @@ produces.
 
 There is one limit this table cannot express: a native call with no timeout of
 its own. The watchdog interrupts V8 bytecode, and a handler parked on
-`await ctx.services.kv.get(...)` is not running any. Outbound `fetch` is
+`await context.env.KV.get(...)` is not running any. Outbound `fetch` is
 covered — see below — but the kv, SQL, blob and queue clients have no per-call
 deadline, so a storage process that accepts the connection and never answers
 keeps that runtime thread waiting.
@@ -199,22 +199,23 @@ every one of them is sent.
 |---|---|
 | `context.request` | the request |
 | `context.params` | route placeholders from the manifest's patterns |
-| `context.env` | the environment's variables and secrets, as delivered; platform-reserved keys are removed before the isolate sees them |
+| `context.env` | a per-invocation, frozen copy of the environment's variables, secrets and declared logical bindings; platform-reserved keys are removed before the isolate sees them |
 | `context.env.ASSETS` | `fetch(request \| url \| path)` — this version's own static files, through the same `_redirects` and not-found rules the HTTP entry uses. A reserved key: a deployment shipping `ASSETS=...` has it removed before the map becomes `context.env` |
-| `context.services.kv` | `get`, `getWithMetadata`, `put`, `delete`, `list({ prefix, limit, cursor })` — deis-store |
-| `context.services.database` | `query`, `execute`, `batch`, `transaction(cb)` — deis-store, one SQLite file per tenant. `transaction` is a real interactive one: `BEGIN IMMEDIATE` pins a connection for the length of the callback, and the store rolls back and releases it on its own deadline |
-| `context.services.blob` | `get(key, { range })`, `head`, `list({ prefix, delimiter, limit, cursor })`, `put(key, data, { contentType, onlyIf })`, `delete(key, { onlyIf })` — deis-store, content-addressed. `range` takes an HTTP `Range` header value or `{ offset, length }` / `{ suffix }`; `list` pages with a cursor and rolls keys up at a delimiter; the etag is the object's own sha256, and `onlyIf: { ifMatch }` / `{ ifNoneMatch }` makes a write or a delete conditional on it. A conditional write that lost answers `null` rather than throwing, which is what makes read-modify-write a loop an application can write |
-| `context.services.queue` | `send`, `sendBatch(messages)` for a whole array as one unit (one op dispatch, one round trip, all-or-nothing), and `to(name)` for a queue other than the default — deis-queue |
-| `context.services.cache` | the Cache API, in-process per isolate — `match`, `put`, `delete`, beside `caches.default`, `caches.open(name)` and `caches.scope`. It holds answers to GET requests and nothing else, and it decides what it may keep by asking what is *safe* rather than by listing what is not: an entry is stored only when every header on the request being answered and on the key is one of a closed list that cannot single a caller out (or one the response files the entry under with `Vary`), and every header on the response is one of a closed list that describes the representation — so a `Cookie`, an `Origin` or a header nobody has heard of is refused by the same sentence that refuses a `Set-Cookie`, and so is the next name anybody invents. Beside that it refuses what a shared cache may not keep (`no-store`, `private`, `no-cache`, a lifetime of zero, a past `Expires`, `Pragma: no-cache`), what is not a whole answer (a 206 or anything carrying `Content-Range`, a 304, a status outside 200-599) and a variant it cannot vouch for (`Vary: *`, a varying response under a key that does not carry those headers). `Cache-Control: public` and `s-maxage` are lifetimes and grant nothing. An application that wants a per-caller answer cached says so on the call — `put(request, response, { forCaller: userId })`, read back with `match(request, { forCaller: userId })` — and `{ forAnyCaller: true }` is how it states that an answer does not depend on the caller. Every refusal names itself and names the fix. The whole rule, and what it costs, is written out at the top of [`src/runtime/cache_ops.rs`](src/runtime/cache_ops.rs) |
-| `context.bindings.<NAME>` | what the manifest's `bindings` table declared, also published on `env.<NAME>`. A `kv` / `database` / `blob` / `queue` binding is a namespace of this tenant *beside* the unnamed one `context.services.*` reaches — the name is composed onto the tenant after the capability token is checked (`shop.production@HOT`), so no pair of `(tenant, binding)` can spell another pair's namespace. A `service` binding is another application: see the row below |
-| `context.bindings.<NAME>.fetch()` on a `service` binding | calls another application on this platform with no address anywhere — no host, no port, no name to resolve. Dispatched as a message inside this node process to the thread hosting the callee's isolate, so the outbound fetch policy neither applies nor can be widened to allow it. Two gates: the callee consents in its own bundle's `callableBy`, checked per call against the version it is currently serving, and the uploader holds `read:<callee>/<env>`. It follows the caller's own environment by default, costs one of the invocation's subrequests, is capped at a chain depth of 4, and refuses a cycle outright |
-| `context.log` | `debug`, `info`, `warn`, `error` — the structured log line, on every invocation path including cron and queue |
+| `context.env.<KV_BINDING>` | a declared `kv` binding: `get`, `getWithMetadata`, `put`, `delete`, `list({ prefix, limit, cursor })` — deis-store |
+| `context.env.<DATABASE_BINDING>` | a declared `database` binding: `query`, `execute`, `batch`, `transaction(cb)` — deis-store. `transaction` is interactive: `BEGIN IMMEDIATE` pins a connection for the callback and the store rolls it back on its own deadline |
+| `context.env.<BLOB_BINDING>` | a declared `blob` binding: `get(key, { range })`, `head`, `list({ prefix, delimiter, limit, cursor })`, `put(key, data, { contentType, onlyIf })`, `delete(key, { onlyIf })` — content-addressed deis-store |
+| `context.env.<QUEUE_BINDING>` | a declared `queue` binding: `send` and `sendBatch(messages)` — deis-queue |
+| `context.env.<SERVICE_BINDING>.fetch()` | calls the declared application inside this node without an address. The callee's `callableBy` and the uploader's scope are both checked; calls follow the caller's environment by default, spend a subrequest, have a chain-depth limit of 4, and reject cycles |
 | `context.waitUntil(promise)` | work the response does not wait for |
 
-A service the application did not declare is not bound, and calling it says
-"service not available" rather than pretending to have succeeded. The exact
-shape is built by `createServiceContext` in
-[`src/runtime/js/runtime.js`](src/runtime/js/runtime.js).
+Those are the context's only four fields. Request metadata comes from
+`context.request`; application logs use `console`; the Cache API uses
+`caches.default`/`caches.open(name)`. Native `context.services`,
+`context.bindings` and `context.log` objects still exist below the generated
+bridge for schema-1 migration and non-HTTP event internals, but are not part of
+the standard HTTP ABI. A logical binding the application did not declare is
+absent rather than simulated. Its concrete resource interfaces remain Draft
+until Edge Canon's `logical-resource-bindings` capability family is frozen.
 
 ### Global scope — what an application can assume
 
@@ -319,8 +320,8 @@ Request and response bodies cross the Rust/JS boundary as bytes
 (`ops.rs::PendingRequestBody` / `PendingResponseBody`, both `Option<Vec<u8>>`,
 `#[buffer]`/`ToJsBuffer` at the op boundary — see `blob_ops.rs` for why a
 `#[serde] Vec<u8>` is the wrong type on either side), so a binary upload or a
-binary upstream response survives the trip intact. `context.services.kv`,
-`context.services.blob`, the Cache API and `context.services.queue` carry
+binary upstream response survives the trip intact. Declared KV, blob and queue
+bindings in `context.env`, together with the Cache API, carry
 bytes the same way.
 
 ### Outbound `fetch` is policed

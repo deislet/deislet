@@ -182,7 +182,7 @@ ensure_dirs() {
 # The ceiling on the node's log file, in bytes.
 #
 # Why there is one at all. `${LOG_DIR}/deis-runtime.log` is not written only by
-# the node: an application's own `context.log` line lands in it, and an
+# the node: an application's own `console` line lands in it, and an
 # application's line carries whatever a request put in it. So the file's size
 # is decided by whoever can reach the node's port, which on this demo is
 # anybody - the routes are unauthenticated by design, that being what most of
@@ -1098,7 +1098,7 @@ export default async function handler(context: any): Promise<Response> {
   // Without it the only handle on the node's line is its wording, which is the
   // same for every stream on the node - see `trace_of_witness` in
   // scripts/demo.sh for what that cost.
-  if (tag !== "") context.log.info("stream witness " + tag);
+  if (tag !== "") console.log("stream witness " + tag);
 
   const frames = Math.min(Math.max(Number(url.searchParams.get("frames")) || 5, 1), 100);
   const gapMs = Math.min(Math.max(Number(url.searchParams.get("gapMs")) || 120, 0), 2000);
@@ -1205,7 +1205,7 @@ export default async function handler(context: any): Promise<Response> {
   // under this invocation's `trace_id`, and this line is how a caller learns
   // what that id is. See `trace_of_witness` in scripts/demo.sh.
   const tag = url.searchParams.get("tag") ?? "";
-  if (tag !== "") context.log.info("timer witness " + tag);
+  if (tag !== "") console.log("timer witness " + tag);
 
   doors = {};
 
@@ -1314,7 +1314,7 @@ BLOB_ROUTE="/api/objects"
 # carry one.
 #
 # Written here for the same reason the WebSocket handler is: the checks below
-# need an application that actually calls `context.services.blob`, and a
+# need an application that actually calls a declared blob binding, and a
 # feature nothing calls is a feature nobody has. The moment
 # `functions/api/objects.ts` appears in the example app's own sources this
 # stops writing anything.
@@ -1329,14 +1329,14 @@ add_blob_route() {
   local handler="${dest}/functions${BLOB_ROUTE}.ts"
 
   # The binding only exists if the application asks for it: a handler calling
-  # `context.services.blob` in an app that does not declare "blob" gets the
+  # `context.env.BLOB` in an app that does not declare BLOB gets the
   # "this service is not available to this app" error rather than an object
   # store. Enabled here, in the staged copy, for the same reason the handler
   # is written here.
   local config="${dest}/.config.json"
   if [ -f "$config" ] && command -v jq >/dev/null 2>&1; then
     local with_blob
-    with_blob=$(jq '.services.blob = { "enabled": true }' "$config") \
+    with_blob=$(jq '.bindings.BLOB = { "kind": "blob" }' "$config") \
       && printf '%s\n' "$with_blob" > "$config"
   fi
 
@@ -1346,7 +1346,7 @@ add_blob_route() {
 
   mkdir -p "$(dirname "$handler")"
   cat > "$handler" <<'TS'
-// Object storage through `context.services.blob`: list, head, ranged read and
+// Object storage through the declared `context.env.BLOB` binding: list, head, ranged read and
 // conditional write, exposed as the HTTP an application would build on them.
 const json = (body: any, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -1355,7 +1355,7 @@ const json = (body: any, status = 200) =>
   });
 
 export default async function handler(context: any): Promise<Response> {
-  const blob = context.services.blob;
+  const blob = context.env.BLOB;
   const url = new URL(context.request.url);
   const params = url.searchParams;
   const op = params.get("op") || "";
@@ -3849,7 +3849,7 @@ check_secret_delivery() {
 }
 
 check_kv_roundtrip() {
-  local title="context.services.kv round-trips through deis-store"
+  local title="context.env.KV round-trips through deis-store"
   local key="demo-kv-$$"
   local value="stored-through-deis-store"
   local headers="${LOG_DIR}/verify-kv.headers"
@@ -3907,16 +3907,17 @@ check_kv_roundtrip() {
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" \
     -H "x-deis-storage-token: $(storage_token "$tenant")" \
+    -H "x-deis-binding: KV" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1)
   direct_value=$(echo "$direct" | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
 
   if [ "$direct_value" = "$value" ]; then
     pass_check "$title" \
-      "PUT then GET returned ${value} from the node, and deis-store's own KvStore.Get answers the same value directly for tenant ${tenant}, key ${key}"
+      "PUT then GET returned ${value} from the node, and deis-store's own KvStore.Get answers the same value directly for tenant ${tenant}, binding KV, key ${key}"
   else
     fail_check "$title" \
-      "the node answered ${value}, but deis-store's own KvStore.Get for tenant ${tenant}, key ${key} returned: $(echo "$direct" | tr '\n' ' ' | head -c 200)"
+      "the node answered ${value}, but deis-store's own KvStore.Get for tenant ${tenant}, binding KV, key ${key} returned: $(echo "$direct" | tr '\n' ' ' | head -c 200)"
   fi
 }
 
@@ -3937,51 +3938,50 @@ check_kv_roundtrip() {
 # be satisfied by a node that kept three maps in memory.
 
 check_named_bindings_are_separate_namespaces() {
-  local title="two named kv bindings of one application never see each other"
+  local title="three named kv bindings of one application never see each other"
   local key="binding-probe-$$"
   local headers="${LOG_DIR}/verify-binding.headers"
 
-  # The same key, written through three namespaces of the one tenant.
+  # The same key, written through three named namespaces of the one tenant.
   app_request "$headers" "/api/bindings/HOT?key=${key}" -X PUT --data-binary "hot-value" >/dev/null
   if [ "$(http_status "$headers")" != "201" ]; then
     fail_check "$title" "PUT through HOT answered $(http_status "$headers")"
     return
   fi
   app_request "$headers" "/api/bindings/COLD?key=${key}" -X PUT --data-binary "cold-value" >/dev/null
-  app_request "$headers" "/api/bindings/default?key=${key}" -X PUT --data-binary "unnamed-value" >/dev/null
+  app_request "$headers" "/api/bindings/default?key=${key}" -X PUT --data-binary "kv-value" >/dev/null
 
-  local hot cold unnamed hot_ns same_object
+  local hot cold kv hot_ns same_object
   hot=$(app_request "${LOG_DIR}/verify-binding-hot.headers" "/api/bindings/HOT?key=${key}")
   cold=$(app_request "${LOG_DIR}/verify-binding-cold.headers" "/api/bindings/COLD?key=${key}")
-  unnamed=$(app_request "${LOG_DIR}/verify-binding-plain.headers" "/api/bindings/default?key=${key}")
+  kv=$(app_request "${LOG_DIR}/verify-binding-plain.headers" "/api/bindings/default?key=${key}")
   hot_ns=$(echo "$hot" | jq -r '.namespace // empty')
   same_object=$(echo "$hot" | jq -r '.sameObjectOnEnv // empty')
 
   if [ "$(echo "$hot" | jq -r '.value // empty')" != "hot-value" ] \
     || [ "$(echo "$cold" | jq -r '.value // empty')" != "cold-value" ] \
-    || [ "$(echo "$unnamed" | jq -r '.value // empty')" != "unnamed-value" ]; then
+    || [ "$(echo "$kv" | jq -r '.value // empty')" != "kv-value" ]; then
     fail_check "$title" \
-      "the same key read back differently per namespace was expected; HOT=$(echo "$hot" | jq -c '.value'), COLD=$(echo "$cold" | jq -c '.value'), unnamed=$(echo "$unnamed" | jq -c '.value')"
+      "the same key read back differently per namespace was expected; HOT=$(echo "$hot" | jq -c '.value'), COLD=$(echo "$cold" | jq -c '.value'), KV=$(echo "$kv" | jq -c '.value')"
     return
   fi
   if [ "$same_object" != "true" ] || [ "$hot_ns" != "HOT" ]; then
     fail_check "$title" \
-      "env.HOT and context.bindings.HOT must be one object and the object must know its own name; sameObjectOnEnv=${same_object}, namespace=${hot_ns}"
+      "context.env.HOT must be the declared object and know its own name; sameObjectOnEnv=${same_object}, namespace=${hot_ns}"
     return
   fi
 
   # Reading it back through the node proves the isolate got three answers, not
   # where they are kept. deis-store's own KvStore.Get, with the binding header
   # this platform stamps, is what proves the three are three namespaces on
-  # disk -- and the same call without the header is what proves the unnamed
-  # one is exactly where it always was.
+  # disk. Each call carries the logical binding name the application declared.
   if ! command -v grpcurl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
     fail_check "$title" \
-      "the three namespaces answered hot-value / cold-value / unnamed-value through the node, but grpcurl or openssl is missing so deis-store could not be asked directly"
+      "the three namespaces answered hot-value / cold-value / kv-value through the node, but grpcurl or openssl is missing so deis-store could not be asked directly"
     return
   fi
 
-  local tenant token direct_hot direct_plain
+  local tenant token direct_hot direct_kv
   tenant="${APP_ID}.${ENV_NAME}"
   token=$(storage_token "$tenant")
   direct_hot=$(grpcurl -plaintext -max-time 5 \
@@ -3991,19 +3991,20 @@ check_named_bindings_are_separate_namespaces() {
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
     | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
-  direct_plain=$(grpcurl -plaintext -max-time 5 \
+  direct_kv=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" -H "x-deis-storage-token: ${token}" \
+    -H "x-deis-binding: KV" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
     | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
 
-  if [ "$direct_hot" = "hot-value" ] && [ "$direct_plain" = "unnamed-value" ]; then
+  if [ "$direct_hot" = "hot-value" ] && [ "$direct_kv" = "kv-value" ]; then
     pass_check "$title" \
-      "key ${key} written through HOT, COLD and context.services.kv reads back as hot-value, cold-value and unnamed-value; deis-store's own KvStore.Get for tenant ${tenant} answers hot-value with x-deis-binding: HOT and unnamed-value with no binding header at all, so the named namespaces are beside the unnamed one and not on top of it"
+      "key ${key} written through context.env.HOT, COLD and KV reads back separately; deis-store's own KvStore.Get for tenant ${tenant} answers the matching values with x-deis-binding: HOT and KV"
   else
     fail_check "$title" \
-      "deis-store answered ${direct_hot:-<nothing>} for tenant ${tenant} with binding HOT and ${direct_plain:-<nothing>} with no binding; expected hot-value and unnamed-value"
+      "deis-store answered ${direct_hot:-<nothing>} for tenant ${tenant} with binding HOT and ${direct_kv:-<nothing>} with binding KV; expected hot-value and kv-value"
   fi
 }
 
@@ -4096,7 +4097,7 @@ check_cli_reads_a_named_binding() {
     && [ "$unnamed_found" = "false" ] \
     && [ "$through_app" = "written-through-hot" ]; then
     pass_check "$title" \
-      "deis kv put --binding HOT wrote ${key}; reading it back with --binding HOT gives written-through-hot and reports the namespace as ${hot_tenant}, the same command without --binding reports found=false, and the application reading ctx.bindings.HOT sees the CLI's value"
+      "deis kv put --binding HOT wrote ${key}; reading it back with --binding HOT gives written-through-hot and reports the namespace as ${hot_tenant}, the same command without --binding reports found=false, and the application reading context.env.HOT sees the CLI's value"
   else
     fail_check "$title" \
       "--binding HOT read ${hot_value:-<nothing>} in namespace ${hot_tenant:-<none>}, the unnamed namespace reported found=${unnamed_found:-<none>}, and the app read ${through_app:-<nothing>}"
@@ -4360,7 +4361,7 @@ check_data_cli_reads_the_apps_write() {
   fi
 
   local out="${LOG_DIR}/cli-kv-get.json"
-  if ! deis_cli kv get "$key" --json > "$out" 2> "${LOG_DIR}/cli-kv-get.log"; then
+  if ! deis_cli kv get "$key" --binding KV --json > "$out" 2> "${LOG_DIR}/cli-kv-get.log"; then
     fail_check "$title" \
       "deis kv get ${key} failed: $(tail -n 3 "${LOG_DIR}/cli-kv-get.log" | tr '\n' ' ')"
     return
@@ -4376,12 +4377,12 @@ check_data_cli_reads_the_apps_write() {
     | openssl base64 -d -A 2>/dev/null || true)
 
   if [ "$found" = "true" ] && [ "$read_back" = "$value" ] \
-    && [ "$tenant" = "${APP_ID}.${ENV_NAME}" ]; then
+    && [ "$tenant" = "${APP_ID}.${ENV_NAME}@KV" ]; then
     pass_check "$title" \
-      "the handler stored ${key} through context.services.kv; \`deis kv get\` asked the control plane for a storage token, presented it to deis-store as tenant ${tenant}, and read back \"${read_back}\" ($(printf '%s' "$read_back" | wc -c) bytes). The CLI never sees storage_auth_secret: it is handed a token for this one tenant"
+      "the handler stored ${key} through context.env.KV; \`deis kv get --binding KV\` asked the control plane for a storage token, presented it to deis-store as namespace ${tenant}, and read back \"${read_back}\" ($(printf '%s' "$read_back" | wc -c) bytes). The CLI never sees storage_auth_secret: it is handed a token for this one tenant"
   else
     fail_check "$title" \
-      "deis kv get ${key} reports tenant '${tenant:-<none>}', found=${found}, value '${read_back:-<none>}'; expected ${APP_ID}.${ENV_NAME} and \"${value}\""
+      "deis kv get ${key} --binding KV reports namespace '${tenant:-<none>}', found=${found}, value '${read_back:-<none>}'; expected ${APP_ID}.${ENV_NAME}@KV and \"${value}\""
   fi
 }
 
@@ -4495,7 +4496,7 @@ check_a_single_value_cannot_be_bigger_than_a_row_may_be() {
 # changed; `ATTACH DATABASE` then opens that path to read and write; `VACUUM
 # INTO` writes a copy of the caller's data anywhere the process can write. All
 # three are ordinary SQL and all three arrive through the same
-# `context.services.database` an application already has.
+# the declared database binding an application already has.
 #
 # So the boundary is held under the SQL, by an authorizer callback and by
 # `SQLITE_LIMIT_ATTACHED` pinned to zero
@@ -4677,7 +4678,7 @@ seed_blob_objects() {
 }
 
 check_blob_listing() {
-  local title="context.services.blob lists a page and rolls a folder up at a delimiter"
+  local title="context.env.BLOB lists a page and rolls a folder up at a delimiter"
   local headers="${LOG_DIR}/verify-blob-list.headers"
 
   local failed
@@ -4741,7 +4742,7 @@ check_blob_listing() {
 }
 
 check_blob_head() {
-  local title="context.services.blob reads an object's size and etag without its body"
+  local title="context.env.BLOB reads an object's size and etag without its body"
   local headers="${LOG_DIR}/verify-blob-head.headers"
 
   local head
@@ -5535,7 +5536,7 @@ check_second_environment() {
 }
 
 # The storage tenant is (app, environment), so what a preview writes through
-# ctx.services.kv is invisible to production and the other way round.
+# a preview environment's declared KV binding is invisible to production and vice versa.
 #
 # This is the half that cannot be undone if it is wrong: a preview build that
 # overwrites a production key cannot be rolled back, because rolling back
@@ -8701,7 +8702,7 @@ verify_demo() {
   check_data_cli_reads_the_apps_write
   # What a tenant's SQL may cost, as opposed to what it may touch. Both go
   # through `deis db query`, which is the same Database service the
-  # `context.services.database` binding reaches.
+  # the declared database binding reaches.
   check_a_runaway_query_is_stopped_and_names_its_ceiling
   check_a_single_value_cannot_be_bigger_than_a_row_may_be
   # What a tenant's SQL may reach, as opposed to what it may spend. It writes

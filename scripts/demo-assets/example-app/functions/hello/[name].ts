@@ -11,7 +11,7 @@ export default async function handler(context: any): Promise<Response> {
     secretPresent: typeof context.env.DEMO_SECRET === "string" && context.env.DEMO_SECRET.length > 0,
   };
 
-  context.log.info(`greeted ${context.params.name} from ${label}`);
+  console.log(`greeted ${context.params.name} from ${label}`);
 
   return new Response(JSON.stringify(body), {
     headers: { "content-type": "application/json; charset=utf-8" },

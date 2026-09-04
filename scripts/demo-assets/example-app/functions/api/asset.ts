@@ -32,7 +32,7 @@ export default async function handler(context: any): Promise<Response> {
   };
 
   if (!usable) {
-    context.log.error("env.ASSETS is not the platform's binding");
+    console.error("env.ASSETS is not the platform's binding");
     return answer(
       { ...report, error: "env.ASSETS is not an object with a fetch()" },
       500,
@@ -48,7 +48,7 @@ export default async function handler(context: any): Promise<Response> {
 
   const response = await binding.fetch(target);
   const body = await response.text();
-  context.log.info(`env.ASSETS.fetch(${target}) -> ${response.status}`);
+  console.log(`env.ASSETS.fetch(${target}) -> ${response.status}`);
 
   return answer({
     ...report,

@@ -16,13 +16,13 @@ export default async function handler(context: any): Promise<Response> {
   const name = url.searchParams.get("binding") ?? "AUTH";
   const path = url.searchParams.get("path") ?? "/verify";
 
-  const binding = context.bindings[name];
+  const binding = context.env[name];
   if (binding === undefined) {
     return new Response(
       JSON.stringify({
         binding: name,
         error: "this application declares no binding of that name",
-        declared: Object.keys(context.bindings),
+        declared: ["AUTH"],
       }),
       { status: 404, headers: { "content-type": "application/json; charset=utf-8" } },
     );

@@ -95,7 +95,7 @@ chunk 就是一次 op 派发，所以照默认值，一个生产者一秒最多�
 它的值，而不是把限流器造成的那句「V8 中途退栈」原样丢出来。
 
 还有一样这张表写不进去：**一次自己没有超时的原生调用**。看守线程能打断的是 V8 正在
-跑的字节码，而一个卡在 `await ctx.services.kv.get(...)` 上的处理函数此刻没有字节码在
+跑的字节码，而一个卡在 `await context.env.KV.get(...)` 上的处理函数此刻没有字节码在
 跑。出站 `fetch` 是有覆盖的（见下文），但 kv、SQL、blob、队列这几个客户端没有各自的
 调用超时，所以一个收下连接却永不应答的存储进程，能把那条运行时线程一直占着。
 
@@ -138,19 +138,20 @@ chunk 就是一次 op 派发，所以照默认值，一个生产者一秒最多�
 |---|---|
 | `context.request` | 请求 |
 | `context.params` | manifest 里的路由占位符 |
-| `context.env` | 这个环境的变量与密钥；平台保留键在进 Isolate 之前已被取走 |
+| `context.env` | 每次调用独立、冻结的环境变量、密钥与已声明逻辑绑定副本；平台保留键在进 Isolate 之前已被取走 |
 | `context.env.ASSETS` | `fetch(请求 \| URL \| 路径)` —— 这一版自己的静态文件，走的是 HTTP 入口用的同一套 `_redirects` 与兜底规则。`ASSETS` 是保留键：部署里带了同名变量，在这张表变成 `context.env` 之前就被取走了 |
-| `context.services.kv` | `get` / `getWithMetadata` / `put` / `delete` / `list({ prefix, limit, cursor })` —— deis-store |
-| `context.services.database` | `query` / `execute` / `batch` / `transaction(回调)` —— deis-store，每租户一个 SQLite 文件。`transaction` 是真的交互式事务：`BEGIN IMMEDIATE` 在回调期间钉住一条连接，服务端有自己的硬超时，到点回滚并把连接放回去 |
-| `context.services.blob` | `list` / `head` / `get` / `put` / `delete` —— deis-store，内容寻址。`get` 可以带一个范围（HTTP 的 `Range` 头原样转发也行），`list` 支持前缀、分隔符和游标，`put` / `delete` 可以带 `onlyIf` 做条件写：条件不成立时 `put` 返回 `null`、`delete` 返回 `false`，而不是抛异常 |
-| `context.services.queue` | `send`，以及 `to(name)` 投给默认队列以外的队列 —— deis-queue |
-| `context.services.cache` | Cache API，进程内、按 Isolate 隔离 —— `match` / `put` / `delete`，另有 `caches.default`、`caches.open(name)` 与 `caches.scope`。它只存 GET 的答案；判断能不能存，问的是「什么是安全的」而不是「什么是危险的」：只有当被应答的那个请求和这把 key 上的每一个头，都落在一份「不可能指认出某个调用方」的封闭清单里（或者响应用 `Vary` 把这条记录归档到它名下），并且响应上的每一个头都落在另一份「只描述这份表示」的封闭清单里，这条记录才会被存下来 —— 于是 `Cookie`、`Origin`，以及任何没人听说过的头，和 `Set-Cookie` 一样被同一句话挡住，往后谁再发明一个新名字也一样。此外照旧拒绝：共享缓存本就不该留的响应（`no-store`、`private`、`no-cache`、寿命为零、已经过期的 `Expires`、`Pragma: no-cache`），不是一个完整答案的响应（206 或任何带 `Content-Range` 的、304、状态码不在 200-599 之间的），以及无法背书的变体（`Vary: *`；带 `Vary` 却用一把不携带这些头的 key 去存）。`Cache-Control: public` 与 `s-maxage` 只表示寿命，不再表示许可。应用如果确实要缓存「只属于某个调用方」的答案，就在调用上说出来 —— `put(request, response, { forCaller: userId })`，读回时 `match(request, { forCaller: userId })` —— 而 `{ forAnyCaller: true }` 是应用声明「这个答案与谁在问无关」的方式。每一次拒绝都会说清是它自己拒的、以及该怎么改。完整规则与它的代价写在 [`src/runtime/cache_ops.rs`](src/runtime/cache_ops.rs) 的文件头 |
-| `context.log` | `debug` / `info` / `warn` / `error`，在每条调用路径上都有，cron 与队列也不例外 |
+| `context.env.<KV_BINDING>` | 已声明的 `kv` 绑定：`get` / `getWithMetadata` / `put` / `delete` / `list({ prefix, limit, cursor })` —— deis-store |
+| `context.env.<DATABASE_BINDING>` | 已声明的 `database` 绑定：`query` / `execute` / `batch` / `transaction(回调)` —— deis-store |
+| `context.env.<BLOB_BINDING>` | 已声明的 `blob` 绑定：`list` / `head` / `get` / `put` / `delete` —— 内容寻址的 deis-store |
+| `context.env.<QUEUE_BINDING>` | 已声明的 `queue` 绑定：`send` / `sendBatch` —— deis-queue |
+| `context.env.<SERVICE_BINDING>.fetch()` | 在本节点内无地址调用已声明应用；同时检查被调方 `callableBy` 与上传方权限，默认跟随调用方环境，计入子请求，调用链深度上限为 4，并拒绝成环 |
 | `context.waitUntil(promise)` | 不让响应等的那部分工作 |
 
-应用没声明的服务不会被绑上，调它会明说「service not available」，而不是假装成功。
-确切形状看 [`src/runtime/js/runtime.js`](src/runtime/js/runtime.js) 里的
-`createServiceContext`。
+context 只有这四个字段。请求元数据从 `context.request` 读取；应用日志使用
+`console`；Cache API 使用 `caches.default` / `caches.open(name)`。原生层的
+`context.services`、`context.bindings` 与 `context.log` 仍用于 schema 1 迁移和非 HTTP
+事件内部，但不会穿过生成桥进入标准 HTTP ABI。未声明的逻辑绑定直接缺席，不会模拟成功；
+具体资源接口在 Edge Canon `logical-resource-bindings` 能力族冻结前仍是 Draft。
 
 ### 全局作用域——应用可以假设有什么
 
@@ -233,8 +234,8 @@ artifact validator 也会在应用执行前拒绝。`process.version`、
 请求与响应体过 Rust/JS 边界时是字节（`ops.rs::PendingRequestBody` /
 `PendingResponseBody`，都是 `Option<Vec<u8>>`，op 边界上是 `#[buffer]` /
 `ToJsBuffer`——`blob_ops.rs` 里写了为什么两个方向都不能用 `#[serde] Vec<u8>`），
-所以二进制上传或二进制上游响应都能原样穿过去。`context.services.kv`、
-`context.services.blob`、Cache API 与 `context.services.queue` 同样是按字节走的。
+所以二进制上传或二进制上游响应都能原样穿过去。`context.env` 中已声明的 KV、Blob、
+Queue binding 与 Cache API 同样是按字节走的。
 
 ### 出站 fetch 是有策略的
 

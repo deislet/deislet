@@ -1,8 +1,12 @@
 # Storage Services
 
-What `context.services.*` actually does on the runtime side: which op talks to
-which backend, what crosses the Rust/JS boundary as bytes versus text, and
-what happens when a service was never wired up for this deployment.
+How the logical resources exposed through `context.env.<NAME>` reach Deislet's
+runtime services: which op talks to which backend, what crosses the Rust/JS
+boundary as bytes versus text, and what happens when a resource was never
+wired up for this deployment. The runtime still contains an unnamed
+`context.services.*` layer for schema-1 migration and non-HTTP event internals;
+it is not part of the standard HTTP context and new applications must not use
+it.
 
 | Service | Backend | Where |
 |---|---|---|
@@ -46,9 +50,9 @@ missing client. An application that sees this error has a configuration
 problem — an undeclared service or a control plane that was not told the
 storage addresses — not a degraded mode to work around.
 
-That message is the answer for the tenant's *unnamed* namespace, the one
-`context.services.kv` and its siblings reach. A **named** binding that is not
-there is a different mistake and gets a different message from
+That message is the answer for the legacy tenant *unnamed* namespace. A
+**named** logical binding that is not there is a different mistake and gets a
+different message from
 `ops.rs::bound_client`:
 
 ```
@@ -64,10 +68,10 @@ wrong namespace with nothing failing.
 
 ## Bytes across the boundary, not text
 
-A value stored through `context.services.kv`, `context.services.blob` or
-`context.services.cache` is whatever the application wrote — an image, a
-compressed record, a protobuf — and only the application knows whether that
-happens to be text. So the op boundary carries bytes, not a `String`:
+A value stored through a declared KV or Blob binding, or through the Cache API,
+is whatever the application wrote — an image, a compressed record, a protobuf
+— and only the application knows whether that happens to be text. So the op
+boundary carries bytes, not a `String`:
 
 ```rust
 // KV: reading crosses as a Uint8Array, not text. js/runtime.js decodes it as
@@ -113,20 +117,21 @@ survives the trip intact.
 
 ## KV
 
-`context.services.kv` → `KvClient` → deis-store's `KvStore` service
+`context.env.<KV_BINDING>` → `KvClient` → deis-store's `KvStore` service
 (`crates/deis-store/proto/storage.proto`): `Get`, `Set`, `Delete`, `List` and
 `Has`. `Has` is reached by `KvClient::has` but has no JavaScript spelling; an
 application asks by reading the key.
 
 ```javascript
-export default function handler(context) {
-  await context.services.kv.put("counter", "42");
-  const value = await context.services.kv.get("counter"); // "42"
-  const withMeta = await context.services.kv.getWithMetadata("counter");
+export default async function handler(context) {
+  const kv = context.env.SESSIONS;
+  await kv.put("counter", "42");
+  const value = await kv.get("counter"); // "42"
+  const withMeta = await kv.getWithMetadata("counter");
   // => { value, metadata, expiration } | null
-  const page = await context.services.kv.list("user:");
+  const page = await kv.list({ prefix: "user:" });
   // => { keys: [{ name, expiration, metadata }, ...], list_complete, cursor }
-  await context.services.kv.delete("counter");
+  await kv.delete("counter");
 }
 ```
 
@@ -158,24 +163,26 @@ size (1000) when none is given and caps anything above its ceiling (10000).
 
 ## Database
 
-`context.services.database` → `DbClient` → deis-store's `Database` service:
+`context.env.<DATABASE_BINDING>` → `DbClient` → deis-store's `Database`
+service:
 `Execute`, `Query`, `Batch`, `Prepare` / `ExecutePrepared` / `QueryPrepared`,
 and the session-scoped `BeginTransaction` / `ExecuteInTransaction` /
 `QueryInTransaction` / `CommitTransaction` / `RollbackTransaction` that back
 `database.transaction(...)`.
 
 ```javascript
-const rows = await context.services.database.query(
+const database = context.env.PRIMARY_DB;
+const rows = await database.query(
   "SELECT * FROM users WHERE id = ?", [123],
 );
 // => [ { id: 123, name: "Alice" }, ... ]  -- the rows themselves, an array
 
-const exec = await context.services.database.execute(
+const exec = await database.execute(
   "INSERT INTO users (name) VALUES (?)", ["Alice"],
 );
 // => { rows_affected: 1, last_insert_id: 456 }
 
-await context.services.database.transaction(async (tx) => {
+await database.transaction(async (tx) => {
   const [row] = await tx.query("SELECT balance FROM accounts WHERE id = ?", [id]);
   await tx.execute("UPDATE accounts SET balance = ? WHERE id = ?", [row.balance - 10, id]);
 });
@@ -204,30 +211,31 @@ exactly the string and the JSON values the application wrote, not an opaque
 payload. `transaction(...)` pins one connection for the tenant for the life
 of the callback (server-side deadline, default 5 s from
 `DEFAULT_TRANSACTION_DEADLINE`, and `{ timeoutMs }` may only shorten it —
-`TransactionLimits::grant` takes the smaller of the two); the outer
-`context.services.database` handle is a different connection and does not see
-the transaction's uncommitted writes. `tx.query` and `tx.execute` answer
+`TransactionLimits::grant` takes the smaller of the two); the outer logical
+database binding is a different connection and does not see the transaction's
+uncommitted writes. `tx.query` and `tx.execute` answer
 exactly as their outer counterparts do. See `js/runtime.js`'s
 `NativeTransaction` and section 6 of the repository's
 `docs/architecture.zh.md`.
 
 ## Blob
 
-`context.services.blob` → `BlobClient` → deis-store's `BlobStore` service
+`context.env.<BLOB_BINDING>` → `BlobClient` → deis-store's `BlobStore` service
 (`crates/deis-store/proto/blob.proto`): `Get`, `Head`, `List`, `Put`,
 `Delete`. Content-addressed on disk, with `Put` and `Get` streamed in chunks
 so an object never has to sit in memory whole on either side.
 
 ```javascript
-const written = await context.services.blob.put("avatar", arrayBuffer);
+const blob = context.env.MEDIA;
+const written = await blob.put("avatar", arrayBuffer);
 // => { key, etag, size, contentType }
-const object = await context.services.blob.get("avatar"); // null if absent
+const object = await blob.get("avatar"); // null if absent
 const bytes = await object.arrayBuffer();
-const meta = await context.services.blob.head("avatar");  // no body
-const page = await context.services.blob.list("uploads/");
+const meta = await blob.head("avatar");  // no body
+const page = await blob.list({ prefix: "uploads/" });
 // => { objects: [{ key, etag, size, contentType, uploadedAt }, ...],
 //      prefixes, list_complete, cursor }
-await context.services.blob.delete("avatar");
+await blob.delete("avatar");
 ```
 
 `put` takes a string, an `ArrayBuffer` or any `ArrayBufferView` and answers
@@ -259,8 +267,9 @@ every other failure throws, and must not be retried as it stands.
 
 ## Cache
 
-`context.services.cache`, and `globalThis.caches.default` names the identical
-instance (the Cloudflare-style global some code expects to find).
+`globalThis.caches.default` names the standard default cache. The legacy
+schema-1 `context.services.cache` object names the same internal instance but
+does not cross the standard HTTP bridge.
 `caches.open(name)` gives an application caches of its own beside it: there is
 one store per isolate and a name is a namespace inside it, composed by
 `cache_ops.rs::namespaced`, so opening a name costs nothing and two names
@@ -282,7 +291,7 @@ state.
 
 ## Queue
 
-`context.services.queue` → `QueueClient` → deis-queue's `Queue` service
+`context.env.<QUEUE_BINDING>` → `QueueClient` → deis-queue's `Queue` service
 (`crates/deis-queue/proto/queue.proto`: `Send`, `SendBatch`, `Pull`, `Ack`,
 `Nack`, `ListDeadLetters`, `ReplayDeadLetters`). An application has `send()`,
 `sendBatch()`, and `to(name)` for a queue other than the default.

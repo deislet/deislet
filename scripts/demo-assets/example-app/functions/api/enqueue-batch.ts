@@ -35,18 +35,16 @@ export default async function handler(context: any): Promise<Response> {
   }
 
   try {
-    await context.services.queue
-      .to("jobs")
-      .sendBatch(jobs.map((job: any) => ({ body: job })));
+    await context.env.jobs.sendBatch(jobs.map((job: any) => ({ body: job })));
   } catch (e) {
     // Worth reporting rather than swallowing: the batch is all-or-nothing, so
     // this means none of these jobs is queued and the caller may retry the
     // identical array.
-    context.log.error(`sendBatch of ${jobs.length} job(s) failed: ${e}`);
+    console.error(`sendBatch of ${jobs.length} job(s) failed: ${e}`);
     return answer({ queued: 0, error: String(e) }, 502);
   }
 
-  context.log.info(`queued ${jobs.length} job(s) in one batch`);
+  console.log(`queued ${jobs.length} job(s) in one batch`);
 
   // 202 for the same reason /api/enqueue answers 202: the work is accepted,
   // not done. Whether it happened is observable at /api/kv/job:<key>.

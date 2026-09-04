@@ -15,15 +15,13 @@
       "DEMO_SECRET"
     ]
   },
-  "services": {
-    "kv": {
-      "enabled": true
-    },
-    "queue": {
-      "enabled": true
-    }
-  },
   "bindings": {
+    "KV": {
+      "kind": "kv"
+    },
+    "jobs": {
+      "kind": "queue"
+    },
     "HOT": {
       "kind": "kv"
     },

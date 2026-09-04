@@ -20,8 +20,8 @@ export default async function handler(context: any): Promise<Response> {
     });
   }
 
-  await context.services.queue.to("jobs").send(job);
-  context.log.info(`queued job for ${job.key}`);
+  await context.env.jobs.send(job);
+  console.log(`queued job for ${job.key}`);
 
   // 202: the work has been accepted, not done. Whether it happened is
   // observable at /api/kv/job:<key>.

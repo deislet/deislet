@@ -4,15 +4,14 @@
 //! deis-runtime loads one ESM module per app, keeps its default export, and
 //! calls it once per request with a context it builds itself
 //! (`crates/deis-runtime/src/runtime/js/runtime.js`). That context carries
-//! `request`, `env`, `services` (kv, database, blob, queue and cache), `log`
-//! and `waitUntil`, and nothing about *which* handler should run - the runtime
-//! has no idea an app has more than one.
+//! `request`, `env`, platform services and `waitUntil`, and nothing about
+//! *which* handler should run - the runtime has no idea an app has more than
+//! one. Provider-only fields stay behind this bridge.
 //!
 //! So the module generated here is what makes a file tree behave like an app:
 //! it picks the handler whose pattern fits the path, fills in the placeholder
-//! values, adds the request-shaped conveniences edge-canon promises (`path`,
-//! `method`, `query`, `cookies`) on top of what the runtime supplied, and
-//! answers 404 when nothing matched.
+//! values, narrows the native object to Edge Canon's exact four-field request
+//! context, and answers 404 when nothing matched.
 //!
 //! It fills `context.params` itself rather than trusting the runtime's copy,
 //! and the reason is not that the runtime matches less than this module does.
@@ -23,9 +22,8 @@
 //! promise, while `functions/api/[[catch]].ts` says the handler expects to
 //! read the tail as `params.catch` as well. This module still has the file
 //! name, so it publishes the capture under both spellings - and it has to
-//! build a context anyway for `path`, `method`, `query` and `cookies`, which
-//! the runtime does not supply at all. So it rebuilds `params` with the rest
-//! rather than merging into a half-filled copy.
+//! build a standard context anyway. It therefore rebuilds `params` rather
+//! than merging into a half-filled copy.
 
 use crate::routing::RoutePlan;
 use deis_build_core::javascript_string;
@@ -102,51 +100,6 @@ function splitPath(pathname) {
   return parts;
 }
 
-// The query string, parsed here rather than through URLSearchParams: the
-// runtime's polyfill of it exposes only `get`, so iterating it would throw on
-// exactly the platform this module is built for.
-function parseQuery(search) {
-  const query = {};
-  if (!search) return query;
-
-  for (const pair of search.replace(/^\?/, '').split('&')) {
-    if (pair === '') continue;
-    const eq = pair.indexOf('=');
-    const rawKey = eq === -1 ? pair : pair.slice(0, eq);
-    const rawValue = eq === -1 ? '' : pair.slice(eq + 1);
-    const key = decodeSegment(rawKey.replace(/\+/g, ' '));
-    const value = decodeSegment(rawValue.replace(/\+/g, ' '));
-
-    if (Object.prototype.hasOwnProperty.call(query, key)) {
-      const existing = query[key];
-      if (Array.isArray(existing)) existing.push(value);
-      else query[key] = [existing, value];
-    } else {
-      query[key] = value;
-    }
-  }
-
-  return query;
-}
-
-function parseCookies(request) {
-  const jar = {};
-  const header = request && request.headers ? request.headers.get('Cookie') : null;
-
-  if (header) {
-    for (const cookie of header.split(';')) {
-      const eq = cookie.indexOf('=');
-      if (eq === -1) continue;
-      jar[cookie.slice(0, eq).trim()] = cookie.slice(eq + 1).trim();
-    }
-  }
-
-  return {
-    get(name) { return jar[name]; },
-    getAll() { return Object.assign({}, jar); },
-  };
-}
-
 function pathnameOf(request) {
   const raw = request && request.url ? String(request.url) : '/';
   try {
@@ -158,35 +111,14 @@ function pathnameOf(request) {
   }
 }
 
-// The context the handler sees: everything deis-runtime supplied - env,
-// services, log, waitUntil - plus the request-shaped conveniences edge-canon
-// promises. `params` is overwritten with this module's own match: it is the
-// only one that also knows the name the catch-all was written with in the
-// file tree, so `params.catch` works alongside `params['*']`.
-//
-// `log` is rebuilt here even though the runtime now puts one on every context
-// it makes. A bundle outlives the build that produced it and a node is
-// upgraded on its operator's schedule, so this module has to work on a
-// runtime older than itself; the two definitions are the same four calls into
-// the same console.
-function buildContext(context, params, pathname) {
-  const request = context.request;
-  const search = request && request.url ? String(request.url).split('?')[1] : '';
-
-  return Object.assign({}, context, {
-    params: params,
-    path: pathname,
-    method: request ? request.method : 'GET',
-    query: parseQuery(search ? '?' + search.split('#')[0] : ''),
-    headers: request ? request.headers : undefined,
-    cookies: parseCookies(request),
-    log: {
-      debug: (...args) => console.debug(...args),
-      info: (...args) => console.info(...args),
-      warn: (...args) => console.warn(...args),
-      error: (...args) => console.error(...args),
-    },
-  });
+// The generated bridge, not the native runtime, owns the public ABI. It keeps
+// exactly four fields and turns the native waitUntil into an invocation-bound
+// lifecycle function shared with every other target.
+function buildContext(context, params) {
+  const nativeWaitUntil = context && typeof context.waitUntil === 'function'
+    ? context.waitUntil.bind(context)
+    : undefined;
+  return createEdgeCanonContext(context.request, context.env, params, nativeWaitUntil);
 }
 
 export default async function deisletEntry(context) {
@@ -196,8 +128,10 @@ export default async function deisletEntry(context) {
   for (const route of ROUTES) {
     const params = matchRoute(route, segments);
     if (params === null) continue;
+    const lifecycle = buildContext(context, params);
     return await invokeEdgeCanonHandler(
-      () => route.handler(buildContext(context, params, pathname))
+      lifecycle,
+      () => route.handler(lifecycle.context)
     );
   }
 
@@ -216,7 +150,10 @@ pub fn generate_entry_module(plan: &RoutePlan) -> String {
     let mut code = String::new();
 
     code.push_str(HEADER);
-    code.push_str("import { invokeEdgeCanonHandler } from './edge-canon-runtime.js';\n");
+    code.push_str(
+        "import { createEdgeCanonContext, invokeEdgeCanonHandler } from \
+         './edge-canon-runtime.js';\n",
+    );
 
     for (index, route) in routes.iter().enumerate() {
         code.push_str(&format!(
@@ -317,7 +254,7 @@ mod tests {
     #[test]
     fn request_handlers_use_the_same_canonical_error_boundary_as_provider_targets() {
         let code = generate_entry_module(&plan(&[entry("/", "../src/index.ts", None)]));
-        assert!(code.contains("import { invokeEdgeCanonHandler } from './edge-canon-runtime.js'"));
+        assert!(code.contains("createEdgeCanonContext, invokeEdgeCanonHandler"));
         assert!(code.contains("return await invokeEdgeCanonHandler"));
     }
 
@@ -376,9 +313,9 @@ mod tests {
     fn a_queue_handler_is_handed_the_three_arguments_the_canon_defines() {
         // edge-canon SPECIFICATION_EXT.md section 3.2:
         // `queue(batch, env, context)`. The runtime used to call it with two,
-        // so a handler written to the canon read `context.services` off the
-        // environment table. The wrapper names the three so the generated
-        // module states the contract rather than aliasing it away.
+        // so a handler written to the canon read invocation controls from the
+        // environment/bindings table. The wrapper names the three so the
+        // generated module states the contract rather than aliasing it away.
         let code = generate_entry_module(&RoutePlan {
             routes: Vec::new(),
             queue: Some("../src/_queue.ts".to_string()),

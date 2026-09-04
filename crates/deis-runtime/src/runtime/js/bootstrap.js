@@ -971,6 +971,34 @@ function moveTimers(from, to) {
   SetPrototypeClear(from.timeouts);
 }
 
+// Hand the outbound-call guards between two owners as a unit. A guard carries
+// the set it removes itself from when the call settles, so moving only the set
+// member would leave that completion editing its old home and the new home
+// retaining a dead guard forever.
+function moveGuards(from, to) {
+  for (const guard of new SafeSetIterator(from.guards)) {
+    guard.set = to.guards;
+    SetPrototypeAdd(to.guards, guard);
+  }
+  SetPrototypeClear(from.guards);
+}
+
+// A response body can finish while waitUntil work registered by the same
+// handler is still using a timer or outbound call that the stream adopted.
+// Return those resources to the invocation instead of cancelling them with
+// the body; the waitUntil tail's final sweep remains the single owner that
+// releases them.
+function returnOwnerToInvocation(owner) {
+  const held = {
+    calls: owner.guards.size,
+    intervals: owner.intervals.size,
+    timeouts: owner.timeouts.size,
+  };
+  moveGuards(owner, invocationOwner);
+  moveTimers(owner, invocationOwner);
+  return held;
+}
+
 // ---------------------------------------------------------------------------
 // Handing what is open to a response stream
 // ---------------------------------------------------------------------------
@@ -1137,9 +1165,10 @@ const streamScope = ObjectFreeze({
   // The owner is taken out of `streamOwners` and stops being the one in force
   // if it was: filing anything into a released set would leave it with nothing
   // to sweep it, which is the leak this whole arrangement exists to prevent.
-  release(owner) {
+  release(owner, preserveForInvocation = false) {
     if (entryOwner === owner) entryOwner = invocationOwner;
     SetPrototypeDelete(streamOwners, owner);
+    if (preserveForInvocation) return returnOwnerToInvocation(owner);
     return sweepOwner(owner);
   },
 });

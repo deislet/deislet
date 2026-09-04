@@ -1,7 +1,9 @@
 use deis_build_core::{
     HandlerInfo, ModuleReference, ModuleReferenceKind, ModuleSourcePosition,
-    NonPortableStreamConstructorReference, ProviderOnlyGlobalReference,
+    NonPortableStreamConstructorReference, NonStandardContextReference,
+    ProviderOnlyGlobalReference,
 };
+use std::collections::HashSet;
 use swc_common::{
     sync::Lrc, FileName, Globals, Mark, SourceMap, Span, Spanned, SyntaxContext, GLOBALS,
 };
@@ -54,7 +56,38 @@ impl TypeScriptParser {
             let top_level_mark = Mark::new();
             module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, true));
             let unresolved_context = SyntaxContext::empty().apply_mark(unresolved_mark);
-            let mut visitor = HandlerVisitor::new(self.source_map.clone(), unresolved_context);
+            let mut exported = DefaultHandlerCollector::default();
+            module.visit_with(&mut exported);
+            loop {
+                let before = exported.callables.len();
+                let mut aliases = DefaultHandlerAliasCollector::new(&exported.callables);
+                module.visit_with(&mut aliases);
+                exported.callables.extend(aliases.sources);
+                if exported.callables.len() == before {
+                    break;
+                }
+            }
+            let mut contexts = DefaultHandlerContextCollector::new(exported.callables);
+            module.visit_with(&mut contexts);
+            loop {
+                let before = contexts.contexts.len();
+                let mut aliases = ContextAliasCollector::new(&contexts.contexts);
+                module.visit_with(&mut aliases);
+                contexts.contexts.extend(aliases.aliases);
+                if contexts.contexts.len() == before {
+                    break;
+                }
+            }
+            let DefaultHandlerContextCollector {
+                contexts,
+                destructured_fields,
+                ..
+            } = contexts;
+            let mut visitor =
+                HandlerVisitor::new(self.source_map.clone(), unresolved_context, contexts);
+            for (field, span) in destructured_fields {
+                visitor.record_context_field(field, span);
+            }
             module.visit_with(&mut visitor);
             visitor
         });
@@ -71,6 +104,7 @@ impl TypeScriptParser {
             non_literal_module_load_positions: visitor.non_literal_module_load_positions,
             provider_only_global_references: visitor.provider_only_global_references,
             non_portable_stream_constructors: visitor.non_portable_stream_constructors,
+            non_standard_context_references: visitor.non_standard_context_references,
         })
     }
 
@@ -104,6 +138,206 @@ impl TypeScriptParser {
     }
 }
 
+#[derive(Default)]
+struct DefaultHandlerCollector {
+    callables: HashSet<Id>,
+}
+
+impl Visit for DefaultHandlerCollector {
+    fn visit_export_default_expr(&mut self, expression: &ExportDefaultExpr) {
+        if let Expr::Ident(ident) = &*expression.expr {
+            self.callables.insert(ident.to_id());
+        }
+        expression.visit_children_with(self);
+    }
+
+    fn visit_named_export(&mut self, export: &NamedExport) {
+        for specifier in &export.specifiers {
+            if let ExportSpecifier::Named(named) = specifier {
+                let exported = named.exported.as_ref().unwrap_or(&named.orig);
+                if export_name(exported) == "default" {
+                    if let ModuleExportName::Ident(local) = &named.orig {
+                        self.callables.insert(local.to_id());
+                    }
+                }
+            }
+        }
+        export.visit_children_with(self);
+    }
+}
+
+/// Follow local aliases backwards from the exported value to the function
+/// expression that implements it. The resolver has already given every
+/// binding a distinct `Id`, so a same-spelled variable in another scope cannot
+/// be mistaken for the exported handler.
+struct DefaultHandlerAliasCollector<'a> {
+    callables: &'a HashSet<Id>,
+    sources: HashSet<Id>,
+}
+
+impl<'a> DefaultHandlerAliasCollector<'a> {
+    fn new(callables: &'a HashSet<Id>) -> Self {
+        Self {
+            callables,
+            sources: HashSet::new(),
+        }
+    }
+}
+
+impl Visit for DefaultHandlerAliasCollector<'_> {
+    fn visit_var_declarator(&mut self, declaration: &VarDeclarator) {
+        if let (Pat::Ident(alias), Some(Expr::Ident(source))) =
+            (&declaration.name, declaration.init.as_deref())
+        {
+            if self.callables.contains(&alias.id.to_id()) {
+                self.sources.insert(source.to_id());
+            }
+        }
+        declaration.visit_children_with(self);
+    }
+}
+
+struct DefaultHandlerContextCollector {
+    callables: HashSet<Id>,
+    contexts: HashSet<Id>,
+    destructured_fields: Vec<(String, Span)>,
+}
+
+impl DefaultHandlerContextCollector {
+    fn new(callables: HashSet<Id>) -> Self {
+        Self {
+            callables,
+            contexts: HashSet::new(),
+            destructured_fields: Vec::new(),
+        }
+    }
+
+    fn record_first_parameter(&mut self, parameters: &[Param]) {
+        if let Some(parameter) = parameters.first() {
+            self.record_context_pattern(&parameter.pat);
+        }
+    }
+
+    fn record_first_pattern(&mut self, parameters: &[Pat]) {
+        if let Some(parameter) = parameters.first() {
+            self.record_context_pattern(parameter);
+        }
+    }
+
+    fn record_context_pattern(&mut self, pattern: &Pat) {
+        match pattern {
+            Pat::Ident(binding) => {
+                self.contexts.insert(binding.id.to_id());
+            }
+            Pat::Object(object) => {
+                for property in &object.props {
+                    match property {
+                        ObjectPatProp::KeyValue(key_value) => {
+                            self.record_context_property(&key_value.key)
+                        }
+                        ObjectPatProp::Assign(assign) => self
+                            .destructured_fields
+                            .push((assign.key.id.sym.to_string(), assign.key.id.span)),
+                        // Rest observes only fields that exist on the exact
+                        // four-field object and therefore does not request a
+                        // provider extension.
+                        ObjectPatProp::Rest(_) => {}
+                    }
+                }
+            }
+            Pat::Assign(assign) => self.record_context_pattern(&assign.left),
+            _ => {}
+        }
+    }
+
+    fn record_context_property(&mut self, property: &PropName) {
+        let field = match property {
+            PropName::Ident(field) => (field.sym.to_string(), field.span),
+            PropName::Str(field) => (field.value.to_string_lossy().into_owned(), field.span),
+            PropName::Computed(computed) => match &*computed.expr {
+                Expr::Lit(Lit::Str(field)) => {
+                    (field.value.to_string_lossy().into_owned(), field.span)
+                }
+                _ => ("<dynamic>".to_string(), computed.span),
+            },
+            PropName::Num(number) => (number.value.to_string(), number.span),
+            PropName::BigInt(number) => (number.value.to_string(), number.span),
+        };
+        if !self.destructured_fields.contains(&field) {
+            self.destructured_fields.push(field);
+        }
+    }
+}
+
+impl Visit for DefaultHandlerContextCollector {
+    fn visit_export_default_decl(&mut self, declaration: &ExportDefaultDecl) {
+        if let DefaultDecl::Fn(function) = &declaration.decl {
+            self.record_first_parameter(&function.function.params);
+        }
+        declaration.visit_children_with(self);
+    }
+
+    fn visit_export_default_expr(&mut self, expression: &ExportDefaultExpr) {
+        match &*expression.expr {
+            Expr::Fn(function) => self.record_first_parameter(&function.function.params),
+            Expr::Arrow(arrow) => self.record_first_pattern(&arrow.params),
+            _ => {}
+        }
+        expression.visit_children_with(self);
+    }
+
+    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
+        if self.callables.contains(&declaration.ident.to_id()) {
+            self.record_first_parameter(&declaration.function.params);
+        }
+        declaration.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, declaration: &VarDeclarator) {
+        let Pat::Ident(binding) = &declaration.name else {
+            declaration.visit_children_with(self);
+            return;
+        };
+        if !self.callables.contains(&binding.id.to_id()) {
+            declaration.visit_children_with(self);
+            return;
+        }
+        match declaration.init.as_deref() {
+            Some(Expr::Fn(function)) => self.record_first_parameter(&function.function.params),
+            Some(Expr::Arrow(arrow)) => self.record_first_pattern(&arrow.params),
+            _ => {}
+        }
+        declaration.visit_children_with(self);
+    }
+}
+
+struct ContextAliasCollector<'a> {
+    contexts: &'a HashSet<Id>,
+    aliases: HashSet<Id>,
+}
+
+impl<'a> ContextAliasCollector<'a> {
+    fn new(contexts: &'a HashSet<Id>) -> Self {
+        Self {
+            contexts,
+            aliases: HashSet::new(),
+        }
+    }
+}
+
+impl Visit for ContextAliasCollector<'_> {
+    fn visit_var_declarator(&mut self, declaration: &VarDeclarator) {
+        if let (Pat::Ident(alias), Some(Expr::Ident(source))) =
+            (&declaration.name, declaration.init.as_deref())
+        {
+            if self.contexts.contains(&source.to_id()) {
+                self.aliases.insert(alias.id.to_id());
+            }
+        }
+        declaration.visit_children_with(self);
+    }
+}
+
 struct HandlerVisitor {
     source_map: Lrc<SourceMap>,
     unresolved_context: SyntaxContext,
@@ -116,10 +350,16 @@ struct HandlerVisitor {
     non_literal_module_load_positions: Vec<ModuleSourcePosition>,
     provider_only_global_references: Vec<ProviderOnlyGlobalReference>,
     non_portable_stream_constructors: Vec<NonPortableStreamConstructorReference>,
+    context_bindings: HashSet<Id>,
+    non_standard_context_references: Vec<NonStandardContextReference>,
 }
 
 impl HandlerVisitor {
-    fn new(source_map: Lrc<SourceMap>, unresolved_context: SyntaxContext) -> Self {
+    fn new(
+        source_map: Lrc<SourceMap>,
+        unresolved_context: SyntaxContext,
+        context_bindings: HashSet<Id>,
+    ) -> Self {
         Self {
             source_map,
             unresolved_context,
@@ -132,6 +372,46 @@ impl HandlerVisitor {
             non_literal_module_load_positions: Vec::new(),
             provider_only_global_references: Vec::new(),
             non_portable_stream_constructors: Vec::new(),
+            context_bindings,
+            non_standard_context_references: Vec::new(),
+        }
+    }
+
+    fn static_context_field(&self, member: &MemberExpr) -> Option<(String, Span)> {
+        let Expr::Ident(context) = &*member.obj else {
+            return None;
+        };
+        if !self.context_bindings.contains(&context.to_id()) {
+            return None;
+        }
+        match &member.prop {
+            MemberProp::Ident(field) => Some((field.sym.to_string(), field.span)),
+            MemberProp::Computed(computed) => match &*computed.expr {
+                Expr::Lit(Lit::Str(field)) => {
+                    Some((field.value.to_string_lossy().into_owned(), field.span))
+                }
+                _ => Some(("<dynamic>".to_string(), computed.span)),
+            },
+            MemberProp::PrivateName(field) => Some((field.name.to_string(), field.span)),
+        }
+    }
+
+    fn record_context_field(&mut self, field: String, span: Span) {
+        if matches!(field.as_str(), "request" | "env" | "params" | "waitUntil") {
+            return;
+        }
+        let location = self.source_map.lookup_char_pos(span.lo());
+        let reference = NonStandardContextReference {
+            field,
+            line: location.line,
+            column: location.col_display + 1,
+        };
+        if !self
+            .non_standard_context_references
+            .iter()
+            .any(|existing| existing == &reference)
+        {
+            self.non_standard_context_references.push(reference);
         }
     }
 
@@ -444,6 +724,12 @@ impl Visit for HandlerVisitor {
         // Check any expression for service usage
         self.check_service_usage(n);
 
+        if let Expr::Member(member) = n {
+            if let Some((field, span)) = self.static_context_field(member) {
+                self.record_context_field(field, span);
+            }
+        }
+
         // WebSocket termination is not in the current provider intersection.
         // Observe runtime expressions, including computed property access,
         // without scanning comments, string contents or erased TS types.
@@ -538,6 +824,47 @@ impl Visit for HandlerVisitor {
                             assign.key.id.span,
                         ),
                         ObjectPatProp::Rest(_) => {}
+                    }
+                }
+            }
+            if let Expr::Ident(context) = &**initializer {
+                if self.context_bindings.contains(&context.to_id()) {
+                    for property in &pattern.props {
+                        match property {
+                            ObjectPatProp::KeyValue(key_value) => match &key_value.key {
+                                PropName::Ident(field) => {
+                                    self.record_context_field(field.sym.to_string(), field.span)
+                                }
+                                PropName::Str(field) => self.record_context_field(
+                                    field.value.to_string_lossy().into_owned(),
+                                    field.span,
+                                ),
+                                PropName::Computed(computed) => match &*computed.expr {
+                                    Expr::Lit(Lit::Str(field)) => self.record_context_field(
+                                        field.value.to_string_lossy().into_owned(),
+                                        field.span,
+                                    ),
+                                    _ => self.record_context_field(
+                                        "<dynamic>".to_string(),
+                                        computed.span,
+                                    ),
+                                },
+                                PropName::Num(number) => {
+                                    self.record_context_field(number.value.to_string(), number.span)
+                                }
+                                PropName::BigInt(number) => {
+                                    self.record_context_field(number.value.to_string(), number.span)
+                                }
+                            },
+                            ObjectPatProp::Assign(assign) => self.record_context_field(
+                                assign.key.id.sym.to_string(),
+                                assign.key.id.span,
+                            ),
+                            // A rest pattern copies only the four standard
+                            // fields that exist at runtime; it does not name a
+                            // provider extension and is therefore portable.
+                            ObjectPatProp::Rest(_) => {}
+                        }
                     }
                 }
             }
@@ -872,6 +1199,93 @@ export default async function handler() { return new Response(String(value)); }
             )
             .expect("module parses");
         assert!(info.non_portable_stream_constructors.is_empty());
+    }
+
+    #[test]
+    fn standard_context_fields_are_exact_and_simple_aliases_are_resolved() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                r#"
+                function handler(ctx) {
+                  const alias = ctx;
+                  const second = alias;
+                  const { request, env, params, waitUntil, path } = second;
+                  return new Response(String(request) + env + params + waitUntil + path + ctx["services"] + ctx[key]);
+                }
+                export { handler as default };
+                "#,
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        let fields = info
+            .non_standard_context_references
+            .iter()
+            .map(|reference| reference.field.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["path", "services", "<dynamic>"]);
+    }
+
+    #[test]
+    fn an_unrelated_local_context_object_is_not_the_handler_context() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                r#"
+                function helper() {
+                  const context = { path: "/local", services: {} };
+                  return context.path + String(context.services);
+                }
+                export default function handler(ctx) {
+                  return new Response(ctx.request.url + helper());
+                }
+                "#,
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        assert!(info.non_standard_context_references.is_empty());
+    }
+
+    #[test]
+    fn direct_default_arrow_context_is_checked() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "export default (requestContext) => new Response(requestContext.method);",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        assert_eq!(info.non_standard_context_references.len(), 1);
+        assert_eq!(info.non_standard_context_references[0].field, "method");
+    }
+
+    #[test]
+    fn default_parameter_destructuring_is_checked() {
+        let parser = TypeScriptParser::new();
+        for code in [
+            "export default ({ request, env, params, waitUntil, path }) => new Response(String(path));",
+            "export default function ({ request, ['services']: services } = {}) { return new Response(String(services)); }",
+        ] {
+            let info = parser
+                .parse(code, "functions/index.ts")
+                .expect("module parses");
+            assert_eq!(info.non_standard_context_references.len(), 1, "{code}");
+        }
+    }
+
+    #[test]
+    fn an_aliased_default_handler_is_checked() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "const implementation = (ctx) => new Response(ctx.path);\n\
+                 const published = implementation;\n\
+                 export default published;\n",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        assert_eq!(info.non_standard_context_references.len(), 1);
+        assert_eq!(info.non_standard_context_references[0].field, "path");
     }
 
     #[test]

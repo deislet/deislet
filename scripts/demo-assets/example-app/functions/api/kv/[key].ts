@@ -1,4 +1,4 @@
-// KV through `context.services.kv`, which reaches deis-store over gRPC.
+// KV through the declared logical binding `context.env.KV`.
 //
 // PUT stores the request body under the key, GET reads it back. Nothing here
 // knows where deis-store lives: the address is handed to the node by the
@@ -43,14 +43,14 @@ export default async function handler(context: any): Promise<Response> {
 
   if (method === "PUT" || method === "POST") {
     const value = await context.request.text();
-    await context.services.kv.put(key, value);
+    await context.env.KV.put(key, value);
     return new Response(JSON.stringify({ key, stored: value }), {
       status: 201,
       headers: { "content-type": "application/json; charset=utf-8" },
     });
   }
 
-  const value = await context.services.kv.get(key);
+  const value = await context.env.KV.get(key);
   if (value === null || value === undefined) {
     return new Response(JSON.stringify({ key, found: false }), {
       status: 404,

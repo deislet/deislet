@@ -93,10 +93,6 @@ import type { Context } from '@edge-canon/types';
 export default async function handler(context: Context): Promise<Response> {
   const name = new URL(context.request.url).searchParams.get('name') || 'World';
 
-  // 使用基础服务 - KV Storage
-  const { kv } = context.services;
-  await kv.put('last-visitor', name);
-
   return new Response(JSON.stringify({
     message: `Hello, ${name}!`,
     timestamp: new Date().toISOString()
@@ -105,6 +101,9 @@ export default async function handler(context: Context): Promise<Response> {
   });
 }
 ```
+
+可移植 context 只有 `request`、`env`、`params`、`waitUntil`。逻辑资源必须显式声明，
+并从 `context.env.<BINDING_NAME>` 访问；见[逻辑资源](basic-services.zh.md)。
 
 ## 使用 Build
 
@@ -245,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
 - 📖 阅读 [适配器规范](./adapter-specs.zh.md) 了解各平台产出什么，
   平台整体设计在 [architecture.zh.md](../../../docs/architecture.zh.md)
 - 📖 查看 [输出模式](./output-modes.md) 了解 Files/Memory/Both 模式
-- 📖 阅读 [基础服务](./basic-services.md) 了解 KV 和 Cache 使用
+- 📖 阅读 [逻辑资源](./basic-services.zh.md) 了解 KV 和 Cache 使用
 - 📖 查看 [Edge Canon 规范](https://github.com/deislet/edge-canon)
 
 ## 常见问题
