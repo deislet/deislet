@@ -47,11 +47,17 @@ all parsing and compiling to this crate.
 deis validate
 deis build                      # 全部目标 | every target
 deis build --vendor cloudflare
+cargo run -p deis-build -- node-npm-limits  # build ceilings as JSON
 ```
 
 `deis-build` 自己也有一个同名二进制，参数相同，用于不带平台侧功能时直接调编译器。
 There is also a `deis-build` binary with the same flags, for driving the
 compiler without any of the platform-side commands.
+
+`node-npm-limits` is side-effect free and reports the exact Node/npm
+toolchain, package/file/octet, expansion, timeout, and live-monitor ceilings
+before a build starts. The same values are available to library callers as
+`deis_build::node_npm_build_limits()`.
 
 ### 作为库使用 | Use as Library
 

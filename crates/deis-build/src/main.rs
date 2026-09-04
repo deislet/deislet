@@ -41,6 +41,9 @@ enum Commands {
         #[arg(long)]
         no_minify: bool,
     },
+
+    /// Print the Node/npm build ceilings enforced before and during install
+    NodeNpmLimits,
 }
 
 #[tokio::main]
@@ -60,6 +63,12 @@ async fn main() -> Result<()> {
             no_minify,
         } => {
             commands::build::execute(vendor, watch, !no_minify).await?;
+        }
+        Commands::NodeNpmLimits => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&deis_build::node_npm_build_limits())?
+            );
         }
     }
 

@@ -6,6 +6,18 @@
 
 pub const NODE_SEMANTIC_BASELINE: &str = "24.20.0";
 
+/// Conditions Edge Canon adds to the resolver's syntax-specific `import` or
+/// `require` condition and its standard `browser`/`default` conditions.
+///
+/// Package condition objects retain Node's declaration-order semantics; this
+/// list is the exact additional active set, not a provider-specific priority
+/// override.
+pub const NODE_CUSTOM_CONDITIONS: [&str; 2] = ["edge-canon", "worker"];
+pub const NODE_IMPORT_CONDITIONS: [&str; 5] =
+    ["edge-canon", "worker", "browser", "import", "default"];
+pub const NODE_REQUIRE_CONDITIONS: [&str; 5] =
+    ["edge-canon", "worker", "browser", "require", "default"];
+
 pub const NODE_BUILTIN_MODULES: [&str; 18] = [
     "node:assert",
     "node:assert/strict",
@@ -250,5 +262,18 @@ mod tests {
                 Some(builtin)
             );
         }
+    }
+
+    #[test]
+    fn resolver_conditions_are_exact_and_syntax_specific() {
+        assert_eq!(NODE_CUSTOM_CONDITIONS, ["edge-canon", "worker"]);
+        assert_eq!(
+            NODE_IMPORT_CONDITIONS,
+            ["edge-canon", "worker", "browser", "import", "default"]
+        );
+        assert_eq!(
+            NODE_REQUIRE_CONDITIONS,
+            ["edge-canon", "worker", "browser", "require", "default"]
+        );
     }
 }

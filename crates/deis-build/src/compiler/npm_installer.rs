@@ -9,6 +9,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deis_build_core::{NodeNpmUsage, NODE_SEMANTIC_BASELINE};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,22 +18,64 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
-use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::process::{Child, Command};
+use tokio::time::{sleep, sleep_until, timeout, Instant};
 use unicode_normalization::UnicodeNormalization;
 
 const NPM_TOOLCHAIN_VERSION: &str = "11.19.0";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+const INSTALL_MONITOR_INTERVAL: Duration = Duration::from_millis(50);
 pub(super) const MAX_LOCKED_PACKAGES: usize = 10_000;
 pub(super) const MAX_INSTALLED_FILES: usize = 100_000;
 pub(super) const MAX_DOWNLOADED_OCTETS: u64 = 256 * 1024 * 1024;
 pub(super) const MAX_INSTALLED_OCTETS: u64 = 512 * 1024 * 1024;
 pub(super) const MAX_EXPANSION_RATIO: u64 = 100;
+// npm's content-addressed cache also contains integrity indexes and temporary
+// download files. Bound those bytes while allowing fixed bookkeeping outside
+// the archive budget that is checked exactly after installation.
+const MAX_CACHE_OVERHEAD_OCTETS: u64 = 16 * 1024 * 1024;
+const MAX_INSTALL_WORK_ENTRIES: usize = 200_000;
 const NODE_EXECUTABLE_ENV: &str = "DEIS_NODE_EXECUTABLE";
 const NPM_CLI_ENV: &str = "DEIS_NPM_CLI";
 const NPM_USERCONFIG_ENV: &str = "DEIS_NPM_USERCONFIG";
+
+/// The limits enforced by this build implementation, available before a
+/// project is read or an npm process starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeNpmBuildLimits {
+    pub schema_version: &'static str,
+    pub node_semantic_baseline: &'static str,
+    pub npm_toolchain_version: &'static str,
+    pub max_locked_packages: u64,
+    pub max_installed_files: u64,
+    pub max_downloaded_octets: u64,
+    pub max_download_cache_work_octets: u64,
+    pub max_installed_octets: u64,
+    pub max_expansion_ratio: u64,
+    pub max_install_work_entries: u64,
+    pub install_timeout_milliseconds: u64,
+    pub monitor_interval_milliseconds: u64,
+}
+
+pub const fn node_npm_build_limits() -> NodeNpmBuildLimits {
+    NodeNpmBuildLimits {
+        schema_version: "edge-canon.node-npm-limits/v1",
+        node_semantic_baseline: NODE_SEMANTIC_BASELINE,
+        npm_toolchain_version: NPM_TOOLCHAIN_VERSION,
+        max_locked_packages: MAX_LOCKED_PACKAGES as u64,
+        max_installed_files: MAX_INSTALLED_FILES as u64,
+        max_downloaded_octets: MAX_DOWNLOADED_OCTETS,
+        max_download_cache_work_octets: MAX_DOWNLOADED_OCTETS + MAX_CACHE_OVERHEAD_OCTETS,
+        max_installed_octets: MAX_INSTALLED_OCTETS,
+        max_expansion_ratio: MAX_EXPANSION_RATIO,
+        max_install_work_entries: MAX_INSTALL_WORK_ENTRIES as u64,
+        install_timeout_milliseconds: INSTALL_TIMEOUT.as_millis() as u64,
+        monitor_interval_milliseconds: INSTALL_MONITOR_INTERVAL.as_millis() as u64,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NpmInstallEvidence {
@@ -145,16 +188,15 @@ pub(super) async fn stage_locked_dependencies(
             "EC_NPM_PACKAGE_UNRESOLVED: failed to start the pinned npm build tool: {error}"
         )
     })?;
-    let status = match timeout(INSTALL_TIMEOUT, child.wait()).await {
-        Ok(result) => result?,
-        Err(_) => {
-            let _ = child.kill().await;
-            anyhow::bail!(
-                "EC_NPM_PACKAGE_UNRESOLVED: pinned npm install exceeded {} seconds and was terminated; no provider artifact was produced",
-                INSTALL_TIMEOUT.as_secs()
-            );
-        }
-    };
+    let status = wait_for_bounded_install(
+        &mut child,
+        staged_root,
+        &work.path().join("cache"),
+        InstallLimits::production(),
+        INSTALL_TIMEOUT,
+        INSTALL_MONITOR_INTERVAL,
+    )
+    .await?;
     if !status.success() {
         anyhow::bail!(
             "EC_NPM_PACKAGE_UNRESOLVED: pinned npm install failed with status {}; stdout/stderr are withheld because registry diagnostics may contain credentials",
@@ -192,6 +234,171 @@ pub(super) async fn stage_locked_dependencies(
         downloaded_octets,
         installed_octets: audit.installed_octets,
     }))
+}
+
+#[derive(Clone, Copy)]
+struct InstallLimits {
+    cache_octets: u64,
+    installed_octets: u64,
+    installed_files: usize,
+    work_entries: usize,
+}
+
+impl InstallLimits {
+    const fn production() -> Self {
+        Self {
+            cache_octets: MAX_DOWNLOADED_OCTETS + MAX_CACHE_OVERHEAD_OCTETS,
+            installed_octets: MAX_INSTALLED_OCTETS,
+            installed_files: MAX_INSTALLED_FILES,
+            work_entries: MAX_INSTALL_WORK_ENTRIES,
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ObservedTree {
+    entries: usize,
+    files: usize,
+    octets: u64,
+}
+
+/// Wait for npm while independently measuring the two directories it can
+/// grow. The post-install integrity and path audit remains authoritative; this
+/// observer exists so a hostile archive cannot consume the entire configured
+/// allowance (or host disk) before that audit gets a chance to run.
+async fn wait_for_bounded_install(
+    child: &mut Child,
+    staged_root: &Path,
+    cache_root: &Path,
+    limits: InstallLimits,
+    deadline_after: Duration,
+    monitor_interval: Duration,
+) -> anyhow::Result<ExitStatus> {
+    let deadline = Instant::now() + deadline_after;
+    loop {
+        tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => {
+                terminate_install(child).await;
+                anyhow::bail!(
+                    "EC_NPM_PACKAGE_UNRESOLVED: pinned npm install exceeded {} seconds and was terminated; no provider artifact was produced",
+                    deadline_after.as_secs()
+                );
+            }
+            _ = sleep(monitor_interval) => {
+                let staged_root = staged_root.to_path_buf();
+                let cache_root = cache_root.to_path_buf();
+                let observed = tokio::task::spawn_blocking(move || {
+                    enforce_install_limits(&staged_root, &cache_root, limits)
+                })
+                .await;
+                let observed = match observed {
+                    Ok(observed) => observed,
+                    Err(_) => {
+                        terminate_install(child).await;
+                        anyhow::bail!(
+                            "EC_NPM_RESOURCE_LIMIT_EXCEEDED: npm resource monitor failed"
+                        );
+                    }
+                };
+                if let Err(error) = observed {
+                    terminate_install(child).await;
+                    return Err(error);
+                }
+            }
+            result = child.wait() => return result.map_err(Into::into),
+        }
+    }
+}
+
+async fn terminate_install(child: &mut Child) {
+    let _ = child.kill().await;
+    // `kill` currently waits on every Tokio platform, but an explicit wait
+    // also makes the no-zombie invariant survive that implementation detail.
+    let _ = child.wait().await;
+}
+
+fn enforce_install_limits(
+    staged_root: &Path,
+    cache_root: &Path,
+    limits: InstallLimits,
+) -> anyhow::Result<()> {
+    let cache = observe_tree(cache_root, limits.work_entries)?;
+    if cache.octets > limits.cache_octets {
+        anyhow::bail!(
+            "EC_NPM_RESOURCE_LIMIT_EXCEEDED: npm download cache exceeded {} octets during package fetch and was terminated",
+            limits.cache_octets
+        );
+    }
+
+    let installed = observe_tree(&staged_root.join("node_modules"), limits.work_entries)?;
+    if installed.files > limits.installed_files {
+        anyhow::bail!(
+            "EC_NPM_RESOURCE_LIMIT_EXCEEDED: npm produced more than {} installed files and was terminated",
+            limits.installed_files
+        );
+    }
+    if installed.octets > limits.installed_octets {
+        anyhow::bail!(
+            "EC_NPM_RESOURCE_LIMIT_EXCEEDED: npm expanded more than {} installed octets and was terminated",
+            limits.installed_octets
+        );
+    }
+    Ok(())
+}
+
+fn observe_tree(root: &Path, max_entries: usize) -> anyhow::Result<ObservedTree> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ObservedTree::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("EC_NPM_ARCHIVE_PATH_UNSAFE: npm work root is not a regular directory");
+    }
+
+    let mut observed = ObservedTree::default();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // npm can atomically move a cache entry while the observer is
+                // walking it. A vanished name has consumed no remaining disk.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            observed.entries = observed.entries.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("EC_NPM_RESOURCE_LIMIT_EXCEEDED: npm entry count overflowed")
+            })?;
+            if observed.entries > max_entries {
+                anyhow::bail!(
+                    "EC_NPM_RESOURCE_LIMIT_EXCEEDED: npm work tree exceeded {max_entries} entries and was terminated"
+                );
+            }
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                anyhow::bail!("EC_NPM_ARCHIVE_PATH_UNSAFE: npm created a special filesystem entry");
+            }
+            observed.files = observed.files.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("EC_NPM_RESOURCE_LIMIT_EXCEEDED: npm file count overflowed")
+            })?;
+            observed.octets = observed.octets.checked_add(metadata.len()).ok_or_else(|| {
+                anyhow::anyhow!("EC_NPM_RESOURCE_LIMIT_EXCEEDED: npm byte count overflowed")
+            })?;
+        }
+    }
+    Ok(observed)
 }
 
 async fn version_output(program: &Path, arguments: &[&OsStr]) -> anyhow::Result<String> {
@@ -764,6 +971,102 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_npm_limits_are_queryable_as_stable_machine_readable_values() {
+        let limits = serde_json::to_value(node_npm_build_limits()).expect("serialize limits");
+        assert_eq!(limits["schemaVersion"], "edge-canon.node-npm-limits/v1");
+        assert_eq!(limits["nodeSemanticBaseline"], NODE_SEMANTIC_BASELINE);
+        assert_eq!(limits["npmToolchainVersion"], NPM_TOOLCHAIN_VERSION);
+        assert_eq!(limits["maxLockedPackages"], MAX_LOCKED_PACKAGES);
+        assert_eq!(limits["maxInstalledFiles"], MAX_INSTALLED_FILES);
+        assert_eq!(limits["maxDownloadedOctets"], MAX_DOWNLOADED_OCTETS);
+        assert_eq!(limits["maxInstalledOctets"], MAX_INSTALLED_OCTETS);
+        assert_eq!(limits["maxExpansionRatio"], MAX_EXPANSION_RATIO);
+        assert_eq!(
+            limits["monitorIntervalMilliseconds"],
+            INSTALL_MONITOR_INTERVAL.as_millis() as u64
+        );
+    }
+
+    #[test]
+    fn install_observer_counts_regular_bytes_without_following_links() {
+        let project = tempfile::tempdir().expect("temp project");
+        let root = project.path().join("tree");
+        fs::create_dir_all(root.join("nested")).expect("tree");
+        fs::write(root.join("one"), b"123").expect("first file");
+        fs::write(root.join("nested/two"), b"4567").expect("second file");
+
+        assert_eq!(
+            observe_tree(&root, 3).expect("bounded tree"),
+            ObservedTree {
+                entries: 3,
+                files: 2,
+                octets: 7,
+            }
+        );
+        let error = observe_tree(&root, 2)
+            .expect_err("entry ceiling must stop the walk")
+            .to_string();
+        assert!(error.contains("EC_NPM_RESOURCE_LIMIT_EXCEEDED"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn install_observer_terminates_a_process_as_the_tree_crosses_its_limit() {
+        let project = tempfile::tempdir().expect("temp project");
+        let staged = project.path().join("staged");
+        let cache = project.path().join("cache");
+        fs::create_dir_all(staged.join("node_modules/pkg")).expect("installed tree");
+        fs::create_dir_all(&cache).expect("cache tree");
+        fs::write(staged.join("node_modules/pkg/expanded.js"), b"12345").expect("expanded file");
+
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("long-running child");
+        let error = wait_for_bounded_install(
+            &mut child,
+            &staged,
+            &cache,
+            InstallLimits {
+                cache_octets: 1024,
+                installed_octets: 4,
+                installed_files: 10,
+                work_entries: 20,
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect_err("growth must terminate npm")
+        .to_string();
+
+        assert!(error.contains("EC_NPM_RESOURCE_LIMIT_EXCEEDED"), "{error}");
+        assert!(
+            child.try_wait().expect("query child").is_some(),
+            "resource failure must reap the child"
+        );
+    }
 
     #[test]
     fn npm_config_only_requests_explicit_well_formed_environment_names() {

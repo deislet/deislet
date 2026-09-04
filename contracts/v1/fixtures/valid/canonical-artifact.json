@@ -20,9 +20,9 @@
   },
   "standard": {
     "contractId": "edge-canon.next",
-    "version": "edge-canon.next@5950a4de9abc8c0933661cf25d1ab95bf526d9b2",
+    "version": "edge-canon.next@91f3f7b52f679654981d7671b54e95a8c9becc4b",
     "releaseStatus": "proposal",
-    "sourceCommit": "5950a4de9abc8c0933661cf25d1ab95bf526d9b2",
+    "sourceCommit": "91f3f7b52f679654981d7671b54e95a8c9becc4b",
     "contractDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
     "artifactSchemaPath": "schemas/canonical-build-output.schema.json",
     "artifactSchemaDigest": {"algorithm": "sha256", "value": "2711f0fd63103f9e40b5a2909279e16e9025db6b8616ab5dd4f1265d3ccb5191"}

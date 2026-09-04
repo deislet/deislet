@@ -44,9 +44,13 @@ cargo build -p deis-build
 deis validate
 deis build                      # 全部目标
 deis build --vendor cloudflare
+cargo run -p deis-build -- node-npm-limits  # 以 JSON 查询构建上限
 ```
 
 `deis-build` 自己也有一个同名二进制，参数相同，用于不带平台侧功能时直接调编译器。
+`node-npm-limits` 不读取项目、不产生副作用，在构建前给出精确的 Node/npm 工具链、
+package/file/octet、展开倍率、超时与在线监控上限；库调用方读取
+`deis_build::node_npm_build_limits()` 可得到同一结构。
 
 ### 作为库使用
 

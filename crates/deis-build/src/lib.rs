@@ -84,7 +84,7 @@ pub use deis_build_adapter_deno as adapter_deno;
 pub use deis_build_adapter_tencent as adapter_tencent;
 
 // Export the main compiler interface
-pub use compiler::{Compiler, CompilerOptions};
+pub use compiler::{node_npm_build_limits, Compiler, CompilerOptions, NodeNpmBuildLimits};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

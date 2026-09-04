@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use rolldown::{
     Bundler, BundlerOptions, CodeSplittingMode, InputItem, OutputFormat, Platform,
-    RawMinifyOptions, SourceMapType,
+    RawMinifyOptions, ResolveOptions, SourceMapType,
 };
 use rolldown_common::Output;
 
@@ -87,6 +87,20 @@ impl BuildBundler {
             // Only the exact validated builtin list may survive the bundle.
             external: (!allowed_externals.is_empty())
                 .then(|| allowed_externals.iter().cloned().collect::<Vec<_>>().into()),
+            // Rolldown adds `import` or `require`, `browser`, and `default`
+            // for the selected resolver path. These are the two Edge Canon
+            // conditions that must additionally be active for every backend.
+            // Supplying the list also prevents Rolldown's unrelated `module`
+            // default from silently becoming part of the application model.
+            resolve: Some(ResolveOptions {
+                condition_names: Some(
+                    crate::NODE_CUSTOM_CONDITIONS
+                        .iter()
+                        .map(|condition| (*condition).to_string())
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
             // Every target this compiler serves takes exactly one module: the
             // deislet bundle names a single `worker/index.js` in its manifest,
             // a Worker names one `main`, an EdgeOne function is one file. There
@@ -324,5 +338,79 @@ impl BuildBundler {
         }
 
         Ok(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn every_node_target_uses_the_edge_canon_package_condition() {
+        let project = tempfile::tempdir().expect("temp project");
+        let package = project.path().join("node_modules/conditional-package");
+        fs::create_dir_all(&package).expect("package directory");
+        fs::write(
+            package.join("package.json"),
+            r#"{
+              "name": "conditional-package",
+              "version": "1.0.0",
+              "type": "module",
+              "exports": {
+                ".": {
+                  "edge-canon": "./edge.mjs",
+                  "worker": "./worker.mjs",
+                  "browser": "./browser.mjs",
+                  "import": "./import.mjs",
+                  "default": "./default.mjs"
+                }
+              }
+            }"#,
+        )
+        .expect("package manifest");
+        for (file, value) in [
+            ("edge.mjs", "edge-canon-selected"),
+            ("worker.mjs", "worker-selected"),
+            ("browser.mjs", "browser-selected"),
+            ("import.mjs", "import-selected"),
+            ("default.mjs", "default-selected"),
+        ] {
+            fs::write(package.join(file), format!("export default {value:?};"))
+                .expect("conditional module");
+        }
+        let entry = project.path().join("entry.mjs");
+        fs::write(
+            &entry,
+            r#"import selected from "conditional-package"; export default selected;"#,
+        )
+        .expect("entry module");
+
+        for platform in [
+            TargetPlatform::CloudflareNode,
+            TargetPlatform::EdgeOneNode,
+            TargetPlatform::DenoNode,
+            TargetPlatform::DeisletNode,
+        ] {
+            let (artifact, warnings) =
+                BuildBundler::new(entry.to_str().expect("UTF-8 entry"), platform)
+                    .with_cwd(project.path().to_path_buf())
+                    .generate()
+                    .await
+                    .expect("conditional package bundles");
+            assert!(warnings.is_empty(), "{platform:?}: {warnings:?}");
+            assert!(
+                artifact.contains("edge-canon-selected"),
+                "{platform:?}: {artifact}"
+            );
+            for rejected in [
+                "worker-selected",
+                "browser-selected",
+                "import-selected",
+                "default-selected",
+            ] {
+                assert!(!artifact.contains(rejected), "{platform:?}: {artifact}");
+            }
+        }
     }
 }

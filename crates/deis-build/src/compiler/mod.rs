@@ -1,4 +1,5 @@
 mod npm_installer;
+pub use npm_installer::{node_npm_build_limits, NodeNpmBuildLimits};
 mod transformer;
 mod validator;
 
