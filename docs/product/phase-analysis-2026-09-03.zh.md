@@ -1292,3 +1292,12 @@ Application/framework source + versioned build plan
 - 启动还会接管此前已有但缺少 `product_operations` 行的迁移，保留原 operation UUIDv7，并为不可恢复的旧请求事实生成明确标识的 system actor、稳定摘要和新的 request/correlation ID；不会伪造当时客户端身份。
 - 当前 migration 没有真实 child/provider operation，所以两个数组保持空值；底层 identity migration 状态没有 `cancelled` 枚举，取消以带稳定错误码的 `failed` 记录流程结果，公共产品状态仍为 `cancelled`。这两个事实均是诚实映射，不得为了填字段伪造下游操作或修改已发布的终态语义。
 - 此切片仍未完成 `P0-MODEL-001`：restore/backend incarnation fencing、telemetry/Stateful Objects/provider resources inventory/fence、其他 build/deploy/lifecycle producer 的 Operation 接入、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 继续阻断完成。
+
+## 19. P0-MODEL-001 后端 incarnation 与 restore fencing
+
+- 仅持久化 endpoint SHA-256 不能证明远端仍是同一份物理数据：恢复、回滚或替换数据目录后，服务可以继续监听同一地址，而旧 fence、inventory 与 receipt 已不再约束新数据。该缺口会让 migration/cutover 在最危险的恢复场景中静默沿用失效证据。
+- 统一 `BackendMigration` 协议新增受同一 `migration-admin` 权限保护的 `GetBackendInfo`。每个 backend fence journal 现在保存不可变 UUIDv7 incarnation；相同 journal 重启保持 ID，新 journal 生成新 ID。acquire/release request 必须携带 expected incarnation，后端在持久变更前再次核对；receipt v2 把 incarnation 纳入 SHA-256，release response 也回执该 ID，从而封闭 discovery 与实际变更之间的替换窗口。
+- 升级不是清空状态：旧 journal 会原位增加 metadata、event identity 与 receipt version。已有 active receipt 标为 v1并按旧摘要继续验证，新 acquire 只产生绑定 incarnation 的 v2；未知版本、非法 UUIDv7、篡改 digest 均拒绝启动。审计同时修复了建表 SQL 中重复的 fence event 外键声明。
+- Control 在任何 backend mutation 前发现并持久绑定 incarnation 到 `identity_migration_backend_attempts`。同一 attempt 后续重试、已捕获 waiting evidence 的只读复核和 cancellation release 都必须观察到相同 ID；不同 ID 即使 endpoint 未变也失败关闭。契约 evidence 新增 `backendIncarnationId`，真实/模拟 gRPC 测试覆盖发现、绑定、回执和同址替换。
+- deis-store snapshot manifest 记录源 incarnation，但继续明确排除 migration fence journal；restore 完成数据校验后立即初始化并打印新 incarnation。测试证明源/目标 ID 不同、目标重启保持 ID、snapshot 不携带 journal。旧 format-1 manifest 仍可读取，其未知源 ID 表达为 `None`，不会伪造历史身份。
+- 这解决的是“检测并阻断替换”，还不是完整 restore 产品流程。restore 尚未成为有 RBAC、幂等键、Operation、互斥锁、审计和重试的 Control lifecycle，deis-queue 也没有产品级 backup/restore；telemetry/Stateful Objects/provider resources、canonical-first dual-read、copy/verify/cutover、旧 capability revoke 与 tombstone 同样继续阻断 `P0-MODEL-001` 完成。

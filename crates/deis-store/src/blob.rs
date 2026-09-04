@@ -3824,6 +3824,7 @@ mod tests {
             "01990f44-1000-7000-8000-000000000050",
             1,
             "test-fence-token-00000000000000000001",
+            &svc.fences.backend_incarnation_id().to_string(),
         )
         .unwrap();
         svc.fences.acquire(request).await.unwrap();

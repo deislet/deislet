@@ -124,8 +124,11 @@ fn take_snapshot(config: &Config, out: &std::path::Path) -> Result<()> {
     // Printed as well as logged: this is a command a person ran and is
     // watching, and the restore line is the thing they will need later.
     println!(
-        "snapshot written to {}\n  databases: {}\n  objects:   {} ({} bytes)\n  restore:   {}",
+        "snapshot written to {}\n  backend:   {}\n  databases: {}\n  objects:   {} ({} bytes)\n  restore:   {}",
         out.display(),
+        manifest
+            .source_backend_incarnation_id
+            .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
         manifest.databases.len(),
         manifest.objects,
         manifest.object_bytes,
@@ -159,9 +162,14 @@ fn restore_snapshot(config: &Config, from: &std::path::Path, into: Option<PathBu
         )
     })?;
     println!(
-        "restored {} into {}\n  databases: {}\n  objects:   {} ({} bytes)",
+        "restored {} into {}\n  source backend:   {}\n  restored backend: {}\n  databases: {}\n  objects:   {} ({} bytes)",
         from.display(),
         target.display(),
+        report.source_backend_incarnation_id.map_or_else(
+            || "unknown (legacy snapshot)".to_string(),
+            |id| id.to_string()
+        ),
+        report.restored_backend_incarnation_id,
         report.databases,
         report.objects,
         report.object_bytes

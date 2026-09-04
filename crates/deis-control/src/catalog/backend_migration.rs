@@ -16,8 +16,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use deis_backend_migration::MIGRATION_AUTH_HEADER;
 use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
 use deis_backend_migration::proto::{
-    AcquireWriteFenceRequest, ComponentInventory, FenceReceipt, InspectTenantRequest,
-    ReleaseWriteFenceRequest, TenantInventory,
+    AcquireWriteFenceRequest, BackendInfo, ComponentInventory, FenceReceipt, GetBackendInfoRequest,
+    InspectTenantRequest, ReleaseWriteFenceRequest, TenantInventory,
 };
 use deis_wire::{CanonicalId, OperationEvent};
 use rusqlite::{OptionalExtension, Row, params, types::Type};
@@ -86,6 +86,7 @@ pub struct EvidenceDigest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendFenceEvidence {
+    pub backend_incarnation_id: CanonicalId,
     pub migration_id: CanonicalId,
     pub expected_application_revision: u64,
     pub epoch: u64,
@@ -129,6 +130,7 @@ pub struct BackendMigrationAttempt {
     pub tenant: String,
     pub expected_application_revision: u64,
     pub target_endpoint_sha256: String,
+    pub backend_incarnation_id: Option<CanonicalId>,
     pub state: BackendAttemptState,
     pub attempt_count: u64,
     pub fence_epoch: Option<u64>,
@@ -309,10 +311,55 @@ impl IdentityMigrationCoordinator {
                                     && attempt.backend == target.backend
                                     && attempt.target_endpoint_sha256 == target.endpoint_sha256
                                     && attempt.state == BackendAttemptState::Captured
+                                    && attempt.backend_incarnation_id.is_some()
                             })
                         })
                     })
             {
+                for attempt in &attempts {
+                    let target = self
+                        .targets
+                        .iter()
+                        .find(|target| target.backend == attempt.backend)
+                        .expect("the complete-attempt predicate only accepts configured targets");
+                    let found = match self.backend_incarnation(target, &attempt.tenant).await {
+                        Ok(found) => found,
+                        Err(failure) => {
+                            self.record_failure(
+                                planned.migration_id,
+                                target.backend,
+                                &attempt.tenant,
+                                &failure,
+                            )
+                            .await?;
+                            return Err(failure);
+                        }
+                    };
+                    if attempt.backend_incarnation_id != Some(found) {
+                        let failure = protocol_error(
+                            target,
+                            &attempt.tenant,
+                            "backend incarnation changed after inventory capture",
+                        );
+                        self.record_failure(
+                            planned.migration_id,
+                            target.backend,
+                            &attempt.tenant,
+                            &failure,
+                        )
+                        .await?;
+                        return Err(failure);
+                    }
+                    if attempt.last_error_code.is_some() || attempt.last_error_message.is_some() {
+                        self.clear_attempt_failure(
+                            planned.migration_id,
+                            target.backend,
+                            &attempt.tenant,
+                        )
+                        .await?;
+                    }
+                }
+                let attempts = self.backend_attempts(planned.migration_id).await?;
                 return Ok(summarize_identity_migration(planned, attempts));
             }
         }
@@ -500,11 +547,36 @@ impl IdentityMigrationCoordinator {
             }
         };
         let mut client = BackendMigrationClient::new(channel);
+        let backend_incarnation_id = match self
+            .get_backend_incarnation(&mut client, target, tenant)
+            .await
+        {
+            Ok(id) => id,
+            Err(failure) => {
+                self.record_failure(plan.migration_id, target.backend, tenant, &failure)
+                    .await?;
+                return Err(failure);
+            }
+        };
+        if let Err(failure) = self
+            .mark_backend_incarnation(
+                plan.migration_id,
+                target.backend,
+                tenant,
+                backend_incarnation_id,
+            )
+            .await
+        {
+            self.record_failure(plan.migration_id, target.backend, tenant, &failure)
+                .await?;
+            return Err(failure);
+        }
         let request_body = AcquireWriteFenceRequest {
             tenant: tenant.to_string(),
             migration_id: plan.migration_id.to_string(),
             expected_application_revision: revision,
             fence_token: plan.fence_token().to_string(),
+            expected_backend_incarnation_id: backend_incarnation_id.to_string(),
         };
         let acquire = match client
             .acquire_write_fence(authed_request(request_body, target))
@@ -518,9 +590,14 @@ impl IdentityMigrationCoordinator {
                 return Err(failure);
             }
         };
-        if let Err(failure) =
-            validate_receipt(&acquire, plan.migration_id, revision, tenant, target)
-        {
+        if let Err(failure) = validate_receipt(
+            &acquire,
+            plan.migration_id,
+            revision,
+            tenant,
+            backend_incarnation_id,
+            target,
+        ) {
             self.record_failure(plan.migration_id, target.backend, tenant, &failure)
                 .await?;
             return Err(failure);
@@ -553,6 +630,7 @@ impl IdentityMigrationCoordinator {
             plan.migration_id,
             revision,
             tenant,
+            backend_incarnation_id,
             target,
         ) {
             Ok(evidence) => evidence,
@@ -590,11 +668,36 @@ impl IdentityMigrationCoordinator {
             }
         };
         let mut client = BackendMigrationClient::new(channel);
+        let backend_incarnation_id = match self
+            .get_backend_incarnation(&mut client, target, &attempt.tenant)
+            .await
+        {
+            Ok(id) => id,
+            Err(failure) => {
+                self.record_failure(plan.migration_id, target.backend, &attempt.tenant, &failure)
+                    .await?;
+                return Err(failure);
+            }
+        };
+        if let Err(failure) = self
+            .mark_backend_incarnation(
+                plan.migration_id,
+                target.backend,
+                &attempt.tenant,
+                backend_incarnation_id,
+            )
+            .await
+        {
+            self.record_failure(plan.migration_id, target.backend, &attempt.tenant, &failure)
+                .await?;
+            return Err(failure);
+        }
         let request = ReleaseWriteFenceRequest {
             tenant: attempt.tenant.clone(),
             migration_id: plan.migration_id.to_string(),
             expected_application_revision: revision,
             fence_token: plan.fence_token().to_string(),
+            expected_backend_incarnation_id: backend_incarnation_id.to_string(),
         };
         let released_epoch = match client
             .release_write_fence(authed_request(request, target))
@@ -607,6 +710,21 @@ impl IdentityMigrationCoordinator {
                         target,
                         &attempt.tenant,
                         "release response did not prove a positive fence epoch",
+                    );
+                    self.record_failure(
+                        plan.migration_id,
+                        target.backend,
+                        &attempt.tenant,
+                        &failure,
+                    )
+                    .await?;
+                    return Err(failure);
+                }
+                if response.backend_incarnation_id != backend_incarnation_id.to_string() {
+                    let failure = protocol_error(
+                        target,
+                        &attempt.tenant,
+                        "release response changed backend incarnation",
                     );
                     self.record_failure(
                         plan.migration_id,
@@ -697,6 +815,74 @@ impl IdentityMigrationCoordinator {
                 if changed != 1 {
                     return Err(CatalogError::conflict(format!(
                         "identity migration {migration_id} cannot retarget backend {backend} tenant {tenant} or change its expected revision; create a new backend incarnation instead"
+                    )));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn backend_incarnation(
+        &self,
+        target: &BackendTarget,
+        tenant: &str,
+    ) -> Result<CanonicalId, MigrationCoordinatorError> {
+        let endpoint = Endpoint::from_shared(target.endpoint.clone())
+            .map_err(|error| backend_error(target, tenant, error.to_string()))?
+            .connect_timeout(self.rpc_timeout)
+            .timeout(self.rpc_timeout);
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|error| backend_error(target, tenant, error.to_string()))?;
+        let mut client = BackendMigrationClient::new(channel);
+        self.get_backend_incarnation(&mut client, target, tenant)
+            .await
+    }
+
+    async fn get_backend_incarnation(
+        &self,
+        client: &mut BackendMigrationClient<tonic::transport::Channel>,
+        target: &BackendTarget,
+        tenant: &str,
+    ) -> Result<CanonicalId, MigrationCoordinatorError> {
+        let info = client
+            .get_backend_info(authed_request(GetBackendInfoRequest {}, target))
+            .await
+            .map_err(|status| status_error(target, tenant, status))?
+            .into_inner();
+        validate_backend_info(info, target, tenant)
+    }
+
+    async fn mark_backend_incarnation(
+        &self,
+        migration_id: CanonicalId,
+        backend: &str,
+        tenant: &str,
+        backend_incarnation_id: CanonicalId,
+    ) -> Result<(), MigrationCoordinatorError> {
+        let backend = backend.to_string();
+        let tenant = tenant.to_string();
+        self.catalog
+            .database()
+            .with_connection(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE identity_migration_backend_attempts
+                        SET backend_incarnation_id = ?4, updated_at = ?5
+                      WHERE migration_id = ?1 AND backend = ?2 AND tenant = ?3
+                        AND (backend_incarnation_id IS NULL OR backend_incarnation_id = ?4)",
+                    params![
+                        migration_id.to_string(),
+                        backend,
+                        tenant,
+                        backend_incarnation_id.to_string(),
+                        now_secs()
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(CatalogError::conflict(format!(
+                        "identity migration {migration_id} cannot continue because backend {backend} tenant {tenant} has a different durable incarnation"
                     )));
                 }
                 Ok(())
@@ -826,6 +1012,25 @@ impl IdentityMigrationCoordinator {
         .await
     }
 
+    async fn clear_attempt_failure(
+        &self,
+        migration_id: CanonicalId,
+        backend: &str,
+        tenant: &str,
+    ) -> Result<(), MigrationCoordinatorError> {
+        let backend = backend.to_string();
+        let tenant = tenant.to_string();
+        self.update_exactly_one(move |connection| {
+            connection.execute(
+                "UPDATE identity_migration_backend_attempts
+                    SET last_error_code = NULL, last_error_message = NULL, updated_at = ?4
+                  WHERE migration_id = ?1 AND backend = ?2 AND tenant = ?3",
+                params![migration_id.to_string(), backend, tenant, now_secs()],
+            )
+        })
+        .await
+    }
+
     async fn update_exactly_one<F>(&self, update: F) -> Result<(), MigrationCoordinatorError>
     where
         F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<usize> + Send + 'static,
@@ -930,7 +1135,7 @@ impl CatalogStore {
             .with_connection(move |connection| {
                 let mut statement = connection.prepare(
                     "SELECT migration_id, backend, tenant, expected_application_revision,
-                            target_endpoint_sha256, state, attempt_count, fence_epoch,
+                            target_endpoint_sha256, backend_incarnation_id, state, attempt_count, fence_epoch,
                             acquired_at, receipt_sha256, evidence_json, last_error_code,
                             last_error_message, created_at, updated_at
                        FROM identity_migration_backend_attempts
@@ -1156,11 +1361,33 @@ fn protocol_error(
     }
 }
 
+fn validate_backend_info(
+    info: BackendInfo,
+    target: &BackendTarget,
+    tenant: &str,
+) -> Result<CanonicalId, MigrationCoordinatorError> {
+    if info.backend != target.backend {
+        return Err(protocol_error(
+            target,
+            tenant,
+            format!("backend identity was {:?}", info.backend),
+        ));
+    }
+    info.backend_incarnation_id.parse().map_err(|error| {
+        protocol_error(
+            target,
+            tenant,
+            format!("backend incarnation ID was invalid: {error}"),
+        )
+    })
+}
+
 fn validate_receipt(
     receipt: &FenceReceipt,
     migration_id: CanonicalId,
     revision: u64,
     tenant: &str,
+    backend_incarnation_id: CanonicalId,
     target: &BackendTarget,
 ) -> Result<(), MigrationCoordinatorError> {
     if receipt.tenant != tenant {
@@ -1182,6 +1409,13 @@ fn validate_receipt(
             target,
             tenant,
             "fence receipt changed expected_application_revision",
+        ));
+    }
+    if receipt.backend_incarnation_id != backend_incarnation_id.to_string() {
+        return Err(protocol_error(
+            target,
+            tenant,
+            "fence receipt changed backend incarnation",
         ));
     }
     if receipt.fence_epoch == 0 || receipt.acquired_at_unix_seconds <= 0 {
@@ -1207,6 +1441,7 @@ fn evidence_from_inventory(
     migration_id: CanonicalId,
     revision: u64,
     tenant: &str,
+    backend_incarnation_id: CanonicalId,
     target: &BackendTarget,
 ) -> Result<BackendMigrationEvidence, MigrationCoordinatorError> {
     if inventory.backend != target.backend {
@@ -1222,7 +1457,14 @@ fn evidence_from_inventory(
     let fence = inventory
         .fence
         .ok_or_else(|| protocol_error(target, tenant, "inventory omitted its active fence"))?;
-    validate_receipt(&fence, migration_id, revision, tenant, target)?;
+    validate_receipt(
+        &fence,
+        migration_id,
+        revision,
+        tenant,
+        backend_incarnation_id,
+        target,
+    )?;
     if fence != *acquired {
         return Err(protocol_error(
             target,
@@ -1266,6 +1508,7 @@ fn evidence_from_inventory(
         tenant: tenant.to_string(),
         authentication_domain: "migration-admin".to_string(),
         fence: BackendFenceEvidence {
+            backend_incarnation_id,
             migration_id,
             expected_application_revision: revision,
             epoch: fence.fence_epoch,
@@ -1375,25 +1618,33 @@ fn map_attempt(row: &Row<'_>) -> rusqlite::Result<BackendMigrationAttempt> {
     let migration_id = migration_id_text.parse().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
     })?;
-    let state_text: String = row.get(5)?;
+    let backend_incarnation_text: Option<String> = row.get(5)?;
+    let backend_incarnation_id = backend_incarnation_text
+        .map(|value| {
+            value.parse().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(error))
+            })
+        })
+        .transpose()?;
+    let state_text: String = row.get(6)?;
     let state = BackendAttemptState::parse(&state_text).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            5,
+            6,
             Type::Text,
             format!("invalid backend migration attempt state {state_text:?}").into(),
         )
     })?;
-    let evidence_json: Option<String> = row.get(10)?;
+    let evidence_json: Option<String> = row.get(11)?;
     let evidence = evidence_json
         .map(|json| {
             serde_json::from_str(&json).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
+                rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(error))
             })
         })
         .transpose()?;
     let revision: i64 = row.get(3)?;
-    let attempt_count: i64 = row.get(6)?;
-    let fence_epoch: Option<i64> = row.get(7)?;
+    let attempt_count: i64 = row.get(7)?;
+    let fence_epoch: Option<i64> = row.get(8)?;
     Ok(BackendMigrationAttempt {
         migration_id,
         backend: row.get(1)?,
@@ -1402,24 +1653,25 @@ fn map_attempt(row: &Row<'_>) -> rusqlite::Result<BackendMigrationAttempt> {
             rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
         })?,
         target_endpoint_sha256: row.get(4)?,
+        backend_incarnation_id,
         state,
         attempt_count: u64::try_from(attempt_count).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
         })?,
         fence_epoch: fence_epoch
             .map(|epoch| {
                 u64::try_from(epoch).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
+                    rusqlite::Error::FromSqlConversionFailure(8, Type::Integer, Box::new(error))
                 })
             })
             .transpose()?,
-        acquired_at_unix_seconds: row.get(8)?,
-        receipt_sha256: row.get(9)?,
+        acquired_at_unix_seconds: row.get(9)?,
+        receipt_sha256: row.get(10)?,
         evidence,
-        last_error_code: row.get(11)?,
-        last_error_message: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        last_error_code: row.get(12)?,
+        last_error_message: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
@@ -1442,7 +1694,9 @@ mod tests {
     use deis_backend_migration::proto::backend_migration_server::{
         BackendMigration, BackendMigrationServer,
     };
-    use deis_backend_migration::proto::{ReleaseWriteFenceRequest, ReleaseWriteFenceResponse};
+    use deis_backend_migration::proto::{
+        BackendInfo, GetBackendInfoRequest, ReleaseWriteFenceRequest, ReleaseWriteFenceResponse,
+    };
     use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -1463,6 +1717,7 @@ mod tests {
         backend: &'static str,
         expected_authorization: String,
         components: Vec<ComponentInventory>,
+        backend_incarnation_id: Arc<Mutex<CanonicalId>>,
         request: Arc<Mutex<Option<AcquireWriteFenceRequest>>>,
         acquire_calls: Arc<AtomicUsize>,
         release_calls: Arc<AtomicUsize>,
@@ -1474,6 +1729,7 @@ mod tests {
                 backend,
                 expected_authorization: format!("Bearer {token}"),
                 components,
+                backend_incarnation_id: Arc::new(Mutex::new(CanonicalId::new_v7())),
                 request: Arc::new(Mutex::new(None)),
                 acquire_calls: Arc::new(AtomicUsize::new(0)),
                 release_calls: Arc::new(AtomicUsize::new(0)),
@@ -1511,12 +1767,28 @@ mod tests {
                 } else {
                     "b".repeat(64)
                 },
+                backend_incarnation_id: request.expected_backend_incarnation_id,
             })
         }
     }
 
     #[async_trait]
     impl BackendMigration for FakeBackend {
+        async fn get_backend_info(
+            &self,
+            request: Request<GetBackendInfoRequest>,
+        ) -> Result<Response<BackendInfo>, Status> {
+            self.authorize(&request)?;
+            let backend_incarnation_id = *self
+                .backend_incarnation_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Ok(Response::new(BackendInfo {
+                backend: self.backend.to_string(),
+                backend_incarnation_id: backend_incarnation_id.to_string(),
+            }))
+        }
+
         async fn acquire_write_fence(
             &self,
             request: Request<AcquireWriteFenceRequest>,
@@ -1524,6 +1796,13 @@ mod tests {
             self.acquire_calls.fetch_add(1, Ordering::SeqCst);
             self.authorize(&request)?;
             let request = request.into_inner();
+            let backend_incarnation_id = *self
+                .backend_incarnation_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if request.expected_backend_incarnation_id != backend_incarnation_id.to_string() {
+                return Err(Status::failed_precondition("backend incarnation changed"));
+            }
             let mut recorded = self
                 .request
                 .lock()
@@ -1565,6 +1844,13 @@ mod tests {
             self.release_calls.fetch_add(1, Ordering::SeqCst);
             self.authorize(&request)?;
             let release = request.into_inner();
+            let backend_incarnation_id = *self
+                .backend_incarnation_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if release.expected_backend_incarnation_id != backend_incarnation_id.to_string() {
+                return Err(Status::failed_precondition("backend incarnation changed"));
+            }
             let mut recorded = self
                 .request
                 .lock()
@@ -1583,6 +1869,7 @@ mod tests {
             Ok(Response::new(ReleaseWriteFenceResponse {
                 released: true,
                 fence_epoch: 7,
+                backend_incarnation_id: backend_incarnation_id.to_string(),
             }))
         }
     }
@@ -1654,6 +1941,7 @@ mod tests {
         let queue = FakeBackend::new("deis-queue", QUEUE_TOKEN, vec![component("queue", 'f')]);
         let store_calls = Arc::clone(&store.acquire_calls);
         let queue_calls = Arc::clone(&queue.acquire_calls);
+        let store_incarnation = Arc::clone(&store.backend_incarnation_id);
         let (store_endpoint, stop_store, store_handle) = serve(store).await;
         let (queue_endpoint, stop_queue, queue_handle) = serve(queue).await;
 
@@ -1751,7 +2039,30 @@ mod tests {
             "a completed waiting operation must not make another network attempt"
         );
         assert_eq!(store_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(queue_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(queue_calls.load(Ordering::SeqCst), 1);
+
+        let original_incarnation = *store_incarnation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *store_incarnation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = CanonicalId::new_v7();
+        let replacement_error = coordinator.coordinate("shop").await.unwrap_err();
+        assert!(
+            replacement_error
+                .to_string()
+                .contains("backend incarnation changed"),
+            "a restore at the same endpoint must invalidate captured evidence: {replacement_error}"
+        );
+        assert_eq!(store_calls.load(Ordering::SeqCst), 2);
+        *store_incarnation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = original_incarnation;
+        let recovered = coordinator.coordinate("shop").await.unwrap();
+        assert!(recovered.attempts.iter().all(|attempt| {
+            attempt.last_error_code.is_none() && attempt.last_error_message.is_none()
+        }));
+        assert_eq!(store_calls.load(Ordering::SeqCst), 2);
 
         let retargeted = config(
             "http://127.0.0.1:1".to_string(),

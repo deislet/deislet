@@ -5,6 +5,7 @@
   "tenant": "checkout-api.production",
   "authenticationDomain": "migration-admin",
   "fence": {
+    "backendIncarnationId": "01990f44-1000-7000-8000-000000000049",
     "migrationId": "01990f44-1000-7000-8000-000000000050",
     "expectedApplicationRevision": 7,
     "epoch": 12,

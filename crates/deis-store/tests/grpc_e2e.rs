@@ -13,7 +13,7 @@
 
 use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
 use deis_backend_migration::proto::{
-    AcquireWriteFenceRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
+    AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
 use deis_store::config::Config;
 use deis_store::proto::blob::{
@@ -1758,18 +1758,20 @@ async fn migration_management_is_absent_by_default_and_independently_authenticat
     const ADMIN: &str = "migration-admin-token-000000000000000001";
     const MIGRATION: &str = "01990f44-1000-7000-8000-000000000050";
     const FENCE: &str = "migration-fence-token-00000000000000001";
-    let request = || AcquireWriteFenceRequest {
+    const UNKNOWN_INCARNATION: &str = "01990f44-1000-7000-8000-000000000099";
+    let request = |backend_incarnation_id: &str| AcquireWriteFenceRequest {
         tenant: "shop.production".to_string(),
         migration_id: MIGRATION.to_string(),
         expected_application_revision: 3,
         fence_token: FENCE.to_string(),
+        expected_backend_incarnation_id: backend_incarnation_id.to_string(),
     };
 
     let without_management = Harness::start().await;
     let error = without_management
         .migration()
         .await
-        .acquire_write_fence(Request::new(request()))
+        .acquire_write_fence(Request::new(request(UNKNOWN_INCARNATION)))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unimplemented);
@@ -1777,7 +1779,14 @@ async fn migration_management_is_absent_by_default_and_independently_authenticat
 
     let harness = Harness::start_migration_authenticated(ADMIN).await;
     let mut migration = harness.migration().await;
-    let mut application_credential = Request::new(request());
+    let backend_info = migration
+        .get_backend_info(as_migration_admin(ADMIN, GetBackendInfoRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(backend_info.backend, "deis-store");
+    let backend_incarnation_id = backend_info.backend_incarnation_id;
+    let mut application_credential = Request::new(request(&backend_incarnation_id));
     application_credential
         .metadata_mut()
         .insert(STORAGE_TOKEN_HEADER, "not-an-admin-token".parse().unwrap());
@@ -1790,7 +1799,7 @@ async fn migration_management_is_absent_by_default_and_independently_authenticat
         tonic::Code::Unauthenticated
     );
     let receipt = migration
-        .acquire_write_fence(as_migration_admin(ADMIN, request()))
+        .acquire_write_fence(as_migration_admin(ADMIN, request(&backend_incarnation_id)))
         .await
         .unwrap()
         .into_inner();
@@ -1831,6 +1840,7 @@ async fn migration_management_is_absent_by_default_and_independently_authenticat
         migration_id: MIGRATION.to_string(),
         expected_application_revision: 3,
         fence_token: "different-fence-token-00000000000000002".to_string(),
+        expected_backend_incarnation_id: backend_incarnation_id.clone(),
     };
     assert_eq!(
         migration
@@ -1848,6 +1858,7 @@ async fn migration_management_is_absent_by_default_and_independently_authenticat
                 migration_id: MIGRATION.to_string(),
                 expected_application_revision: 3,
                 fence_token: FENCE.to_string(),
+                expected_backend_incarnation_id: backend_incarnation_id,
             },
         ))
         .await

@@ -18,6 +18,8 @@
 6. `InspectTenant` 返回规范排序、length-delimited SHA-256、item count、logical bytes、orphan count 和 unchecked orphan count。无法读取、内容摘要不匹配、SQL WAL 未完全 checkpoint 或存在不可检查项时不得宣称 verified。
 7. acquire 的完全相同重试幂等；不同 migration ID、application revision 或 token 发生冲突。release 只接受获得当前 fence 的完全相同三元组，避免过期协调器解除新 fence。
 8. release 是 cutover 前 rollback 的入口。cutover 后由 Control 的迁移 operation 决定是否保留旧 namespace fence、何时撤销旧 capability 和写入 tombstone；后端不能自行猜测。
+9. 每份物理后端数据必须有持久、不可变的 UUIDv7 incarnation ID。`GetBackendInfo` 返回 backend kind 与该 ID；acquire/release 同时携带 expected incarnation，后端必须在提交 fence transaction 前再次核对。只比较 endpoint 不足以识别同一地址下被 restore、替换或回滚的数据。
+10. fence receipt v2 把 incarnation ID 纳入摘要。旧 journal 原位升级时保留 v1 active receipt 并标记版本；新 acquire 只产生 v2。未知版本或摘要不匹配均拒绝启动。
 
 ## 线性化点
 
@@ -38,6 +40,7 @@ release:                                                 wait ──────
 - `deis-backend-migration` 定义共享 proto、Bearer interceptor、receipt、inventory digest 和 durable per-tenant gate。
 - `deis-store` 的 KV、SQL、blob 共用 `migration-fences.sqlite`；`deis-queue` 使用自己数据目录内的同名 journal。
 - journal 使用 SQLite `WAL + synchronous=FULL`，active fence 与 append-only acquire/release event 在同一 `BEGIN IMMEDIATE` transaction 更新。
+- journal 的 singleton metadata 保存 backend incarnation UUIDv7，并以 trigger 禁止原位改绑。相同 journal 重启保持 ID；新数据目录获得新 ID。
 - KV inventory 以 fence 获得时刻判断 TTL，防止等待期间自然到期改变集合；KV expiry sweeper 跳过 fenced tenant。
 - SQL inventory 只在 `wal_checkpoint(TRUNCATE)` 完全成功后 hash tenant database file；Query endpoint 额外使用 SQLite `readonly` 分类，不能用返回 rows 的写语句绕过 Execute 的 fence。
 - blob inventory hash 有序 metadata，并逐一校验实际 content SHA-256；unreferenced content 与无法分类的目录项分别报告。
@@ -49,11 +52,12 @@ Embedded 模式仍是一份 data directory 对应一个 service process，多个
 
 共享 gRPC 服务为 `deis.backend.migration.v1.BackendMigration`：
 
+- `GetBackendInfo`
 - `AcquireWriteFence`
 - `InspectTenant`
 - `ReleaseWriteFence`
 
-机器可读证据格式由 `contracts/v1/backend-migration-evidence.schema.json` 定义。proto 响应不返回 fence token，只返回其绑定后的 receipt digest。Control 已把 backend response 转成该证据文档并关联到持久 attempt；identity migration 也已采用正式 `ProductOperation`，持久记录 actor、organization、幂等摘要、request/correlation 和统一状态转换。当前没有真实 provider 下游操作，因此 child/provider operation 数组保持为空；所有 component evidence 仍须在后续 verification 阶段合并。
+机器可读证据格式由 `contracts/v1/backend-migration-evidence.schema.json` 定义。proto 响应不返回 fence token，只返回绑定 incarnation 后的 receipt digest。Control 在网络变更前把首次发现的 incarnation 持久绑定到 attempt，重试、已捕获 evidence 的复核和取消 release 都要求相同 ID；RPC 发现与 acquire 之间的替换由 request 内的 expected ID 再次阻断。identity migration 也已采用正式 `ProductOperation`，持久记录 actor、organization、幂等摘要、request/correlation 和统一状态转换。当前没有真实 provider 下游操作，因此 child/provider operation 数组保持为空；所有 component evidence 仍须在后续 verification 阶段合并。
 
 ## 尚未完成
 
@@ -61,7 +65,7 @@ Embedded 模式仍是一份 data directory 对应一个 service process，多个
 
 - Control 已通过受管理员权限保护的异步 API 调用两个管理服务并持久化 per-backend/tenant attempt 与契约 evidence，能在客户端断开或 Control 重启后按同一请求恢复；migration 已返回满足 `operation.schema.json` 的公共 Operation，并以 `Idempotency-Key`、`ETag`/`If-Match` 与唯一状态图处理幂等和并发取消。取消只有在所有已取得的 backend fence 精确释放后才进入 `cancelled` 并解除 catalog fence；
 - telemetry、Stateful Objects 与 provider resources 尚无同契约 inventory/fence；
-- deis-store snapshot/restore 不复制 migration fence journal，deis-queue 也尚无产品级 backup/restore；在 Control 能把 restore 建模为新 backend incarnation、重新取得 fence 并校验证据前，迁移/cutover 不得与 restore 重叠，也不能把普通备份恢复当成 fence 延续；
+- deis-store snapshot manifest 已记录源 incarnation，restore 不复制 migration fence journal并立即生成、报告一个新 incarnation；Control 因而能识别同一 endpoint 下的数据替换并拒绝沿用旧 evidence/fence。restore 本身仍未成为受权限、幂等和审计约束的正式 ProductOperation，deis-queue 也尚无产品级 backup/restore；这些完成前，迁移/cutover 仍不得与 restore 重叠，也不能把普通备份恢复当成 fence 延续；
 - canonical-first dual-read、copy/verify、atomic cutover、旧 capability 撤销和 tombstone 尚未执行；
 - SQL 当前证据适合 embedded file copy/rename；跨引擎 HA SQL driver 必须产生规范 logical dump digest，不能拿供应商物理文件摘要冒充跨实现相等。
 

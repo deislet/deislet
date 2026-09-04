@@ -18,10 +18,11 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "migrationId", "expectedApplicationRevision", "epoch", "acquiredAt",
-        "receiptDigest"
+        "backendIncarnationId", "migrationId", "expectedApplicationRevision",
+        "epoch", "acquiredAt", "receiptDigest"
       ],
       "properties": {
+        "backendIncarnationId": {"$ref": "#/$defs/canonicalId"},
         "migrationId": {"$ref": "#/$defs/canonicalId"},
         "expectedApplicationRevision": {"type": "integer", "minimum": 1},
         "epoch": {"type": "integer", "minimum": 1},

@@ -6,8 +6,9 @@ use crate::tenant::TenantId;
 use deis_backend_migration::FenceRequest;
 use deis_backend_migration::proto::backend_migration_server::BackendMigration;
 use deis_backend_migration::proto::{
-    AcquireWriteFenceRequest, FenceReceipt as FenceReceiptMessage, InspectTenantRequest,
-    ReleaseWriteFenceRequest, ReleaseWriteFenceResponse, TenantInventory,
+    AcquireWriteFenceRequest, BackendInfo, FenceReceipt as FenceReceiptMessage,
+    GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
+    ReleaseWriteFenceResponse, TenantInventory,
 };
 use tonic::{Request, Response, Status};
 
@@ -25,6 +26,16 @@ impl StoreMigrationService {
 
 #[tonic::async_trait]
 impl BackendMigration for StoreMigrationService {
+    async fn get_backend_info(
+        &self,
+        _request: Request<GetBackendInfoRequest>,
+    ) -> Result<Response<BackendInfo>, Status> {
+        Ok(Response::new(BackendInfo {
+            backend: "deis-store".to_string(),
+            backend_incarnation_id: self.stores.fences.backend_incarnation_id().to_string(),
+        }))
+    }
+
     async fn acquire_write_fence(
         &self,
         request: Request<AcquireWriteFenceRequest>,
@@ -36,6 +47,7 @@ impl BackendMigration for StoreMigrationService {
             &request.migration_id,
             request.expected_application_revision,
             &request.fence_token,
+            &request.expected_backend_incarnation_id,
         )
         .map_err(Status::from)?;
         let receipt = self
@@ -104,6 +116,7 @@ impl BackendMigration for StoreMigrationService {
             &request.migration_id,
             request.expected_application_revision,
             &request.fence_token,
+            &request.expected_backend_incarnation_id,
         )
         .map_err(Status::from)?;
         let epoch = self
@@ -115,6 +128,7 @@ impl BackendMigration for StoreMigrationService {
         Ok(Response::new(ReleaseWriteFenceResponse {
             released: true,
             fence_epoch: epoch,
+            backend_incarnation_id: self.stores.fences.backend_incarnation_id().to_string(),
         }))
     }
 }
@@ -131,21 +145,23 @@ mod tests {
     const MIGRATION: &str = "01990f44-1000-7000-8000-000000000050";
     const TOKEN: &str = "test-fence-token-00000000000000000001";
 
-    fn acquire() -> AcquireWriteFenceRequest {
+    fn acquire(backend_incarnation_id: &str) -> AcquireWriteFenceRequest {
         AcquireWriteFenceRequest {
             tenant: "shop.production".to_string(),
             migration_id: MIGRATION.to_string(),
             expected_application_revision: 7,
             fence_token: TOKEN.to_string(),
+            expected_backend_incarnation_id: backend_incarnation_id.to_string(),
         }
     }
 
-    fn release() -> ReleaseWriteFenceRequest {
+    fn release(backend_incarnation_id: &str) -> ReleaseWriteFenceRequest {
         ReleaseWriteFenceRequest {
             tenant: "shop.production".to_string(),
             migration_id: MIGRATION.to_string(),
             expected_application_revision: 7,
             fence_token: TOKEN.to_string(),
+            expected_backend_incarnation_id: backend_incarnation_id.to_string(),
         }
     }
 
@@ -192,10 +208,16 @@ mod tests {
             .unwrap();
 
         let management = StoreMigrationService::new(stores.clone());
+        let backend_incarnation_id = stores.fences.backend_incarnation_id().to_string();
         let acquiring = {
             let management = management.clone();
+            let backend_incarnation_id = backend_incarnation_id.clone();
             tokio::spawn(async move {
-                BackendMigration::acquire_write_fence(&management, Request::new(acquire())).await
+                BackendMigration::acquire_write_fence(
+                    &management,
+                    Request::new(acquire(&backend_incarnation_id)),
+                )
+                .await
             })
         };
         tokio::task::yield_now().await;
@@ -283,8 +305,13 @@ mod tests {
         let (receipt, fence_pin) = stores.fences.fenced_read(tenant.as_str()).await.unwrap();
         let releasing = {
             let management = management.clone();
+            let backend_incarnation_id = backend_incarnation_id.clone();
             tokio::spawn(async move {
-                BackendMigration::release_write_fence(&management, Request::new(release())).await
+                BackendMigration::release_write_fence(
+                    &management,
+                    Request::new(release(&backend_incarnation_id)),
+                )
+                .await
             })
         };
         tokio::task::yield_now().await;

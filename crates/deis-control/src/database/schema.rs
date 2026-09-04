@@ -805,6 +805,18 @@ fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
                                                     CHECK(length(target_endpoint_sha256) = 64
                                                       AND lower(target_endpoint_sha256) = target_endpoint_sha256
                                                       AND target_endpoint_sha256 NOT GLOB '*[^0-9a-f]*'),
+            backend_incarnation_id         TEXT
+                CHECK(backend_incarnation_id IS NULL OR
+                      (length(backend_incarnation_id) = 36
+                       AND lower(backend_incarnation_id) = backend_incarnation_id
+                       AND substr(backend_incarnation_id, 9, 1) = '-'
+                       AND substr(backend_incarnation_id, 14, 1) = '-'
+                       AND substr(backend_incarnation_id, 15, 1) = '7'
+                       AND substr(backend_incarnation_id, 19, 1) = '-'
+                       AND substr(backend_incarnation_id, 20, 1) GLOB '[89ab]'
+                       AND substr(backend_incarnation_id, 24, 1) = '-'
+                       AND length(replace(backend_incarnation_id, '-', '')) = 32
+                       AND replace(backend_incarnation_id, '-', '') NOT GLOB '*[^0-9a-f]*')),
             state                         TEXT NOT NULL
                                                   CHECK(state IN
                                                     ('acquiring', 'fenced', 'inspecting', 'captured',
@@ -916,6 +928,7 @@ fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
 
+    ensure_backend_attempt_incarnation_column(conn)?;
     migrate_identity_migration_history(conn)?;
 
     conn.execute_batch(
@@ -1143,6 +1156,18 @@ fn migrate_identity_migration_history(conn: &Connection) -> Result<()> {
                                                     CHECK(length(target_endpoint_sha256) = 64
                                                       AND lower(target_endpoint_sha256) = target_endpoint_sha256
                                                       AND target_endpoint_sha256 NOT GLOB '*[^0-9a-f]*'),
+            backend_incarnation_id         TEXT
+                CHECK(backend_incarnation_id IS NULL OR
+                      (length(backend_incarnation_id) = 36
+                       AND lower(backend_incarnation_id) = backend_incarnation_id
+                       AND substr(backend_incarnation_id, 9, 1) = '-'
+                       AND substr(backend_incarnation_id, 14, 1) = '-'
+                       AND substr(backend_incarnation_id, 15, 1) = '7'
+                       AND substr(backend_incarnation_id, 19, 1) = '-'
+                       AND substr(backend_incarnation_id, 20, 1) GLOB '[89ab]'
+                       AND substr(backend_incarnation_id, 24, 1) = '-'
+                       AND length(replace(backend_incarnation_id, '-', '')) = 32
+                       AND replace(backend_incarnation_id, '-', '') NOT GLOB '*[^0-9a-f]*')),
             state                         TEXT NOT NULL
                                                   CHECK(state IN
                                                     ('acquiring', 'fenced', 'inspecting', 'captured',
@@ -1168,7 +1193,8 @@ fn migrate_identity_migration_history(conn: &Connection) -> Result<()> {
 
         INSERT INTO identity_migration_backend_attempts_history_v2
         SELECT migration_id, backend, tenant, expected_application_revision,
-               target_endpoint_sha256, state, attempt_count, fence_epoch, acquired_at,
+               target_endpoint_sha256, backend_incarnation_id, state, attempt_count,
+               fence_epoch, acquired_at,
                receipt_sha256, evidence_json, last_error_code, last_error_message,
                created_at, updated_at
           FROM identity_migration_backend_attempts;
@@ -1181,6 +1207,32 @@ fn migrate_identity_migration_history(conn: &Connection) -> Result<()> {
         "#,
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn ensure_backend_attempt_incarnation_column(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(identity_migration_backend_attempts)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "backend_incarnation_id") {
+        conn.execute(
+            r#"ALTER TABLE identity_migration_backend_attempts
+               ADD COLUMN backend_incarnation_id TEXT
+               CHECK(backend_incarnation_id IS NULL OR
+                     (length(backend_incarnation_id) = 36
+                      AND lower(backend_incarnation_id) = backend_incarnation_id
+                      AND substr(backend_incarnation_id, 9, 1) = '-'
+                      AND substr(backend_incarnation_id, 14, 1) = '-'
+                      AND substr(backend_incarnation_id, 15, 1) = '7'
+                      AND substr(backend_incarnation_id, 19, 1) = '-'
+                      AND substr(backend_incarnation_id, 20, 1) GLOB '[89ab]'
+                      AND substr(backend_incarnation_id, 24, 1) = '-'
+                      AND length(replace(backend_incarnation_id, '-', '')) = 32
+                      AND replace(backend_incarnation_id, '-', '') NOT GLOB '*[^0-9a-f]*'))"#,
+            [],
+        )?;
+    }
     Ok(())
 }
 

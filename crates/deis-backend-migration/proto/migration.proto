@@ -6,9 +6,17 @@ package deis.backend.migration.v1;
 // application data services and is registered only when an explicit
 // migration administrator credential is configured.
 service BackendMigration {
+  rpc GetBackendInfo(GetBackendInfoRequest) returns (BackendInfo);
   rpc AcquireWriteFence(AcquireWriteFenceRequest) returns (FenceReceipt);
   rpc InspectTenant(InspectTenantRequest) returns (TenantInventory);
   rpc ReleaseWriteFence(ReleaseWriteFenceRequest) returns (ReleaseWriteFenceResponse);
+}
+
+message GetBackendInfoRequest {}
+
+message BackendInfo {
+  string backend = 1;
+  string backend_incarnation_id = 2;
 }
 
 message AcquireWriteFenceRequest {
@@ -16,6 +24,7 @@ message AcquireWriteFenceRequest {
   string migration_id = 2;
   uint64 expected_application_revision = 3;
   string fence_token = 4;
+  string expected_backend_incarnation_id = 5;
 }
 
 message InspectTenantRequest {
@@ -27,11 +36,13 @@ message ReleaseWriteFenceRequest {
   string migration_id = 2;
   uint64 expected_application_revision = 3;
   string fence_token = 4;
+  string expected_backend_incarnation_id = 5;
 }
 
 message ReleaseWriteFenceResponse {
   bool released = 1;
   uint64 fence_epoch = 2;
+  string backend_incarnation_id = 3;
 }
 
 message FenceReceipt {
@@ -41,6 +52,7 @@ message FenceReceipt {
   uint64 fence_epoch = 4;
   int64 acquired_at_unix_seconds = 5;
   string receipt_sha256 = 6;
+  string backend_incarnation_id = 7;
 }
 
 message ComponentInventory {

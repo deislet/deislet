@@ -20,7 +20,7 @@
 
 use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
 use deis_backend_migration::proto::{
-    AcquireWriteFenceRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
+    AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
 use deis_queue::config::Config;
 use deis_queue::proto::queue::{
@@ -146,11 +146,13 @@ async fn migration_management_is_absent_by_default_and_freezes_queue_mutations()
     const ADMIN: &str = "migration-admin-token-000000000000000001";
     const MIGRATION: &str = "01990f44-1000-7000-8000-000000000050";
     const FENCE: &str = "migration-fence-token-00000000000000001";
-    let acquire = || AcquireWriteFenceRequest {
+    const UNKNOWN_INCARNATION: &str = "01990f44-1000-7000-8000-000000000099";
+    let acquire = |backend_incarnation_id: &str| AcquireWriteFenceRequest {
         tenant: "shop.production".to_string(),
         migration_id: MIGRATION.to_string(),
         expected_application_revision: 3,
         fence_token: FENCE.to_string(),
+        expected_backend_incarnation_id: backend_incarnation_id.to_string(),
     };
 
     let without_management = Harness::start().await;
@@ -158,7 +160,7 @@ async fn migration_management_is_absent_by_default_and_freezes_queue_mutations()
         without_management
             .migration()
             .await
-            .acquire_write_fence(Request::new(acquire()))
+            .acquire_write_fence(Request::new(acquire(UNKNOWN_INCARNATION)))
             .await
             .unwrap_err()
             .code(),
@@ -179,16 +181,23 @@ async fn migration_management_is_absent_by_default_and_freezes_queue_mutations()
         .await
         .unwrap();
     let mut migration = harness.migration().await;
+    let backend_info = migration
+        .get_backend_info(as_migration_admin(ADMIN, GetBackendInfoRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(backend_info.backend, "deis-queue");
+    let backend_incarnation_id = backend_info.backend_incarnation_id;
     assert_eq!(
         migration
-            .acquire_write_fence(Request::new(acquire()))
+            .acquire_write_fence(Request::new(acquire(&backend_incarnation_id)))
             .await
             .unwrap_err()
             .code(),
         Code::Unauthenticated
     );
     migration
-        .acquire_write_fence(as_migration_admin(ADMIN, acquire()))
+        .acquire_write_fence(as_migration_admin(ADMIN, acquire(&backend_incarnation_id)))
         .await
         .unwrap();
 
@@ -228,6 +237,7 @@ async fn migration_management_is_absent_by_default_and_freezes_queue_mutations()
                 migration_id: MIGRATION.to_string(),
                 expected_application_revision: 3,
                 fence_token: FENCE.to_string(),
+                expected_backend_incarnation_id: backend_incarnation_id,
             },
         ))
         .await
