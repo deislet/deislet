@@ -1,3 +1,4 @@
+mod npm_installer;
 mod transformer;
 mod validator;
 
@@ -300,7 +301,13 @@ impl Compiler {
                 // Check for deno
                 if Command::new("deno").arg("--version").output().is_ok() {
                     println!("{}", "  Create smoke test (deno check)...".dimmed());
-                    let entry_point = output_dir.join("_deis_internal/router.ts");
+                    let bundled_entry = output_dir.join("index.js");
+                    let source_entry = output_dir.join("_deis_internal/router.ts");
+                    let entry_point = if bundled_entry.is_file() {
+                        bundled_entry
+                    } else {
+                        source_entry
+                    };
                     // An entry point that is not there is a failure, not a
                     // skip. This arm used to say nothing at all in that case,
                     // so a deno build that had written no router - the exact
@@ -1048,7 +1055,14 @@ impl Compiler {
         // or invalid for every target; provider selection cannot turn an
         // unsupported builtin/export or an unlocked dependency into a
         // deployable artifact.
-        validate_node_npm_project(&project_root, &module_references)?;
+        let node_npm_usage = validate_node_npm_project(&project_root, &module_references)?;
+        let uses_node_npm = node_npm_usage.is_used();
+        npm_installer::stage_locked_dependencies(
+            &project_root,
+            &build_dir.join("project"),
+            &node_npm_usage,
+        )
+        .await?;
 
         // The project's static files, read once for whatever this target does
         // with them.
@@ -1106,13 +1120,26 @@ impl Compiler {
         // compile here instead of silently losing a target.
         let artifacts = match vendor {
             deis_build_adapter_cloudflare::VENDOR => {
-                deis_build_adapter_cloudflare::generate(&routes, config, &adapter_assets)?
+                deis_build_adapter_cloudflare::generate_with_node_compat(
+                    &routes,
+                    config,
+                    &adapter_assets,
+                    uses_node_npm,
+                )?
             }
-            deis_build_adapter_deno::VENDOR => {
-                deis_build_adapter_deno::generate(&routes, config, &adapter_assets)?
-            }
+            deis_build_adapter_deno::VENDOR => deis_build_adapter_deno::generate_with_node_runtime(
+                &routes,
+                config,
+                &adapter_assets,
+                uses_node_npm,
+            )?,
             deis_build_adapter_tencent::VENDOR => {
-                deis_build_adapter_tencent::generate(&routes, config, &adapter_assets)?
+                deis_build_adapter_tencent::generate_with_node_runtime(
+                    &routes,
+                    config,
+                    &adapter_assets,
+                    uses_node_npm,
+                )?
             }
             deis_build_adapter_deislet::VENDOR => {
                 deis_build_adapter_deislet::generate(&routes, config, &adapter_assets)?
@@ -1130,7 +1157,7 @@ impl Compiler {
         // behind - only the staged copies of the author's own sources, which
         // every target writes before this point because the bundler resolves
         // them off disk.
-        if vendor == deis_build_adapter_deno::VENDOR {
+        if vendor == deis_build_adapter_deno::VENDOR && !uses_node_npm {
             let deno_json = artifacts
                 .config_files
                 .iter()
@@ -1147,7 +1174,11 @@ impl Compiler {
                 content = content.replace("router.ts", "_deis_internal/router.ts");
             }
 
-            fs::write(build_dir.join(&name), &content)?;
+            let config_path = build_dir.join(&name);
+            if let Some(parent) = config_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(config_path, &content)?;
 
             // Collect into memory (Memory/Both modes)
             if should_collect_memory {
@@ -1192,7 +1223,9 @@ impl Compiler {
         }
 
         // Handle Code (Bundle or Skip)
-        let (entry_code, entry_filename) = if vendor != deis_build_adapter_deno::VENDOR {
+        let (entry_code, entry_filename) = if vendor != deis_build_adapter_deno::VENDOR
+            || uses_node_npm
+        {
             // Bundle.
             //
             // Exhaustive rather than `_ => Cloudflare`: the catch-all made a
@@ -1200,8 +1233,13 @@ impl Compiler {
             // deno was the target it had been silently mapping until the
             // `!=` above stopped sending it here at all.
             let platform = match vendor {
+                deis_build_adapter_cloudflare::VENDOR if uses_node_npm => {
+                    TargetPlatform::CloudflareNode
+                }
                 deis_build_adapter_cloudflare::VENDOR => TargetPlatform::Cloudflare,
+                deis_build_adapter_tencent::VENDOR if uses_node_npm => TargetPlatform::EdgeOneNode,
                 deis_build_adapter_tencent::VENDOR => TargetPlatform::EdgeOne,
+                deis_build_adapter_deno::VENDOR if uses_node_npm => TargetPlatform::DenoNode,
                 deis_build_adapter_deislet::VENDOR => TargetPlatform::Deislet,
                 other => {
                     return Err(anyhow::anyhow!(
@@ -1240,6 +1278,17 @@ impl Compiler {
 
             match bundled {
                 Ok((bundled_code, advisories)) => {
+                    // A package may introduce Node imports that were not
+                    // present in the application's local graph. Validate the
+                    // final external surface after tree shaking as well; only
+                    // exact standard exports may survive into a provider
+                    // artifact.
+                    let derived_path = format!("<derived {vendor} bundle>");
+                    let derived = self.parser.parse(&bundled_code, &derived_path)?;
+                    validate_node_npm_project(
+                        &project_root,
+                        &[(derived_path, derived.module_references)],
+                    )?;
                     // What the bundler said that was not fatal. Printed and
                     // carried, like every other advisory this build produces -
                     // these used to reach a terminal and nothing else.
@@ -1248,6 +1297,9 @@ impl Compiler {
                         warnings.push(advisory);
                     }
                     let filename = match vendor {
+                        deis_build_adapter_tencent::VENDOR if uses_node_npm => {
+                            "cloud-functions/api-node/index.mjs".to_string()
+                        }
                         deis_build_adapter_tencent::VENDOR => "edge-functions/index.js".to_string(),
                         deis_build_adapter_deislet::VENDOR => {
                             deis_build_adapter_deislet::WORKER_ENTRY.to_string()
@@ -1256,15 +1308,18 @@ impl Compiler {
                     };
 
                     if keeps_output && vendor != deis_build_adapter_deislet::VENDOR {
-                        let output_file = if vendor == deis_build_adapter_tencent::VENDOR {
-                            let ef_dir = build_dir.join("edge-functions");
-                            if !ef_dir.exists() {
-                                let _ = fs::create_dir_all(&ef_dir);
-                            }
-                            ef_dir.join("index.js")
-                        } else {
-                            build_dir.join("index.js")
-                        };
+                        let output_file =
+                            if vendor == deis_build_adapter_tencent::VENDOR && uses_node_npm {
+                                let node_dir = build_dir.join("cloud-functions/api-node");
+                                fs::create_dir_all(&node_dir)?;
+                                node_dir.join("index.mjs")
+                            } else if vendor == deis_build_adapter_tencent::VENDOR {
+                                let ef_dir = build_dir.join("edge-functions");
+                                fs::create_dir_all(&ef_dir)?;
+                                ef_dir.join("index.js")
+                            } else {
+                                build_dir.join("index.js")
+                            };
 
                         fs::write(&output_file, &bundled_code)?;
                         println!(
@@ -1292,11 +1347,12 @@ impl Compiler {
             )
         };
 
-        // Cleanup for bundled targets (Cloudflare, EdgeOne, Deislet). The
+        // Cleanup for bundled targets (Cloudflare, EdgeOne, Deislet, and Deno
+        // when the standard Node/npm surface is used). The
         // router, route proxies and project-shaped source mirror have all
         // been folded into the single entry module at this point. Deno is the
-        // exception: it deploys this ESM tree directly.
-        if vendor != deis_build_adapter_deno::VENDOR && keeps_output {
+        // exception: its Web-only form deploys this ESM tree directly.
+        if (vendor != deis_build_adapter_deno::VENDOR || uses_node_npm) && keeps_output {
             for staged in ["_deis_internal", "src", "project"] {
                 let directory = build_dir.join(staged);
                 if directory.exists() {

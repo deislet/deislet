@@ -28,6 +28,19 @@ pub fn generate(
     config: &ProjectConfig,
     assets: &[StaticAsset],
 ) -> anyhow::Result<AdapterArtifacts> {
+    generate_with_node_compat(routes, config, assets, false)
+}
+
+/// Generate the same Worker artifact while enabling Cloudflare's native Node
+/// implementation for an already-validated Edge Canon Node/npm graph. The
+/// source validator, not this provider flag, decides which builtins/exports an
+/// application may use.
+pub fn generate_with_node_compat(
+    routes: &[(String, String)],
+    config: &ProjectConfig,
+    assets: &[StaticAsset],
+    node_compat: bool,
+) -> anyhow::Result<AdapterArtifacts> {
     let has_kv = config
         .services
         .as_ref()
@@ -102,8 +115,13 @@ pub fn generate(
         r#"name = "{}"
 main = "index.js"
 compatibility_date = "{compatibility_date}"
-{}{}{}"#,
+{}{}{}{}"#,
         config.name,
+        if node_compat {
+            "compatibility_flags = [\"nodejs_compat\"]\n"
+        } else {
+            ""
+        },
         if assets.is_empty() {
             String::new()
         } else {

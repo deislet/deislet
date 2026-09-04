@@ -200,3 +200,30 @@ fn test_kv_adapter_shape() {
     // Verify .then() chains (not async/await in object methods)
     assert!(kv_code.contains(".then(function"));
 }
+
+#[test]
+fn validated_node_graph_uses_build_output_v3_node_api_shape() {
+    let routes = vec![
+        ("/".to_string(), "./src/index.ts".to_string()),
+        ("/users/:id".to_string(), "./src/users/[id].ts".to_string()),
+    ];
+    let result = deis_build_adapter_tencent::generate_with_node_runtime(
+        &routes,
+        &test_config("node-app", false),
+        &[],
+        true,
+    )
+    .expect("Node Function output");
+    assert!(result.router_code.contains("Node Function Entry Point"));
+    let config = result
+        .config_files
+        .iter()
+        .find(|(name, _)| name == "cloud-functions/api-node/config.json")
+        .map(|(_, content)| content)
+        .expect("Node API route config");
+    let config: serde_json::Value = serde_json::from_str(config).expect("valid config JSON");
+    assert_eq!(config["version"], 3);
+    assert_eq!(config["routes"][0]["src"], "^/$");
+    assert_eq!(config["routes"][1]["src"], "^/users/([^/]+)$");
+    assert_eq!(config["routes"][1]["dest"], "/users/$1");
+}

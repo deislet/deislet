@@ -1,0 +1,912 @@
+//! Locked npm installation for the canonical build graph.
+//!
+//! npm is an implementation detail here, not an application runtime. The
+//! compiler invokes one exact Node/npm toolchain in a scratch-only project,
+//! suppresses lifecycle scripts, audits the resulting tree, and then lets the
+//! bundler consume it. No provider receives registry credentials or a runtime
+//! package manager.
+
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use deis_build_core::{NodeNpmUsage, NODE_SEMANTIC_BASELINE};
+use serde_json::Value;
+use sha2::{Digest, Sha512};
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{BufReader, Read};
+use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::time::timeout;
+use unicode_normalization::UnicodeNormalization;
+
+const NPM_TOOLCHAIN_VERSION: &str = "11.19.0";
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const MAX_LOCKED_PACKAGES: usize = 10_000;
+pub(super) const MAX_INSTALLED_FILES: usize = 100_000;
+pub(super) const MAX_DOWNLOADED_OCTETS: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_INSTALLED_OCTETS: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_EXPANSION_RATIO: u64 = 100;
+const NODE_EXECUTABLE_ENV: &str = "DEIS_NODE_EXECUTABLE";
+const NPM_CLI_ENV: &str = "DEIS_NPM_CLI";
+const NPM_USERCONFIG_ENV: &str = "DEIS_NPM_USERCONFIG";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NpmInstallEvidence {
+    pub node_version: String,
+    pub npm_version: String,
+    pub package_count: usize,
+    pub file_count: usize,
+    pub downloaded_octets: u64,
+    pub installed_octets: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NpmToolchain {
+    node: PathBuf,
+    npm_cli: PathBuf,
+}
+
+impl NpmToolchain {
+    fn discover() -> anyhow::Result<Self> {
+        let node = resolve_executable(NODE_EXECUTABLE_ENV, "node")?;
+        let npm_cli = match env::var_os(NPM_CLI_ENV) {
+            Some(path) => canonical_regular_file(PathBuf::from(path), NPM_CLI_ENV)?,
+            None => discover_npm_cli(&node)?,
+        };
+        Ok(Self { node, npm_cli })
+    }
+
+    async fn verify(&self) -> anyhow::Result<(String, String)> {
+        let node_version = version_output(&self.node, &[OsStr::new("--version")]).await?;
+        if node_version != format!("v{NODE_SEMANTIC_BASELINE}") {
+            anyhow::bail!(
+                "EC_NODE_BASELINE_UNSUPPORTED: the configured build Node is {node_version:?}; Edge Canon requires exactly v{NODE_SEMANTIC_BASELINE}. Set {NODE_EXECUTABLE_ENV} to the absolute Node executable"
+            );
+        }
+        let npm_version = version_output(
+            &self.node,
+            &[self.npm_cli.as_os_str(), OsStr::new("--version")],
+        )
+        .await?;
+        if npm_version != NPM_TOOLCHAIN_VERSION {
+            anyhow::bail!(
+                "EC_NPM_TOOLCHAIN_UNSUPPORTED: the configured npm CLI is {npm_version:?}; this build is pinned to {NPM_TOOLCHAIN_VERSION}. Set {NPM_CLI_ENV} to the absolute npm-cli.js path"
+            );
+        }
+        Ok((node_version, npm_version))
+    }
+}
+
+/// Install only when a registry package is actually reachable from source.
+pub(super) async fn stage_locked_dependencies(
+    source_root: &Path,
+    staged_root: &Path,
+    usage: &NodeNpmUsage,
+) -> anyhow::Result<Option<NpmInstallEvidence>> {
+    if usage.registry_packages.is_empty() {
+        return Ok(None);
+    }
+    if usage.locked_package_count > MAX_LOCKED_PACKAGES {
+        anyhow::bail!(
+            "EC_NPM_RESOURCE_LIMIT_EXCEEDED: lock contains {} packages, above this builder's {MAX_LOCKED_PACKAGES}-package limit",
+            usage.locked_package_count
+        );
+    }
+
+    let toolchain = NpmToolchain::discover()?;
+    let (node_version, npm_version) = toolchain.verify().await?;
+    fs::create_dir_all(staged_root)?;
+    copy_exact_input(
+        &source_root.join("package.json"),
+        &staged_root.join("package.json"),
+    )?;
+    copy_exact_input(
+        &source_root.join("package-lock.json"),
+        &staged_root.join("package-lock.json"),
+    )?;
+
+    let work = InstallWorkDir::create(staged_root)?;
+    let user_config = prepare_user_config(work.path())?;
+    let mut command = Command::new(&toolchain.node);
+    command
+        .arg(&toolchain.npm_cli)
+        .args([
+            "ci",
+            "--ignore-scripts",
+            "--omit=dev",
+            "--no-audit",
+            "--no-fund",
+            "--no-progress",
+            "--install-links=false",
+            "--install-strategy=hoisted",
+            "--loglevel=error",
+        ])
+        .current_dir(staged_root)
+        .env_clear()
+        .env("PATH", tool_path(&toolchain.node)?)
+        .env("NPM_CONFIG_CACHE", work.path().join("cache"))
+        .env("NPM_CONFIG_USERCONFIG", user_config.path())
+        .env("NPM_CONFIG_IGNORE_SCRIPTS", "true")
+        .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
+        .env("NPM_CONFIG_AUDIT", "false")
+        .env("NPM_CONFIG_FUND", "false")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    copy_network_environment(&mut command, user_config.contents())?;
+
+    let mut child = command.spawn().map_err(|error| {
+        anyhow::anyhow!(
+            "EC_NPM_PACKAGE_UNRESOLVED: failed to start the pinned npm build tool: {error}"
+        )
+    })?;
+    let status = match timeout(INSTALL_TIMEOUT, child.wait()).await {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "EC_NPM_PACKAGE_UNRESOLVED: pinned npm install exceeded {} seconds and was terminated; no provider artifact was produced",
+                INSTALL_TIMEOUT.as_secs()
+            );
+        }
+    };
+    if !status.success() {
+        anyhow::bail!(
+            "EC_NPM_PACKAGE_UNRESOLVED: pinned npm install failed with status {}; stdout/stderr are withheld because registry diagnostics may contain credentials",
+            status.code().map_or_else(|| "signal".to_string(), |code| code.to_string())
+        );
+    }
+
+    let downloaded_octets = audit_download_cache(&work.path().join("cache"), staged_root)?;
+    let audit = audit_installed_tree(staged_root, usage)?;
+    if downloaded_octets > MAX_DOWNLOADED_OCTETS {
+        anyhow::bail!(
+            "EC_NPM_RESOURCE_LIMIT_EXCEEDED: locked package archives contain {downloaded_octets} octets, above this builder's {MAX_DOWNLOADED_OCTETS}-octet limit"
+        );
+    }
+    if audit.installed_octets > MAX_INSTALLED_OCTETS {
+        anyhow::bail!(
+            "EC_NPM_RESOURCE_LIMIT_EXCEEDED: installed packages contain {} octets, above this builder's {MAX_INSTALLED_OCTETS}-octet limit",
+            audit.installed_octets
+        );
+    }
+    if downloaded_octets == 0
+        || u128::from(audit.installed_octets)
+            > u128::from(downloaded_octets) * u128::from(MAX_EXPANSION_RATIO)
+    {
+        anyhow::bail!(
+            "EC_NPM_ARCHIVE_BOMB: installed packages expand to {} octets from {downloaded_octets} archive octets, above the {MAX_EXPANSION_RATIO}:1 limit",
+            audit.installed_octets
+        );
+    }
+    Ok(Some(NpmInstallEvidence {
+        node_version,
+        npm_version,
+        package_count: audit.package_count,
+        file_count: audit.file_count,
+        downloaded_octets,
+        installed_octets: audit.installed_octets,
+    }))
+}
+
+async fn version_output(program: &Path, arguments: &[&OsStr]) -> anyhow::Result<String> {
+    let result = timeout(
+        Duration::from_secs(10),
+        Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("tool version check timed out"))??;
+    if !result.status.success() || result.stdout.len() > 128 {
+        anyhow::bail!("tool version check failed or returned an invalid response");
+    }
+    String::from_utf8(result.stdout)
+        .map(|value| value.trim().to_string())
+        .map_err(Into::into)
+}
+
+fn resolve_executable(variable: &str, fallback: &str) -> anyhow::Result<PathBuf> {
+    if let Some(path) = env::var_os(variable) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            anyhow::bail!("{variable} must be an absolute path");
+        }
+        return canonical_regular_file(path, variable);
+    }
+    let search = env::var_os("PATH").ok_or_else(|| {
+        anyhow::anyhow!("EC_NPM_TOOLCHAIN_UNAVAILABLE: PATH is absent and {variable} is unset")
+    })?;
+    for directory in env::split_paths(&search) {
+        #[cfg(windows)]
+        let candidates = [
+            directory.join(format!("{fallback}.exe")),
+            directory.join(fallback),
+        ];
+        #[cfg(not(windows))]
+        let candidates = [directory.join(fallback)];
+        for candidate in candidates {
+            if candidate.is_file() {
+                return canonical_regular_file(candidate, fallback);
+            }
+        }
+    }
+    anyhow::bail!(
+        "EC_NPM_TOOLCHAIN_UNAVAILABLE: cannot find {fallback}; set {variable} to its absolute path"
+    )
+}
+
+fn canonical_regular_file(path: PathBuf, description: &str) -> anyhow::Result<PathBuf> {
+    let path = fs::canonicalize(&path).map_err(|error| {
+        anyhow::anyhow!("EC_NPM_TOOLCHAIN_UNAVAILABLE: cannot resolve {description}: {error}")
+    })?;
+    if !fs::metadata(&path)?.is_file() {
+        anyhow::bail!(
+            "EC_NPM_TOOLCHAIN_UNAVAILABLE: {description} is not a regular file: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn discover_npm_cli(node: &Path) -> anyhow::Result<PathBuf> {
+    let bin = node.parent().ok_or_else(|| {
+        anyhow::anyhow!("EC_NPM_TOOLCHAIN_UNAVAILABLE: Node executable has no parent directory")
+    })?;
+    let root = bin.parent().unwrap_or(bin);
+    let mut candidates = vec![
+        bin.join("npm"),
+        bin.join("npm.cmd"),
+        root.join("lib/node_modules/npm/bin/npm-cli.js"),
+        root.join("node_modules/npm/bin/npm-cli.js"),
+        bin.join("node_modules/npm/bin/npm-cli.js"),
+    ];
+    candidates.dedup();
+    for candidate in candidates {
+        if candidate.is_file() {
+            let resolved = fs::canonicalize(candidate)?;
+            if resolved.extension().and_then(OsStr::to_str) == Some("js") {
+                return canonical_regular_file(resolved, "npm CLI");
+            }
+        }
+    }
+    anyhow::bail!(
+        "EC_NPM_TOOLCHAIN_UNAVAILABLE: cannot find npm-cli.js beside {}; set {NPM_CLI_ENV} to its absolute path",
+        node.display()
+    )
+}
+
+fn tool_path(node: &Path) -> anyhow::Result<OsString> {
+    let directory = node
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Node executable has no parent directory"))?;
+    env::join_paths([directory]).map_err(Into::into)
+}
+
+fn copy_exact_input(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    let bytes = fs::read(source)?;
+    if destination.exists() && fs::read(destination)? != bytes {
+        anyhow::bail!(
+            "EC_NPM_LOCK_MISMATCH: staged {} already exists with different bytes",
+            destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+    }
+    if !destination.exists() {
+        fs::write(destination, bytes)?;
+    }
+    Ok(())
+}
+
+struct InstallWorkDir {
+    path: PathBuf,
+}
+
+impl InstallWorkDir {
+    fn create(staged_root: &Path) -> anyhow::Result<Self> {
+        let path = staged_root.join(".deis-npm-work");
+        if path.exists() {
+            anyhow::bail!(
+                "EC_NPM_CACHE_UNSAFE: temporary npm work path already exists: {}",
+                path.display()
+            );
+        }
+        fs::create_dir(&path)?;
+        set_private_directory(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for InstallWorkDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct PreparedUserConfig {
+    path: PathBuf,
+    contents: Vec<u8>,
+}
+
+impl PreparedUserConfig {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn contents(&self) -> &[u8] {
+        &self.contents
+    }
+}
+
+fn prepare_user_config(work: &Path) -> anyhow::Result<PreparedUserConfig> {
+    let contents = match env::var_os(NPM_USERCONFIG_ENV) {
+        Some(source) => {
+            let source = PathBuf::from(source);
+            if !source.is_absolute() {
+                anyhow::bail!("{NPM_USERCONFIG_ENV} must be an absolute path");
+            }
+            let metadata = fs::symlink_metadata(&source)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!("{NPM_USERCONFIG_ENV} must name a regular non-symlink file");
+            }
+            fs::read(source)?
+        }
+        None => Vec::new(),
+    };
+    let path = work.join("user.npmrc");
+    fs::write(&path, &contents)?;
+    set_private_file(&path)?;
+    Ok(PreparedUserConfig { path, contents })
+}
+
+fn copy_network_environment(command: &mut Command, user_config: &[u8]) -> anyhow::Result<()> {
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+    ] {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let text = std::str::from_utf8(user_config)
+        .map_err(|_| anyhow::anyhow!("{NPM_USERCONFIG_ENV} must be UTF-8"))?;
+    for name in referenced_environment_names(text)? {
+        let value = env::var_os(&name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "EC_NPM_AUTH_REQUIRED: npm user config references {name}, but that environment variable is absent"
+            )
+        })?;
+        command.env(name, value);
+    }
+    Ok(())
+}
+
+fn referenced_environment_names(config: &str) -> anyhow::Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut remaining = config;
+    while let Some(start) = remaining.find("${") {
+        remaining = &remaining[start + 2..];
+        let Some(end) = remaining.find('}') else {
+            anyhow::bail!("{NPM_USERCONFIG_ENV} contains an unterminated environment reference");
+        };
+        let name = &remaining[..end];
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+            || name.as_bytes()[0].is_ascii_digit()
+        {
+            anyhow::bail!("{NPM_USERCONFIG_ENV} contains an invalid environment variable name");
+        }
+        names.insert(name.to_string());
+        remaining = &remaining[end + 1..];
+    }
+    Ok(names)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeAudit {
+    package_count: usize,
+    file_count: usize,
+    installed_octets: u64,
+}
+
+/// Independently bind every registry package's downloaded tarball bytes to
+/// its package-lock SHA-512. npm 11's isolated cacache is part of the pinned
+/// build toolchain, so no older cache entry or unverified mirror can satisfy
+/// this check.
+fn audit_download_cache(cache: &Path, staged_root: &Path) -> anyhow::Result<u64> {
+    let lock: Value = serde_json::from_slice(&fs::read(staged_root.join("package-lock.json"))?)?;
+    let packages = lock
+        .get("packages")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("EC_NPM_LOCK_MISMATCH: lock packages object disappeared"))?;
+    let content_root = cache.join("_cacache/content-v2/sha512");
+    let canonical_content_root = fs::canonicalize(&content_root).map_err(|_| {
+        anyhow::anyhow!(
+            "EC_NPM_INTEGRITY_FAILED: pinned npm did not retain its verified SHA-512 content cache"
+        )
+    })?;
+    let mut seen = BTreeSet::new();
+    let mut downloaded_octets = 0u64;
+
+    for (path, record) in packages.iter().filter(|(path, _)| !path.is_empty()) {
+        // npm deliberately omits an optional dependency when its os/cpu/libc
+        // constraints do not match this builder. Such a record still belongs
+        // in the portable lock, but there are no installed or downloaded
+        // bytes to audit on this host. A missing non-optional record is a
+        // broken installation and must not receive the same exemption.
+        if !staged_root.join(path).exists() {
+            if record
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            anyhow::bail!("EC_NPM_PACKAGE_UNRESOLVED: locked package {path:?} was not installed");
+        }
+        let encoded = record
+            .get("integrity")
+            .and_then(Value::as_str)
+            .and_then(|value| value.strip_prefix("sha512-"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "EC_NPM_INTEGRITY_REQUIRED: locked package {path:?} lacks SHA-512 integrity"
+                )
+            })?;
+        let digest = BASE64_STANDARD.decode(encoded).map_err(|_| {
+            anyhow::anyhow!(
+                "EC_NPM_INTEGRITY_REQUIRED: locked package {path:?} has invalid SHA-512 integrity"
+            )
+        })?;
+        if digest.len() != 64 {
+            anyhow::bail!(
+                "EC_NPM_INTEGRITY_REQUIRED: locked package {path:?} has invalid SHA-512 integrity"
+            );
+        }
+        let digest_hex = hex::encode(&digest);
+        if !seen.insert(digest_hex.clone()) {
+            continue;
+        }
+        let content = content_root
+            .join(&digest_hex[..2])
+            .join(&digest_hex[2..4])
+            .join(&digest_hex[4..]);
+        let canonical = fs::canonicalize(&content).map_err(|_| {
+            anyhow::anyhow!(
+                "EC_NPM_INTEGRITY_FAILED: downloaded bytes for locked package {path:?} are absent"
+            )
+        })?;
+        if !canonical.starts_with(&canonical_content_root) {
+            anyhow::bail!(
+                "EC_NPM_CACHE_UNSAFE: cached bytes for locked package {path:?} escape the isolated content cache"
+            );
+        }
+        let metadata = fs::symlink_metadata(&content)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!(
+                "EC_NPM_CACHE_UNSAFE: cached bytes for locked package {path:?} are not a regular file"
+            );
+        }
+        reject_hard_link(&metadata, &content)?;
+        downloaded_octets = downloaded_octets
+            .checked_add(metadata.len())
+            .ok_or_else(|| {
+                anyhow::anyhow!("EC_NPM_RESOURCE_LIMIT_EXCEEDED: downloaded byte count overflowed")
+            })?;
+        if downloaded_octets > MAX_DOWNLOADED_OCTETS {
+            anyhow::bail!(
+                "EC_NPM_RESOURCE_LIMIT_EXCEEDED: locked package archives exceed this builder's {MAX_DOWNLOADED_OCTETS}-octet limit"
+            );
+        }
+        let mut input = BufReader::new(fs::File::open(&content)?);
+        let mut actual = Sha512::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            actual.update(&buffer[..count]);
+        }
+        let actual = actual.finalize();
+        if actual.as_slice() != digest.as_slice() {
+            anyhow::bail!(
+                "EC_NPM_INTEGRITY_FAILED: downloaded bytes for locked package {path:?} differ from package-lock.json"
+            );
+        }
+    }
+    Ok(downloaded_octets)
+}
+
+fn audit_installed_tree(staged_root: &Path, usage: &NodeNpmUsage) -> anyhow::Result<TreeAudit> {
+    let node_modules = staged_root.join("node_modules");
+    let root = fs::canonicalize(&node_modules).map_err(|_| {
+        anyhow::anyhow!("EC_NPM_PACKAGE_UNRESOLVED: npm produced no node_modules directory")
+    })?;
+    let lock: Value = serde_json::from_slice(&fs::read(staged_root.join("package-lock.json"))?)?;
+    let locked = lock
+        .get("packages")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("EC_NPM_LOCK_MISMATCH: lock packages object disappeared"))?;
+
+    let mut package_count = 0usize;
+    for path in locked.keys().filter(|path| !path.is_empty()) {
+        let package_root = staged_root.join(path);
+        if !package_root.exists() {
+            continue;
+        }
+        let canonical = fs::canonicalize(&package_root)?;
+        if !canonical.starts_with(&root) {
+            anyhow::bail!(
+                "EC_NPM_ARCHIVE_PATH_UNSAFE: installed package {path:?} resolves outside node_modules"
+            );
+        }
+        audit_package_manifest(path, &canonical)?;
+        package_count += 1;
+        if package_count > MAX_LOCKED_PACKAGES {
+            anyhow::bail!(
+                "EC_NPM_RESOURCE_LIMIT_EXCEEDED: installed package count exceeds {MAX_LOCKED_PACKAGES}"
+            );
+        }
+    }
+    for package in &usage.registry_packages {
+        if !staged_root.join(format!("node_modules/{package}")).is_dir() {
+            anyhow::bail!(
+                "EC_NPM_PACKAGE_UNRESOLVED: imported package {package:?} was not installed"
+            );
+        }
+    }
+
+    let mut normalized_paths = BTreeMap::<String, PathBuf>::new();
+    let mut file_count = 0usize;
+    let mut installed_octets = 0u64;
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let relative = path.strip_prefix(&root).expect("walk stays under root");
+            validate_portable_relative_path(relative)?;
+            let portable = relative.to_string_lossy().replace('\\', "/");
+            let collision_key = portable.nfc().collect::<String>().to_lowercase();
+            if let Some(previous) = normalized_paths.insert(collision_key, relative.to_path_buf()) {
+                anyhow::bail!(
+                    "EC_NPM_ARCHIVE_PATH_COLLISION: installed paths {:?} and {:?} collide across supported filesystems",
+                    previous,
+                    relative
+                );
+            }
+
+            if metadata.file_type().is_symlink() {
+                let target = fs::canonicalize(&path)?;
+                if !target.starts_with(&root) {
+                    anyhow::bail!(
+                        "EC_NPM_ARCHIVE_PATH_UNSAFE: installed symlink {:?} escapes node_modules",
+                        relative
+                    );
+                }
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                anyhow::bail!(
+                    "EC_NPM_ARCHIVE_PATH_UNSAFE: installed path {:?} is not a regular file or directory",
+                    relative
+                );
+            }
+            reject_hard_link(&metadata, relative)?;
+            if path.extension().and_then(OsStr::to_str) == Some("node")
+                || path.file_name().and_then(OsStr::to_str) == Some("binding.gyp")
+            {
+                anyhow::bail!(
+                    "EC_NPM_NATIVE_ADDON_UNSUPPORTED: installed package contains {:?}",
+                    relative
+                );
+            }
+            file_count += 1;
+            if file_count > MAX_INSTALLED_FILES {
+                anyhow::bail!(
+                    "EC_NPM_RESOURCE_LIMIT_EXCEEDED: installed file count exceeds {MAX_INSTALLED_FILES}"
+                );
+            }
+            installed_octets = installed_octets
+                .checked_add(metadata.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "EC_NPM_RESOURCE_LIMIT_EXCEEDED: installed byte count overflowed"
+                    )
+                })?;
+            if installed_octets > MAX_INSTALLED_OCTETS {
+                anyhow::bail!(
+                    "EC_NPM_RESOURCE_LIMIT_EXCEEDED: installed packages exceed {MAX_INSTALLED_OCTETS} octets"
+                );
+            }
+        }
+    }
+
+    Ok(TreeAudit {
+        package_count,
+        file_count,
+        installed_octets,
+    })
+}
+
+fn audit_package_manifest(lock_path: &str, package_root: &Path) -> anyhow::Result<()> {
+    let path = package_root.join("package.json");
+    let document: Value = serde_json::from_slice(&fs::read(&path).map_err(|_| {
+        anyhow::anyhow!(
+            "EC_NPM_PACKAGE_UNRESOLVED: installed package {lock_path:?} has no package.json"
+        )
+    })?)?;
+    if let Some(scripts) = document.get("scripts").and_then(Value::as_object) {
+        for hook in ["preinstall", "install", "postinstall"] {
+            if scripts.contains_key(hook) {
+                anyhow::bail!(
+                    "EC_NPM_LIFECYCLE_SCRIPT_UNSUPPORTED: installed package {lock_path:?} declares {hook}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_portable_relative_path(path: &Path) -> anyhow::Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        anyhow::bail!("EC_NPM_ARCHIVE_PATH_UNSAFE: installed path is not relative");
+    }
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("EC_NPM_ARCHIVE_PATH_UNSAFE: installed path contains traversal");
+        };
+        let name = name.to_string_lossy();
+        let stem = name.split('.').next().unwrap_or_default();
+        if matches!(
+            stem.to_ascii_lowercase().as_str(),
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
+        ) {
+            anyhow::bail!(
+                "EC_NPM_ARCHIVE_PATH_UNSAFE: installed path component {name:?} is not portable"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_hard_link(metadata: &fs::Metadata, path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() > 1 {
+        anyhow::bail!(
+            "EC_NPM_ARCHIVE_PATH_UNSAFE: installed file {:?} is hard-linked",
+            path
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_hard_link(_metadata: &fs::Metadata, _path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn npm_config_only_requests_explicit_well_formed_environment_names() {
+        assert_eq!(
+            referenced_environment_names(
+                "//registry.example/:_authToken=${NPM_TOKEN}\nproxy=${HTTPS_PROXY}\n"
+            )
+            .expect("valid references"),
+            BTreeSet::from(["HTTPS_PROXY".to_string(), "NPM_TOKEN".to_string()])
+        );
+        for invalid in ["x=${}", "x=${1TOKEN}", "x=${TOKEN-NAME}", "x=${TOKEN"] {
+            assert!(referenced_environment_names(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn portable_path_validation_rejects_traversal_and_windows_devices() {
+        for invalid in [Path::new("../x"), Path::new("nested/CON.txt")] {
+            assert!(validate_portable_relative_path(invalid).is_err());
+        }
+        assert!(validate_portable_relative_path(Path::new("@scope/pkg/index.js")).is_ok());
+    }
+
+    #[test]
+    fn installed_tree_audit_rejects_hooks_native_files_and_case_collisions() {
+        let project = tempfile::tempdir().expect("temp project");
+        fs::create_dir_all(project.path().join("node_modules/pkg")).expect("package root");
+        fs::write(
+            project.path().join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/pkg":{"version":"1.0.0","resolved":"https://registry.example/pkg.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}"#,
+        )
+        .expect("lock");
+        let usage = NodeNpmUsage {
+            registry_packages: BTreeSet::from(["pkg".to_string()]),
+            locked_package_count: 1,
+            ..Default::default()
+        };
+        let package_json = project.path().join("node_modules/pkg/package.json");
+        fs::write(&package_json, r#"{"name":"pkg","version":"1.0.0"}"#).expect("package manifest");
+        fs::write(project.path().join("node_modules/pkg/A.js"), "a").expect("first file");
+        fs::write(project.path().join("node_modules/pkg/a.js"), "b").expect("second file");
+        let error = audit_installed_tree(project.path(), &usage)
+            .expect_err("case collision must fail")
+            .to_string();
+        assert!(error.contains("EC_NPM_ARCHIVE_PATH_COLLISION"), "{error}");
+
+        fs::remove_file(project.path().join("node_modules/pkg/a.js")).expect("remove collision");
+        fs::write(
+            &package_json,
+            r#"{"name":"pkg","version":"1.0.0","scripts":{"install":"node-gyp rebuild"}}"#,
+        )
+        .expect("hook manifest");
+        let error = audit_installed_tree(project.path(), &usage)
+            .expect_err("install hook must fail")
+            .to_string();
+        assert!(
+            error.contains("EC_NPM_LIFECYCLE_SCRIPT_UNSUPPORTED"),
+            "{error}"
+        );
+
+        fs::write(&package_json, r#"{"name":"pkg","version":"1.0.0"}"#).expect("clean manifest");
+        fs::write(project.path().join("node_modules/pkg/addon.node"), "native")
+            .expect("native file");
+        let error = audit_installed_tree(project.path(), &usage)
+            .expect_err("native addon must fail")
+            .to_string();
+        assert!(error.contains("EC_NPM_NATIVE_ADDON_UNSUPPORTED"), "{error}");
+    }
+
+    #[test]
+    fn isolated_cache_bytes_are_bound_to_the_lock_sha512() {
+        let project = tempfile::tempdir().expect("temp project");
+        let cache = project.path().join("cache");
+        let staged = project.path().join("staged");
+        fs::create_dir_all(staged.join("node_modules/pkg")).expect("installed package");
+        let package = b"a deterministic package archive";
+        let digest = Sha512::digest(package);
+        let encoded = BASE64_STANDARD.encode(digest);
+        let digest_hex = hex::encode(digest);
+        let content = cache
+            .join("_cacache/content-v2/sha512")
+            .join(&digest_hex[..2])
+            .join(&digest_hex[2..4])
+            .join(&digest_hex[4..]);
+        fs::create_dir_all(content.parent().expect("content parent")).expect("cache path");
+        fs::write(&content, package).expect("cached bytes");
+        fs::write(
+            staged.join("package-lock.json"),
+            format!(
+                r#"{{"lockfileVersion":3,"packages":{{"":{{}},"node_modules/pkg":{{"version":"1.0.0","resolved":"https://registry.example/pkg.tgz","integrity":"sha512-{encoded}"}}}}}}"#
+            ),
+        )
+        .expect("lock");
+
+        assert_eq!(
+            audit_download_cache(&cache, &staged).expect("matching bytes"),
+            package.len() as u64
+        );
+        fs::write(&content, b"tampered package archive").expect("tamper cache");
+        let error = audit_download_cache(&cache, &staged)
+            .expect_err("tampering must fail")
+            .to_string();
+        assert!(error.contains("EC_NPM_INTEGRITY_FAILED"), "{error}");
+    }
+
+    #[test]
+    fn isolated_cache_allows_only_missing_optional_platform_packages() {
+        let project = tempfile::tempdir().expect("temp project");
+        let cache = project.path().join("cache");
+        let staged = project.path().join("staged");
+        let installed = staged.join("node_modules/pkg");
+        fs::create_dir_all(&installed).expect("installed package");
+        let package = b"the installed package archive";
+        let digest = Sha512::digest(package);
+        let encoded = BASE64_STANDARD.encode(digest);
+        let digest_hex = hex::encode(digest);
+        let content = cache
+            .join("_cacache/content-v2/sha512")
+            .join(&digest_hex[..2])
+            .join(&digest_hex[2..4])
+            .join(&digest_hex[4..]);
+        fs::create_dir_all(content.parent().expect("content parent")).expect("cache path");
+        fs::write(&content, package).expect("cached bytes");
+        fs::write(
+            staged.join("package-lock.json"),
+            format!(
+                r#"{{"lockfileVersion":3,"packages":{{"":{{}},"node_modules/pkg":{{"version":"1.0.0","resolved":"https://registry.example/pkg.tgz","integrity":"sha512-{encoded}"}},"node_modules/platform-only":{{"version":"1.0.0","resolved":"https://registry.example/platform-only.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","optional":true}}}}}}"#
+            ),
+        )
+        .expect("lock");
+
+        assert_eq!(
+            audit_download_cache(&cache, &staged).expect("optional package may be absent"),
+            package.len() as u64
+        );
+
+        let lock = fs::read_to_string(staged.join("package-lock.json"))
+            .expect("read lock")
+            .replace("\"optional\":true", "\"optional\":false");
+        fs::write(staged.join("package-lock.json"), lock).expect("write non-optional lock");
+        let error = audit_download_cache(&cache, &staged)
+            .expect_err("missing required package must fail")
+            .to_string();
+        assert!(error.contains("EC_NPM_PACKAGE_UNRESOLVED"), "{error}");
+    }
+}

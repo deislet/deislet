@@ -12,6 +12,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const NODE_SEMANTIC_BASELINE: &str = "24.20.0";
+pub const NODE_BUILTIN_MODULES: [&str; 18] = [
+    "node:assert",
+    "node:assert/strict",
+    "node:async_hooks",
+    "node:buffer",
+    "node:crypto",
+    "node:diagnostics_channel",
+    "node:events",
+    "node:path",
+    "node:process",
+    "node:querystring",
+    "node:stream",
+    "node:stream/promises",
+    "node:string_decoder",
+    "node:timers",
+    "node:timers/promises",
+    "node:url",
+    "node:util",
+    "node:zlib",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeNpmError {
@@ -244,6 +264,15 @@ fn validate_manifest_and_lock(
                     ),
                 ));
             }
+        }
+    }
+    for name in locked_declarations.keys() {
+        if !declared.contains_key(name) {
+            return Err(NodeNpmError::project(
+                "EC_NPM_LOCK_MISMATCH",
+                &lock_path,
+                format!("the root lock declares {name:?}, which is absent from package.json"),
+            ));
         }
     }
     for name in imported_packages.keys() {

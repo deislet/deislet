@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
@@ -17,9 +18,13 @@ use rolldown_common::Output;
 /// bundled" while `deis_build::compiler` sent that target somewhere else
 /// entirely. What stands behind a deno artefact instead is
 /// `Compiler::refuse_specifiers_deno_cannot_resolve` and `deno check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetPlatform {
     Cloudflare,
+    CloudflareNode,
     EdgeOne,
+    EdgeOneNode,
+    DenoNode,
     /// deis-runtime: a deno_core isolate with Web APIs and no Node built-ins,
     /// loading one ESM entry point.
     Deislet,
@@ -27,17 +32,38 @@ pub enum TargetPlatform {
 
 pub struct BuildBundler {
     options: BundlerOptions,
+    allowed_externals: BTreeSet<String>,
 }
 
 impl BuildBundler {
     pub fn new(entry: &str, platform: TargetPlatform) -> Self {
-        // Every target left here is a browser-like isolate loading one ESM
-        // module: a Worker, an EdgeOne function, a deis-runtime isolate. None
-        // has Node built-ins.
+        // Web-only outputs are browser-like isolates; the explicit Node
+        // modes preserve only the standard's validated builtin imports for a
+        // provider runtime to implement. Every mode still emits one ESM entry.
         let (platform_opt, format) = match platform {
             TargetPlatform::Cloudflare | TargetPlatform::EdgeOne | TargetPlatform::Deislet => {
                 (Some(Platform::Browser), Some(OutputFormat::Esm))
             }
+            TargetPlatform::CloudflareNode
+            | TargetPlatform::EdgeOneNode
+            | TargetPlatform::DenoNode => (Some(Platform::Browser), Some(OutputFormat::Esm)),
+        };
+
+        let allowed_externals: BTreeSet<String> = if matches!(
+            platform,
+            TargetPlatform::CloudflareNode | TargetPlatform::EdgeOneNode | TargetPlatform::DenoNode
+        ) {
+            crate::NODE_BUILTIN_MODULES
+                .iter()
+                .flat_map(|canonical| {
+                    [
+                        (*canonical).to_string(),
+                        canonical.strip_prefix("node:").unwrap().to_string(),
+                    ]
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
         };
 
         let options = BundlerOptions {
@@ -47,6 +73,13 @@ impl BuildBundler {
             }]),
             platform: platform_opt,
             format,
+            // Keep npm packages fully bundled. Platform::Node would
+            // externalize runtime machinery on the bundler's behalf (for
+            // example node:module for an otherwise portable CommonJS
+            // package), expanding the runtime surface behind the standard.
+            // Only the exact validated builtin list may survive the bundle.
+            external: (!allowed_externals.is_empty())
+                .then(|| allowed_externals.iter().cloned().collect::<Vec<_>>().into()),
             // Every target this compiler serves takes exactly one module: the
             // deislet bundle names a single `worker/index.js` in its manifest,
             // a Worker names one `main`, an EdgeOne function is one file. There
@@ -63,7 +96,10 @@ impl BuildBundler {
             ..Default::default()
         };
 
-        Self { options }
+        Self {
+            options,
+            allowed_externals,
+        }
     }
 
     /// Resolve modules and print paths relative to `cwd` instead of the
@@ -124,7 +160,7 @@ impl BuildBundler {
         let mut bundler = Bundler::new(self.options.clone())?;
         let result = bundler.generate().await?;
         let advisories = Self::refuse_broken_references(&result.warnings)?;
-        Ok((Self::single_js_chunk(result.assets)?, advisories))
+        Ok((self.single_js_chunk(result.assets)?, advisories))
     }
 
     /// Stop on a warning that says the emitted module names something that is
@@ -198,7 +234,7 @@ impl BuildBundler {
     /// asset a module referenced, a chunk a future option asked for. Refusing
     /// names the file and stops the build; the alternative is shipping an
     /// application whose only symptom is that it serves nothing.
-    fn single_js_chunk(assets: Vec<Output>) -> Result<String> {
+    fn single_js_chunk(&self, assets: Vec<Output>) -> Result<String> {
         let mut entry: Option<(String, Vec<String>)> = None;
         let mut extra_chunks: Vec<String> = Vec::new();
         let mut emitted_assets: Vec<String> = Vec::new();
@@ -266,6 +302,10 @@ impl BuildBundler {
         // that wrote `import { v4 } from "uuid"` therefore built, packed,
         // uploaded and deployed, and then failed to load - the same failure as
         // a dropped chunk, reached through a missing dependency instead.
+        let outstanding: Vec<String> = outstanding
+            .into_iter()
+            .filter(|specifier| !self.allowed_externals.contains(specifier))
+            .collect();
         if !outstanding.is_empty() {
             bail!(
                 "the bundled entry still imports {} module(s) it could not resolve ({}); nothing \

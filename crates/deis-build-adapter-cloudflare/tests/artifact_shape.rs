@@ -267,3 +267,16 @@ fn the_static_files_are_declared_so_wrangler_serves_them() {
     let without = generate(&routes, &test_config("site", false), &[]).unwrap();
     assert!(!wrangler_toml(&without).contains("[assets]"));
 }
+
+#[test]
+fn a_validated_node_graph_enables_the_provider_runtime_explicitly() {
+    let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
+    let result = deis_build_adapter_cloudflare::generate_with_node_compat(
+        &routes,
+        &test_config("node-app", false),
+        &[],
+        true,
+    )
+    .expect("generate Node-compatible Worker");
+    assert!(wrangler_toml(&result).contains("compatibility_flags = [\"nodejs_compat\"]"));
+}

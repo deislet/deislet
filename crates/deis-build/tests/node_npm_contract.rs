@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::Path;
 
-use deis_build::{Compiler, CompilerOptions};
+use deis_build::{Compiler, CompilerOptions, OutputMode};
 
 const VENDORS: [&str; 4] = ["cloudflare", "deno", "tencent", "deislet"];
 
@@ -93,4 +93,57 @@ async fn dynamic_resolution_uses_the_standard_error_on_every_target() {
         None,
     )
     .await;
+}
+
+#[tokio::test]
+async fn an_allowed_builtin_survives_only_as_the_same_standard_import() {
+    let source = "import { createHash } from 'node:crypto';\n\
+                  export default function handler() {\n\
+                    return new Response(createHash('sha256').update('edge-canon').digest('hex'));\n\
+                  }\n";
+
+    for vendor in ["cloudflare", "deno", "tencent"] {
+        let project = tempfile::tempdir().expect("temp project");
+        stage(project.path(), vendor, source);
+        let compiler = Compiler::with_options(CompilerOptions {
+            project_dir: project.path().to_string_lossy().to_string(),
+            output_mode: OutputMode::Memory,
+            ..Default::default()
+        });
+        let result = compiler
+            .compile(project.path(), vec![vendor.to_string()], false)
+            .await
+            .unwrap_or_else(|error| panic!("{vendor} rejected an allowed builtin: {error}"));
+        let artifacts = result.builds[vendor]
+            .artifacts
+            .as_ref()
+            .expect("memory build artifacts");
+        assert!(
+            artifacts.entry_code.contains("node:crypto"),
+            "{vendor} must preserve the validated builtin as an external import"
+        );
+        assert!(
+            !artifacts.entry_code.contains("node:module"),
+            "{vendor} must not acquire a bundler-created Node surface"
+        );
+
+        match vendor {
+            "cloudflare" => assert!(artifacts.config_files["wrangler.toml"]
+                .contains("compatibility_flags = [\"nodejs_compat\"]")),
+            "deno" => {
+                assert_eq!(artifacts.entry_filename, "index.js");
+                assert!(artifacts.config_files["deno.json"].contains("deno run -A index.js"));
+            }
+            "tencent" => {
+                assert_eq!(
+                    artifacts.entry_filename,
+                    "cloud-functions/api-node/index.mjs"
+                );
+                assert!(artifacts
+                    .config_files
+                    .contains_key("cloud-functions/api-node/config.json"));
+            }
+            _ => unreachable!(),
+        }
+    }
 }

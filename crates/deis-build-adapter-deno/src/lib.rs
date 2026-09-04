@@ -29,6 +29,18 @@ pub fn generate(
     config: &ProjectConfig,
     assets: &[StaticAsset],
 ) -> anyhow::Result<AdapterArtifacts> {
+    generate_with_node_runtime(routes, config, assets, false)
+}
+
+/// Generate a Deno Deploy artifact for the validated Node/npm subset. npm
+/// packages are bundled by the compiler; only approved Node builtins remain
+/// external for Deno's compatibility layer.
+pub fn generate_with_node_runtime(
+    routes: &[(String, String)],
+    config: &ProjectConfig,
+    assets: &[StaticAsset],
+    node_runtime: bool,
+) -> anyhow::Result<AdapterArtifacts> {
     let has_kv = config
         .services
         .as_ref()
@@ -47,7 +59,7 @@ pub fn generate(
     };
 
     // 3. Generate Router Code
-    let router_code = generate_router_code(routes, has_kv, assets);
+    let router_code = generate_router_code(routes, has_kv, assets, node_runtime);
 
     // 4. Generate Config Files
     let mut config_files = Vec::new();
@@ -61,21 +73,23 @@ pub fn generate(
     // built for Deno, whether or not it had heard of uuid, which pins a
     // version on behalf of a project that never asked for one.
     //
-    // Applications that import npm packages should write them as `npm:`
-    // specifiers, which Deno resolves without a map entry. Turning a bare
-    // specifier into a mapped one needs the dependency list, and that has to
-    // come from the compiler - which reads the project - rather than be
-    // invented here.
+    // npm package resolution is a compiler responsibility under Edge Canon;
+    // the deployable must not independently resolve a different version.
     let mut imports = serde_json::Map::new();
     imports.insert(
         "std/".to_string(),
         serde_json::json!("https://deno.land/std@0.208.0/"),
     );
 
+    let entry = if node_runtime {
+        "index.js"
+    } else {
+        "router.ts"
+    };
     let deno_json = serde_json::json!({
         "tasks": {
-            "start": "deno run -A router.ts",
-            "dev": "deno run --watch -A router.ts"
+            "start": format!("deno run -A {entry}"),
+            "dev": format!("deno run --watch -A {entry}")
         },
         "imports": imports
     });
@@ -97,6 +111,7 @@ fn generate_router_code(
     routes: &[(String, String)],
     has_kv: bool,
     assets: &[StaticAsset],
+    bundled_at_root: bool,
 ) -> String {
     let mut imports = String::new();
     let mut route_handlers = String::new();
@@ -145,6 +160,7 @@ fn generate_router_code(
         serde_json::to_string_pretty(&asset_types).unwrap_or_else(|_| "{}".to_string());
 
     let assets_dir = ASSETS_DIR;
+    let assets_prefix = if bundled_at_root { "./" } else { "../" };
     format!(
         r#"/**
  * Deno Deploy Entry Point
@@ -222,7 +238,7 @@ async function serveAsset(pathname: string): Promise<Response | null> {{
   if (contentType === undefined) return null;
 
   try {{
-    const bytes = await Deno.readFile(new URL('../{assets_dir}/' + key, import.meta.url));
+    const bytes = await Deno.readFile(new URL('{assets_prefix}{assets_dir}/' + key, import.meta.url));
     return new Response(bytes, {{ headers: {{ 'content-type': contentType }} }});
   }} catch (error) {{
     // The table said the file was carried and it could not be read, so the
