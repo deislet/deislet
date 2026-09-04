@@ -189,6 +189,7 @@ mod tests {
             module_references: vec![],
             non_literal_module_loads: 0,
             non_literal_module_load_positions: vec![],
+            provider_only_global_references: vec![],
         }
     }
 

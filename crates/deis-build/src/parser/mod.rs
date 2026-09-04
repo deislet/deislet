@@ -1,8 +1,14 @@
-use deis_build_core::{HandlerInfo, ModuleReference, ModuleReferenceKind, ModuleSourcePosition};
-use swc_common::{sync::Lrc, FileName, SourceMap, Span, Spanned};
+use deis_build_core::{
+    HandlerInfo, ModuleReference, ModuleReferenceKind, ModuleSourcePosition,
+    ProviderOnlyGlobalReference,
+};
+use swc_common::{
+    sync::Lrc, FileName, Globals, Mark, SourceMap, Span, Spanned, SyntaxContext, GLOBALS,
+};
 use swc_ecma_ast::*;
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
-use swc_ecma_visit::{Visit, VisitWith};
+use swc_ecma_transforms_base::resolver;
+use swc_ecma_visit::{Visit, VisitMutWith, VisitWith};
 
 pub struct TypeScriptParser {
     source_map: Lrc<SourceMap>,
@@ -35,12 +41,23 @@ impl TypeScriptParser {
         );
 
         let mut parser = Parser::new_from(lexer);
-        let module = parser
+        let mut module = parser
             .parse_module()
             .map_err(|e| anyhow::anyhow!("Parse error: {e:?}"))?;
 
-        let mut visitor = HandlerVisitor::new(self.source_map.clone());
-        module.visit_with(&mut visitor);
+        let visitor = GLOBALS.set(&Globals::new(), || {
+            // Give unresolved globals a stable syntax context before the
+            // policy visitor runs. A spelling such as `WebSocket` can also be
+            // a perfectly portable local class or import; only the unresolved
+            // global is the provider API that EC-STREAM excludes.
+            let unresolved_mark = Mark::new();
+            let top_level_mark = Mark::new();
+            module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, true));
+            let unresolved_context = SyntaxContext::empty().apply_mark(unresolved_mark);
+            let mut visitor = HandlerVisitor::new(self.source_map.clone(), unresolved_context);
+            module.visit_with(&mut visitor);
+            visitor
+        });
 
         Ok(HandlerInfo {
             path: filename.to_string(),
@@ -52,6 +69,7 @@ impl TypeScriptParser {
             module_references: visitor.module_references,
             non_literal_module_loads: visitor.non_literal_module_loads,
             non_literal_module_load_positions: visitor.non_literal_module_load_positions,
+            provider_only_global_references: visitor.provider_only_global_references,
         })
     }
 
@@ -87,6 +105,7 @@ impl TypeScriptParser {
 
 struct HandlerVisitor {
     source_map: Lrc<SourceMap>,
+    unresolved_context: SyntaxContext,
     has_default_export: bool,
     named_exports: Vec<String>,
     used_services: Vec<String>,
@@ -94,12 +113,14 @@ struct HandlerVisitor {
     module_references: Vec<ModuleReference>,
     non_literal_module_loads: usize,
     non_literal_module_load_positions: Vec<ModuleSourcePosition>,
+    provider_only_global_references: Vec<ProviderOnlyGlobalReference>,
 }
 
 impl HandlerVisitor {
-    fn new(source_map: Lrc<SourceMap>) -> Self {
+    fn new(source_map: Lrc<SourceMap>, unresolved_context: SyntaxContext) -> Self {
         Self {
             source_map,
+            unresolved_context,
             has_default_export: false,
             named_exports: Vec::new(),
             used_services: Vec::new(),
@@ -107,6 +128,7 @@ impl HandlerVisitor {
             module_references: Vec::new(),
             non_literal_module_loads: 0,
             non_literal_module_load_positions: Vec::new(),
+            provider_only_global_references: Vec::new(),
         }
     }
 
@@ -156,6 +178,53 @@ impl HandlerVisitor {
             line: location.line,
             column: location.col_display + 1,
         });
+    }
+
+    fn record_provider_only_global(&mut self, name: &str, span: Span) {
+        if !matches!(name, "WebSocket" | "WebSocketPair") {
+            return;
+        }
+        let location = self.source_map.lookup_char_pos(span.lo());
+        let reference = ProviderOnlyGlobalReference {
+            name: name.to_string(),
+            line: location.line,
+            column: location.col_display + 1,
+        };
+        if !self
+            .provider_only_global_references
+            .iter()
+            .any(|existing| existing == &reference)
+        {
+            self.provider_only_global_references.push(reference);
+        }
+    }
+
+    fn is_global_object(&self, expression: &Expr) -> bool {
+        match expression {
+            Expr::Ident(ident) => {
+                matches!(ident.sym.as_ref(), "globalThis" | "self")
+                    && ident.ctxt == self.unresolved_context
+            }
+            Expr::Paren(paren) => self.is_global_object(&paren.expr),
+            _ => false,
+        }
+    }
+
+    fn record_provider_only_property_name(&mut self, property: &PropName) {
+        match property {
+            PropName::Ident(ident) => {
+                self.record_provider_only_global(ident.sym.as_ref(), ident.span)
+            }
+            PropName::Str(value) => {
+                self.record_provider_only_global(&value.value.to_string_lossy(), value.span)
+            }
+            PropName::Computed(computed) => {
+                if let Expr::Lit(Lit::Str(value)) = &*computed.expr {
+                    self.record_provider_only_global(&value.value.to_string_lossy(), value.span);
+                }
+            }
+            PropName::Num(_) | PropName::BigInt(_) => {}
+        }
     }
 }
 
@@ -315,6 +384,30 @@ impl Visit for HandlerVisitor {
         // Check any expression for service usage
         self.check_service_usage(n);
 
+        // WebSocket termination is not in the current provider intersection.
+        // Observe runtime expressions, including computed property access,
+        // without scanning comments, string contents or erased TS types.
+        match n {
+            Expr::Ident(ident) if ident.ctxt == self.unresolved_context => {
+                self.record_provider_only_global(ident.sym.as_ref(), ident.span);
+            }
+            Expr::Member(member) if self.is_global_object(&member.obj) => match &member.prop {
+                MemberProp::Ident(ident) => {
+                    self.record_provider_only_global(ident.sym.as_ref(), ident.span);
+                }
+                MemberProp::Computed(computed) => {
+                    if let Expr::Lit(Lit::Str(value)) = &*computed.expr {
+                        self.record_provider_only_global(
+                            &value.value.to_string_lossy(),
+                            value.span,
+                        );
+                    }
+                }
+                MemberProp::PrivateName(_) => {}
+            },
+            _ => {}
+        }
+
         // These literal forms resolve files just as a static import does.
         // They belong in the staged module graph as well; otherwise a build
         // can ship its eager path and leave its lazy or CommonJS path behind.
@@ -364,6 +457,27 @@ impl Visit for HandlerVisitor {
         }
 
         // Continue visiting children
+        n.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, n: &VarDeclarator) {
+        // Destructuring reads the global property without forming a MemberExpr.
+        if let (Pat::Object(pattern), Some(initializer)) = (&n.name, &n.init) {
+            if self.is_global_object(initializer) {
+                for property in &pattern.props {
+                    match property {
+                        ObjectPatProp::KeyValue(key_value) => {
+                            self.record_provider_only_property_name(&key_value.key);
+                        }
+                        ObjectPatProp::Assign(assign) => self.record_provider_only_global(
+                            assign.key.id.sym.as_ref(),
+                            assign.key.id.span,
+                        ),
+                        ObjectPatProp::Rest(_) => {}
+                    }
+                }
+            }
+        }
         n.visit_children_with(self);
     }
 }
@@ -586,6 +700,65 @@ export default async function handler() { return new Response(String(value)); }
         assert_eq!(info.non_literal_module_loads, 2);
         assert_eq!(info.non_literal_module_load_positions.len(), 2);
         assert_eq!(info.non_literal_module_load_positions[0].line, 1);
+    }
+
+    #[test]
+    fn provider_only_websocket_globals_are_ast_references_not_text_matches() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "type WebSocket = string;\n\
+                 const harmless = 'WebSocketPair'; // new WebSocket('ignored')\n\
+                 const one = new WebSocket(url);\n\
+                 const two = globalThis['WebSocketPair'];\n\
+                 export default function handler() { return new Response(harmless + one + two); }\n",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        assert_eq!(info.provider_only_global_references.len(), 2);
+        assert_eq!(info.provider_only_global_references[0].name, "WebSocket");
+        assert_eq!(info.provider_only_global_references[0].line, 3);
+        assert!(info.provider_only_global_references[0].column > 0);
+        assert_eq!(
+            info.provider_only_global_references[1].name,
+            "WebSocketPair"
+        );
+        assert_eq!(info.provider_only_global_references[1].line, 4);
+        assert!(info.provider_only_global_references[1].column > 0);
+    }
+
+    #[test]
+    fn local_websocket_names_are_not_provider_globals() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "import { WebSocketPair } from './portable.ts';\n\
+                 class WebSocket { constructor(_url: string) {} }\n\
+                 export default function handler() {\n\
+                   return new Response(String(new WebSocket('local')) + WebSocketPair);\n\
+                 }\n",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        assert!(info.provider_only_global_references.is_empty());
+    }
+
+    #[test]
+    fn global_object_destructuring_is_a_provider_reference() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "const { WebSocket: Socket, ['WebSocketPair']: Pair } = globalThis;\n\
+                 export default function handler() { return new Response(String(Socket) + Pair); }\n",
+                "functions/index.ts",
+            )
+            .expect("module parses");
+        assert_eq!(info.provider_only_global_references.len(), 2);
+        assert_eq!(info.provider_only_global_references[0].name, "WebSocket");
+        assert_eq!(
+            info.provider_only_global_references[1].name,
+            "WebSocketPair"
+        );
     }
 
     #[test]

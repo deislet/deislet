@@ -108,10 +108,22 @@ pub struct HandlerInfo {
     /// literal and therefore cannot be put into a self-contained artifact.
     pub non_literal_module_loads: usize,
     pub non_literal_module_load_positions: Vec<ModuleSourcePosition>,
+    /// Runtime references to globals that exist on one provider but are not
+    /// in the unified application surface. These are recorded from the AST so
+    /// comments, string contents and erased TypeScript types do not trigger a
+    /// source-policy failure.
+    pub provider_only_global_references: Vec<ProviderOnlyGlobalReference>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModuleSourcePosition {
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderOnlyGlobalReference {
+    pub name: String,
     pub line: usize,
     pub column: usize,
 }

@@ -603,6 +603,26 @@ impl Compiler {
         ))
     }
 
+    fn refuse_provider_only_globals(path: &str, info: &HandlerInfo) -> anyhow::Result<()> {
+        if info.provider_only_global_references.is_empty() {
+            return Ok(());
+        }
+        let references = info
+            .provider_only_global_references
+            .iter()
+            .map(|reference| {
+                format!(
+                    "{} at {path}:{}:{}",
+                    reference.name, reference.line, reference.column
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(anyhow::anyhow!(
+            "EC_STREAM_WEBSOCKET_NONPORTABLE: {references}. The current Edge Canon standard has no portable WebSocket/WebSocketPair application API, so every target rejects these references before deployment"
+        ))
+    }
+
     /// Stop a build over a handler whose name contains a backslash.
     ///
     /// `\` is a directory separator on Windows and an ordinary character in a
@@ -951,6 +971,7 @@ impl Compiler {
             let parsed = self.parser.parse(&code, &handler_path)?;
             Self::refuse_a_handler_with_no_default_export(&handler_path, Some(&parsed))?;
             Self::refuse_non_literal_module_loads(&handler_path, &parsed)?;
+            Self::refuse_provider_only_globals(&handler_path, &parsed)?;
             module_references.push((handler_path.clone(), parsed.module_references.clone()));
             handler_specifiers.push((handler_path.clone(), parsed.imports.clone()));
             module_queue.push_back((source_path.clone(), parsed.imports));
@@ -1036,6 +1057,7 @@ impl Compiler {
                         let name = dependency.to_string_lossy().to_string();
                         let parsed = self.parser.parse(code, &name)?;
                         Self::refuse_non_literal_module_loads(&name, &parsed)?;
+                        Self::refuse_provider_only_globals(&name, &parsed)?;
                         module_references.push((name.clone(), parsed.module_references.clone()));
                         handler_specifiers.push((name, parsed.imports.clone()));
                         module_queue.push_back((dependency.clone(), parsed.imports));
@@ -1287,6 +1309,7 @@ impl Compiler {
                     // artifact.
                     let derived_path = format!("<derived {vendor} bundle>");
                     let derived = self.parser.parse(&bundled_code, &derived_path)?;
+                    Self::refuse_provider_only_globals(&derived_path, &derived)?;
                     validate_node_npm_project(
                         &project_root,
                         &[(derived_path, derived.module_references)],

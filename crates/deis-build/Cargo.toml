@@ -49,7 +49,8 @@ hex = "0.4"
 swc_core = "0.100"
 swc_common = "18.0"
 swc_ecma_ast = "20.0"
-swc_ecma_parser = "33.0"
+swc_ecma_parser = "34.0"
+swc_ecma_transforms_base = "37.0"
 swc_ecma_visit = "20.0"
 
 [dev-dependencies]
