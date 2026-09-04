@@ -4,7 +4,7 @@
 - 日期：2026-09-04
 - 决策者：产品负责人已确认的统一标准、行业主流语义交集与产品级推进方向
 - 关联：[ADR-019](019-coordinated-data-lifecycle.md)、[ADR-023](023-backend-migration-fence-and-inventory.md)、`../product/phase-analysis-2026-09-03.zh.md` 第 25 节、`../../contracts/v1/backend-restore-set.schema.json`、`../../contracts/v1/backend-restore-report.schema.json`
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/82c77542b209ee2bf96f1e888a0bd51fd1f804f6/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/6679c018896b8d5b424111d11a1005682c359c16/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 决策
 

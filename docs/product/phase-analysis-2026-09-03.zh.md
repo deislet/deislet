@@ -1397,3 +1397,13 @@ Application/framework source + versioned build plan
 - 新增跨目标回归证明 Cloudflare、EdgeOne 与 Deislet 单文件产物均含 eager/lazy 两层 helper，Deno 部署树同时含 route proxy 与完整 project mirror；越界导入和计算式模块加载给出具名失败。原 compiler/build-core/四 adapter 全套测试继续通过。
 - provider 工具验收也发现本机 `npx --package=wrangler@4.129.0` 实际命中了缓存中的 4.86.0；它虽接受产物，但不能作为锁定工具证据。隔离安装并用绝对入口运行的 Wrangler 4.129.0 随后接受同一 Cloudflare 派生产物。修复后的 Deislet 编译器成功生成 bundle，本地真实 `deis dev` 又验证 `/sync`、`/context`、POST `/method` 和结构化 `EDGE_CANON_EVIDENCE` 日志。
 - Deislet commit `4056732f10e5aacd12b88c6f2b86d7484c4a3cb6` 的完整 checks run `33848760058` 已成功；它只覆盖进入本切片前的 provider protocol lock。本模块图修复仍需提交后的新远端 run，不能借用上一 run 宣称绿色。
+
+## 30. P0-SPEC-002 请求体下限、确定性 prepare 与锁迁移
+
+- Edge Canon commit `5128a9f7e5e24e1b351ffadfba47f55b9a8a3b60` 根据两家公开入门档能力补入请求体共同下限：Cloudflare Workers Free 允许 100 MB request body，EdgeOne Edge Functions 公布 1 MB；Draft `EC-WEB-LIMIT-004` 因此只承诺内容编码前、带正确 `Content-Length` 的 1,000,000 字节 body，新增 T015 验证逐字节读回。响应 body、wall time、内存归属、`waitUntil` 宽限和超限后的流式语义仍不得猜测。
+- Edge Canon commit `6679c018896b8d5b424111d11a1005682c359c16` 新增 canonical/derived artifact 两份 schema 和确定性构建器。canonical artifact 从锁定 Git commit 读取 fixture/CPU workload 原始字节并绑定逐文件摘要；provider prepare 先严格复核完整目录、摘要、模式、无符号链接/额外文件，再为 Cloudflare、EdgeOne 和 Deislet 生成各自官方目录形状、薄 wrapper、固定四键 context 和结构化 evidence 日志。输出必须位于独立工作树严格后代，以原子 rename 发布；完全相同请求幂等，冲突内容不覆盖。
+- 三个 adapter manifest 的 `prepare` 已从 pending 改为 implemented，Deislet source revision 固定到 `eeb9dc4bb186bef3b703da976ce3e5e9fee1b5c5`。这只证明可复现派生产物，不证明真实部署：deploy/invoke/collect/cleanup 与所有 case evidence 仍 pending，registry maturity、compliant 和 supported 没有提升。
+- 本地 33 项 Node 自测、15 个能力族/24 条 Draft clause/15 suite/4 backend 治理门禁、JSON Schema 与 diff check 均通过；固定绝对入口的 Wrangler 4.129.0 dry-run 接受 Cloudflare 产物，修复后的 Deislet compiler 能构建同一派生产物并由本地 runtime 验证 sync/context/method/background evidence。Edge Canon run `33852468221` 已成功。
+- Deislet 锁现固定到 `6679c018896b8d5b424111d11a1005682c359c16`，registry 内容未变，SHA-256 仍为 `4b81bac7eabc432be11937cef680f248be37d70c0b9c62cb980360204149a924`；所有 ADR、roadmap、契约 fixture 与三份 target-status 派生视图同步迁移到同一 commit，expected Draft clause 数更新为 24。
+- 模块图修复 commit `eeb9dc4bb186bef3b703da976ce3e5e9fee1b5c5` 的 run `33852192844` 中 compiler job 已成功，但 demo witness 暴露了测试本身的 pipe-buffer 相关缺陷：`definition_of | grep -q` 在函数增大后由 grep 提前退出，producer 收到 SIGPIPE，`pipefail` 把已找到的匹配误报为失败。witness 现先完整捕获函数定义再用 shell 模式匹配，本地全部 witness 通过；必须由后续提交重新取得完整远端绿色证据。
+- 下一阻断项仍是三个后端的真实 deploy/invoke/collect/cleanup：需要短期且幂等的 deployment identity、安全清理、受控 redirect/evidence/connection-barrier 服务、断连客户端，以及结构化 failure/background/CPU/limit 观测。真实远端凭证缺失时不得伪造 evidence，但不阻止继续实现和验证本地可执行路径。

@@ -1511,7 +1511,12 @@ Build completed
 LOG
 
 # And the check quotes it: a summary nobody prints is a summary nobody reads.
-if definition_of check_every_compiler_target_is_built | grep -q 'vendor_verification_summary "\$log"'; then
+# Keep the whole definition in memory before matching it.  A direct
+# `definition_of | grep -q` pipeline lets grep exit as soon as it finds the
+# line; once this function grows beyond a pipe buffer, the producer then gets
+# SIGPIPE and `pipefail` turns a successful match into a failed witness.
+compiler_target_definition=$(definition_of check_every_compiler_target_is_built)
+if [[ "$compiler_target_definition" == *'vendor_verification_summary "$log"'* ]]; then
   pass "the compiler-target check puts the vendor summary in its evidence"
 else
   fail "the compiler-target check puts the vendor summary in its evidence" \
