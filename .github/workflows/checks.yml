@@ -145,7 +145,18 @@ jobs:
         working-directory: crates/deis-control/web
         run: |
           npm ci
-          npm audit --audit-level=high
+          # The registry occasionally answers the audit endpoint with a 5xx.
+          # Retry that same mandatory check; the final failure still fails the
+          # job, so a real high-severity advisory cannot be hidden.
+          for attempt in 1 2 3; do
+            if timeout 60s npm audit --audit-level=high --fetch-retries=1 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=10000; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
           npm run build
 
       # deis-wire's build script compiles the protobuf definitions with

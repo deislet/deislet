@@ -230,10 +230,11 @@ the control pushes. Notable behaviour:
   default. `path`, `app_id`, `timeout_secs` (2), `healthy_after` (1) and
   `unhealthy_after` (2) are the rest of it; `health_check_interval_secs` (5)
   is how often the question is asked. One check pass runs before the process
-  serves its first request, so a node that is up and not answering is out of
-  rotation from the first request rather than for the first interval. When no
-  upstream is in rotation the edge answers `503` and logs how many upstreams
-  there are and how many passed.
+  serves its first request. A newly discovered address is not selectable until
+  one probe succeeds, at startup or after a live configuration change; after
+  that first proof, `healthy_after` and `unhealthy_after` provide the normal
+  recovery/failure hysteresis. When no upstream is in rotation the edge
+  answers `503` and logs how many upstreams there are and how many passed.
 
   A `200` on its own is still thin: `_system`'s `/health` is a handler that
   returns a constant, so it proves the dispatcher ran an isolate and says

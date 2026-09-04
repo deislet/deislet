@@ -15,11 +15,11 @@
 //!    pass before this process serves its first request, so such a node is
 //!    already out of rotation by the first request rather than for the first
 //!    [`health_check_interval`] of this process's life.
-//! 2. A backend pingora has just discovered starts out marked healthy - that
-//!    is pingora's default and it cannot be set from here, so a node added
-//!    mid-life is believed until it is asked. The exposure is one probe, not
-//!    one interval: the background loop runs discovery and the health check
-//!    back to back in the same pass, and both are on the same schedule.
+//! 2. Pingora internally marks a newly discovered backend healthy. The
+//!    platform therefore keeps a separate admission set: a backend is not
+//!    selectable until this process has observed one successful probe. This
+//!    applies both at startup and when an address is added mid-life; after
+//!    admission, pingora's configured success/failure hysteresis takes over.
 //! 3. When nothing passes, [`Balancer::select`] returns `None` and the
 //!    request is answered `503` at the edge, with [`Balancer::rotation`]
 //!    naming how many upstreams there are and how many are in rotation. That
@@ -59,10 +59,11 @@
 //! [`health_check_interval`]: crate::config::SystemConfig::health_check_interval
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use futures::future::join_all;
 use pingora::http::RequestHeader;
@@ -87,6 +88,7 @@ use crate::proxy::APP_ID_HEADER;
 /// Resolves the configured upstreams into backends.
 pub struct ConfigDiscovery {
     config: Arc<ConfigManager>,
+    admission: Arc<Admission>,
 }
 
 #[async_trait]
@@ -136,21 +138,108 @@ impl ServiceDiscovery for ConfigDiscovery {
         if backends.is_empty() {
             warn!("no upstreams available; requests will be answered with 503");
         }
+        self.admission.discovered(&backends);
         debug!(count = backends.len(), "upstreams discovered");
         Ok((backends, HashMap::new()))
     }
 }
 
+/// Backends for which this process has observed at least one successful
+/// probe since their most recent discovery.
+///
+/// Pingora's health state deliberately starts at healthy. That is useful for
+/// passive pools but unsafe for a readiness-gated runtime: a newly added node
+/// could receive a request before the first probe says it is ready. This set
+/// is the missing "unknown" state. Once a backend has passed, ordinary
+/// `healthy_after`/`unhealthy_after` hysteresis remains authoritative.
+struct Admission {
+    discovered: Mutex<BTreeSet<Backend>>,
+    passed: ArcSwap<BTreeSet<Backend>>,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            discovered: Mutex::new(BTreeSet::new()),
+            passed: ArcSwap::from_pointee(BTreeSet::new()),
+        }
+    }
+}
+
+impl Admission {
+    fn discovered(&self, backends: &BTreeSet<Backend>) {
+        // The mutex serialises discovery with a probe completing, while
+        // request selection reads the published set without taking a lock.
+        let mut discovered = self.discovered.lock().expect("upstream admission state");
+        let mut passed = (**self.passed.load()).clone();
+        passed.retain(|backend| backends.contains(backend));
+        self.passed.store(Arc::new(passed));
+        *discovered = backends.clone();
+    }
+
+    fn passed(&self, backend: &Backend) {
+        let discovered = self.discovered.lock().expect("upstream admission state");
+        // A probe can finish while discovery is removing its backend. Do not
+        // let that stale success pre-admit the same address if it is added
+        // again later.
+        if discovered.contains(backend) {
+            let mut passed = (**self.passed.load()).clone();
+            passed.insert(backend.clone());
+            self.passed.store(Arc::new(passed));
+        }
+    }
+
+    fn permits(&self, backend: &Backend) -> bool {
+        self.passed.load().contains(backend)
+    }
+}
+
+/// Records a successful first probe without changing the health check's
+/// configured hysteresis.
+struct AdmittingHealthCheck {
+    inner: Box<dyn HealthCheck + Send + Sync + 'static>,
+    admission: Arc<Admission>,
+}
+
+#[async_trait]
+impl HealthCheck for AdmittingHealthCheck {
+    async fn check(&self, target: &Backend) -> pingora::Result<()> {
+        let result = self.inner.check(target).await;
+        if result.is_ok() {
+            self.admission.passed(target);
+        }
+        result
+    }
+
+    async fn health_status_change(&self, target: &Backend, healthy: bool) {
+        self.inner.health_status_change(target, healthy).await;
+    }
+
+    fn backend_summary(&self, target: &Backend) -> String {
+        self.inner.backend_summary(target)
+    }
+
+    fn health_threshold(&self, success: bool) -> usize {
+        self.inner.health_threshold(success)
+    }
+}
+
 /// The active selection algorithm wrapped around pingora balancers.
 ///
-/// `Clone` is a handle clone and nothing more: every variant holds one `Arc`
-/// to the single `LoadBalancer` the background service updates, so two
+/// `Clone` is a handle clone and nothing more: the selected implementation
+/// holds one `Arc` to the single `LoadBalancer` the background service updates, so two
 /// `Balancer` values are two views of the same pool and the same health
 /// state. `main` keeps one to warm the pool up with after `bootstrap()` and
 /// gives the other to [`crate::proxy::DeisProxy`], which lets every fallible
 /// step of startup finish before the replacement reports itself ready.
 #[derive(Clone)]
-pub enum Balancer {
+pub struct Balancer {
+    inner: BalancerKind,
+    admission: Arc<Admission>,
+}
+
+#[derive(Clone)]
+enum BalancerKind {
     RoundRobin(Arc<LoadBalancer<RoundRobin>>),
     Random(Arc<LoadBalancer<Random>>),
     HeaderHash {
@@ -185,25 +274,51 @@ impl Balancer {
              reload, at this edge and at every other one. Without that, the new machine is \
              managed and deployed to and takes no traffic"
         );
+        let admission = Arc::new(Admission::default());
         let discovery = Box::new(ConfigDiscovery {
             config: Arc::clone(&config),
+            admission: Arc::clone(&admission),
         });
         match system.balancing_strategy() {
             BalancingStrategy::RoundRobin => {
-                let (lb, service) = make::<RoundRobin>(discovery, &system);
-                (Balancer::RoundRobin(lb), service)
+                let (lb, service) = make::<RoundRobin>(discovery, &system, &admission);
+                (
+                    Balancer {
+                        inner: BalancerKind::RoundRobin(lb),
+                        admission,
+                    },
+                    service,
+                )
             }
             BalancingStrategy::Random => {
-                let (lb, service) = make::<Random>(discovery, &system);
-                (Balancer::Random(lb), service)
+                let (lb, service) = make::<Random>(discovery, &system, &admission);
+                (
+                    Balancer {
+                        inner: BalancerKind::Random(lb),
+                        admission,
+                    },
+                    service,
+                )
             }
             BalancingStrategy::HeaderHash(header) => {
-                let (lb, service) = make::<FNVHash>(discovery, &system);
-                (Balancer::HeaderHash { header, lb }, service)
+                let (lb, service) = make::<FNVHash>(discovery, &system, &admission);
+                (
+                    Balancer {
+                        inner: BalancerKind::HeaderHash { header, lb },
+                        admission,
+                    },
+                    service,
+                )
             }
             BalancingStrategy::IpHash => {
-                let (lb, service) = make::<Consistent>(discovery, &system);
-                (Balancer::IpHash(lb), service)
+                let (lb, service) = make::<Consistent>(discovery, &system, &admission);
+                (
+                    Balancer {
+                        inner: BalancerKind::IpHash(lb),
+                        admission,
+                    },
+                    service,
+                )
             }
         }
     }
@@ -220,11 +335,11 @@ impl Balancer {
     /// that decision to before the first request rather than up to one
     /// interval after it.
     pub async fn warm_up(&self) -> pingora::Result<()> {
-        match self {
-            Balancer::RoundRobin(lb) => warm_up_one(lb).await,
-            Balancer::Random(lb) => warm_up_one(lb).await,
-            Balancer::HeaderHash { lb, .. } => warm_up_one(lb).await,
-            Balancer::IpHash(lb) => warm_up_one(lb).await,
+        match &self.inner {
+            BalancerKind::RoundRobin(lb) => warm_up_one(lb, &self.admission).await,
+            BalancerKind::Random(lb) => warm_up_one(lb, &self.admission).await,
+            BalancerKind::HeaderHash { lb, .. } => warm_up_one(lb, &self.admission).await,
+            BalancerKind::IpHash(lb) => warm_up_one(lb, &self.admission).await,
         }
     }
 
@@ -236,23 +351,23 @@ impl Balancer {
     /// refusing the health check (`0` of `n`), and a selection that ran out of
     /// iterations with healthy nodes present (`m` of `n`, `m > 0`).
     pub fn rotation(&self) -> (usize, usize) {
-        match self {
-            Balancer::RoundRobin(lb) => rotation_of(lb),
-            Balancer::Random(lb) => rotation_of(lb),
-            Balancer::HeaderHash { lb, .. } => rotation_of(lb),
-            Balancer::IpHash(lb) => rotation_of(lb),
+        match &self.inner {
+            BalancerKind::RoundRobin(lb) => rotation_of(lb, &self.admission),
+            BalancerKind::Random(lb) => rotation_of(lb, &self.admission),
+            BalancerKind::HeaderHash { lb, .. } => rotation_of(lb, &self.admission),
+            BalancerKind::IpHash(lb) => rotation_of(lb, &self.admission),
         }
     }
 
     /// Selection key for a request under the active strategy.
     pub fn key(&self, session: &Session) -> Vec<u8> {
-        match self {
-            Balancer::RoundRobin(_) | Balancer::Random(_) => Vec::new(),
-            Balancer::HeaderHash { header, .. } => session
+        match &self.inner {
+            BalancerKind::RoundRobin(_) | BalancerKind::Random(_) => Vec::new(),
+            BalancerKind::HeaderHash { header, .. } => session
                 .get_header(header.as_str())
                 .map(|value| value.as_bytes().to_vec())
                 .unwrap_or_default(),
-            Balancer::IpHash(_) => session
+            BalancerKind::IpHash(_) => session
                 .client_addr()
                 .and_then(|addr| addr.as_inet())
                 .map(|addr| addr.ip().to_string().into_bytes())
@@ -279,8 +394,8 @@ impl Balancer {
     /// [`ProxyHttp::upstream_peer`]: pingora::proxy::ProxyHttp::upstream_peer
     pub fn select(&self, key: &[u8], avoid: &[String]) -> Option<Backend> {
         const MAX_ITERATIONS: usize = 256;
-        let accept = |backend: &Backend, healthy: bool| {
-            if !healthy {
+        let accept = |backend: &Backend, healthy: bool, admission: &Admission| {
+            if !healthy || !admission.permits(backend) {
                 return false;
             }
             // The overwhelming majority of requests never fail to connect and
@@ -292,25 +407,39 @@ impl Balancer {
             let addr = backend.addr.to_string();
             !avoid.contains(&addr)
         };
-        match self {
-            Balancer::RoundRobin(lb) => lb.select_with(key, MAX_ITERATIONS, accept),
-            Balancer::Random(lb) => lb.select_with(key, MAX_ITERATIONS, accept),
-            Balancer::HeaderHash { lb, .. } => lb.select_with(key, MAX_ITERATIONS, accept),
-            Balancer::IpHash(lb) => lb.select_with(key, MAX_ITERATIONS, accept),
+        match &self.inner {
+            BalancerKind::RoundRobin(lb) => {
+                lb.select_with(key, MAX_ITERATIONS, |backend, healthy| {
+                    accept(backend, healthy, &self.admission)
+                })
+            }
+            BalancerKind::Random(lb) => lb.select_with(key, MAX_ITERATIONS, |backend, healthy| {
+                accept(backend, healthy, &self.admission)
+            }),
+            BalancerKind::HeaderHash { lb, .. } => {
+                lb.select_with(key, MAX_ITERATIONS, |backend, healthy| {
+                    accept(backend, healthy, &self.admission)
+                })
+            }
+            BalancerKind::IpHash(lb) => lb.select_with(key, MAX_ITERATIONS, |backend, healthy| {
+                accept(backend, healthy, &self.admission)
+            }),
         }
     }
 
     pub fn strategy(&self) -> BalancingStrategy {
-        match self {
-            Balancer::RoundRobin(_) => BalancingStrategy::RoundRobin,
-            Balancer::Random(_) => BalancingStrategy::Random,
-            Balancer::HeaderHash { header, .. } => BalancingStrategy::HeaderHash(header.clone()),
-            Balancer::IpHash(_) => BalancingStrategy::IpHash,
+        match &self.inner {
+            BalancerKind::RoundRobin(_) => BalancingStrategy::RoundRobin,
+            BalancerKind::Random(_) => BalancingStrategy::Random,
+            BalancerKind::HeaderHash { header, .. } => {
+                BalancingStrategy::HeaderHash(header.clone())
+            }
+            BalancerKind::IpHash(_) => BalancingStrategy::IpHash,
         }
     }
 }
 
-async fn warm_up_one<S>(lb: &Arc<LoadBalancer<S>>) -> pingora::Result<()>
+async fn warm_up_one<S>(lb: &Arc<LoadBalancer<S>>, admission: &Admission) -> pingora::Result<()>
 where
     S: BackendSelection + Send + Sync + 'static,
     S::Iter: BackendIter,
@@ -319,7 +448,7 @@ where
     // Parallel: one unreachable node must not add its whole probe timeout to
     // the wait every other node's answer is already behind.
     lb.backends().run_health_check(true).await;
-    let (ready, total) = rotation_of(lb);
+    let (ready, total) = rotation_of(lb, admission);
     if total == 0 {
         // Not fatal: `upstreams` may be empty on purpose while a control
         // plane fills it in, and discovery runs again on every interval.
@@ -342,14 +471,17 @@ where
     Ok(())
 }
 
-fn rotation_of<S>(lb: &Arc<LoadBalancer<S>>) -> (usize, usize)
+fn rotation_of<S>(lb: &Arc<LoadBalancer<S>>, admission: &Admission) -> (usize, usize)
 where
     S: BackendSelection + Send + Sync + 'static,
     S::Iter: BackendIter,
 {
     let backends = lb.backends();
     let all = backends.get_backend();
-    let ready = all.iter().filter(|b| backends.ready(b)).count();
+    let ready = all
+        .iter()
+        .filter(|b| backends.ready(b) && admission.permits(b))
+        .count();
     (ready, all.len())
 }
 
@@ -622,13 +754,17 @@ fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Syn
 fn make<S>(
     discovery: Box<dyn ServiceDiscovery + Send + Sync + 'static>,
     system: &SystemConfig,
+    admission: &Arc<Admission>,
 ) -> (Arc<LoadBalancer<S>>, Box<dyn ServiceWithDependents>)
 where
     S: BackendSelection + Send + Sync + 'static,
     S::Iter: BackendIter,
 {
     let mut backends = Backends::new(discovery);
-    backends.set_health_check(build_health_check(system));
+    backends.set_health_check(Box::new(AdmittingHealthCheck {
+        inner: build_health_check(system),
+        admission: Arc::clone(admission),
+    }));
     let mut lb = LoadBalancer::<S>::from_backends(backends);
     let interval = system.health_check_interval();
     lb.health_check_frequency = Some(interval);
@@ -638,4 +774,55 @@ where
     let service = background_service("upstream discovery and health checks", lb);
     let lb = service.task();
     (lb, Box::new(service))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend(port: u16) -> Backend {
+        Backend::new(&format!("127.0.0.1:{port}")).expect("test backend")
+    }
+
+    #[test]
+    fn a_discovered_backend_is_unknown_until_one_probe_passes() {
+        let admission = Admission::default();
+        let node = backend(8100);
+        admission.discovered(&BTreeSet::from([node.clone()]));
+
+        assert!(!admission.permits(&node));
+        admission.passed(&node);
+        assert!(admission.permits(&node));
+    }
+
+    #[test]
+    fn removal_clears_admission_and_a_late_probe_cannot_restore_it() {
+        let admission = Admission::default();
+        let node = backend(8101);
+        admission.discovered(&BTreeSet::from([node.clone()]));
+        admission.passed(&node);
+        assert!(admission.permits(&node));
+
+        admission.discovered(&BTreeSet::new());
+        admission.passed(&node);
+        assert!(!admission.permits(&node));
+
+        admission.discovered(&BTreeSet::from([node.clone()]));
+        assert!(
+            !admission.permits(&node),
+            "re-adding an address requires a new successful probe"
+        );
+    }
+
+    #[test]
+    fn rediscovering_the_same_backend_keeps_its_proof() {
+        let admission = Admission::default();
+        let node = backend(8102);
+        let pool = BTreeSet::from([node.clone()]);
+        admission.discovered(&pool);
+        admission.passed(&node);
+
+        admission.discovered(&pool);
+        assert!(admission.permits(&node));
+    }
 }

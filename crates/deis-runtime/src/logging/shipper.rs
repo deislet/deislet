@@ -56,6 +56,14 @@ const COMPONENT: &str = "deis-runtime";
 /// Structured field carrying the node id, which the proto has no column for.
 const NODE_FIELD: &str = "node";
 
+/// Structured field carrying the environment half of a canonical tenant.
+///
+/// Most entries have already passed through `logging::layer`, which splits
+/// `shop.preview` into `app_id = shop` and this field. `LogEntry` is public,
+/// though, and direct callers can put the tenant into `app_id`. Normalising
+/// again at the wire boundary makes both paths obey the collector contract.
+const ENVIRONMENT_FIELD: &str = "environment";
+
 /// Log shipper configuration.
 ///
 /// Built from [`LoggingConfig`]; see `crate::config` for what each value means
@@ -535,11 +543,24 @@ fn to_proto(entry: &LogEntry) -> ProtoLogEntry {
         .entry(NODE_FIELD.to_string())
         .or_insert_with(|| entry.source.clone());
 
+    let app_id =
+        entry.app_id.as_deref().map(
+            |app_id| match deis_wire::conventions::split_tenant(app_id) {
+                Some((application, environment)) => {
+                    fields
+                        .entry(ENVIRONMENT_FIELD.to_string())
+                        .or_insert_with(|| environment.to_string());
+                    application.to_string()
+                }
+                None => app_id.to_string(),
+            },
+        );
+
     ProtoLogEntry {
         timestamp_us: micros_since_epoch(entry.timestamp),
         level: proto_level(entry.level) as i32,
         component: COMPONENT.to_string(),
-        app_id: entry.app_id.clone().unwrap_or_default(),
+        app_id: app_id.unwrap_or_default(),
         message: entry.message.clone(),
         fields,
         trace_id: entry.trace_id.clone().unwrap_or_default(),

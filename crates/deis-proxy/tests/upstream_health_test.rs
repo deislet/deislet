@@ -500,18 +500,19 @@ async fn a_node_that_stops_accepting_has_its_requests_carried_by_another() {
 async fn a_node_that_is_listening_but_not_ready_is_given_no_traffic() {
     let backend = Backend::start().await;
     let not_ready = NotReadyNode::start().await;
-    let (top_level_config, extra_config) = second_upstream(not_ready.addr, "http");
+    let (_, extra_config) = second_upstream(not_ready.addr, "http");
     let proxy = Proxy::launch(ProxyOptions {
         upstream: backend.addr,
-        top_level_config,
+        // Leave no second background probe for the test to win by timing.
+        // `unhealthy_after` is two, so pingora still considers this newly
+        // discovered address healthy after the one warm-up failure. The
+        // platform's first-success admission rule must nevertheless keep it
+        // out of rotation from the harness's own startup request onward.
+        top_level_config: "health_check_interval_secs = 3600\n".to_string(),
         extra_config,
         ..Default::default()
     })
     .await;
-
-    // The node has to have been judged before client traffic is counted; see
-    // `wait_until_out_of_rotation`.
-    wait_until_out_of_rotation(&proxy, not_ready.addr).await;
 
     let mut answers = Vec::new();
     for n in 0..REQUESTS {

@@ -338,6 +338,35 @@ mod tests {
     }
 
     #[test]
+    fn to_proto_normalises_a_tenant_supplied_directly_to_a_log_entry() {
+        let entry = LogEntry::new("node-1".to_string(), LogLevel::Info, "ready".to_string())
+            .with_app_id("shop.preview".to_string());
+
+        let proto = to_proto(&entry);
+
+        assert_eq!(proto.app_id, "shop");
+        assert_eq!(
+            proto.fields.get("environment").map(String::as_str),
+            Some("preview")
+        );
+    }
+
+    #[test]
+    fn an_explicit_environment_wins_when_the_app_id_is_a_tenant() {
+        let entry = LogEntry::new("node-1".to_string(), LogLevel::Info, "ready".to_string())
+            .with_app_id("shop.production".to_string())
+            .with_field("environment".to_string(), "preview".to_string());
+
+        let proto = to_proto(&entry);
+
+        assert_eq!(proto.app_id, "shop");
+        assert_eq!(
+            proto.fields.get("environment").map(String::as_str),
+            Some("preview")
+        );
+    }
+
+    #[test]
     fn an_entry_without_optional_fields_maps_to_empty_strings() {
         let entry = LogEntry::new("node-1".to_string(), LogLevel::Info, "hello".to_string());
         let proto = to_proto(&entry);

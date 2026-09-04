@@ -159,6 +159,9 @@ weight = 2
 
 # What the edge asks an upstream before giving it traffic.
 [health_check]
+# A newly discovered address receives no client request until one probe has
+# passed. These thresholds apply after that first proof, so failure hysteresis
+# cannot accidentally admit an unknown node during startup or live discovery.
 # http (default) asks the node; tcp only opens a connection, which a
 # deis-runtime node accepts long before it can serve anything.
 mode = "http"

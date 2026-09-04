@@ -1328,3 +1328,18 @@ Application/framework source + versioned build plan
 - `deis-telemetry restore --from DIR [--into DIR]` 只接受不存在或空目标；复制前复核源 SQLite `integrity_check`、摘要和三类 count，复制后对目标重复相同验证。缺失文件、追加字节、manifest 未知字段/格式、非法摘要、count 漂移或已占用目标均失败关闭。
 - `migration-fences.sqlite` 明确不进入快照。restore 在目标目录创建全新 fence journal 和 backend incarnation，并检查它不同于 manifest 的源 incarnation；旧 receipt、inventory 与 coordinator attempt 因而不能跨恢复继续有效。三个 embedded 数据后端至此都有同语义的本地可验证 snapshot/restore 原语。
 - 新增 4 项 snapshot 回归，覆盖 logs/metrics/traces 全量恢复、源/目标 identity 不同、围栏 journal 排除、恢复后正常查询、空目录、目标占用、文件篡改与畸形分区失败关闭；`deis-telemetry` 当前 134 项单元测试和 20 项集成测试通过。正式 Control Restore ProductOperation、服务停止/目录切换 topology driver、跨三个后端的一致恢复点与回滚仍未完成，本切片不把离线 CLI 冒充产品恢复闭环。
+
+## 23. P0-SPEC-002 Web Fetch 资源证据与可执行 harness 草案
+
+- 2026-09-04 重新核对官方资料：Cloudflare Workers Free 公布每 HTTP 调用 10 ms CPU、每 isolate 128 MB、50 次外部子请求与 6 个同时等待响应头连接；Tencent EdgeOne Edge Functions 公布 200 ms CPU、每执行环境 128 MB、64 次 `fetch` 与 8 个并发 `fetch`，其免费版页面确认该产品处于一般用户可用的免费档。共同下限因此新增为 Draft 条款 `EC-WEB-LIMIT-001..003`：10 ms CPU、50 次外部子请求、6 个并发等待响应头外连。
+- 未公布或口径不一致的事实没有被猜成标准：EdgeOne 响应 body、HTTP wall time、`waitUntil` 宽限仍无公开保证；两家的内存归属、`MB` 精确字节、资源超限时已开始响应流和相邻调用的处理也未对齐。这些空白继续阻断 `minimum-resource-guarantees` 进入 normative-complete。
+- Edge Canon commit `d0f54dd257789604257eba973b364588ca5496a3` 新增 T012–T014 资源用例，并把 EC-WEB harness 从 `planned` 推进为 `draft`。统一 `fixture.mjs`、严格 raw observation schema 与唯一 `oracle.mjs` 已覆盖 T001–T005；adapter 只能负责调用固定版本官方 CLI/API、部署、采集和清理，不能自行提交 pass/fail 或改写断言。
+- harness manifest 明确 `providerAdapters` 仍为空、covered cases 只有前五项；oracle sample 仅是自测而非后端证据。6 项 fixture/oracle 正反测试、JSON Schema 校验与上游治理检查通过，registry 的任何 maturity/compliance/support 均未提升。Deislet 标准锁现固定到该 commit，并把 expected draft clauses 从 20 更新为 23；T006–T014 和三个一等后端真实 adapter 仍是下一阻断项。
+
+## 24. 远端回归暴露的身份与后端准入缺陷
+
+- commit `19085e2a844f386050c8d35e13282f7e25553caa` 的完整 run [`33833433695`](https://github.com/deislet/deislet/actions/runs/33833433695) 最终为 failure。documents、witnesses、compiler/adapters/CLI、product governance 与完整 demo 成功；runtime、control/services 和 workspace audit 三个 job 失败，故该 run 不能作为绿色发布证据。
+- runtime 失败是确定性回归，不是时序问题：直接构造的 `LogEntry` 仍把 `demo.production` 整体放进 `app_id`，新 telemetry canonical identity 校验会拒绝带 `.` 的 application part。发送边界现与 tracing layer 使用同一规则，拆成 `app_id=demo` 与 `environment=production`，且保留显式 environment 优先；真实认证 collector 回归与两项 wire 单测覆盖直接调用路径。
+- proxy 失败揭示 Pingora 新 backend 默认标记 healthy 与 `unhealthy_after=2` 的组合会在第一次失败探测后仍允许一个启动请求。现增加独立 first-success admission：地址在启动或 live discovery 后必须至少通过一次实际 health probe 才能参与选择，之后才由既有 success/failure hysteresis 接管；读取使用 ArcSwap 快照，避免给请求热路径增加互斥锁。移除地址会清除证明，迟到 probe 不能预先放行以后重加的同地址。确定性测试把下一次探测推迟一小时，证明不是依赖测试调度；精确用例连续 30 次及完整 upstream health 8 项均通过。
+- workspace audit 的实际失败是 npm audit endpoint 返回 503，不是发现高危依赖。workflow 对同一个强制 audit 增加单次 60 秒上限与三次重试；最终非零仍使 job 失败，真实 advisory 不会被降级或忽略。
+- Edge Canon commit `d0f54dd257789604257eba973b364588ca5496a3` 的远端 governance run [`33834486055`](https://github.com/deislet/edge-canon/actions/runs/33834486055) 已成功。Deislet 修复仍须以新的完整远端 run 验证，不能用该标准仓库 run 或本地结果代替。
