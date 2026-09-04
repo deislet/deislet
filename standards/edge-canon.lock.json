@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-04T18:52:00+08:00",
+  "resolvedAt": "2026-09-04T19:26:00+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "b0a96f54632b1642ae228e0f2624b9520074b647",
+    "sourceCommit": "0a36dc422b5a343e49b60ba6db36ac406a7da09a",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "contractPath": "standard/contract.json",
     "contractSchemaPath": "schemas/standard-contract.schema.json",
@@ -14,12 +14,17 @@
     "canonicalArtifactSchemaSha256": "2711f0fd63103f9e40b5a2909279e16e9025db6b8616ab5dd4f1265d3ccb5191",
     "canonicalArtifactHarnessPath": "conformance/harness/canonical-build-artifact/harness.json",
     "canonicalArtifactPlatformEvidencePath": "conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json",
+    "routingRequirementsPath": "standard/requirements/routing-static-assets.zh.md",
+    "routingSchemaPath": "schemas/routing-static-assets.schema.json",
+    "routingSchemaSha256": "0ce3dfe6801ff38207dcf4d51a8ae8e1e6ff4ed66de71dcdaed847bd1339b10c",
+    "routingHarnessPath": "conformance/harness/routing-static-assets/harness.json",
+    "routingPlatformEvidencePath": "conformance/evidence/routing-static-assets-platforms-2026-09-04.json",
     "conformanceKitPath": "conformance/kit.json",
     "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
     "registryPath": "conformance/registry.json",
     "registrySchemaPath": "schemas/conformance-registry.schema.json",
     "registrySnapshotPath": "standards/edge-canon.conformance-registry.json",
-    "registrySha256": "bf87d1c0ceb5988ce9860b62b9c54bb267dfd4b741a9d43799210682f2f58f85"
+    "registrySha256": "186175dfa8841af2c91360827ce3aeb7c6ff30a84be9a41be46ff42c97c54ad8"
   },
   "standard": {
     "contractId": "edge-canon.next",
@@ -39,7 +44,7 @@
     "upstreamCommand": "python3 scripts/check-governance.py",
     "upstreamResult": "passed",
     "expectedCapabilityFamilies": 15,
-    "expectedDraftClauses": 40,
+    "expectedDraftClauses": 60,
     "expectedConformanceSuites": 15,
     "expectedBackends": 4
   }
