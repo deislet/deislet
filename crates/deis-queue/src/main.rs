@@ -14,9 +14,9 @@
 //! single-box install; binding anywhere else in that state is refused at
 //! startup. See the crate docs in `lib.rs` and [`deis_queue::auth`].
 
-use anyhow::Result;
-use clap::Parser;
-use deis_queue::{config::Config, server};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use deis_queue::{config::Config, server, snapshot};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -27,6 +27,27 @@ struct Cli {
     /// missing file starts the service on those defaults.
     #[arg(short, long, default_value = "deis-queue.toml")]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Serve the queue. This is also the default with no subcommand.
+    Serve,
+    /// Write a consistent, verifiable queue snapshot into an empty directory.
+    Snapshot {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Restore a queue snapshot into an absent or empty data directory.
+    Restore {
+        #[arg(long)]
+        from: PathBuf,
+        /// Defaults to `data_dir` from the queue configuration.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -44,7 +65,60 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = Config::load(&cli.config)?;
-    let listener = server::bind(&config).await?;
-
-    server::serve(config, listener, server::shutdown_signal()).await
+    match cli.command {
+        None | Some(Command::Serve) => {
+            let listener = server::bind(&config).await?;
+            server::serve(config, listener, server::shutdown_signal()).await
+        }
+        Some(Command::Snapshot { out }) => {
+            let manifest = snapshot::take(&config.data_dir, &out).with_context(|| {
+                format!(
+                    "cannot snapshot queue {} into {}",
+                    config.data_dir.display(),
+                    out.display()
+                )
+            })?;
+            println!(
+                "queue snapshot written to {}\n  backend:      {}\n  messages:     {}\n  dead letters: {}\n  restore:      {}",
+                out.display(),
+                manifest.source_backend_incarnation_id,
+                manifest
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.messages),
+                manifest
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.dead_letters),
+                manifest.restore_with
+            );
+            Ok(())
+        }
+        Some(Command::Restore { from, into }) => {
+            let target = into.unwrap_or_else(|| config.data_dir.clone());
+            let report = snapshot::restore(&from, &target).with_context(|| {
+                format!(
+                    "cannot restore queue {} into {}",
+                    from.display(),
+                    target.display()
+                )
+            })?;
+            println!(
+                "queue restored from {} into {}\n  source backend:   {}\n  restored backend: {}\n  messages:          {}\n  dead letters:      {}",
+                from.display(),
+                target.display(),
+                report.source_backend_incarnation_id,
+                report.restored_backend_incarnation_id,
+                report
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.messages),
+                report
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.dead_letters)
+            );
+            Ok(())
+        }
+    }
 }

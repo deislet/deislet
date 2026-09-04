@@ -65,7 +65,7 @@ Embedded 模式仍是一份 data directory 对应一个 service process，多个
 
 - Control 已通过受管理员权限保护的异步 API 调用两个管理服务并持久化 per-backend/tenant attempt 与契约 evidence，能在客户端断开或 Control 重启后按同一请求恢复；migration 已返回满足 `operation.schema.json` 的公共 Operation，并以 `Idempotency-Key`、`ETag`/`If-Match` 与唯一状态图处理幂等和并发取消。取消只有在所有已取得的 backend fence 精确释放后才进入 `cancelled` 并解除 catalog fence；
 - telemetry、Stateful Objects 与 provider resources 尚无同契约 inventory/fence；
-- deis-store snapshot manifest 已记录源 incarnation，restore 不复制 migration fence journal并立即生成、报告一个新 incarnation；Control 因而能识别同一 endpoint 下的数据替换并拒绝沿用旧 evidence/fence。restore 本身仍未成为受权限、幂等和审计约束的正式 ProductOperation，deis-queue 也尚无产品级 backup/restore；这些完成前，迁移/cutover 仍不得与 restore 重叠，也不能把普通备份恢复当成 fence 延续；
+- deis-store 与 deis-queue snapshot manifest 都记录源 incarnation，restore 不复制 migration fence journal并立即生成、报告一个新 incarnation；两者分别验证内容摘要/SQLite integrity 与 item count，Control 因而能识别同一 endpoint 下的数据替换并拒绝沿用旧 evidence/fence。restore 本身仍未成为受权限、幂等和审计约束的正式 ProductOperation；完成前，迁移/cutover 仍不得与 restore 重叠，也不能把普通备份恢复当成 fence 延续；
 - canonical-first dual-read、copy/verify、atomic cutover、旧 capability 撤销和 tombstone 尚未执行；
 - SQL 当前证据适合 embedded file copy/rename；跨引擎 HA SQL driver 必须产生规范 logical dump digest，不能拿供应商物理文件摘要冒充跨实现相等。
 

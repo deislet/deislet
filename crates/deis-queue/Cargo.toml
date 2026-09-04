@@ -9,6 +9,7 @@ description = "Deislet message queue with lease-based consumption"
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
@@ -22,6 +23,7 @@ clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"
 uuid = { version = "1.12", features = ["v4"] }
 tokio-stream = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

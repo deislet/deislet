@@ -624,6 +624,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 - **`ScheduledEvent` 带上了 `environment`**：控制面按 `(应用, 环境)` 调度，节点也按这对值找处理函数；空值仍按 `production` 解释，与 HTTP 数据面同一条规则。
 - **换版先装好再切**：`RuntimePool::stage_app` 在另一条线程上把新版本建好预热，`activate` 才切流量，旧版本全程在应答，没有不可用窗口。
 - **deis-store 有一致性快照**：`deis-store snapshot` / `restore` 两个子命令。这些 SQLite 都开着 WAL，`cp -r` 拷出来的目录可能缺最近的提交或直接损坏，而且打开时不报错。
+- **deis-queue 也有一致性快照**：`deis-queue snapshot` / `restore` 使用 `VACUUM INTO`，manifest 固定 database digest、message/dead-letter count 与 backend incarnation；restore 双向验证后生成新 incarnation，不复制 migration fence。
 
 ### 仍然开着的
 

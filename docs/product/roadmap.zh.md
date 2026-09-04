@@ -29,12 +29,12 @@
 ## 当前进行中
 
 - `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 已形成 20 条候选条款和 11 个 provider-independent 草案用例。最低资源保证已固定采用所有参考供应商最低免费/入门档共同基线，但具体数值、计量和超限行为仍为 `pending`；执行 harness 仍为 `planned`，其余 14 个能力族尚未开始，故本项继续保持 `active`。
-- `P0-MODEL-001`：七份 Draft schema 与 14 个正反 fixture 已覆盖 canonical identity/artifact/binding/operation/driver、identity migration 和 backend fence evidence。除 canonical ID、tenant transport、catalog inventory/fence 与物理 namespace 外，现已实现共享 `BackendMigration` gRPC、独立且默认关闭的管理认证、持久单调 per-tenant writer fence，以及 KV/SQL/blob/queue 的确定性 inventory。每份后端数据现在具有持久不可变的 incarnation UUIDv7；Control 在 attempt、acquire/receipt/evidence、已捕获状态复核和 cancel/release 全链路绑定该 ID，同一 endpoint 下 restore/替换也会失败关闭。deis-store snapshot 记录源 ID但不复制 fence journal，restore 立即生成并报告新 ID。迁移已返回包含 organization/actor/幂等摘要/request/correlation/child/provider 字段的正式公共 Operation，以唯一状态图、`ETag`/`If-Match` 和可恢复 backend fence release 完成取消；终态历史保留且每个 application 最多一个非终态迁移。当前操作只进入 `waiting`：telemetry/stateful/provider、正式 restore Operation 与 queue backup/restore、live parser、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 仍未完成，故本项继续保持 `active`。
+- `P0-MODEL-001`：七份 Draft schema 与 14 个正反 fixture 已覆盖 canonical identity/artifact/binding/operation/driver、identity migration 和 backend fence evidence。除 canonical ID、tenant transport、catalog inventory/fence 与物理 namespace 外，现已实现共享 `BackendMigration` gRPC、独立且默认关闭的管理认证、持久单调 per-tenant writer fence，以及 KV/SQL/blob/queue 的确定性 inventory。每份后端数据现在具有持久不可变的 incarnation UUIDv7；Control 在 attempt、acquire/receipt/evidence、已捕获状态复核和 cancel/release 全链路绑定该 ID，同一 endpoint 下 restore/替换也会失败关闭。deis-store 与 deis-queue 均有一致、digest/integrity 验证的 snapshot/restore，记录源 ID但不复制 fence journal，restore 立即生成并报告新 ID。迁移已返回包含 organization/actor/幂等摘要/request/correlation/child/provider 字段的正式公共 Operation，以唯一状态图、`ETag`/`If-Match` 和可恢复 backend fence release 完成取消；终态历史保留且每个 application 最多一个非终态迁移。当前操作只进入 `waiting`：telemetry/stateful/provider、正式 restore Operation、live parser、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 仍未完成，故本项继续保持 `active`。
 
 ## 紧接着执行
 
 1. `P0-SPEC-002`：先完成 `web-fetch-events` 的最低资源保证、依赖类型和三后端可执行 harness，再按其闭环逐项完成其余 14 个 mandatory 能力族；`pending` 是发布阻断项。
-2. `P0-MODEL-001`：下一步把已可检测的新 restore incarnation 纳入正式 ProductOperation 与互斥协调，并补齐 queue backup/restore；同时为 telemetry、Stateful Objects、provider resources 补同语义接口，并让 build/deploy/lifecycle producer 复用同一 Operation。只有所有必需 component 的 orphan/unchecked 都为零后，才进入 canonical-first dual-read、copy/verify/cutover、旧 token 撤销与 rollback。后端物理 key 仍不能冒充标准逻辑身份或 capability subject。
+2. `P0-MODEL-001`：下一步把两个后端已可验证、可识别新 incarnation 的 restore 纳入正式 ProductOperation 与互斥协调；同时为 telemetry、Stateful Objects、provider resources 补同语义接口，并让 build/deploy/lifecycle producer 复用同一 Operation。只有所有必需 component 的 orphan/unchecked 都为零后，才进入 canonical-first dual-read、copy/verify/cutover、旧 token 撤销与 rollback。后端物理 key 仍不能冒充标准逻辑身份或 capability subject。
 
 ## 执行规则
 

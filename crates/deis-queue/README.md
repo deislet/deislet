@@ -16,6 +16,13 @@ dead-letter replay and retention. Inventory remains readable while writes are
 frozen. Leaving the setting absent means the management service is not
 registered.
 
+Consistent operator backups use `deis-queue snapshot --out <directory>` and
+`deis-queue restore --from <directory>`. Snapshotting uses SQLite's
+`VACUUM INTO`, records row counts and a SHA-256 in `snapshot.json`, and is safe
+while the queue is live; copying a WAL-mode data directory with `cp -r` is not.
+Restore requires an empty target, rechecks SQLite integrity and the manifest,
+and creates a new backend incarnation instead of copying migration fences.
+
 ## What one tenant can do to every other tenant
 
 **There is no per-tenant quota.** One message body, one batch and one pull

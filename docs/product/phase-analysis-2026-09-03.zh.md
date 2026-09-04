@@ -1301,3 +1301,10 @@ Application/framework source + versioned build plan
 - Control 在任何 backend mutation 前发现并持久绑定 incarnation 到 `identity_migration_backend_attempts`。同一 attempt 后续重试、已捕获 waiting evidence 的只读复核和 cancellation release 都必须观察到相同 ID；不同 ID 即使 endpoint 未变也失败关闭。契约 evidence 新增 `backendIncarnationId`，真实/模拟 gRPC 测试覆盖发现、绑定、回执和同址替换。
 - deis-store snapshot manifest 记录源 incarnation，但继续明确排除 migration fence journal；restore 完成数据校验后立即初始化并打印新 incarnation。测试证明源/目标 ID 不同、目标重启保持 ID、snapshot 不携带 journal。旧 format-1 manifest 仍可读取，其未知源 ID 表达为 `None`，不会伪造历史身份。
 - 这解决的是“检测并阻断替换”，还不是完整 restore 产品流程。restore 尚未成为有 RBAC、幂等键、Operation、互斥锁、审计和重试的 Control lifecycle，deis-queue 也没有产品级 backup/restore；telemetry/Stateful Objects/provider resources、canonical-first dual-read、copy/verify/cutover、旧 capability revoke 与 tombstone 同样继续阻断 `P0-MODEL-001` 完成。
+
+## 20. P0-MODEL-001 Queue snapshot/restore 数据底座
+
+- deis-queue 现在提供与 store 对称的 `snapshot` / `restore` operator command。在线 snapshot 使用 SQLite `VACUUM INTO`，不会把 WAL 与主文件复制在不同提交时刻；完成标志 `snapshot.json` 记录 queue database bytes、SHA-256、message/dead-letter count、源 data directory 与源 backend incarnation。
+- restore 只接受空目标，先要求 manifest 的固定相对路径与 canonical SHA-256，再对源 SQLite 运行 `integrity_check`、重算摘要和两类 item count；复制后对目标重复同一验证。缺文件、附加字节、摘要/count 漂移、未知 manifest 字段/版本或占用目标均失败，不会启动一个看似健康但证据不匹配的 queue。
+- migration fence journal 仍明确不进入 snapshot。成功 restore 在目标立即初始化新的 incarnation，CLI 输出源/目标 ID；回归测试覆盖 ready message、dead letter、租户读取、snapshot 篡改、非空目标、空队列和重启后 ID 稳定。
+- 此切片补齐 embedded store/queue 的本地恢复原语，不把本地路径操作冒充远程产品 API。下一步仍须由 Control 以正式 ProductOperation、RBAC、幂等、互斥、审计和跨后端 manifest 协调它们；物理 restore 前停止服务/切换离线数据目录的执行机制也必须由 deployment topology driver 明确实现。

@@ -551,7 +551,8 @@ sequenceDiagram
 - **先单机**。SQLite + 本地盘对内部规模够用。接口层不暴露单机假设，以后换后端不动
   proto。
 - **不做跨节点复制**。deis-store 是全量复制模型下唯一的有状态点，也是单点。内部使用
-  先接受。**备份是有的**：`deis-store snapshot` / `restore` 两个子命令做一致性快照，
+  先接受。**备份是有的**：`deis-store snapshot` / `restore` 与
+  `deis-queue snapshot` / `restore` 子命令做一致性快照，
   因为这些 SQLite 都开着 WAL，直接 `cp -r` 或 `rsync` 拷出来的目录可能缺最近的提交、
   也可能直接是坏的，而且打开时不会报错。做成子命令而不是 RPC，是因为它是运维动作，
   不该让任何能连到端口的人触发。

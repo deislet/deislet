@@ -114,6 +114,7 @@ pub mod migration;
 pub mod proto;
 pub mod queue;
 pub mod server;
+pub mod snapshot;
 pub mod sqlite;
 pub mod tenant;
 

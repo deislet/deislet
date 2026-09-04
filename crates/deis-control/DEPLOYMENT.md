@@ -793,11 +793,11 @@ document's script. In the order it matters:
   databases *and* the objects, and writes a `snapshot.json` naming both counts;
   a running service takes the same snapshots on a timer once `snapshot_dir` is
   set.
-* **deis-queue** - `<data_dir>/queue.sqlite`, also WAL, and with no snapshot
-  subcommand of its own. Copy it with
-  `sqlite3 -readonly queue.sqlite ".backup out.db"` or `VACUUM INTO`, never
-  with `cp`, and never without `-readonly`: the queue is being written while
-  you copy it. In-flight messages are the loss.
+* **deis-queue** - `deis-queue snapshot --out DIR` and
+  `deis-queue restore --from DIR`. The command uses `VACUUM INTO`, records the
+  database digest plus message/dead-letter counts, and gives a restored data
+  directory a new backend incarnation. Never copy its WAL-mode directory with
+  `cp`; in-flight messages are the loss.
 * **deis-proxy** - the ACME storage directory (`tls.acme.storage_dir`, default
   `acme`). It holds the account key and the issued certificates. Losing it is
   recoverable but not free: the account is registered again and every
