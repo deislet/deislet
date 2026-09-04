@@ -19,7 +19,7 @@ fn stage(project: &Path) {
           import { createHash } from "node:crypto";
           import { platform, version, versions } from "node:process";
 
-          export default function handler() {
+          export default async function handler() {
             const digest = createHash("sha256").update(Buffer.from("edge-canon")).digest("hex");
             const providerGlobals = ["Web" + "Socket", ["WebSocket", "Pair"].join(""), ["WebSocket", "Server"].join("")]
               .map(name => {
@@ -34,7 +34,49 @@ fn stage(project: &Path) {
                   configurable: descriptor?.configurable,
                 };
               });
-            return new Response(JSON.stringify({ digest, platform, version, node: versions.node, providerGlobals }));
+            const transformDescriptor = Object.getOwnPropertyDescriptor(globalThis, "TransformStream");
+            const identity = new TransformStream();
+            const reader = identity.readable.getReader();
+            const writer = identity.writable.getWriter();
+            const [writeResult, readResult] = await Promise.all([
+              writer.write(new Uint8Array([1, 2, 3])),
+              reader.read(),
+            ]);
+            writer.releaseLock();
+            reader.releaseLock();
+            const invalid = new TransformStream();
+            const invalidWriter = invalid.writable.getWriter();
+            let invalidChunk;
+            try {
+              await invalidWriter.write("not-bytes");
+              invalidChunk = { settlement: "fulfill", name: null, code: null };
+            } catch (error) {
+              invalidChunk = { settlement: "reject", name: error.name, code: error.code };
+            }
+            invalidWriter.releaseLock();
+            let configuredTransform;
+            try {
+              Reflect.construct(TransformStream, [{ transform() {} }]);
+              configuredTransform = { settlement: "return", name: null, code: null };
+            } catch (error) {
+              configuredTransform = { settlement: "throw", name: error.name, code: error.code };
+            }
+            return new Response(JSON.stringify({
+              digest, platform, version, node: versions.node, providerGlobals,
+              transform: {
+                descriptor: {
+                  writable: transformDescriptor?.writable,
+                  enumerable: transformDescriptor?.enumerable,
+                  configurable: transformDescriptor?.configurable,
+                },
+                writeResult: writeResult ?? null,
+                chunk: [...readResult.value],
+                invalidChunk,
+                configuredTransform,
+                constructorClosed: TransformStream.prototype.constructor === TransformStream,
+                functionPrototypeClosed: Object.getPrototypeOf(TransformStream) === Function.prototype,
+              },
+            }));
           }
         "#,
     )
@@ -120,7 +162,16 @@ async fn compiler_output_runs_on_the_deislet_node_compatibility_layer() {
             {"name":"WebSocket","type":"undefined","owned":true,"valueIsUndefined":true,"writable":false,"enumerable":false,"configurable":false},
             {"name":"WebSocketPair","type":"undefined","owned":true,"valueIsUndefined":true,"writable":false,"enumerable":false,"configurable":false},
             {"name":"WebSocketServer","type":"undefined","owned":true,"valueIsUndefined":true,"writable":false,"enumerable":false,"configurable":false}
-          ]
+          ],
+          "transform": {
+            "descriptor": {"writable":false,"enumerable":false,"configurable":false},
+            "writeResult": null,
+            "chunk": [1,2,3],
+            "invalidChunk": {"settlement":"reject","name":"TypeError","code":"EC_STREAM_CHUNK_TYPE"},
+            "configuredTransform": {"settlement":"throw","name":"TypeError","code":"EC_STREAM_TRANSFORMER_NONPORTABLE"},
+            "constructorClosed": true,
+            "functionPrototypeClosed": true
+          }
         })
     );
 }

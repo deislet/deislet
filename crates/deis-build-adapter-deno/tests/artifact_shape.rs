@@ -98,6 +98,8 @@ fn test_deno_json_format() {
     // Verify required fields per spec.mdc
     assert!(content.contains("\"tasks\""));
     assert!(content.contains("\"imports\""));
+    let parsed: serde_json::Value = serde_json::from_str(content).expect("deno.json parses");
+    assert_eq!(parsed["imports"], serde_json::json!({}));
 }
 
 #[test]

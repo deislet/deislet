@@ -30,7 +30,7 @@ impl Transformer {
             // leaf dependency also runs it before its own top-level code.
             return Ok(format!(
                 "{}{}",
-                deis_build_core::provider_global_isolation_prelude(),
+                deis_build_core::portable_runtime_prelude(),
                 code
             ));
         }

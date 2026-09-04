@@ -75,11 +75,7 @@ pub fn generate_with_node_runtime(
     //
     // npm package resolution is a compiler responsibility under Edge Canon;
     // the deployable must not independently resolve a different version.
-    let mut imports = serde_json::Map::new();
-    imports.insert(
-        "std/".to_string(),
-        serde_json::json!("https://deno.land/std@0.208.0/"),
-    );
+    let imports = serde_json::Map::new();
 
     let entry = if node_runtime {
         "index.js"
@@ -472,12 +468,9 @@ mod generated_config {
             .as_object()
             .expect("deno.json has an imports map");
 
-        // The std map is this adapter's own, and is the only entry it is
-        // entitled to add on the project's behalf.
-        assert_eq!(
-            imports.keys().collect::<Vec<_>>(),
-            vec!["std/"],
-            "the import map should contain only what this adapter itself needs: {imports:?}"
+        assert!(
+            imports.is_empty(),
+            "an adapter with a closed local graph must not introduce a remote resolver: {imports:?}"
         );
     }
 }

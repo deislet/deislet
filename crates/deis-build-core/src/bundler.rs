@@ -92,7 +92,7 @@ impl BuildBundler {
             // this runtime boundary also closes computed/reflection access to
             // provider globals that are outside the standard intersection.
             banner: Some(AddonOutputOption::String(Some(
-                crate::provider_global_isolation_prelude().to_string(),
+                crate::portable_runtime_prelude().to_string(),
             ))),
             // Keep npm packages fully bundled. Platform::Node would
             // externalize runtime machinery on the bundler's behalf (for

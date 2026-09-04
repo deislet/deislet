@@ -127,7 +127,7 @@ async fn comments_strings_and_erased_types_do_not_become_runtime_references() {
 
 #[tokio::test]
 async fn every_generated_target_seals_reflective_provider_global_access() {
-    let prelude = deis_build_core::provider_global_isolation_prelude();
+    let prelude = deis_build_core::portable_runtime_prelude();
     for vendor in VENDORS {
         let project = tempfile::tempdir().expect("temporary project");
         stage(

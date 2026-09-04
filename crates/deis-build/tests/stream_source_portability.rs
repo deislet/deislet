@@ -2,6 +2,7 @@
 //! not provider-dependent direct constructors or configured transformers.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use deis_build::{Compiler, CompilerOptions};
@@ -152,4 +153,53 @@ async fn a_local_dependency_cannot_hide_a_direct_constructor() {
         "{error}"
     );
     assert!(error.contains("shared/stream.ts:1:"), "{error}");
+}
+
+#[tokio::test]
+async fn every_generated_target_installs_the_identity_byte_runtime_boundary() {
+    let prelude = deis_build_core::portable_runtime_prelude();
+    for vendor in VENDORS {
+        let project = tempfile::tempdir().expect("temporary project");
+        stage(
+            project.path(),
+            vendor,
+            "export default function handler() { const value = new TransformStream(); return new Response(String(value.readable.locked)); }\n",
+        );
+        build(project.path(), vendor)
+            .await
+            .unwrap_or_else(|error| panic!("{vendor} identity runtime build: {error}"));
+
+        let root = project.path().join("dist").join(vendor);
+        let entry = match vendor {
+            "cloudflare" => fs::read_to_string(root.join("index.js")).expect("Cloudflare entry"),
+            "tencent" => {
+                fs::read_to_string(root.join("edge-functions/index.js")).expect("EdgeOne entry")
+            }
+            "deno" => fs::read_to_string(root.join("project/functions/index.ts"))
+                .expect("Deno staged application module"),
+            "deislet" => {
+                let file = fs::File::open(root.join("bundle.zip")).expect("Deislet bundle");
+                let mut archive = zip::ZipArchive::new(file).expect("Deislet ZIP");
+                let mut code = String::new();
+                archive
+                    .by_name("worker/index.js")
+                    .expect("Deislet worker entry")
+                    .read_to_string(&mut code)
+                    .expect("Deislet worker is UTF-8");
+                code
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            entry.starts_with(prelude),
+            "{vendor} does not normalize TransformStream before application code"
+        );
+        for code in [
+            "EC_STREAM_CHUNK_TYPE",
+            "EC_STREAM_TRANSFORMER_NONPORTABLE",
+            "EC_STREAM_RUNTIME_INCOMPATIBLE",
+        ] {
+            assert!(entry.contains(code), "{vendor} runtime omits {code}");
+        }
+    }
 }

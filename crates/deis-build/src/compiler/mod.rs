@@ -639,7 +639,7 @@ impl Compiler {
             .collect::<Vec<_>>()
             .join(", ");
         Err(anyhow::anyhow!(
-            "EC_STREAM_WEBSOCKET_NONPORTABLE: {references}. The current Edge Canon standard has no portable WebSocket/WebSocketPair application API, so every target rejects these references before deployment"
+            "EC_STREAM_WEBSOCKET_NONPORTABLE: {references}. The current Edge Canon standard has no portable WebSocket/WebSocketPair/WebSocketServer application API, so every target rejects these references before deployment"
         ))
     }
 
@@ -1136,11 +1136,7 @@ impl Compiler {
                         module_queue.push_back((dependency.clone(), parsed.imports));
                     }
                     let staged_code = if is_script && vendor == deis_build_adapter_deno::VENDOR {
-                        format!(
-                            "{}{}",
-                            deis_build_core::provider_global_isolation_prelude(),
-                            code
-                        )
+                        format!("{}{}", deis_build_core::portable_runtime_prelude(), code)
                     } else {
                         code.to_string()
                     };
@@ -1273,6 +1269,7 @@ impl Compiler {
                 .iter()
                 .find(|(name, _)| name == "deno.json")
                 .map(|(_, content)| content.as_str());
+            Self::refuse_external_import_map_targets(deno_json)?;
             Self::refuse_specifiers_deno_cannot_resolve(deno_json, &handler_specifiers)?;
         }
 
@@ -1681,6 +1678,36 @@ impl Compiler {
              the project and import it by path.",
             unresolvable.len(),
             unresolvable.join("\n  ")
+        ))
+    }
+
+    /// Generated import-map targets are runtime module edges too. Keeping
+    /// this beside the Deno resolver gate means an adapter regression cannot
+    /// quietly reintroduce a deployment-time URL resolver after application
+    /// source has already passed the shared closure policy.
+    fn refuse_external_import_map_targets(deno_json: Option<&str>) -> anyhow::Result<()> {
+        let Some(text) = deno_json else {
+            return Ok(());
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return Ok(());
+        };
+        let Some(imports) = value.get("imports").and_then(|imports| imports.as_object()) else {
+            return Ok(());
+        };
+        let mut kinds = imports
+            .values()
+            .filter_map(|target| target.as_str())
+            .filter_map(deis_build_core::external_runtime_module_kind)
+            .collect::<Vec<_>>();
+        if kinds.is_empty() {
+            return Ok(());
+        }
+        kinds.sort();
+        kinds.dedup();
+        Err(anyhow::anyhow!(
+            "EC_ARTIFACT_MODULE_EXTERNAL: generated Deno import map contains provider-resolved target class(es): {}. The adapter must carry a closed module graph and cannot delegate completion to deployment-time URL or filesystem resolution",
+            kinds.join(", ")
         ))
     }
 
@@ -2093,5 +2120,21 @@ mod output_mode_tests {
         let message = error.to_string();
         assert!(message.contains("Memory"), "{message}");
         assert!(message.contains("deislet"), "{message}");
+    }
+
+    #[test]
+    fn generated_deno_import_maps_cannot_restore_remote_resolution() {
+        let error = Compiler::refuse_external_import_map_targets(Some(
+            r#"{"imports":{"remote":"https://user:EC_MODULE_SECRET@example.invalid/x.ts"}}"#,
+        ))
+        .expect_err("generated remote import-map target must fail")
+        .to_string();
+        assert!(error.contains("EC_ARTIFACT_MODULE_EXTERNAL"), "{error}");
+        assert!(error.contains("https-scheme"), "{error}");
+        assert!(!error.contains("EC_MODULE_SECRET"), "{error}");
+        Compiler::refuse_external_import_map_targets(Some(
+            r#"{"imports":{"local":"./vendor/local.ts"}}"#,
+        ))
+        .expect("artifact-local import-map target is closed");
     }
 }
