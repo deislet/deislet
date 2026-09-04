@@ -155,6 +155,10 @@ def validate_standard_lock() -> str:
         "routingSchemaPath": "schemas/routing-static-assets.schema.json",
         "routingHarnessPath": "conformance/harness/routing-static-assets/harness.json",
         "routingPlatformEvidencePath": "conformance/evidence/routing-static-assets-platforms-2026-09-04.json",
+        "webPlatformApisRequirementsPath": "standard/requirements/web-platform-apis.zh.md",
+        "webPlatformApisSchemaPath": "schemas/web-platform-apis.schema.json",
+        "webPlatformApisHarnessPath": "conformance/harness/web-platform-apis/harness.json",
+        "webPlatformApisPlatformEvidencePath": "conformance/evidence/web-platform-apis-platforms-2026-09-04.json",
         "conformanceKitPath": "conformance/kit.json",
         "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
         "registryPath": "conformance/registry.json",
@@ -171,10 +175,14 @@ def validate_standard_lock() -> str:
         bool(SHA256.fullmatch(source.get("routingSchemaSha256", ""))),
         "standard lock routing schema digest is not SHA-256",
     )
+    require(
+        bool(SHA256.fullmatch(source.get("webPlatformApisSchemaSha256", ""))),
+        "standard lock Web Platform APIs schema digest is not SHA-256",
+    )
     verification = lock.get("verification", {})
     require(verification.get("upstreamResult") == "passed", "locked upstream governance check did not pass")
     require(verification.get("expectedCapabilityFamilies") == 15, "unexpected capability family count")
-    require(verification.get("expectedDraftClauses") == 60, "unexpected draft clause count")
+    require(verification.get("expectedDraftClauses") == 90, "unexpected draft clause count")
     require(verification.get("expectedConformanceSuites") == 15, "unexpected conformance suite count")
     require(verification.get("expectedBackends") == 4, "unexpected backend record count")
 

@@ -4,11 +4,11 @@
 
 - 决策事实与问题来源：[阶段分析](../product/phase-analysis-2026-09-03.zh.md)
 - 可执行工程路线：[产品级路线](../product/roadmap.zh.md)
-- 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/0a36dc422b5a343e49b60ba6db36ac406a7da09a/proposals/0001-unified-platform-contract/README.zh.md)
-- 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/0a36dc422b5a343e49b60ba6db36ac406a7da09a/standard/contract.json)
-- 上游逐条要求：[standard/requirements.json](https://github.com/deislet/edge-canon/blob/0a36dc422b5a343e49b60ba6db36ac406a7da09a/standard/requirements.json)
-- 上游测试入口：[conformance/kit.json](https://github.com/deislet/edge-canon/blob/0a36dc422b5a343e49b60ba6db36ac406a7da09a/conformance/kit.json)
-- 上游证据 registry：[conformance/registry.json](https://github.com/deislet/edge-canon/blob/0a36dc422b5a343e49b60ba6db36ac406a7da09a/conformance/registry.json)
+- 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/proposals/0001-unified-platform-contract/README.zh.md)
+- 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/contract.json)
+- 上游逐条要求：[standard/requirements.json](https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/requirements.json)
+- 上游测试入口：[conformance/kit.json](https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/kit.json)
+- 上游证据 registry：[conformance/registry.json](https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/registry.json)
 
 | ADR | 决策 | 状态 |
 |---|---|---|

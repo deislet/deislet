@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-002B
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/0a36dc422b5a343e49b60ba6db36ac406a7da09a/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 背景
 
