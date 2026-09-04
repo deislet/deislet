@@ -11,9 +11,9 @@
 //! not a path, and the generated `deno.json` maps nothing to it, so the module
 //! throws as it is evaluated and the whole application serves nothing.
 //!
-//! The deno check is not the bundler's rule copied over - the two resolve
-//! differently on purpose, and a second copy of an allow-list is how two
-//! targets come to disagree. It reads the import map this build generated.
+//! The Deno module-graph check is not the bundler's rule copied over - the two
+//! resolve differently on purpose, and a second copy of an allow-list is how
+//! two targets come to disagree. It reads the import map this build generated.
 
 use std::fs;
 use std::path::Path;
@@ -214,8 +214,8 @@ async fn a_local_dependency_cannot_hide_an_external_runtime_module() {
 }
 
 /// A relative import is Deno's own business and must not be caught by the bare
-/// specifier rule - the staged tree is where it resolves, and `deno check`
-/// reads it when deno is installed.
+/// specifier rule - the staged tree is where it resolves, and Deno's own
+/// module-graph compiler reads it when deno is installed.
 #[tokio::test]
 async fn a_relative_import_between_handlers_still_builds_for_deno() {
     let project = tempfile::tempdir().expect("a temporary project");

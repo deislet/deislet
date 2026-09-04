@@ -158,7 +158,7 @@ fn test_error_handling_present() {
     // Verify error handling is present (per best practices)
     assert!(result.router_code.contains("try"));
     assert!(result.router_code.contains("catch"));
-    assert!(result.router_code.contains("console.error"));
+    assert!(result.support_files[0].1.contains("console.error"));
 }
 
 #[test]

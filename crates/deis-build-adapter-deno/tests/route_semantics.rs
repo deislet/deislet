@@ -29,11 +29,30 @@ fn generated_router_preserves_catch_all_names_and_encodes_js_literals() {
     assert!(artifacts
         .router_code
         .contains("matchRoute(url.pathname, \"/quo'te\")"));
-    assert!(artifacts.router_code.contains("if (part === '*')"));
+    let runtime = &artifacts.support_files[0].1;
+    assert!(runtime.contains("if (part === '*')"));
+    assert!(runtime.contains("params['*'] = rest"));
+    assert!(runtime.contains("params[wildcardName] = rest"));
+}
+
+#[test]
+fn generated_handler_boundary_awaits_and_returns_the_fixed_non_leaking_error() {
+    let artifacts = generate(
+        &[("/".to_string(), "../src/index.ts".to_string())],
+        &config(),
+        &[],
+    )
+    .unwrap();
+    let runtime = &artifacts.support_files[0].1;
+
     assert!(artifacts
-        .context_builder_code
-        .contains("params['*'] = rest"));
-    assert!(artifacts
-        .context_builder_code
-        .contains("params[wildcardName] = rest"));
+        .router_code
+        .contains("return await invokeEdgeCanonHandler"));
+    assert!(runtime.contains("const result = await invoke()"));
+    assert!(runtime.contains("EC_HANDLER_THROWN"));
+    assert!(runtime.contains("EC_HANDLER_RESULT_INVALID"));
+    assert!(runtime.contains("'content-type': 'text/plain; charset=utf-8'"));
+    assert!(runtime.contains("'cache-control': 'no-store'"));
+    assert!(runtime.contains("Internal Server Error\\n"));
+    assert!(!runtime.contains("error instanceof Error ? error.message"));
 }

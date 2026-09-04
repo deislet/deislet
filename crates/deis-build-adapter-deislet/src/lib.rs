@@ -81,6 +81,10 @@ pub fn generate(
         context_builder_code: String::new(),
         kv_adapter_code: None,
         config_files: Vec::new(),
+        support_files: vec![(
+            "edge-canon-runtime.js".to_string(),
+            deis_build_core::javascript_runtime_module(false),
+        )],
     })
 }
 

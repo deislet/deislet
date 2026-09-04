@@ -143,6 +143,8 @@ def validate_standard_lock() -> str:
     )
     expected_sources = {
         "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
+        "webFetchEventsFixturePath": "conformance/harness/web-fetch-events/fixture.mjs",
+        "webFetchEventsCpuWorkloadPath": "conformance/harness/web-fetch-events/cpu-workload.mjs",
         "contractPath": "standard/contract.json",
         "contractSchemaPath": "schemas/standard-contract.schema.json",
         "requirementsPath": "standard/requirements.json",
@@ -179,6 +181,18 @@ def validate_standard_lock() -> str:
     }
     for key, expected in expected_sources.items():
         require(source.get(key) == expected, f"standard lock {key} must be {expected}")
+    for source_key, local_name in (
+        ("webFetchEventsFixtureSha256", "edge-canon-web-fetch-events.mjs"),
+        ("webFetchEventsCpuWorkloadSha256", "edge-canon-web-fetch-events-cpu-workload.mjs"),
+    ):
+        digest = source.get(source_key, "")
+        require(bool(SHA256.fullmatch(digest)), f"standard lock {source_key} is not SHA-256")
+        local_fixture = ROOT / "standards" / "fixtures" / local_name
+        require(local_fixture.is_file(), f"vendored fixture is missing: {local_name}")
+        require(
+            hashlib.sha256(local_fixture.read_bytes()).hexdigest() == digest,
+            f"vendored fixture differs from the standard lock: {local_name}",
+        )
     require(
         bool(SHA256.fullmatch(source.get("canonicalArtifactSchemaSha256", ""))),
         "standard lock canonical artifact schema digest is not SHA-256",

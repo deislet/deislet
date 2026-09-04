@@ -13,7 +13,9 @@
 /// if they ever stop agreeing.
 pub const VENDOR: &str = "tencent";
 
-use deis_build_core::{AdapterArtifacts, ProjectConfig, StaticAsset};
+use deis_build_core::{
+    javascript_runtime_module, javascript_string, AdapterArtifacts, ProjectConfig, StaticAsset,
+};
 
 /// Where the compiler stages this project's static files inside the EdgeOne
 /// output directory: the deployment root itself.
@@ -92,6 +94,10 @@ pub fn generate_with_node_runtime(
         context_builder_code,
         kv_adapter_code,
         config_files,
+        support_files: vec![(
+            "edge-canon-runtime.js".to_string(),
+            javascript_runtime_module(false),
+        )],
     })
 }
 
@@ -100,8 +106,8 @@ fn generate_router_code(routes: &[(String, String)], _has_kv: bool, node_runtime
     let mut route_handlers = String::new();
 
     for (i, (route, import_path)) in routes.iter().enumerate() {
-        let import_literal = serde_json::to_string(import_path).expect("serialize import path");
-        let route_literal = serde_json::to_string(route).expect("serialize route");
+        let import_literal = javascript_string(import_path);
+        let route_literal = javascript_string(route);
         let wildcard_name = deis_build_core::routes::wildcard_name(
             deis_build_core::routes::staged_handler_path(import_path),
         )
@@ -119,7 +125,7 @@ fn generate_router_code(routes: &[(String, String)], _has_kv: bool, node_runtime
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(pathname, {route_literal})) {{
     const enhancedContext = buildEnhancedContext(context, {route_literal}, {wildcard_name});
-    return {invocation};
+    return await invokeEdgeCanonHandler(() => {invocation});
   }}
 "#
         ));
@@ -130,7 +136,6 @@ fn generate_router_code(routes: &[(String, String)], _has_kv: bool, node_runtime
     } else {
         ""
     };
-
     format!(
         r#"/**
  * EdgeOne Pages {} Entry Point
@@ -142,45 +147,23 @@ fn generate_router_code(routes: &[(String, String)], _has_kv: bool, node_runtime
  * - Only uses Web APIs from approved list (line 899-928)
  */
 
+import {{ invokeEdgeCanonHandler, edgeCanonFailureResponse, matchRoute }} from './edge-canon-runtime.js';
 import {{ buildEnhancedContext }} from './adapters/context-builder';
 {node_runtime_import}{imports}
 
 // Main entry point as per EdgeOne spec (line 847)
-export function onRequest(context) {{
+export async function onRequest(context) {{
   try {{
     const pathname = context.request.url ? new URL(context.request.url).pathname : '/';
 
 {route_handlers}
     // 404 Not Found
     return new Response('Not Found', {{ status: 404 }});
-  }} catch (error) {{
-    // Error handling with console API (line 900)
-    console.error('EdgeOne Function Error:', error);
-    return new Response('Internal Error: ' + (error.message || String(error)), {{
-      status: 500,
-      headers: {{ 'content-type': 'text/plain' }}
-    }});
+  }} catch (_) {{
+    return edgeCanonFailureResponse('EC_PROVIDER_CONTEXT_INVALID');
   }}
 }}
 
-// Route matching helper - supports exact match and dynamic params
-function matchRoute(pathname, route) {{
-  const routeParts = route.split('/').filter(Boolean);
-  const pathParts = pathname.split('/').filter(Boolean);
-  for (let i = 0; i < routeParts.length; i++) {{
-    const part = routeParts[i];
-    if (part === '*') return i === routeParts.length - 1;
-    if (i >= pathParts.length) return false;
-    if (part.startsWith(':')) continue;
-    if (decodeSegment(part) !== decodeSegment(pathParts[i])) return false;
-  }}
-  return routeParts.length === pathParts.length;
-}}
-
-function decodeSegment(segment) {{
-  try {{ return decodeURIComponent(segment); }}
-  catch (_) {{ return segment; }}
-}}
 "#,
         if node_runtime {
             "Node Function"
@@ -262,7 +245,6 @@ fn generate_context_builder_code(has_kv: bool) -> String {
     } else {
         ""
     };
-
     format!(
         r#"/**
  * EdgeOne Context Builder
@@ -272,7 +254,7 @@ fn generate_context_builder_code(has_kv: bool) -> String {
  * - Only uses approved Web APIs (line 899-928)
  * - Avoids unsupported syntax (no spread operators, Object.fromEntries, etc)
  */
-{kv_import}
+{kv_import}import {{ extractParams }} from '../edge-canon-runtime.js';
 // Build enhanced context with utility methods
 export function buildEnhancedContext(context, route, wildcardName) {{
   const request = context.request;
@@ -316,32 +298,6 @@ export function buildEnhancedContext(context, route, wildcardName) {{
       }}
     }}
   }};
-}}
-
-// Extract dynamic route parameters
-function extractParams(pathname, route, wildcardName) {{
-  const params = {{}};
-  const routeParts = route.split('/').filter(Boolean);
-  const pathParts = pathname.split('/').filter(Boolean);
-
-  for (let i = 0; i < routeParts.length; i++) {{
-    const part = routeParts[i];
-    if (part === '*') {{
-      const rest = pathParts.slice(i).map(decodeSegment).join('/');
-      params['*'] = rest;
-      if (wildcardName !== null) params[wildcardName] = rest;
-    }} else if (part.startsWith(':')) {{
-      const paramName = part.slice(1);
-      params[paramName] = decodeSegment(pathParts[i] || '');
-    }}
-  }}
-
-  return params;
-}}
-
-function decodeSegment(segment) {{
-  try {{ return decodeURIComponent(segment); }}
-  catch (_) {{ return segment; }}
 }}
 
 // Parse cookies from request

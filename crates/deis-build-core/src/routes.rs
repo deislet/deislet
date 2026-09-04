@@ -37,6 +37,112 @@
 /// it apart again to find out whether a file sits *at* the function root.
 pub const STAGED_HANDLER_PREFIX: &str = "../src/";
 
+/// Encode an application-controlled value as a JavaScript string literal.
+///
+/// Route names and import specifiers come from the project file tree. They
+/// must never be interpolated between quotes by a provider adapter: a legal
+/// apostrophe, line separator or backslash in a file name would otherwise
+/// change the generated module. JSON strings are valid JavaScript string
+/// literals and give every adapter one escaping rule.
+pub fn javascript_string(value: &str) -> String {
+    serde_json::to_string(value).expect("a Rust string always serialises as JSON")
+}
+
+/// Provider-neutral route matching code embedded by JavaScript/TypeScript
+/// adapters.
+///
+/// Keep this code untyped: it is valid in both `.js` and `.ts` outputs. A
+/// provider adapter may choose its native entrypoint shape, but it may not
+/// choose different path semantics.
+pub const JAVASCRIPT_ROUTE_MATCHER: &str = r#"export function matchRoute(pathname, route) {
+  const routeParts = route.split('/').filter(Boolean);
+  const pathParts = pathname.split('/').filter(Boolean);
+  for (let i = 0; i < routeParts.length; i++) {
+    const part = routeParts[i];
+    if (part === '*') return i === routeParts.length - 1;
+    if (i >= pathParts.length) return false;
+    if (part.startsWith(':')) continue;
+    if (decodeRouteSegment(part) !== decodeRouteSegment(pathParts[i])) return false;
+  }
+  return routeParts.length === pathParts.length;
+}"#;
+
+/// Provider-neutral parameter extraction code embedded in generated context
+/// builders. `wildcardName` preserves the name from `[[catch]]` while `*`
+/// remains the stable cross-artifact spelling of a catch-all.
+pub const JAVASCRIPT_ROUTE_PARAM_EXTRACTOR: &str = r#"export function extractParams(pathname, route, wildcardName) {
+  const params = {};
+  const routeParts = route.split('/').filter(Boolean);
+  const pathParts = pathname.split('/').filter(Boolean);
+
+  routeParts.forEach((part, i) => {
+    if (part === '*') {
+      const rest = pathParts.slice(i).map(decodeRouteSegment).join('/');
+      params['*'] = rest;
+      if (wildcardName !== null) params[wildcardName] = rest;
+    } else if (part.startsWith(':')) {
+      params[part.slice(1)] = decodeRouteSegment(pathParts[i] || '');
+    }
+  });
+
+  return params;
+}"#;
+
+const JAVASCRIPT_ROUTE_DECODER: &str = r#"function decodeRouteSegment(segment) {
+  try { return decodeURIComponent(segment); }
+  catch (_) { return segment; }
+}"#;
+
+/// The common Edge Canon handler boundary used by provider entry modules.
+///
+/// It deliberately records only the stable failure code. Application error
+/// messages can contain secrets and must not become response data (or an
+/// adapter-authored log field). A provider evidence collector can associate
+/// the structured code with its invocation without parsing an error page.
+pub const JAVASCRIPT_HANDLER_BOUNDARY: &str = r#"export async function invokeEdgeCanonHandler(invoke) {
+  try {
+    const result = await invoke();
+    if (!(result instanceof Response)) {
+      return edgeCanonFailureResponse('EC_HANDLER_RESULT_INVALID');
+    }
+    return result;
+  } catch (_) {
+    return edgeCanonFailureResponse('EC_HANDLER_THROWN');
+  }
+}
+
+export function edgeCanonFailureResponse(failureCode) {
+  console.error('Edge Canon invocation failure', { failureCode });
+  return new Response('Internal Server Error\n', {
+    status: 500,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store'
+    }
+  });
+}"#;
+
+/// One module containing the application-independent JavaScript semantics all
+/// provider adapters import. Deno's unbundled Web output also executes the
+/// runtime isolation prelude from this first dependency; bundled targets get
+/// the same prelude from the bundler banner and avoid carrying it twice.
+pub fn javascript_runtime_module(include_portable_boundary: bool) -> String {
+    let mut module = String::new();
+    if include_portable_boundary {
+        module.push_str(crate::portable_runtime_prelude());
+        module.push('\n');
+    }
+    module.push_str(JAVASCRIPT_HANDLER_BOUNDARY);
+    module.push_str("\n\n");
+    module.push_str(JAVASCRIPT_ROUTE_DECODER);
+    module.push_str("\n\n");
+    module.push_str(JAVASCRIPT_ROUTE_MATCHER);
+    module.push_str("\n\n");
+    module.push_str(JAVASCRIPT_ROUTE_PARAM_EXTRACTOR);
+    module.push('\n');
+    module
+}
+
 /// The handler's path under the function root, recovered from the specifier the
 /// compiler built with [`STAGED_HANDLER_PREFIX`].
 ///
@@ -237,6 +343,28 @@ fn escape_literal(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn javascript_literals_cannot_be_broken_by_project_paths() {
+        assert_eq!(
+            javascript_string("../src/a'b\\c.ts"),
+            r#""../src/a'b\\c.ts""#
+        );
+        assert_eq!(javascript_string("/line\nnext"), "\"/line\\nnext\"");
+    }
+
+    #[test]
+    fn shared_javascript_runtime_carries_the_canonical_route_and_error_rules() {
+        assert!(JAVASCRIPT_ROUTE_MATCHER.contains("part === '*'"));
+        assert!(JAVASCRIPT_ROUTE_MATCHER.contains("decodeRouteSegment(pathParts[i])"));
+        assert!(JAVASCRIPT_ROUTE_PARAM_EXTRACTOR.contains("params['*'] = rest"));
+        assert!(JAVASCRIPT_ROUTE_PARAM_EXTRACTOR.contains("params[wildcardName] = rest"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("await invoke()"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("EC_HANDLER_THROWN"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("EC_HANDLER_RESULT_INVALID"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("Internal Server Error\\n"));
+        assert!(JAVASCRIPT_HANDLER_BOUNDARY.contains("'cache-control': 'no-store'"));
+    }
 
     #[test]
     fn the_root_index_is_the_root_route() {

@@ -301,7 +301,10 @@ impl Compiler {
                 use std::process::Command;
                 // Check for deno
                 if Command::new("deno").arg("--version").output().is_ok() {
-                    println!("{}", "  Create smoke test (deno check)...".dimmed());
+                    println!(
+                        "{}",
+                        "  Create smoke test (deno cache --no-check --no-remote)...".dimmed()
+                    );
                     let bundled_entry = output_dir.join("index.js");
                     let source_entry = output_dir.join("_deis_internal/router.ts");
                     let entry_point = if bundled_entry.is_file() {
@@ -316,30 +319,51 @@ impl Compiler {
                     if !entry_point.exists() {
                         return Err(anyhow::anyhow!(
                             "the deno target has no entry point at {}, so there is nothing for \
-                             `deno check` to read and nothing for Deno Deploy to run",
+                             `deno cache` to read and nothing for Deno Deploy to run",
                             entry_point.display()
                         ));
                     }
+                    // This is deliberately a module-graph compilation/loadability
+                    // check, not a Deno-only TypeScript policy gate. Cloudflare,
+                    // EdgeOne and Deislet accept JavaScript-call semantics such as
+                    // passing an argument to a zero-parameter function and do not
+                    // impose Deno's `noImplicitAny` defaults on `.ts` files. Letting
+                    // one target reject that same portable source would make the
+                    // provider select the application contract. Shared source and
+                    // capability validation already ran before adapter selection;
+                    // `cache --no-check` still parses/transpiles every module and
+                    // resolves the complete staged graph. `--no-remote` makes the
+                    // closure promise fail closed even if a generated import edge
+                    // regresses past the compiler's own external-module gate.
                     let status = Command::new("deno")
-                        .args(["check", entry_point.to_str().unwrap()])
+                        .args([
+                            "cache",
+                            "--no-check",
+                            "--no-remote",
+                            entry_point.to_str().unwrap(),
+                        ])
                         .current_dir(output_dir)
                         .status()?;
 
                     if !status.success() {
                         return Err(anyhow::anyhow!(
-                            "`deno check` refused this program (exit {}); its output above says \
-                             why. Deno Deploy would fail to load the same files",
+                            "`deno cache --no-check --no-remote` refused this module graph (exit \
+                             {}); its output above says why. Deno Deploy would fail to parse or \
+                             load the same files",
                             status.code().unwrap_or(-1)
                         ));
                     }
                     Ok(Verification::Ran(
-                        "deno check accepted the program".to_string(),
+                        "deno parsed and resolved the closed module graph (cache --no-check \
+                         --no-remote)"
+                            .to_string(),
                     ))
                 } else {
                     Ok(Verification::Skipped(
                         "the deno target was not verified: 'deno' is not on PATH, so nothing \
-                         type-checked this program. Install deno to have the build refuse a \
-                         program Deno Deploy would reject"
+                         parsed and resolved its generated module graph with the provider tool. \
+                         Install deno to have the build refuse a program Deno Deploy could not \
+                         load"
                             .to_string(),
                     ))
                 }
@@ -1135,11 +1159,7 @@ impl Compiler {
                         handler_specifiers.push((name, parsed.imports.clone()));
                         module_queue.push_back((dependency.clone(), parsed.imports));
                     }
-                    let staged_code = if is_script && vendor == deis_build_adapter_deno::VENDOR {
-                        format!("{}{}", deis_build_core::portable_runtime_prelude(), code)
-                    } else {
-                        code.to_string()
-                    };
+                    let staged_code = code.to_string();
                     Self::write_staged_file(&mirror_path, staged_code.as_bytes())?;
                     total_size += staged_code.len();
                     if should_collect_memory {
@@ -1296,6 +1316,35 @@ impl Compiler {
         // Prepare System Directory
         let system_dir = build_dir.join("_deis_internal");
         fs::create_dir_all(&system_dir)?;
+
+        // Provider-neutral support modules are ordinary dependencies of the
+        // generated router. Bundled targets fold them into their single entry;
+        // Deno keeps the `.js` file beside its `.ts` router, so generated
+        // JavaScript stays JavaScript and is evaluated before application
+        // modules without being copied into every source file.
+        for (relative, content) in artifacts.support_files {
+            let relative_path = Path::new(&relative);
+            if relative_path.is_absolute()
+                || relative_path
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(anyhow::anyhow!(
+                    "the {vendor} adapter produced an unsafe support path {relative:?}"
+                ));
+            }
+            let output_path = system_dir.join(relative_path);
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&output_path, &content)?;
+            if should_collect_memory {
+                memory_system_files.insert(
+                    format!("_deis_internal/{}", relative.replace('\\', "/")),
+                    content,
+                );
+            }
+        }
 
         // Write System Code
         fs::write(system_dir.join("router.ts"), &artifacts.router_code)?;
@@ -1631,14 +1680,17 @@ impl Compiler {
     /// copy of the allow-list disagreeing with it.
     ///
     /// Only bare specifiers. A relative or absolute path is Deno's own
-    /// resolution against the staged tree and is left to `deno check`, which
-    /// this build runs when deno is installed.
+    /// resolution against the staged tree and is left to Deno's module-graph
+    /// compiler, which this build runs when deno is installed.
     ///
     /// A handler swc could not parse contributes no specifiers and is passed
     /// over here, the same tolerance `refuse_a_handler_with_no_default_export`
     /// has and for the same reason: swc and Deno are two different parsers,
     /// and failing a build on source Deno would have accepted is the worse
-    /// trade. `deno check` is what speaks for those files.
+    /// trade. `deno cache --no-check --no-remote` is what speaks for whether
+    /// those files parse and form a loadable, closed Deno module graph. Type
+    /// policy is deliberately not target-specific; portable semantic checks
+    /// run before this provider branch.
     fn refuse_specifiers_deno_cannot_resolve(
         deno_json: Option<&str>,
         handlers: &[(String, Vec<String>)],

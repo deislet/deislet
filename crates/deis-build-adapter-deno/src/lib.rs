@@ -13,7 +13,9 @@
 /// if they ever stop agreeing.
 pub const VENDOR: &str = "deno";
 
-use deis_build_core::{AdapterArtifacts, ProjectConfig, StaticAsset};
+use deis_build_core::{
+    javascript_runtime_module, javascript_string, AdapterArtifacts, ProjectConfig, StaticAsset,
+};
 
 /// Where the compiler stages this project's static files inside the Deno
 /// output directory.
@@ -100,6 +102,10 @@ pub fn generate_with_node_runtime(
         context_builder_code,
         kv_adapter_code,
         config_files,
+        support_files: vec![(
+            "edge-canon-runtime.js".to_string(),
+            javascript_runtime_module(!node_runtime),
+        )],
     })
 }
 
@@ -113,8 +119,8 @@ fn generate_router_code(
     let mut route_handlers = String::new();
 
     for (i, (route, import_path)) in routes.iter().enumerate() {
-        let import_literal = serde_json::to_string(import_path).expect("serialize import path");
-        let route_literal = serde_json::to_string(route).expect("serialize route");
+        let import_literal = javascript_string(import_path);
+        let route_literal = javascript_string(route);
         let wildcard_name = deis_build_core::routes::wildcard_name(
             deis_build_core::routes::staged_handler_path(import_path),
         )
@@ -130,7 +136,7 @@ fn generate_router_code(
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(url.pathname, {route_literal})) {{
     const context = buildContext(request, {route_literal}, {wildcard_name});
-    return {invocation};
+    return await invokeEdgeCanonHandler(() => {invocation});
   }}
 "#
         ));
@@ -188,6 +194,7 @@ fn generate_router_code(
  * See: https://docs.deno.com/deploy/
  */
 
+import {{ invokeEdgeCanonHandler, edgeCanonFailureResponse, matchRoute }} from './edge-canon-runtime.js';
 {node_runtime_import}{imports}{kv_import}{context_builder_import}
 
 // Initialize Deno KV database
@@ -206,38 +213,10 @@ Deno.serve(async (request: Request): Promise<Response> => {{
 {route_handlers}
     // 404 Not Found
     return new Response('Not Found', {{ status: 404 }});
-  }} catch (error) {{
-    console.error('Deno Deploy Error:', error);
-    return new Response(
-      // `error` is `unknown` in a catch clause, so reaching for `.message`
-      // without narrowing first is a type error: `deno check` refused this
-      // module, which is exactly the smoke test the build runs on it.
-      JSON.stringify({{ error: error instanceof Error ? error.message : String(error) }}),
-      {{
-        status: 500,
-        headers: {{ 'content-type': 'application/json' }}
-      }}
-    );
+  }} catch (_) {{
+    return edgeCanonFailureResponse('EC_PROVIDER_CONTEXT_INVALID');
   }}
 }});
-
-function matchRoute(pathname: string, route: string): boolean {{
-  const routeParts = route.split('/').filter(Boolean);
-  const pathParts = pathname.split('/').filter(Boolean);
-  for (let i = 0; i < routeParts.length; i++) {{
-    const part = routeParts[i];
-    if (part === '*') return i === routeParts.length - 1;
-    if (i >= pathParts.length) return false;
-    if (part.startsWith(':')) continue;
-    if (decodeSegment(part) !== decodeSegment(pathParts[i])) return false;
-  }}
-  return routeParts.length === pathParts.length;
-}}
-
-function decodeSegment(segment: string): string {{
-  try {{ return decodeURIComponent(segment); }}
-  catch (_) {{ return segment; }}
-}}
 
 // The static files this build carried, and the media type each one is served
 // as. Written by the compiler from the project's assets directory.
@@ -282,7 +261,6 @@ fn generate_context_builder_code(has_kv: bool) -> String {
     } else {
         "kv: undefined,"
     };
-
     format!(
         r#"/**
  * Deno Deploy Context Builder
@@ -296,7 +274,7 @@ fn generate_context_builder_code(has_kv: bool) -> String {
  * See: https://docs.deno.com/deploy/api/runtime-request
  */
 
-{kv_import}
+{kv_import}import {{ extractParams }} from '../edge-canon-runtime.js';
 
 export function createContextBuilder(kv?: Deno.Kv) {{
   return function buildContext(request: Request, route: string = '/', wildcardName: string | null = null) {{
@@ -342,30 +320,6 @@ export function createContextBuilder(kv?: Deno.Kv) {{
       }},
     }};
   }};
-}}
-
-function extractParams(pathname: string, route: string, wildcardName: string | null): Record<string, string> {{
-  const params: Record<string, string> = {{}};
-  const routeParts = route.split('/').filter(Boolean);
-  const pathParts = pathname.split('/').filter(Boolean);
-
-  routeParts.forEach((part, i) => {{
-    if (part === '*') {{
-      const rest = pathParts.slice(i).map(decodeSegment).join('/');
-      params['*'] = rest;
-      if (wildcardName !== null) params[wildcardName] = rest;
-    }} else if (part.startsWith(':')) {{
-      const paramName = part.slice(1);
-      params[paramName] = decodeSegment(pathParts[i] || '');
-    }}
-  }});
-
-  return params;
-}}
-
-function decodeSegment(segment: string): string {{
-  try {{ return decodeURIComponent(segment); }}
-  catch (_) {{ return segment; }}
 }}
 
 function parseCookies(request: Request): any {{

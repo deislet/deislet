@@ -21,7 +21,7 @@ const VENDORS: [&str; 4] = ["cloudflare", "tencent", "deno", "deislet"];
 
 fn stage(project: &Path) {
     std::fs::create_dir_all(project.join("functions")).expect("function directory");
-    std::fs::write(project.join("functions/[[path]].ts"), FIXTURE).expect("standard fixture");
+    std::fs::write(project.join("functions/[[path]].mjs"), FIXTURE).expect("standard fixture");
     std::fs::write(project.join(".config.json"), PROJECT_CONFIG).expect("configuration");
 }
 
@@ -179,7 +179,7 @@ async fn exact_provider_fixture_builds_for_every_target_and_runs_on_deislet() {
         dist.join("cloudflare/index.js"),
         dist.join("tencent/edge-functions/index.js"),
         dist.join("deno/_deis_internal/router.ts"),
-        dist.join("deno/project/functions/[[path]].ts"),
+        dist.join("deno/project/functions/[[path]].mjs"),
         dist.join("deislet/bundle.zip"),
     ] {
         assert!(path.is_file(), "missing deployable {}", path.display());

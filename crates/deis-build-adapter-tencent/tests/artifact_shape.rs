@@ -28,7 +28,9 @@ fn test_entry_point_format() {
     let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify onRequest entry point (per spec.mdc line 847)
-    assert!(result.router_code.contains("export function onRequest"));
+    assert!(result
+        .router_code
+        .contains("export async function onRequest"));
     assert!(result.router_code.contains("onRequest(context)"));
 
     // Should NOT use export default { fetch() } format
@@ -76,7 +78,7 @@ fn test_emitted_web_apis_match_research_snapshot() {
     assert!(result.context_builder_code.contains("new URL"));
 
     // ✅ Allowed: console.*
-    assert!(result.router_code.contains("console.error"));
+    assert!(result.support_files[0].1.contains("console.error"));
 
     // Verify forEach usage (compatible alternative to Object.fromEntries)
     assert!(result
@@ -123,12 +125,18 @@ fn test_error_handling() {
     let config = test_config("test-app", false);
 
     let result = generate(&routes, &config, &[]).unwrap();
+    let runtime = &result.support_files[0].1;
 
-    // Verify comprehensive error handling
+    // The Edge Canon wrapper catches both synchronous throws and rejected
+    // promises, validates the returned value and emits the fixed non-leaking
+    // response instead of a provider-authored error page.
     assert!(result.router_code.contains("try"));
-    assert!(result.router_code.contains("catch (error)"));
-    assert!(result.router_code.contains("console.error"));
-    assert!(result.router_code.contains("'Internal Error"));
+    assert!(result.router_code.contains("catch (_)"));
+    assert!(runtime.contains("console.error"));
+    assert!(runtime.contains("EC_HANDLER_THROWN"));
+    assert!(runtime.contains("EC_HANDLER_RESULT_INVALID"));
+    assert!(runtime.contains("Internal Server Error\\n"));
+    assert!(!runtime.contains("error.message"));
 }
 
 #[test]

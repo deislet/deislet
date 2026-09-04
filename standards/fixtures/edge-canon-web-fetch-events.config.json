@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "name": "edge-canon-web-fetch-events",
+  "runtime": "standard-v1",
+  "language": "typescript",
+  "functionRoot": "./functions",
+  "compatibilityDate": "2026-09-01",
+  "vendors": {
+    "cloudflare": { "enabled": true },
+    "tencent": { "enabled": true },
+    "deno": { "enabled": true },
+    "deislet": { "enabled": true }
+  },
+  "build": { "outDir": "./dist" }
+}

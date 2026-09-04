@@ -13,7 +13,9 @@
 /// if they ever stop agreeing.
 pub const VENDOR: &str = "cloudflare";
 
-use deis_build_core::{AdapterArtifacts, ProjectConfig, StaticAsset};
+use deis_build_core::{
+    javascript_runtime_module, javascript_string, AdapterArtifacts, ProjectConfig, StaticAsset,
+};
 
 /// Where the compiler stages this project's static files inside the Cloudflare
 /// output directory, and what `wrangler.toml` points at.
@@ -174,6 +176,10 @@ database_id = ""    # Add your D1 database ID
         context_builder_code,
         kv_adapter_code,
         config_files,
+        support_files: vec![(
+            "edge-canon-runtime.js".to_string(),
+            javascript_runtime_module(false),
+        )],
     })
 }
 
@@ -182,8 +188,8 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: 
     let mut route_handlers = String::new();
 
     for (i, (route, import_path)) in routes.iter().enumerate() {
-        let import_literal = serde_json::to_string(import_path).expect("serialize import path");
-        let route_literal = serde_json::to_string(route).expect("serialize route");
+        let import_literal = javascript_string(import_path);
+        let route_literal = javascript_string(route);
         let wildcard_name = deis_build_core::routes::wildcard_name(
             deis_build_core::routes::staged_handler_path(import_path),
         )
@@ -199,7 +205,7 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: 
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(url.pathname, {route_literal})) {{
     const context = buildContext(request, {route_literal}, {wildcard_name});
-    return {invocation};
+    return await invokeEdgeCanonHandler(() => {invocation});
   }}
 "#
         ));
@@ -215,7 +221,6 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: 
     } else {
         ""
     };
-
     format!(
         r#"/**
  * Cloudflare Workers Entry Point
@@ -229,6 +234,7 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: 
  * See: https://developers.cloudflare.com/workers/
  */
 
+import {{ invokeEdgeCanonHandler, edgeCanonFailureResponse, matchRoute }} from './edge-canon-runtime.js';
 import {{ createContextBuilder }} from './adapters/context-builder';
 {node_runtime_import}{imports}
 
@@ -242,32 +248,11 @@ export default {{
       // 404 Not Found
       return new Response('Not Found', {{ status: 404 }});
     }} catch (error) {{
-      console.error('Worker Error:', error);
-      return new Response('Internal Server Error', {{
-        status: 500,
-        headers: {{ 'content-type': 'text/plain' }}
-      }});
+      return edgeCanonFailureResponse('EC_PROVIDER_CONTEXT_INVALID');
     }}
   }}
 }};
 
-function matchRoute(pathname: string, route: string): boolean {{
-  const routeParts = route.split('/').filter(Boolean);
-  const pathParts = pathname.split('/').filter(Boolean);
-  for (let i = 0; i < routeParts.length; i++) {{
-    const part = routeParts[i];
-    if (part === '*') return i === routeParts.length - 1;
-    if (i >= pathParts.length) return false;
-    if (part.startsWith(':')) continue;
-    if (decodeSegment(part) !== decodeSegment(pathParts[i])) return false;
-  }}
-  return routeParts.length === pathParts.length;
-}}
-
-function decodeSegment(segment: string): string {{
-  try {{ return decodeURIComponent(segment); }}
-  catch (_) {{ return segment; }}
-}}
 "#
     )
 }
@@ -278,7 +263,6 @@ fn generate_context_builder_code(has_kv: bool) -> String {
     } else {
         ""
     };
-
     format!(
         r#"/**
  * Cloudflare Workers Context Builder
@@ -292,7 +276,7 @@ fn generate_context_builder_code(has_kv: bool) -> String {
  * See: https://developers.cloudflare.com/workers/runtime-apis/handlers/fetch/
  */
 
-{kv_import}
+{kv_import}import {{ extractParams }} from '../edge-canon-runtime.js';
 
 export function createContextBuilder(env: any, ctx: any) {{
   return function buildContext(request: Request, route: string = '/', wildcardName: string | null = null) {{
@@ -340,30 +324,6 @@ export function createContextBuilder(env: any, ctx: any) {{
       passThroughOnException: () => ctx.passThroughOnException(),
     }};
   }};
-}}
-
-function extractParams(pathname: string, route: string, wildcardName: string | null): Record<string, string> {{
-  const params: Record<string, string> = {{}};
-  const routeParts = route.split('/').filter(Boolean);
-  const pathParts = pathname.split('/').filter(Boolean);
-
-  routeParts.forEach((part, i) => {{
-    if (part === '*') {{
-      const rest = pathParts.slice(i).map(decodeSegment).join('/');
-      params['*'] = rest;
-      if (wildcardName !== null) params[wildcardName] = rest;
-    }} else if (part.startsWith(':')) {{
-      const paramName = part.slice(1);
-      params[paramName] = decodeSegment(pathParts[i] || '');
-    }}
-  }});
-
-  return params;
-}}
-
-function decodeSegment(segment: string): string {{
-  try {{ return decodeURIComponent(segment); }}
-  catch (_) {{ return segment; }}
 }}
 
 function parseCookies(request: Request): any {{

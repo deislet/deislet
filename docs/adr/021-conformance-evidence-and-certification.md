@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-020
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/8a209c9a003fbbf9328f80fb77acf39b850d88fe/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/f8eabb6619a50aab02fd44647c3bc7d64d817d24/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 决策
 
@@ -273,7 +273,7 @@ Conformance 证明语义，support 证明当前产品承诺。一个 EOL 版本�
 从仓库证据看：
 
 - Cloudflare target 在 Wrangler 存在时运行 `wrangler deploy --dry-run`，可构成部分 level 2 evidence；缺 Wrangler 时仅 level 1 且有 warning。
-- Deno target 在 Deno 存在时运行 `deno check`，可构成部分 level 2 evidence；缺工具时仅 level 1。
+- Deno target 在 Deno 存在时运行 `deno cache --no-check --no-remote`，验证完整产物图可解析、可转译且不依赖远端模块，可构成部分 level 2 evidence；缺工具时仅 level 1。它不把 Deno 独有的 TypeScript 默认策略当成跨平台应用标准；统一源码语义门禁必须在选择 target 之前执行。
 - Tencent/EdgeOne target 明确没有本地 dry-run，仅由 compiler 自身检查，当前最多 level 1。
 - Deislet target 有 bundle read-back/loadability、workspace tests 和单机 demo/e2e，可能覆盖 level 2/3 的许多证据，但不是本次定义的完整、独立 Edge Canon conformance kit。
 - 当前没有统一 provider deploy driver、真实 Cloudflare/EdgeOne deployment identity、shared semantic oracle、完整 failure/security/lifecycle suite 和签名 registry。

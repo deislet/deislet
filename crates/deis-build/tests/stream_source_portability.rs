@@ -175,8 +175,22 @@ async fn every_generated_target_installs_the_identity_byte_runtime_boundary() {
             "tencent" => {
                 fs::read_to_string(root.join("edge-functions/index.js")).expect("EdgeOne entry")
             }
-            "deno" => fs::read_to_string(root.join("project/functions/index.ts"))
-                .expect("Deno staged application module"),
+            "deno" => {
+                let router =
+                    fs::read_to_string(root.join("_deis_internal/router.ts")).expect("Deno router");
+                let boundary_at = router
+                    .find("from './edge-canon-runtime.js'")
+                    .expect("Deno router imports the runtime boundary");
+                let handler_at = router
+                    .find("import handler0")
+                    .expect("Deno router imports the application handler");
+                assert!(
+                    boundary_at < handler_at,
+                    "Deno must evaluate the runtime boundary before the application graph"
+                );
+                fs::read_to_string(root.join("_deis_internal/edge-canon-runtime.js"))
+                    .expect("Deno runtime boundary")
+            }
             "deislet" => {
                 let file = fs::File::open(root.join("bundle.zip")).expect("Deislet bundle");
                 let mut archive = zip::ZipArchive::new(file).expect("Deislet ZIP");

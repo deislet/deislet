@@ -190,4 +190,7 @@ pub struct AdapterArtifacts {
     pub context_builder_code: String,
     pub kv_adapter_code: Option<String>,
     pub config_files: Vec<(String, String)>,
+    /// Provider-neutral JavaScript modules imported by generated adapter code.
+    /// Paths are relative to the compiler's `_deis_internal/` directory.
+    pub support_files: Vec<(String, String)>,
 }

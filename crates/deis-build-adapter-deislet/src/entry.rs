@@ -28,6 +28,7 @@
 //! rather than merging into a half-filled copy.
 
 use crate::routing::RoutePlan;
+use deis_build_core::javascript_string;
 
 /// The banner at the top of every generated entry module.
 const HEADER: &str = r#"/**
@@ -195,7 +196,9 @@ export default async function deisletEntry(context) {
   for (const route of ROUTES) {
     const params = matchRoute(route, segments);
     if (params === null) continue;
-    return await route.handler(buildContext(context, params, pathname));
+    return await invokeEdgeCanonHandler(
+      () => route.handler(buildContext(context, params, pathname))
+    );
   }
 
   // No handler claims this path. An app with static files never gets here for
@@ -213,11 +216,12 @@ pub fn generate_entry_module(plan: &RoutePlan) -> String {
     let mut code = String::new();
 
     code.push_str(HEADER);
+    code.push_str("import { invokeEdgeCanonHandler } from './edge-canon-runtime.js';\n");
 
     for (index, route) in routes.iter().enumerate() {
         code.push_str(&format!(
             "import handler{index} from {};\n",
-            js_string(&route.import_path)
+            javascript_string(&route.import_path)
         ));
     }
 
@@ -236,10 +240,10 @@ pub fn generate_entry_module(plan: &RoutePlan) -> String {
         let segments: Vec<&str> = route.pattern.split('/').filter(|s| !s.is_empty()).collect();
         code.push_str(&format!(
             "  {{ pattern: {}, segments: {}, wildcard: {}, handler: handler{index} }},\n",
-            js_string(&route.pattern),
+            javascript_string(&route.pattern),
             serde_json::to_string(&segments).expect("route segments serialise"),
             match &route.wildcard {
-                Some(name) => js_string(name),
+                Some(name) => javascript_string(name),
                 None => "null".to_string(),
             },
         ));
@@ -266,7 +270,7 @@ pub fn generate_entry_module(plan: &RoutePlan) -> String {
              environment table, and the same context a request handler gets.\nimport \
              queueHandler from {};\nexport const queue = (batch, env, context) =>\n  \
              queueHandler(batch, env, context);\n",
-            js_string(import)
+            javascript_string(import)
         ));
     }
     if let Some(import) = &plan.scheduled {
@@ -275,18 +279,11 @@ pub fn generate_entry_module(plan: &RoutePlan) -> String {
              triggers it there; a tick is fire-and-forget and is never made up later.\nimport \
              scheduledHandler from {};\nexport const scheduled = (event, env, context) =>\n  \
              scheduledHandler(event, env, context);\n",
-            js_string(import)
+            javascript_string(import)
         ));
     }
 
     code
-}
-
-/// A JavaScript string literal, escaped by the JSON encoder rather than by
-/// hand: a path with a quote or a backslash in it would otherwise generate a
-/// module that does not parse.
-fn js_string(value: &str) -> String {
-    serde_json::to_string(value).expect("a string always serialises")
 }
 
 #[cfg(test)]
@@ -315,6 +312,13 @@ mod tests {
         // runtime.js: "No default export handler found" unless this holds.
         let code = generate_entry_module(&plan(&[entry("/", "../src/index.ts", None)]));
         assert!(code.contains("export default async function deisletEntry(context)"));
+    }
+
+    #[test]
+    fn request_handlers_use_the_same_canonical_error_boundary_as_provider_targets() {
+        let code = generate_entry_module(&plan(&[entry("/", "../src/index.ts", None)]));
+        assert!(code.contains("import { invokeEdgeCanonHandler } from './edge-canon-runtime.js'"));
+        assert!(code.contains("return await invokeEdgeCanonHandler"));
     }
 
     #[test]
