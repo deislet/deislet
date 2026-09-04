@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-004
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/d06f79ac3fc8abcc288b722e9ee41da6bf0da79e/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/90897c134b649de4868aa41beebff1f23f346081/proposals/0001-unified-platform-contract/README.zh.md)
 
 > 历史说明：本文关于“不是当前最弱免费套餐的机械交集”、允许特定付费等级取得认证，以及“免费层不必天然合规”的结论，已被产品负责人后续选择取代。资源分类、计量、应用预算、超限语义、测试方法及更强后端能力不进入可移植契约等其余结论继续有效。当前规则以 ADR-022 为准。
 

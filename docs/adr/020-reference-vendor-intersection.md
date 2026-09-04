@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-019
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/d06f79ac3fc8abcc288b722e9ee41da6bf0da79e/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/90897c134b649de4868aa41beebff1f23f346081/proposals/0001-unified-platform-contract/README.zh.md)
 - 关联决策：DEC-001（单一标准）、DEC-003（独立治理）、DEC-006（首批合规后端）
 
 ## 决策
