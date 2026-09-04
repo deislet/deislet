@@ -6310,7 +6310,7 @@ export default function handler(context: any): Response {
         let (log, _guard) = app_log();
         let mut runtime = streaming_runtime("traced.production", TALKATIVE_APP).await;
 
-        let (status, _, _) = answer_to(&mut runtime, "/hello").await;
+        let (status, response_headers, _) = answer_to(&mut runtime, "/hello").await;
         assert_eq!(status, 200);
 
         let traces = traces_of("traced.production");
@@ -6321,6 +6321,21 @@ export default function handler(context: any): Response {
             !invocation.trace_id.is_empty(),
             "an invocation with no id cannot be joined to anything it wrote"
         );
+        assert_eq!(
+            crate::runtime::header_list::first_value(&response_headers, crate::TRACE_ID_HEADER),
+            Some(invocation.trace_id.as_str()),
+            "the response must identify the exact trace record provider tooling can query"
+        );
+        if crate::runtime::isolate::ThreadCpuClock::for_current_thread().is_some() {
+            let cpu = invocation
+                .attributes
+                .get(crate::runtime::metrics::CPU_TIME_US_ATTRIBUTE)
+                .expect("a node with a per-thread CPU clock records request CPU");
+            assert!(
+                cpu.parse::<u64>().is_ok(),
+                "request CPU is an integer microsecond count, got {cpu:?}"
+            );
+        }
 
         let lines: Vec<_> = log
             .drain(256)
@@ -6358,6 +6373,53 @@ export default function handler(context: any): Response {
                 );
             }
         }
+    }
+
+    /// A correlation id is evidence only if application code cannot choose
+    /// it. Dynamic responses bypass the static `_headers` validator, and a
+    /// proxied upstream may return names the bundle never contained, so the
+    /// runtime boundary has to close the whole namespace once more.
+    #[tokio::test]
+    async fn a_response_cannot_forge_the_platform_trace_identity() {
+        let mut runtime = streaming_runtime(
+            "response-identity.production",
+            r#"
+                export default function handler() {
+                  return new Response("ok", { headers: {
+                    "x-deis-trace-id": "chosen-by-the-app",
+                    "x-deis-future-credential": "chosen-by-the-app",
+                    "x-application-header": "kept"
+                  }});
+                }
+            "#,
+        )
+        .await;
+
+        let (status, headers, _) = answer_to(&mut runtime, "/").await;
+        assert_eq!(status, 200);
+        let trace_id = crate::runtime::header_list::first_value(&headers, crate::TRACE_ID_HEADER)
+            .expect("the platform stamps its trace id");
+        assert_ne!(trace_id, "chosen-by-the-app");
+        assert!(!trace_id.is_empty());
+        assert_eq!(
+            crate::runtime::header_list::count_of(&headers, crate::TRACE_ID_HEADER),
+            1
+        );
+        assert_eq!(
+            crate::runtime::header_list::first_value(&headers, "x-deis-future-credential"),
+            None,
+            "unknown future platform names are swept too"
+        );
+        assert_eq!(
+            crate::runtime::header_list::first_value(&headers, "x-application-header"),
+            Some("kept")
+        );
+
+        let traces = traces_of("response-identity.production");
+        let [invocation] = traces.as_slice() else {
+            panic!("one request is one invocation record, not {}", traces.len());
+        };
+        assert_eq!(trace_id, invocation.trace_id);
     }
 
     /// The same id, on the kind of invocation nobody is waiting on.

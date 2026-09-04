@@ -300,7 +300,10 @@ message TraceRecord {
     // Empty when it ended cleanly.
     string error = 12;
 
-    // Extra dimensions: a queue batch's message counts, a retry number.
+    // Extra dimensions: a queue batch's message counts, a retry number. HTTP
+    // requests produced by deis-runtime reserve `cpu_time_us` for the integer
+    // number of microseconds measured by that runtime thread's OS CPU clock;
+    // absence means unavailable and must not be filled from duration_us.
     // Bounded the way LogEntry.fields is: keys over 256 bytes refuse the
     // record, values are cut at 16 KiB, more than 64 KiB altogether refuses
     // the record. trace_id, app_id, environment, node and method are refused

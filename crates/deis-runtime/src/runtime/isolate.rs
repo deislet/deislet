@@ -2514,7 +2514,7 @@ impl AppRuntime {
         // body belongs to.
         let stream_target = url.clone();
 
-        let facts = RequestFacts {
+        let mut facts = RequestFacts {
             // Read from the isolate rather than passed down: the invocation is
             // already running by the time this is built, and taking it from
             // the one place that holds it is what keeps the trace record and
@@ -2602,6 +2602,11 @@ impl AppRuntime {
             Err(e) => Err(e.into()),
         };
 
+        // Read the same per-thread CPU clock the watchdog enforces before the
+        // guard is consumed. This is backend CPU evidence for this invocation;
+        // `started.elapsed()` remains wall time and is never substituted when
+        // the OS exposes no thread clock.
+        facts.cpu_time = cut_off.cpu.as_ref().and_then(CpuBudget::used);
         let fired = cut_off.disarm();
         self.disarm_execution_budget();
 
@@ -2694,6 +2699,10 @@ impl AppRuntime {
         } else {
             RequestOutcome::Ok
         };
+        // Kept after `facts` is consumed by the trace recorder: the platform
+        // stamps this same id only after removing anything the application or
+        // an upstream tried to put in its reserved header namespace.
+        let trace_id = facts.trace_id.clone();
         self.metrics.record_request_with(
             &self.app_id,
             started.elapsed(),
@@ -2757,7 +2766,7 @@ impl AppRuntime {
         // that predates the fix: one value per header name, the last one
         // written winning. On is the answer the Fetch specification gives -
         // every `Set-Cookie` the handler set reaches the client.
-        let headers = if self
+        let mut headers = if self
             .compatibility
             .is_on(deis_bundle::Flag::MultipleSetCookieHeaders)
         {
@@ -2793,6 +2802,44 @@ impl AppRuntime {
             }
             folded
         };
+
+        // `x-deis-*` is the platform's namespace on both sides of a handler.
+        // Static response rules already refuse it, but a dynamic Response or
+        // an upstream fetch can still contain one. Remove the whole family,
+        // including names this version has never heard of, then add only the
+        // trace identity this invocation actually owns. The sole exception is
+        // the built-in `_system` app returning the readiness and reason this
+        // node placed on its request; ordinary deployments can never take that
+        // identity. The trace value is therefore useful as correlation
+        // evidence and cannot be forged by application code.
+        let is_system_app = deis_wire::conventions::split_tenant(&self.app_id)
+            .is_some_and(|(app_id, _)| app_id == crate::health::SYSTEM_APP_ID);
+        let is_allowed_system_header = |name: &str| {
+            is_system_app
+                && (name.eq_ignore_ascii_case(crate::health::READINESS_HEADER)
+                    || name.eq_ignore_ascii_case(crate::health::REASON_HEADER))
+        };
+        let mut removed_platform_headers: Vec<String> = headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .filter(|name| crate::is_platform_header(name) && !is_allowed_system_header(name))
+            .collect();
+        removed_platform_headers.sort();
+        removed_platform_headers.dedup();
+        headers
+            .retain(|(name, _)| !crate::is_platform_header(name) || is_allowed_system_header(name));
+        if !removed_platform_headers.is_empty() {
+            tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                headers = %removed_platform_headers.join(", "),
+                "App {} tried to place {} header name(s) in the platform's reserved response \
+                 namespace; they were removed before the answer left the isolate",
+                self.app_id,
+                removed_platform_headers.len(),
+            );
+        }
+        super::header_list::set_unique(&mut headers, crate::TRACE_ID_HEADER, trace_id);
 
         if let Some(response_tx) = response_tx.take() {
             let _ = response_tx.send(Ok((response.status, headers, response_body)));

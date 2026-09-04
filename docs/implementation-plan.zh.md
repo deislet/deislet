@@ -511,7 +511,10 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 
 **现状**：上面这五个 RPC 与 Prometheus 端口都有；波次 D4 之后还多了第三套服务
 `TraceService`（`PushTraces` / `QueryTraces` / `TailTraces`），一次调用一条轨迹，
-`deis trace`（含 `--follow`）读的就是它。所以这个组件现在是三套服务、八个 RPC。**投递方只有 deis-runtime 一个**——
+`deis trace`（含 `--follow`）读的就是它。HTTP 轨迹的 `attributes.cpu_time_us`
+来自运行线程的 OS CPU 时钟；缺少该属性表示节点无法计量，不能以 `duration_us`
+代替。节点还在动态应用响应离开 isolate 前清除应用写入的 `x-deis-*`，再以
+`x-deis-trace-id` 返回同一轨迹号，供精确关联查询。所以这个组件现在是三套服务、八个 RPC。**投递方只有 deis-runtime 一个**——
 deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout，所以
 访问量与耗时这两个本该由 deis-proxy 提供的主要数字，现在只能从节点侧推算，
 而被 deis-proxy 挡在门外的请求在这里完全看不见。`Tail` 与 `Query` 已经有 CLI 消费方

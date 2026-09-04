@@ -440,6 +440,12 @@ impl MetricsRegistry {
         trace.target = facts.url;
         trace.status = facts.status;
         trace.error = facts.error;
+        if let Some(cpu_time) = facts.cpu_time {
+            trace.attributes.insert(
+                CPU_TIME_US_ATTRIBUTE.to_string(),
+                cpu_time.as_micros().min(u64::MAX as u128).to_string(),
+            );
+        }
         self.record_invocation(trace);
     }
 
@@ -650,7 +656,19 @@ pub struct RequestFacts {
     /// with something unparseable. An operator reading a trace has to be able
     /// to tell "your code is broken" from "our node is".
     pub platform_fault: bool,
+    /// CPU time spent executing the request handler, measured from the
+    /// runtime thread's own OS CPU clock. `None` means this node cannot expose
+    /// a per-thread clock; it must never be replaced with wall-clock time.
+    pub cpu_time: Option<Duration>,
 }
+
+/// Typed name used in a trace's bounded attribute map for per-request CPU.
+///
+/// The telemetry protocol deliberately keeps extension dimensions in the
+/// attribute map. This key and its integer-microsecond unit are nevertheless
+/// part of the runtime/CLI contract: provider tooling reads it as backend CPU
+/// evidence and must not infer the value from `duration_us`.
+pub const CPU_TIME_US_ATTRIBUTE: &str = "cpu_time_us";
 
 /// One invocation of one application, as an operator needs to see it.
 ///

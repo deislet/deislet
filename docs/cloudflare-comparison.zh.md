@@ -325,6 +325,7 @@ Node.js 兼容（4.9）另算：它是要先拍板的产品问题，不是排期
 
 - deis-telemetry 多了一套 `TraceService`：推送、查询、跟随三个调用，和日志那套并排放，不混在一起。
 - 节点每处理完一次调用就发一条轨迹——请求、队列批次、cron 触发、WebSocket 消息各算一次——记的是**平台做的判定**，所以「应用自己抛了」和「我们把它杀了」是两种不同的结局，超时、op 限流、内存、CPU 各有各的名字。
+- HTTP 调用以运行线程的 OS CPU 时钟写入 `attributes.cpu_time_us`；节点不能计量时字段缺失，绝不用 wall time 猜。响应中的 `x-deis-trace-id` 是应用响应离开 isolate 前清空平台命名空间后由 runtime 盖章的同一轨迹号，因此单次请求可以无歧义回查计量记录。
 - 延迟从高水位改成直方图（`deis_runtime_isolate_execution_ms_bucket`，14 个桶，配 `_sum` 和 `_count`），Prometheus 的 `histogram_quantile` 能直接算分位数。
 - 读的一头是 `deis trace`：按结局筛（`--outcome ok/app-error/timeout/rate-limited/memory-limit/cpu-limit/internal-error/failed`）、按类型筛（`--kind http/queue/cron/websocket`）、按状态码或状态码段筛、按时间段、按耗时下限、按轨迹号，也能 `--follow` 跟实时的。轨迹号和 `deis logs --trace-id` 是同一个号，所以从一条轨迹能直接跳到那次调用写的日志。
 

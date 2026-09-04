@@ -37,6 +37,14 @@ pub use deis_wire::conventions::{
 /// [`APP_ID_HEADER`].
 pub const PLATFORM_HEADER_PREFIX: &str = "x-deis-";
 
+/// Correlates one answered HTTP request with its invocation trace.
+///
+/// The application never supplies this value. The isolate removes the whole
+/// platform header namespace from the application's answer and stamps the id
+/// that its log lines and telemetry record carry. Provider tooling can then
+/// query the exact invocation instead of guessing from timestamps or URLs.
+pub const TRACE_ID_HEADER: &str = "x-deis-trace-id";
+
 /// Whether a header name is in the platform's own namespace.
 ///
 /// Case-insensitive, because a header name is: a client sending

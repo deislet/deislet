@@ -404,6 +404,7 @@ mod tests {
                 status: 500,
                 error: "TypeError: cannot read properties of undefined".into(),
                 platform_fault: false,
+                cpu_time: Some(Duration::from_micros(8_750)),
             },
         );
 
@@ -417,6 +418,13 @@ mod tests {
         assert_eq!(trace.status, 500);
         assert_eq!(trace.trace_id, "abc");
         assert!(trace.error.starts_with("TypeError"));
+        assert_eq!(
+            trace
+                .attributes
+                .get(CPU_TIME_US_ATTRIBUTE)
+                .map(String::as_str),
+            Some("8750")
+        );
         assert!(trace.duration >= Duration::from_millis(9));
     }
 

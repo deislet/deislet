@@ -633,7 +633,7 @@ deis-control。
 | **查询 API** | `LogService.Query`，供控制面决策与面板展示 | 有 |
 | **Prometheus** | 独立 HTTP 端口上的 `/metrics` | 有 |
 | **实时 tail** | `LogService.Tail` 流式订阅 | 有，`deis tail` 是它的消费方 |
-| **调用轨迹** | `TraceService`：`PushTraces` / `QueryTraces` / `TailTraces`，一次调用一条，和日志那套并排放不混在一起 | 有，`deis trace` 是它的消费方。留存默认 3 天，比日志的 7 天短——不管应用写不写日志，每次调用都会产生一条 |
+| **调用轨迹** | `TraceService`：`PushTraces` / `QueryTraces` / `TailTraces`，一次调用一条，和日志那套并排放不混在一起 | 有，`deis trace` 是它的消费方。HTTP 响应由平台盖章 `x-deis-trace-id`，同号轨迹以 `attributes.cpu_time_us` 保存 OS 线程 CPU；缺失不能用 wall time 补。留存默认 3 天，比日志的 7 天短——不管应用写不写日志，每次调用都会产生一条 |
 | **耗时分位数** | 延迟按直方图存（14 个桶 + `_sum` + `_count`），`histogram_quantile` 直接能算 | 有。此前是一个只升不降的高水位数值，一次 30 秒的超时会把它永久钉在 30 秒 |
 
 deis-telemetry 自己的日志只写 stderr，不自摄入，避免递归。

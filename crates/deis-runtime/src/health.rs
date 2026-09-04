@@ -628,9 +628,10 @@ mod tests {
 
         let _turn = test_host::take();
         let apps = test_host::host();
-        // Not `_system`: the shared host is used by other tests, and this one
-        // must not collide with a node's own copy.
-        let key = AppKey::production("system-probe-under-test");
+        // The system identity is what authorises the two response headers;
+        // a distinct environment avoids colliding with a node's production
+        // copy in this process-wide test host.
+        let key = AppKey::new(SYSTEM_APP_ID, "probe-under-test");
         apps.load_app(
             key.clone(),
             include_str!("dispatcher/system_app.js").to_string(),
@@ -727,7 +728,7 @@ mod tests {
 
         let _turn = test_host::take();
         let apps = test_host::host();
-        let key = AppKey::production("system-probe-reason");
+        let key = AppKey::new(SYSTEM_APP_ID, "probe-reason");
         apps.load_app(
             key.clone(),
             include_str!("dispatcher/system_app.js").to_string(),
@@ -846,7 +847,7 @@ mod tests {
 
         let _turn = test_host::take();
         let apps = test_host::host();
-        let key = AppKey::production("system-probe-no-reason");
+        let key = AppKey::new(SYSTEM_APP_ID, "probe-no-reason");
         apps.load_app(
             key.clone(),
             include_str!("dispatcher/system_app.js").to_string(),
