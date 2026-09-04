@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-04T16:14:13+08:00",
+  "resolvedAt": "2026-09-04T18:24:32+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "6679c018896b8d5b424111d11a1005682c359c16",
+    "sourceCommit": "6a8768559372fb749650c9ef355d80524d3590ff",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "contractPath": "standard/contract.json",
     "contractSchemaPath": "schemas/standard-contract.schema.json",

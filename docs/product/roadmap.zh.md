@@ -28,12 +28,12 @@
 
 ## 当前进行中
 
-- `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 现有 24 条候选条款和 15 个 provider-independent 草案用例。官方资料已支持 1,000,000 字节已知长度请求体、10 ms HTTP CPU、50 次外部子请求与 6 个同时等待响应头外连的 Draft 共同下限；响应大小、wall time、内存归属、`waitUntil` 宽限和超限错误仍阻断冻结。统一 fixture、依赖清单、CPU 校准、observation schema 与唯一 oracle 已执行化 T001–T015；provider adapter v1 的 request/result/schema、固定工具锁、安全子进程边界和三个 Draft manifest 已落地，共有 33 项正反、安全与派生产物自测。三个 adapter 已实现 `inspect`/`preflight`/`prepare`，尚未完成真实部署、调用、取证和清理；其余 14 个能力族也尚未开始，故本项继续保持 `active`。
+- `P0-SPEC-002`：已建立 15 个能力族 × 8 个语义维度的需求注册表；`web-fetch-events` 现有 24 条候选条款和 15 个 provider-independent 草案用例。官方资料已支持 1,000,000 字节已知长度请求体、10 ms HTTP CPU、50 次外部子请求与 6 个同时等待响应头外连的 Draft 共同下限；响应大小、wall time、内存归属、`waitUntil` 宽限和超限错误仍阻断冻结。统一 fixture、依赖清单、CPU 校准、artifact lineage、observation schema 与唯一 oracle 已执行化 T001–T015；三个 adapter 已实现安全 `inspect/preflight/prepare/deploy/invoke`，Cloudflare 与 Deislet 还实现精确单次 CPU `collect`、身份核验 `cleanup` 和可恢复 `run`，本地 67 项测试全过且 Edge Canon governance run `33863090202` 成功。EdgeOne `collect/cleanup/run`、三个后端真实账户 evidence 及其余 14 个能力族仍未完成，故本项继续保持 `active`。
 - `P0-MODEL-001`：九份 Draft schema 与 20 组正反 fixture 已覆盖 canonical identity/artifact/binding/operation/driver、identity migration、backend fence evidence、三后端 restore set 和 execution report。共享 `BackendMigration`、独立管理认证、持久 per-tenant writer fence，以及 KV/SQL/blob/queue/telemetry inventory 已落地；backend incarnation 贯穿 discovery、attempt、receipt/evidence、重试和 release。三后端 verified snapshot 现由正式 Restore ProductOperation 与 `deis-backend-topology` 协调：capture 在关闭入口前建立 crash journal，下一次 topology mutation 会先恢复服务/入口并发布完整集合或保留不完整现场；同一 outage barrier 的本地 artifact 受 `snapshot_roots` 约束，staging 绑定 tree digest，目录路径从可信 config 重建，rename 先同步父目录再推进 journal；随后关闭 writer admission、停止/复核、切换、启动/验证，失败则在证明服务不可达后完整 rollback。status 持全局锁且只报告物理复验的共享终态 report。Control 以持久 owner lease/心跳支持多实例接管，并在三端 live incarnation 复核后原子推进 installation/plan/Operation；`waiting` 的未知物理状态不得直接取消。迁移 Operation 的幂等、并发取消与历史同样保留。无人值守 backup Operation/scheduler、Stateful Objects/provider、其他 Operation producer、live parser、canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 仍未完成，故本项继续保持 `active`。
 
 ## 紧接着执行
 
-1. `P0-SPEC-002`：为 `web-fetch-events` 实现 Deislet/Cloudflare/EdgeOne 三个固定版本 adapter，并补齐响应大小、wall time、内存归属、`waitUntil` 宽限、超限处理和依赖类型；再按该闭环逐项完成其余 14 个 mandatory 能力族。任何 `pending` 都是发布阻断项。
+1. `P0-SPEC-002`：完成 EdgeOne 可公开依赖的单次 CPU 取证、资源清理和 `run`，为三个后端取得真实账户 evidence；同时补齐响应大小、wall time、内存归属、`waitUntil` 宽限、超限处理和依赖类型，再按该闭环逐项完成其余 14 个 mandatory 能力族。任何 `pending` 都是发布阻断项。
 2. `P0-MODEL-001`：下一步为 Stateful Objects、provider resources 补同语义 inventory/fence/backup/restore，并让 build/deploy/lifecycle producer 复用同一 Operation；随后进入 canonical-first dual-read、copy/verify/cutover、旧 token 撤销与 tombstone。并行补齐 topology canary 配置、隔离恢复演练、snapshot 加密/异地复制/retention 与 RPO/RTO policy。后端物理 key 仍不能冒充标准逻辑身份或 capability subject。
 
 ## 执行规则
