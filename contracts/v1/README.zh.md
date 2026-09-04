@@ -23,7 +23,7 @@
 
 ## 当前实现进度
 
-identity 迁移已完成五个可执行切片。第一段让 `application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效、擦除或从一个有效 UUIDv7 改绑到另一个有效 UUIDv7，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
+identity 迁移已完成六个可执行切片。第一段让 `application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效、擦除或从一个有效 UUIDv7 改绑到另一个有效 UUIDv7，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
 
 第二段新增共享 `deis-wire::CanonicalTenantId`，唯一逻辑拼写与本契约相同：`v1/<application UUIDv7>/<environment UUIDv7>`。Control 的 push 与 assignment list 现在同时发送两个 canonical ID；节点只允许“两者都缺失”的旧 Control 或“两者都有效”的新 Control，partial/UUIDv4/非规范拼写在 bundle 下载前失败关闭。节点把 identity 写入 installed record，已记录的 canonical tenant 不能被另一组合法 ID 重绑，旧 Control 的字段缺失也不能擦除它。Runtime placement/telemetry key 与 storage authority 已拆成两个输入，KV/SQL/blob 与 queue poller 共用后者，并有真实 store round-trip 测试证明两者不会混用。
 
@@ -33,7 +33,9 @@ identity 迁移已完成五个可执行切片。第一段让 `application`、`en
 
 第五段建立后端真实写入栅栏与外部 inventory。共享 `deis.backend.migration.v1.BackendMigration` 只在配置独立 `migration_admin_token` 时注册，且只接受 `Authorization: Bearer`；应用 storage token 不属于该认证域。store 的 KV/SQL/blob 共用持久 fence journal，queue 使用自己的 journal；acquire 等待已有写许可和 SQL 交互事务完成，再提交单调 epoch，重启先恢复 active fence。KV expiry、blob orphan sweep、queue lease/ack/nack/replay/retention 也受同一边界。inventory 产生规范 SHA-256/count/bytes/orphan evidence，SQL 必须完成 WAL checkpoint，blob 校验真实 content digest；错误 token/revision/migration 不能替换或释放 fence。共享 proto、Rust 测试和真实 gRPC 测试验证了默认不暴露、独立认证、在途事务 drain、四类 component 拒绝写入、重启保持和精确 rollback。
 
-这些切片仍不代表八阶段迁移完成。Control 的计划/获取 catalog fence 仍只有内部 Rust 入口，没有 production Operation API 或后台 coordinator 调用，也尚未调用两个 backend management service 并持久化返回的 evidence。telemetry、Stateful Objects 与 provider resources 仍无 inventory/fence；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+第六段由 Control 使用分别配置、禁止复用的 store/queue 管理凭证协调 catalog 与每个 legacy tenant 的 backend fence。`identity_migration_backend_attempts` 在每次网络调用前后记录 endpoint digest、revision、状态、attempt count、回执和契约 evidence；Control 若在远端取得 fence 后崩溃，下一次以相同 migration/revision/token 重放，而不是猜测。受管理员权限保护的 `POST /api/apps/:app/identity-migration` 在持久 plan 后返回 `202` 并后台执行，客户端断开不会取消；启动时恢复 `planned/running`，GET 在管理凭证移除后仍可读取脱敏状态。错误 backend/tenant、缺失或变化的 receipt、组件缺失/重复、非规范摘要或时间均失败关闭。当前只捕获 store 的 KV/SQL/blob 与 queue，操作进入 `waiting` 且明确列出 telemetry、Stateful Objects、provider resources 缺口，不会冒充 ready-for-copy。
+
+这些切片仍不代表八阶段迁移完成。当前 API 虽已有稳定 migration/operation ID、异步执行和崩溃恢复，但还不是满足 `operation.schema.json` 全字段与通用状态图的正式公共 Operation：organization、actor、idempotency、request/correlation、child/provider operation 尚未建模。telemetry、Stateful Objects 与 provider resources 仍无 inventory/fence；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
 
 ## 七份机器契约
 

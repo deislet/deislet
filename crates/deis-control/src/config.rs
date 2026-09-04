@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
     pub bind_addr: String,
     pub port: u16,
@@ -163,6 +163,17 @@ pub struct ControlConfig {
     /// in the file cannot become an HMAC key that happens to compute.
     #[serde(default)]
     pub storage_auth_secret: Option<String>,
+    /// Independent administrator credential used only when Control calls the
+    /// deis-store backend-migration service. It is never derived from, equal
+    /// to, or sent in place of an application storage capability.
+    #[serde(default)]
+    pub store_migration_admin_token: Option<String>,
+    /// Independent administrator credential used only when Control calls the
+    /// deis-queue backend-migration service. Keeping this separate from the
+    /// store credential limits a compromise to one backend and permits their
+    /// rotation and deployment lifecycles to differ.
+    #[serde(default)]
+    pub queue_migration_admin_token: Option<String>,
     /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).
     ///
     /// A tick does two things: it rebuilds the task list from the catalog,
@@ -248,9 +259,67 @@ impl Default for ControlConfig {
             store_endpoint: None,
             queue_endpoint: None,
             storage_auth_secret: None,
+            store_migration_admin_token: None,
+            queue_migration_admin_token: None,
             cron_tick_seconds: default_cron_tick_seconds(),
             node_registration_ttl_secs: default_node_registration_ttl(),
         }
+    }
+}
+
+impl std::fmt::Debug for ControlConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("port", &self.port)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("heartbeat_timeout", &self.heartbeat_timeout)
+            .field(
+                "node_preshared_keys",
+                &format_args!("<redacted:{} configured>", self.node_preshared_keys.len()),
+            )
+            .field(
+                "api_keys",
+                &format_args!("<redacted:{} configured>", self.api_keys.len()),
+            )
+            .field("api_auth_enabled", &self.api_auth_enabled)
+            .field("api_cors_allowed_origins", &self.api_cors_allowed_origins)
+            .field("tls", &self.tls)
+            .field("deis_runtime_nodes", &self.deis_runtime_nodes)
+            .field(
+                "deis_runtime_poll_interval",
+                &self.deis_runtime_poll_interval,
+            )
+            .field("bundle_dir", &self.bundle_dir)
+            .field("public_base_url", &self.public_base_url)
+            .field("secret_key_file", &self.secret_key_file)
+            .field("store_endpoint", &self.store_endpoint)
+            .field("queue_endpoint", &self.queue_endpoint)
+            .field(
+                "storage_auth_secret",
+                &self.storage_auth_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "store_migration_admin_token",
+                &self
+                    .store_migration_admin_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field(
+                "queue_migration_admin_token",
+                &self
+                    .queue_migration_admin_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("cron_tick_seconds", &self.cron_tick_seconds)
+            .field(
+                "node_registration_ttl_secs",
+                &self.node_registration_ttl_secs,
+            )
+            .finish()
     }
 }
 

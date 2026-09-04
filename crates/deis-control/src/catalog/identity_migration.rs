@@ -3,9 +3,11 @@
 //! This module implements the part of the eight-phase migration that Control
 //! can prove today: a deterministic catalog inventory, permanent binding IDs,
 //! a persisted migration/operation identity, and an atomic revision fence.
-//! It deliberately does not advance a migration past `running`. The same
-//! fencing token is not yet enforced by deis-store and deis-queue, so calling
-//! this a storage-writer fence or starting copy/cutover would be false.
+//! The catalog half deliberately cannot advance a migration by itself. The
+//! backend coordinator uses the same token against deis-store and deis-queue,
+//! persists their evidence, and may then move the record to `waiting`.
+//! Telemetry, Stateful Objects and provider resources are still missing, so
+//! calling the current state verified or starting copy/cutover would be false.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -374,6 +376,28 @@ impl CatalogStore {
             .await
     }
 
+    /// Plans left before backend coordination completed. A Control process
+    /// calls this at startup so closing the initiating client or restarting
+    /// Control cannot cancel a durable migration operation.
+    pub async fn resumable_identity_migrations(&self) -> CatalogResult<Vec<IdentityMigrationPlan>> {
+        self.database()
+            .with_connection(|conn| {
+                let mut statement = conn.prepare(&format!(
+                    "SELECT {MIGRATION_COLUMNS} FROM identity_migrations
+                      WHERE state IN ('planned', 'running')
+                      ORDER BY created_at, migration_id"
+                ))?;
+                let plans = statement
+                    .query_map([], map_plan)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for plan in &plans {
+                    validate_binding_rows(conn, plan)?;
+                }
+                Ok(plans)
+            })
+            .await
+    }
+
     /// Atomically acquire the catalog revision fence for a planned migration.
     ///
     /// This freezes environment/version/deployment/route mutations in SQLite,
@@ -442,7 +466,7 @@ impl CatalogStore {
                     app_id = %plan.application_name,
                     migration_id = %plan.migration_id,
                     application_revision = plan.expected_application_revision,
-                    "Acquired the identity-migration catalog fence; storage-writer fencing is still required before copy or cutover"
+                    "Acquired the identity-migration catalog fence; backend writer fences and complete evidence are still required before copy or cutover"
                 );
                 Ok(plan)
             })

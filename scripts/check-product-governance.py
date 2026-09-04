@@ -188,7 +188,7 @@ def validate_standard_lock() -> str:
     return commit
 
 
-def validate_roadmap() -> None:
+def validate_roadmap(locked_standard_commit: str) -> None:
     load_json("docs/product/roadmap.schema.json")
     roadmap = load_json("docs/product/roadmap.json")
     require(roadmap.get("schemaVersion") == 1, "roadmap schemaVersion must be 1")
@@ -202,6 +202,13 @@ def validate_roadmap() -> None:
     require(phase_ids == EXPECTED_PHASES, f"roadmap phases must be ordered {EXPECTED_PHASES}")
     require(phases[0].get("status") == "active", "phase 0 must be active")
     require(all(phase.get("status") == "queued" for phase in phases[1:]), "later phases must remain queued")
+    require(
+        any(
+            f"{len(EXPECTED_ADRS)} 份 Accepted ADR" in criterion
+            for criterion in phases[0].get("exitCriteria", [])
+        ),
+        "phase 0 exit criteria must state the actual accepted ADR count",
+    )
 
     for index, phase in enumerate(phases):
         expected_dependencies = [] if index == 0 else [f"phase-{index - 1}"]
@@ -246,6 +253,11 @@ def validate_roadmap() -> None:
         require(item_id in work, f"nextActions references unknown item {item_id}")
         require(work[item_id].get("status") in {"active", "queued"}, f"{item_id}: invalid next-action status")
     require(work[next_actions[0]].get("status") == "active", "first next action must be active")
+    spec = work.get("P0-SPEC-001", {})
+    require(
+        locked_standard_commit in spec.get("verification", ""),
+        "P0-SPEC-001 verification must name the currently locked Edge Canon commit",
+    )
 
     status_schema = load_json("docs/product/target-status.schema.json")
     target_status = load_json("docs/product/target-status.json")
@@ -462,7 +474,7 @@ def main() -> int:
     try:
         validate_adrs()
         commit = validate_standard_lock()
-        validate_roadmap()
+        validate_roadmap(commit)
         validate_integration()
     except (KeyError, TypeError, ValidationError) as error:
         print(f"product governance validation failed: {error}", file=sys.stderr)

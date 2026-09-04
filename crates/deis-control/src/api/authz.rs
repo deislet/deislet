@@ -363,6 +363,24 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             Requirement::new("app.delete", Verb::Admin, named(app), Resource::Every).changes_state()
         }
 
+        // Identity migration freezes every environment and reaches backend
+        // management services with credentials no application operator may
+        // hold. Both starting it and reading its cross-backend inventory are
+        // therefore platform-administrator operations over the whole app.
+        ["api", "apps", app, "identity-migration"] if !writing => Requirement::new(
+            "identity_migration.get",
+            Verb::Admin,
+            named(app),
+            Resource::Every,
+        ),
+        ["api", "apps", app, "identity-migration"] => Requirement::new(
+            "identity_migration.start",
+            Verb::Admin,
+            named(app),
+            Resource::Every,
+        )
+        .changes_state(),
+
         // ---- names of deleted applications --------------------------------
         //
         // Reading the list names every application that was ever deleted on
@@ -1338,6 +1356,18 @@ mod tests {
             ("POST", "/api/apps", "app.create", Verb::Deploy),
             ("GET", "/api/apps/demo", "app.get", Verb::Read),
             ("DELETE", "/api/apps/demo", "app.delete", Verb::Admin),
+            (
+                "GET",
+                "/api/apps/demo/identity-migration",
+                "identity_migration.get",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/apps/demo/identity-migration",
+                "identity_migration.start",
+                Verb::Admin,
+            ),
             ("GET", "/api/retired-apps", "retired_app.list", Verb::Admin),
             (
                 "DELETE",

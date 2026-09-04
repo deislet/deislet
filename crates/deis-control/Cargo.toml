@@ -26,7 +26,7 @@ rustls-pemfile = "2.0"
 # gRPC
 tonic = { version = "0.12", features = ["router"] }
 prost = "0.13"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 # Database
 # `fallible_uint` because several queries here bind a `usize` - a row limit, a
@@ -81,6 +81,7 @@ mime_guess = "2"
 
 # Control Wire SDK
 deis-wire = { path = "../deis-wire" }
+deis-backend-migration = { path = "../deis-backend-migration" }
 # Drives the node session lifecycle (src/session.rs) and the command
 # lifecycle (src/database/command_status.rs).
 yasm = { workspace = true }

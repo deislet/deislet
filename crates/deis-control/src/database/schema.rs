@@ -793,6 +793,42 @@ fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_identity_migrations_legacy_name
             ON identity_migrations(app_id, created_at);
 
+        CREATE TABLE IF NOT EXISTS identity_migration_backend_attempts (
+            migration_id                  TEXT NOT NULL,
+            backend                       TEXT NOT NULL CHECK(length(backend) BETWEEN 1 AND 128),
+            tenant                        TEXT NOT NULL CHECK(length(tenant) BETWEEN 1 AND 256),
+            expected_application_revision INTEGER NOT NULL
+                                                    CHECK(expected_application_revision >= 1),
+            target_endpoint_sha256         TEXT NOT NULL
+                                                    CHECK(length(target_endpoint_sha256) = 64
+                                                      AND lower(target_endpoint_sha256) = target_endpoint_sha256
+                                                      AND target_endpoint_sha256 NOT GLOB '*[^0-9a-f]*'),
+            state                         TEXT NOT NULL
+                                                  CHECK(state IN
+                                                    ('acquiring', 'fenced', 'inspecting', 'captured',
+                                                     'release-requested', 'released')),
+            attempt_count                 INTEGER NOT NULL CHECK(attempt_count >= 1),
+            fence_epoch                   INTEGER CHECK(fence_epoch IS NULL OR fence_epoch >= 1),
+            acquired_at                   INTEGER,
+            receipt_sha256                TEXT
+                CHECK(receipt_sha256 IS NULL OR
+                      (length(receipt_sha256) = 64
+                       AND lower(receipt_sha256) = receipt_sha256
+                       AND receipt_sha256 NOT GLOB '*[^0-9a-f]*')),
+            evidence_json                 TEXT
+                CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
+            last_error_code               TEXT,
+            last_error_message            TEXT,
+            created_at                    INTEGER NOT NULL,
+            updated_at                    INTEGER NOT NULL,
+            PRIMARY KEY(migration_id, backend, tenant),
+            FOREIGN KEY(migration_id) REFERENCES identity_migrations(migration_id)
+                ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_identity_migration_backend_attempts_state
+            ON identity_migration_backend_attempts(migration_id, state, updated_at);
+
         CREATE TRIGGER IF NOT EXISTS trg_identity_migrations_identity_immutable_v1
         BEFORE UPDATE OF migration_id, operation_id, app_id,
                          canonical_application_id, created_at
@@ -1668,6 +1704,7 @@ mod tests {
             "audit_log",
             "domain_grants",
             "identity_migrations",
+            "identity_migration_backend_attempts",
             "canonical_binding_ids",
         ] {
             assert!(

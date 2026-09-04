@@ -12,6 +12,7 @@ pub mod grpc;
 pub mod identity;
 pub mod metrics;
 pub mod middleware;
+pub mod migrations;
 pub mod nodes;
 pub mod registration;
 pub mod static_files;
@@ -121,6 +122,10 @@ pub fn build_api_router(
         deis_runtime: Arc::clone(&deis_runtime_manager),
         catalog: Arc::clone(&catalog_state.store),
     };
+
+    let migration_state =
+        migrations::MigrationApiState::new(Arc::clone(&catalog_state.store), &config);
+    migration_state.resume_on_start();
 
     let auth_config = middleware::AuthConfig::from_control_config(&config);
 
@@ -235,6 +240,7 @@ pub fn build_api_router(
         // The catalog brings its own state, so it is merged as a
         // finished router rather than threaded through the chain above.
         .merge(catalog::router(catalog_state.clone()))
+        .merge(migrations::router(migration_state))
         .layer(axum_middleware::from_fn_with_state(
             authz_state.clone(),
             authz::authorize,

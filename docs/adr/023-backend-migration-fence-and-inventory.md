@@ -53,13 +53,13 @@ Embedded 模式仍是一份 data directory 对应一个 service process，多个
 - `InspectTenant`
 - `ReleaseWriteFence`
 
-机器可读证据格式由 `contracts/v1/backend-migration-evidence.schema.json` 定义。proto 响应不返回 fence token，只返回其绑定后的 receipt digest。Control 持久 operation 后续负责把 backend response 转成该证据文档、签名/关联 attempt，并合并进 identity migration verification。
+机器可读证据格式由 `contracts/v1/backend-migration-evidence.schema.json` 定义。proto 响应不返回 fence token，只返回其绑定后的 receipt digest。Control 已把 backend response 转成该证据文档并关联到持久 attempt；完整 Operation 契约后续还须补齐 actor、organization、idempotency、request/correlation 和通用状态转换，再把所有 component evidence 合并进 identity migration verification。
 
 ## 尚未完成
 
 本 ADR 落地后，`P0-MODEL-001` 仍不能标记完成：
 
-- Control 尚未通过正式 Operation API 调用两个管理服务并持久化 per-backend attempt/evidence；
+- Control 已通过受管理员权限保护的异步 API 调用两个管理服务并持久化 per-backend/tenant attempt 与契约 evidence，能在客户端断开或 Control 重启后按同一请求恢复；但当前 migration operation 仍缺正式 `operation.schema.json` 所要求的 organization、actor、idempotency、request/correlation、child/provider operation 字段和通用转换 API，不能称为完整公共 Operation；
 - telemetry、Stateful Objects 与 provider resources 尚无同契约 inventory/fence；
 - deis-store snapshot/restore 不复制 migration fence journal，deis-queue 也尚无产品级 backup/restore；在 Control 能把 restore 建模为新 backend incarnation、重新取得 fence 并校验证据前，迁移/cutover 不得与 restore 重叠，也不能把普通备份恢复当成 fence 延续；
 - canonical-first dual-read、copy/verify、atomic cutover、旧 capability 撤销和 tombstone 尚未执行；

@@ -291,6 +291,20 @@ bundle_dir = "/var/lib/deis-control/bundles"
 #   openssl rand -hex 32
 # storage_auth_secret = "put a long random string here"
 
+# Independent backend-migration administrator credentials. Each value must
+# match migration_admin_token on the corresponding service, contain at least
+# 32 bytes, and be different from every application, node, human API and
+# other-backend credential. Control keeps them on its management side; they
+# are never handed to a runtime node, application, browser or CLI.
+#
+# Both are required before POST /api/apps/<app>/identity-migration will plan
+# or fence anything. Generate two values, not one copied twice:
+#
+#   openssl rand -hex 32
+#   openssl rand -hex 32
+# store_migration_admin_token = "put the deis-store migration token here"
+# queue_migration_admin_token = "put the deis-queue migration token here"
+
 # Seconds between cron scheduler ticks (1..=60). A tick rebuilds the task
 # list from the catalog and fires whatever came due, so the default means a
 # newly deployed schedule is noticed within a minute and fires within a

@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-04T04:10:26+08:00",
+  "updatedAt": "2026-09-04T08:50:24+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -21,7 +21,7 @@
       "status": "active",
       "dependsOn": [],
       "exitCriteria": [
-        "22 份 Accepted ADR 在仓库内可追溯且无临时路径",
+        "23 份 Accepted ADR 在仓库内可追溯且无临时路径",
         "Edge Canon proposal、机器契约、schema 与 registry 经 CI 校验",
         "目标版本所有能力族的 API、错误、一致性、生命周期、保证、fixture 与 oracle 均达到 normative-complete",
         "compiler 只依据标准版本验证，不读取 provider capability profile",
@@ -51,7 +51,7 @@
             {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/proposals/0001-unified-platform-contract/README.zh.md"},
             {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/336f388466bf958ec1a6c4b50ba5cd2990ad78e0/standard/contract.json"}
           ],
-          "verification": "在 Edge Canon commit 2df06b2 运行 python3 scripts/check-governance.py"
+          "verification": "在 Edge Canon commit 336f388466bf958ec1a6c4b50ba5cd2990ad78e0 运行 python3 scripts/check-governance.py"
         },
         {
           "id": "P0-CONF-001",
@@ -133,9 +133,11 @@
             {"type": "local-path", "value": "crates/deis-backend-migration/proto/migration.proto"},
             {"type": "local-path", "value": "crates/deis-backend-migration/src/lib.rs"},
             {"type": "local-path", "value": "crates/deis-store/src/migration.rs"},
-            {"type": "local-path", "value": "crates/deis-queue/src/migration.rs"}
+            {"type": "local-path", "value": "crates/deis-queue/src/migration.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/catalog/backend_migration.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/api/migrations.rs"}
           ],
-          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-backend-migration -p deis-wire -p deis-store -p deis-queue -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment、节点持久化、catalog migration plan/revision fence、Deislet 物理 canonical namespace，以及独立默认关闭的 backend migration 管理认证、持久单调 per-tenant writer fence、在途 SQL transaction drain、KV/SQL/blob/queue inventory SHA-256/count/bytes/orphan evidence、应用 storage token 隔离、错误 token/revision/migration 拒绝、重启恢复与真实 gRPC 路径；live request parser 仍故意拒绝 logical/physical canonical key，完成前仍须验证正式公共 Operation/coordinator、restore/backend incarnation 重新 fencing、telemetry/stateful/provider inventory/fence、canonical-first 双读、copy/cutover、rollback/failure、旧 capability 撤销与 tombstone"
+          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-backend-migration -p deis-wire -p deis-store -p deis-queue -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment、节点持久化、catalog migration plan/revision fence、Deislet 物理 canonical namespace、独立默认关闭的 backend migration 管理认证、持久单调 per-tenant writer fence、在途 SQL transaction drain、KV/SQL/blob/queue inventory，以及 Control 使用独立 per-backend 管理凭证的异步协调、网络调用前后 attempt journal、部分获取失败恢复、严格 evidence 验证、客户端断开后继续、启动恢复和脱敏 GET；live request parser 仍故意拒绝 logical/physical canonical key，完成前仍须验证满足 operation.schema.json 全字段与通用状态图的公共 Operation、restore/backend incarnation 重新 fencing、telemetry/stateful/provider inventory/fence、canonical-first 双读、copy/cutover、rollback/failure、旧 capability 撤销与 tombstone"
         },
         {
           "id": "P0-CI-001",

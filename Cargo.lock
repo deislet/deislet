@@ -2112,6 +2112,7 @@ dependencies = [
  "axum-server",
  "chrono",
  "dashmap 6.2.1",
+ "deis-backend-migration",
  "deis-bundle",
  "deis-wire",
  "futures",

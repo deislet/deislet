@@ -27,6 +27,7 @@
 //!   older version, so the history stays complete and a rollback is as
 //!   cheap as a deploy.
 
+pub mod backend_migration;
 pub mod bundle;
 pub mod compatibility;
 pub mod domains;
@@ -36,6 +37,11 @@ pub mod model;
 pub mod secrets;
 pub mod store;
 
+pub use backend_migration::{
+    BackendAttemptState, BackendMigrationAttempt, BackendMigrationEvidence,
+    IdentityMigrationCoordinator, IdentityMigrationRun, MigrationCoordinatorError,
+    summarize_identity_migration,
+};
 pub use bundle::{BundleStore, StoredBundle};
 pub use compatibility::{
     CompatibilityProfile, DeclaredCompatibility, declared_compatibility, describe_version,

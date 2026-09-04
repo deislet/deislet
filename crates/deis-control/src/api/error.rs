@@ -89,6 +89,22 @@ impl From<crate::catalog::CatalogError> for ApiError {
     }
 }
 
+impl From<crate::catalog::MigrationCoordinatorError> for ApiError {
+    fn from(err: crate::catalog::MigrationCoordinatorError) -> Self {
+        use crate::catalog::MigrationCoordinatorError;
+        match err {
+            MigrationCoordinatorError::Configuration(message) => ApiError::NotConfigured(message),
+            MigrationCoordinatorError::Catalog(error) => error.into(),
+            MigrationCoordinatorError::Backend { .. } => {
+                ApiError::ServiceUnavailable(err.to_string())
+            }
+            MigrationCoordinatorError::Protocol { .. } => {
+                ApiError::ServiceUnavailable(err.to_string())
+            }
+        }
+    }
+}
+
 /// Map configuration-push failures onto HTTP status classes.
 ///
 /// The same reasoning as the command mapping below: a push travels down a
