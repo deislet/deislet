@@ -1,46 +1,41 @@
 {
   "$schema": "../../canonical-artifact.schema.json",
   "schemaVersion": 1,
-  "artifactFormat": "edge-canon.canonical-artifact.v1",
+  "recordType": "deislet.canonical-artifact-record/v1",
   "artifactId": "01990f44-1000-7000-8000-000000000010",
   "applicationId": "01990f44-1000-7000-8000-000000000001",
   "state": "verified",
   "deployable": false,
   "createdAt": "2026-09-03T13:01:00Z",
-  "digest": {"algorithm": "sha256", "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-  "payload": {
-    "mediaType": "application/vnd.edge-canon.artifact.v1+tar",
-    "sizeBytes": 4096,
-    "rootDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+  "canonicalOutput": {
+    "format": "edge-canon.build-output/v1",
+    "manifestPath": ".edge-canon/output.json",
+    "artifactSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "contentRootSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "fileCount": 6,
+    "storage": {
+      "kind": "object",
+      "locator": "artifacts/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
   },
   "standard": {
     "contractId": "edge-canon.next",
-    "version": "next@6a8768559372fb749650c9ef355d80524d3590ff",
+    "version": "edge-canon.next@b0a96f54632b1642ae228e0f2624b9520074b647",
     "releaseStatus": "proposal",
-    "sourceCommit": "6a8768559372fb749650c9ef355d80524d3590ff",
-    "contractDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+    "sourceCommit": "b0a96f54632b1642ae228e0f2624b9520074b647",
+    "contractDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+    "artifactSchemaPath": "schemas/canonical-build-output.schema.json",
+    "artifactSchemaDigest": {"algorithm": "sha256", "value": "2711f0fd63103f9e40b5a2909279e16e9025db6b8616ab5dd4f1265d3ccb5191"}
   },
-  "source": {
-    "repository": "https://github.com/example/checkout-api",
-    "revision": "0123456789abcdef0123456789abcdef01234567",
-    "treeDigest": {"algorithm": "sha256", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
-    "dirty": false
-  },
-  "inputs": {
-    "buildPlanDigest": {"algorithm": "sha256", "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
-    "dependencyLockDigest": {"algorithm": "sha256", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
-    "publicBuildVariablesDigest": {"algorithm": "sha256", "value": "1111111111111111111111111111111111111111111111111111111111111111"}
-  },
-  "toolchain": [
-    {"name": "deis-build", "version": "0.1.0", "distributionDigest": {"algorithm": "sha256", "value": "2222222222222222222222222222222222222222222222222222222222222222"}}
-  ],
-  "bindingInterfaceDigest": {"algorithm": "sha256", "value": "3333333333333333333333333333333333333333333333333333333333333333"},
-  "sbom": {"format": "spdx-2.3", "digest": {"algorithm": "sha256", "value": "4444444444444444444444444444444444444444444444444444444444444444"}},
-  "provenance": {"format": "slsa-v1", "builderId": "deislet/build/dev", "digest": {"algorithm": "sha256", "value": "5555555555555555555555555555555555555555555555555555555555555555"}},
   "validation": {
     "status": "passed",
     "requirementsDigest": {"algorithm": "sha256", "value": "6666666666666666666666666666666666666666666666666666666666666666"},
+    "reportPath": "documents/validation-report.json",
     "reportDigest": {"algorithm": "sha256", "value": "7777777777777777777777777777777777777777777777777777777777777777"}
+  },
+  "attestations": {
+    "sbom": {"path": "documents/sbom.spdx.json", "digest": {"algorithm": "sha256", "value": "4444444444444444444444444444444444444444444444444444444444444444"}},
+    "provenance": {"path": "documents/provenance.json", "digest": {"algorithm": "sha256", "value": "5555555555555555555555555555555555555555555555555555555555555555"}}
   },
   "signatures": []
 }

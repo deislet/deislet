@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-021
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/6a8768559372fb749650c9ef355d80524d3590ff/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/b0a96f54632b1642ae228e0f2624b9520074b647/proposals/0001-unified-platform-contract/README.zh.md)
 - 取代范围：[ADR-005](005-portable-guarantees.md) 中的套餐基线与 provider 认证粒度
 
 ## 背景

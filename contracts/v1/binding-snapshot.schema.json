@@ -19,7 +19,7 @@
     "providerTargetId": {"$ref": "#/$defs/canonicalId"},
     "revision": {"type": "integer", "minimum": 1},
     "createdAt": {"type": "string", "format": "date-time"},
-    "standardVersion": {"type": "string", "minLength": 1},
+    "standardVersion": {"$ref": "#/$defs/exactStandardVersion"},
     "declarations": {
       "type": "array", "uniqueItems": true,
       "items": {"$ref": "#/$defs/declaration"}
@@ -32,6 +32,7 @@
   },
   "$defs": {
     "canonicalId": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "exactStandardVersion": {"type": "string", "pattern": "^edge-canon\\.next@[0-9a-f]{40}$"},
     "digest": {
       "type": "object", "additionalProperties": false,
       "required": ["algorithm", "value"],
@@ -83,7 +84,7 @@
           "type": "object", "additionalProperties": false,
           "required": ["standardVersion", "capabilityFamily", "requirementsDigest"],
           "properties": {
-            "standardVersion": {"type": "string", "minLength": 1},
+            "standardVersion": {"$ref": "#/$defs/exactStandardVersion"},
             "capabilityFamily": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
             "requirementsDigest": {"$ref": "#/$defs/digest"}
           }

@@ -147,6 +147,10 @@ def validate_standard_lock() -> str:
         "contractSchemaPath": "schemas/standard-contract.schema.json",
         "requirementsPath": "standard/requirements.json",
         "requirementsSchemaPath": "schemas/requirements-registry.schema.json",
+        "canonicalArtifactRequirementsPath": "standard/requirements/canonical-build-artifact.zh.md",
+        "canonicalArtifactSchemaPath": "schemas/canonical-build-output.schema.json",
+        "canonicalArtifactHarnessPath": "conformance/harness/canonical-build-artifact/harness.json",
+        "canonicalArtifactPlatformEvidencePath": "conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json",
         "conformanceKitPath": "conformance/kit.json",
         "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
         "registryPath": "conformance/registry.json",
@@ -155,10 +159,14 @@ def validate_standard_lock() -> str:
     }
     for key, expected in expected_sources.items():
         require(source.get(key) == expected, f"standard lock {key} must be {expected}")
+    require(
+        bool(SHA256.fullmatch(source.get("canonicalArtifactSchemaSha256", ""))),
+        "standard lock canonical artifact schema digest is not SHA-256",
+    )
     verification = lock.get("verification", {})
     require(verification.get("upstreamResult") == "passed", "locked upstream governance check did not pass")
     require(verification.get("expectedCapabilityFamilies") == 15, "unexpected capability family count")
-    require(verification.get("expectedDraftClauses") == 24, "unexpected draft clause count")
+    require(verification.get("expectedDraftClauses") == 40, "unexpected draft clause count")
     require(verification.get("expectedConformanceSuites") == 15, "unexpected conformance suite count")
     require(verification.get("expectedBackends") == 4, "unexpected backend record count")
 

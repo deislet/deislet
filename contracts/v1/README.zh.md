@@ -46,7 +46,7 @@ identity 迁移已完成八个可执行切片。第一段让 `application`、`en
 ## 九份机器契约
 
 1. [`resource-identity.schema.json`](resource-identity.schema.json)：主要对象的 canonical ID、kind、scope、display name 和 revision。ID 是定位符，不是凭证。
-2. [`canonical-artifact.schema.json`](canonical-artifact.schema.json)：Edge Canon 版本、payload、输入、toolchain、SBOM、provenance、验证和签名。Proposal artifact 必须是 `deployable: false`；可部署产物必须锁定已发布标准、验证通过并有签名。
+2. [`canonical-artifact.schema.json`](canonical-artifact.schema.json)：Deislet 控制面的 canonical artifact record，不再复制 payload 格式。真正的输出目录、根清单、文件集合和构建输入只由标准锁定的上游 `schemas/canonical-build-output.schema.json` 定义；record 绑定 manifest identity、content root、标准/schema 摘要、SBOM/provenance/validation 文档和外置签名。Proposal artifact 必须是 `deployable: false`；可部署 record 必须锁定已发布标准、验证通过并有签名。
 3. [`binding-snapshot.schema.json`](binding-snapshot.schema.json)：逻辑声明到 provider resource 的 immutable resolution，包含权限、mode、ownership、credential revision、region、limits 和 lifecycle，不含 secret value。
 4. [`operation.schema.json`](operation.schema.json)：持久产品操作及其 scope、target、幂等摘要、revision、phase、progress、child/provider operation、错误和时间。
 5. [`provider-driver.schema.json`](provider-driver.schema.json)：driver/官方工具精确版本、凭证传递、安全约束、12 个 lifecycle 动作及内部 native/composed/companion 映射。映射不是应用 profile，也不产生支持声明。

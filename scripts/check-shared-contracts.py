@@ -240,9 +240,41 @@ def validate_cross_document_invariants(registry: dict) -> None:
         artifact["standard"]["sourceCommit"] == lock["source"]["sourceCommit"],
         "artifact fixture does not pin the locked Edge Canon commit",
     )
+    require(
+        artifact["standard"]["version"]
+        == f"edge-canon.next@{lock['source']['sourceCommit']}",
+        "artifact fixture standard version is not the exact locked Edge Canon version",
+    )
+    require(
+        artifact["standard"]["artifactSchemaPath"]
+        == lock["source"]["canonicalArtifactSchemaPath"],
+        "artifact fixture points at a different upstream canonical output schema",
+    )
+    require(
+        artifact["standard"]["artifactSchemaDigest"]["value"]
+        == lock["source"]["canonicalArtifactSchemaSha256"],
+        "artifact fixture canonical output schema digest differs from the standard lock",
+    )
+    require(
+        artifact["canonicalOutput"]["storage"]["locator"].endswith(
+            artifact["canonicalOutput"]["artifactSha256"]
+        ),
+        "artifact fixture storage locator is not content-addressed by its manifest identity",
+    )
     require(artifact.get("deployable") is False, "proposal artifact fixture must remain non-deployable")
 
     binding = load_json("contracts/v1/fixtures/valid/binding-snapshot.json")
+    require(
+        binding["standardVersion"] == artifact["standard"]["version"],
+        "binding snapshot and canonical artifact pin different standard versions",
+    )
+    require(
+        all(
+            entry["resolvedGuarantee"]["standardVersion"] == binding["standardVersion"]
+            for entry in binding["resolutions"]
+        ),
+        "binding resolution guarantee differs from its snapshot standard version",
+    )
     declarations = {entry["bindingId"]: (entry["name"], entry["kind"]) for entry in binding["declarations"]}
     resolutions = {entry["bindingId"]: (entry["name"], entry["kind"]) for entry in binding["resolutions"]}
     require(declarations == resolutions, "binding declarations and resolutions differ")

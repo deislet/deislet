@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-014
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/6a8768559372fb749650c9ef355d80524d3590ff/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/b0a96f54632b1642ae228e0f2624b9520074b647/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 决策
 
@@ -94,6 +94,8 @@ Provider packager / deployment driver
 ## Canonical Build Output
 
 Edge Canon 应发布文件系统可交换、schema-versioned 的 Build Output contract。初始至少表达：
+
+该契约现已在锁定的 Edge Canon `canonical-build-artifact` Draft 中建立：根目录清单为 `.edge-canon/output.json`，format 为 `edge-canon.build-output/v1`，artifact identity 是规范清单字节的 SHA-256，文件集合由独立 root digest 传递绑定。Deislet 的 `contracts/v1/canonical-artifact.schema.json` 只保存控制面 record，不得再次定义 tar/zip payload 或复制 build metadata；压缩包和对象存储布局只是传输/存储实现。
 
 - artifact manifest 与 integrity table；
 - static asset tree、content type、immutable digest 与 cache metadata；

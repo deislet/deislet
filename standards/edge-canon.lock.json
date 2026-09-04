@@ -1,20 +1,25 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-04T18:24:32+08:00",
+  "resolvedAt": "2026-09-04T18:52:00+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "6a8768559372fb749650c9ef355d80524d3590ff",
+    "sourceCommit": "b0a96f54632b1642ae228e0f2624b9520074b647",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "contractPath": "standard/contract.json",
     "contractSchemaPath": "schemas/standard-contract.schema.json",
     "requirementsPath": "standard/requirements.json",
     "requirementsSchemaPath": "schemas/requirements-registry.schema.json",
+    "canonicalArtifactRequirementsPath": "standard/requirements/canonical-build-artifact.zh.md",
+    "canonicalArtifactSchemaPath": "schemas/canonical-build-output.schema.json",
+    "canonicalArtifactSchemaSha256": "2711f0fd63103f9e40b5a2909279e16e9025db6b8616ab5dd4f1265d3ccb5191",
+    "canonicalArtifactHarnessPath": "conformance/harness/canonical-build-artifact/harness.json",
+    "canonicalArtifactPlatformEvidencePath": "conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json",
     "conformanceKitPath": "conformance/kit.json",
     "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
     "registryPath": "conformance/registry.json",
     "registrySchemaPath": "schemas/conformance-registry.schema.json",
     "registrySnapshotPath": "standards/edge-canon.conformance-registry.json",
-    "registrySha256": "4b81bac7eabc432be11937cef680f248be37d70c0b9c62cb980360204149a924"
+    "registrySha256": "bf87d1c0ceb5988ce9860b62b9c54bb267dfd4b741a9d43799210682f2f58f85"
   },
   "standard": {
     "contractId": "edge-canon.next",
@@ -34,7 +39,7 @@
     "upstreamCommand": "python3 scripts/check-governance.py",
     "upstreamResult": "passed",
     "expectedCapabilityFamilies": 15,
-    "expectedDraftClauses": 24,
+    "expectedDraftClauses": 40,
     "expectedConformanceSuites": 15,
     "expectedBackends": 4
   }
