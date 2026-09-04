@@ -149,7 +149,14 @@ fn stage(project: &Path, vendor: &str) {
               contextProbe("A", 2),
               contextProbe("B", 1),
             ]);
-            localStorage.disable();
+            const exitLifecycle = localStorage.run({ label: "outer" }, () => {
+              const exited = localStorage.exit((left, right) => ({
+                store: localStorage.getStore() ?? null,
+                sum: left + right,
+              }), 2, 3);
+              return { exited, restored: localStorage.getStore().label };
+            });
+            const storeAfterRun = localStorage.getStore() ?? null;
 
             return {
               buffer: {
@@ -203,7 +210,8 @@ fn stage(project: &Path, vendor: &str) {
               scheduling: {
                 scheduleOrder,
                 contexts: { A: contextA, B: contextB },
-                storeAfterDisable: localStorage.getStore() ?? null,
+                exitLifecycle,
+                storeAfterRun,
               },
             };
           }
@@ -577,7 +585,15 @@ async fn every_provider_node_bundle_normalizes_identity_globals_and_invocation_e
                 );
             }
             assert_eq!(
-                semantics["scheduling"]["storeAfterDisable"],
+                semantics["scheduling"]["exitLifecycle"],
+                serde_json::json!({
+                    "exited": {"store": null, "sum": 5},
+                    "restored": "outer"
+                }),
+                "{vendor}"
+            );
+            assert_eq!(
+                semantics["scheduling"]["storeAfterRun"],
                 serde_json::Value::Null,
                 "{vendor}"
             );

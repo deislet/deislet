@@ -101,11 +101,54 @@ fn native_specifier(canonical: &str) -> String {
 
 fn builtin_source(canonical: &str) -> String {
     match canonical {
+        "node:async_hooks" => async_hooks_source(),
         "node:process" => process_source(),
         "node:path" => path_source(),
         "node:url" => url_source(),
         _ => passthrough_source(canonical),
     }
+}
+
+/// Expose the exact `AsyncLocalStorage` method intersection selected by Edge
+/// Canon. Cloudflare deliberately omits `enterWith()` and `disable()`, so
+/// those methods cannot be part of one portable application contract. The
+/// provider's native engine still supplies the selected propagation behavior.
+fn async_hooks_source() -> String {
+    format!(
+        r#"import {{ AsyncLocalStorage as NativeAsyncLocalStorage }} from {native};
+
+const states = new WeakMap();
+function state(instance) {{
+  const value = states.get(instance);
+  if (value === undefined) throw new TypeError("invalid AsyncLocalStorage receiver");
+  return value;
+}}
+
+class AsyncLocalStorage {{
+  constructor(options) {{
+    states.set(this, new NativeAsyncLocalStorage(options));
+  }}
+
+  run(store, callback, ...args) {{
+    if (typeof callback !== "function") throw new TypeError("AsyncLocalStorage callback must be a function");
+    return state(this).run(store, callback, ...args);
+  }}
+
+  getStore() {{
+    return state(this).getStore();
+  }}
+
+  exit(callback, ...args) {{
+    if (typeof callback !== "function") throw new TypeError("AsyncLocalStorage callback must be a function");
+    return state(this).run(undefined, callback, ...args);
+  }}
+}}
+
+export {{ AsyncLocalStorage }};
+"#,
+        native = serde_json::to_string(&native_specifier("node:async_hooks"))
+            .expect("specifier is JSON text"),
+    )
 }
 
 fn passthrough_source(canonical: &str) -> String {
@@ -392,5 +435,15 @@ mod tests {
         for canonical in deis_node_contract::NODE_BUILTIN_MODULES {
             assert!(source.contains(canonical), "missing {canonical}: {source}");
         }
+    }
+
+    #[test]
+    fn async_local_storage_exposes_only_the_portable_method_intersection() {
+        let source = async_hooks_source();
+        for method in ["run(store", "getStore()", "exit(callback"] {
+            assert!(source.contains(method), "missing {method}: {source}");
+        }
+        assert!(!source.contains("  enterWith("), "{source}");
+        assert!(!source.contains("  disable()"), "{source}");
     }
 }
