@@ -1388,3 +1388,12 @@ Application/framework source + versioned build plan
 - 治理现在强制三个 manifest 恰好覆盖全部一等后端及 T001–T014；若 manifest 标为 complete 但仍有 pending operation、case blocker 或 limitation，或者 harness 完成列表与 manifest 不一致，校验失败。新增安全测试覆盖 stdout/stderr 脱敏、argv 泄漏拒绝、输出超限不回显可能的局部秘密、超时终止和篡改工具锁拒绝；连同 fixture/oracle 共 23 项 Node 测试，本地治理、JSON Schema 校验与 diff check 均通过，上游 run [`33848399022`](https://github.com/deislet/edge-canon/actions/runs/33848399022) 也成功。
 - 这仍不是部署证据。三个 manifest 诚实保持 `draft`，只有 `inspect`/`preflight` 为 implemented；prepare、真实 deploy、invoke、collect、cleanup、run 及 14 项 case coverage 全为 pending。Edge Canon registry 只把阻断文案改成“已有三个 Draft adapter 但没有 complete adapter”，所有 backend maturity、compliant 与 supported 均未提升。Deislet 已锁定该上游 commit 及 registry SHA-256 `4b81bac7eabc432be11937cef680f248be37d70c0b9c62cb980360204149a924`。
 - 继续阻断项：可部署的 provider wrapper 与 canonical/derived artifact lineage；受控 evidence sink、redirect origin、connection barrier；断连 client；三个后端的结构化 failure/background/CPU/limit 证据读取；短期资源 identity、幂等恢复和安全 cleanup；真实测试账户运行。响应 body、wall time、内存归属、`waitUntil` 宽限、超限后流式处理和依赖能力族也尚未冻结，因此 `P0-SPEC-002` 继续 active。
+
+## 29. P1-BUILD-001 本地模块图与 provider prepare 验收发现
+
+- EC-WEB Deislet 派生产物的真实 `deis build --vendor deislet` 首次失败，错误为无法从暂存的 `dist/deislet/src/[[all]].js` 解析 `../canonical/fixture.mjs`。这暴露的是既有产品缺陷，不是 conformance fixture 特例：文档明确要求非 handler 辅助模块放在 `functionRoot` 外，编译器却只复制 handler，普通相对导入因此从未进入构建树。
+- 编译器现在把每个路由文件生成稳定的 `src/` 薄代理，并把完整可达本地模块图按原项目相对形状写入 `project/` 镜像；静态 import、再导出、字面量动态 `import()` 和字面量 `require()` 都递归遍历。这样嵌套 `functionRoot` 的 `../../shared/x.js` 仍解析到同一项目文件，辅助模块也不会被误注册为路由。
+- 本地绝对路径、解析到项目外、符号链接文件、缺失目标和无法枚举的动态 `import(expression)` / `require(expression)` 均在构建期失败关闭。handler 发现同时与公共路由规则对齐，补齐 `.tsx/.jsx/.mjs/.cjs`，避免路由层声称接受而 compiler 静默忽略。
+- 新增跨目标回归证明 Cloudflare、EdgeOne 与 Deislet 单文件产物均含 eager/lazy 两层 helper，Deno 部署树同时含 route proxy 与完整 project mirror；越界导入和计算式模块加载给出具名失败。原 compiler/build-core/四 adapter 全套测试继续通过。
+- provider 工具验收也发现本机 `npx --package=wrangler@4.129.0` 实际命中了缓存中的 4.86.0；它虽接受产物，但不能作为锁定工具证据。隔离安装并用绝对入口运行的 Wrangler 4.129.0 随后接受同一 Cloudflare 派生产物。修复后的 Deislet 编译器成功生成 bundle，本地真实 `deis dev` 又验证 `/sync`、`/context`、POST `/method` 和结构化 `EDGE_CANON_EVIDENCE` 日志。
+- Deislet commit `4056732f10e5aacd12b88c6f2b86d7484c4a3cb6` 的完整 checks run `33848760058` 已成功；它只覆盖进入本切片前的 provider protocol lock。本模块图修复仍需提交后的新远端 run，不能借用上一 run 宣称绿色。

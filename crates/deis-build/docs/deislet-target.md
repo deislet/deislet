@@ -52,6 +52,21 @@ node evaluates it - the whole application down, every route, not the one file.
 Named exports alone are not enough, and the build refuses such a file by name.
 A helper that is not a handler belongs outside the function root.
 
+Handlers may import those helpers with ordinary relative ESM paths. The build
+walks the complete reachable local module graph — static imports, re-exports,
+literal `import()` calls and literal `require()` calls — and stages it under a
+project-shaped mirror before bundling. This preserves the meaning of relative
+paths even when `functionRoot` is nested. A local import that resolves outside
+the project, crosses a symbolic-link file, or names no file fails the build;
+otherwise the deployable would depend on unrecorded state from the build
+machine. Route files are small generated proxies into that mirror, so helpers
+remain helpers and never acquire routes of their own. Bundled targets remove
+both staging trees after producing their one entry module; the Deno target
+carries them because Deno resolves the ESM tree at deployment/runtime. A
+computed `import(expression)` or `require(expression)` is refused: the build
+cannot enumerate what it would need to carry, and accepting it would defer a
+missing-module failure until that branch happens to run.
+
 **A file name is data in the route table, never syntax.** `[name]` and
 `[[name]]` are how the file tree spells a placeholder and a catch-all, so a
 raw `:` or `*` in a name is a literal and is escaped to stay one:

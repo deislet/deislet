@@ -186,6 +186,7 @@ mod tests {
             named_exports: vec![],
             used_services: vec![],
             imports: vec![],
+            non_literal_module_loads: 0,
         }
     }
 

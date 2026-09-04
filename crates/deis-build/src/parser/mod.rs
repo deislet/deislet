@@ -49,6 +49,7 @@ impl TypeScriptParser {
             named_exports: visitor.named_exports,
             used_services: visitor.used_services,
             imports: visitor.imports,
+            non_literal_module_loads: visitor.non_literal_module_loads,
         })
     }
 
@@ -87,6 +88,7 @@ struct HandlerVisitor {
     named_exports: Vec<String>,
     used_services: Vec<String>,
     imports: Vec<String>,
+    non_literal_module_loads: usize,
 }
 
 impl HandlerVisitor {
@@ -96,6 +98,7 @@ impl HandlerVisitor {
             named_exports: Vec::new(),
             used_services: Vec::new(),
             imports: Vec::new(),
+            non_literal_module_loads: 0,
         }
     }
 
@@ -121,6 +124,12 @@ impl HandlerVisitor {
             }
         }
     }
+
+    fn record_import(&mut self, specifier: &str) {
+        if !self.imports.iter().any(|existing| existing == specifier) {
+            self.imports.push(specifier.to_string());
+        }
+    }
 }
 
 /// The text of an exported name, whether it was written as an identifier or as
@@ -133,12 +142,14 @@ fn export_name(name: &ModuleExportName) -> String {
 }
 
 impl Visit for HandlerVisitor {
-    fn visit_export_default_decl(&mut self, _: &ExportDefaultDecl) {
+    fn visit_export_default_decl(&mut self, declaration: &ExportDefaultDecl) {
         self.has_default_export = true;
+        declaration.visit_children_with(self);
     }
 
-    fn visit_export_default_expr(&mut self, _: &ExportDefaultExpr) {
+    fn visit_export_default_expr(&mut self, expression: &ExportDefaultExpr) {
         self.has_default_export = true;
+        expression.visit_children_with(self);
     }
 
     fn visit_export_decl(&mut self, n: &ExportDecl) {
@@ -159,6 +170,7 @@ impl Visit for HandlerVisitor {
             }
             _ => {}
         }
+        n.visit_children_with(self);
     }
 
     fn visit_named_export(&mut self, n: &NamedExport) {
@@ -191,15 +203,45 @@ impl Visit for HandlerVisitor {
                 self.named_exports.push(name);
             }
         }
+        if let Some(source) = &n.src {
+            self.record_import(&source.value.to_string_lossy());
+        }
     }
 
     fn visit_import_decl(&mut self, n: &ImportDecl) {
-        self.imports.push(n.src.value.to_string_lossy().to_string());
+        self.record_import(&n.src.value.to_string_lossy());
+    }
+
+    fn visit_export_all(&mut self, n: &ExportAll) {
+        self.record_import(&n.src.value.to_string_lossy());
     }
 
     fn visit_expr(&mut self, n: &Expr) {
         // Check any expression for service usage
         self.check_service_usage(n);
+
+        // These literal forms resolve files just as a static import does.
+        // They belong in the staged module graph as well; otherwise a build
+        // can ship its eager path and leave its lazy or CommonJS path behind.
+        if let Expr::Call(call) = n {
+            let imports_module = matches!(call.callee, Callee::Import(_))
+                || matches!(
+                    &call.callee,
+                    Callee::Expr(callee)
+                        if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
+                );
+            if imports_module {
+                if let Some(argument) = call.args.first() {
+                    if let Expr::Lit(Lit::Str(specifier)) = &*argument.expr {
+                        self.record_import(&specifier.value.to_string_lossy());
+                    } else {
+                        self.non_literal_module_loads += 1;
+                    }
+                } else {
+                    self.non_literal_module_loads += 1;
+                }
+            }
+        }
 
         // Continue visiting children
         n.visit_children_with(self);
@@ -324,6 +366,48 @@ export default async function handler(context: Context) {
         assert!(info.imports.contains(&"zod".to_string()));
         assert!(info.imports.contains(&"@deis/types".to_string()));
         assert!(info.imports.contains(&"../utils".to_string()));
+    }
+
+    #[test]
+    fn every_literal_module_edge_is_recorded_once() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                r#"
+import value from './static.js';
+export { value as named } from './reexport.js';
+export * from './all.js';
+const lazy = import('./lazy.js');
+const legacy = require('./legacy.cjs');
+export default async function handler() { return new Response(String(value)); }
+"#,
+                "functions/index.js",
+            )
+            .expect("module parses");
+
+        assert_eq!(
+            info.imports,
+            vec![
+                "./static.js",
+                "./reexport.js",
+                "./all.js",
+                "./lazy.js",
+                "./legacy.cjs",
+            ]
+        );
+        assert_eq!(info.non_literal_module_loads, 0);
+    }
+
+    #[test]
+    fn computed_module_loads_are_counted_for_a_fail_closed_build() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "export default async function handler(name) { await import(name); return require(name); }",
+                "functions/index.js",
+            )
+            .expect("module parses");
+        assert_eq!(info.non_literal_module_loads, 2);
     }
 
     #[test]

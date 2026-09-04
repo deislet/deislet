@@ -141,7 +141,7 @@ impl BuildBundler {
     ///
     /// That is exactly what a handler file with named exports and no default
     /// export produced. The generated entry module imports each handler as
-    /// `import handlerN from "../src/<file>"` and puts `handlerN` in its route
+    /// `import handlerN from "../src/<file>"` (the staged route proxy) and puts `handlerN` in its route
     /// table; with no default to bind, the import disappears and `handlerN`
     /// is left free in `const ROUTES = [...]`, which runs at module scope. The
     /// build printed a green line and packed a bundle that could not be

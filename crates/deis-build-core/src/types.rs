@@ -98,6 +98,9 @@ pub struct HandlerInfo {
     pub named_exports: Vec<String>,
     pub used_services: Vec<String>,
     pub imports: Vec<String>,
+    /// `import(expr)` / `require(expr)` edges whose target is not a string
+    /// literal and therefore cannot be put into a self-contained artifact.
+    pub non_literal_module_loads: usize,
 }
 
 /// One static file the project ships, as an adapter needs to know it.

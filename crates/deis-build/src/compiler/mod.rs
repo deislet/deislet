@@ -5,9 +5,9 @@ use crate::parser::TypeScriptParser;
 use colored::Colorize;
 use deis_build_core::bundler::{BuildBundler, TargetPlatform};
 use deis_build_core::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub use transformer::Transformer;
@@ -409,15 +409,23 @@ impl Compiler {
         project_dir: &Path,
         config: &ProjectConfig,
     ) -> anyhow::Result<Vec<String>> {
-        let functions_dir = project_dir.join(&config.function_root);
+        let project_root = fs::canonicalize(project_dir)?;
+        let configured_functions_dir = project_dir.join(&config.function_root);
         let mut handlers = Vec::new();
 
         // A project with no function root is a site made only of static files,
         // which is a shape the platform serves on purpose (asset-first). The
         // walk below would otherwise fail on the missing directory and the
         // whole build would stop with a bare "No such file or directory".
-        if !functions_dir.exists() {
+        if !configured_functions_dir.exists() {
             return Ok(handlers);
+        }
+        let functions_dir = fs::canonicalize(&configured_functions_dir)?;
+        if !functions_dir.starts_with(&project_root) {
+            return Err(anyhow::anyhow!(
+                "functionRoot {:?} resolves outside the project; a deployable must be self-contained",
+                config.function_root
+            ));
         }
 
         for entry in WalkDir::new(&functions_dir) {
@@ -425,7 +433,10 @@ impl Compiler {
             if entry.file_type().is_file() {
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
-                    if ext == "ts" || ext == "js" || ext == "wasm" {
+                    if matches!(
+                        ext.to_str(),
+                        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "wasm")
+                    ) {
                         Self::refuse_a_separator_inside_a_name(&functions_dir, path)?;
                         handlers.push(path.to_string_lossy().to_string());
                     }
@@ -434,6 +445,148 @@ impl Compiler {
         }
 
         Ok(handlers)
+    }
+
+    /// Resolve one local module edge using the same finite set of source
+    /// suffixes this compiler accepts. The resolved file must stay inside the
+    /// project: otherwise a successful build depends on an unrecorded file
+    /// from the build machine, and the source tree is not the deployable's
+    /// source of truth.
+    fn resolve_local_module(
+        project_root: &Path,
+        importer: &Path,
+        specifier: &str,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        if specifier.starts_with('/') || specifier.starts_with("file://") {
+            return Err(anyhow::anyhow!(
+                "{} imports {specifier:?}, an absolute local path. A deployable must be self-contained; move the file under {} and import it relatively",
+                importer.display(),
+                project_root.display()
+            ));
+        }
+        if !specifier.starts_with("./") && !specifier.starts_with("../") {
+            return Ok(None);
+        }
+        if specifier.contains('\\') {
+            return Err(anyhow::anyhow!(
+                "{} imports {specifier:?} with a backslash; ESM module paths use '/' on every build host",
+                importer.display()
+            ));
+        }
+
+        let suffix_at = specifier.find(['?', '#']).unwrap_or(specifier.len());
+        let disk_specifier = &specifier[..suffix_at];
+        let requested = importer
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", importer.display()))?
+            .join(disk_specifier);
+        let mut candidates = vec![requested.clone()];
+        if requested.extension().is_none() {
+            for extension in ["ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "wasm"] {
+                candidates.push(requested.with_extension(extension));
+            }
+            for extension in ["ts", "tsx", "js", "jsx", "mjs", "cjs", "json"] {
+                candidates.push(requested.join(format!("index.{extension}")));
+            }
+        } else if matches!(
+            requested.extension().and_then(|value| value.to_str()),
+            Some("js" | "jsx" | "mjs" | "cjs")
+        ) {
+            // TypeScript commonly writes the JavaScript name that will exist
+            // after compilation. Prefer an exact file, then the source forms.
+            candidates.push(requested.with_extension("ts"));
+            candidates.push(requested.with_extension("tsx"));
+        }
+
+        let candidate = candidates
+            .into_iter()
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} imports {specifier:?}, but no project file resolves that module",
+                    importer.display()
+                )
+            })?;
+        if fs::symlink_metadata(&candidate)?.file_type().is_symlink() {
+            return Err(anyhow::anyhow!(
+                "{} imports {} through a symbolic link; deployable source files must have one stable project path",
+                importer.display(),
+                candidate.display()
+            ));
+        }
+        let resolved = fs::canonicalize(&candidate)?;
+        if !resolved.starts_with(project_root) {
+            return Err(anyhow::anyhow!(
+                "{} imports {specifier:?}, which resolves outside the project at {}. A deployable must be self-contained",
+                importer.display(),
+                resolved.display()
+            ));
+        }
+        Ok(Some(resolved))
+    }
+
+    fn project_mirror_path(
+        build_dir: &Path,
+        project_root: &Path,
+        source: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        let relative = source.strip_prefix(project_root).map_err(|_| {
+            anyhow::anyhow!(
+                "source {} is outside project {}",
+                source.display(),
+                project_root.display()
+            )
+        })?;
+        Ok(build_dir.join("project").join(relative))
+    }
+
+    fn write_staged_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if path.exists() {
+            let existing = fs::read(path)?;
+            if existing != bytes {
+                return Err(anyhow::anyhow!(
+                    "two source modules map to {} with different bytes; refusing an ambiguous staging tree",
+                    path.display()
+                ));
+            }
+            return Ok(());
+        }
+        fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    fn proxy_module(proxy: &Path, source: &Path) -> anyhow::Result<String> {
+        let from = proxy
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent", proxy.display()))?;
+        let relative = pathdiff::diff_paths(source, from).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot express {} relative to {} on this build host",
+                source.display(),
+                from.display()
+            )
+        })?;
+        let mut specifier = relative.to_string_lossy().replace('\\', "/");
+        if !specifier.starts_with('.') {
+            specifier = format!("./{specifier}");
+        }
+        let quoted = serde_json::to_string(&specifier)?;
+        Ok(format!(
+            "export {{ default }} from {quoted};\nexport * from {quoted};\n"
+        ))
+    }
+
+    fn refuse_non_literal_module_loads(path: &str, info: &HandlerInfo) -> anyhow::Result<()> {
+        if info.non_literal_module_loads == 0 {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "{path} contains {} import()/require() call(s) whose module name is not a string literal. This build cannot enumerate or carry those files, so accepting it could produce a deployable that fails only when that branch runs. Use one literal module specifier per branch",
+            info.non_literal_module_loads
+        ))
     }
 
     /// Stop a build over a handler whose name contains a backslash.
@@ -728,65 +881,81 @@ impl Compiler {
         let mut memory_source_files = HashMap::new();
         let mut memory_system_files = HashMap::new();
 
-        // Discover handlers
+        // Discover handlers and stage the complete local module graph. The
+        // router keeps its stable `../src/<route file>` imports, but those
+        // files are small proxies into a project-shaped mirror. Keeping the
+        // original project-relative shape is what makes `../shared/x.js`
+        // continue to mean the same file after staging, including when the
+        // configured function root is nested.
         let handlers = self.discover_handlers(project_dir, config)?;
+        let project_root = fs::canonicalize(project_dir)?;
+        let function_root = if handlers.is_empty() {
+            None
+        } else {
+            Some(fs::canonicalize(project_dir.join(&config.function_root))?)
+        };
         let mut routes = Vec::new();
         let mut files = Vec::new();
         let mut total_size = 0;
-        // Every module specifier each handler writes, kept against the
-        // author's own path. The deno target is the only reader: it is the one
-        // target whose modules are shipped unbundled, so nothing else ever
-        // looks at what they import. See
-        // `refuse_specifiers_deno_cannot_resolve`.
+        // Every module specifier in the reachable graph is also kept for the
+        // Deno resolver check, because helpers can import a bare name just as
+        // a route handler can.
         let mut handler_specifiers: Vec<(String, Vec<String>)> = Vec::new();
+        let mut module_queue: VecDeque<(PathBuf, Vec<String>)> = VecDeque::new();
+        let mut staged_modules: HashSet<PathBuf> = HashSet::new();
 
-        // Copy files (User Code) to dist/vendor/src/
+        // A handler is staged twice on purpose: its unmodified source lives in
+        // `project/` with every helper, while `src/` holds the route proxy the
+        // generated adapter already knows how to import. Bundled targets drop
+        // both trees after producing their one entry module; Deno ships them.
         for handler_path in handlers {
-            let relative_path = Path::new(&handler_path)
-                .strip_prefix(project_dir.join(&config.function_root))
-                .unwrap_or(Path::new(&handler_path));
-
-            // Output to dist/vendor/src/... (to avoid conflict with generated files)
+            let source_path = PathBuf::from(&handler_path);
+            let relative_path = source_path.strip_prefix(
+                function_root
+                    .as_deref()
+                    .expect("a discovered handler has a function root"),
+            )?;
             let output_path = build_dir.join("src").join(relative_path);
+            let mirror_path = Self::project_mirror_path(&build_dir, &project_root, &source_path)?;
 
             if handler_path.ends_with(".wasm") {
-                if let Some(parent) = output_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(&handler_path, &output_path)?;
+                let bytes = fs::read(&source_path)?;
+                Self::write_staged_file(&mirror_path, &bytes)?;
+                Self::write_staged_file(&output_path, &bytes)?;
+                total_size += bytes.len() * 2;
                 files.push(handler_path.clone());
+                staged_modules.insert(source_path);
                 continue;
             }
 
             let code = fs::read_to_string(&handler_path)?;
-            // Parsed once. The default-export check and the deno specifier
-            // check both read this, and a second parse would be a second
-            // reading of the same file that could disagree with the first.
-            let parsed = self.parser.parse(&code, &handler_path).ok();
-            Self::refuse_a_handler_with_no_default_export(&handler_path, parsed.as_ref())?;
-            if let Some(info) = &parsed {
-                handler_specifiers.push((handler_path.clone(), info.imports.clone()));
-            }
+            let parsed = self.parser.parse(&code, &handler_path)?;
+            Self::refuse_a_handler_with_no_default_export(&handler_path, Some(&parsed))?;
+            Self::refuse_non_literal_module_loads(&handler_path, &parsed)?;
+            handler_specifiers.push((handler_path.clone(), parsed.imports.clone()));
+            module_queue.push_back((source_path.clone(), parsed.imports));
+            staged_modules.insert(source_path.clone());
             let transformed = self
                 .transformer
                 .transform(&code, &handler_path, vendor, config)?;
-
-            // Staged unconditionally: this is the file the generated router
-            // imports as `../src/<handler>`, so the bundler needs it on disk
-            // whether or not the output directory is kept.
-            if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&output_path, &transformed)?;
+            Self::write_staged_file(&mirror_path, transformed.as_bytes())?;
+            let proxy = Self::proxy_module(&output_path, &mirror_path)?;
+            Self::write_staged_file(&output_path, proxy.as_bytes())?;
 
             // Collect into memory (Memory/Both modes)
             if should_collect_memory {
                 let source_key = format!("src/{}", relative_path.to_string_lossy());
-                memory_source_files.insert(source_key, transformed.clone());
+                memory_source_files.insert(source_key, proxy.clone());
+                let project_relative = source_path.strip_prefix(&project_root)?;
+                let mirror_key = format!(
+                    "project/{}",
+                    project_relative.to_string_lossy().replace('\\', "/")
+                );
+                memory_source_files.insert(mirror_key, transformed.clone());
             }
 
             files.push(handler_path.clone());
-            total_size += transformed.len();
+            total_size += transformed.len() + proxy.len();
 
             // Add to routes
             if !handler_path.ends_with(".wasm") {
@@ -817,6 +986,47 @@ impl Compiler {
                 // Fix Windows paths for JS import
                 let import_path = import_path.replace("\\", "/");
                 routes.push((route, import_path));
+            }
+        }
+
+        while let Some((importer, specifiers)) = module_queue.pop_front() {
+            for specifier in specifiers {
+                let Some(dependency) =
+                    Self::resolve_local_module(&project_root, &importer, &specifier)?
+                else {
+                    continue;
+                };
+                if !staged_modules.insert(dependency.clone()) {
+                    continue;
+                }
+
+                let bytes = fs::read(&dependency)?;
+                let mirror_path =
+                    Self::project_mirror_path(&build_dir, &project_root, &dependency)?;
+                Self::write_staged_file(&mirror_path, &bytes)?;
+                let project_relative = dependency.strip_prefix(&project_root)?;
+                files.push(dependency.to_string_lossy().to_string());
+                total_size += bytes.len();
+
+                if let Ok(code) = std::str::from_utf8(&bytes) {
+                    if matches!(
+                        dependency.extension().and_then(|value| value.to_str()),
+                        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+                    ) {
+                        let name = dependency.to_string_lossy().to_string();
+                        let parsed = self.parser.parse(code, &name)?;
+                        Self::refuse_non_literal_module_loads(&name, &parsed)?;
+                        handler_specifiers.push((name, parsed.imports.clone()));
+                        module_queue.push_back((dependency.clone(), parsed.imports));
+                    }
+                    if should_collect_memory {
+                        let key = format!(
+                            "project/{}",
+                            project_relative.to_string_lossy().replace('\\', "/")
+                        );
+                        memory_source_files.insert(key, code.to_string());
+                    }
+                }
             }
         }
 
@@ -1062,34 +1272,15 @@ impl Compiler {
             )
         };
 
-        // Cleanup for Bundled targets (CF, EO, Runtime)
+        // Cleanup for bundled targets (Cloudflare, EdgeOne, Deislet). The
+        // router, route proxies and project-shaped source mirror have all
+        // been folded into the single entry module at this point. Deno is the
+        // exception: it deploys this ESM tree directly.
         if vendor != deis_build_adapter_deno::VENDOR && keeps_output {
-            // Delete _deis_internal
-            let system_dir = build_dir.join("_deis_internal");
-            if system_dir.exists() {
-                fs::remove_dir_all(system_dir)?;
-            }
-
-            // Cleanup source files in src/ but keep assets
-            let src_dir = build_dir.join("src");
-            if vendor == deis_build_adapter_deislet::VENDOR && src_dir.exists() {
-                // Nothing loose survives a deislet build: the archive carries
-                // the whole app, and a leftover copy of the sources next to it
-                // is stale the moment the next build runs.
-                fs::remove_dir_all(&src_dir)?;
-            } else if src_dir.exists() {
-                for entry in WalkDir::new(&src_dir).contents_first(true) {
-                    let entry = entry?;
-                    if entry.file_type().is_file() {
-                        if let Some(ext) = entry.path().extension() {
-                            if ext == "ts" || ext == "js" {
-                                fs::remove_file(entry.path())?;
-                            }
-                        }
-                    } else if entry.file_type().is_dir() {
-                        // Try to remove dir (succeeds only if empty)
-                        let _ = fs::remove_dir(entry.path());
-                    }
+            for staged in ["_deis_internal", "src", "project"] {
+                let directory = build_dir.join(staged);
+                if directory.exists() {
+                    fs::remove_dir_all(directory)?;
                 }
             }
         }

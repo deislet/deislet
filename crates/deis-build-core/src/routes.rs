@@ -26,9 +26,12 @@
 /// Where the compiler stages a handler, as the generated entry module reaches
 /// it.
 ///
-/// Every handler under the function root is copied into `src/` of the build
-/// directory and the generated entry module is written into `_deis_internal/`,
-/// so the entry imports a handler as `../src/<path under the function root>`.
+/// Every handler under the function root gets a route proxy in `src/` of the
+/// build directory and the generated entry module is written into
+/// `_deis_internal/`, so the entry imports it as
+/// `../src/<path under the function root>`. The proxy re-exports the source
+/// from the project-shaped module mirror; keeping this route-facing prefix
+/// stable lets route planning stay independent of source staging.
 /// The constant lives here rather than in either half because both halves read
 /// it: the compiler builds the specifier, and the deislet route planner takes
 /// it apart again to find out whether a file sits *at* the function root.
