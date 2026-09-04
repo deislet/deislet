@@ -4,7 +4,7 @@
 - 日期：2026-09-04
 - 决策者：产品负责人已确认的统一标准方向；本记录落实 ADR-019 的后端约束
 - 关联：[ADR-019](019-coordinated-data-lifecycle.md)、`../product/phase-analysis-2026-09-03.zh.md` 第 13 节、`../../contracts/v1/backend-migration-evidence.schema.json`
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 决策
 

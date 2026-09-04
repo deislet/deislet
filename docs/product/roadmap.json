@@ -48,10 +48,10 @@
           "status": "done",
           "dependsOn": ["P0-DEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/proposals/0001-unified-platform-contract/README.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/contract.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/proposals/0001-unified-platform-contract/README.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/standard/contract.json"}
           ],
-          "verification": "在 Edge Canon commit dc48a82d856c7d3991350b2aebba051bb9db3aad 运行 python3 scripts/check-governance.py"
+          "verification": "在 Edge Canon commit 01d03d39d52691e0dde732357e0fd32c8011cac1 运行 python3 scripts/check-governance.py"
         },
         {
           "id": "P0-CONF-001",
@@ -60,8 +60,8 @@
           "status": "done",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/registry.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/schemas/conformance-registry.schema.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/registry.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/schemas/conformance-registry.schema.json"}
           ],
           "verification": "registry 中 proposal 不能 compliant，supported 必须蕴含 compliant"
         },
@@ -86,27 +86,31 @@
           "status": "active",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/requirements.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/requirements/web-fetch-events.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/kit.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/harness/web-fetch-events/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/harness/web-fetch-events/provider-adapter-protocol.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/harness/web-fetch-events/oracle.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/requirements/canonical-build-artifact.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/schemas/canonical-build-output.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/harness/canonical-build-artifact/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/requirements/routing-static-assets.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/schemas/routing-static-assets.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/harness/routing-static-assets/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/evidence/routing-static-assets-platforms-2026-09-04.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/standard/requirements/web-platform-apis.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/schemas/web-platform-apis.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/harness/web-platform-apis/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/dc48a82d856c7d3991350b2aebba051bb9db3aad/conformance/evidence/web-platform-apis-platforms-2026-09-04.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/standard/requirements.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/standard/requirements/web-fetch-events.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/kit.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/harness/web-fetch-events/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/harness/web-fetch-events/provider-adapter-protocol.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/harness/web-fetch-events/oracle.mjs"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/standard/requirements/canonical-build-artifact.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/schemas/canonical-build-output.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/harness/canonical-build-artifact/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/standard/requirements/routing-static-assets.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/schemas/routing-static-assets.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/harness/routing-static-assets/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/evidence/routing-static-assets-platforms-2026-09-04.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/standard/requirements/web-platform-apis.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/schemas/web-platform-apis.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/harness/web-platform-apis/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/evidence/web-platform-apis-platforms-2026-09-04.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/standard/requirements/streams-websockets-background-work.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/schemas/streams-websockets-background-work.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/harness/streams-websockets-background-work/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/01d03d39d52691e0dde732357e0fd32c8011cac1/conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json"}
           ],
-          "verification": "Edge Canon commit dc48a82d856c7d3991350b2aebba051bb9db3aad 运行 python3 scripts/check-governance.py 和 node --test；本地 81 项测试全过，远端 governance run 33870140499 成功。EC-WEB T001–T015 的同源 fixture/oracle、artifact lineage、安全进程边界、身份绑定 deploy、at-most-once invoke 和 provider-neutral collect 已落地；Cloudflare/Deislet 另有精确单次 CPU、cleanup 与可恢复 run。EC-ARTIFACT 的 16 条、EC-ROUTING 的 20 条及 EC-WEBAPI 的 30 条 Draft clause 均有 schema、case、reference harness 和 oracle；对应 T001–T008、T001–T011、T001–T014 均在 Linux、macOS、Windows 生成一致 identity。EdgeOne collect/cleanup/run、三个真实账户 evidence、canonical artifact/routing/Web API 的真实 framework/provider 集成、尚未冻结的资源/生命周期维度及其余 11 个能力族继续阻断完成"
+          "verification": "Edge Canon commit 01d03d39d52691e0dde732357e0fd32c8011cac1 运行 python3 scripts/check-governance.py 和 node --test；本地 88 项测试全过，远端 governance run 33872115372 成功。EC-WEB T001–T015 的同源 fixture/oracle、artifact lineage、安全进程边界、身份绑定 deploy、at-most-once invoke 和 provider-neutral collect 已落地；Cloudflare/Deislet 另有精确单次 CPU、cleanup 与可恢复 run。EC-ARTIFACT 的 16 条、EC-ROUTING 的 20 条、EC-WEBAPI 的 30 条及 EC-STREAM 的 28 条 Draft clause 均有 schema、case、reference harness 和 oracle；对应 T001–T008、T001–T011、T001–T014、T001–T013 均在 Linux、macOS、Windows 生成一致 identity。EC-STREAM 明确以预部署拒绝处理当前无参考供应商运行时交集的 WebSocket。EdgeOne collect/cleanup/run、三个真实账户 evidence、真实 framework/provider 集成、尚未冻结的资源/生命周期维度及其余 10 个能力族继续阻断完成"
         },
         {
           "id": "P0-EVID-001",
