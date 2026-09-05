@@ -857,6 +857,7 @@ pub(crate) fn resume_on_start(state: CatalogState) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut next_secret_revision_gc = 0;
+        let mut next_provider_credential_lease_reap = 0;
         loop {
             interval.tick().await;
             let plans = match state.store.nonterminal_deployment_plans().await {
@@ -896,6 +897,23 @@ pub(crate) fn resume_on_start(state: CatalogState) {
                     Err(error) => warn!(
                         error = %error,
                         "Could not reconcile staged-secret retention; ciphertext was retained and the next pass will retry"
+                    ),
+                }
+            }
+            if cycle_now >= next_provider_credential_lease_reap {
+                match state.provider_credentials.expire_leases().await {
+                    Ok(expired) => {
+                        if expired > 0 {
+                            info!(
+                                expired,
+                                "Expired provider credential leases and recorded immutable audit events"
+                            );
+                        }
+                        next_provider_credential_lease_reap = cycle_now.saturating_add(30);
+                    }
+                    Err(error) => warn!(
+                        error = %error,
+                        "Could not expire provider credential leases; no credential was exposed and the next pass will retry"
                     ),
                 }
             }

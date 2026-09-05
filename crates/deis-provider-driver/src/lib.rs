@@ -6,6 +6,7 @@
 //! pinned official CLI. Provider credentials are deliberately absent from all
 //! serializable request and receipt types.
 
+mod credential;
 mod digest;
 mod executor;
 mod lifecycle;
@@ -13,14 +14,18 @@ mod manifest;
 mod model;
 mod orchestrator;
 
+pub use credential::{
+    CredentialBrokerError, CredentialBrokerErrorKind, CredentialLeaseDisposition,
+    CredentialMaterial, CredentialMaterialError, ProviderCredentialBroker, ProviderCredentialLease,
+};
 pub use digest::{Sha256Digest, Sha256DigestError};
 pub use executor::{
     CommandExecutionError, CommandExecutionErrorKind, CommandInvocation, CommandOutput,
     PinnedCommandRunner, PinnedExecutable, SecretInjection, SecretString, SideEffectPolicy,
 };
 pub use lifecycle::{
-    DriverContractError, ProviderDriver, validate_driver_error, validate_driver_request,
-    validate_driver_response,
+    DriverContractError, DriverExecutionContext, ProviderDriver, validate_driver_error,
+    validate_driver_request, validate_driver_response,
 };
 pub use manifest::{
     BackendManifest, ClaimPolicy, CredentialPolicy, DriverIdentity, DriverManifestError,

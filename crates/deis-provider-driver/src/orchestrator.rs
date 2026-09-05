@@ -5,8 +5,9 @@ use deis_wire::CanonicalId;
 use tokio::time::{Instant, interval_at};
 
 use crate::{
-    DriverContractError, DriverError, DriverReceipt, DriverRequest, ProviderDriver, Sha256Digest,
-    validate_driver_error, validate_driver_request, validate_driver_response,
+    DriverContractError, DriverError, DriverExecutionContext, DriverReceipt, DriverRequest,
+    ProviderDriver, Sha256Digest, validate_driver_error, validate_driver_request,
+    validate_driver_response,
 };
 
 /// Exact executable/manifest identity selected with a durable target. A
@@ -266,7 +267,9 @@ where
             return Err(DriverOrchestratorError::Contract(error));
         }
 
-        let mut execution = Box::pin(driver.execute(&claim.request));
+        let execution_context =
+            DriverExecutionContext::new(&claim.request, claim.owner_id, claim.claim_epoch);
+        let mut execution = Box::pin(driver.execute(&execution_context));
         let mut heartbeat = interval_at(
             Instant::now() + self.config.heartbeat_interval,
             self.config.heartbeat_interval,
@@ -466,7 +469,11 @@ mod tests {
             &self.manifest
         }
 
-        async fn execute(&self, request: &DriverRequest) -> Result<DriverReceipt, DriverError> {
+        async fn execute(
+            &self,
+            context: &DriverExecutionContext<'_>,
+        ) -> Result<DriverReceipt, DriverError> {
+            let request = context.request();
             tokio::time::sleep(self.delay).await;
             if self.fail {
                 return Err(DriverError {

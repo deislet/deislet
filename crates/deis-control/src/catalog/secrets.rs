@@ -170,6 +170,21 @@ pub fn secret_revision_aad(env_id: &str, name: &str, revision: &str) -> Vec<u8> 
     format!("{env_id}\u{1f}{name}\u{1f}{revision}").into_bytes()
 }
 
+/// Associated data for one immutable provider-management credential
+/// revision. Organization, backend, binding and revision are all included so
+/// copied ciphertext cannot be made valid in another account or generation.
+pub fn provider_credential_revision_aad(
+    organization_id: &str,
+    backend_id: &str,
+    binding_id: &str,
+    revision: u64,
+) -> Vec<u8> {
+    format!(
+        "provider-credential\u{1f}{organization_id}\u{1f}{backend_id}\u{1f}{binding_id}\u{1f}{revision}"
+    )
+    .into_bytes()
+}
+
 /// Whether this process can serve secret endpoints at all.
 ///
 /// Held as a single value in the API state so a missing key produces one
@@ -281,6 +296,27 @@ mod tests {
 
         let plaintext = cipher.decrypt(&blob, &aad).unwrap();
         assert_eq!(plaintext, b"s3cr3t");
+    }
+
+    #[test]
+    fn provider_credential_aad_binds_every_identity_dimension() {
+        let baseline = provider_credential_revision_aad("org-a", "deislet", "binding-a", 1);
+        assert_ne!(
+            baseline,
+            provider_credential_revision_aad("org-b", "deislet", "binding-a", 1)
+        );
+        assert_ne!(
+            baseline,
+            provider_credential_revision_aad("org-a", "deno", "binding-a", 1)
+        );
+        assert_ne!(
+            baseline,
+            provider_credential_revision_aad("org-a", "deislet", "binding-b", 1)
+        );
+        assert_ne!(
+            baseline,
+            provider_credential_revision_aad("org-a", "deislet", "binding-a", 2)
+        );
     }
 
     #[test]

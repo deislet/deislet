@@ -37,7 +37,9 @@ use axum::{
 };
 
 use crate::api::middleware::{NodeAuthConfig, node_auth};
-use crate::catalog::{ArtifactStore, BundleStore, CatalogStore, SecretsBackend};
+use crate::catalog::{
+    ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore, SecretsBackend,
+};
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
 use crate::session::SessionManager;
 
@@ -56,6 +58,9 @@ pub struct CatalogState {
     /// become canonical merely by being uploaded here.
     pub artifacts: Arc<ArtifactStore>,
     pub secrets: Arc<SecretsBackend>,
+    /// Encrypts provider-management credentials and authorizes their
+    /// operation-scoped driver leases against the same catalog database.
+    pub provider_credentials: Arc<CatalogProviderCredentialVault>,
     /// Pushes a deployment out to the nodes. Deploy, rollback and secret
     /// change all end here; see [`crate::delivery`].
     pub deliverer: Arc<DeploymentDeliverer>,
@@ -462,6 +467,10 @@ pub(crate) mod tests {
         };
         let store = Arc::new(CatalogStore::new(database));
         let secrets = Arc::new(secrets);
+        let provider_credentials = Arc::new(CatalogProviderCredentialVault::new(
+            store.as_ref().clone(),
+            Arc::clone(&secrets),
+        ));
         let address = Arc::new(PublicAddress {
             configured: Some("http://control.test".to_string()),
             fallback: "http://127.0.0.1:8080".to_string(),
@@ -504,6 +513,7 @@ pub(crate) mod tests {
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
             artifacts: Arc::new(ArtifactStore::beside_bundles(bundle_dir.path())),
             secrets: Arc::clone(&secrets),
+            provider_credentials,
             storage: storage.clone(),
             deliverer: Arc::new(DeploymentDeliverer::new(
                 store,

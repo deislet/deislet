@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal as unix_signal};
 use tracing::{error, info};
 
@@ -32,6 +33,7 @@ pub const DRAIN_GRACE: Duration = Duration::from_secs(15);
 /// container with SIGTERM. Listening for SIGINT alone would leave this
 /// process killed outright by every supervisor there is, skipping the
 /// drain entirely.
+#[cfg(unix)]
 pub async fn signal() {
     let mut terminate = match unix_signal(SignalKind::terminate()) {
         Ok(stream) => Some(stream),
@@ -54,6 +56,11 @@ pub async fn signal() {
         }
         None => report_interrupt(tokio::signal::ctrl_c().await),
     }
+}
+
+#[cfg(not(unix))]
+pub async fn signal() {
+    report_interrupt(tokio::signal::ctrl_c().await);
 }
 
 fn report_interrupt(result: std::io::Result<()>) {

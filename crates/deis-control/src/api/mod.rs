@@ -476,12 +476,17 @@ fn build_catalog_state(
 
     let store = Arc::new(CatalogStore::new(database));
     let secrets = Arc::new(secrets);
+    let provider_credentials = Arc::new(crate::catalog::CatalogProviderCredentialVault::new(
+        store.as_ref().clone(),
+        Arc::clone(&secrets),
+    ));
 
     catalog::CatalogState {
         store: Arc::clone(&store),
         bundles: Arc::new(bundles),
         artifacts: Arc::new(artifacts),
         secrets: Arc::clone(&secrets),
+        provider_credentials,
         // The same wiring the deliverer writes into every deployment, so the
         // token `deis kv` is handed is bit-for-bit the one the application's
         // own storage calls carry.

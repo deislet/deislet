@@ -33,14 +33,14 @@ pub struct SecretString(Zeroizing<String>);
 
 impl SecretString {
     pub fn new(value: impl Into<String>) -> Result<Self, CommandExecutionError> {
-        let value = value.into();
+        let value = Zeroizing::new(value.into());
         if value.is_empty() || value.len() > MAX_SECRET_BYTES || value.contains('\0') {
             return Err(CommandExecutionError::before_start(
                 CommandExecutionErrorKind::InvalidInvocation,
                 "credential must be non-empty, contain no NUL, and fit the credential bound",
             ));
         }
-        Ok(Self(Zeroizing::new(value)))
+        Ok(Self(value))
     }
 
     fn expose(&self) -> &str {

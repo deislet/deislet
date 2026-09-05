@@ -38,6 +38,7 @@ pub mod identity_migration;
 pub mod limits;
 pub mod model;
 pub mod operation;
+pub mod provider_credential;
 pub mod provider_driver_operation;
 pub mod secrets;
 pub mod store;
@@ -68,6 +69,10 @@ pub use model::{
     Environment, ProviderDerivation, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
+pub use provider_credential::{
+    CatalogProviderCredentialVault, ProviderCredentialAuditEvent, ProviderCredentialBinding,
+    ProviderCredentialBindingSpec,
+};
 pub use provider_driver_operation::{
     PROVIDER_DEPLOYMENT_STEPS, ProviderDeploymentDriveOutcome, ProviderDeploymentSpec,
     ProviderDeploymentStep, ProviderDeploymentWorkflow, ProviderDriverOperationRecord,

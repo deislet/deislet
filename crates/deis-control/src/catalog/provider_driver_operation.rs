@@ -206,6 +206,25 @@ impl CatalogStore {
         self.database()
             .with_connection(move |connection| {
                 let organization_id = default_organization_id(connection)?;
+                let credential_matches = connection
+                    .query_row(
+                        "SELECT 1 FROM provider_credential_bindings
+                          WHERE binding_id = ?1 AND organization_id = ?2
+                            AND backend_id = ?3 AND status = 'active'",
+                        params![
+                            spec.credential_binding_id.to_string(),
+                            organization_id.to_string(),
+                            spec.backend_id,
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !credential_matches {
+                    return Err(CatalogError::conflict(
+                        "provider installation needs an active credential binding for the same organization and backend",
+                    ));
+                }
                 connection.execute(
                     "INSERT INTO provider_installations
                        (installation_id, organization_id, backend_id, account_reference,
@@ -2681,11 +2700,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use deis_provider_driver::{
-        ArtifactVersionRef, DeploymentState, ProviderDriverManifest, ProviderNeutralPlan,
+        ArtifactVersionRef, CredentialMaterial, DeploymentState, DriverExecutionContext,
+        ProviderDriverManifest, ProviderNeutralPlan,
     };
     use tempfile::TempDir;
 
     use super::*;
+    use crate::catalog::{
+        CatalogProviderCredentialVault, ProviderCredentialBindingSpec, SecretCipher, SecretsBackend,
+    };
     use crate::database::Database;
 
     struct Harness {
@@ -2710,12 +2733,29 @@ mod tests {
             .create_environment("provider-test", "production")
             .await
             .unwrap();
+        let credential_vault = CatalogProviderCredentialVault::new(
+            store.clone(),
+            Arc::new(SecretsBackend::Ready(Box::new(
+                SecretCipher::from_key_bytes(&[42; 32]).unwrap(),
+            ))),
+        );
+        let credential = credential_vault
+            .provision(
+                ProviderCredentialBindingSpec {
+                    backend_id: "cloudflare-workers-pages".to_owned(),
+                    name: "provider-test".to_owned(),
+                },
+                CredentialMaterial::new(b"provider-test-credential".to_vec()).unwrap(),
+                context("provider-credential-provision"),
+            )
+            .await
+            .unwrap();
         let installation = store
             .register_provider_installation(ProviderInstallationSpec {
                 backend_id: "cloudflare-workers-pages".to_owned(),
                 account_reference: "account-reference".to_owned(),
                 region: None,
-                credential_binding_id: CanonicalId::new_v7(),
+                credential_binding_id: credential.binding_id,
             })
             .await
             .unwrap();
@@ -2890,7 +2930,11 @@ mod tests {
             &self.manifest
         }
 
-        async fn execute(&self, request: &DriverRequest) -> Result<DriverReceipt, DriverError> {
+        async fn execute(
+            &self,
+            context: &DriverExecutionContext<'_>,
+        ) -> Result<DriverReceipt, DriverError> {
+            let request = context.request();
             self.calls.lock().unwrap().push(request.operation);
             Ok(success_driver_receipt(request))
         }
@@ -2947,7 +2991,11 @@ mod tests {
             &self.manifest
         }
 
-        async fn execute(&self, request: &DriverRequest) -> Result<DriverReceipt, DriverError> {
+        async fn execute(
+            &self,
+            context: &DriverExecutionContext<'_>,
+        ) -> Result<DriverReceipt, DriverError> {
+            let request = context.request();
             self.calls.lock().unwrap().push(request.operation);
             if request.operation == DriverOperation::Activate {
                 return Ok(DriverReceipt {
@@ -2974,7 +3022,11 @@ mod tests {
             &self.manifest
         }
 
-        async fn execute(&self, request: &DriverRequest) -> Result<DriverReceipt, DriverError> {
+        async fn execute(
+            &self,
+            context: &DriverExecutionContext<'_>,
+        ) -> Result<DriverReceipt, DriverError> {
+            let request = context.request();
             if request.operation == DriverOperation::Plan {
                 return Err(DriverError {
                     operation_id: request.operation_id,

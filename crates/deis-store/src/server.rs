@@ -26,6 +26,7 @@ use deis_backend_migration::proto::backend_migration_server::BackendMigrationSer
 use deis_backend_migration::{MigrationAuth, TenantWriteFences};
 use std::future::Future;
 use tokio::net::TcpListener;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -135,6 +136,7 @@ pub async fn bind(config: &Config) -> Result<TcpListener> {
 /// service killed outright by every such supervisor, skipping the drain
 /// below, so in-flight KV writes, SQL transactions and blob uploads would be
 /// lost.
+#[cfg(unix)]
 pub async fn shutdown_signal() {
     let mut terminate = match signal(SignalKind::terminate()) {
         Ok(stream) => Some(stream),
@@ -159,6 +161,11 @@ pub async fn shutdown_signal() {
         }
         None => report_interrupt(tokio::signal::ctrl_c().await),
     }
+}
+
+#[cfg(not(unix))]
+pub async fn shutdown_signal() {
+    report_interrupt(tokio::signal::ctrl_c().await);
 }
 
 fn report_interrupt(result: std::io::Result<()>) {

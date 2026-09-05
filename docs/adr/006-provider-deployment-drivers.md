@@ -226,6 +226,22 @@ deis deployments reconcile
 7. CLI/API 中断后的 reconciliation 测试。
 8. Edge Canon conformance app 的真实部署测试。
 
+## 已落地的凭据执行边界
+
+Control 的凭据 binding 不再是未解析引用：它必须先在同一 organization/backend 的加密 vault 中建立，随后才可
+注册 provider installation。每次密文轮换产生不可变 revision，AES-256-GCM associated data 固定 organization、
+backend、binding 与 revision；吊销会同步禁用 installation 和未结束租约。
+
+provider operation 取得 durable owner/epoch 后，orchestrator 才构造不可序列化的 execution context。driver 用该
+context 从 broker 申请短租约；数据库在同一授权判断中复核 operation、target、installation、binding、当前
+credential revision 和两个 lease expiry。凭据 material 不属于可序列化 request/receipt/error，Debug 固定脱敏并
+在 drop 时清零。provision、rotation、lease、release、expiry、revocation 和 denial 只记录无敏感值的 append-only
+audit metadata。
+
+Control 的持久 reconciler 定期收敛过期租约并记录审计。这个基础实现仍不表示公共管理面或真实 provider 已完成；
+API/CLI/Web 接线、受信 driver 安装、各 driver 实际使用、KMS/envelope key、机器 mTLS/capability 与 live security
+evidence 仍是后续验收项。
+
 ## 后果
 
 - 需要新增 provider-neutral deployment core 和 provider drivers，而不是继续把逻辑堆入 build adapter。

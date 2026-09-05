@@ -2302,13 +2302,102 @@ fn ensure_product_operation_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Install the provider-neutral deployment domain and the fenced operation
-/// journal used by every backend driver. Provider credentials are represented
-/// only by an opaque binding identity; plaintext and encrypted credential
-/// material deliberately have no column in these tables.
+/// Install the provider-neutral deployment domain, encrypted credential vault
+/// and fenced operation journal used by every backend driver. Ciphertext is
+/// isolated in immutable credential revisions; serializable driver requests,
+/// deployment records and operation journals contain binding identities only.
 fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        CREATE TABLE IF NOT EXISTS provider_credential_bindings (
+            binding_id          TEXT PRIMARY KEY,
+            organization_id     TEXT NOT NULL
+                                     REFERENCES product_organizations(organization_id),
+            backend_id          TEXT NOT NULL
+                                     CHECK(backend_id IN ('deislet',
+                                                          'cloudflare-workers-pages',
+                                                          'tencent-edgeone-makers', 'deno')),
+            name                TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+            status              TEXT NOT NULL CHECK(status IN ('active', 'revoked')),
+            current_revision    INTEGER NOT NULL CHECK(current_revision >= 1),
+            row_revision        INTEGER NOT NULL CHECK(row_revision >= 1),
+            last_used_at        INTEGER,
+            created_at          INTEGER NOT NULL,
+            updated_at          INTEGER NOT NULL,
+            CHECK(length(binding_id) = 36
+              AND lower(binding_id) = binding_id
+              AND substr(binding_id, 9, 1) = '-'
+              AND substr(binding_id, 14, 1) = '-'
+              AND substr(binding_id, 15, 1) = '7'
+              AND substr(binding_id, 19, 1) = '-'
+              AND substr(binding_id, 20, 1) GLOB '[89ab]'
+              AND substr(binding_id, 24, 1) = '-'
+              AND length(replace(binding_id, '-', '')) = 32
+              AND replace(binding_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(updated_at >= created_at),
+            CHECK(last_used_at IS NULL OR last_used_at >= created_at),
+            UNIQUE(organization_id, backend_id, name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_credential_bindings_status
+            ON provider_credential_bindings(organization_id, backend_id, status, binding_id);
+
+        CREATE TABLE IF NOT EXISTS provider_credential_revisions (
+            binding_id          TEXT NOT NULL
+                                     REFERENCES provider_credential_bindings(binding_id),
+            credential_revision INTEGER NOT NULL CHECK(credential_revision >= 1),
+            encryption_scheme   TEXT NOT NULL CHECK(encryption_scheme = 'aes-256-gcm-v1'),
+            ciphertext          BLOB NOT NULL
+                                     CHECK(typeof(ciphertext) = 'blob'
+                                       AND length(ciphertext) BETWEEN 29 AND 65564),
+            created_at          INTEGER NOT NULL,
+            PRIMARY KEY(binding_id, credential_revision)
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_revisions_immutable_v1
+        BEFORE UPDATE ON provider_credential_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential revisions are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_revisions_no_delete_v1
+        BEFORE DELETE ON provider_credential_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential revisions cannot be deleted');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_bindings_identity_immutable_v1
+        BEFORE UPDATE OF binding_id, organization_id, backend_id, name, created_at
+        ON provider_credential_bindings
+        WHEN NEW.binding_id != OLD.binding_id
+          OR NEW.organization_id != OLD.organization_id
+          OR NEW.backend_id != OLD.backend_id
+          OR NEW.name != OLD.name
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential binding identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_bindings_transition_v1
+        BEFORE UPDATE ON provider_credential_bindings
+        WHEN NEW.row_revision != OLD.row_revision + 1
+          OR NEW.updated_at < OLD.updated_at
+          OR (NEW.last_used_at IS NOT NULL
+              AND OLD.last_used_at IS NOT NULL
+              AND NEW.last_used_at < OLD.last_used_at)
+          OR NEW.current_revision NOT IN (OLD.current_revision, OLD.current_revision + 1)
+          OR OLD.status = 'revoked'
+          OR (OLD.status = 'active' AND NEW.status NOT IN ('active', 'revoked'))
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid provider credential binding transition');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_bindings_no_delete_v1
+        BEFORE DELETE ON provider_credential_bindings
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential bindings cannot be deleted');
+        END;
+
         CREATE TABLE IF NOT EXISTS provider_installations (
             installation_id      TEXT PRIMARY KEY,
             organization_id      TEXT NOT NULL
@@ -2320,7 +2409,8 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             account_reference    TEXT NOT NULL
                                       CHECK(length(account_reference) BETWEEN 1 AND 512),
             region               TEXT CHECK(region IS NULL OR length(region) BETWEEN 1 AND 128),
-            credential_binding_id TEXT NOT NULL,
+            credential_binding_id TEXT NOT NULL
+                                       REFERENCES provider_credential_bindings(binding_id),
             status               TEXT NOT NULL CHECK(status IN ('active', 'disabled', 'revoked')),
             revision             INTEGER NOT NULL CHECK(revision >= 1),
             created_at           INTEGER NOT NULL,
@@ -2350,6 +2440,19 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_provider_installations_backend
             ON provider_installations(organization_id, backend_id, status);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_installations_credential_v1
+        BEFORE INSERT ON provider_installations
+        WHEN NOT EXISTS (
+            SELECT 1 FROM provider_credential_bindings b
+             WHERE b.binding_id = NEW.credential_binding_id
+               AND b.organization_id = NEW.organization_id
+               AND b.backend_id = NEW.backend_id
+               AND b.status = 'active'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider installation credential binding mismatch');
+        END;
 
         CREATE TRIGGER IF NOT EXISTS trg_provider_installations_identity_immutable_v1
         BEFORE UPDATE OF installation_id, organization_id, backend_id,
@@ -2577,6 +2680,170 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_driver_attempts_state
             ON provider_driver_attempts(state, started_at, operation_id);
 
+        CREATE TABLE IF NOT EXISTS provider_credential_leases (
+            lease_id             TEXT PRIMARY KEY,
+            binding_id           TEXT NOT NULL,
+            credential_revision  INTEGER NOT NULL,
+            operation_id         TEXT NOT NULL
+                                      REFERENCES provider_driver_operations(operation_id),
+            owner_id             TEXT NOT NULL,
+            claim_epoch          INTEGER NOT NULL CHECK(claim_epoch >= 1),
+            state                TEXT NOT NULL
+                                      CHECK(state IN ('active', 'released', 'expired', 'revoked')),
+            disposition          TEXT
+                                      CHECK(disposition IS NULL OR
+                                            disposition IN ('succeeded', 'failed')),
+            issued_at            INTEGER NOT NULL,
+            expires_at           INTEGER NOT NULL CHECK(expires_at > issued_at),
+            released_at          INTEGER,
+            FOREIGN KEY(binding_id, credential_revision)
+                REFERENCES provider_credential_revisions(binding_id, credential_revision),
+            CHECK(length(lease_id) = 36
+              AND lower(lease_id) = lease_id
+              AND substr(lease_id, 9, 1) = '-'
+              AND substr(lease_id, 14, 1) = '-'
+              AND substr(lease_id, 15, 1) = '7'
+              AND substr(lease_id, 19, 1) = '-'
+              AND substr(lease_id, 20, 1) GLOB '[89ab]'
+              AND substr(lease_id, 24, 1) = '-'
+              AND length(replace(lease_id, '-', '')) = 32
+              AND replace(lease_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(owner_id) = 36
+              AND lower(owner_id) = owner_id
+              AND substr(owner_id, 9, 1) = '-'
+              AND substr(owner_id, 14, 1) = '-'
+              AND substr(owner_id, 15, 1) = '7'
+              AND substr(owner_id, 19, 1) = '-'
+              AND substr(owner_id, 20, 1) GLOB '[89ab]'
+              AND substr(owner_id, 24, 1) = '-'
+              AND length(replace(owner_id, '-', '')) = 32
+              AND replace(owner_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK((state = 'active' AND disposition IS NULL AND released_at IS NULL)
+               OR (state = 'released' AND disposition IS NOT NULL AND released_at IS NOT NULL)
+               OR (state IN ('expired', 'revoked')
+                   AND disposition IS NULL AND released_at IS NOT NULL))
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_credential_leases_active_operation
+            ON provider_credential_leases(operation_id)
+            WHERE state = 'active';
+        CREATE INDEX IF NOT EXISTS idx_provider_credential_leases_expiry
+            ON provider_credential_leases(state, expires_at, lease_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_leases_fence_v1
+        BEFORE INSERT ON provider_credential_leases
+        WHEN NOT EXISTS (
+            SELECT 1
+              FROM provider_driver_operations o
+              JOIN provider_targets t ON t.target_id = o.provider_target_id
+              JOIN provider_installations i ON i.installation_id = t.installation_id
+              JOIN provider_credential_bindings b
+                ON b.binding_id = i.credential_binding_id
+             WHERE o.operation_id = NEW.operation_id
+               AND o.state = 'running'
+               AND o.owner_id = NEW.owner_id
+               AND o.claim_epoch = NEW.claim_epoch
+               AND o.lease_expires_at >= NEW.expires_at
+               AND t.status = 'active'
+               AND i.status = 'active'
+               AND b.status = 'active'
+               AND b.binding_id = NEW.binding_id
+               AND b.current_revision = NEW.credential_revision
+               AND b.organization_id = i.organization_id
+               AND b.backend_id = i.backend_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential lease is not authorized by the active operation claim');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_leases_identity_immutable_v1
+        BEFORE UPDATE OF lease_id, binding_id, credential_revision, operation_id,
+                         owner_id, claim_epoch, issued_at, expires_at
+        ON provider_credential_leases
+        WHEN NEW.lease_id != OLD.lease_id
+          OR NEW.binding_id != OLD.binding_id
+          OR NEW.credential_revision != OLD.credential_revision
+          OR NEW.operation_id != OLD.operation_id
+          OR NEW.owner_id != OLD.owner_id
+          OR NEW.claim_epoch != OLD.claim_epoch
+          OR NEW.issued_at != OLD.issued_at
+          OR NEW.expires_at != OLD.expires_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential lease identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_leases_transition_v1
+        BEFORE UPDATE OF state, disposition, released_at ON provider_credential_leases
+        WHEN OLD.state != 'active'
+          OR NEW.state NOT IN ('released', 'expired', 'revoked')
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid provider credential lease transition');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_leases_no_delete_v1
+        BEFORE DELETE ON provider_credential_leases
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential leases cannot be deleted');
+        END;
+
+        CREATE TABLE IF NOT EXISTS provider_credential_audit_events (
+            event_id              TEXT PRIMARY KEY,
+            binding_id            TEXT NOT NULL
+                                       REFERENCES provider_credential_bindings(binding_id),
+            credential_revision   INTEGER NOT NULL,
+            lease_id              TEXT REFERENCES provider_credential_leases(lease_id),
+            operation_id          TEXT REFERENCES provider_driver_operations(operation_id),
+            owner_id              TEXT,
+            claim_epoch           INTEGER,
+            actor_id              TEXT NOT NULL REFERENCES operation_actors(actor_id),
+            event_type            TEXT NOT NULL
+                                       CHECK(event_type IN ('provisioned', 'rotated', 'leased',
+                                                            'released', 'expired', 'revoked',
+                                                            'denied')),
+            disposition           TEXT
+                                       CHECK(disposition IS NULL OR
+                                             disposition IN ('succeeded', 'failed')),
+            occurred_at           INTEGER NOT NULL,
+            FOREIGN KEY(binding_id, credential_revision)
+                REFERENCES provider_credential_revisions(binding_id, credential_revision),
+            CHECK(length(event_id) = 36
+              AND lower(event_id) = event_id
+              AND substr(event_id, 9, 1) = '-'
+              AND substr(event_id, 14, 1) = '-'
+              AND substr(event_id, 15, 1) = '7'
+              AND substr(event_id, 19, 1) = '-'
+              AND substr(event_id, 20, 1) GLOB '[89ab]'
+              AND substr(event_id, 24, 1) = '-'
+              AND length(replace(event_id, '-', '')) = 32
+              AND replace(event_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK((lease_id IS NULL AND operation_id IS NULL
+                    AND owner_id IS NULL AND claim_epoch IS NULL
+                    AND event_type IN ('provisioned', 'rotated', 'revoked'))
+               OR (lease_id IS NOT NULL AND operation_id IS NOT NULL
+                    AND owner_id IS NOT NULL AND claim_epoch >= 1
+                    AND event_type IN ('leased', 'released', 'expired', 'revoked'))
+               OR (lease_id IS NULL AND operation_id IS NOT NULL
+                    AND owner_id IS NOT NULL AND claim_epoch >= 1
+                    AND event_type = 'denied'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_credential_audit_binding
+            ON provider_credential_audit_events(binding_id, occurred_at, event_id);
+        CREATE INDEX IF NOT EXISTS idx_provider_credential_audit_operation
+            ON provider_credential_audit_events(operation_id, occurred_at, event_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_audit_immutable_v1
+        BEFORE UPDATE ON provider_credential_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential audit events are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_credential_audit_no_delete_v1
+        BEFORE DELETE ON provider_credential_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'provider credential audit events cannot be deleted');
+        END;
+
         CREATE TRIGGER IF NOT EXISTS trg_provider_driver_attempts_identity_immutable_v1
         BEFORE UPDATE OF operation_id, claim_epoch, owner_id,
                          execution_operation, started_at
@@ -2759,6 +3026,26 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         END;
         "#,
     )?;
+    let quarantined = conn.execute(
+        "UPDATE provider_installations
+            SET status = 'revoked', revision = revision + 1,
+                updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER))
+          WHERE status = 'active'
+            AND NOT EXISTS (
+                SELECT 1 FROM provider_credential_bindings b
+                 WHERE b.binding_id = provider_installations.credential_binding_id
+                   AND b.organization_id = provider_installations.organization_id
+                   AND b.backend_id = provider_installations.backend_id
+                   AND b.status = 'active'
+            )",
+        [],
+    )?;
+    if quarantined > 0 {
+        info!(
+            quarantined,
+            "Revoked legacy provider installations whose credential binding cannot be resolved"
+        );
+    }
     Ok(())
 }
 
@@ -3150,6 +3437,58 @@ fn drop_power_reserve(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use rusqlite::OptionalExtension;
+
+    #[test]
+    fn unresolved_legacy_provider_credentials_are_quarantined_on_upgrade() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE provider_installations (
+                installation_id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                backend_id TEXT NOT NULL,
+                account_reference TEXT NOT NULL,
+                region TEXT,
+                credential_binding_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(organization_id, backend_id, account_reference)
+            );",
+        )
+        .unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute("DROP TRIGGER trg_provider_installations_credential_v1", [])
+            .unwrap();
+        let organization_id: String = conn
+            .query_row(
+                "SELECT organization_id FROM product_organizations WHERE slug = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let installation_id = CanonicalId::new_v7().to_string();
+        let missing_binding_id = CanonicalId::new_v7().to_string();
+        conn.execute(
+            "INSERT INTO provider_installations
+               (installation_id, organization_id, backend_id, account_reference,
+                region, credential_binding_id, status, revision, created_at, updated_at)
+             VALUES (?1, ?2, 'deislet', 'legacy-account', NULL, ?3, 'active', 1, 1, 1)",
+            rusqlite::params![installation_id, organization_id, missing_binding_id],
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+        let upgraded: (String, i64) = conn
+            .query_row(
+                "SELECT status, revision FROM provider_installations
+                  WHERE account_reference = 'legacy-account'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(upgraded, ("revoked".to_owned(), 2));
+    }
 
     #[test]
     fn legacy_secret_rows_are_migrated_to_immutable_revisions_idempotently() {

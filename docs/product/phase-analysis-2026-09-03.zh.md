@@ -1921,3 +1921,47 @@ Application/framework source + versioned build plan
 - `P1-DEPLOY-001` 仍保持 active。该 application service 尚未挂到公共 API/CLI/Web，也尚无 credential vault
   lease/use audit、受信 installer、Deislet/Cloudflare/EdgeOne 完整 driver 与真实账户 lifecycle evidence；当前
   mock driver 只证明统一协调语义，不是 provider deployment 或 conformance 证据。
+
+## 67. Provider credential vault、执行 claim 绑定与不可变审计
+
+- 复核 provider installation 后确认此前的 `credential_binding_id` 只是一个未解析 UUID；数据库既不要求该
+  binding 存在，也没有凭据密文、版本、轮换、吊销、短期取用或审计实现。任何内部调用者都能把随机或跨 backend
+  identity 注册为 active installation，driver contract 中“凭据只在安全边界内取得”没有可执行授权条件。
+- `deis-provider-driver` 现新增不可序列化、不可 Clone、drop 清零且 Debug 固定脱敏的 `CredentialMaterial` 和
+  `ProviderCredentialLease`；无效构造路径也先进入 zeroizing allocation 再返回。orchestrator 在 durable claim 成功
+  后把非序列化 `DriverExecutionContext` 交给 driver，其中只有 request 引用、owner UUIDv7 与 claim epoch；凭据仍
+  不进入 `DriverRequest`、desired-state digest、receipt、error、argv 或日志。driver 只能通过统一 broker 以该
+  context 请求最长 5 分钟且不超过 operation lease 的短租约。
+- Control 新增独立 encrypted vault：binding 固定 organization/backend/name，credential revision 以
+  AES-256-GCM `nonce || ciphertext` 保存；AAD 同时绑定 organization、backend、binding UUIDv7 与单调 revision，
+  防止合法 ciphertext 被搬到另一账户、backend、binding 或代际。revision 不可更新/删除；binding 只允许单调
+  last-use、下一 revision 或 active→revoked，安装创建必须查询同 organization/backend 的 active binding，数据库
+  trigger 再次执行相同约束。
+- lease insert trigger 联结 driver operation、target、installation 与 binding，要求 operation 正处于 running、
+  owner/epoch 完全相同、target/installation/binding 均 active、credential revision 为当前代际，且 credential expiry
+  不晚于 operation expiry。同一 operation 同时最多一个 active lease。轮换会原子写新密文、提升 revision 并吊销
+  旧 active lease；binding 吊销同时撤销租约并把引用它的 installation 置为 revoked。显式 success/failure release、
+  expiry、rotation/revoke 和 stale claim denial 都进入不含 credential 的 append-only audit；audit update/delete 由
+  trigger 拒绝。
+- 集成测试通过真实 provider orchestrator claim 证明：live driver 可解封并释放且数据库密文不含明文片段；轮换
+  后同一 operation 重新取得新 revision；旧 owner/epoch 即使仍持有旧 execution context 也无法取得 credential，
+  拒绝事件保留 operation/owner/epoch；随机或跨 backend binding 不能注册 installation；吊销联动 installation 且
+  audit 不可删除。当前专项为 6/6（其中 1 项 AAD、5 项 vault），共享 driver crate 为 27/27。
+- Control 启动时把同一个 vault 注入 catalog application state；现有持久部署 reconciler 每 30 秒回收已过期租约并
+  写入审计，失败时不暴露凭据且保留为下一轮重试。该切片仍未关闭 `P1-DEPLOY-001` 或 `P3-SEC-001`：vault 尚未
+  接到公共 API/CLI/Web，driver 安装器和三个真实 backend driver 尚未使用 broker；当前本地 master key 也不是
+  tenant envelope/KMS、per-machine mTLS 或短期 capability。任何 provider live/support/conformance 状态保持不变。
+
+## 68. Provider deployment 精确提交复跑暴露 Windows signal 编译缺陷
+
+- 对已推送的父流程提交 `6003b12` 运行 exact `git archive` 验证。s67 macOS 26.6 arm64 首轮在链接阶段因数据卷只余
+  约 2 GiB 而报 `ENOSPC`，这是环境失败，不能算代码通过；不删除项目或用户数据、改用
+  `CARGO_INCREMENTAL=0` 与 `CARGO_PROFILE_TEST_DEBUG=0` 后，目标 Control 测试和严格 all-target Clippy 均通过。
+- s69 Windows 11 AMD64 在构建 `deis-control` 的依赖时失败：`deis-queue/src/server.rs` 无条件导入
+  `tokio::signal::unix`。这发生在 provider deployment 测试运行前，因此 `6003b12` 不能登记为 Control 三平台
+  通过；此前 `db10a9c` 的独立 `deis-provider-driver` 三平台证据仍有效，但不能被扩大解释为完整 Control 证据。
+- 同类复核还找到 `deis-store`、`deis-telemetry` 与 `deis-control` 的 process shutdown 路径存在相同无条件 Unix
+  import。当前修复让 Unix 继续同时处理 SIGTERM/SIGINT，非 Unix 使用 Tokio 的 Ctrl-C 支持；不是在 Windows
+  伪造 SIGTERM。Queue 本地 103 项单测与 22 项 gRPC 集成全过，相关 crate 严格 Clippy 通过。
+- 该修复只有在新提交的 exact archive 上完成 Windows/macOS/Linux 复跑后才能形成通过证据；当前阶段记录明确
+  保留 `6003b12` 的 Windows 失败 observation，不以工作树或 Linux 结果覆盖历史失败。

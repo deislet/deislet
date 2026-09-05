@@ -2,10 +2,52 @@ use std::fmt;
 
 use async_trait::async_trait;
 
+use deis_wire::CanonicalId;
+
 use crate::{
     DriverError, DriverNextAction, DriverOperation, DriverReceipt, DriverRequest, DriverStepState,
     SideEffect, ValidatedProviderDriverManifest,
 };
+
+/// Non-serializable execution authority supplied by the orchestrator after a
+/// durable claim succeeds. Drivers use it when requesting credentials; it is
+/// never part of the provider-neutral request or persisted JSON contract.
+#[derive(Clone, Copy, Debug)]
+pub struct DriverExecutionContext<'a> {
+    request: &'a DriverRequest,
+    owner_id: CanonicalId,
+    claim_epoch: u64,
+}
+
+impl<'a> DriverExecutionContext<'a> {
+    #[must_use]
+    pub(crate) const fn new(
+        request: &'a DriverRequest,
+        owner_id: CanonicalId,
+        claim_epoch: u64,
+    ) -> Self {
+        Self {
+            request,
+            owner_id,
+            claim_epoch,
+        }
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &'a DriverRequest {
+        self.request
+    }
+
+    #[must_use]
+    pub const fn owner_id(&self) -> CanonicalId {
+        self.owner_id
+    }
+
+    #[must_use]
+    pub const fn claim_epoch(&self) -> u64 {
+        self.claim_epoch
+    }
+}
 
 #[async_trait]
 pub trait ProviderDriver: Send + Sync {
@@ -14,7 +56,10 @@ pub trait ProviderDriver: Send + Sync {
     /// Execute exactly one durable lifecycle operation. Credentials are an
     /// implementation concern and must be obtained inside the driver security
     /// boundary, never added to [`DriverRequest`].
-    async fn execute(&self, request: &DriverRequest) -> Result<DriverReceipt, DriverError>;
+    async fn execute(
+        &self,
+        context: &DriverExecutionContext<'_>,
+    ) -> Result<DriverReceipt, DriverError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

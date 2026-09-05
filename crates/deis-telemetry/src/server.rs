@@ -30,6 +30,7 @@ use anyhow::{Context, Result};
 use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
 use deis_backend_migration::{FenceError, MigrationAuth, TenantWriteFences};
 use tokio::net::TcpListener;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -123,6 +124,7 @@ impl RunningServer {
 /// outright by every supervisor there is, skipping the shutdown below, so
 /// open tail streams would be cut without notice and the last accepted batch
 /// might never reach the database.
+#[cfg(unix)]
 async fn shutdown_signal() {
     let mut terminate = match signal(SignalKind::terminate()) {
         Ok(stream) => Some(stream),
@@ -145,6 +147,11 @@ async fn shutdown_signal() {
         }
         None => report_interrupt(tokio::signal::ctrl_c().await),
     }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    report_interrupt(tokio::signal::ctrl_c().await);
 }
 
 fn report_interrupt(result: std::io::Result<()>) {

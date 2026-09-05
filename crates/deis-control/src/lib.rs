@@ -26,10 +26,12 @@ pub mod tls;
 pub use audit::{AuditEntry, AuditQuery, AuditRecord, AuditStore, Outcome as AuditOutcome};
 pub use catalog::{
     App, Assignment, BackendAttemptState, BackendMigrationAttempt, BackendMigrationEvidence,
-    BundleManifest, BundleStore, CatalogError, CatalogIdentityInventory, CatalogStore,
-    DeployedVersion, Deployment, Environment, IdentityMigrationCoordinator, IdentityMigrationPlan,
-    IdentityMigrationRun, IdentityMigrationState, MigrationCoordinatorError,
-    OperationRequestContext, Route, SecretCipher, SecretsBackend, Version,
+    BundleManifest, BundleStore, CatalogError, CatalogIdentityInventory,
+    CatalogProviderCredentialVault, CatalogStore, DeployedVersion, Deployment, Environment,
+    IdentityMigrationCoordinator, IdentityMigrationPlan, IdentityMigrationRun,
+    IdentityMigrationState, MigrationCoordinatorError, OperationRequestContext,
+    ProviderCredentialAuditEvent, ProviderCredentialBinding, ProviderCredentialBindingSpec, Route,
+    SecretCipher, SecretsBackend, Version,
 };
 pub use command::{CommandExecutor, CommandRequest, CommandResponse, CommandType, ExecuteError};
 pub use config::{ControlConfig, RuntimeNodeConfig, TlsConfig};
