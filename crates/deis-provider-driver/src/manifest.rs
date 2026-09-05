@@ -8,7 +8,7 @@ use crate::{ALL_DRIVER_OPERATIONS, DriverOperation, Sha256Digest};
 
 pub const DRIVER_CONTRACT_VERSION: &str = "1.0.0-draft.1";
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ToolDigest {
@@ -22,6 +22,7 @@ pub struct ToolDigest {
 pub struct DriverIdentity {
     pub id: String,
     pub version: String,
+    /// SHA-256 of the canonical cross-platform provider-driver release index.
     pub distribution_digest: ToolDigest,
 }
 
@@ -44,7 +45,7 @@ pub struct SupportedStandard {
     pub contract_digest: ToolDigest,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OfficialToolKind {
     Cli,
@@ -60,6 +61,8 @@ pub struct OfficialTool {
     pub kind: OfficialToolKind,
     pub name: String,
     pub version: String,
+    /// SHA-256 of the reviewed upstream source distribution. The release
+    /// index separately binds every host-specific materialized file.
     pub distribution_digest: ToolDigest,
     pub non_interactive: bool,
 }
@@ -196,7 +199,7 @@ fn unique_nonempty(values: &[String]) -> bool {
         && values.iter().collect::<BTreeSet<_>>().len() == values.len()
 }
 
-fn is_contract_identifier(value: &str) -> bool {
+pub(crate) fn is_contract_identifier(value: &str) -> bool {
     let mut saw_separator = false;
     let mut previous_separator = true;
     for byte in value.bytes() {
@@ -222,7 +225,7 @@ fn is_kebab_identifier(value: &str) -> bool {
         })
 }
 
-fn is_schema_semver(value: &str) -> bool {
+pub(crate) fn is_schema_semver(value: &str) -> bool {
     let (core, suffix) = value
         .split_once('-')
         .map_or((value, None), |(core, suffix)| (core, Some(suffix)));

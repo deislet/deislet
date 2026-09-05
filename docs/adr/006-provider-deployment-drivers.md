@@ -242,6 +242,28 @@ Control 的持久 reconciler 定期收敛过期租约并记录审计。这个基
 API/CLI/Web 接线、受信 driver 安装、各 driver 实际使用、KMS/envelope key、机器 mTLS/capability 与 live security
 evidence 仍是后续验收项。
 
+## 跨平台发行身份与安装树
+
+`driver.distributionDigest` 统一定义为 RFC 8785 canonical `provider-driver-release` 文档的 SHA-256，而不是某一个
+操作系统 archive 的摘要。同一个逻辑 driver ID/version 只有一个 release identity；release index 再为
+`linux-amd64`、`linux-arm64`、`macos-arm64`、`windows-amd64` 分别固定 archive、完整文件表、tree digest、driver
+component 和官方工具 component。这样各平台可以有适当的二进制/依赖实现，但 target pin 与 lifecycle 契约仍只有
+一个，不会因主机差异产生第二套应用抽象。
+
+官方工具的 manifest digest 继续表示经评审的上游 source distribution；release index 的 component file set 和
+materialization digest 负责证明该来源在特定主机上展开出的完整依赖树。每个 executable 必须属于该 component 的
+规范有序文件集，同时也是完整 distribution file table 的 executable 成员。
+
+安装器只接受绝对、真实、受服务身份控制的 installation root，并在进程间文件锁内工作。它从同一个已打开的 regular
+archive handle 复核长度和摘要，在隔离 staging 中拒绝 link、非 regular、额外、重复、缺失、大小或摘要不符的 entry；
+路径规则同时排除 traversal、反斜杠/盘符、大小写碰撞、file-as-parent 和 Windows reserved name。全部文件验证并同步后
+才按 release digest + host 原子发布只读目录，随后再次遍历完整树；已有目录必须逐文件一致，绝不原位修补。崩溃留下的
+专用 staging 只在持有同一安装锁时清理。
+
+这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成 Wrangler 的真实完整安装树，也未把 release
+签名/透明日志、Windows service account DACL、Control 持久安装 registry 和 runtime dispatcher 接入生产路径。
+在这些完成并形成精确提交三平台证据前，不能把验证安装器称作已部署的受信 driver 服务，更不能升级 backend 支持状态。
+
 ## 后果
 
 - 需要新增 provider-neutral deployment core 和 provider drivers，而不是继续把逻辑堆入 build adapter。

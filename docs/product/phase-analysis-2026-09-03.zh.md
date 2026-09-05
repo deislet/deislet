@@ -1983,3 +1983,32 @@ Application/framework source + versioned build plan
 - exact archive 不含生成的 `crates/deis-control/web/dist`，因此构建明确警告 dashboard 路由返回 404；本证据只覆盖
   API/Control Rust 边界，不把未构建 Web 资产计入通过。全量 Control 三平台 suite、受信 driver 安装、公共
   vault/target/deployment API/CLI/Web、三个完整 provider driver 和真实账户生命周期仍是后续阻断项。
+
+## 70. 跨平台 driver release identity 与验证安装树
+
+- 继续审查受信 installer 时确认，manifest 只有一个 `driver.distributionDigest`，同时却允许声明四种 host OS。
+  如果该摘要被解释成某个 Linux/macOS/Windows archive，同一 driver/version 不可能同时匹配其他平台；若只解释成
+  上游 npm tarball，又没有绑定平台相关 native optional dependency、Node runtime、wrapper 和完整安装文件树。
+  这种歧义会让 target 的 exact driver pin 在跨平台时失去含义。
+- 新增共享 `provider-driver-release` 契约：manifest 的单个 distribution digest 只能是整个 RFC 8785 canonical
+  release index 的 SHA-256；同一 index 再按规范顺序为每个声明 host 固定 archive digest/size、完整 file table 与
+  tree digest、唯一 driver component、全部官方工具 component、各 component 的有序 file set/materialization digest
+  和 executable/argument prefix。官方工具 manifest digest 明确定义为经评审的上游 source distribution，因此
+  “下载来源”和“平台安装结果”不再混为一个摘要。
+- JSON Schema、Rust parser 与共享跨文档校验共同强制：release/manifest ID、version、contract、host set、official
+  tool kind/name/version/source digest 完全一致；file path 只能使用统一 portable grammar，并拒绝 traversal、反斜杠/
+  drive prefix、大小写折叠冲突、Windows reserved name、file-as-parent、重复/乱序、大小上限、tree/component digest
+  漂移，以及不属于 component 和完整 file table 的 executable。共享 registry 现为 10 份 Schema、26 组正反 fixture。
+- `DriverReleaseInstaller` 要求绝对、非 symlink installation root；Unix 还要求当前服务身份所有且 group/other 不可写。
+  安装在进程间文件锁内完成：从同一个已打开 regular archive handle 校验长度/SHA-256，在随机 staging 中只接受 exact
+  regular file set，逐文件限制 size 并流式核对摘要，拒绝 link/non-regular/extra/duplicate/missing；全部 fsync、按
+  manifest 设为只读并全树复验后，才以 `<release digest>-<host>` 原子 rename 发布。已有 content-addressed 目录必须
+  逐文件/权限一致，损坏时失败且绝不原位修补。只清理同一受控 root 内专用前缀、无 link/non-regular 的崩溃 staging。
+- 本机固定 Rust 1.96.0 当前 driver 全量为 39/39，新增 4 项 release 与 8 项 Unix installer 回归覆盖 manifest binding、
+  host/path/tree/component 漂移、archive tamper、extra/link、wrong host、只读 content-addressed 幂等复用、崩溃 staging
+  回收、非 owner-only root 和既有树被替换后 fail closed；严格 all-target Clippy 与共享契约治理通过。
+- 该切片建立的是可执行验证核心，还没有实际发布受信 driver：当前 release fixture 是合成 bytes，Wrangler 4.129.0
+  尚无包含完整 dependency tree/native optional package/Node runtime 的真实 release archive；release 签名或透明日志、
+  Windows service account DACL 验证、Control 持久 installed-release registry、dispatcher 与每次命令前强制全树校验
+  也未接入生产调用链。完成这些并在精确提交 Linux/macOS/Windows 复跑前，roadmap 只能把“安装契约/核心”记为已落地，
+  不能关闭受信发行、完整 driver、live deployment 或 conformance 阻断项。

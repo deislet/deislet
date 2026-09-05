@@ -5,7 +5,7 @@
   "driver": {
     "id": "deislet.driver.cloudflare",
     "version": "0.1.0-draft.1",
-    "distributionDigest": {"algorithm": "sha256", "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+    "distributionDigest": {"algorithm": "sha256", "value": "e148c05678057cd50dea086c69d9432cbf0d36dd6167203144866f48fae95b05"}
   },
   "backend": {
     "id": "cloudflare-workers-pages",

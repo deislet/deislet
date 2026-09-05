@@ -9,10 +9,12 @@
 mod credential;
 mod digest;
 mod executor;
+mod installer;
 mod lifecycle;
 mod manifest;
 mod model;
 mod orchestrator;
+mod release;
 
 pub use credential::{
     CredentialBrokerError, CredentialBrokerErrorKind, CredentialLeaseDisposition,
@@ -22,6 +24,10 @@ pub use digest::{Sha256Digest, Sha256DigestError};
 pub use executor::{
     CommandExecutionError, CommandExecutionErrorKind, CommandInvocation, CommandOutput,
     PinnedCommandRunner, PinnedExecutable, SecretInjection, SecretString, SideEffectPolicy,
+};
+pub use installer::{
+    DriverInstallationError, DriverReleaseInstaller, InstalledDriverRelease,
+    InstalledReleaseExecutable,
 };
 pub use lifecycle::{
     DriverContractError, DriverExecutionContext, ProviderDriver, validate_driver_error,
@@ -41,4 +47,10 @@ pub use orchestrator::{
     DriverOperationClaim, DriverOperationClaimOutcome, DriverOperationStore,
     DriverOrchestrationOutcome, DriverOrchestrator, DriverOrchestratorConfig,
     DriverOrchestratorConfigError, DriverOrchestratorError, ProviderDriverPin,
+};
+pub use release::{
+    DriverHostDistribution, DriverReleaseArchive, DriverReleaseComponent,
+    DriverReleaseComponentRole, DriverReleaseError, DriverReleaseExecutable, DriverReleaseFile,
+    DriverReleaseIdentity, DriverReleaseImplementation, DriverReleaseInstallationPolicy,
+    HostOperatingSystem, ProviderDriverRelease, ValidatedProviderDriverRelease,
 };

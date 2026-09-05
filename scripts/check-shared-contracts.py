@@ -29,6 +29,7 @@ EXPECTED_DOCUMENTS = {
     "binding-snapshot",
     "operation",
     "provider-driver",
+    "provider-driver-release",
     "identity-migration",
     "backend-migration-evidence",
     "backend-restore-set",
@@ -282,6 +283,110 @@ def validate_cross_document_invariants(registry: dict) -> None:
     driver = load_json("contracts/v1/fixtures/valid/provider-driver.json")
     require(driver.get("operations") == EXPECTED_PROVIDER_OPERATIONS, "provider fixture omits a required operation")
     require(driver.get("supportedStandardVersions") == [], "proposal driver must not claim a supported standard version")
+
+    driver_release = load_json("contracts/v1/fixtures/valid/provider-driver-release.json")
+    release_canonical = json.dumps(
+        driver_release, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    require(
+        driver["driver"]["distributionDigest"]["value"]
+        == hashlib.sha256(release_canonical).hexdigest(),
+        "provider driver distribution digest must bind the canonical release index",
+    )
+    require(
+        driver_release["driver"]
+        == {"id": driver["driver"]["id"], "version": driver["driver"]["version"]},
+        "provider driver release identity differs from its manifest",
+    )
+    require(
+        driver_release["driverContractVersion"] == driver["driverContractVersion"],
+        "provider driver release and manifest use different contract versions",
+    )
+    distributions = driver_release["distributions"]
+    hosts = [distribution["hostOperatingSystem"] for distribution in distributions]
+    require(
+        hosts == driver["supportedHostOperatingSystems"] and len(hosts) == len(set(hosts)),
+        "provider driver release must cover each declared host exactly once and in canonical order",
+    )
+    expected_tools = sorted(
+        (
+            tool["kind"],
+            tool["name"],
+            tool["version"],
+            tool["distributionDigest"]["value"],
+        )
+        for tool in driver["officialTools"]
+    )
+    for distribution in distributions:
+        files = distribution["files"]
+        paths = [entry["path"] for entry in files]
+        require(
+            paths == sorted(paths) and len(paths) == len(set(paths)),
+            f"provider driver release {distribution['hostOperatingSystem']} file table is not canonical",
+        )
+        file_table_canonical = json.dumps(
+            files, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        require(
+            distribution["treeDigest"]["value"]
+            == hashlib.sha256(file_table_canonical).hexdigest(),
+            f"provider driver release {distribution['hostOperatingSystem']} tree digest drifted",
+        )
+        file_digests = {entry["path"]: entry["sha256"]["value"] for entry in files}
+        components = distribution["components"]
+        component_keys = [(component["role"], component["name"]) for component in components]
+        require(
+            len(component_keys) == len(set(component_keys)),
+            f"provider driver release {distribution['hostOperatingSystem']} repeats a component",
+        )
+        driver_components = [component for component in components if component["role"] == "driver"]
+        require(
+            len(driver_components) == 1
+            and driver_components[0]["name"] == driver["driver"]["id"]
+            and driver_components[0]["version"] == driver["driver"]["version"],
+            f"provider driver release {distribution['hostOperatingSystem']} lacks its exact driver",
+        )
+        actual_tools = sorted(
+            (
+                component["toolKind"],
+                component["name"],
+                component["version"],
+                component["sourceDistributionDigest"]["value"],
+            )
+            for component in components
+            if component["role"] == "official-tool"
+        )
+        require(
+            actual_tools == expected_tools,
+            f"provider driver release {distribution['hostOperatingSystem']} official tools differ",
+        )
+        for component in components:
+            executable = component.get("executable")
+            if executable is not None:
+                component_paths = component["filePaths"]
+                require(
+                    component_paths == sorted(component_paths)
+                    and len(component_paths) == len(set(component_paths))
+                    and executable["path"] in component_paths,
+                    f"provider driver release {distribution['hostOperatingSystem']} component file set is not canonical",
+                )
+                component_files = [entry for entry in files if entry["path"] in component_paths]
+                require(
+                    len(component_files) == len(component_paths),
+                    f"provider driver release {distribution['hostOperatingSystem']} component references a missing file",
+                )
+                component_canonical = json.dumps(
+                    component_files, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                ).encode("utf-8")
+                require(
+                    component["materializationDigest"]["value"]
+                    == hashlib.sha256(component_canonical).hexdigest(),
+                    f"provider driver release {distribution['hostOperatingSystem']} component digest drifted",
+                )
+                require(
+                    file_digests.get(executable["path"]) == executable["sha256"]["value"],
+                    f"provider driver release {distribution['hostOperatingSystem']} executable is not pinned in its file table",
+                )
 
     operation = load_json("contracts/v1/fixtures/valid/operation.json")
     provider_operation_ids = [entry["providerOperationId"] for entry in operation["providerOperations"]]

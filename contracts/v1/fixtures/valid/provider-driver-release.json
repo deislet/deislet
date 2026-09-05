@@ -1,0 +1,192 @@
+{
+  "$schema": "../../provider-driver-release.schema.json",
+  "schemaVersion": 1,
+  "driverContractVersion": "1.0.0-draft.1",
+  "driver": {
+    "id": "deislet.driver.cloudflare",
+    "version": "0.1.0-draft.1"
+  },
+  "distributions": [
+    {
+      "hostOperatingSystem": "linux-amd64",
+      "archive": {
+        "format": "tar",
+        "sha256": {"algorithm": "sha256", "value": "1111111111111111111111111111111111111111111111111111111111111111"},
+        "sizeBytes": 10240
+      },
+      "treeDigest": {"algorithm": "sha256", "value": "0c6dbbe271a9c91b27cf8212548f1ee487c34c985ebead9aa16a8b0a1c5c1c82"},
+      "components": [
+        {
+          "role": "driver",
+          "name": "deislet.driver.cloudflare",
+          "version": "0.1.0-draft.1",
+          "implementation": "executable",
+          "materializationDigest": {"algorithm": "sha256", "value": "c4e96d545e4aa459942b0148f08e294cb4c21667bf23fa0afb2e6f3fc1e8e7cb"},
+          "filePaths": ["bin/driver"],
+          "executable": {
+            "path": "bin/driver",
+            "sha256": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+            "argumentPrefix": []
+          }
+        },
+        {
+          "role": "official-tool",
+          "name": "wrangler",
+          "version": "pinned-by-driver-lock",
+          "toolKind": "cli",
+          "implementation": "executable",
+          "materializationDigest": {"algorithm": "sha256", "value": "29e28ef15661d934e10d674ef3c88b211120fe50a5793b43acabc39dc66c972c"},
+          "sourceDistributionDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+          "filePaths": ["tools/wrangler"],
+          "executable": {
+            "path": "tools/wrangler",
+            "sha256": {"algorithm": "sha256", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+            "argumentPrefix": []
+          }
+        }
+      ],
+      "files": [
+        {"path": "bin/driver", "sha256": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}, "sizeBytes": 128, "executable": true},
+        {"path": "tools/wrangler", "sha256": {"algorithm": "sha256", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}, "sizeBytes": 256, "executable": true}
+      ]
+    },
+    {
+      "hostOperatingSystem": "linux-arm64",
+      "archive": {
+        "format": "tar",
+        "sha256": {"algorithm": "sha256", "value": "2222222222222222222222222222222222222222222222222222222222222222"},
+        "sizeBytes": 10240
+      },
+      "treeDigest": {"algorithm": "sha256", "value": "45faa47b3f9d085272aba24dbae662cfe006c1b89279d38ed97cd3342c154e2d"},
+      "components": [
+        {
+          "role": "driver",
+          "name": "deislet.driver.cloudflare",
+          "version": "0.1.0-draft.1",
+          "implementation": "executable",
+          "materializationDigest": {"algorithm": "sha256", "value": "1e9ff0756a18a581a26354565ae7ff41d797a7433603ffc89d2c54fc05b3c3a7"},
+          "filePaths": ["bin/driver"],
+          "executable": {
+            "path": "bin/driver",
+            "sha256": {"algorithm": "sha256", "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+            "argumentPrefix": []
+          }
+        },
+        {
+          "role": "official-tool",
+          "name": "wrangler",
+          "version": "pinned-by-driver-lock",
+          "toolKind": "cli",
+          "implementation": "executable",
+          "materializationDigest": {"algorithm": "sha256", "value": "2bdbdc896dd254a40a6e5f3da4222787b3db506dc4874eda8cb95e5ff855c8ea"},
+          "sourceDistributionDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+          "filePaths": ["tools/wrangler"],
+          "executable": {
+            "path": "tools/wrangler",
+            "sha256": {"algorithm": "sha256", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+            "argumentPrefix": []
+          }
+        }
+      ],
+      "files": [
+        {"path": "bin/driver", "sha256": {"algorithm": "sha256", "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}, "sizeBytes": 128, "executable": true},
+        {"path": "tools/wrangler", "sha256": {"algorithm": "sha256", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}, "sizeBytes": 256, "executable": true}
+      ]
+    },
+    {
+      "hostOperatingSystem": "macos-arm64",
+      "archive": {
+        "format": "tar",
+        "sha256": {"algorithm": "sha256", "value": "3333333333333333333333333333333333333333333333333333333333333333"},
+        "sizeBytes": 10240
+      },
+      "treeDigest": {"algorithm": "sha256", "value": "447f128db7050ae5aedcda53f454ccd54df8f919e69ee67d2988007dd9dc5859"},
+      "components": [
+        {
+          "role": "driver",
+          "name": "deislet.driver.cloudflare",
+          "version": "0.1.0-draft.1",
+          "implementation": "executable",
+          "materializationDigest": {"algorithm": "sha256", "value": "e9d3647dcd5057719a5244ae7c79efcedb72b10d1a55e691072e371f8c900360"},
+          "filePaths": ["bin/driver"],
+          "executable": {
+            "path": "bin/driver",
+            "sha256": {"algorithm": "sha256", "value": "1111111111111111111111111111111111111111111111111111111111111111"},
+            "argumentPrefix": []
+          }
+        },
+        {
+          "role": "official-tool",
+          "name": "wrangler",
+          "version": "pinned-by-driver-lock",
+          "toolKind": "cli",
+          "implementation": "executable",
+          "materializationDigest": {"algorithm": "sha256", "value": "9d4cb31d81895effc1aaa55090f52f72f8bb69d3a7c6c0aac40209e52e2abaae"},
+          "sourceDistributionDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+          "filePaths": ["tools/wrangler"],
+          "executable": {
+            "path": "tools/wrangler",
+            "sha256": {"algorithm": "sha256", "value": "2222222222222222222222222222222222222222222222222222222222222222"},
+            "argumentPrefix": []
+          }
+        }
+      ],
+      "files": [
+        {"path": "bin/driver", "sha256": {"algorithm": "sha256", "value": "1111111111111111111111111111111111111111111111111111111111111111"}, "sizeBytes": 128, "executable": true},
+        {"path": "tools/wrangler", "sha256": {"algorithm": "sha256", "value": "2222222222222222222222222222222222222222222222222222222222222222"}, "sizeBytes": 256, "executable": true}
+      ]
+    },
+    {
+      "hostOperatingSystem": "windows-amd64",
+      "archive": {
+        "format": "tar",
+        "sha256": {"algorithm": "sha256", "value": "4444444444444444444444444444444444444444444444444444444444444444"},
+        "sizeBytes": 10240
+      },
+      "treeDigest": {"algorithm": "sha256", "value": "909cb4cd04bb852e7a007d5975111ab47251b65fd21d916e9865f6845e7b021b"},
+      "components": [
+        {
+          "role": "driver",
+          "name": "deislet.driver.cloudflare",
+          "version": "0.1.0-draft.1",
+          "implementation": "executable",
+          "materializationDigest": {"algorithm": "sha256", "value": "5f9bf4076c423a57b93a11b16f6b6a4f5ad8d03298bed5591920b4336c093b53"},
+          "filePaths": ["bin/driver.exe"],
+          "executable": {
+            "path": "bin/driver.exe",
+            "sha256": {"algorithm": "sha256", "value": "3333333333333333333333333333333333333333333333333333333333333333"},
+            "argumentPrefix": []
+          }
+        },
+        {
+          "role": "official-tool",
+          "name": "wrangler",
+          "version": "pinned-by-driver-lock",
+          "toolKind": "cli",
+          "implementation": "executable",
+          "materializationDigest": {"algorithm": "sha256", "value": "fd2099eb9bb30c49d5287ed104b338b3608ead1c50594377f4535f80c0e85d48"},
+          "sourceDistributionDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+          "filePaths": ["tools/wrangler.exe"],
+          "executable": {
+            "path": "tools/wrangler.exe",
+            "sha256": {"algorithm": "sha256", "value": "4444444444444444444444444444444444444444444444444444444444444444"},
+            "argumentPrefix": []
+          }
+        }
+      ],
+      "files": [
+        {"path": "bin/driver.exe", "sha256": {"algorithm": "sha256", "value": "3333333333333333333333333333333333333333333333333333333333333333"}, "sizeBytes": 128, "executable": true},
+        {"path": "tools/wrangler.exe", "sha256": {"algorithm": "sha256", "value": "4444444444444444444444444444444444444444444444444444444444444444"}, "sizeBytes": 256, "executable": true}
+      ]
+    }
+  ],
+  "installationPolicy": {
+    "archiveFormat": "tar",
+    "allowLinks": false,
+    "allowNonRegularFiles": false,
+    "allowExtraFiles": false,
+    "contentAddressed": true,
+    "readOnlyAfterInstall": true,
+    "verifyBeforeEveryExecution": true
+  }
+}

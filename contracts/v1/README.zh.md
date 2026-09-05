@@ -18,6 +18,7 @@
 | 构建产物 | build core 的 `VendorBuild`/`AdapterArtifacts` 直接表达多个 vendor 输出；Deislet bundle manifest 仍包含应用名称和旧服务模型 | 先形成 provider-neutral、内容寻址、可验证和签名的 canonical artifact，再派生 provider artifact |
 | Binding | 现有 bundle 已有 named binding，但 resolved provider resource、credential revision、ownership 和 lifecycle 没有同一不可变快照 | environment version 保存严格的 binding snapshot，secret 只保存 revision/reference，永不保存明文 |
 | Provider driver | 当前 adapter 主要生成文件，外部部署还没有统一 driver lifecycle | driver 必须实现 12 个统一动作，可以在内部调用锁定的官方 CLI/API，但只返回统一 operation 与结构化诊断 |
+| Driver 发行 | 单个 `distributionDigest` 未说明它代表哪种主机 archive，来源 tarball 也不等于 npm/CLI 完整安装树 | digest 绑定一个 canonical release index，再由它逐主机固定 archive、file tree、components 与 executable |
 
 这些是迁移输入，不因 schema 文件出现而自动修复。路线中的 `P0-MODEL-001` 只有在代码采用共享类型、旧数据迁移 fixture 可实际运行、且无停机 cutover 测试通过后才能完成。
 
@@ -45,19 +46,28 @@ identity 迁移已完成八个可执行切片。第一段让 `application`、`en
 
 第十一段建立统一 provider deployment application service。一个 `deploy` 父 Operation 以 JCS desired-state SHA-256 固定 application/environment、不可变 target revision、标准版本、canonical artifact、provider derivation 和 provider-neutral plan；调用者声明的 artifact ID/digest 必须真实解析到同一应用、标准、canonical parent 与目标 provider payload，不能只凭字段形状入库。父流程按 `preflight → plan → prepare → upload → verify → activate → observe` 创建七个不可变 child Operation，并聚合 child/provider identity 与可证明进度。并发协调者通过当前 child 的 owner/epoch lease 互斥；child 已完成而父状态尚未刷新时，replacement coordinator 从 step journal 推进，unknown activation 仍以同一 child identity 执行 `reconcile` 后才进入 observe。每个 application/environment/target 同时至多一个非终态 deployment，启动扫描只返回非终态历史。
 
-这些切片仍不代表八阶段 identity 迁移或统一部署完成。当前迁移、restore、单步 provider work 与 provider deployment parent 已满足 `operation.schema.json` 全字段与通用状态图，但完整 driver、credential lease/audit 和 API/CLI/Web 仍未接线。Stateful Objects 与 provider resources 仍无 inventory/fence/restore；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+第十二段定义跨平台 provider driver release。manifest 的单个 `driver.distributionDigest` 现在只能是整个 RFC 8785
+canonical release index 的 SHA-256；index 再按规范顺序为每个声明 host 固定 archive、完整 file table/tree digest、
+driver 与官方工具 component、component file set/materialization digest 和 executable。Rust parser 与共享契约校验器
+同时拒绝缺失/重复 host、来源工具漂移、大小写路径碰撞、Windows reserved name、file-as-parent、tree/component digest
+漂移或未列入 component/file table 的 executable。验证安装器在 owner-only root（Unix）和进程间锁下，以同一个已
+打开 archive handle 复核摘要，在 staging 中只展开 exact regular file set，全部同步和只读化后按 release+host 原子
+发布；已有目录只能完整复核，不能覆盖修补，专用崩溃 staging 在下一次持锁安装时安全清理。
 
-## 九份机器契约
+这些切片仍不代表八阶段 identity 迁移或统一部署完成。当前迁移、restore、单步 provider work 与 provider deployment parent 已满足 `operation.schema.json` 全字段与通用状态图，credential vault/broker 与验证安装器核心也已存在；但真实官方工具 materialized release、签名来源、Windows service DACL、Control 安装 registry、完整 driver 和 API/CLI/Web 仍未接线。Stateful Objects 与 provider resources 仍无 inventory/fence/restore；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+
+## 十份机器契约
 
 1. [`resource-identity.schema.json`](resource-identity.schema.json)：主要对象的 canonical ID、kind、scope、display name 和 revision。ID 是定位符，不是凭证。
 2. [`canonical-artifact.schema.json`](canonical-artifact.schema.json)：Deislet 控制面的 canonical artifact record，不再复制 payload 格式。真正的输出目录、根清单、文件集合和构建输入只由标准锁定的上游 `schemas/canonical-build-output.schema.json` 定义；record 绑定 manifest identity、content root、标准/schema 摘要、SBOM/provenance/validation 文档和外置签名。Proposal artifact 必须是 `deployable: false`；可部署 record 必须锁定已发布标准、验证通过并有签名。
 3. [`binding-snapshot.schema.json`](binding-snapshot.schema.json)：逻辑声明到 provider resource 的 immutable resolution，包含权限、mode、ownership、credential revision、region、limits 和 lifecycle，不含 secret value。
 4. [`operation.schema.json`](operation.schema.json)：持久产品操作及其 scope、target、幂等摘要、revision、phase、progress、child/provider operation、错误和时间。
 5. [`provider-driver.schema.json`](provider-driver.schema.json)：driver/官方工具精确版本、凭证传递、安全约束、12 个 lifecycle 动作及内部 native/composed/companion 映射。映射不是应用 profile，也不产生支持声明。
-6. [`identity-migration.schema.json`](identity-migration.schema.json)：旧 name-based tenant 到 canonical identity 的 inventory、双读、复制/rename、验证、cutover、旧 capability 撤销和 tombstone。
-7. [`backend-migration-evidence.schema.json`](backend-migration-evidence.schema.json)：后端在持久 writer fence 下取得的 component count/bytes/digest/orphan evidence；明确认证域、backend incarnation 和 receipt，但禁止保存 fence token。
-8. [`backend-restore-set.schema.json`](backend-restore-set.schema.json)：把 store、queue、telemetry 三份本地快照绑定到同一个全平台停写/停服屏障、固定 topology driver 和不可变 snapshot digest；明确禁止复制 migration fence journal。缺少任一组件、只具有各自一致点或无法证明 outage barrier 的集合不能进入平台级 Restore Operation。
-9. [`backend-restore-report.schema.json`](backend-restore-report.schema.json)：topology driver 对同一 operation/restore set 的可对账终态证据，只允许 `succeeded` 或 `rolled-back`，并按固定顺序记录三后端切换前后的 incarnation。`restoreSetSha256` 统一是 restore set 的 RFC 8785 JCS 字节摘要；进程退出、timeout 或中间阶段不属于 report 状态。
+6. [`provider-driver-release.schema.json`](provider-driver-release.schema.json)：一个 logical driver release 的 canonical identity 以及各主机 archive、完整文件树、component materialization、entrypoint 和不允许弱化的安装策略。
+7. [`identity-migration.schema.json`](identity-migration.schema.json)：旧 name-based tenant 到 canonical identity 的 inventory、双读、复制/rename、验证、cutover、旧 capability 撤销和 tombstone。
+8. [`backend-migration-evidence.schema.json`](backend-migration-evidence.schema.json)：后端在持久 writer fence 下取得的 component count/bytes/digest/orphan evidence；明确认证域、backend incarnation 和 receipt，但禁止保存 fence token。
+9. [`backend-restore-set.schema.json`](backend-restore-set.schema.json)：把 store、queue、telemetry 三份本地快照绑定到同一个全平台停写/停服屏障、固定 topology driver 和不可变 snapshot digest；明确禁止复制 migration fence journal。缺少任一组件、只具有各自一致点或无法证明 outage barrier 的集合不能进入平台级 Restore Operation。
+10. [`backend-restore-report.schema.json`](backend-restore-report.schema.json)：topology driver 对同一 operation/restore set 的可对账终态证据，只允许 `succeeded` 或 `rolled-back`，并按固定顺序记录三后端切换前后的 incarnation。`restoreSetSha256` 统一是 restore set 的 RFC 8785 JCS 字节摘要；进程退出、timeout 或中间阶段不属于 report 状态。
 
 UUIDv7 目前是 draft 实现选择：它标准化、可跨进程生成并按时间大致排序；其时间部分不是秘密，因此授权永远另行校验。若安全或存储评审否决该格式，必须在 v1 冻结前更新所有 schema/fixture；已发布后不得原地换格式。
 
@@ -113,7 +123,7 @@ inspect / reconcile / delete / cleanup
 
 ## 可执行校验
 
-[`fixtures.json`](fixtures.json) 同时登记每份 schema 的正、反例。反例从对应正例应用确定性 JSON Pointer mutation，证明以下情况会失败：名称冒充 ID、canonical artifact 携带 provider 字段、binding snapshot 含 secret value、终态 operation 没有完成时间、driver 缺生命周期动作、迁移继续使用名称 tenant key、backend evidence 泄漏 fence token，以及 restore set 缺少 component 或复制 fence journal。
+[`fixtures.json`](fixtures.json) 同时登记每份 schema 的正、反例。反例从对应正例应用确定性 JSON Pointer mutation，证明以下情况会失败：名称冒充 ID、canonical artifact 携带 provider 字段、binding snapshot 含 secret value、终态 operation 没有完成时间、driver 缺生命周期动作、driver release 路径穿越、迁移继续使用名称 tenant key、backend evidence 泄漏 fence token，以及 restore set 缺少 component 或复制 fence journal。
 
 运行：
 

@@ -19,7 +19,10 @@
       "properties": {
         "id": {"type": "string", "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"},
         "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},
-        "distributionDigest": {"$ref": "#/$defs/digest"}
+        "distributionDigest": {
+          "description": "SHA-256 of the RFC 8785 canonical provider-driver-release document; never a host-specific archive digest.",
+          "$ref": "#/$defs/digest"
+        }
       }
     },
     "backend": {
@@ -57,7 +60,10 @@
           "kind": {"enum": ["cli", "api", "sdk", "native"]},
           "name": {"type": "string", "minLength": 1},
           "version": {"type": "string", "minLength": 1},
-          "distributionDigest": {"$ref": "#/$defs/digest"},
+          "distributionDigest": {
+            "description": "SHA-256 of the reviewed upstream source distribution; the host materialization is pinned by provider-driver-release.",
+            "$ref": "#/$defs/digest"
+          },
           "nonInteractive": {"const": true}
         }
       }
