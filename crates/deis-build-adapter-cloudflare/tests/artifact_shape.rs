@@ -110,23 +110,14 @@ fn standard_wait_until_is_backed_by_the_native_execution_context() {
 }
 
 #[test]
-fn test_kv_adapter_when_enabled() {
+fn unresolved_kv_binding_is_rejected() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-worker", true);
 
-    let result = generate(&routes, &config, &[]).unwrap();
-
-    // Verify KV adapter is generated when enabled
-    assert!(result.kv_adapter_code.is_some());
-
-    let kv_code = result.kv_adapter_code.unwrap();
-
-    // Verify KV methods match spec.mdc examples
-    assert!(kv_code.contains("async get(key: string)"));
-    assert!(kv_code.contains("async getJSON"));
-    assert!(kv_code.contains("async put"));
-    assert!(kv_code.contains("async delete"));
-    assert!(kv_code.contains("async list"));
+    let error = generate(&routes, &config, &[]).expect_err("unresolved bindings must fail closed");
+    assert!(error
+        .to_string()
+        .contains("EC_BINDING_TARGET_UNIMPLEMENTED"));
 }
 
 #[test]

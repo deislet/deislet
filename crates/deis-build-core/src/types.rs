@@ -73,8 +73,21 @@ impl ValidationResult {
 #[derive(Debug, Clone)]
 pub struct CompilationResult {
     pub success: bool,
+    /// The one provider-neutral artifact every on-disk target build is
+    /// derived from. Memory-only compatibility mode has no completed
+    /// directory and therefore leaves this absent.
+    pub canonical_artifact: Option<CanonicalBuild>,
     pub builds: std::collections::HashMap<String, VendorBuild>,
     pub errors: Vec<ValidationError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalBuild {
+    pub output_path: String,
+    pub manifest_path: String,
+    pub artifact_sha256: String,
+    pub content_root_sha256: String,
+    pub file_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -86,8 +99,24 @@ pub struct VendorBuild {
     pub files: Vec<String>,
     pub size: usize,
     pub warnings: Vec<String>,
+    /// Exact canonical parent and provider payload identity. It is present on
+    /// every provider build returned by `Compiler::compile`; raw source
+    /// adapter internals never escape the compiler.
+    pub derivation: Option<ProviderDerivation>,
     /// Build artifact contents (set in Memory/Both modes)
     pub artifacts: Option<BuildArtifacts>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderDerivation {
+    pub parent_artifact_sha256: String,
+    pub parent_content_root_sha256: String,
+    /// Memory-only builds have no retained provider directory or sidecar, but
+    /// still carry their exact parent identity.
+    pub manifest_path: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub payload_root_sha256: Option<String>,
+    pub file_count: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

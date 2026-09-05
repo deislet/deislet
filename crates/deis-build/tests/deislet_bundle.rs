@@ -65,6 +65,21 @@ fn archive_names(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+fn canonical_routing(project: &Path) -> deis_build::canonical_routing::RoutingDocument {
+    let mut artifacts = std::fs::read_dir(project.join("dist/canonical"))
+        .expect("read the canonical store")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir());
+    let root = artifacts.next().expect("one canonical artifact").path();
+    assert!(
+        artifacts.next().is_none(),
+        "the build has one canonical parent"
+    );
+    let bytes = std::fs::read(root.join("documents/routing-static-assets.json"))
+        .expect("read canonical routing");
+    serde_json::from_slice(&bytes).expect("canonical routing document")
+}
+
 /// The bundled module's export clause.
 ///
 /// Found by scanning rather than by looking at the last line: minification is
@@ -122,6 +137,7 @@ async fn the_file_tree_becomes_route_patterns() {
 
     let bytes = build_bundle(project.path()).await;
     let manifest = read_manifest(&bytes).expect("a loadable manifest").manifest;
+    let routing = canonical_routing(project.path());
 
     // `functions/users/[id].ts` and `functions/api/[[catch]].ts`, spelled the
     // way the runtime's matcher and RouteRule.pattern spell them. The order is
@@ -132,9 +148,18 @@ async fn the_file_tree_becomes_route_patterns() {
     // keeps constraining segments after another has run out is the more
     // specific of the two.
     assert_eq!(
-        manifest.route_patterns(),
+        routing
+            .functions
+            .iter()
+            .map(|route| route.source.as_str())
+            .collect::<Vec<_>>(),
         vec!["/users/:id", "/", "/api/*"],
-        "patterns and their order both matter"
+        "canonical patterns and their order both matter"
+    );
+    assert_eq!(
+        manifest.route_patterns(),
+        vec!["/*"],
+        "the Deislet transport invokes the already-routed canonical module through one catch-all"
     );
     assert!(
         manifest.routes.iter().all(|r| r.methods.is_empty()),
@@ -360,6 +385,7 @@ async fn a_site_with_only_static_files_still_builds() {
     let manifest = read_manifest(&bytes).expect("a loadable manifest").manifest;
 
     assert!(manifest.routes.is_empty());
+    assert!(canonical_routing(project.path()).functions.is_empty());
     assert_eq!(manifest.assets.len(), 2, "the files are still carried");
 
     let worker = entry_text(&bytes, "worker/index.js");

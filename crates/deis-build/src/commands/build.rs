@@ -54,6 +54,20 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
     if result.success {
         println!("\n{}", "Build completed".green().bold());
 
+        if let Some(canonical) = &result.canonical_artifact {
+            println!(
+                "{}",
+                format!(
+                    "  ✓ Canonical: {} (content {}, {} files)\n    {}",
+                    &canonical.artifact_sha256[..12],
+                    &canonical.content_root_sha256[..12],
+                    canonical.file_count,
+                    canonical.output_path
+                )
+                .green()
+            );
+        }
+
         for (i, (vendor, build)) in result.builds.iter().enumerate() {
             println!(
                 "\n{}",
@@ -65,6 +79,22 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
                 )
                 .bold()
             );
+
+            if let Some(derivation) = &build.derivation {
+                println!(
+                    "{}",
+                    format!(
+                        "  ✓ Derived from canonical {}{}",
+                        &derivation.parent_artifact_sha256[..12],
+                        derivation
+                            .manifest_sha256
+                            .as_ref()
+                            .map(|digest| format!(", record {}", &digest[..12]))
+                            .unwrap_or_default()
+                    )
+                    .green()
+                );
+            }
             println!(
                 "{}",
                 format!("  ✓ Compiled {} file(s)", build.files.len()).green()

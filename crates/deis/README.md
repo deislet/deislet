@@ -4,9 +4,10 @@
 apart is the point:
 
 - **The project on disk.** `deis init`, `deis dev`, `deis validate` and
-  `deis build` need no platform at all. `deis build --vendor cloudflare|deno|tencent`
-  produces what that vendor's own tooling deploys; this CLI never pushes to
-  them.
+  `deis build` need no platform at all. It always creates one verified Edge
+  Canon Build Output first; `--vendor cloudflare|deno|tencent` derives what
+  that vendor's own tooling deploys from that same parent. This CLI never
+  pushes to them.
 - **The locked standard registry.** `deis targets list|inspect` reads the same
   generated target-status JSON as the product documentation and Web console;
   it does not infer support from an adapter being present.
@@ -135,9 +136,12 @@ Check the project against the specification.
 
 ### `deis build [--vendor …]`
 
-Compile. `--vendor deislet` produces `dist/deislet/bundle.zip`, the bundle a
-version is made of; the other vendors produce their own output for their own
-tooling.
+Compile one content-addressed canonical artifact, then derive the selected
+provider payload. `--vendor deislet` produces `dist/deislet/bundle.zip`, the
+bundle a version is made of; the other vendors produce their own output for
+their own tooling. The command prints the canonical and derivation identities.
+Provider packaging fails before output when a declared standard feature has no
+implemented mapping; it never silently removes that feature.
 
 ### `deis deploy`
 

@@ -53,7 +53,10 @@
 //! ```
 
 // Core compiler module
+pub mod canonical_artifact;
+pub mod canonical_routing;
 pub mod compiler;
+pub mod provider_derivation;
 
 // Parser module
 pub mod parser;
@@ -69,8 +72,8 @@ pub use deis_build_core::{
         Feature, MissingTargetImplementationError, Platform, TargetArtifactCoverage,
     },
     types::{
-        BuildArtifacts, CompilationResult, HandlerInfo, OutputMode, ValidationError,
-        ValidationResult, VendorBuild,
+        BuildArtifacts, CanonicalBuild, CompilationResult, HandlerInfo, OutputMode,
+        ProviderDerivation, ValidationError, ValidationResult, VendorBuild,
     },
 };
 

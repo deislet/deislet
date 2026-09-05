@@ -81,7 +81,10 @@ impl Feature {
     /// Name of the mapping emitted by Deislet's current target packager.
     pub fn target_implementation_name(&self, platform: Platform) -> Option<&'static str> {
         match (self, platform) {
-            (Feature::SQLDatabase, Platform::Cloudflare) => Some("D1 Database"),
+            // The old adapter writes empty D1 placeholders and no standard
+            // binding plan. A placeholder is neither a resource mapping nor a
+            // deployable artifact.
+            (Feature::SQLDatabase, Platform::Cloudflare) => None,
             // No database declaration or connection wiring is generated in
             // the Deno artifact today.
             (Feature::SQLDatabase, Platform::Deno) => None,
@@ -266,7 +269,7 @@ mod tests {
         let caps = TargetArtifactCoverage::new(Platform::Cloudflare);
 
         // Only mappings the current packager actually writes.
-        assert!(caps.implements(Feature::SQLDatabase));
+        assert!(!caps.implements(Feature::SQLDatabase));
         assert!(caps.implements(Feature::NodeRuntime));
         assert!(!caps.implements(Feature::ObjectStorage));
         assert!(!caps.implements(Feature::CronJobs));

@@ -5,24 +5,25 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Build** 是一个专注的代码编译器，将符合 [Edge Canon](https://github.com/deislet/edge-canon) 标准的 Edge Function 代码翻译为特定平台的可部署代码。
+**Build** 是统一构建器：先把符合 [Edge Canon](https://github.com/deislet/edge-canon) 的应用编译成一个可验证、按内容寻址的 canonical Build Output，再从该产物派生目标平台的部署形状。
 
-Build is a focused code compiler that translates [Edge Canon](https://github.com/deislet/edge-canon) compliant Edge Function code into platform-specific deployable code.
+Build first compiles an [Edge Canon](https://github.com/deislet/edge-canon) application into one verified, content-addressed canonical Build Output, then derives each provider payload from that artifact.
 
 ## 🎯 核心定位 | Core Purpose
 
-**Build 只做一件事：翻译代码**
+**Build 固定一条构建边界：应用源码不能绕过 canonical artifact 到达 provider packager。**
 
 Build does one thing: **translate code**
 
 ```
-Input:  Edge Canon standard code → Output: Platform-specific deployable code
-输入：Edge Canon 标准代码  → 输出：平台特定可部署代码
+Input → canonical Build Output → verified provider derivation
+输入  → canonical Build Output → 已验证的平台派生产物
 ```
 
 ## ✨ 特性 | Features
 
-- **纯粹翻译器 | Pure Translator**: 专注代码转换 | Focused on code transformation
+- **单一 canonical parent | One Canonical Parent**: 所有 target 只从同一已验证产物派生 | Every target derives only from the same verified artifact
+- **可追溯派生 | Traceable Derivation**: provider payload 完整文件集与 parent digest 由 sidecar 绑定 | A sidecar binds the complete provider payload to its parent digest
 - **多目标产物 | Multi-Target Artifacts**: Cloudflare Workers、Deno Deploy、Tencent EdgeOne、Deislet
 - **标准验证 | Standard Validation**: 检测平台特定代码 | Detect platform-specific code
 - **目标实现检查 | Target Implementation Check**: 编译时拒绝打包器尚无映射的目标产物 | Reject missing packager mappings at build time
@@ -77,6 +78,10 @@ let compiler = Compiler::with_options(CompilerOptions {
 
 let result = compiler.build().await?;
 ```
+
+`result.canonical_artifact` 返回持久 canonical identity（Memory 模式除外）；每个落盘
+`VendorBuild` 的 `derivation` 指向 `dist/.deislet/derivations/<vendor>/` 下的完整性记录。
+构建或部署会重新校验这些 identity，未实现的标准语义映射会失败而不是被忽略。
 
 ## 📚 文档 | Documentation
 

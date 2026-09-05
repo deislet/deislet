@@ -2038,6 +2038,7 @@ dependencies = [
  "indicatif",
  "pathdiff",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
  "swc_common 18.0.1",

@@ -137,10 +137,7 @@ export default async function deisletEntry(context) {
 
   // No handler claims this path. An app with static files never gets here for
   // them: deis-runtime serves a bundle asset before it starts an isolate.
-  return new Response('Not Found', {
-    status: 404,
-    headers: { 'content-type': 'text/plain; charset=utf-8' },
-  });
+  return new Response(null, { status: 404 });
 }
 "#;
 

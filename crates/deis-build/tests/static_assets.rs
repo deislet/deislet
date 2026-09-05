@@ -25,12 +25,6 @@ fn stage(dir: &Path) {
     std::fs::write(dir.join("public/index.html"), "<h1>site-marker</h1>\n").expect("write a page");
     std::fs::write(dir.join("public/css/app.css"), "body{color:red}\n")
         .expect("write a stylesheet");
-    // Read by the build, never served: publishing an author's routing table at
-    // /_redirects is what the rule exists to prevent, and it holds for every
-    // target and not just this platform's own.
-    std::fs::write(dir.join("public/_redirects"), "/old /index.html 301\n")
-        .expect("write the redirect table");
-
     std::fs::write(
         dir.join(".config.json"),
         r#"{
@@ -99,17 +93,9 @@ async fn every_target_carries_the_projects_static_files() {
             "{vendor} has to carry the stylesheet at {stylesheet}"
         );
 
-        // The site's own configuration is not one of the files it serves, and
-        // it is not carried anywhere. The build says so rather than leaving the
-        // author to find out that their redirects went nowhere.
         assert!(
-            !out.join("_redirects").exists() && !out.join("assets/_redirects").exists(),
-            "{vendor} must not publish the site's redirect table"
-        );
-        assert!(
-            build.warnings.iter().any(|w| w.contains("_redirects")),
-            "{vendor} has to say the redirect rules are not in force: {:?}",
-            build.warnings
+            build.derivation.is_some(),
+            "{vendor} records canonical lineage"
         );
     }
 }
@@ -118,6 +104,11 @@ async fn every_target_carries_the_projects_static_files() {
 async fn the_deislet_bundle_still_carries_them_and_keeps_its_own_rule() {
     let project = tempfile::tempdir().expect("a temporary project");
     stage(project.path());
+    std::fs::write(
+        project.path().join("public/_redirects"),
+        "/old /index.html 301\n",
+    )
+    .expect("write the redirect table");
 
     let build = build(project.path(), "deislet").await;
     let bytes = std::fs::read(Path::new(&build.output_path).join("bundle.zip"))
@@ -131,4 +122,35 @@ async fn the_deislet_bundle_still_carries_them_and_keeps_its_own_rule() {
     // `_redirects` is read into the manifest's site rules rather than carried
     // as a file, which is this target's own answer to the same question.
     assert!(!paths.contains(&"_redirects"));
+}
+
+#[tokio::test]
+async fn an_unimplemented_standard_rule_mapping_fails_instead_of_being_dropped() {
+    for vendor in ["cloudflare", "deno", "tencent"] {
+        let project = tempfile::tempdir().expect("a temporary project");
+        stage(project.path());
+        std::fs::write(
+            project.path().join("public/_redirects"),
+            "/old /index.html 301\n",
+        )
+        .expect("write the redirect table");
+        let compiler = Compiler::with_options(CompilerOptions {
+            project_dir: project.path().to_string_lossy().to_string(),
+            ..Default::default()
+        });
+        let error = compiler
+            .compile(project.path(), vec![vendor.to_string()], true)
+            .await
+            .expect_err("an omitted standard rule must fail the target")
+            .to_string();
+        assert!(
+            error.contains("EC_ROUTING_TARGET_UNIMPLEMENTED"),
+            "{vendor}: {error}"
+        );
+        assert!(error.contains("redirects"), "{vendor}: {error}");
+        assert!(
+            !project.path().join("dist").join(vendor).exists(),
+            "{vendor} must not leave a partial provider artifact"
+        );
+    }
 }

@@ -7,10 +7,59 @@ use crate::parser::TypeScriptParser;
 use colored::Colorize;
 use deis_build_core::bundler::{BuildBundler, TargetPlatform};
 use deis_build_core::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+/// Internal source-adapter target. It is never accepted from `--vendor` and
+/// never appears in the provider build map.
+const CANONICAL_TARGET: &str = "canonical";
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CanonicalApplicationPlan {
+    schema_version: u64,
+    format: String,
+    standard_version: String,
+    config: ProjectConfig,
+    environment_variable_names: Vec<String>,
+    secret_names: Vec<String>,
+    routes: Vec<CanonicalRoute>,
+    uses_node_npm: bool,
+    build: CanonicalBuildPlan,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRoute {
+    kind: String,
+    pattern: String,
+    source: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CanonicalBuildPlan {
+    minify: bool,
+    source_map: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CanonicalRuntimeEntrypoints {
+    schema_version: u64,
+    entries: Vec<CanonicalRuntimeEntrypoint>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRuntimeEntrypoint {
+    id: String,
+    kind: String,
+    module: String,
+    export: String,
+}
 
 pub use transformer::Transformer;
 pub use validator::Validator;
@@ -185,16 +234,74 @@ impl Compiler {
         let mut builds = HashMap::new();
         let mut rejected: Vec<String> = Vec::new();
 
+        // The provider-neutral artifact is one build, not one per selected
+        // provider. Even Memory mode crosses this boundary: its completed
+        // parent lives in a temporary store until every requested target has
+        // been derived, then disappears with that store so the project's
+        // output directory remains untouched.
+        let canonical_lifetime = if self.options.output_mode == OutputMode::Memory {
+            Some(ScratchDir::create("canonical-parent")?)
+        } else {
+            None
+        };
+        let mut canonical_config = config.clone();
+        if let Some(lifetime) = &canonical_lifetime {
+            let build = canonical_config
+                .build
+                .get_or_insert(deis_build_core::BuildConfig {
+                    out_dir: String::new(),
+                    minify: true,
+                    sourcemap: true,
+                });
+            build.out_dir = lifetime.path().to_string_lossy().into_owned();
+        }
+        let canonical = self
+            .build_from_project(project_dir, CANONICAL_TARGET, &canonical_config, minify)
+            .await?;
+        let summary = crate::canonical_artifact::validate(
+            Path::new(&canonical.output_path),
+            Some(&Self::locked_standard_version()?),
+            &[],
+        )?;
+        let canonical_for_derivation = CanonicalBuild {
+            manifest_path: summary
+                .root
+                .join(crate::canonical_artifact::MANIFEST_PATH)
+                .to_string_lossy()
+                .into_owned(),
+            output_path: summary.root.to_string_lossy().into_owned(),
+            artifact_sha256: summary.artifact_sha256,
+            content_root_sha256: summary.content_root_sha256,
+            file_count: summary.file_count,
+        };
+        let canonical_artifact = if canonical_lifetime.is_some() {
+            None
+        } else {
+            Some(canonical_for_derivation.clone())
+        };
+
         for vendor in target_vendors {
             let mut build = self
-                .build_for_vendor(project_dir, &vendor, &config, minify)
+                .build_for_vendor(
+                    project_dir,
+                    &vendor,
+                    &config,
+                    minify,
+                    Some(&canonical_for_derivation),
+                )
                 .await?;
+            if !canonical.warnings.is_empty() {
+                let mut source_warnings = canonical.warnings.clone();
+                source_warnings.append(&mut build.warnings);
+                build.warnings = source_warnings;
+            }
             let output_dir = Path::new(&build.output_path).to_path_buf();
 
             // Verify artifacts (Smoke Test). Memory mode leaves the output
             // directory empty on purpose, so there is nothing on disk to hand
             // wrangler or deno; verifying anyway would report a missing
             // directory as a failed build.
+            let mut verification_failed = false;
             if self.options.output_mode != OutputMode::Memory {
                 match self.verify_artifacts(&vendor, &output_dir) {
                     Ok(Verification::Ran(note)) => {
@@ -210,6 +317,7 @@ impl Compiler {
                         build.warnings.push(reason);
                     }
                     Err(e) => {
+                        verification_failed = true;
                         println!(
                             "{}",
                             format!("  ✗ Verification failed for {vendor}: {e}").red()
@@ -217,6 +325,34 @@ impl Compiler {
                         rejected.push(format!("{vendor}: {e}"));
                     }
                 }
+            }
+
+            if self.options.output_mode != OutputMode::Memory && !verification_failed {
+                let record_store = output_dir
+                    .parent()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "EC_DERIVATION_PUBLISH_FAILED: provider output has no record store parent"
+                        )
+                    })?
+                    .join(".deislet/derivations")
+                    .join(&vendor);
+                let derived = crate::provider_derivation::publish(
+                    &record_store,
+                    &output_dir,
+                    &vendor,
+                    &Self::locked_standard_version()?,
+                    &canonical_for_derivation.artifact_sha256,
+                    &canonical_for_derivation.content_root_sha256,
+                )?;
+                build.derivation = Some(ProviderDerivation {
+                    parent_artifact_sha256: derived.parent_artifact_sha256,
+                    parent_content_root_sha256: derived.parent_content_root_sha256,
+                    manifest_path: Some(derived.manifest_path.to_string_lossy().into_owned()),
+                    manifest_sha256: Some(derived.manifest_sha256),
+                    payload_root_sha256: Some(derived.payload_root_sha256),
+                    file_count: Some(derived.file_count),
+                });
             }
 
             builds.insert(vendor, build);
@@ -245,6 +381,7 @@ impl Compiler {
 
         Ok(CompilationResult {
             success: true,
+            canonical_artifact,
             builds,
             errors: Vec::new(),
         })
@@ -966,8 +1103,475 @@ impl Compiler {
         vendor: &str,
         config: &ProjectConfig,
         minify: bool,
+        canonical: Option<&CanonicalBuild>,
+    ) -> anyhow::Result<VendorBuild> {
+        let canonical = canonical.ok_or_else(|| {
+            anyhow::anyhow!(
+                "EC_ARTIFACT_PARENT_REQUIRED: the {vendor} target cannot be built without a \
+                 completed Edge Canon Build Output"
+            )
+        })?;
+        self.package_canonical_for_vendor(project_dir, vendor, config, minify, canonical)
+            .await
+    }
+
+    /// Reconstruct the only source tree a provider adapter is allowed to see.
+    ///
+    /// Application code, routes, static bytes and semantic configuration come
+    /// from the validated canonical parent. The original project contributes
+    /// only deployment-time environment values and the requested output
+    /// location; neither is part of the provider-neutral build identity.
+    async fn package_canonical_for_vendor(
+        &self,
+        original_project_dir: &Path,
+        vendor: &str,
+        deployment_config: &ProjectConfig,
+        _minify: bool,
+        canonical: &CanonicalBuild,
+    ) -> anyhow::Result<VendorBuild> {
+        if vendor == CANONICAL_TARGET {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DERIVATION_INVALID: a canonical artifact cannot be derived from itself"
+            ));
+        }
+
+        let canonical_root = Path::new(&canonical.output_path);
+        let standard_version = Self::locked_standard_version()?;
+        let summary =
+            crate::canonical_artifact::validate(canonical_root, Some(&standard_version), &[])?;
+        if summary.artifact_sha256 != canonical.artifact_sha256
+            || summary.content_root_sha256 != canonical.content_root_sha256
+        {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DIGEST_MISMATCH: canonical parent identity changed before provider derivation"
+            ));
+        }
+
+        let manifest = crate::canonical_artifact::read_manifest(canonical_root)?;
+        let application_plan =
+            Self::read_canonical_document(canonical_root, &manifest, "application-plan")?;
+        let plan: CanonicalApplicationPlan = serde_json::from_slice(&application_plan).map_err(
+            |_| {
+                anyhow::anyhow!(
+                    "EC_ARTIFACT_DOCUMENT_INVALID: application-plan does not match the supported schema"
+                )
+            },
+        )?;
+        if plan.schema_version != 1
+            || plan.format != "deislet.application-plan/v1"
+            || plan.standard_version != standard_version
+        {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DOCUMENT_INVALID: application-plan identity is not the locked contract"
+            ));
+        }
+
+        Self::validate_deployment_environment(deployment_config, &plan)?;
+        Self::refuse_canonical_event_target(vendor, &plan)?;
+        Self::refuse_unimplemented_resource_target(vendor, &plan.config)?;
+        let routing_bytes =
+            Self::read_canonical_document(canonical_root, &manifest, "routing-static-assets")?;
+        let routing = crate::canonical_routing::parse(&routing_bytes, &standard_version)?;
+        Self::validate_canonical_routing_files(&manifest, &routing)?;
+        crate::canonical_routing::require_target_implementation(vendor, &routing)?;
+
+        let original_project_root = fs::canonicalize(original_project_dir)?;
+        let output_base = original_project_root.join(
+            deployment_config
+                .build
+                .as_ref()
+                .map(|build| build.out_dir.as_str())
+                .unwrap_or("./dist"),
+        );
+        let mut derived_config = plan.config.clone();
+        derived_config.function_root = "./functions".into();
+        derived_config.environment = deployment_config.environment.clone();
+        derived_config.vendors = None;
+        derived_config.build = Some(deis_build_core::BuildConfig {
+            out_dir: output_base.to_string_lossy().into_owned(),
+            minify: plan.build.minify,
+            sourcemap: plan.build.source_map,
+        });
+        if let Some(assets) = derived_config.assets.as_mut() {
+            assets.dir = "./public".into();
+        }
+
+        let runtime_entrypoints =
+            Self::read_canonical_document(canonical_root, &manifest, "runtime-entrypoints")?;
+        let entrypoints: CanonicalRuntimeEntrypoints =
+            serde_json::from_slice(&runtime_entrypoints).map_err(|_| {
+                anyhow::anyhow!(
+                    "EC_ARTIFACT_DOCUMENT_INVALID: runtime-entrypoints does not match the supported schema"
+                )
+            })?;
+        if entrypoints.schema_version != 1 {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DOCUMENT_INVALID: runtime-entrypoints version is unsupported"
+            ));
+        }
+        Self::validate_canonical_entrypoints(&plan, &entrypoints)?;
+        let derived_source = ScratchDir::create(&format!("canonical-{vendor}"))?;
+        let functions = derived_source.path().join("functions");
+        fs::create_dir_all(&functions)?;
+        let has_fetch = entrypoints
+            .entries
+            .iter()
+            .any(|entrypoint| entrypoint.kind == "fetch");
+        if has_fetch {
+            Self::copy_canonical_file(
+                canonical_root,
+                &manifest,
+                "functions/main.js",
+                &functions.join("[[all]].js"),
+            )?;
+        } else if !entrypoints.entries.is_empty() {
+            Self::copy_canonical_file(
+                canonical_root,
+                &manifest,
+                "functions/main.js",
+                &derived_source.path().join("canonical-main.js"),
+            )?;
+        }
+        for entrypoint in entrypoints.entries {
+            if entrypoint.module != "functions/main.js" {
+                return Err(anyhow::anyhow!(
+                    "EC_ARTIFACT_DOCUMENT_INVALID: runtime entrypoint names an unsupported module"
+                ));
+            }
+            match (entrypoint.kind.as_str(), entrypoint.export.as_str()) {
+                ("fetch", "default") => {}
+                ("queue", "queue") => {
+                    let module = if has_fetch {
+                        "./[[all]].js"
+                    } else {
+                        "../canonical-main.js"
+                    };
+                    Self::write_staged_file(
+                        &functions.join("_queue.js"),
+                        format!("export {{ queue as default }} from '{module}';\n").as_bytes(),
+                    )?
+                }
+                ("scheduled", "scheduled") => {
+                    let module = if has_fetch {
+                        "./[[all]].js"
+                    } else {
+                        "../canonical-main.js"
+                    };
+                    Self::write_staged_file(
+                        &functions.join("_scheduled.js"),
+                        format!("export {{ scheduled as default }} from '{module}';\n").as_bytes(),
+                    )?
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                    "EC_ARTIFACT_DOCUMENT_INVALID: runtime entrypoint kind/export is unsupported"
+                ))
+                }
+            }
+        }
+
+        let public = derived_source.path().join("public");
+        for file in &manifest.content.files {
+            let Some(relative) = file.path.strip_prefix("static/") else {
+                continue;
+            };
+            Self::copy_canonical_file(
+                canonical_root,
+                &manifest,
+                &file.path,
+                &public.join(relative),
+            )?;
+        }
+        if vendor == deis_build_adapter_deislet::VENDOR {
+            for (filename, bytes) in crate::canonical_routing::deislet_site_files(&routing)? {
+                Self::write_staged_file(&public.join(filename), &bytes)?;
+            }
+        }
+
+        // The adapter sees only the reconstructed tree above. Calling the raw
+        // builder here is deliberate: routing back through `build_for_vendor`
+        // would ask for another canonical parent and create a second path from
+        // application source to provider output.
+        let mut build = self
+            .build_from_project(derived_source.path(), vendor, &derived_config, true)
+            .await?;
+        build.derivation = Some(ProviderDerivation {
+            parent_artifact_sha256: canonical.artifact_sha256.clone(),
+            parent_content_root_sha256: canonical.content_root_sha256.clone(),
+            manifest_path: None,
+            manifest_sha256: None,
+            payload_root_sha256: None,
+            file_count: None,
+        });
+        Ok(build)
+    }
+
+    fn read_canonical_document(
+        root: &Path,
+        manifest: &crate::canonical_artifact::CanonicalManifest,
+        kind: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut matches = manifest.documents.iter().filter(|item| item.kind == kind);
+        let document = matches.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "EC_ARTIFACT_DOCUMENT_MISSING: canonical artifact has no {kind} document"
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DOCUMENT_INVALID: canonical artifact has multiple {kind} documents"
+            ));
+        }
+        fs::read(root.join(&document.path)).map_err(|_| {
+            anyhow::anyhow!(
+                "EC_ARTIFACT_DOCUMENT_INVALID: canonical semantic document cannot be read"
+            )
+        })
+    }
+
+    fn copy_canonical_file(
+        root: &Path,
+        manifest: &crate::canonical_artifact::CanonicalManifest,
+        canonical_path: &str,
+        destination: &Path,
+    ) -> anyhow::Result<()> {
+        if !manifest
+            .content
+            .files
+            .iter()
+            .any(|file| file.path == canonical_path)
+        {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DOCUMENT_INVALID: provider derivation requested an unbound canonical file"
+            ));
+        }
+        let bytes = fs::read(root.join(canonical_path)).map_err(|_| {
+            anyhow::anyhow!("EC_ARTIFACT_DOCUMENT_INVALID: a bound canonical file cannot be read")
+        })?;
+        Self::write_staged_file(destination, &bytes)
+    }
+
+    fn validate_deployment_environment(
+        deployment_config: &ProjectConfig,
+        plan: &CanonicalApplicationPlan,
+    ) -> anyhow::Result<()> {
+        let mut variable_names = deployment_config
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.variables.as_ref())
+            .map(|variables| variables.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        variable_names.sort();
+        let mut secret_names = deployment_config
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.secrets.clone())
+            .unwrap_or_default();
+        secret_names.sort();
+        secret_names.dedup();
+        if variable_names != plan.environment_variable_names || secret_names != plan.secret_names {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DERIVATION_INPUT_MISMATCH: deployment environment names differ from the canonical plan"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_canonical_routing_files(
+        manifest: &crate::canonical_artifact::CanonicalManifest,
+        routing: &crate::canonical_routing::RoutingDocument,
+    ) -> anyhow::Result<()> {
+        for asset in &routing.assets {
+            let file = manifest
+                .content
+                .files
+                .iter()
+                .find(|file| file.path == asset.file_path)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "EC_ROUTING_ASSET_INVALID: routing document names an unbound canonical file"
+                    )
+                })?;
+            if file.size != asset.size
+                || file.sha256 != asset.sha256
+                || file.media_type != asset.media_type
+            {
+                return Err(anyhow::anyhow!(
+                    "EC_ROUTING_ASSET_INVALID: routing asset identity differs from canonical content"
+                ));
+            }
+        }
+        if routing
+            .functions
+            .iter()
+            .any(|route| route.entrypoint_id != "main")
+        {
+            return Err(anyhow::anyhow!(
+                "EC_ROUTING_FUNCTION_INVALID: routing document names an unknown fetch entrypoint"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_canonical_entrypoints(
+        plan: &CanonicalApplicationPlan,
+        entrypoints: &CanonicalRuntimeEntrypoints,
+    ) -> anyhow::Result<()> {
+        let mut ids = HashSet::new();
+        let mut kinds = HashMap::<&str, usize>::new();
+        for entrypoint in &entrypoints.entries {
+            if entrypoint.id.is_empty() || !ids.insert(entrypoint.id.as_str()) {
+                return Err(anyhow::anyhow!(
+                    "EC_ARTIFACT_DOCUMENT_INVALID: runtime entrypoint identifiers are invalid"
+                ));
+            }
+            *kinds.entry(entrypoint.kind.as_str()).or_default() += 1;
+        }
+        if kinds.get("fetch").copied().unwrap_or_default() > 1
+            || kinds.get("queue").copied().unwrap_or_default() > 1
+            || kinds.get("scheduled").copied().unwrap_or_default() > 1
+            || kinds
+                .keys()
+                .any(|kind| !matches!(*kind, "fetch" | "queue" | "scheduled"))
+        {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DOCUMENT_INVALID: runtime entrypoint families are invalid"
+            ));
+        }
+
+        let mut route_kinds = HashMap::<&str, usize>::new();
+        for route in &plan.routes {
+            if route.pattern.is_empty()
+                || route.source.is_empty()
+                || Path::new(&route.source).is_absolute()
+                || Path::new(&route.source)
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                || !matches!(
+                    route.kind.as_str(),
+                    "fetch" | "queue" | "scheduled" | "reserved"
+                )
+            {
+                return Err(anyhow::anyhow!(
+                    "EC_ARTIFACT_DOCUMENT_INVALID: application route plan is invalid"
+                ));
+            }
+            *route_kinds.entry(route.kind.as_str()).or_default() += 1;
+        }
+        for event in ["queue", "scheduled"] {
+            let planned = route_kinds.get(event).copied().unwrap_or_default() > 0;
+            let exported = kinds.get(event).copied().unwrap_or_default() == 1;
+            if planned != exported {
+                return Err(anyhow::anyhow!(
+                    "EC_ARTIFACT_DOCUMENT_INVALID: route plan and runtime entrypoints disagree"
+                ));
+            }
+        }
+        let planned_fetch = route_kinds.get("fetch").copied().unwrap_or_default() > 0;
+        let exported_fetch = kinds.get("fetch").copied().unwrap_or_default() == 1;
+        if planned_fetch != exported_fetch {
+            return Err(anyhow::anyhow!(
+                "EC_ARTIFACT_DOCUMENT_INVALID: route plan and fetch entrypoint disagree"
+            ));
+        }
+
+        // The flag records source-side Node/npm use for audit and reproducible
+        // rebuilds. Provider selection is based on the canonical module's
+        // remaining runtime imports, so a fully bundled npm package does not
+        // force a provider-specific Node mode.
+        let _source_used_node_npm = plan.uses_node_npm;
+        Ok(())
+    }
+
+    fn refuse_canonical_event_target(
+        vendor: &str,
+        plan: &CanonicalApplicationPlan,
+    ) -> anyhow::Result<()> {
+        if vendor == deis_build_adapter_deislet::VENDOR {
+            return Ok(());
+        }
+        let events = plan
+            .routes
+            .iter()
+            .filter_map(|route| match route.kind.as_str() {
+                "queue" => Some(format!("{} (Queue)", route.source)),
+                "scheduled" => Some(format!("{} (Scheduled)", route.source)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "EC_EVENT_TARGET_UNIMPLEMENTED: the {vendor} packager cannot encode the event \
+             handler(s) {}; it has no generated trigger declaration or event wrapper. They \
+             were not exposed as HTTP routes and no deployable provider artifact was produced",
+            events.join(", ")
+        ))
+    }
+
+    fn refuse_unimplemented_resource_target(
+        vendor: &str,
+        config: &ProjectConfig,
+    ) -> anyhow::Result<()> {
+        if vendor == deis_build_adapter_deislet::VENDOR {
+            return Ok(());
+        }
+        let mut declarations = config
+            .bindings
+            .iter()
+            .map(|(name, binding)| format!("{name} ({})", binding.kind))
+            .collect::<Vec<_>>();
+        if let Some(services) = &config.services {
+            for (name, enabled) in [
+                ("kv", services.kv.as_ref().is_some_and(|item| item.enabled)),
+                (
+                    "database",
+                    services.database.as_ref().is_some_and(|item| item.enabled),
+                ),
+                (
+                    "blob",
+                    services.blob.as_ref().is_some_and(|item| item.enabled),
+                ),
+                (
+                    "queue",
+                    services.queue.as_ref().is_some_and(|item| item.enabled),
+                ),
+            ] {
+                if enabled {
+                    declarations.push(format!("legacy service {name}"));
+                }
+            }
+        }
+        if !config.callable_by.is_empty() {
+            declarations.push("service-binding ingress policy".into());
+        }
+        if declarations.is_empty() {
+            return Ok(());
+        }
+        declarations.sort();
+        Err(anyhow::anyhow!(
+            "EC_BINDING_TARGET_UNIMPLEMENTED: the {vendor} packager has no standard logical \
+             resource binding plan for {}; no provider-specific binding, credential placeholder, \
+             or deployable artifact was produced",
+            declarations.join(", ")
+        ))
+    }
+
+    /// Build the provider-neutral source artifact, or package a temporary
+    /// project that was reconstructed from one. Provider builds never call
+    /// this with the author's project directory directly; that boundary is
+    /// enforced by [`Self::build_for_vendor`].
+    async fn build_from_project(
+        &self,
+        project_dir: &Path,
+        vendor: &str,
+        config: &ProjectConfig,
+        minify: bool,
     ) -> anyhow::Result<VendorBuild> {
         use deis_build_core::types::BuildArtifacts;
+
+        let is_canonical = vendor == CANONICAL_TARGET;
 
         // What the author asked for, from the two places they can ask.
         //
@@ -985,11 +1589,16 @@ impl Compiler {
         // Check this packager's artifact coverage. Standard validation and
         // target certification are separate registry-driven gates.
         let required_features = self.detect_required_features(config);
-        let mut warnings = self.validate_target_artifact_coverage(vendor, &required_features)?;
+        let mut warnings = if is_canonical {
+            Vec::new()
+        } else {
+            self.validate_target_artifact_coverage(vendor, &required_features)?
+        };
 
         let output_mode = self.options.output_mode;
         let keeps_output = matches!(output_mode, OutputMode::Files | OutputMode::Both);
-        let should_collect_memory = matches!(output_mode, OutputMode::Memory | OutputMode::Both);
+        let should_collect_memory =
+            !is_canonical && matches!(output_mode, OutputMode::Memory | OutputMode::Both);
 
         // The deislet target's artefact is an archive on disk, and the caller
         // receives it as a path. Memory mode has no directory to hand a path
@@ -1021,7 +1630,7 @@ impl Compiler {
         // resolve, so every one of the user's handlers fails to resolve and no
         // vendor can be built at all. What Memory mode promises is an empty
         // output directory, not a build that never touches a disk.
-        let scratch = if keeps_output {
+        let scratch = if keeps_output && !is_canonical {
             None
         } else {
             Some(ScratchDir::create(vendor)?)
@@ -1257,9 +1866,10 @@ impl Compiler {
         // of it, so they are never served - here as in the bundle, where
         // publishing an author's routing table at /_redirects is the thing the
         // rule exists to prevent.
-        let (site_files, served_assets): (Vec<_>, Vec<_>) = staged_assets
+        let served_assets = staged_assets
             .iter()
-            .partition(|asset| deis_build_adapter_deislet::is_site_file(&asset.path));
+            .filter(|asset| !deis_build_adapter_deislet::is_site_file(&asset.path))
+            .collect::<Vec<_>>();
         let adapter_assets: Vec<StaticAsset> = served_assets
             .iter()
             .map(|asset| StaticAsset {
@@ -1268,28 +1878,6 @@ impl Compiler {
             })
             .collect();
 
-        // Every host has its own redirect and header configuration and none of
-        // them reads these two files, so the rules in them are simply not in
-        // force on a vendor target. Saying so beats letting an author believe a
-        // redirect table travelled with the build.
-        if vendor != deis_build_adapter_deislet::VENDOR && !site_files.is_empty() {
-            let names: Vec<&str> = site_files.iter().map(|a| a.path.as_str()).collect();
-            let warning =
-                format!(
-                "{} not carried to the {vendor} target: {} configures this platform's own asset \
-                 server, and {vendor} has its own. The rules in {} are not in force there",
-                if names.len() == 1 {
-                    format!("{} is", names[0])
-                } else {
-                    format!("{} are", names.join(" and "))
-                },
-                if names.len() == 1 { "it" } else { "each of them" },
-                if names.len() == 1 { "it" } else { "them" }
-            );
-            println!("{}", format!("  ⚠ {warning}").yellow());
-            warnings.push(warning);
-        }
-
         // Call Adapter to get Artifacts (In Memory).
         //
         // The arms match on each adapter's own `VENDOR` constant rather than
@@ -1297,6 +1885,9 @@ impl Compiler {
         // are one fact: an adapter renamed without its constant fails to
         // compile here instead of silently losing a target.
         let artifacts = match vendor {
+            CANONICAL_TARGET => {
+                deis_build_adapter_deislet::generate(&routes, config, &adapter_assets)?
+            }
             deis_build_adapter_cloudflare::VENDOR => {
                 deis_build_adapter_cloudflare::generate_with_node_compat(
                     &routes,
@@ -1441,6 +2032,8 @@ impl Compiler {
             // deno was the target it had been silently mapping until the
             // `!=` above stopped sending it here at all.
             let platform = match vendor {
+                CANONICAL_TARGET if uses_node_npm => TargetPlatform::CanonicalNode,
+                CANONICAL_TARGET => TargetPlatform::Canonical,
                 deis_build_adapter_cloudflare::VENDOR if uses_node_npm => {
                     TargetPlatform::CloudflareNode
                 }
@@ -1461,17 +2054,16 @@ impl Compiler {
             let router_path = system_dir.join("router.ts");
 
             println!("{}", format!("  ⚡ Bundling for {}...", vendor).dimmed());
-            let mut bundler = BuildBundler::new(router_path.to_str().unwrap(), platform)
+            let bundler = BuildBundler::new(router_path.to_str().unwrap(), platform)
                 .minified(minify)
-                .with_source_map(source_map);
+                .with_source_map(source_map)
+                .with_cwd(build_dir.clone());
 
             // A bundle is content-addressed, so its bytes may not depend on
-            // where the build was launched from. Pinning the bundler's working
-            // directory to the project makes the module paths it writes into
-            // the output relative to the project root and nothing else.
-            if vendor == deis_build_adapter_deislet::VENDOR {
-                bundler = bundler.with_cwd(project_dir.to_path_buf());
-            }
+            // either the checkout or a temporary canonical reconstruction.
+            // Every input the bundler sees has already been staged under
+            // `build_dir`; pinning cwd there gives source maps the same
+            // `_deis_internal/src/project` names on every machine and target.
 
             // Always `generate()`, never `bundle()`.
             //
@@ -1510,6 +2102,7 @@ impl Compiler {
                         warnings.push(advisory);
                     }
                     let filename = match vendor {
+                        CANONICAL_TARGET => "functions/main.js".to_string(),
                         deis_build_adapter_tencent::VENDOR if uses_node_npm => {
                             "cloud-functions/api-node/index.mjs".to_string()
                         }
@@ -1521,18 +2114,21 @@ impl Compiler {
                     };
 
                     if keeps_output && vendor != deis_build_adapter_deislet::VENDOR {
-                        let output_file =
-                            if vendor == deis_build_adapter_tencent::VENDOR && uses_node_npm {
-                                let node_dir = build_dir.join("cloud-functions/api-node");
-                                fs::create_dir_all(&node_dir)?;
-                                node_dir.join("index.mjs")
-                            } else if vendor == deis_build_adapter_tencent::VENDOR {
-                                let ef_dir = build_dir.join("edge-functions");
-                                fs::create_dir_all(&ef_dir)?;
-                                ef_dir.join("index.js")
-                            } else {
-                                build_dir.join("index.js")
-                            };
+                        let output_file = if is_canonical {
+                            let functions = build_dir.join("functions");
+                            fs::create_dir_all(&functions)?;
+                            functions.join("main.js")
+                        } else if vendor == deis_build_adapter_tencent::VENDOR && uses_node_npm {
+                            let node_dir = build_dir.join("cloud-functions/api-node");
+                            fs::create_dir_all(&node_dir)?;
+                            node_dir.join("index.mjs")
+                        } else if vendor == deis_build_adapter_tencent::VENDOR {
+                            let ef_dir = build_dir.join("edge-functions");
+                            fs::create_dir_all(&ef_dir)?;
+                            ef_dir.join("index.js")
+                        } else {
+                            build_dir.join("index.js")
+                        };
 
                         fs::write(&output_file, &bundled_code)?;
                         println!(
@@ -1584,6 +2180,7 @@ impl Compiler {
         // caller's disk.
         if keeps_output && vendor != deis_build_adapter_deislet::VENDOR {
             let destination = build_dir.join(match vendor {
+                CANONICAL_TARGET => "static",
                 deis_build_adapter_cloudflare::VENDOR => deis_build_adapter_cloudflare::ASSETS_DIR,
                 deis_build_adapter_deno::VENDOR => deis_build_adapter_deno::ASSETS_DIR,
                 deis_build_adapter_tencent::VENDOR => deis_build_adapter_tencent::ASSETS_DIR,
@@ -1631,6 +2228,50 @@ impl Compiler {
             warnings.extend(bundle.warnings);
         }
 
+        let final_output_dir = if is_canonical {
+            let summary = self.emit_canonical_artifact(
+                project_dir,
+                &output_dir,
+                config,
+                &entry_code,
+                &routes,
+                &staged_modules,
+                &staged_assets,
+                uses_node_npm,
+                minify,
+                source_map,
+            )?;
+            let manifest = crate::canonical_artifact::read_manifest(&summary.root)?;
+            files = manifest
+                .content
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect();
+            total_size = manifest
+                .content
+                .files
+                .iter()
+                .map(|file| file.size as usize)
+                .sum::<usize>()
+                + fs::metadata(summary.root.join(crate::canonical_artifact::MANIFEST_PATH))
+                    .map(|metadata| metadata.len() as usize)
+                    .unwrap_or(0);
+            println!(
+                "{}",
+                format!(
+                    "  ✓ Canonical artifact {} (content root {}, {} files)",
+                    &summary.artifact_sha256[..12],
+                    &summary.content_root_sha256[..12],
+                    summary.file_count
+                )
+                .green()
+            );
+            summary.root
+        } else {
+            output_dir.clone()
+        };
+
         // Build BuildArtifacts (Memory/Both modes)
         let build_artifacts = if should_collect_memory {
             Some(BuildArtifacts {
@@ -1652,10 +2293,11 @@ impl Compiler {
 
         Ok(VendorBuild {
             vendor: vendor.to_string(),
-            output_path: output_dir.to_string_lossy().to_string(),
+            output_path: final_output_dir.to_string_lossy().to_string(),
             files,
             size: total_size,
             warnings,
+            derivation: None,
             artifacts: build_artifacts,
         })
     }
@@ -1720,7 +2362,10 @@ impl Compiler {
         vendor: &str,
         routes: &[(String, String)],
     ) -> anyhow::Result<()> {
-        if vendor == deis_build_adapter_deislet::VENDOR {
+        if matches!(
+            vendor,
+            CANONICAL_TARGET | deis_build_adapter_deislet::VENDOR
+        ) {
             return Ok(());
         }
 
@@ -1910,6 +2555,407 @@ impl Compiler {
                 .map(|a| a.dir.as_str())
                 .unwrap_or("./public"),
         )
+    }
+
+    fn locked_standard_version() -> anyhow::Result<String> {
+        const LOCK: &str = include_str!("../../../../standards/edge-canon.lock.json");
+        let lock: serde_json::Value = serde_json::from_str(LOCK).map_err(|_| {
+            anyhow::anyhow!(
+                "EC_ARTIFACT_STANDARD_PIN_INVALID: the embedded Edge Canon lock is invalid"
+            )
+        })?;
+        let commit = lock
+            .pointer("/source/sourceCommit")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                value.len() == 40
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "EC_ARTIFACT_STANDARD_PIN_INVALID: the embedded Edge Canon lock has no exact commit"
+                )
+            })?;
+        Ok(format!("edge-canon.next@{commit}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_canonical_artifact(
+        &self,
+        project_dir: &Path,
+        artifact_store: &Path,
+        config: &ProjectConfig,
+        entry_code: &str,
+        routes: &[(String, String)],
+        source_modules: &HashSet<PathBuf>,
+        staged_assets: &[deis_build_adapter_deislet::StagedAsset],
+        uses_node_npm: bool,
+        minify: bool,
+        source_map: bool,
+    ) -> anyhow::Result<crate::canonical_artifact::CanonicalArtifactSummary> {
+        use crate::canonical_artifact::{
+            canonical_json_bytes, ArtifactFileInput, BuildMetadata, CanonicalArtifactInput,
+            Toolchain,
+        };
+        use sha2::{Digest, Sha256};
+
+        let standard_version = Self::locked_standard_version()?;
+        let routing_document =
+            crate::canonical_routing::build(&standard_version, config, routes, staged_assets)?;
+        let routing_document_bytes = canonical_json_bytes(&routing_document)?;
+        let route_plan = deis_build_adapter_deislet::plan_routes(routes);
+        let route_rows = routes
+            .iter()
+            .map(|(pattern, import_path)| {
+                let kind = match deis_build_core::routes::handler_kind(import_path) {
+                    deis_build_core::routes::HandlerKind::Http => "fetch",
+                    deis_build_core::routes::HandlerKind::Queue => "queue",
+                    deis_build_core::routes::HandlerKind::Scheduled => "scheduled",
+                    deis_build_core::routes::HandlerKind::Reserved => "reserved",
+                };
+                let source =
+                    deis_build_core::routes::staged_handler_path(import_path).replace('\\', "/");
+                serde_json::json!({"kind": kind, "pattern": pattern, "source": source})
+            })
+            .collect::<Vec<_>>();
+        let environment_names = config
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.variables.as_ref())
+            .map(|variables| {
+                let mut names = variables.keys().cloned().collect::<Vec<_>>();
+                names.sort();
+                names
+            })
+            .unwrap_or_default();
+        let mut secret_names = config
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.secrets.clone())
+            .unwrap_or_default();
+        secret_names.sort();
+        secret_names.dedup();
+
+        // This document intentionally excludes environment values, provider
+        // selection/configuration and output paths. It is the provider-neutral
+        // plan a packager may consume, not a copy of `.config.json`.
+        let mut canonical_config = config.clone();
+        canonical_config.function_root = "./functions".into();
+        canonical_config.environment = None;
+        canonical_config.vendors = None;
+        canonical_config.build = None;
+        if let Some(assets) = canonical_config.assets.as_mut() {
+            assets.dir = "./public".into();
+        }
+        let application_plan = serde_json::json!({
+            "schemaVersion": 1,
+            "format": "deislet.application-plan/v1",
+            "standardVersion": standard_version.clone(),
+            "config": canonical_config,
+            "environmentVariableNames": environment_names,
+            "secretNames": secret_names,
+            "routes": route_rows,
+            "usesNodeNpm": uses_node_npm,
+            "build": {"minify": minify, "sourceMap": source_map},
+        });
+        let application_plan_bytes = canonical_json_bytes(&application_plan)?;
+
+        let source_tree_sha256 = Self::canonical_source_tree_sha256(
+            project_dir,
+            source_modules,
+            staged_assets,
+            &application_plan_bytes,
+        )?;
+        let build_plan_sha256 = hex::encode(Sha256::digest(&application_plan_bytes));
+        let dependency_lock = fs::read(project_dir.join("package-lock.json"))
+            .unwrap_or_else(|_| b"edge-canon.no-dependency-lock/v1\0".to_vec());
+        let dependency_lock_sha256 = hex::encode(Sha256::digest(&dependency_lock));
+        let public_inputs_sha256 =
+            hex::encode(Sha256::digest(b"edge-canon.public-build-inputs/v1\0none"));
+        let entry_sha256 = hex::encode(Sha256::digest(entry_code.as_bytes()));
+        let packages = Self::canonical_sbom_packages(project_dir)?;
+
+        let runtime_entrypoints = {
+            let mut entries = Vec::new();
+            if !routing_document.functions.is_empty() {
+                entries.push(serde_json::json!({
+                    "id": "main",
+                    "kind": "fetch",
+                    "module": "functions/main.js",
+                    "export": "default"
+                }));
+            }
+            if route_plan.queue.is_some() {
+                entries.push(serde_json::json!({
+                    "id": "queue",
+                    "kind": "queue",
+                    "module": "functions/main.js",
+                    "export": "queue"
+                }));
+            }
+            if route_plan.scheduled.is_some() {
+                entries.push(serde_json::json!({
+                    "id": "scheduled",
+                    "kind": "scheduled",
+                    "module": "functions/main.js",
+                    "export": "scheduled"
+                }));
+            }
+            serde_json::json!({"schemaVersion": 1, "entries": entries})
+        };
+        let sbom = serde_json::json!({
+            "spdxVersion": "SPDX-2.3",
+            "dataLicense": "CC0-1.0",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": config.name,
+            "documentNamespace": format!("https://deislet.dev/sbom/{source_tree_sha256}"),
+            "creationInfo": {
+                "created": "1970-01-01T00:00:00Z",
+                "creators": [format!("Tool: deis-build-{}", env!("CARGO_PKG_VERSION"))]
+            },
+            "packages": packages,
+        });
+        let provenance = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "functions/main.js", "digest": {"sha256": entry_sha256}}],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {
+                "buildDefinition": {
+                    "buildType": "https://deislet.dev/build-types/generic-edge-canon-source/v1",
+                    "externalParameters": application_plan,
+                    "internalParameters": {},
+                    "resolvedDependencies": []
+                },
+                "runDetails": {
+                    "builder": {"id": "https://github.com/deislet/deislet/tree/main/crates/deis-build"},
+                    "metadata": {}
+                }
+            }
+        });
+        let validation_report = serde_json::json!({
+            "schemaVersion": 1,
+            "standardVersion": standard_version.clone(),
+            "result": "pass",
+            "requirementsDigest": hex::encode(Sha256::digest(standard_version.as_bytes())),
+            "checks": [
+                "source-policy",
+                "module-closure",
+                "node-npm-contract",
+                "portable-paths",
+                "artifact-integrity"
+            ]
+        });
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "functions/main.js".to_string(),
+            ArtifactFileInput::new(entry_code.as_bytes(), "text/javascript; charset=utf-8"),
+        );
+        for asset in staged_assets
+            .iter()
+            .filter(|asset| !deis_build_adapter_deislet::is_site_file(&asset.path))
+        {
+            files.insert(
+                format!("static/{}", asset.path),
+                ArtifactFileInput::new(asset.bytes.clone(), asset.content_type),
+            );
+        }
+        let semantic_documents = vec![
+            (
+                "application-plan".into(),
+                1,
+                "documents/application-plan.json".into(),
+            ),
+            ("provenance".into(), 1, "documents/provenance.json".into()),
+            (
+                "runtime-entrypoints".into(),
+                1,
+                "documents/runtime-entrypoints.json".into(),
+            ),
+            ("sbom".into(), 1, "documents/sbom.spdx.json".into()),
+            (
+                "validation-report".into(),
+                1,
+                "documents/validation-report.json".into(),
+            ),
+            (
+                "routing-static-assets".into(),
+                1,
+                "documents/routing-static-assets.json".into(),
+            ),
+        ];
+        for (path, media_type, document) in [
+            (
+                "documents/application-plan.json",
+                "application/json",
+                application_plan_bytes.clone(),
+            ),
+            (
+                "documents/provenance.json",
+                "application/vnd.in-toto+json",
+                canonical_json_bytes(&provenance)?,
+            ),
+            (
+                "documents/runtime-entrypoints.json",
+                "application/json",
+                canonical_json_bytes(&runtime_entrypoints)?,
+            ),
+            (
+                "documents/sbom.spdx.json",
+                "application/spdx+json",
+                canonical_json_bytes(&sbom)?,
+            ),
+            (
+                "documents/validation-report.json",
+                "application/json",
+                canonical_json_bytes(&validation_report)?,
+            ),
+            (
+                "documents/routing-static-assets.json",
+                "application/json",
+                routing_document_bytes,
+            ),
+        ] {
+            files.insert(
+                path.to_string(),
+                ArtifactFileInput::new(document, media_type),
+            );
+        }
+
+        let input = CanonicalArtifactInput {
+            standard_version: standard_version.clone(),
+            files,
+            documents: semantic_documents,
+            build: BuildMetadata {
+                source_tree_sha256,
+                build_plan_sha256,
+                dependency_lock_sha256,
+                public_inputs_sha256,
+                source_date_epoch: 0,
+                network_access: if uses_node_npm { "declared" } else { "denied" }.into(),
+                secret_inputs_used: false,
+                toolchains: vec![Toolchain {
+                    name: "deis-build".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    executable_sha256: Self::compiler_executable_sha256()?,
+                }],
+            },
+        };
+        crate::canonical_artifact::publish(artifact_store, input)
+    }
+
+    fn canonical_source_tree_sha256(
+        project_dir: &Path,
+        source_modules: &HashSet<PathBuf>,
+        assets: &[deis_build_adapter_deislet::StagedAsset],
+        application_plan: &[u8],
+    ) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+
+        let project_root = fs::canonicalize(project_dir)?;
+        let mut inputs = BTreeMap::<String, Vec<u8>>::new();
+        inputs.insert("project-config.json".into(), application_plan.to_vec());
+        for module in source_modules {
+            let relative = module
+                .strip_prefix(&project_root)
+                .map_err(|_| {
+                    anyhow::anyhow!("EC_ARTIFACT_PATH_INVALID: source module escapes the project")
+                })?
+                .to_str()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("EC_ARTIFACT_PATH_INVALID: source module path is not UTF-8")
+                })?
+                .replace('\\', "/");
+            inputs.insert(format!("source/{relative}"), fs::read(module)?);
+        }
+        for asset in assets {
+            inputs.insert(format!("assets/{}", asset.path), asset.bytes.clone());
+        }
+        for name in ["package.json", "package-lock.json"] {
+            let path = project_dir.join(name);
+            if path.is_file() {
+                inputs.insert(format!("dependency/{name}"), fs::read(path)?);
+            }
+        }
+
+        let mut digest = Sha256::new();
+        for (path, bytes) in inputs {
+            let path = path.as_bytes();
+            digest.update((path.len() as u64).to_be_bytes());
+            digest.update(path);
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(Sha256::digest(&bytes));
+        }
+        Ok(hex::encode(digest.finalize()))
+    }
+
+    fn canonical_sbom_packages(project_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+        use sha2::{Digest, Sha256};
+
+        let lock_path = project_dir.join("package-lock.json");
+        if !lock_path.is_file() {
+            return Ok(Vec::new());
+        }
+        let lock: serde_json::Value = serde_json::from_slice(&fs::read(lock_path)?)?;
+        let Some(packages) = lock.get("packages").and_then(serde_json::Value::as_object) else {
+            return Ok(Vec::new());
+        };
+        let mut rows = packages
+            .iter()
+            .filter(|(path, _)| !path.is_empty())
+            .filter_map(|(path, value)| {
+                let version = value.get("version")?.as_str()?;
+                let name = path
+                    .strip_prefix("node_modules/")?
+                    .rsplit_once("/node_modules/")
+                    .map(|(_, name)| name)
+                    .unwrap_or_else(|| path.trim_start_matches("node_modules/"));
+                let id = hex::encode(Sha256::digest(path.as_bytes()));
+                Some(serde_json::json!({
+                    "name": name,
+                    "SPDXID": format!("SPDXRef-Package-{}", &id[..20]),
+                    "versionInfo": version,
+                    "downloadLocation": "NOASSERTION",
+                    "filesAnalyzed": false
+                }))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            left.get("SPDXID")
+                .and_then(serde_json::Value::as_str)
+                .cmp(&right.get("SPDXID").and_then(serde_json::Value::as_str))
+        });
+        Ok(rows)
+    }
+
+    fn compiler_executable_sha256() -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        use std::sync::OnceLock;
+
+        // The reference builder is an interpreted module and hashes that
+        // executable source. Do the corresponding stable thing for this
+        // compiled builder: hash the source-adapter implementation and its
+        // exact dependency lock, not the host-specific ELF/Mach-O/PE image.
+        // Hashing a 400 MiB debug test binary made every integration process
+        // spend close to a minute on metadata and also guaranteed different
+        // canonical identities across Linux, macOS and Windows.
+        static DIGEST: OnceLock<String> = OnceLock::new();
+        Ok(DIGEST
+            .get_or_init(|| {
+                let mut digest = Sha256::new();
+                for bytes in [
+                    include_bytes!("mod.rs").as_slice(),
+                    include_bytes!("../canonical_artifact.rs").as_slice(),
+                    include_bytes!("../../../../Cargo.lock").as_slice(),
+                ] {
+                    digest.update((bytes.len() as u64).to_be_bytes());
+                    digest.update(bytes);
+                }
+                hex::encode(digest.finalize())
+            })
+            .clone())
     }
 
     /// Pack a finished deislet build into the application bundle.
@@ -2166,8 +3212,13 @@ mod output_mode_tests {
                 "{vendor}: the bundle has to contain the handler, not just the router"
             );
             assert!(
-                artifacts.source_files.contains_key("src/index.ts"),
-                "{vendor}: the transformed source is part of what Memory mode returns"
+                artifacts.source_files.contains_key("src/[[all]].js"),
+                "{vendor}: Memory mode must expose the provider input reconstructed from the \
+                 canonical parent, not a second compilation of the original handler"
+            );
+            assert!(
+                !artifacts.source_files.contains_key("src/index.ts"),
+                "{vendor}: the original project must not bypass the canonical parent"
             );
         }
     }
@@ -2228,6 +3279,60 @@ mod output_mode_tests {
             "a build may only write under the project it was given, not {}",
             stray.display()
         );
+    }
+
+    /// Provider packaging is a derivation boundary, not a convenient second
+    /// build from the checkout. Once the canonical parent exists, later
+    /// source changes must be invisible to every provider packager.
+    #[tokio::test]
+    async fn provider_derivation_never_rereads_the_original_application_source() {
+        let project = tempfile::tempdir().expect("a temporary project");
+        stage_project(project.path(), "tencent");
+        let compiler = Compiler::with_options(CompilerOptions {
+            project_dir: project.path().to_string_lossy().into_owned(),
+            output_mode: OutputMode::Files,
+            ..Default::default()
+        });
+        let config = compiler
+            .load_config(project.path())
+            .expect("load the project config");
+        let raw_parent = compiler
+            .build_from_project(project.path(), CANONICAL_TARGET, &config, false)
+            .await
+            .expect("build the canonical parent");
+        let summary = crate::canonical_artifact::validate(
+            Path::new(&raw_parent.output_path),
+            Some(&Compiler::locked_standard_version().expect("locked standard version")),
+            &[],
+        )
+        .expect("validate the parent");
+        let parent = CanonicalBuild {
+            manifest_path: summary
+                .root
+                .join(crate::canonical_artifact::MANIFEST_PATH)
+                .to_string_lossy()
+                .into_owned(),
+            output_path: summary.root.to_string_lossy().into_owned(),
+            artifact_sha256: summary.artifact_sha256,
+            content_root_sha256: summary.content_root_sha256,
+            file_count: summary.file_count,
+        };
+
+        fs::write(
+            project.path().join("functions/index.ts"),
+            "export default function handler() {\n  return new Response(\"mutated-after-parent\");\n}\n",
+        )
+        .expect("mutate the source after publishing the parent");
+
+        let build = compiler
+            .build_for_vendor(project.path(), "tencent", &config, false, Some(&parent))
+            .await
+            .expect("derive the provider payload from the parent");
+        let code =
+            fs::read_to_string(Path::new(&build.output_path).join("edge-functions/index.js"))
+                .expect("read the provider entry");
+        assert!(code.contains("handler-body-marker"));
+        assert!(!code.contains("mutated-after-parent"));
     }
 
     /// A staging directory holds a copy of the user's transformed sources, so

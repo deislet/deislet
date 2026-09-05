@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-04T11:48:22+08:00",
+  "updatedAt": "2026-09-05T08:51:45+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -12,7 +12,8 @@
   },
   "nextActions": [
     "P0-SPEC-002",
-    "P0-MODEL-001"
+    "P0-MODEL-001",
+    "P1-BUILD-001"
   ],
   "phases": [
     {
@@ -207,10 +208,16 @@
           "id": "P1-BUILD-001",
           "title": "实现 source/framework adapter 到 canonical artifact 的统一构建链",
           "owner": "deislet",
-          "status": "queued",
+          "status": "active",
           "dependsOn": ["P0-MODEL-001", "P0-SPEC-002"],
-          "outputs": [{"type": "planned-path", "value": "canonical artifact crates, schemas and fixtures"}],
-          "verification": "跨三平台重复构建 digest 一致且 provenance 可验证"
+          "outputs": [
+            {"type": "local-path", "value": "crates/deis-build/src/canonical_artifact.rs"},
+            {"type": "local-path", "value": "crates/deis-build/src/canonical_routing.rs"},
+            {"type": "local-path", "value": "crates/deis-build/src/provider_derivation.rs"},
+            {"type": "local-path", "value": "crates/deis-build/tests/canonical_build_output.rs"},
+            {"type": "local-path", "value": "crates/deis-build/tests/provider_resource_bindings.rs"}
+          ],
+          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；仍需 Linux/macOS/Windows 的真实 compiler identity、全部 semantic document schema、不可变 provider payload、签名和 framework/provider 集成，故保持 active"
         },
         {
           "id": "P1-DEPLOY-001",

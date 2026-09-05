@@ -52,6 +52,20 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
     if result.success {
         println!("\n{}", "Build completed".green().bold());
 
+        if let Some(canonical) = &result.canonical_artifact {
+            println!(
+                "{}",
+                format!(
+                    "  ✓ Canonical: {} (content {}, {} files)\n    {}",
+                    &canonical.artifact_sha256[..12],
+                    &canonical.content_root_sha256[..12],
+                    canonical.file_count,
+                    canonical.output_path
+                )
+                .green()
+            );
+        }
+
         for (i, (vendor, build)) in result.builds.iter().enumerate() {
             println!(
                 "\n{}",
@@ -63,6 +77,22 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
                 )
                 .bold()
             );
+
+            if let Some(derivation) = &build.derivation {
+                println!(
+                    "{}",
+                    format!(
+                        "  ✓ Derived from canonical {}{}",
+                        &derivation.parent_artifact_sha256[..12],
+                        derivation
+                            .manifest_sha256
+                            .as_ref()
+                            .map(|digest| format!(", record {}", &digest[..12]))
+                            .unwrap_or_default()
+                    )
+                    .green()
+                );
+            }
             println!(
                 "{}",
                 format!("  ✓ Compiled {} file(s)", build.files.len()).green()
@@ -153,6 +183,43 @@ pub async fn deislet_bundle(project_dir: &Path, minify: bool) -> Result<Bundle> 
              \"vendors\": {{ \"deislet\": {{ \"enabled\": true }} }}"
         )
     })?;
+
+    // Deployment is a new trust boundary. Recompute both the canonical parent
+    // and the provider payload lineage here rather than trusting the checks
+    // performed earlier in the build call: a concurrent or manual mutation
+    // between packaging and upload must stop before bytes leave this machine.
+    let canonical = result.canonical_artifact.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the build returned no retained Edge Canon parent, so its provider payload cannot be deployed"
+        )
+    })?;
+    let canonical_summary =
+        deis_build::canonical_artifact::validate(Path::new(&canonical.output_path), None, &[])
+            .context("revalidating the canonical artifact before deployment")?;
+    if canonical_summary.artifact_sha256 != canonical.artifact_sha256
+        || canonical_summary.content_root_sha256 != canonical.content_root_sha256
+    {
+        bail!("the canonical artifact identity changed after the build completed");
+    }
+    let derivation = build.derivation.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("the deislet bundle has no canonical parent derivation record")
+    })?;
+    let derivation_path = derivation.manifest_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("the deislet bundle has no retained provider derivation manifest")
+    })?;
+    let derived = deis_build::provider_derivation::validate(
+        Path::new(derivation_path),
+        Path::new(&build.output_path),
+        Some(DEISLET_VENDOR),
+        Some(&canonical_summary.standard_version),
+        Some(&canonical.artifact_sha256),
+    )
+    .context("revalidating the deislet provider payload before deployment")?;
+    if derivation.manifest_sha256.as_deref() != Some(derived.manifest_sha256.as_str())
+        || derivation.payload_root_sha256.as_deref() != Some(derived.payload_root_sha256.as_str())
+    {
+        bail!("the deislet provider derivation identity changed after the build completed");
+    }
 
     let path = Path::new(&build.output_path).join(deis_build::adapter_deislet::BUNDLE_FILE_NAME);
     read_bundle(&path)

@@ -43,6 +43,7 @@ pub fn generate_with_node_runtime(
     assets: &[StaticAsset],
     node_runtime: bool,
 ) -> anyhow::Result<AdapterArtifacts> {
+    refuse_unplanned_resources(config)?;
     let has_kv = config
         .services
         .as_ref()
@@ -107,6 +108,26 @@ pub fn generate_with_node_runtime(
             javascript_runtime_module(!node_runtime),
         )],
     })
+}
+
+fn refuse_unplanned_resources(config: &ProjectConfig) -> anyhow::Result<()> {
+    let enabled_service = config.services.as_ref().is_some_and(|services| {
+        [
+            services.kv.as_ref(),
+            services.database.as_ref(),
+            services.blob.as_ref(),
+            services.queue.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|service| service.enabled)
+    });
+    if !config.bindings.is_empty() || enabled_service || !config.callable_by.is_empty() {
+        anyhow::bail!(
+            "EC_BINDING_TARGET_UNIMPLEMENTED: the deno adapter requires a resolved standard binding plan"
+        );
+    }
+    Ok(())
 }
 
 fn generate_router_code(
@@ -213,7 +234,7 @@ Deno.serve(async (request: Request): Promise<Response> => {{
 
 {route_handlers}
     // 404 Not Found
-    return new Response('Not Found', {{ status: 404 }});
+    return new Response(null, {{ status: 404 }});
   }} catch (_) {{
     return edgeCanonFailureResponse('EC_PROVIDER_CONTEXT_INVALID');
   }}

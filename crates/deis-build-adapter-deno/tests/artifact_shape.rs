@@ -35,14 +35,14 @@ fn test_entry_point_format() {
 }
 
 #[test]
-fn test_deno_kv_usage() {
+fn unresolved_kv_binding_is_rejected() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", true);
 
-    let result = generate(&routes, &config, &[]).unwrap();
-
-    // Verify Deno.openKv() usage (per spec.mdc)
-    assert!(result.router_code.contains("Deno.openKv()"));
+    let error = generate(&routes, &config, &[]).expect_err("unresolved bindings must fail closed");
+    assert!(error
+        .to_string()
+        .contains("EC_BINDING_TARGET_UNIMPLEMENTED"));
 }
 
 #[test]
@@ -57,24 +57,14 @@ fn test_env_access() {
 }
 
 #[test]
-fn test_kv_adapter_when_enabled() {
+fn callable_resource_without_a_binding_plan_is_rejected() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", true);
 
-    let result = generate(&routes, &config, &[]).unwrap();
-
-    // Verify KV adapter is generated
-    assert!(result.kv_adapter_code.is_some());
-
-    let kv_code = result.kv_adapter_code.unwrap();
-
-    // Verify KV methods match Deno KV API (per spec.mdc)
-    assert!(kv_code.contains("async get(key: string)"));
-    assert!(kv_code.contains("async getJSON"));
-    assert!(kv_code.contains("async put"));
-    assert!(kv_code.contains("async delete"));
-    assert!(kv_code.contains("kv.get([key])")); // Deno KV uses array keys
-    assert!(kv_code.contains("kv.set([key]"));
+    let error = generate(&routes, &config, &[]).expect_err("unresolved bindings must fail closed");
+    assert!(error
+        .to_string()
+        .contains("EC_BINDING_TARGET_UNIMPLEMENTED"));
 }
 
 #[test]

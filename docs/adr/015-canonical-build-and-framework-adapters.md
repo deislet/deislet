@@ -31,24 +31,30 @@ Deislet 提供产品级统一构建生命周期，并维护主流框架的一等
 
 ## 当前实现与缺口
 
-当前仓库已经具备一个有价值但范围较窄的编译器基础：
+`P1-BUILD-001` 已进入实现阶段。当前 compiler 对每次构建先且只先生成一个锁定标准版本的
+`edge-canon.build-output/v1`：清单采用 RFC 8785 JCS + LF，内容表和 manifest 都有独立
+SHA-256 identity，目录按 manifest digest 寻址，经隔离 staging、完整验证和原子 rename 发布。
+产物携带 runtime entrypoint、标准路由/静态资产文档、SBOM、provenance、validation report
+和去除运行时值的 application plan；路径可移植性、额外文件、符号/硬链接、摘要漂移和明显
+secret 均为 fail-closed。
 
-- `deis build` 校验 Edge Canon 项目并生成 deislet/cloudflare/deno/tencent 目标产物；
-- Deislet bundle 有 digest 与共享 manifest reader；
-- Cloudflare/Deno 产物可在本机存在官方工具时做额外验证；
-- provider adapter 能生成入口、router、context builder 与供应商配置；
-- 构建拒绝供应商工具明确判定为无效的产物。
+Cloudflare、Deno、Tencent 与 Deislet packager 只读取已验证 canonical parent。应用源码在
+parent 发布后被改写也不会改变派生产物；每个落盘 provider payload 另有 canonical JSON
+derivation record，绑定标准版本、parent artifact/content root 和 provider 完整文件集。
+`deis deploy` 在读取/上传 bundle 前重新校验 parent、record 和 payload。路由、资产、事件和
+逻辑资源若当前 target 尚无标准语义映射，会在 provider 产物写出前以稳定错误拒绝，不再静默
+丢失或降级。Memory 模式同样经过临时 canonical parent，但不会把临时 identity 当成持久结果。
 
-它还不是本 ADR 所需的构建产品：
+以下仍是完成本 ADR 的明确缺口：
 
-- 没有通用 source checkout、依赖安装、framework build、remote build job 与日志存储生命周期；
-- `deis build --watch` 明确未实现；
-- compiler 直接从 Edge Canon source 生成多个 vendor artifact，缺少独立、稳定的 canonical Build Output 层；
-- 决策时的 `PlatformCapabilities` 根据目标允许或拒绝 Node/SSR/ISR/Stateful Object 等功能，与 DEC-001 的单一合规标准冲突；它已改名为只陈述 Deislet 打包器现状的 `TargetArtifactCoverage`，但按标准版本统一验证和 canonical Build Output 仍待本 ADR 后续实现；
-- Tencent `spec.mdc` 等文档很丰富，但不是可执行、版本化、经 conformance suite 验证的框架适配器；
-- README 仍明确写着无 Node built-ins/npm resolution，因此现状无法承载主流全栈框架；
-- 缺少 framework/version/feature 支持矩阵、monorepo roots、lockfile policy、build cache、SBOM、provenance、secret redaction 与 artifact signing；
-- 当前多 target 输出可能分别成功或失败，尚不能证明它们来自一个语义完全相同的 canonical artifact。
+- provider payload 目前仍写入可变的 `dist/<target>`，虽有完整派生摘要和部署前复核，尚未按自身 identity 不可变发布；
+- canonical semantic document 的 schema 覆盖尚未扩展到 logical resource、environment/secret、queue/cron、SSR/ISR、middleware 与 Stateful Object；未实现 target 目前只能 fail closed；
+- 缺少 artifact signature、受信 builder identity、透明/远端 build job、build log 生命周期和控制面 canonical artifact record 持久化；
+- 没有通用 source checkout、framework build、monorepo root、远端 build cache 和官方 framework adapter；`deis build --watch` 仍明确未实现；
+- npm lock/install 已有严格路径，但 native dependency 的目标平台构建、完整多框架矩阵和 cache reuse 未完成；
+- provider 官方 CLI 检查可缺席并形成 warning；统一 driver API、固定工具版本、账户级 prepare/deploy/verify/activate/rollback 及 deployment identity 尚未实现；
+- Linux 上的 determinism 已有回归，但本实现尚未取得 Linux/macOS/Windows 对同一真实 compiler 产物的 identity 证据；
+- 当前结果只是 artifact generation/integrity 证据，不是 provider compliance 或产品 support 结论；registry 状态不得据此提升。
 
 ## 分层架构
 

@@ -74,6 +74,27 @@ fn manifest_patterns(bundle: &Path) -> Vec<String> {
     parsed.manifest.route_patterns()
 }
 
+fn canonical_patterns(project: &Path) -> Vec<String> {
+    let mut artifacts = std::fs::read_dir(project.join("dist/canonical"))
+        .expect("read the canonical store")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir());
+    let root = artifacts.next().expect("one canonical artifact").path();
+    assert!(
+        artifacts.next().is_none(),
+        "the build has one canonical parent"
+    );
+    let bytes = std::fs::read(root.join("documents/routing-static-assets.json"))
+        .expect("read canonical routing");
+    let routing: deis_build::canonical_routing::RoutingDocument =
+        serde_json::from_slice(&bytes).expect("canonical routing document");
+    routing
+        .functions
+        .into_iter()
+        .map(|route| route.source)
+        .collect()
+}
+
 /// A file whose name reads as pattern syntax answers its own name.
 ///
 /// The catch-all is the dangerous one: unescaped, one file called `*.ts`
@@ -92,12 +113,17 @@ async fn a_name_that_reads_as_a_pattern_is_escaped_and_reported() {
     write_handler(&project.path().join("functions/users/[id].ts"));
 
     let build = build(project.path()).await.expect("this project builds");
-    let mut patterns = manifest_patterns(&project.path().join("dist/deislet/bundle.zip"));
+    let mut patterns = canonical_patterns(project.path());
     patterns.sort();
     assert_eq!(
         patterns,
         vec!["/", "/api/%2A", "/api/health", "/users/%3Aid", "/users/:id",],
         "one route per file, and the placeholder is the one written [id]"
+    );
+    assert_eq!(
+        manifest_patterns(&project.path().join("dist/deislet/bundle.zip")),
+        vec!["/*"],
+        "the provider bundle exposes one transport entry; application routing stays inside the canonical module"
     );
 
     // Nothing was silently dropped as a duplicate, which is what used to

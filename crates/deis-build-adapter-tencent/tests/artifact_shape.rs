@@ -184,22 +184,14 @@ fn context_bridge_avoids_object_spread_syntax() {
 }
 
 #[test]
-fn test_kv_adapter_shape() {
+fn unresolved_kv_binding_is_rejected() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", true);
 
-    let result = generate(&routes, &config, &[]).unwrap();
-
-    assert!(result.kv_adapter_code.is_some());
-
-    let kv_code = result.kv_adapter_code.unwrap();
-
-    // Verify KV adapter uses function keyword (not arrow functions)
-    assert!(kv_code.contains("get: function"));
-    assert!(kv_code.contains("put: function"));
-
-    // Verify .then() chains (not async/await in object methods)
-    assert!(kv_code.contains(".then(function"));
+    let error = generate(&routes, &config, &[]).expect_err("unresolved bindings must fail closed");
+    assert!(error
+        .to_string()
+        .contains("EC_BINDING_TARGET_UNIMPLEMENTED"));
 }
 
 #[test]

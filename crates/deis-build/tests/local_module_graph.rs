@@ -125,22 +125,20 @@ async fn every_bundled_target_carries_helpers_outside_a_nested_function_root() {
 }
 
 #[tokio::test]
-async fn deno_ships_route_proxies_and_the_complete_project_shaped_graph() {
+async fn deno_ships_only_the_canonical_parent_graph() {
     let project = tempfile::tempdir().expect("temporary project");
     stage(project.path(), "deno");
     build(project.path(), "deno")
         .await
         .expect("deno builds the local graph");
     let output = project.path().join("dist/deno");
-    let proxy = fs::read_to_string(output.join("src/index.js")).expect("route proxy");
-    assert!(
-        proxy.contains("../project/web/functions/index.js"),
-        "{proxy}"
-    );
-    assert!(output.join("project/web/functions/index.js").is_file());
-    assert!(output.join("project/shared/entry.js").is_file());
-    assert!(output.join("project/shared/eager.js").is_file());
-    assert!(output.join("project/shared/lazy.js").is_file());
+    let proxy = fs::read_to_string(output.join("src/[[all]].js")).expect("route proxy");
+    assert!(proxy.contains("../project/functions/[[all]].js"), "{proxy}");
+    let canonical_module =
+        fs::read_to_string(output.join("project/functions/[[all]].js")).expect("canonical module");
+    assert_markers(&canonical_module, "deno");
+    assert!(!output.join("project/web/functions/index.js").exists());
+    assert!(!output.join("project/shared").exists());
 }
 
 #[tokio::test]

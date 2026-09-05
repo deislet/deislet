@@ -21,6 +21,10 @@ use rolldown_common::Output;
 /// `Compiler::refuse_specifiers_deno_cannot_resolve` and `deno check`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetPlatform {
+    /// Provider-neutral Edge Canon entry. npm dependencies are folded in;
+    /// selected runtime modules remain exact standard edges.
+    Canonical,
+    CanonicalNode,
     Cloudflare,
     CloudflareNode,
     EdgeOne,
@@ -46,10 +50,12 @@ impl BuildBundler {
         // modes preserve only the standard's validated builtin imports for a
         // provider runtime to implement. Every mode still emits one ESM entry.
         let (platform_opt, format) = match platform {
-            TargetPlatform::Cloudflare | TargetPlatform::EdgeOne | TargetPlatform::Deislet => {
-                (Some(Platform::Browser), Some(OutputFormat::Esm))
-            }
-            TargetPlatform::CloudflareNode
+            TargetPlatform::Canonical
+            | TargetPlatform::Cloudflare
+            | TargetPlatform::EdgeOne
+            | TargetPlatform::Deislet => (Some(Platform::Browser), Some(OutputFormat::Esm)),
+            TargetPlatform::CanonicalNode
+            | TargetPlatform::CloudflareNode
             | TargetPlatform::EdgeOneNode
             | TargetPlatform::DenoNode
             | TargetPlatform::DeisletNode => (Some(Platform::Browser), Some(OutputFormat::Esm)),
@@ -57,7 +63,8 @@ impl BuildBundler {
 
         let node_target = matches!(
             platform,
-            TargetPlatform::CloudflareNode
+            TargetPlatform::CanonicalNode
+                | TargetPlatform::CloudflareNode
                 | TargetPlatform::EdgeOneNode
                 | TargetPlatform::DenoNode
                 | TargetPlatform::DeisletNode
@@ -424,6 +431,7 @@ mod tests {
         .expect("entry module");
 
         for platform in [
+            TargetPlatform::CanonicalNode,
             TargetPlatform::CloudflareNode,
             TargetPlatform::EdgeOneNode,
             TargetPlatform::DenoNode,

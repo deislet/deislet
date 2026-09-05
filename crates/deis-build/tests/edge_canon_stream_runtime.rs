@@ -179,7 +179,9 @@ async fn exact_provider_fixture_builds_for_every_target_and_runs_on_deislet() {
         dist.join("cloudflare/index.js"),
         dist.join("tencent/edge-functions/index.js"),
         dist.join("deno/_deis_internal/router.ts"),
-        dist.join("deno/project/functions/[[path]].mjs"),
+        // Deno receives the reconstructed canonical entry, not the original
+        // provider fixture/source tree through a second build path.
+        dist.join("deno/project/functions/[[all]].js"),
         dist.join("deislet/bundle.zip"),
     ] {
         assert!(path.is_file(), "missing deployable {}", path.display());
