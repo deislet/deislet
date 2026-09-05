@@ -163,6 +163,13 @@ pub fn secret_aad(env_id: &str, name: &str) -> Vec<u8> {
     format!("{env_id}\u{1f}{name}").into_bytes()
 }
 
+/// Associated data for an immutable revision. Including the revision stops a
+/// valid ciphertext from being substituted into another revision row of the
+/// same environment and name.
+pub fn secret_revision_aad(env_id: &str, name: &str, revision: &str) -> Vec<u8> {
+    format!("{env_id}\u{1f}{name}\u{1f}{revision}").into_bytes()
+}
+
 /// Whether this process can serve secret endpoints at all.
 ///
 /// Held as a single value in the API state so a missing key produces one

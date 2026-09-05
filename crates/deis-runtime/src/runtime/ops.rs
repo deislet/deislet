@@ -782,14 +782,36 @@ pub fn subrequest_allowance(state: &OpState, scope: u32) -> Option<Rc<Subrequest
 
 // Environment variables store
 pub type EnvStore = Rc<RefCell<HashMap<String, String>>>;
+pub type StandardEnvStore =
+    Rc<RefCell<Option<std::collections::BTreeMap<String, serde_json::Value>>>>;
 
 /// Internal op: get environment variables
 #[op2]
 #[serde]
-fn op_deis_get_env(state: &mut OpState) -> HashMap<String, String> {
+fn op_deis_get_env(state: &mut OpState) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let standard = state
+        .try_borrow::<StandardEnvStore>()
+        .and_then(|store| store.borrow().clone());
+    if let Some(standard) = standard {
+        return standard;
+    }
     let env_store = state.borrow::<EnvStore>().clone();
-    let map = env_store.borrow().clone();
-    map
+    let environment = env_store
+        .borrow()
+        .iter()
+        .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+        .collect();
+    environment
+}
+
+/// Whether this isolate was built from the standard declaration/snapshot
+/// path. The bootstrap uses the answer to keep legacy convenience bindings
+/// out of the standard declared-only namespace.
+#[op2(fast)]
+fn op_deis_environment_is_standard(state: &mut OpState) -> bool {
+    state
+        .try_borrow::<StandardEnvStore>()
+        .is_some_and(|store| store.borrow().is_some())
 }
 
 // Define extension
@@ -805,7 +827,8 @@ extension!(
         op_set_response,
         op_deis_take_request_body,
         op_deis_set_response_body,
-        op_deis_get_env
+        op_deis_get_env,
+        op_deis_environment_is_standard
     ],
 );
 

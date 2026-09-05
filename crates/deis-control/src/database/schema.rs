@@ -468,6 +468,196 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Edge Canon environment secrets are immutable revisions selected by a
+    // per-environment head. The legacy `secrets` table above is retained only
+    // as an upgrade source for schema-1 deployments; new writes go to these
+    // tables and never overwrite revision ciphertext.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS secret_revisions (
+            revision_id       TEXT PRIMARY KEY,
+            app_id            TEXT NOT NULL,
+            env_id            TEXT NOT NULL REFERENCES environments(id),
+            name              TEXT NOT NULL,
+            ciphertext        BLOB NOT NULL,
+            encryption_scheme TEXT NOT NULL,
+            created_at        INTEGER NOT NULL,
+            UNIQUE(env_id, name, revision_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_secret_revisions_env_name
+            ON secret_revisions(env_id, name, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS secret_heads (
+            env_id      TEXT NOT NULL REFERENCES environments(id),
+            name        TEXT NOT NULL,
+            revision_id TEXT NOT NULL REFERENCES secret_revisions(revision_id),
+            updated_at  INTEGER NOT NULL,
+            PRIMARY KEY(env_id, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS environment_binding_snapshots (
+            snapshot_id        TEXT PRIMARY KEY,
+            app_id             TEXT NOT NULL,
+            env_id             TEXT NOT NULL REFERENCES environments(id),
+            version_id         TEXT NOT NULL REFERENCES versions(id),
+            declarations_sha256 TEXT NOT NULL,
+            document           TEXT NOT NULL CHECK(json_valid(document)),
+            created_at         INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_environment_snapshots_env_version
+            ON environment_binding_snapshots(env_id, version_id, created_at DESC);
+        "#,
+    )?;
+    ensure_deployment_snapshot_column(conn)?;
+
+    // Existing ciphertext was authenticated against (env_id, name). Give it
+    // an immutable revision without decrypting it during schema migration;
+    // the recorded scheme tells the delivery boundary which AAD to use.
+    conn.execute(
+        r#"
+        INSERT OR IGNORE INTO secret_revisions
+            (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
+        SELECT id, app_id, env_id, name, ciphertext, 'legacy-name-v1', updated_at
+          FROM secrets
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        INSERT OR IGNORE INTO secret_heads (env_id, name, revision_id, updated_at)
+        SELECT env_id, name, id, updated_at FROM secrets
+        "#,
+        [],
+    )?;
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS trg_secret_revisions_owner_insert_v1
+        BEFORE INSERT ON secret_revisions
+        WHEN NOT EXISTS (
+            SELECT 1 FROM environments
+             WHERE id = NEW.env_id AND app_id = NEW.app_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'secret revision environment does not belong to application');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_secret_revisions_immutable_v1
+        BEFORE UPDATE ON secret_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'secret revision is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_secret_heads_revision_insert_v1
+        BEFORE INSERT ON secret_heads
+        WHEN NOT EXISTS (
+            SELECT 1 FROM secret_revisions
+             WHERE revision_id = NEW.revision_id
+               AND env_id = NEW.env_id
+               AND name = NEW.name
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'secret head revision belongs to another binding');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_secret_heads_revision_update_v1
+        BEFORE UPDATE ON secret_heads
+        WHEN NEW.env_id != OLD.env_id
+          OR NEW.name != OLD.name
+          OR NOT EXISTS (
+              SELECT 1 FROM secret_revisions
+               WHERE revision_id = NEW.revision_id
+                 AND env_id = NEW.env_id
+                 AND name = NEW.name
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'secret head revision belongs to another binding');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_environment_snapshots_owner_insert_v1
+        BEFORE INSERT ON environment_binding_snapshots
+        WHEN NOT EXISTS (
+            SELECT 1 FROM environments
+             WHERE id = NEW.env_id AND app_id = NEW.app_id
+        ) OR NOT EXISTS (
+            SELECT 1 FROM versions
+             WHERE id = NEW.version_id AND app_id = NEW.app_id
+        ) OR json_extract(NEW.document, '$.deploymentVersionId') IS NOT NEW.version_id
+           OR json_extract(NEW.document, '$.environmentId') IS NOT (
+               SELECT canonical_id FROM environments WHERE id = NEW.env_id
+           )
+           OR json_extract(NEW.document, '$.declarationsSha256') IS NOT NEW.declarations_sha256
+        BEGIN
+            SELECT RAISE(ABORT, 'environment snapshot ownership or document identity mismatch');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_environment_snapshots_immutable_v1
+        BEFORE UPDATE ON environment_binding_snapshots
+        BEGIN
+            SELECT RAISE(ABORT, 'environment snapshot is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_deployments_snapshot_insert_v1
+        BEFORE INSERT ON deployments
+        WHEN NEW.snapshot_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM environment_binding_snapshots
+             WHERE snapshot_id = NEW.snapshot_id
+               AND app_id = NEW.app_id
+               AND env_id = NEW.env_id
+               AND version_id = NEW.version_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'deployment snapshot belongs to another deployment target');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_deployments_snapshot_update_v1
+        BEFORE UPDATE OF snapshot_id ON deployments
+        WHEN NEW.snapshot_id IS NOT OLD.snapshot_id
+        BEGIN
+            SELECT RAISE(ABORT, 'deployment snapshot selection is immutable');
+        END;
+
+        -- A rolling-upgrade peer may still write the legacy table. Mirror
+        -- each such write into an immutable revision/head so new processes
+        -- never serve stale secret state while the fleet is mixed-version.
+        CREATE TRIGGER IF NOT EXISTS trg_legacy_secret_insert_revision_v1
+        AFTER INSERT ON secrets
+        BEGIN
+            INSERT OR IGNORE INTO secret_revisions
+                (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
+            VALUES
+                (NEW.id, NEW.app_id, NEW.env_id, NEW.name, NEW.ciphertext, 'legacy-name-v1', NEW.updated_at);
+            INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
+            VALUES (NEW.env_id, NEW.name, NEW.id, NEW.updated_at)
+            ON CONFLICT(env_id, name) DO UPDATE SET
+                revision_id = excluded.revision_id,
+                updated_at = excluded.updated_at;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_legacy_secret_update_revision_v1
+        AFTER UPDATE ON secrets
+        BEGIN
+            INSERT OR IGNORE INTO secret_revisions
+                (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
+            VALUES
+                (NEW.id, NEW.app_id, NEW.env_id, NEW.name, NEW.ciphertext, 'legacy-name-v1', NEW.updated_at);
+            INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
+            VALUES (NEW.env_id, NEW.name, NEW.id, NEW.updated_at)
+            ON CONFLICT(env_id, name) DO UPDATE SET
+                revision_id = excluded.revision_id,
+                updated_at = excluded.updated_at;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_legacy_secret_delete_head_v1
+        AFTER DELETE ON secrets
+        BEGIN
+            DELETE FROM secret_heads
+             WHERE env_id = OLD.env_id
+               AND name = OLD.name
+               AND revision_id = OLD.id;
+        END;
+        "#,
+    )?;
+
     // ------------------------------------------------------------------
     // Who may call this API, and what everybody did.
     //
@@ -577,6 +767,22 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     ensure_product_operation_schema(conn)?;
 
     info!("Database tables created successfully");
+    Ok(())
+}
+
+fn ensure_deployment_snapshot_column(conn: &Connection) -> Result<()> {
+    let has_snapshot = conn
+        .prepare("PRAGMA table_info(deployments)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "snapshot_id");
+    if !has_snapshot {
+        conn.execute(
+            "ALTER TABLE deployments ADD COLUMN snapshot_id TEXT REFERENCES environment_binding_snapshots(snapshot_id)",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -971,7 +1177,7 @@ fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
 
-    // These five tables are the complete input to the catalog inventory:
+    // These catalog tables are the complete input to the catalog inventory:
     // environments name tenants, versions declare bindings, deployments say
     // which declaration is live, routes must move in the same cutover, and
     // secret names are logical bindings even though their values stay sealed.
@@ -984,6 +1190,13 @@ fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
         ("deployments", "NEW.app_id", "OLD.app_id"),
         ("routes", "NEW.app_id", "OLD.app_id"),
         ("secrets", "NEW.app_id", "OLD.app_id"),
+        ("secret_revisions", "NEW.app_id", "OLD.app_id"),
+        (
+            "secret_heads",
+            "(SELECT app_id FROM environments WHERE id = NEW.env_id)",
+            "(SELECT app_id FROM environments WHERE id = OLD.env_id)",
+        ),
+        ("environment_binding_snapshots", "NEW.app_id", "OLD.app_id"),
     ] {
         conn.execute_batch(&format!(
             r#"
@@ -2097,6 +2310,117 @@ fn drop_power_reserve(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use rusqlite::OptionalExtension;
+
+    #[test]
+    fn legacy_secret_rows_are_migrated_to_immutable_revisions_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute("INSERT INTO apps (id, created_at) VALUES ('demo', 1)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO environments (id, app_id, name, created_at)
+             VALUES ('env-legacy', 'demo', 'production', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO secrets (id, app_id, env_id, name, ciphertext, updated_at)
+             VALUES ('secret-legacy', 'demo', 'env-legacy', 'TOKEN', X'010203', 2)",
+            [],
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+        create_tables(&conn).unwrap();
+
+        let revision: (String, String, Vec<u8>) = conn
+            .query_row(
+                "SELECT revision_id, encryption_scheme, ciphertext
+                   FROM secret_revisions WHERE env_id = 'env-legacy' AND name = 'TOKEN'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(revision.0, "secret-legacy");
+        assert_eq!(revision.1, "legacy-name-v1");
+        assert_eq!(revision.2, vec![1, 2, 3]);
+        let head: String = conn
+            .query_row(
+                "SELECT revision_id FROM secret_heads
+                  WHERE env_id = 'env-legacy' AND name = 'TOKEN'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(head, "secret-legacy");
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM secret_revisions WHERE revision_id = 'secret-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "restart duplicated a migrated revision");
+    }
+
+    #[test]
+    fn rolling_upgrade_legacy_secret_writes_update_the_revision_head() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute("INSERT INTO apps (id, created_at) VALUES ('demo', 1)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO environments (id, app_id, name, created_at)
+             VALUES ('env-legacy', 'demo', 'production', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO secrets (id, app_id, env_id, name, ciphertext, updated_at)
+             VALUES ('legacy-1', 'demo', 'env-legacy', 'TOKEN', X'01', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO secrets (id, app_id, env_id, name, ciphertext, updated_at)
+             VALUES ('legacy-2', 'demo', 'env-legacy', 'TOKEN', X'02', 3)
+             ON CONFLICT(env_id, name) DO UPDATE SET
+                 id = excluded.id,
+                 ciphertext = excluded.ciphertext,
+                 updated_at = excluded.updated_at",
+            [],
+        )
+        .unwrap();
+
+        let head: String = conn
+            .query_row(
+                "SELECT revision_id FROM secret_heads
+                  WHERE env_id = 'env-legacy' AND name = 'TOKEN'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(head, "legacy-2");
+        let retained: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM secret_revisions
+                  WHERE revision_id IN ('legacy-1', 'legacy-2')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 2, "legacy rotation overwrote history");
+
+        conn.execute(
+            "DELETE FROM secrets WHERE env_id = 'env-legacy' AND name = 'TOKEN'",
+            [],
+        )
+        .unwrap();
+        let heads: i64 = conn
+            .query_row("SELECT count(*) FROM secret_heads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(heads, 0);
+    }
 
     #[test]
     fn legacy_single_migration_table_becomes_append_only_terminal_history() {

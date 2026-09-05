@@ -184,6 +184,18 @@ message ApplyDeploymentRequest {
     // name in field 3 remains what application code sees and what rolling
     // upgrade routing uses; it is no longer the future storage authority.
     string canonical_environment_id = 10;
+
+    // Exact Edge Canon declaration and version-bound binding snapshot. JSON is
+    // RFC 8785 canonical UTF-8. Both are present together for schema-2 native
+    // bundles and absent together only on legacy schema-1 deployments.
+    string environment_declarations_json = 11;
+    string environment_snapshot_json = 12;
+    string environment_snapshot_id = 13;
+
+    // Plaintext secret values keyed by the opaque revision ids named in the
+    // snapshot. Names and config values remain in the canonical snapshot;
+    // this map is the only secret-bearing addition and must never be logged.
+    map<string, string> secret_values_by_revision = 14;
 }
 
 // A version's compatibility declaration, exactly as its manifest spells it.

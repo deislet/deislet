@@ -198,15 +198,18 @@ they disagree.
 ```bash
 deis secret set API_KEY                    # value read from stdin
 printf %s "$VALUE" | deis secret set API_KEY
-deis secret set API_KEY value -e preview
+printf %s "$PREVIEW_VALUE" | deis secret set API_KEY -e preview
 deis secret list
 deis secret rm API_KEY
 ```
 
-`list` shows names and times. There is no command that prints a value — the
+`set` refuses an echoing terminal and has no positional value form, keeping
+plaintext out of shell history and process listings. `list` shows names,
+immutable revisions and times. There is no command that prints a value — the
 control plane has no endpoint that returns one. A secret is not part of the
-bundle, so changing one creates no version; the running one is delivered
-again with the new value, and where that landed is printed.
+bundle, so changing one creates no application version; the running version
+is delivered again with a new environment snapshot, and where that landed is
+printed.
 
 ### `deis logs` and `deis tail`
 

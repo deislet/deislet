@@ -73,6 +73,7 @@ async fn the_record_survives_being_written_and_read_back() {
         environment: "production".into(),
         canonical_environment_id: None,
         bundle_sha: "abc123".into(),
+        environment_snapshot_id: None,
     };
 
     store.remember(record.clone()).await;
@@ -89,6 +90,7 @@ async fn canonical_identity_survives_the_installed_record() {
         environment: "production".into(),
         canonical_environment_id: Some("018f2518-7e38-7f80-8000-000000000002".parse().unwrap()),
         bundle_sha: "abc123".into(),
+        environment_snapshot_id: Some("snapshot-1".into()),
     };
 
     store.remember(record.clone()).await;
@@ -134,6 +136,7 @@ async fn canonical_identity_can_be_learned_but_never_reassigned_or_erased() {
             environment: "production".into(),
             canonical_environment_id: Some(environment),
             bundle_sha: "abc123".into(),
+            environment_snapshot_id: None,
         })
         .await;
 
@@ -169,6 +172,7 @@ async fn a_second_version_of_an_app_replaces_its_line_rather_than_adding_one() {
                 environment: "production".into(),
                 canonical_environment_id: None,
                 bundle_sha: "sha".into(),
+                environment_snapshot_id: None,
             })
             .await;
     }
@@ -195,6 +199,7 @@ async fn forgetting_an_app_removes_its_bundles_and_its_line() {
             environment: "production".into(),
             canonical_environment_id: None,
             bundle_sha: "sha".into(),
+            environment_snapshot_id: None,
         })
         .await;
 

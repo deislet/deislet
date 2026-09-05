@@ -351,6 +351,10 @@ async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_an
             }),
             canonical_application_id: String::new(),
             canonical_environment_id: String::new(),
+            environment_declarations_json: String::new(),
+            environment_snapshot_json: String::new(),
+            environment_snapshot_id: String::new(),
+            secret_values_by_revision: Default::default(),
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -403,6 +407,10 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_i
             }),
             canonical_application_id: String::new(),
             canonical_environment_id: String::new(),
+            environment_declarations_json: String::new(),
+            environment_snapshot_json: String::new(),
+            environment_snapshot_id: String::new(),
+            secret_values_by_revision: Default::default(),
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -446,6 +454,10 @@ async fn a_partial_canonical_identity_is_refused_before_the_bundle_is_fetched() 
             compatibility: None,
             canonical_application_id: "018f2518-7e38-7f80-8000-000000000001".to_string(),
             canonical_environment_id: String::new(),
+            environment_declarations_json: String::new(),
+            environment_snapshot_json: String::new(),
+            environment_snapshot_id: String::new(),
+            secret_values_by_revision: Default::default(),
         }))
         .await
         .unwrap()

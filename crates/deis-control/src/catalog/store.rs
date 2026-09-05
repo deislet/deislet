@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use deis_wire::EnvironmentBindingSnapshot;
 use deis_wire::{CanonicalId, CanonicalIdError};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use tracing::{debug, error, info, warn};
@@ -36,10 +37,29 @@ const APP_COLUMNS: &str = "id, canonical_id, revision, created_at";
 const VERSION_COLUMNS: &str =
     "id, canonical_id, app_id, number, bundle_sha, bundle_path, manifest, created_at";
 const ENVIRONMENT_COLUMNS: &str = "id, canonical_id, app_id, name, created_at";
-const DEPLOYMENT_COLUMNS: &str = "id, canonical_id, app_id, env_id, version_id, created_at, note";
+const DEPLOYMENT_COLUMNS: &str =
+    "id, canonical_id, app_id, env_id, version_id, created_at, note, snapshot_id";
 const ROUTE_COLUMNS: &str = "id, app_id, env_id, host, path_prefix, priority";
 const RETIRED_NAME_COLUMNS: &str = "app_id, retired_at, environments, released_at";
 const DOMAIN_GRANT_COLUMNS: &str = "pattern, app_id, environment, created_at, note";
+
+/// One compare-and-swap update to a secret head, committed with the new
+/// deployment snapshot that references it.
+pub struct SecretHeadChange<'a> {
+    pub name: &'a str,
+    pub replacement_revision: Option<&'a str>,
+    pub expected_revision: Option<&'a str>,
+}
+
+struct DeploymentActivation<'a> {
+    env: &'a Environment,
+    version_id: &'a str,
+    snapshot: &'a EnvironmentBindingSnapshot,
+    expected_current_deployment: Option<&'a str>,
+    expected_secret_heads: Option<std::collections::BTreeMap<String, Option<String>>>,
+    note: Option<String>,
+    secret_change: Option<(String, Option<String>, Option<String>)>,
+}
 
 /// Ordering that defines "the current deployment of an environment".
 ///
@@ -103,6 +123,15 @@ pub struct UndescribableEnvironment {
 
 pub struct CatalogStore {
     db: Arc<Database>,
+}
+
+/// One encrypted immutable secret revision selected by the current head.
+/// Ciphertext is intentionally not serializable or printable.
+pub struct SecretCiphertext {
+    pub name: String,
+    pub revision: String,
+    pub encryption_scheme: String,
+    pub ciphertext: Vec<u8>,
 }
 
 impl CatalogStore {
@@ -251,11 +280,16 @@ impl CatalogStore {
                 };
 
                 // Children first: the foreign keys are enforced.
-                let secrets =
-                    tx.execute("DELETE FROM secrets WHERE app_id = ?1", params![app_id])?;
+                let secrets = tx.execute(
+                    "DELETE FROM secret_heads WHERE env_id IN (SELECT id FROM environments WHERE app_id = ?1)",
+                    params![app_id],
+                )?;
+                tx.execute("DELETE FROM secrets WHERE app_id = ?1", params![app_id])?;
                 let routes = tx.execute("DELETE FROM routes WHERE app_id = ?1", params![app_id])?;
                 let deployments =
                     tx.execute("DELETE FROM deployments WHERE app_id = ?1", params![app_id])?;
+                tx.execute("DELETE FROM environment_binding_snapshots WHERE app_id = ?1", params![app_id])?;
+                tx.execute("DELETE FROM secret_revisions WHERE app_id = ?1", params![app_id])?;
                 let environments = tx.execute(
                     "DELETE FROM environments WHERE app_id = ?1",
                     params![app_id],
@@ -779,10 +813,11 @@ impl CatalogStore {
                     version_id: version.id,
                     created_at: now_secs(),
                     note,
+                    snapshot_id: None,
                 };
                 conn.execute(
                     &format!(
-                        "INSERT INTO deployments ({DEPLOYMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                        "INSERT INTO deployments ({DEPLOYMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
                     ),
                     params![
                         deployment.id,
@@ -792,6 +827,7 @@ impl CatalogStore {
                         deployment.version_id,
                         deployment.created_at,
                         deployment.note,
+                        deployment.snapshot_id,
                     ],
                 )?;
                 Ok(deployment)
@@ -808,6 +844,324 @@ impl CatalogStore {
             "Deployment pointer moved; nodes pick this up on their next assignment fetch"
         );
         Ok(deployment)
+    }
+
+    /// Atomically persist an immutable environment snapshot and move the
+    /// deployment pointer only if the caller prepared against the current
+    /// pointer it names. A competing deploy wins once; the loser must reread
+    /// and prepare again.
+    pub async fn activate_deployment(
+        &self,
+        env: &Environment,
+        version_id: &str,
+        snapshot: &EnvironmentBindingSnapshot,
+        expected_current_deployment: Option<&str>,
+        expected_secret_heads: &std::collections::BTreeMap<String, Option<String>>,
+        note: Option<String>,
+    ) -> CatalogResult<Deployment> {
+        self.activate_deployment_inner(DeploymentActivation {
+            env,
+            version_id,
+            snapshot,
+            expected_current_deployment,
+            expected_secret_heads: Some(expected_secret_heads.clone()),
+            note,
+            secret_change: None,
+        })
+        .await
+    }
+
+    /// Reactivate a previously committed snapshot. Historical snapshots bind
+    /// immutable secret revisions by design, so rollback does not compare
+    /// them with today's mutable heads.
+    pub async fn reactivate_deployment_snapshot(
+        &self,
+        env: &Environment,
+        version_id: &str,
+        snapshot: &EnvironmentBindingSnapshot,
+        expected_current_deployment: Option<&str>,
+        note: Option<String>,
+    ) -> CatalogResult<Deployment> {
+        self.activate_deployment_inner(DeploymentActivation {
+            env,
+            version_id,
+            snapshot,
+            expected_current_deployment,
+            expected_secret_heads: None,
+            note,
+            secret_change: None,
+        })
+        .await
+    }
+
+    /// Activate a new deployment snapshot and move one secret head in the
+    /// same transaction. This is the rotation/deletion commit point: neither
+    /// the name nor the running snapshot can become visible on its own.
+    pub async fn activate_deployment_with_secret_change(
+        &self,
+        env: &Environment,
+        version_id: &str,
+        snapshot: &EnvironmentBindingSnapshot,
+        expected_current_deployment: Option<&str>,
+        change: SecretHeadChange<'_>,
+        note: Option<String>,
+    ) -> CatalogResult<Deployment> {
+        validate_secret_name(change.name)?;
+        if let Some(revision) = change.replacement_revision {
+            revision.parse::<CanonicalId>().map_err(|_| {
+                CatalogError::invalid("secret revision must be a lowercase UUIDv7 identity")
+            })?;
+        }
+        self.activate_deployment_inner(DeploymentActivation {
+            env,
+            version_id,
+            snapshot,
+            expected_current_deployment,
+            expected_secret_heads: None,
+            note,
+            secret_change: Some((
+                change.name.to_string(),
+                change.replacement_revision.map(str::to_string),
+                change.expected_revision.map(str::to_string),
+            )),
+        })
+        .await
+    }
+
+    async fn activate_deployment_inner(
+        &self,
+        activation: DeploymentActivation<'_>,
+    ) -> CatalogResult<Deployment> {
+        let DeploymentActivation {
+            env,
+            version_id,
+            snapshot,
+            expected_current_deployment,
+            expected_secret_heads,
+            note,
+            secret_change,
+        } = activation;
+        if snapshot.deployment_version_id != version_id
+            || snapshot.environment_id != env.canonical_id.to_string()
+        {
+            return Err(CatalogError::invalid(
+                "EC_ENV_SNAPSHOT_INVALID: snapshot is not bound to this version and environment",
+            ));
+        }
+        let snapshot_id = snapshot
+            .identity()
+            .map_err(|error| CatalogError::invalid(format!("{}", error)))?;
+        let document = String::from_utf8(
+            snapshot
+                .canonical_json()
+                .map_err(|error| CatalogError::invalid(format!("{}", error)))?,
+        )
+        .map_err(|_| CatalogError::invalid("EC_ENV_SNAPSHOT_INVALID: snapshot is not UTF-8"))?;
+        let app_id = env.app_id.clone();
+        let env_id = env.id.clone();
+        let env_name = env.name.clone();
+        let version_id = version_id.to_string();
+        let declarations_sha256 = snapshot.declarations_sha256.clone();
+        let expected = expected_current_deployment.map(str::to_string);
+
+        let deployment = self
+            .with_conn(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let version = load_version(&tx, &app_id, &version_id)?;
+                let current = current_deployment(&tx, &env_id)?;
+                if current.as_ref().map(|row| row.id.as_str()) != expected.as_deref() {
+                    return Err(CatalogError::conflict(
+                        "EC_ENV_ACTIVATION_CONFLICT: deployment changed while the environment snapshot was prepared; reread and retry",
+                    ));
+                }
+
+                if let Some(expected_heads) = &expected_secret_heads {
+                    for (name, expected_revision) in expected_heads {
+                        let current_revision: Option<String> = tx
+                            .query_row(
+                                "SELECT revision_id FROM secret_heads WHERE env_id = ?1 AND name = ?2",
+                                params![env_id, name],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        if current_revision.as_deref() != expected_revision.as_deref() {
+                            return Err(CatalogError::conflict(
+                                "EC_ENV_ACTIVATION_CONFLICT: a secret head changed while the environment snapshot was prepared; reread and retry",
+                            ));
+                        }
+                    }
+                }
+
+                if let Some((name, replacement, expected_secret)) = &secret_change {
+                    let current_secret: Option<String> = tx
+                        .query_row(
+                            "SELECT revision_id FROM secret_heads WHERE env_id = ?1 AND name = ?2",
+                            params![env_id, name],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if current_secret.as_deref() != expected_secret.as_deref() {
+                        return Err(CatalogError::conflict(
+                            "EC_ENV_ACTIVATION_CONFLICT: secret head changed while the environment snapshot was prepared; reread and retry",
+                        ));
+                    }
+                    if let Some(revision) = replacement {
+                        let available: i64 = tx.query_row(
+                            "SELECT count(*) FROM secret_revisions
+                              WHERE revision_id = ?1 AND env_id = ?2 AND name = ?3",
+                            params![revision, env_id, name],
+                            |row| row.get(0),
+                        )?;
+                        if available != 1 {
+                            return Err(CatalogError::invalid(
+                                "EC_ENV_SECRET_REVISION_UNAVAILABLE: staged secret revision is unavailable",
+                            ));
+                        }
+                        tx.execute(
+                            "INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
+                             VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT(env_id, name) DO UPDATE SET
+                                 revision_id = excluded.revision_id,
+                                 updated_at = excluded.updated_at",
+                            params![env_id, name, revision, now_secs()],
+                        )?;
+                    } else {
+                        tx.execute(
+                            "DELETE FROM secret_heads WHERE env_id = ?1 AND name = ?2",
+                            params![env_id, name],
+                        )?;
+                    }
+                    tx.execute(
+                        "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
+                        params![env_id, name],
+                    )?;
+                }
+
+                tx.execute(
+                    "INSERT OR IGNORE INTO environment_binding_snapshots
+                         (snapshot_id, app_id, env_id, version_id, declarations_sha256, document, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        snapshot_id,
+                        app_id,
+                        env_id,
+                        version.id,
+                        declarations_sha256,
+                        document,
+                        now_secs(),
+                    ],
+                )?;
+                let existing: String = tx.query_row(
+                    "SELECT document FROM environment_binding_snapshots WHERE snapshot_id = ?1",
+                    params![snapshot_id],
+                    |row| row.get(0),
+                )?;
+                if existing != document {
+                    return Err(CatalogError::conflict(
+                        "EC_ENV_SNAPSHOT_IDENTITY_COLLISION: snapshot identity names different content",
+                    ));
+                }
+
+                let deployment = Deployment {
+                    id: Uuid::new_v4().to_string(),
+                    canonical_id: CanonicalId::new_v7(),
+                    app_id,
+                    env_id,
+                    version_id: version.id,
+                    created_at: now_secs(),
+                    note,
+                    snapshot_id: Some(snapshot_id),
+                };
+                tx.execute(
+                    &format!(
+                        "INSERT INTO deployments ({DEPLOYMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                    ),
+                    params![
+                        deployment.id,
+                        deployment.canonical_id.to_string(),
+                        deployment.app_id,
+                        deployment.env_id,
+                        deployment.version_id,
+                        deployment.created_at,
+                        deployment.note,
+                        deployment.snapshot_id,
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(deployment)
+            })
+            .await?;
+
+        info!(
+            app_id = %deployment.app_id,
+            environment = %env_name,
+            version_id = %deployment.version_id,
+            deployment_id = %deployment.id,
+            snapshot_id = %deployment.snapshot_id.as_deref().unwrap_or(""),
+            "Environment snapshot and deployment pointer activated atomically"
+        );
+        Ok(deployment)
+    }
+
+    pub async fn get_environment_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> CatalogResult<EnvironmentBindingSnapshot> {
+        let snapshot_id = snapshot_id.to_string();
+        self.with_conn(move |conn| {
+            let document: String = conn
+                .query_row(
+                    "SELECT document FROM environment_binding_snapshots WHERE snapshot_id = ?1",
+                    params![snapshot_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CatalogError::not_found(format!("environment snapshot {snapshot_id}"))
+                })?;
+            serde_json::from_str(&document).map_err(|_| {
+                CatalogError::BundleStorage(
+                    "stored environment snapshot is no longer valid JSON".to_string(),
+                )
+            })
+        })
+        .await
+    }
+
+    /// Most recent historical deployment of this version that owns a
+    /// standard snapshot. Rollback reactivates this exact snapshot.
+    pub async fn deployment_snapshot_for_version(
+        &self,
+        env_id: &str,
+        version_id: &str,
+    ) -> CatalogResult<Option<(Deployment, EnvironmentBindingSnapshot)>> {
+        let env_id = env_id.to_string();
+        let version_id = version_id.to_string();
+        self.with_conn(move |conn| {
+            let row: Option<(Deployment, String)> = conn
+                .query_row(
+                    "SELECT d.id, d.canonical_id, d.app_id, d.env_id, d.version_id,
+                                d.created_at, d.note, d.snapshot_id, s.document
+                           FROM deployments d
+                           JOIN environment_binding_snapshots s ON s.snapshot_id = d.snapshot_id
+                          WHERE d.env_id = ?1 AND d.version_id = ?2
+                          ORDER BY d.created_at DESC, d.rowid DESC LIMIT 1",
+                    params![env_id, version_id],
+                    |row| Ok((map_deployment(row)?, row.get(8)?)),
+                )
+                .optional()?;
+            row.map(|(deployment, document)| {
+                serde_json::from_str(&document)
+                    .map(|snapshot| (deployment, snapshot))
+                    .map_err(|_| {
+                        CatalogError::BundleStorage(
+                            "stored environment snapshot is no longer valid JSON".to_string(),
+                        )
+                    })
+            })
+            .transpose()
+        })
+        .await
     }
 
     /// The newest pointer row of an environment, i.e. what it runs now.
@@ -1233,6 +1587,185 @@ impl CatalogStore {
     // Secrets (ciphertext in, ciphertext out)
     // ----------------------------------------------------------------
 
+    /// Persist an immutable encrypted revision without changing the name that
+    /// deployments resolve. A schema-2 secret update stages first, prepares a
+    /// complete snapshot, then promotes both in one transaction.
+    pub async fn stage_secret_revision(
+        &self,
+        env: &Environment,
+        name: &str,
+        revision: &str,
+        ciphertext: Vec<u8>,
+    ) -> CatalogResult<SecretMeta> {
+        validate_secret_name(name)?;
+        revision.parse::<CanonicalId>().map_err(|_| {
+            CatalogError::invalid("secret revision must be a lowercase UUIDv7 identity")
+        })?;
+        let app_id = env.app_id.clone();
+        let env_id = env.id.clone();
+        let name = name.to_string();
+        let revision = revision.to_string();
+        let updated_at = now_secs();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO secret_revisions
+                     (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'revision-v1', ?6)",
+                params![revision, app_id, env_id, name, ciphertext, updated_at],
+            )?;
+            Ok(SecretMeta {
+                name,
+                revision,
+                updated_at,
+            })
+        })
+        .await
+    }
+
+    pub async fn current_secret_revision(
+        &self,
+        env_id: &str,
+        name: &str,
+    ) -> CatalogResult<Option<String>> {
+        let env_id = env_id.to_string();
+        let name = name.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT revision_id FROM secret_heads WHERE env_id = ?1 AND name = ?2",
+                params![env_id, name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    /// Move or remove a secret head without changing a deployment pointer.
+    /// Used when no version is active, the active version is legacy, or the
+    /// standard version does not declare this name.
+    pub async fn promote_secret_change(
+        &self,
+        env: &Environment,
+        name: &str,
+        replacement_revision: Option<&str>,
+        expected_secret_revision: Option<&str>,
+    ) -> CatalogResult<()> {
+        validate_secret_name(name)?;
+        if let Some(revision) = replacement_revision {
+            revision.parse::<CanonicalId>().map_err(|_| {
+                CatalogError::invalid("secret revision must be a lowercase UUIDv7 identity")
+            })?;
+        }
+        let env_id = env.id.clone();
+        let name = name.to_string();
+        let replacement = replacement_revision.map(str::to_string);
+        let expected = expected_secret_revision.map(str::to_string);
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT revision_id FROM secret_heads WHERE env_id = ?1 AND name = ?2",
+                    params![env_id, name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current.as_deref() != expected.as_deref() {
+                return Err(CatalogError::conflict(
+                    "EC_ENV_ACTIVATION_CONFLICT: secret head changed while the update was prepared; reread and retry",
+                ));
+            }
+            if let Some(revision) = &replacement {
+                let available: i64 = tx.query_row(
+                    "SELECT count(*) FROM secret_revisions
+                      WHERE revision_id = ?1 AND env_id = ?2 AND name = ?3",
+                    params![revision, env_id, name],
+                    |row| row.get(0),
+                )?;
+                if available != 1 {
+                    return Err(CatalogError::invalid(
+                        "EC_ENV_SECRET_REVISION_UNAVAILABLE: staged secret revision is unavailable",
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(env_id, name) DO UPDATE SET
+                         revision_id = excluded.revision_id,
+                         updated_at = excluded.updated_at",
+                    params![env_id, name, revision, now_secs()],
+                )?;
+            } else {
+                tx.execute(
+                    "DELETE FROM secret_heads WHERE env_id = ?1 AND name = ?2",
+                    params![env_id, name],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
+                params![env_id, name],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Remove a revision that never reached a head or snapshot. The exact
+    /// reference scan makes cleanup conservative: uncertainty retains
+    /// ciphertext rather than destroying something rollback may need.
+    pub async fn discard_secret_revision_if_unreferenced(
+        &self,
+        env_id: &str,
+        name: &str,
+        revision: &str,
+    ) -> CatalogResult<bool> {
+        let env_id = env_id.to_string();
+        let name = name.to_string();
+        let revision = revision.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let head_refs: i64 = tx.query_row(
+                "SELECT count(*) FROM secret_heads WHERE revision_id = ?1",
+                params![revision],
+                |row| row.get(0),
+            )?;
+            if head_refs != 0 {
+                return Ok(false);
+            }
+            let mut statement = tx.prepare("SELECT document FROM environment_binding_snapshots")?;
+            let documents = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            for document in documents {
+                let snapshot: EnvironmentBindingSnapshot = serde_json::from_str(&document)
+                    .map_err(|_| {
+                        CatalogError::BundleStorage(
+                            "stored environment snapshot is no longer valid JSON".to_string(),
+                        )
+                    })?;
+                if snapshot.bindings.iter().any(|binding| {
+                    matches!(
+                        binding,
+                        deis_wire::EnvironmentBinding::Secret(secret)
+                            if secret.revision == revision
+                    )
+                }) {
+                    return Ok(false);
+                }
+            }
+            let removed = tx.execute(
+                "DELETE FROM secret_revisions
+                  WHERE revision_id = ?1 AND env_id = ?2 AND name = ?3",
+                params![revision, env_id, name],
+            )?;
+            tx.commit()?;
+            Ok(removed == 1)
+        })
+        .await
+    }
+
     /// Store or replace one secret. The caller passes ciphertext produced
     /// by [`super::SecretCipher`]; this layer never sees a plaintext value
     /// and never logs one.
@@ -1251,24 +1784,35 @@ impl CatalogStore {
 
         let meta = self
             .with_conn(move |conn| {
-                let id: String = conn
-                    .query_row(
-                        "SELECT id FROM secrets WHERE env_id = ?1 AND name = ?2",
-                        params![env_id, name_owned],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
-                conn.execute(
+                let tx = conn.unchecked_transaction()?;
+                let id = Uuid::new_v4().to_string();
+                tx.execute(
                     "INSERT INTO secrets (id, app_id, env_id, name, ciphertext, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(env_id, name) DO UPDATE SET
+                         id = excluded.id,
                          ciphertext = excluded.ciphertext,
                          updated_at = excluded.updated_at",
                     params![id, app_id, env_id, name_owned, ciphertext, updated_at],
                 )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO secret_revisions
+                         (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'legacy-name-v1', ?6)",
+                    params![id, app_id, env_id, name_owned, ciphertext, updated_at],
+                )?;
+                tx.execute(
+                    "INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(env_id, name) DO UPDATE SET
+                         revision_id = excluded.revision_id,
+                         updated_at = excluded.updated_at",
+                    params![env_id, name_owned, id, updated_at],
+                )?;
+                tx.commit()?;
                 Ok(SecretMeta {
                     name: name_owned,
+                    revision: id,
                     updated_at,
                 })
             })
@@ -1279,9 +1823,61 @@ impl CatalogStore {
             environment = %env.name,
             secret = %meta.name,
             ciphertext_bytes = bytes,
-            "Secret stored encrypted; the value is not versioned, so it takes effect on the next deployment push without creating a version"
+            "Legacy secret stored encrypted and mirrored into an immutable revision; it takes effect on the next deployment push without creating an application version"
         );
         Ok(meta)
+    }
+
+    /// Append an already-encrypted secret revision and move only the current
+    /// head. The revision row is immutable; rollback snapshots keep referring
+    /// to it after later rotations or deletion of the head.
+    pub async fn put_secret_revision(
+        &self,
+        env: &Environment,
+        name: &str,
+        revision: &str,
+        ciphertext: Vec<u8>,
+    ) -> CatalogResult<SecretMeta> {
+        validate_secret_name(name)?;
+        revision.parse::<CanonicalId>().map_err(|_| {
+            CatalogError::invalid("secret revision must be a lowercase UUIDv7 identity")
+        })?;
+        let app_id = env.app_id.clone();
+        let env_id = env.id.clone();
+        let name = name.to_string();
+        let revision = revision.to_string();
+        let updated_at = now_secs();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO secret_revisions
+                     (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'revision-v1', ?6)",
+                params![revision, app_id, env_id, name, ciphertext, updated_at],
+            )?;
+            tx.execute(
+                "INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(env_id, name) DO UPDATE SET
+                     revision_id = excluded.revision_id,
+                     updated_at = excluded.updated_at",
+                params![env_id, name, revision, updated_at],
+            )?;
+            // Once a name uses revision-bound AAD, remove its legacy current
+            // row so an older process fails closed instead of reading stale
+            // plaintext under the same name.
+            tx.execute(
+                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
+                params![env_id, name],
+            )?;
+            tx.commit()?;
+            Ok(SecretMeta {
+                name,
+                revision,
+                updated_at,
+            })
+        })
+        .await
     }
 
     /// Names and timestamps only. There is deliberately no API that reads
@@ -1290,11 +1886,12 @@ impl CatalogStore {
         let env_id = env_id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare("SELECT name, updated_at FROM secrets WHERE env_id = ?1 ORDER BY name")?;
+                .prepare("SELECT name, revision_id, updated_at FROM secret_heads WHERE env_id = ?1 ORDER BY name")?;
             let rows = stmt.query_map(params![env_id], |row| {
                 Ok(SecretMeta {
                     name: row.get(0)?,
-                    updated_at: row.get(1)?,
+                    revision: row.get(1)?,
+                    updated_at: row.get(2)?,
                 })
             })?;
             let mut secrets = Vec::new();
@@ -1310,8 +1907,9 @@ impl CatalogStore {
         let env_id = env.id.clone();
         let name_owned = name.to_string();
         self.with_conn(move |conn| {
-            let removed = conn.execute(
-                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
+            let tx = conn.unchecked_transaction()?;
+            let removed = tx.execute(
+                "DELETE FROM secret_heads WHERE env_id = ?1 AND name = ?2",
                 params![env_id, name_owned],
             )?;
             if removed == 0 {
@@ -1319,6 +1917,11 @@ impl CatalogStore {
                     "secret {name_owned} in environment {env_id}"
                 )));
             }
+            tx.execute(
+                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
+                params![env_id, name_owned],
+            )?;
+            tx.commit()?;
             Ok(())
         })
         .await?;
@@ -1335,19 +1938,62 @@ impl CatalogStore {
     /// Ciphertexts for one environment, for building the `env` map that
     /// travels with a deployment. Decryption happens at the call site so
     /// plaintext lives as briefly as possible.
-    pub async fn secret_ciphertexts(&self, env_id: &str) -> CatalogResult<Vec<(String, Vec<u8>)>> {
+    pub async fn secret_ciphertexts(&self, env_id: &str) -> CatalogResult<Vec<SecretCiphertext>> {
         let env_id = env_id.to_string();
         self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare("SELECT name, ciphertext FROM secrets WHERE env_id = ?1 ORDER BY name")?;
+            let mut stmt = conn.prepare(
+                "SELECT h.name, h.revision_id, r.encryption_scheme, r.ciphertext
+                       FROM secret_heads h
+                       JOIN secret_revisions r ON r.revision_id = h.revision_id
+                      WHERE h.env_id = ?1 ORDER BY h.name",
+            )?;
             let rows = stmt.query_map(params![env_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                Ok(SecretCiphertext {
+                    name: row.get(0)?,
+                    revision: row.get(1)?,
+                    encryption_scheme: row.get(2)?,
+                    ciphertext: row.get(3)?,
+                })
             })?;
             let mut secrets = Vec::new();
             for row in rows {
                 secrets.push(row?);
             }
             Ok(secrets)
+        })
+        .await
+    }
+
+    pub async fn secret_revision_ciphertext(
+        &self,
+        env_id: &str,
+        name: &str,
+        revision: &str,
+    ) -> CatalogResult<SecretCiphertext> {
+        let env_id = env_id.to_string();
+        let name = name.to_string();
+        let revision = revision.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT name, revision_id, encryption_scheme, ciphertext
+                   FROM secret_revisions
+                  WHERE env_id = ?1 AND name = ?2 AND revision_id = ?3",
+                params![env_id, name, revision],
+                |row| {
+                    Ok(SecretCiphertext {
+                        name: row.get(0)?,
+                        revision: row.get(1)?,
+                        encryption_scheme: row.get(2)?,
+                        ciphertext: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CatalogError::not_found(format!(
+                    "secret revision {revision} for {name} in environment {env_id}"
+                ))
+            })
         })
         .await
     }
@@ -1388,7 +2034,7 @@ impl CatalogStore {
                 // reconciling against this answer should indeed be running
                 // nothing for it.
                 let mut stmt = conn.prepare(
-                    "SELECT e.app_id, e.id, e.name, d.version_id, v.bundle_sha
+                    "SELECT e.app_id, e.id, e.name, d.version_id, v.bundle_sha, d.snapshot_id
                      FROM environments e
                      JOIN deployments d ON d.id = (
                          SELECT inner_d.id FROM deployments inner_d
@@ -1405,13 +2051,15 @@ impl CatalogStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 })?;
 
                 let mut assignments = Vec::new();
                 let mut undescribable = Vec::new();
                 for row in rows {
-                    let (app_id, environment_id, environment, version_id, bundle_sha) = row?;
+                    let (app_id, environment_id, environment, version_id, bundle_sha, snapshot_id) =
+                        row?;
                     match bundle_sha {
                         Some(bundle_sha) => assignments.push(Assignment {
                             app_id,
@@ -1419,6 +2067,7 @@ impl CatalogStore {
                             environment,
                             version_id,
                             bundle_sha,
+                            snapshot_id,
                         }),
                         None => undescribable.push(UndescribableEnvironment {
                             app_id,
@@ -1542,6 +2191,7 @@ fn map_deployment(row: &Row<'_>) -> rusqlite::Result<Deployment> {
         version_id: row.get(4)?,
         created_at: row.get(5)?,
         note: row.get(6)?,
+        snapshot_id: row.get(7)?,
     })
 }
 
@@ -2603,13 +3253,321 @@ mod tests {
         assert_eq!(listed[0].name, "API_KEY");
 
         let stored = store.secret_ciphertexts(&env.id).await.unwrap();
-        assert_eq!(stored[0].1, b"ciphertext-two".to_vec());
+        assert_eq!(stored[0].ciphertext, b"ciphertext-two".to_vec());
 
         assert!(store.put_secret(&env, "bad-name", vec![1]).await.is_err());
 
         store.delete_secret(&env, "API_KEY").await.unwrap();
         assert_eq!(store.list_secrets(&env.id).await.unwrap().len(), 1);
         assert!(store.delete_secret(&env, "API_KEY").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn standard_secret_rotations_are_immutable_and_deletion_only_removes_the_head() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        let first = CanonicalId::new_v7().to_string();
+        let second = CanonicalId::new_v7().to_string();
+
+        store
+            .put_secret_revision(&env, "API_KEY", &first, b"ciphertext-one".to_vec())
+            .await
+            .unwrap();
+        store
+            .put_secret_revision(&env, "API_KEY", &second, b"ciphertext-two".to_vec())
+            .await
+            .unwrap();
+
+        let current = store.secret_ciphertexts(&env.id).await.unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].revision, second);
+        assert_eq!(current[0].ciphertext, b"ciphertext-two");
+        assert_eq!(
+            store
+                .secret_revision_ciphertext(&env.id, "API_KEY", &first)
+                .await
+                .unwrap()
+                .ciphertext,
+            b"ciphertext-one",
+            "rotation overwrote the revision retained by an older snapshot"
+        );
+
+        store.delete_secret(&env, "API_KEY").await.unwrap();
+        assert!(store.secret_ciphertexts(&env.id).await.unwrap().is_empty());
+        assert_eq!(
+            store
+                .secret_revision_ciphertext(&env.id, "API_KEY", &second)
+                .await
+                .unwrap()
+                .ciphertext,
+            b"ciphertext-two",
+            "deleting the current name destroyed a historical revision"
+        );
+    }
+
+    fn snapshot(
+        version_id: &str,
+        environment_id: &str,
+        declarations: &deis_wire::EnvironmentDeclarations,
+        secret_revision: Option<&str>,
+    ) -> deis_wire::EnvironmentBindingSnapshot {
+        let bindings = secret_revision
+            .map(|revision| {
+                vec![deis_wire::EnvironmentBinding::Secret(
+                    deis_wire::EnvironmentSecretBinding::new("TOKEN", revision),
+                )]
+            })
+            .unwrap_or_default();
+        deis_wire::EnvironmentBindingSnapshot::new(
+            declarations.standard_version.clone(),
+            version_id,
+            environment_id,
+            declarations.identity().unwrap(),
+            bindings,
+        )
+    }
+
+    #[tokio::test]
+    async fn standard_snapshot_activation_is_compare_and_swap() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        let version = version(&store, "demo", "sha-1").await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            Vec::new(),
+        );
+        let snapshot = snapshot(
+            &version.id,
+            &env.canonical_id.to_string(),
+            &declarations,
+            None,
+        );
+
+        let winner = store
+            .activate_deployment(
+                &env,
+                &version.id,
+                &snapshot,
+                None,
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let loser = store
+            .activate_deployment(
+                &env,
+                &version.id,
+                &snapshot,
+                None,
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(loser.to_string().contains("EC_ENV_ACTIVATION_CONFLICT"));
+        assert_eq!(
+            store.current_deployment(&env.id).await.unwrap().unwrap().id,
+            winner.id,
+            "a stale activation moved the pointer after losing compare-and-swap"
+        );
+        assert_eq!(store.list_deployments(&env.id, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_snapshot_activation_detects_a_concurrent_secret_head_change() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        let version = version(&store, "demo", "sha-1").await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "TOKEN".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: false,
+            }],
+        );
+        let prepared_without_secret = snapshot(
+            &version.id,
+            &env.canonical_id.to_string(),
+            &declarations,
+            None,
+        );
+        let expected_heads = std::collections::BTreeMap::from([("TOKEN".to_string(), None)]);
+
+        store
+            .put_secret_revision(
+                &env,
+                "TOKEN",
+                &CanonicalId::new_v7().to_string(),
+                b"new".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let error = store
+            .activate_deployment(
+                &env,
+                &version.id,
+                &prepared_without_secret,
+                None,
+                &expected_heads,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("EC_ENV_ACTIVATION_CONFLICT"));
+        assert!(store.current_deployment(&env.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn losing_secret_activation_keeps_the_winner_and_discards_staging() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        let version = version(&store, "demo", "sha-1").await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "TOKEN".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        );
+        let original = CanonicalId::new_v7().to_string();
+        let staged = CanonicalId::new_v7().to_string();
+        let winner = CanonicalId::new_v7().to_string();
+        store
+            .put_secret_revision(&env, "TOKEN", &original, b"old".to_vec())
+            .await
+            .unwrap();
+        let initial_snapshot = snapshot(
+            &version.id,
+            &env.canonical_id.to_string(),
+            &declarations,
+            Some(&original),
+        );
+        let deployment = store
+            .activate_deployment(
+                &env,
+                &version.id,
+                &initial_snapshot,
+                None,
+                &std::collections::BTreeMap::from([("TOKEN".to_string(), Some(original.clone()))]),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .stage_secret_revision(&env, "TOKEN", &staged, b"staged".to_vec())
+            .await
+            .unwrap();
+        store
+            .put_secret_revision(&env, "TOKEN", &winner, b"winner".to_vec())
+            .await
+            .unwrap();
+        let losing_snapshot = snapshot(
+            &version.id,
+            &env.canonical_id.to_string(),
+            &declarations,
+            Some(&staged),
+        );
+
+        let error = store
+            .activate_deployment_with_secret_change(
+                &env,
+                &version.id,
+                &losing_snapshot,
+                Some(&deployment.id),
+                SecretHeadChange {
+                    name: "TOKEN",
+                    replacement_revision: Some(&staged),
+                    expected_revision: Some(&original),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("EC_ENV_ACTIVATION_CONFLICT"));
+        assert_eq!(
+            store
+                .current_secret_revision(&env.id, "TOKEN")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(winner.as_str())
+        );
+        assert_eq!(
+            store.current_deployment(&env.id).await.unwrap().unwrap().id,
+            deployment.id
+        );
+        assert!(
+            store
+                .discard_secret_revision_if_unreferenced(&env.id, "TOKEN", &staged)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .secret_revision_ciphertext(&env.id, "TOKEN", &staged)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_lookup_returns_the_exact_historical_snapshot() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        let v1 = version(&store, "demo", "sha-1").await;
+        let v2 = version(&store, "demo", "sha-2").await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "TOKEN".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        );
+        let revision_one = CanonicalId::new_v7().to_string();
+        let revision_two = CanonicalId::new_v7().to_string();
+        let first = snapshot(
+            &v1.id,
+            &env.canonical_id.to_string(),
+            &declarations,
+            Some(&revision_one),
+        );
+        let first_deployment = store
+            .activate_deployment(&env, &v1.id, &first, None, &Default::default(), None)
+            .await
+            .unwrap();
+        let second = snapshot(
+            &v2.id,
+            &env.canonical_id.to_string(),
+            &declarations,
+            Some(&revision_two),
+        );
+        store
+            .activate_deployment(
+                &env,
+                &v2.id,
+                &second,
+                Some(&first_deployment.id),
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_, restored) = store
+            .deployment_snapshot_for_version(&env.id, &v1.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored, first);
+        assert_ne!(restored, second);
     }
 
     #[tokio::test]
@@ -2628,11 +3586,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.secret_ciphertexts(&production.id).await.unwrap()[0].1,
+            store.secret_ciphertexts(&production.id).await.unwrap()[0].ciphertext,
             b"prod".to_vec()
         );
         assert_eq!(
-            store.secret_ciphertexts(&preview.id).await.unwrap()[0].1,
+            store.secret_ciphertexts(&preview.id).await.unwrap()[0].ciphertext,
             b"preview".to_vec()
         );
     }
@@ -2650,6 +3608,15 @@ mod tests {
             .put_secret(&env, "API_KEY", b"ciphertext".to_vec())
             .await
             .unwrap();
+        store
+            .put_secret_revision(
+                &env,
+                "TOKEN",
+                &CanonicalId::new_v7().to_string(),
+                b"revision-ciphertext".to_vec(),
+            )
+            .await
+            .unwrap();
 
         // A second app must survive untouched.
         let other = app_with_env(&store, "keeper", "production").await;
@@ -2661,7 +3628,7 @@ mod tests {
         assert_eq!(removed.environments, 1);
         assert_eq!(removed.deployments, 1);
         assert_eq!(removed.routes, 1);
-        assert_eq!(removed.secrets, 1);
+        assert_eq!(removed.secrets, 2);
         assert_eq!(removed.bundle_paths.len(), 2);
 
         assert!(store.get_app("demo").await.is_err());

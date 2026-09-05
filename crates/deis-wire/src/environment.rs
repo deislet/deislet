@@ -19,6 +19,11 @@ pub const ENVIRONMENT_BINDING_SNAPSHOT_SCHEMA: &str =
     "https://github.com/deislet/edge-canon/schemas/environment-binding-snapshot.schema.json";
 pub const ENVIRONMENT_BINDING_COUNT_LIMIT: usize = 64;
 pub const ENVIRONMENT_VALUE_BYTES_LIMIT: usize = 5_120;
+/// The exact Edge Canon revision this product build implements. Documents
+/// naming another syntactically valid commit are future input, not a request
+/// to guess compatible behavior.
+pub const CURRENT_EDGE_CANON_STANDARD_VERSION: &str =
+    "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentError {
@@ -128,8 +133,12 @@ impl EnvironmentDeclarations {
 
     /// SHA-256 of RFC 8785 canonical UTF-8 bytes, without a presentation LF.
     pub fn identity(&self) -> EnvironmentResult<String> {
-        let bytes = canonical_bytes(self)?;
+        let bytes = self.canonical_json()?;
         Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
+    pub fn canonical_json(&self) -> EnvironmentResult<Vec<u8>> {
+        canonical_bytes(self)
     }
 
     pub fn by_name(&self) -> BTreeMap<&str, &EnvironmentDeclaration> {
@@ -348,8 +357,12 @@ impl EnvironmentBindingSnapshot {
     }
 
     pub fn identity(&self) -> EnvironmentResult<String> {
-        let bytes = canonical_bytes(self)?;
+        let bytes = self.canonical_json()?;
         Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
+    pub fn canonical_json(&self) -> EnvironmentResult<Vec<u8>> {
+        canonical_bytes(self)
     }
 }
 
@@ -714,6 +727,19 @@ mod tests {
         assert_eq!(
             validate_secret_value(&(exact + "x")).unwrap_err().code(),
             "EC_ENV_VALUE_LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn compiled_standard_pin_matches_the_repository_lock() {
+        let lock: serde_json::Value =
+            serde_json::from_str(include_str!("../../../standards/edge-canon.lock.json")).unwrap();
+        let contract = lock["standard"]["contractId"].as_str().unwrap();
+        let commit = lock["source"]["sourceCommit"].as_str().unwrap();
+        assert_eq!(
+            CURRENT_EDGE_CANON_STANDARD_VERSION,
+            format!("{contract}@{commit}"),
+            "the compiled protocol pin drifted from standards/edge-canon.lock.json"
         );
     }
 }

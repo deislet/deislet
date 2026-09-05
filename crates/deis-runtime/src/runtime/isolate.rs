@@ -1020,6 +1020,11 @@ pub struct IsolateSpec {
 
     /// Values visible to the app through `Deno.env` / `ctx.env`.
     pub env: HashMap<String, String>,
+    pub standard_env: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Explicit process.env projection. Production deployment construction
+    /// always supplies this, including `Some(empty)`. Direct legacy callers
+    /// may leave it absent to retain the historical env-derived projection.
+    pub node_process_env: Option<HashMap<String, String>>,
 
     /// Storage authority presented by KV, SQL, blob and queue clients.
     ///
@@ -1165,6 +1170,7 @@ pub struct AppRuntime {
     /// per-invocation resources, so writes cannot reach the deployment config
     /// or the next request through this reused isolate.
     node_process_env: NodeProcessEnvStore,
+    node_process_env_seed: HashMap<String, String>,
     /// How many stretches of application code this isolate has begun or
     /// finished, shared with the isolate's `OpState`.
     ///
@@ -1247,6 +1253,8 @@ impl AppRuntime {
         let IsolateSpec {
             entry_point,
             env,
+            standard_env,
+            node_process_env,
             storage_tenant,
             permissions: permissions_config,
             memory_limit_mb,
@@ -1257,6 +1265,11 @@ impl AppRuntime {
             assets,
             compatibility,
         } = spec;
+        let node_process_env_seed = node_process_env.unwrap_or_else(|| {
+            let mut projection = env.clone();
+            super::strip_reserved_env(&mut projection);
+            projection
+        });
         let ExecutionLimits {
             timeout_ms,
             wait_until_timeout_ms,
@@ -1563,6 +1576,9 @@ impl AppRuntime {
 
             let env_store: EnvStore = Rc::new(RefCell::new(env));
             state.put(env_store);
+            let standard_env_store: super::ops::StandardEnvStore =
+                Rc::new(RefCell::new(standard_env));
+            state.put(standard_env_store);
             state.put(node_process_env.clone());
 
             // Empty until an invocation arms it. `terminate_execution` is what
@@ -1738,6 +1754,7 @@ impl AppRuntime {
             execution_deadline,
             subrequest_budget,
             node_process_env,
+            node_process_env_seed,
             invocations,
             call_path,
             trace: current_trace,
@@ -1837,13 +1854,7 @@ impl AppRuntime {
     /// its caller's, and a cold start belongs to the request that paid for it.
     fn begin_invocation(&mut self, trace_id: String) {
         *self.trace.borrow_mut() = trace_id;
-        let deployment_env = {
-            let op_state = self.runtime.op_state();
-            let state = op_state.borrow();
-            let snapshot = state.borrow::<EnvStore>().borrow().clone();
-            snapshot
-        };
-        *self.node_process_env.borrow_mut() = Some(deployment_env);
+        *self.node_process_env.borrow_mut() = Some(self.node_process_env_seed.clone());
         self.timers_swept = false;
         // A name for the stretch about to run, so that what `js/runtime.js`
         // states about the request being answered is readable only inside it.

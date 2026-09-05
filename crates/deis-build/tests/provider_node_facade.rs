@@ -260,6 +260,12 @@ fn stage(project: &Path, vendor: &str) {
               "language": "typescript",
               "functionRoot": "./functions",
               "compatibilityDate": "2026-09-01",
+              "environment": {{
+                "declarations": [
+                  {{ "name": "SHARED", "kind": "config", "valueType": "string", "required": true }},
+                  {{ "name": "TENANT", "kind": "config", "valueType": "string", "required": true }}
+                ]
+              }},
               "vendors": {{ "{vendor}": {{ "enabled": true }} }},
               "build": {{ "outDir": "./dist", "minify": false, "sourcemap": false }}
             }}"#

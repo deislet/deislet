@@ -1211,18 +1211,19 @@ fn load_routes(tx: &Transaction<'_>, app_id: &str) -> CatalogResult<Vec<CatalogR
 
 fn load_secrets(tx: &Transaction<'_>, app_id: &str) -> CatalogResult<Vec<CatalogSecretInventory>> {
     let expected: i64 = tx.query_row(
-        "SELECT count(*) FROM secrets WHERE app_id = ?1",
+        "SELECT count(*) FROM secret_heads AS head
+          JOIN environments AS environment ON environment.id = head.env_id
+         WHERE environment.app_id = ?1",
         [app_id],
         |row| row.get(0),
     )?;
     let mut stmt = tx.prepare(
-        "SELECT secret.id, environment.canonical_id, secret.name, secret.updated_at
-         FROM secrets AS secret
+        "SELECT head.revision_id, environment.canonical_id, head.name, head.updated_at
+         FROM secret_heads AS head
          JOIN environments AS environment
-           ON environment.id = secret.env_id
-          AND environment.app_id = secret.app_id
-         WHERE secret.app_id = ?1
-         ORDER BY environment.name, secret.name, secret.id",
+           ON environment.id = head.env_id
+         WHERE environment.app_id = ?1
+         ORDER BY environment.name, head.name, head.revision_id",
     )?;
     let rows = stmt.query_map([app_id], |row| {
         Ok(CatalogSecretInventory {

@@ -46,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use deis_wire::{CanonicalId, CanonicalTenantId, CanonicalTenantIdError};
+use deis_wire::{CanonicalId, CanonicalTenantId};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
@@ -101,6 +101,14 @@ pub struct Assignment {
     /// cannot honour is refused on its own when its bundle is unpacked.
     #[serde(default)]
     pub compatibility: Option<deis_bundle::DeclaredCompatibility>,
+    #[serde(default)]
+    pub environment_declarations: Option<deis_wire::EnvironmentDeclarations>,
+    #[serde(default)]
+    pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
+    #[serde(default)]
+    pub environment_snapshot_id: Option<String>,
+    #[serde(default)]
+    pub secret_values_by_revision: std::collections::HashMap<String, String>,
 }
 
 /// Hand-written so a `{:?}` on an assignment - in a log line, in an error
@@ -120,20 +128,30 @@ impl std::fmt::Debug for Assignment {
             .field("env", &format_args!("{names:?} = <redacted>"))
             .field("limits", &self.limits)
             .field("compatibility", &self.compatibility)
+            .field("environment_snapshot_id", &self.environment_snapshot_id)
+            .field("secret_values", &"<redacted>")
             .finish()
     }
 }
 
 impl Assignment {
-    fn into_order(self) -> Result<DeploymentOrder, CanonicalTenantIdError> {
+    fn into_order(self) -> Result<DeploymentOrder, String> {
+        let standard_environment_id = self
+            .canonical_environment_id
+            .as_ref()
+            .map(ToString::to_string);
         let canonical_tenant = match (self.canonical_application_id, self.canonical_environment_id)
         {
             (Some(application), Some(environment)) => {
                 Some(CanonicalTenantId::new(application, environment))
             }
             (None, None) => None,
-            (None, Some(_)) => return Err(CanonicalTenantIdError::MissingApplicationId),
-            (Some(_), None) => return Err(CanonicalTenantIdError::MissingEnvironmentId),
+            (None, Some(_)) => {
+                return Err("canonical_application_id is missing".to_string());
+            }
+            (Some(_), None) => {
+                return Err("canonical_environment_id is missing".to_string());
+            }
         };
 
         // Resolved here, per application, so that a declaration this build
@@ -162,6 +180,33 @@ impl Assignment {
             }
         });
 
+        let standard_environment = match (
+            self.environment_declarations,
+            self.environment_snapshot,
+            self.environment_snapshot_id,
+        ) {
+            (None, None, None) if self.secret_values_by_revision.is_empty() => None,
+            (Some(declarations), Some(snapshot), Some(snapshot_id)) => {
+                Some(super::StandardEnvironmentOrder::new(
+                    declarations,
+                    snapshot,
+                    snapshot_id,
+                    self.secret_values_by_revision,
+                    &self.version_id,
+                    standard_environment_id.as_deref().ok_or_else(|| {
+                        "EC_ENV_SNAPSHOT_INVALID: canonical environment identity is missing"
+                            .to_string()
+                    })?,
+                )?)
+            }
+            _ => {
+                return Err(
+                    "EC_ENV_SNAPSHOT_INVALID: assignment environment fields are incomplete"
+                        .to_string(),
+                );
+            }
+        };
+
         Ok(DeploymentOrder {
             app_id: self.app_id,
             canonical_tenant,
@@ -170,6 +215,7 @@ impl Assignment {
             bundle_url: self.bundle_url,
             bundle_sha: self.bundle_sha,
             env: self.env,
+            standard_environment,
             limits: self.limits,
             compatibility: resolved,
         })

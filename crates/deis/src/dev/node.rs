@@ -7,7 +7,7 @@
 //! would only be able to agree with the real one by accident, and the
 //! disagreements would be found in production.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -52,6 +52,20 @@ pub struct DevNode {
     /// are worth nothing once the process is gone, and leaving them behind
     /// would make the next `deis dev` start from someone else's state.
     data_dir: PathBuf,
+    canonical_application_id: Option<deis_wire::CanonicalId>,
+    canonical_environment_id: Option<deis_wire::CanonicalId>,
+}
+
+/// One complete deployment handed to the local production runtime.
+pub(super) struct DevDeployment<'a> {
+    pub(super) app: &'a str,
+    pub(super) environment: &'a str,
+    pub(super) bundle_url: &'a str,
+    pub(super) bundle_sha: &'a str,
+    pub(super) env: HashMap<String, String>,
+    pub(super) config_values: BTreeMap<String, serde_json::Value>,
+    pub(super) local_secrets: &'a BTreeMap<String, String>,
+    pub(super) manifest: &'a deis_bundle::Manifest,
 }
 
 impl DevNode {
@@ -139,6 +153,8 @@ impl DevNode {
                 child,
                 client,
                 data_dir,
+                canonical_application_id: None,
+                canonical_environment_id: None,
             },
             exited,
         ))
@@ -146,15 +162,17 @@ impl DevNode {
 
     /// Load a bundle, the same call and the same arguments the control plane
     /// makes when it deploys a version.
-    pub async fn apply(
-        &mut self,
-        app: &str,
-        environment: &str,
-        bundle_url: &str,
-        bundle_sha: &str,
-        env: HashMap<String, String>,
-        manifest: &deis_bundle::Manifest,
-    ) -> Result<()> {
+    pub(super) async fn apply(&mut self, deployment: DevDeployment<'_>) -> Result<()> {
+        let DevDeployment {
+            app,
+            environment,
+            bundle_url,
+            bundle_sha,
+            mut env,
+            config_values,
+            local_secrets,
+            manifest,
+        } = deployment;
         // The same declaration the control plane would send, read out of the
         // same manifest. A dev node that ran on the platform's newest
         // behaviour while production ran on the application's declared date
@@ -170,13 +188,102 @@ impl DevNode {
         // The manifest's own words, exactly as the control plane would send
         // them; the node answers them with its own table.
         let compatibility = manifest.compatibility.clone().unwrap_or_default();
+        let version_id = format!("dev-{bundle_sha}");
+        let (
+            canonical_application_id,
+            canonical_environment_id,
+            environment_declarations_json,
+            environment_snapshot_json,
+            environment_snapshot_id,
+            secret_values_by_revision,
+        ) = if let Some(declarations) = manifest.environment.as_ref() {
+            let application_id = *self
+                .canonical_application_id
+                .get_or_insert_with(deis_wire::CanonicalId::new_v7);
+            let environment_id = *self
+                .canonical_environment_id
+                .get_or_insert_with(deis_wire::CanonicalId::new_v7);
+            declarations
+                .validate(
+                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                    manifest.bindings.all_names(),
+                )
+                .map_err(anyhow::Error::new)?;
+            let mut bindings = Vec::new();
+            let mut revision_values = HashMap::new();
+            for declaration in &declarations.declarations {
+                env.remove(&declaration.name);
+                match declaration.kind {
+                    deis_wire::EnvironmentKind::Config => {
+                        if let Some(value) = config_values.get(&declaration.name) {
+                            bindings.push(deis_wire::EnvironmentBinding::Config(
+                                deis_wire::EnvironmentConfigBinding::new(
+                                    &declaration.name,
+                                    declaration.value_type,
+                                    value.clone(),
+                                )
+                                .map_err(anyhow::Error::new)?,
+                            ));
+                        } else if declaration.required {
+                            bail!(
+                                "EC_ENV_REQUIRED_MISSING: local config {} has no value",
+                                declaration.name
+                            );
+                        }
+                    }
+                    deis_wire::EnvironmentKind::Secret => {
+                        if let Some(value) = local_secrets.get(&declaration.name) {
+                            deis_wire::validate_secret_value(value).map_err(anyhow::Error::new)?;
+                            let revision = deis_wire::CanonicalId::new_v7().to_string();
+                            bindings.push(deis_wire::EnvironmentBinding::Secret(
+                                deis_wire::EnvironmentSecretBinding::new(
+                                    &declaration.name,
+                                    &revision,
+                                ),
+                            ));
+                            revision_values.insert(revision, value.clone());
+                        } else if declaration.required {
+                            bail!(
+                                "EC_ENV_REQUIRED_MISSING: local secret {} has no value",
+                                declaration.name
+                            );
+                        }
+                    }
+                }
+            }
+            let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+                declarations.standard_version.clone(),
+                &version_id,
+                environment_id.to_string(),
+                declarations.identity().map_err(anyhow::Error::new)?,
+                bindings,
+            );
+            let snapshot_id = snapshot.identity().map_err(anyhow::Error::new)?;
+            (
+                application_id.to_string(),
+                environment_id.to_string(),
+                String::from_utf8(declarations.canonical_json().map_err(anyhow::Error::new)?)?,
+                String::from_utf8(snapshot.canonical_json().map_err(anyhow::Error::new)?)?,
+                snapshot_id,
+                revision_values,
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                HashMap::new(),
+            )
+        };
         let response = self
             .client
             .apply_deployment(ApplyDeploymentRequest {
                 app_id: app.to_string(),
                 // A dev node holds one build at a time, and the digest is
                 // what actually distinguishes two of them.
-                version_id: format!("dev-{bundle_sha}"),
+                version_id,
                 environment: environment.to_string(),
                 bundle_url: bundle_url.to_string(),
                 bundle_sha: bundle_sha.to_string(),
@@ -199,8 +306,12 @@ impl DevNode {
                 // permanent product identities. Both empty is the explicit
                 // additive/legacy form; one-sided identity would be refused
                 // by the node.
-                canonical_application_id: String::new(),
-                canonical_environment_id: String::new(),
+                canonical_application_id,
+                canonical_environment_id,
+                environment_declarations_json,
+                environment_snapshot_json,
+                environment_snapshot_id,
+                secret_values_by_revision,
             })
             .await
             .map_err(|e| {

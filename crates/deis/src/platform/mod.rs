@@ -101,6 +101,10 @@ pub struct Deployment {
     pub created_at: i64,
     #[serde(default)]
     pub note: Option<String>,
+    /// Immutable Edge Canon environment snapshot selected by this pointer.
+    /// Absent for legacy schema-1 deployments and older control planes.
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
 }
 
 /// What a deploy, a rollback or a read of the current pointer answers.
@@ -171,6 +175,9 @@ pub struct NodeFailure {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecretMeta {
     pub name: String,
+    /// Opaque immutable revision; absent only on an older control plane.
+    #[serde(default)]
+    pub revision: Option<String>,
     pub updated_at: i64,
 }
 
@@ -622,10 +629,14 @@ impl Control {
         environment: &str,
         version_id: &str,
         note: Option<&str>,
+        config_values: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<DeploymentResponse> {
         let mut body = serde_json::json!({ "version_id": version_id });
         if let Some(note) = note {
             body["note"] = serde_json::Value::String(note.to_string());
+        }
+        if !config_values.is_empty() {
+            body["config_values"] = serde_json::to_value(config_values)?;
         }
         self.send(
             self.request(

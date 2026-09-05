@@ -33,17 +33,17 @@
 //! and delete a secret and list its name, never read it back
 //! (docs/architecture.zh.md section 8).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
-use crate::catalog::secrets::secret_aad;
+use crate::catalog::secrets::{secret_aad, secret_revision_aad};
 use crate::catalog::{
     CatalogError, CatalogResult, CatalogStore, DeclaredCompatibility, DeclaredLimits, Environment,
-    SecretsBackend, Version, declared_compatibility, declared_limits,
+    SecretHeadChange, SecretsBackend, Version, declared_compatibility, declared_limits,
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
 
@@ -271,6 +271,19 @@ pub struct DeploymentPayload {
     /// Which of the `env` keys came from a secret. Names only - they are
     /// safe to log, the values are not.
     secret_names: Vec<String>,
+    /// Standard declaration and snapshot are public only to the internal
+    /// delivery/runtime boundary. Neither contains secret plaintext.
+    environment_declarations: Option<deis_wire::EnvironmentDeclarations>,
+    environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
+    /// Canonical wire documents are prepared while the payload can still
+    /// fail. `to_request` must never turn a serialization error into three
+    /// empty fields that look like a legacy deployment.
+    environment_declarations_json: Option<String>,
+    environment_snapshot_json: Option<String>,
+    environment_snapshot_id: Option<String>,
+    /// The only standard secret plaintext carrier, keyed by immutable
+    /// revision rather than name. Never serialized to management APIs/logs.
+    secret_values_by_revision: BTreeMap<String, String>,
     /// The storage addresses and the secret this tenant's capability token
     /// is derived from. Kept apart from `env` so the report and the log
     /// lines stay about the application, and merged in only when the wire
@@ -321,6 +334,7 @@ impl std::fmt::Debug for DeploymentPayload {
             .field("variables", &self.variable_names())
             .field("secrets", &self.secret_names)
             .field("values", &"<redacted>")
+            .field("environment_snapshot_id", &self.environment_snapshot_id)
             .field("store_endpoint", &self.storage.store)
             .field("queue_endpoint", &self.storage.queue)
             .field(
@@ -337,6 +351,16 @@ impl DeploymentPayload {
     /// Names of the entries that came from the manifest rather than from a
     /// secret. Safe to log.
     pub fn variable_names(&self) -> Vec<&str> {
+        if let Some(snapshot) = &self.environment_snapshot {
+            return snapshot
+                .bindings
+                .iter()
+                .filter_map(|binding| match binding {
+                    deis_wire::EnvironmentBinding::Config(config) => Some(config.name.as_str()),
+                    deis_wire::EnvironmentBinding::Secret(_) => None,
+                })
+                .collect();
+        }
         self.env
             .keys()
             .map(String::as_str)
@@ -348,8 +372,64 @@ impl DeploymentPayload {
         &self.secret_names
     }
 
+    pub fn environment_snapshot(&self) -> Option<&deis_wire::EnvironmentBindingSnapshot> {
+        self.environment_snapshot.as_ref()
+    }
+
+    /// Secret heads observed while a fresh standard snapshot was prepared.
+    /// Absence is meaningful for optional declarations: activation must fail
+    /// if a concurrent writer creates that head before the pointer commits.
+    pub fn expected_secret_heads(&self) -> Option<BTreeMap<String, Option<String>>> {
+        let declarations = self.environment_declarations.as_ref()?;
+        let snapshot = self.environment_snapshot.as_ref()?;
+        let selected = snapshot
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                deis_wire::EnvironmentBinding::Secret(secret) => {
+                    Some((secret.name.as_str(), secret.revision.as_str()))
+                }
+                deis_wire::EnvironmentBinding::Config(_) => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        Some(
+            declarations
+                .declarations
+                .iter()
+                .filter(|declaration| declaration.kind == deis_wire::EnvironmentKind::Secret)
+                .map(|declaration| {
+                    (
+                        declaration.name.clone(),
+                        selected
+                            .get(declaration.name.as_str())
+                            .map(|revision| (*revision).to_string()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub fn standard_environment_for_wire(
+        &self,
+    ) -> Option<(
+        deis_wire::EnvironmentDeclarations,
+        deis_wire::EnvironmentBindingSnapshot,
+        String,
+        BTreeMap<String, String>,
+    )> {
+        let declarations = self.environment_declarations.clone()?;
+        let snapshot = self.environment_snapshot.clone()?;
+        let identity = self.environment_snapshot_id.clone()?;
+        Some((
+            declarations,
+            snapshot,
+            identity,
+            self.secret_values_by_revision.clone(),
+        ))
+    }
+
     pub fn variable_count(&self) -> usize {
-        self.env.len() - self.secret_names.len()
+        self.variable_names().len()
     }
 
     pub fn secret_count(&self) -> usize {
@@ -388,6 +468,13 @@ impl DeploymentPayload {
             compatibility: Some(compatibility_to_wire(&self.compatibility)),
             canonical_application_id: self.canonical_application_id.to_string(),
             canonical_environment_id: self.canonical_environment_id.to_string(),
+            environment_declarations_json: self
+                .environment_declarations_json
+                .clone()
+                .unwrap_or_default(),
+            environment_snapshot_json: self.environment_snapshot_json.clone().unwrap_or_default(),
+            environment_snapshot_id: self.environment_snapshot_id.clone().unwrap_or_default(),
+            secret_values_by_revision: self.secret_values_by_revision.clone().into_iter().collect(),
         }
     }
 }
@@ -412,6 +499,29 @@ fn compatibility_to_wire(declared: &DeclaredCompatibility) -> proto::Compatibili
             .unwrap_or_default(),
         flags: declared.flags.clone(),
     }
+}
+
+fn decrypt_secret(
+    backend: &SecretsBackend,
+    env_id: &str,
+    stored: &crate::catalog::store::SecretCiphertext,
+) -> CatalogResult<String> {
+    let aad = match stored.encryption_scheme.as_str() {
+        "legacy-name-v1" => secret_aad(env_id, &stored.name),
+        "revision-v1" => secret_revision_aad(env_id, &stored.name, &stored.revision),
+        _ => {
+            return Err(CatalogError::SecretsUnavailable(
+                "stored secret uses an unsupported encryption scheme".to_string(),
+            ));
+        }
+    };
+    let plaintext = backend.cipher()?.decrypt(&stored.ciphertext, &aad)?;
+    String::from_utf8(plaintext).map_err(|_| {
+        CatalogError::SecretsUnavailable(format!(
+            "secret {} does not decrypt to text and cannot be materialized",
+            stored.name
+        ))
+    })
 }
 
 /// Translate a manifest's `limits` block into the wire message.
@@ -550,6 +660,40 @@ impl DeploymentDeliverer {
         version: &Version,
         base_url: &str,
     ) -> CatalogResult<DeploymentPayload> {
+        self.payload_inner(env, version, base_url, BTreeMap::new(), None)
+            .await
+    }
+
+    pub async fn payload_with_config(
+        &self,
+        env: &Environment,
+        version: &Version,
+        base_url: &str,
+        config_values: BTreeMap<String, serde_json::Value>,
+    ) -> CatalogResult<DeploymentPayload> {
+        self.payload_inner(env, version, base_url, config_values, None)
+            .await
+    }
+
+    pub async fn payload_for_snapshot(
+        &self,
+        env: &Environment,
+        version: &Version,
+        base_url: &str,
+        snapshot: deis_wire::EnvironmentBindingSnapshot,
+    ) -> CatalogResult<DeploymentPayload> {
+        self.payload_inner(env, version, base_url, BTreeMap::new(), Some(snapshot))
+            .await
+    }
+
+    async fn payload_inner(
+        &self,
+        env: &Environment,
+        version: &Version,
+        base_url: &str,
+        config_values: BTreeMap<String, serde_json::Value>,
+        prepared_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
+    ) -> CatalogResult<DeploymentPayload> {
         // The legacy foreign key on the environment names the app row; read
         // that durable row so the wire carries its permanent identity rather
         // than deriving authority from the mutable display name.
@@ -650,41 +794,156 @@ impl DeploymentDeliverer {
         }
         let compatibility = manifest.compatibility.clone().unwrap_or_default();
 
-        let ciphertexts = self.store.secret_ciphertexts(&env.id).await?;
-        let mut secret_names = Vec::with_capacity(ciphertexts.len());
-        if !ciphertexts.is_empty() {
-            // Resolved only when there is something to decrypt, so an
-            // application without secrets deploys on a control plane that
-            // has no master key configured.
-            let cipher = self.secrets.cipher()?;
-            for (name, blob) in ciphertexts {
-                let plaintext = cipher.decrypt(&blob, &secret_aad(&env.id, &name))?;
-                let value = String::from_utf8(plaintext).map_err(|_| {
-                    CatalogError::SecretsUnavailable(format!(
-                        "secret {name} does not decrypt to text and cannot be injected as an environment variable"
-                    ))
-                })?;
-                if env_map.insert(name.clone(), value).is_some() {
+        let mut secret_names = Vec::new();
+        let mut environment_declarations = None;
+        let mut environment_snapshot = None;
+        let mut secret_values_by_revision = BTreeMap::new();
+
+        if let Some(declarations) = manifest.environment.clone() {
+            env_map.clear();
+            declarations
+                .validate(
+                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                    manifest.bindings.all_names(),
+                )
+                .map_err(|error| CatalogError::invalid(error.to_string()))?;
+            let declaration_identity = declarations
+                .identity()
+                .map_err(|error| CatalogError::invalid(error.to_string()))?;
+            let mut available_revisions = BTreeSet::new();
+            let snapshot = if let Some(snapshot) = prepared_snapshot {
+                if !config_values.is_empty() {
+                    return Err(CatalogError::invalid(
+                        "EC_ENV_SNAPSHOT_INVALID: config values cannot replace a historical snapshot",
+                    ));
+                }
+                for binding in &snapshot.bindings {
+                    if let deis_wire::EnvironmentBinding::Secret(secret) = binding {
+                        let stored = self
+                            .store
+                            .secret_revision_ciphertext(&env.id, &secret.name, &secret.revision)
+                            .await
+                            .map_err(|_| {
+                                CatalogError::invalid(
+                                    "EC_ENV_SECRET_REVISION_UNAVAILABLE: historical secret revision is unavailable",
+                                )
+                            })?;
+                        let value = decrypt_secret(self.secrets.as_ref(), &env.id, &stored)?;
+                        deis_wire::validate_secret_value(&value)
+                            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+                        available_revisions.insert(stored.revision.clone());
+                        secret_values_by_revision.insert(stored.revision, value);
+                        secret_names.push(stored.name);
+                    }
+                }
+                snapshot
+            } else {
+                let current = self
+                    .store
+                    .secret_ciphertexts(&env.id)
+                    .await?
+                    .into_iter()
+                    .map(|stored| (stored.name.clone(), stored))
+                    .collect::<BTreeMap<_, _>>();
+                let declared = declarations.by_name();
+                for name in config_values.keys() {
+                    let Some(declaration) = declared.get(name.as_str()) else {
+                        return Err(CatalogError::invalid(
+                            "EC_ENV_BINDING_UNDECLARED: deployment config contains an undeclared name",
+                        ));
+                    };
+                    if declaration.kind != deis_wire::EnvironmentKind::Config {
+                        return Err(CatalogError::invalid(
+                            "EC_ENV_BINDING_TYPE_MISMATCH: deployment config supplies a secret declaration",
+                        ));
+                    }
+                }
+
+                let mut bindings = Vec::new();
+                for declaration in &declarations.declarations {
+                    match declaration.kind {
+                        deis_wire::EnvironmentKind::Config => {
+                            if let Some(value) = config_values.get(&declaration.name) {
+                                bindings.push(deis_wire::EnvironmentBinding::Config(
+                                    deis_wire::EnvironmentConfigBinding::new(
+                                        &declaration.name,
+                                        declaration.value_type,
+                                        value.clone(),
+                                    )
+                                    .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                                ));
+                            } else if declaration.required {
+                                return Err(CatalogError::invalid(
+                                    "EC_ENV_REQUIRED_MISSING: required config binding is unavailable",
+                                ));
+                            }
+                        }
+                        deis_wire::EnvironmentKind::Secret => {
+                            if let Some(stored) = current.get(&declaration.name) {
+                                let value = decrypt_secret(self.secrets.as_ref(), &env.id, stored)?;
+                                deis_wire::validate_secret_value(&value)
+                                    .map_err(|error| CatalogError::invalid(error.to_string()))?;
+                                available_revisions.insert(stored.revision.clone());
+                                secret_values_by_revision.insert(stored.revision.clone(), value);
+                                secret_names.push(stored.name.clone());
+                                bindings.push(deis_wire::EnvironmentBinding::Secret(
+                                    deis_wire::EnvironmentSecretBinding::new(
+                                        &stored.name,
+                                        &stored.revision,
+                                    ),
+                                ));
+                            } else if declaration.required {
+                                return Err(CatalogError::invalid(
+                                    "EC_ENV_REQUIRED_MISSING: required secret binding is unavailable",
+                                ));
+                            }
+                        }
+                    }
+                }
+                deis_wire::EnvironmentBindingSnapshot::new(
+                    declarations.standard_version.clone(),
+                    version_id,
+                    env.canonical_id.to_string(),
+                    declaration_identity,
+                    bindings,
+                )
+            };
+            snapshot
+                .validate(
+                    &declarations,
+                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                    |revision| available_revisions.contains(revision),
+                )
+                .map_err(|error| CatalogError::invalid(error.to_string()))?;
+            environment_declarations = Some(declarations);
+            environment_snapshot = Some(snapshot);
+        } else {
+            let ciphertexts = self.store.secret_ciphertexts(&env.id).await?;
+            if !ciphertexts.is_empty() {
+                for stored in ciphertexts {
+                    let value = decrypt_secret(self.secrets.as_ref(), &env.id, &stored)?;
+                    if env_map.insert(stored.name.clone(), value).is_some() {
+                        warn!(
+                            app_id = %env.app_id,
+                            environment = %env.name,
+                            name = %stored.name,
+                            "A stored secret has the same name as a manifest variable; the secret wins, so the value in the bundle's manifest never reaches the application"
+                        );
+                    }
+                    secret_names.push(stored.name);
+                }
+            }
+
+            for declared in &manifest.secrets {
+                if !secret_names.iter().any(|name| name == declared) {
                     warn!(
                         app_id = %env.app_id,
                         environment = %env.name,
-                        name = %name,
-                        "A stored secret has the same name as a manifest variable; the secret wins, so the value in the bundle's manifest never reaches the application"
+                        version_id = %version_id,
+                        secret = %declared,
+                        "The legacy manifest declares this secret but no value is stored for this environment"
                     );
                 }
-                secret_names.push(name);
-            }
-        }
-
-        for declared in &manifest.secrets {
-            if !secret_names.iter().any(|name| name == declared) {
-                warn!(
-                    app_id = %env.app_id,
-                    environment = %env.name,
-                    version_id = %version_id,
-                    secret = %declared,
-                    "The manifest declares this secret but no value is stored for this environment; the application will read it as missing"
-                );
             }
         }
 
@@ -708,6 +967,46 @@ impl DeploymentDeliverer {
             );
         }
 
+        let (environment_declarations_json, environment_snapshot_json, environment_snapshot_id) =
+            match (&environment_declarations, &environment_snapshot) {
+                (Some(declarations), Some(snapshot)) => {
+                    let declarations_json = String::from_utf8(
+                        declarations
+                            .canonical_json()
+                            .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                    )
+                    .map_err(|_| {
+                        CatalogError::invalid(
+                            "EC_ENV_DOCUMENT_INVALID: canonical declaration is not UTF-8",
+                        )
+                    })?;
+                    let snapshot_json = String::from_utf8(
+                        snapshot
+                            .canonical_json()
+                            .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                    )
+                    .map_err(|_| {
+                        CatalogError::invalid(
+                            "EC_ENV_SNAPSHOT_INVALID: canonical snapshot is not UTF-8",
+                        )
+                    })?;
+                    let snapshot_id = snapshot
+                        .identity()
+                        .map_err(|error| CatalogError::invalid(error.to_string()))?;
+                    (
+                        Some(declarations_json),
+                        Some(snapshot_json),
+                        Some(snapshot_id),
+                    )
+                }
+                (None, None) => (None, None, None),
+                _ => {
+                    return Err(CatalogError::invalid(
+                        "EC_ENV_SNAPSHOT_INVALID: declaration and snapshot must be prepared together",
+                    ));
+                }
+            };
+
         Ok(DeploymentPayload {
             app_id: env.app_id.clone(),
             canonical_application_id: app.canonical_id,
@@ -718,6 +1017,12 @@ impl DeploymentDeliverer {
             bundle_sha: version.bundle_sha.clone(),
             env: env_map,
             secret_names,
+            environment_declarations,
+            environment_snapshot,
+            environment_declarations_json,
+            environment_snapshot_json,
+            environment_snapshot_id,
+            secret_values_by_revision,
             storage: self.storage.clone(),
             limits,
             compatibility,
@@ -750,7 +1055,13 @@ impl DeploymentDeliverer {
             .store
             .get_version(&assignment.app_id, &assignment.version_id)
             .await?;
-        self.payload(&env, &version, base_url).await
+        if let Some(snapshot_id) = &assignment.snapshot_id {
+            let snapshot = self.store.get_environment_snapshot(snapshot_id).await?;
+            self.payload_for_snapshot(&env, &version, base_url, snapshot)
+                .await
+        } else {
+            self.payload(&env, &version, base_url).await
+        }
     }
 
     /// Push a payload to every configured node, concurrently.
@@ -1074,7 +1385,18 @@ impl DeploymentDeliverer {
             }
         };
 
-        match self.payload(env, &version, base_url).await {
+        let payload = if let Some(snapshot_id) = &deployment.snapshot_id {
+            match self.store.get_environment_snapshot(snapshot_id).await {
+                Ok(snapshot) => {
+                    self.payload_for_snapshot(env, &version, base_url, snapshot)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.payload(env, &version, base_url).await
+        };
+        match payload {
             Ok(payload) => self.push(&payload, reason).await,
             Err(e) => {
                 error!(
@@ -1088,6 +1410,130 @@ impl DeploymentDeliverer {
                 skipped(version.id.clone(), e.to_string())
             }
         }
+    }
+
+    /// Activate a new snapshot for a secret rotation/deletion without changing
+    /// the application version. Legacy schema-1 deployments keep their old
+    /// reload behavior; schema-2 deployments always append a pointer row.
+    pub async fn activate_secret_change(
+        &self,
+        env: &Environment,
+        base_url: &str,
+        name: &str,
+        revision: Option<&str>,
+        expected_secret_revision: Option<&str>,
+    ) -> CatalogResult<DeliveryReport> {
+        let reason = DeliveryReason::SecretChange;
+        let skipped = |version_id: String, text: String| DeliveryReport {
+            reason,
+            app_id: env.app_id.clone(),
+            environment: env.name.clone(),
+            version_id,
+            delivered: Vec::new(),
+            failed: Vec::new(),
+            skipped: Some(text),
+        };
+        let deployment = match self.store.current_deployment(&env.id).await? {
+            Some(deployment) => deployment,
+            None => {
+                self.store
+                    .promote_secret_change(env, name, revision, expected_secret_revision)
+                    .await?;
+                return Ok(skipped(
+                    String::new(),
+                    "the environment has never been deployed; the secret head will be selected on its first deployment"
+                        .to_string(),
+                ));
+            }
+        };
+        let Some(snapshot_id) = deployment.snapshot_id.as_deref() else {
+            self.store
+                .promote_secret_change(env, name, revision, expected_secret_revision)
+                .await?;
+            return Ok(self.reload_current(env, base_url, reason).await);
+        };
+        let version = self
+            .store
+            .get_version(&env.app_id, &deployment.version_id)
+            .await?;
+        let manifest = deis_bundle::Manifest::parse(&version.manifest).map_err(|error| {
+            CatalogError::BundleStorage(format!(
+                "stored manifest of version {} no longer parses: {error}",
+                version.id
+            ))
+        })?;
+        let Some(declarations) = manifest.environment else {
+            return Err(CatalogError::invalid(
+                "EC_ENV_SNAPSHOT_INVALID: deployment snapshot exists but its bundle has no environment declaration",
+            ));
+        };
+        let Some(declaration) = declarations
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+        else {
+            self.store
+                .promote_secret_change(env, name, revision, expected_secret_revision)
+                .await?;
+            return Ok(skipped(
+                version.id,
+                format!(
+                    "secret {name} is not declared by the running version; its active snapshot is unchanged"
+                ),
+            ));
+        };
+        if declaration.kind != deis_wire::EnvironmentKind::Secret {
+            self.store
+                .promote_secret_change(env, name, revision, expected_secret_revision)
+                .await?;
+            return Ok(skipped(
+                version.id,
+                format!(
+                    "{name} is declared as config, so a secret write cannot replace its active value"
+                ),
+            ));
+        }
+        if revision.is_none() && declaration.required {
+            self.store
+                .promote_secret_change(env, name, None, expected_secret_revision)
+                .await?;
+            return Ok(skipped(
+                version.id,
+                format!(
+                    "required secret {name} was deleted from the current head; the active snapshot keeps its retained revision until a deploy supplies a valid replacement"
+                ),
+            ));
+        }
+        let mut snapshot = self.store.get_environment_snapshot(snapshot_id).await?;
+        snapshot.bindings.retain(|binding| binding.name() != name);
+        if let Some(revision) = revision {
+            snapshot
+                .bindings
+                .push(deis_wire::EnvironmentBinding::Secret(
+                    deis_wire::EnvironmentSecretBinding::new(name, revision),
+                ));
+        }
+        snapshot
+            .bindings
+            .sort_by(|left, right| left.name().cmp(right.name()));
+        let payload = self
+            .payload_for_snapshot(env, &version, base_url, snapshot.clone())
+            .await?;
+        self.store
+            .activate_deployment_with_secret_change(
+                env,
+                &version.id,
+                &snapshot,
+                Some(&deployment.id),
+                SecretHeadChange {
+                    name,
+                    replacement_revision: revision,
+                    expected_revision: expected_secret_revision,
+                },
+                Some(format!("secret {name} revision changed")),
+            )
+            .await?;
+        Ok(self.push(&payload, reason).await)
     }
 }
 
@@ -1222,6 +1668,140 @@ mod tests {
             request.canonical_environment_id,
             env.canonical_id.to_string()
         );
+    }
+
+    fn standard_manifest(declarations: &deis_wire::EnvironmentDeclarations) -> String {
+        serde_json::json!({
+            "schema": 2,
+            "app": "demo",
+            "entry": "worker/index.js",
+            "environment": declarations,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn standard_payload_binds_typed_config_and_an_exact_secret_revision() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            vec![
+                deis_wire::EnvironmentDeclaration {
+                    name: "LABEL".to_string(),
+                    kind: deis_wire::EnvironmentKind::Config,
+                    value_type: deis_wire::EnvironmentValueType::String,
+                    required: true,
+                },
+                deis_wire::EnvironmentDeclaration {
+                    name: "OPTIONS".to_string(),
+                    kind: deis_wire::EnvironmentKind::Config,
+                    value_type: deis_wire::EnvironmentValueType::Json,
+                    required: true,
+                },
+                deis_wire::EnvironmentDeclaration {
+                    name: "TOKEN".to_string(),
+                    kind: deis_wire::EnvironmentKind::Secret,
+                    value_type: deis_wire::EnvironmentValueType::String,
+                    required: true,
+                },
+            ],
+        );
+        let revision = deis_wire::CanonicalId::new_v7().to_string();
+        let sentinel = "standard-secret-sentinel";
+        let ciphertext = deliverer
+            .secrets
+            .cipher()
+            .unwrap()
+            .encrypt(
+                sentinel.as_bytes(),
+                &secret_revision_aad(&env.id, "TOKEN", &revision),
+            )
+            .unwrap();
+        store
+            .put_secret_revision(&env, "TOKEN", &revision, ciphertext)
+            .await
+            .unwrap();
+        let config_values = BTreeMap::from([
+            ("LABEL".to_string(), serde_json::json!("edge")),
+            (
+                "OPTIONS".to_string(),
+                serde_json::json!({"retries": 2, "nested": [true, null]}),
+            ),
+        ]);
+
+        let payload = deliverer
+            .payload_with_config(
+                &env,
+                &version(&standard_manifest(&declarations)),
+                "http://control.test",
+                config_values,
+            )
+            .await
+            .unwrap();
+        assert_eq!(payload.variable_count(), 2);
+        assert_eq!(payload.secret_count(), 1);
+        assert!(!format!("{payload:?}").contains(sentinel));
+
+        let request = payload.to_request();
+        assert!(!request.env.contains_key("LABEL"));
+        assert!(!request.env.contains_key("OPTIONS"));
+        assert!(!request.env.contains_key("TOKEN"));
+        assert_eq!(
+            request.secret_values_by_revision.get(&revision),
+            Some(&sentinel.to_string())
+        );
+        let snapshot: deis_wire::EnvironmentBindingSnapshot =
+            serde_json::from_str(&request.environment_snapshot_json).unwrap();
+        assert_eq!(
+            snapshot.identity().unwrap(),
+            request.environment_snapshot_id
+        );
+        assert_eq!(snapshot.environment_id, env.canonical_id.to_string());
+        assert_eq!(snapshot.bindings.len(), 3);
+        assert_eq!(
+            serde_json::from_str::<deis_wire::EnvironmentDeclarations>(
+                &request.environment_declarations_json
+            )
+            .unwrap(),
+            declarations
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_payload_rejects_missing_and_undeclared_config() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "REQUIRED".to_string(),
+                kind: deis_wire::EnvironmentKind::Config,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        );
+        let version = version(&standard_manifest(&declarations));
+
+        let missing = deliverer
+            .payload_with_config(&env, &version, "http://control.test", BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("EC_ENV_REQUIRED_MISSING"));
+
+        let extra = deliverer
+            .payload_with_config(
+                &env,
+                &version,
+                "http://control.test",
+                BTreeMap::from([
+                    ("REQUIRED".to_string(), serde_json::json!("present")),
+                    ("UNDECLARED".to_string(), serde_json::json!("no")),
+                ]),
+            )
+            .await
+            .unwrap_err();
+        assert!(extra.to_string().contains("EC_ENV_BINDING_UNDECLARED"));
     }
 
     /// What a node has to be told before it downloads anything: which day's

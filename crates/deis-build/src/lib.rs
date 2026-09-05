@@ -66,7 +66,10 @@ pub mod commands;
 
 // Re-export core types for external use
 pub use deis_build_core::{
-    config::{ProjectConfig, ServicesConfig, VendorsConfig},
+    config::{
+        resolve_environment_config_values, resolve_environment_declarations, ProjectConfig,
+        ServicesConfig, VendorsConfig,
+    },
     error::{DeniError, Result},
     target_artifact_coverage::{
         Feature, MissingTargetImplementationError, Platform, TargetArtifactCoverage,

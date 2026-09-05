@@ -39,13 +39,13 @@ pub use deislet_storage_key::{
     DeisletStorageKeyError,
 };
 pub use environment::{
-    ENVIRONMENT_BINDING_COUNT_LIMIT, ENVIRONMENT_BINDING_SNAPSHOT_FORMAT,
-    ENVIRONMENT_BINDING_SNAPSHOT_SCHEMA, ENVIRONMENT_DECLARATIONS_FORMAT,
-    ENVIRONMENT_DECLARATIONS_SCHEMA, ENVIRONMENT_VALUE_BYTES_LIMIT, EnvironmentAccess,
-    EnvironmentActivation, EnvironmentBinding, EnvironmentBindingSnapshot,
-    EnvironmentConfigBinding, EnvironmentDeclaration, EnvironmentDeclarations, EnvironmentError,
-    EnvironmentKind, EnvironmentLimits, EnvironmentSecretBinding, EnvironmentValueType,
-    config_revision, validate_secret_value,
+    CURRENT_EDGE_CANON_STANDARD_VERSION, ENVIRONMENT_BINDING_COUNT_LIMIT,
+    ENVIRONMENT_BINDING_SNAPSHOT_FORMAT, ENVIRONMENT_BINDING_SNAPSHOT_SCHEMA,
+    ENVIRONMENT_DECLARATIONS_FORMAT, ENVIRONMENT_DECLARATIONS_SCHEMA,
+    ENVIRONMENT_VALUE_BYTES_LIMIT, EnvironmentAccess, EnvironmentActivation, EnvironmentBinding,
+    EnvironmentBindingSnapshot, EnvironmentConfigBinding, EnvironmentDeclaration,
+    EnvironmentDeclarations, EnvironmentError, EnvironmentKind, EnvironmentLimits,
+    EnvironmentSecretBinding, EnvironmentValueType, config_revision, validate_secret_value,
 };
 pub use error::{SdkResult, WireError};
 

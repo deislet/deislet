@@ -18,6 +18,9 @@ use std::time::SystemTime;
 /// for it, and a version that fails to load needs something to fall back to.
 pub struct VersionRecord {
     pub version_id: String,
+    /// Immutable standard environment snapshot materialized in this isolate.
+    /// `None` identifies the legacy schema-1 environment path.
+    pub environment_snapshot_id: Option<String>,
     /// Whether the `env` this copy is running with came from the control
     /// plane.
     ///
@@ -42,6 +45,7 @@ impl std::fmt::Debug for VersionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VersionRecord")
             .field("version_id", &self.version_id)
+            .field("environment_snapshot_id", &self.environment_snapshot_id)
             .field("env_confirmed", &self.env_confirmed)
             .field("entry_point", &self.entry_point)
             .field("assets", &self.assets)
@@ -55,6 +59,7 @@ pub struct VersionInstall {
     /// so a preview cannot land in production's slot.
     pub key: AppKey,
     pub version_id: String,
+    pub environment_snapshot_id: Option<String>,
     pub entry_point: String,
     pub code: String,
     /// Carries the decrypted `env`; see [`AppConfig`] for why it neither
@@ -70,6 +75,7 @@ pub struct VersionInstall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledVersion {
     pub version_id: String,
+    pub environment_snapshot_id: Option<String>,
     /// See [`VersionRecord::env_confirmed`].
     pub env_confirmed: bool,
 }
@@ -609,6 +615,8 @@ impl ApplicationManager {
         let spec = IsolateSpec {
             entry_point,
             env: config.env.clone(),
+            standard_env: config.standard_env.clone(),
+            node_process_env: Some(config.node_process_env.clone()),
             storage_tenant: Some(key.tenant_id()),
             permissions: config.permissions.clone(),
             memory_limit_mb: Some(self.effective_memory_limit_mb(&key, config.limits.as_ref())),
@@ -673,6 +681,7 @@ impl ApplicationManager {
         let VersionInstall {
             key,
             version_id,
+            environment_snapshot_id,
             entry_point,
             code,
             config,
@@ -682,6 +691,7 @@ impl ApplicationManager {
 
         let record = Arc::new(VersionRecord {
             version_id: version_id.clone(),
+            environment_snapshot_id,
             env_confirmed,
             entry_point: entry_point.clone(),
             code: code.clone(),
@@ -788,6 +798,8 @@ impl ApplicationManager {
         IsolateSpec {
             entry_point: Some(record.entry_point.clone()),
             env: record.config.env.clone(),
+            standard_env: record.config.standard_env.clone(),
+            node_process_env: Some(record.config.node_process_env.clone()),
             storage_tenant: Some(key.tenant_id()),
             permissions: record.config.permissions.clone(),
             memory_limit_mb: Some(
@@ -825,6 +837,7 @@ impl ApplicationManager {
     pub fn installed_version(&self, key: &AppKey) -> Option<InstalledVersion> {
         self.versions.get(key).map(|e| InstalledVersion {
             version_id: e.version_id.clone(),
+            environment_snapshot_id: e.environment_snapshot_id.clone(),
             env_confirmed: e.env_confirmed,
         })
     }
@@ -838,6 +851,7 @@ impl ApplicationManager {
                     e.key().clone(),
                     InstalledVersion {
                         version_id: e.version_id.clone(),
+                        environment_snapshot_id: e.environment_snapshot_id.clone(),
                         env_confirmed: e.env_confirmed,
                     },
                 )

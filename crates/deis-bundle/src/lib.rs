@@ -402,7 +402,10 @@ impl Manifest {
             }
             (2, Some(environment)) => {
                 environment
-                    .validate(&environment.standard_version, self.bindings.all_names())
+                    .validate(
+                        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                        self.bindings.all_names(),
+                    )
                     .map_err(|error| BundleError::InvalidManifest(error.to_string()))?;
                 if !self.env.is_empty() || !self.secrets.is_empty() {
                     return Err(BundleError::InvalidManifest(
@@ -669,6 +672,14 @@ mod tests {
         assert!(parsed.environment.is_some());
         assert!(parsed.env.is_empty());
         assert!(parsed.secrets.is_empty());
+
+        let mut foreign_revision = valid.clone();
+        foreign_revision["environment"]["standardVersion"] =
+            serde_json::json!("edge-canon.next@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let error = Manifest::parse(&foreign_revision.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("EC_ENV_STANDARD_PIN_INVALID"), "{error}");
 
         let mut carries_legacy_value = valid.clone();
         carries_legacy_value["env"] = serde_json::json!({"TOKEN":"must-not-enter"});

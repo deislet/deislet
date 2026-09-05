@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 
 use crate::app::types::ResourceLimits;
 use crate::app::{AppKey, ApplicationManager};
-use crate::deployment::{Applied, DeploymentManager, DeploymentOrder};
+use crate::deployment::{Applied, DeploymentManager, DeploymentOrder, StandardEnvironmentOrder};
 use crate::health::NodeHealth;
 use crate::runtime::metrics::{recorder, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL};
 
@@ -207,6 +207,34 @@ impl RuntimeManagement for RuntimeManagementService {
             );
         }
 
+        let standard_environment = match decode_standard_environment(
+            &req.environment_declarations_json,
+            &req.environment_snapshot_json,
+            &req.environment_snapshot_id,
+            req.secret_values_by_revision.clone(),
+            &req.version_id,
+            &req.canonical_environment_id,
+        ) {
+            Ok(environment) => environment,
+            Err(reason) => {
+                let key = AppKey::new(req.app_id.clone(), req.environment.clone());
+                let kept = self.running_version(&key);
+                error!(
+                    app_id = %req.app_id,
+                    environment = %req.environment,
+                    version_id = %req.version_id,
+                    kept_version = %kept,
+                    reason = %reason,
+                    "Refusing this deployment before download: its Edge Canon environment snapshot is incomplete or invalid"
+                );
+                return Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: reason,
+                    version_id: kept,
+                }));
+            }
+        };
+
         let order = DeploymentOrder {
             app_id: req.app_id.clone(),
             canonical_tenant,
@@ -215,6 +243,7 @@ impl RuntimeManagement for RuntimeManagementService {
             bundle_url: req.bundle_url,
             bundle_sha: req.bundle_sha,
             env: req.env,
+            standard_environment,
             limits,
             compatibility,
         };
@@ -544,6 +573,51 @@ impl RuntimeManagement for RuntimeManagementService {
             details: self.health.details(),
         }))
     }
+}
+
+fn decode_standard_environment(
+    declarations_json: &str,
+    snapshot_json: &str,
+    snapshot_id: &str,
+    secrets: std::collections::HashMap<String, String>,
+    version_id: &str,
+    environment_id: &str,
+) -> Result<Option<StandardEnvironmentOrder>, String> {
+    let absent = declarations_json.is_empty() && snapshot_json.is_empty() && snapshot_id.is_empty();
+    if absent {
+        return if secrets.is_empty() {
+            Ok(None)
+        } else {
+            Err(
+                "EC_ENV_SNAPSHOT_INVALID: secret revisions arrived without environment documents"
+                    .to_string(),
+            )
+        };
+    }
+    if declarations_json.is_empty()
+        || snapshot_json.is_empty()
+        || snapshot_id.is_empty()
+        || environment_id.is_empty()
+    {
+        return Err(
+            "EC_ENV_SNAPSHOT_INVALID: environment declaration, snapshot, identity and canonical environment id must arrive together"
+                .to_string(),
+        );
+    }
+    let declarations = serde_json::from_str(declarations_json).map_err(|_| {
+        "EC_ENV_DOCUMENT_INVALID: environment declaration JSON is invalid".to_string()
+    })?;
+    let snapshot = serde_json::from_str(snapshot_json)
+        .map_err(|_| "EC_ENV_SNAPSHOT_INVALID: environment snapshot JSON is invalid".to_string())?;
+    StandardEnvironmentOrder::new(
+        declarations,
+        snapshot,
+        snapshot_id.to_string(),
+        secrets,
+        version_id,
+        environment_id,
+    )
+    .map(Some)
 }
 
 /// Read the wire's `ResourceLimits` into the node's own.

@@ -11,6 +11,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tracing::{info, warn};
 
 use super::CatalogState;
@@ -33,6 +34,10 @@ pub struct DeployRequest {
     pub version_number: Option<i64>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Deployment-time config only. Secret values use the dedicated secret
+    /// write API and are selected by immutable revision.
+    #[serde(default)]
+    pub config_values: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -92,9 +97,10 @@ pub async fn deploy(
     .await?;
 
     let base = state.deliverer.base_url(&headers);
+    let expected_current = state.store.current_deployment(&env.id).await?;
     let payload = state
         .deliverer
-        .payload(&env, &version, &base)
+        .payload_with_config(&env, &version, &base, request.config_values)
         .await
         .inspect_err(|e| {
             warn!(
@@ -106,7 +112,27 @@ pub async fn deploy(
             );
         })?;
 
-    let deployment = state.store.deploy(&env, &version.id, request.note).await?;
+    let deployment = if let Some(snapshot) = payload.environment_snapshot() {
+        let expected_secret_heads = payload.expected_secret_heads().ok_or_else(|| {
+            ApiError::Conflict(
+                "EC_ENV_SNAPSHOT_INVALID: standard deployment has no secret-head selection"
+                    .to_string(),
+            )
+        })?;
+        state
+            .store
+            .activate_deployment(
+                &env,
+                &version.id,
+                snapshot,
+                expected_current.as_ref().map(|row| row.id.as_str()),
+                &expected_secret_heads,
+                request.note,
+            )
+            .await?
+    } else {
+        state.store.deploy(&env, &version.id, request.note).await?
+    };
     let delivery = state
         .deliverer
         .push(&payload, DeliveryReason::Deployment)
@@ -160,10 +186,30 @@ pub async fn rollback(
         };
 
     let base = state.deliverer.base_url(&headers);
-    let payload = state
-        .deliverer
-        .payload(&env, &version, &base)
-        .await
+    let expected_current = state.store.current_deployment(&env.id).await?;
+    let historical_snapshot = state
+        .store
+        .deployment_snapshot_for_version(&env.id, &version.id)
+        .await?;
+    if historical_snapshot.is_none()
+        && deis_bundle::Manifest::parse(&version.manifest)
+            .map(|manifest| manifest.environment.is_some())
+            .unwrap_or(false)
+    {
+        return Err(ApiError::Conflict(format!(
+            "EC_ENV_ROLLBACK_SNAPSHOT_UNAVAILABLE: version {} has no historical environment snapshot to reactivate",
+            version.id
+        )));
+    }
+    let payload_result = if let Some((_, snapshot)) = historical_snapshot {
+        state
+            .deliverer
+            .payload_for_snapshot(&env, &version, &base, snapshot)
+            .await
+    } else {
+        state.deliverer.payload(&env, &version, &base).await
+    };
+    let payload = payload_result
         .inspect_err(|e| {
             warn!(
                 app_id = %app_id,
@@ -177,7 +223,20 @@ pub async fn rollback(
     let note = request
         .note
         .unwrap_or_else(|| format!("rollback to version {}", version.number));
-    let deployment = state.store.deploy(&env, &version.id, Some(note)).await?;
+    let deployment = if let Some(snapshot) = payload.environment_snapshot() {
+        state
+            .store
+            .reactivate_deployment_snapshot(
+                &env,
+                &version.id,
+                snapshot,
+                expected_current.as_ref().map(|row| row.id.as_str()),
+                Some(note),
+            )
+            .await?
+    } else {
+        state.store.deploy(&env, &version.id, Some(note)).await?
+    };
     let delivery = state
         .deliverer
         .push(&payload, DeliveryReason::Rollback)
@@ -420,6 +479,164 @@ mod tests {
                 .contains("no runtime nodes are configured")
         );
         assert_eq!(body["delivery"]["delivered"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn standard_deploy_and_secret_rotation_append_atomic_snapshot_pointers() {
+        let h = harness(true).await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            vec![
+                deis_wire::EnvironmentDeclaration {
+                    name: "LABEL".to_string(),
+                    kind: deis_wire::EnvironmentKind::Config,
+                    value_type: deis_wire::EnvironmentValueType::String,
+                    required: true,
+                },
+                deis_wire::EnvironmentDeclaration {
+                    name: "TOKEN".to_string(),
+                    kind: deis_wire::EnvironmentKind::Secret,
+                    value_type: deis_wire::EnvironmentValueType::String,
+                    required: true,
+                },
+            ],
+        );
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let manifest = serde_json::json!({
+            "schema": 2,
+            "app": "demo",
+            "entry": "worker/index.js",
+            "environment": declarations,
+        })
+        .to_string();
+        let (status, uploaded) = call(
+            &h.router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(bundle_with_manifest(&manifest, true)),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{uploaded}");
+        let version_id = uploaded["version"]["id"].as_str().unwrap();
+        json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+        let (status, secret) = json(
+            &h.router,
+            "PUT",
+            "/api/apps/demo/environments/production/secrets/TOKEN",
+            serde_json::json!({"value": "first-value"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{secret}");
+
+        let (status, deployed) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({
+                "version_id": version_id,
+                "config_values": {"LABEL": "edge"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{deployed}");
+        let first_snapshot = deployed["deployment"]["snapshot_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, rotated) = json(
+            &h.router,
+            "PUT",
+            "/api/apps/demo/environments/production/secrets/TOKEN",
+            serde_json::json!({"value": "second-value"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rotated}");
+        assert_eq!(rotated["delivery"]["version_id"], version_id);
+        let (_, current) = json(
+            &h.router,
+            "GET",
+            "/api/apps/demo/environments/production/deployment",
+            Value::Null,
+        )
+        .await;
+        let rotated_snapshot = current["deployment"]["snapshot_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(rotated_snapshot, first_snapshot);
+        assert_eq!(current["deployment"]["version_id"], version_id);
+
+        let (status, deleted) = json(
+            &h.router,
+            "DELETE",
+            "/api/apps/demo/environments/production/secrets/TOKEN",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{deleted}");
+        assert!(
+            deleted["delivery"]["skipped"]
+                .as_str()
+                .unwrap()
+                .contains("required secret")
+        );
+        let (_, still_current) = json(
+            &h.router,
+            "GET",
+            "/api/apps/demo/environments/production/deployment",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            still_current["deployment"]["snapshot_id"], rotated_snapshot,
+            "deleting a required head changed the active retained snapshot"
+        );
+
+        let second_manifest = serde_json::json!({
+            "schema": 2,
+            "app": "demo",
+            "entry": "worker/index.js",
+            "environment": declarations,
+            "routes": [{"pattern": "/second", "methods": []}],
+        })
+        .to_string();
+        let (status, uploaded_second) = call(
+            &h.router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(bundle_with_manifest(&second_manifest, true)),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{uploaded_second}");
+        let never_activated = uploaded_second["version"]["id"].as_str().unwrap();
+        let (status, refused) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/rollback",
+            serde_json::json!({"version_id": never_activated}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("EC_ENV_ROLLBACK_SNAPSHOT_UNAVAILABLE")
+        );
     }
 
     #[tokio::test]

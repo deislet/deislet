@@ -137,6 +137,39 @@ fn bundle_inner(
     TestBundle { bytes: buf, sha256 }
 }
 
+fn standard_bundle(
+    app: &str,
+    code: &str,
+    declarations: &deis_wire::EnvironmentDeclarations,
+) -> TestBundle {
+    let manifest = serde_json::json!({
+        "schema": 2,
+        "app": app,
+        "entry": "worker/index.js",
+        "runtime": "standard-v1",
+        "environment": declarations,
+    });
+    let declaration_document = String::from_utf8(declarations.canonical_json().unwrap()).unwrap();
+    let mut buf = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::FileOptions::default();
+        writer
+            .start_file(deis_bundle::MANIFEST_ENTRY, options)
+            .unwrap();
+        writer.write_all(manifest.to_string().as_bytes()).unwrap();
+        writer.start_file("worker/index.js", options).unwrap();
+        writer.write_all(code.as_bytes()).unwrap();
+        writer
+            .start_file("documents/environment-secrets.json", options)
+            .unwrap();
+        writer.write_all(declaration_document.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+    let sha256 = sha256_hex(&buf);
+    TestBundle { bytes: buf, sha256 }
+}
+
 /// A stand-in control plane serving bundles at `/bundles/{name}`.
 struct ControlPlane {
     addr: SocketAddr,
@@ -225,6 +258,7 @@ fn order_for(
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect(),
+        standard_environment: None,
         limits: None,
         compatibility: None,
     }
@@ -395,6 +429,217 @@ async fn redelivering_the_same_version_reuses_the_bundle_already_on_disk() {
             reused_bundle: true
         }
     );
+}
+
+#[tokio::test]
+async fn standard_environment_is_typed_frozen_fresh_and_kept_out_of_process_env() {
+    const HANDLER: &str = r#"
+let previousEnvironment;
+export default function handler(context) {
+  const fresh = previousEnvironment === undefined || previousEnvironment !== context.env;
+  previousEnvironment = context.env;
+  let topMutationRejected = false;
+  let nestedMutationRejected = false;
+  try { context.env.LABEL = "mutated"; } catch (_) { topMutationRejected = true; }
+  try { context.env.OPTIONS.retries = 99; } catch (_) { nestedMutationRejected = true; }
+  const processBefore = process.env.LABEL;
+  process.env.LABEL = "invocation-local";
+  return new Response(JSON.stringify({
+    fresh,
+    nullPrototype: Object.getPrototypeOf(context.env) === null,
+    nestedNullPrototype: Object.getPrototypeOf(context.env.OPTIONS) === null,
+    frozen: Object.isFrozen(context.env),
+    nestedFrozen: Object.isFrozen(context.env.OPTIONS) && Object.isFrozen(context.env.OPTIONS.flags),
+    topMutationRejected,
+    nestedMutationRejected,
+    environmentNames: Object.keys(context.env).sort(),
+    label: context.env.LABEL,
+    retries: context.env.OPTIONS.retries,
+    token: context.env.TOKEN,
+    processBefore,
+    processWritable: process.env.LABEL === "invocation-local",
+    secretInProcess: Object.prototype.hasOwnProperty.call(process.env, "TOKEN"),
+    jsonInProcess: Object.prototype.hasOwnProperty.call(process.env, "OPTIONS"),
+  }), { headers: { "content-type": "application/json" } });
+}
+"#;
+    let declarations = deis_wire::EnvironmentDeclarations::new(
+        "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+        vec![
+            deis_wire::EnvironmentDeclaration {
+                name: "LABEL".to_string(),
+                kind: deis_wire::EnvironmentKind::Config,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            },
+            deis_wire::EnvironmentDeclaration {
+                name: "OPTIONS".to_string(),
+                kind: deis_wire::EnvironmentKind::Config,
+                value_type: deis_wire::EnvironmentValueType::Json,
+                required: true,
+            },
+            deis_wire::EnvironmentDeclaration {
+                name: "TOKEN".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            },
+        ],
+    );
+    let application_id = deis_wire::CanonicalId::new_v7();
+    let environment_id = deis_wire::CanonicalId::new_v7();
+    let secret_revision = "secret-revision-1";
+    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        "v1",
+        environment_id.to_string(),
+        declarations.identity().unwrap(),
+        vec![
+            deis_wire::EnvironmentBinding::Config(
+                deis_wire::EnvironmentConfigBinding::new(
+                    "LABEL",
+                    deis_wire::EnvironmentValueType::String,
+                    serde_json::json!("edge"),
+                )
+                .unwrap(),
+            ),
+            deis_wire::EnvironmentBinding::Config(
+                deis_wire::EnvironmentConfigBinding::new(
+                    "OPTIONS",
+                    deis_wire::EnvironmentValueType::Json,
+                    serde_json::json!({"retries": 2, "flags": [true, false]}),
+                )
+                .unwrap(),
+            ),
+            deis_wire::EnvironmentBinding::Secret(deis_wire::EnvironmentSecretBinding::new(
+                "TOKEN",
+                secret_revision,
+            )),
+        ],
+    );
+    let standard_environment = StandardEnvironmentOrder::new(
+        declarations.clone(),
+        snapshot.clone(),
+        snapshot.identity().unwrap(),
+        HashMap::from([(secret_revision.to_string(), "secret-value".to_string())]),
+        "v1",
+        &environment_id.to_string(),
+    )
+    .unwrap();
+    let bundle = standard_bundle("demo", HANDLER, &declarations);
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+    let dir = tempfile::tempdir().unwrap();
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+
+    deployer
+        .apply(DeploymentOrder {
+            app_id: "demo".to_string(),
+            canonical_tenant: Some(deis_wire::CanonicalTenantId::new(
+                application_id,
+                environment_id,
+            )),
+            version_id: "v1".to_string(),
+            environment: "production".to_string(),
+            bundle_url: control.url("v1"),
+            bundle_sha: bundle.sha256.clone(),
+            env: HashMap::new(),
+            standard_environment: Some(standard_environment),
+            limits: None,
+            compatibility: None,
+        })
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let (_status, _headers, body) = apps
+            .execute_app(
+                &demo(),
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let observed: serde_json::Value =
+            serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
+        assert_eq!(observed["fresh"], true);
+        assert_eq!(observed["nullPrototype"], true);
+        assert_eq!(observed["nestedNullPrototype"], true);
+        assert_eq!(observed["frozen"], true);
+        assert_eq!(observed["nestedFrozen"], true);
+        assert_eq!(observed["topMutationRejected"], true);
+        assert_eq!(observed["nestedMutationRejected"], true);
+        assert_eq!(
+            observed["environmentNames"],
+            serde_json::json!(["LABEL", "OPTIONS", "TOKEN"])
+        );
+        assert_eq!(observed["label"], "edge");
+        assert_eq!(observed["retries"], 2);
+        assert_eq!(observed["token"], "secret-value");
+        assert_eq!(observed["processBefore"], "edge");
+        assert_eq!(observed["processWritable"], true);
+        assert_eq!(observed["secretInProcess"], false);
+        assert_eq!(observed["jsonInProcess"], false);
+    }
+
+    let mut rotated_snapshot = snapshot;
+    for binding in &mut rotated_snapshot.bindings {
+        if let deis_wire::EnvironmentBinding::Secret(secret) = binding {
+            secret.revision = "secret-revision-2".to_string();
+        }
+    }
+    let rotated_environment = StandardEnvironmentOrder::new(
+        declarations,
+        rotated_snapshot.clone(),
+        rotated_snapshot.identity().unwrap(),
+        HashMap::from([("secret-revision-2".to_string(), "rotated-value".to_string())]),
+        "v1",
+        &environment_id.to_string(),
+    )
+    .unwrap();
+    let as_of = deployer.change_stamp();
+    let applied = deployer
+        .apply_from_assignment(
+            DeploymentOrder {
+                app_id: "demo".to_string(),
+                canonical_tenant: Some(deis_wire::CanonicalTenantId::new(
+                    application_id,
+                    environment_id,
+                )),
+                version_id: "v1".to_string(),
+                environment: "production".to_string(),
+                bundle_url: control.url("v1"),
+                bundle_sha: bundle.sha256.clone(),
+                env: HashMap::new(),
+                standard_environment: Some(rotated_environment),
+                limits: None,
+                compatibility: None,
+            },
+            as_of,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        applied,
+        Applied::Installed {
+            reused_bundle: true
+        }
+    );
+    let (_status, _headers, body) = apps
+        .execute_app(
+            &demo(),
+            "http://localhost/".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let observed: serde_json::Value = serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
+    assert_eq!(observed["token"], "rotated-value");
 }
 
 #[tokio::test]
@@ -1093,6 +1338,79 @@ async fn recovers_its_versions_from_disk_when_there_is_no_control_plane() {
     assert_eq!(recovered, 1);
     assert_eq!(apps.installed_version(&demo()).unwrap().version_id, "v1");
     assert_eq!(apps.assets(&demo()).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_standard_snapshot_is_not_recovered_without_its_memory_only_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let declarations = deis_wire::EnvironmentDeclarations::new(
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        vec![deis_wire::EnvironmentDeclaration {
+            name: "LABEL".to_string(),
+            kind: deis_wire::EnvironmentKind::Config,
+            value_type: deis_wire::EnvironmentValueType::String,
+            required: true,
+        }],
+    );
+    let application_id = deis_wire::CanonicalId::new_v7();
+    let environment_id = deis_wire::CanonicalId::new_v7();
+    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        "v1",
+        environment_id.to_string(),
+        declarations.identity().unwrap(),
+        vec![deis_wire::EnvironmentBinding::Config(
+            deis_wire::EnvironmentConfigBinding::new(
+                "LABEL",
+                deis_wire::EnvironmentValueType::String,
+                serde_json::json!("edge"),
+            )
+            .unwrap(),
+        )],
+    );
+    let standard_environment = StandardEnvironmentOrder::new(
+        declarations.clone(),
+        snapshot.clone(),
+        snapshot.identity().unwrap(),
+        HashMap::new(),
+        "v1",
+        &environment_id.to_string(),
+    )
+    .unwrap();
+    let bundle = standard_bundle("demo", ECHO_HANDLER, &declarations);
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    {
+        let apps = Arc::new(ApplicationManager::new());
+        let deployer = deployer_in(dir.path(), apps).await;
+        deployer
+            .apply(DeploymentOrder {
+                app_id: "demo".to_string(),
+                canonical_tenant: Some(deis_wire::CanonicalTenantId::new(
+                    application_id,
+                    environment_id,
+                )),
+                version_id: "v1".to_string(),
+                environment: "production".to_string(),
+                bundle_url: control.url("v1"),
+                bundle_sha: bundle.sha256,
+                env: HashMap::new(),
+                standard_environment: Some(standard_environment),
+                limits: None,
+                compatibility: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    assert_eq!(deployer.recover_from_disk().await, 0);
+    assert!(
+        apps.installed_version(&demo()).is_none(),
+        "schema-2 started with a snapshot it could not reconstruct exactly"
+    );
 }
 
 #[tokio::test]

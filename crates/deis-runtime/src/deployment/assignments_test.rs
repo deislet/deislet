@@ -380,10 +380,10 @@ fn an_assignment_cannot_supply_only_half_of_canonical_identity() {
     }))
     .unwrap();
 
-    assert_eq!(
-        assignment.into_order().unwrap_err(),
-        deis_wire::CanonicalTenantIdError::MissingEnvironmentId
-    );
+    assert!(assignment
+        .into_order()
+        .unwrap_err()
+        .contains("canonical_environment_id"));
 }
 
 #[test]
@@ -627,6 +627,7 @@ async fn a_refused_push_degrades_a_node_that_has_no_next_reconcile_pass() {
         bundle_url: "http://127.0.0.1:1/bundle".to_string(),
         bundle_sha: "0".repeat(64),
         env: std::collections::HashMap::new(),
+        standard_environment: None,
         limits: None,
         compatibility: None,
     };
@@ -1199,6 +1200,7 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_rolled_back() {
                 bundle_url: format!("{}/bundle", plane.base()),
                 bundle_sha: sha.clone(),
                 env: HashMap::new(),
+                standard_environment: None,
                 limits: None,
                 compatibility: None,
             })
@@ -1253,6 +1255,7 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
                 bundle_url: format!("{}/bundle", plane.base()),
                 bundle_sha: sha.clone(),
                 env: HashMap::new(),
+                standard_environment: None,
                 limits: None,
                 compatibility: None,
             })

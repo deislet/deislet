@@ -84,13 +84,16 @@ cargo build -p deis-store -p deis-queue
 deis-store  --config deis-store.toml  &     # listens on 8090
 deis-queue  --config deis-queue.toml  &     # listens on 8091
 
-deis dev --store http://127.0.0.1:8090 --queue http://127.0.0.1:8091 \
-         -s API_KEY=local-value
+printf '%s\n' 'API_KEY=local-value' | \
+  deis dev --store http://127.0.0.1:8090 --queue http://127.0.0.1:8091 \
+           --secrets-stdin
 ```
 
-`-s/--secret NAME=VALUE` stands in for a value the control plane would have
-decrypted and delivered. Nothing triggers cron locally; call the handler
-directly to test it.
+`--secrets-stdin` reads a `NAME=VALUE` document through EOF before starting;
+`--secrets-file PATH` accepts the same document only from an owner-only regular
+file (for example, after `chmod 600 .dev-secrets`). Secret plaintext never
+travels in argv or the process environment. Nothing triggers cron locally;
+call the handler directly to test it.
 
 ## 3. Point at a platform
 

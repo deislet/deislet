@@ -71,7 +71,7 @@ pub use deis_wire::conventions::ASSIGNMENTS_WITHHELD_HEADER;
 
 /// One line of the list, in exactly the shape the wire contract of
 /// docs/implementation-plan.zh.md section 4 specifies.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct AssignmentView {
     pub app_id: String,
     /// Permanent application identity used by the canonical tenant contract.
@@ -127,6 +127,14 @@ pub struct AssignmentView {
     /// node would have to guess, which is the one thing this field exists to
     /// stop.
     pub compatibility: crate::catalog::DeclaredCompatibility,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_declarations: Option<deis_wire::EnvironmentDeclarations>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_values_by_revision: BTreeMap<String, String>,
 }
 
 /// GET /api/nodes/:id/assignments
@@ -165,28 +173,38 @@ pub async fn for_node(
         // this answer with the reason said out loud. The node then simply
         // does not run it, which is the same outcome a refused deployment
         // has, rather than running it with a hole in its environment.
-        let (env, limits, compatibility, canonical_application_id, canonical_environment_id) =
-            match state.deliverer.assignment_payload(assignment, &base).await {
-                Ok(payload) => (
+        let (
+            env,
+            limits,
+            compatibility,
+            canonical_application_id,
+            canonical_environment_id,
+            standard_environment,
+        ) = match state.deliverer.assignment_payload(assignment, &base).await {
+            Ok(payload) => {
+                let standard_environment = payload.standard_environment_for_wire();
+                (
                     payload.env_for_wire(),
                     payload.limits.clone(),
                     payload.compatibility,
                     payload.canonical_application_id,
                     payload.canonical_environment_id,
-                ),
-                Err(e) => {
-                    error!(
-                        node = %node_id,
-                        app_id = %assignment.app_id,
-                        environment = %assignment.environment,
-                        version_id = %assignment.version_id,
-                        error = %e,
-                        "Could not build the environment for this assignment, so it is left out of the list; the list is marked incomplete so a node reconciling against it does not unload an application that is running fine, and this node will not start this application until the problem is fixed and it asks again"
-                    );
-                    withheld += 1;
-                    continue;
-                }
-            };
+                    standard_environment,
+                )
+            }
+            Err(e) => {
+                error!(
+                    node = %node_id,
+                    app_id = %assignment.app_id,
+                    environment = %assignment.environment,
+                    version_id = %assignment.version_id,
+                    error = %e,
+                    "Could not build the environment for this assignment, so it is left out of the list; the list is marked incomplete so a node reconciling against it does not unload an application that is running fine, and this node will not start this application until the problem is fixed and it asks again"
+                );
+                withheld += 1;
+                continue;
+            }
+        };
 
         views.push(AssignmentView {
             bundle_url: crate::delivery::bundle_url(
@@ -203,6 +221,18 @@ pub async fn for_node(
             env,
             limits,
             compatibility,
+            environment_declarations: standard_environment
+                .as_ref()
+                .map(|(declarations, _, _, _)| declarations.clone()),
+            environment_snapshot: standard_environment
+                .as_ref()
+                .map(|(_, snapshot, _, _)| snapshot.clone()),
+            environment_snapshot_id: standard_environment
+                .as_ref()
+                .map(|(_, _, identity, _)| identity.clone()),
+            secret_values_by_revision: standard_environment
+                .map(|(_, _, _, secrets)| secrets)
+                .unwrap_or_default(),
         });
     }
 

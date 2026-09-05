@@ -76,6 +76,8 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
         );
     }
 
+    let config_values = deployment_config_values(&dir, &bundle.manifest)?;
+
     output.line(format!(
         "  {} built {} ({}, sha256 {})",
         "✓".green(),
@@ -126,7 +128,13 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
 
     let deployment = session
         .control
-        .deploy(&app, &environment, &upload.version.id, args.note.as_deref())
+        .deploy(
+            &app,
+            &environment,
+            &upload.version.id,
+            args.note.as_deref(),
+            &config_values,
+        )
         .await?;
 
     if output.json {
@@ -161,6 +169,31 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     // A version that reached no node is not deployed, whatever the catalog
     // now says, so the exit code has to say so too.
     fail_on_incomplete_delivery(deployment.delivery.as_ref(), &environment)
+}
+
+/// Resolve only the non-secret values selected at deployment time. The
+/// bundle's declaration remains authoritative: a stale project file cannot
+/// silently attach values to a canonical artifact built from another set of
+/// declarations.
+pub(crate) fn deployment_config_values(
+    project_dir: &Path,
+    manifest: &deis_bundle::Manifest,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+    let Some(declarations) = manifest.environment.as_ref() else {
+        return Ok(Default::default());
+    };
+    let config = deis_build::load_project_config(&project_dir.to_string_lossy())
+        .context("reading deployment-time environment config from .config.json")?;
+    let supplied =
+        deis_build::resolve_environment_declarations(&config, &declarations.standard_version)
+            .context("validating deployment-time environment declarations")?;
+    if supplied.identity()? != declarations.identity()? {
+        bail!(
+            "EC_ARTIFACT_DERIVATION_INPUT_MISMATCH: .config.json environment declarations differ from the bundle being deployed"
+        );
+    }
+    deis_build::resolve_environment_config_values(&config, declarations)
+        .context("validating deployment-time environment values")
 }
 
 /// Print the version, the digest and where it landed.
@@ -329,6 +362,51 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KB");
         assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn schema_two_deploy_reads_typed_config_but_never_a_secret_value() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".config.json"),
+            r#"{
+                "version":"1.0",
+                "name":"demo",
+                "runtime":"standard-v1",
+                "language":"javascript",
+                "environment":{
+                    "declarations":[
+                        {"name":"OPTIONS","kind":"config","valueType":"json","required":true},
+                        {"name":"TOKEN","kind":"secret","valueType":"string","required":true}
+                    ],
+                    "values":{"OPTIONS":{"retries":3}}
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = deis_build::load_project_config(&project.path().to_string_lossy()).unwrap();
+        let declarations = deis_build::resolve_environment_declarations(
+            &config,
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+        )
+        .unwrap();
+        let manifest = deis_bundle::Manifest::parse(
+            &serde_json::json!({
+                "schema": 2,
+                "app": "demo",
+                "entry": "worker/index.js",
+                "environment": declarations,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let values = deployment_config_values(project.path(), &manifest).unwrap();
+        assert_eq!(
+            values.get("OPTIONS"),
+            Some(&serde_json::json!({"retries": 3}))
+        );
+        assert!(!values.contains_key("TOKEN"));
     }
 
     #[test]

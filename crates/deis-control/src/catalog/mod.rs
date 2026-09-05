@@ -64,7 +64,7 @@ pub use model::{
 };
 pub use operation::OperationRequestContext;
 pub use secrets::{SecretCipher, SecretsBackend};
-pub use store::{BundlePathRepair, CatalogStore};
+pub use store::{BundlePathRepair, CatalogStore, SecretHeadChange};
 
 use thiserror::Error;
 

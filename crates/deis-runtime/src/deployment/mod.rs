@@ -81,6 +81,7 @@ pub struct DeploymentOrder {
     pub bundle_url: String,
     pub bundle_sha: String,
     pub env: HashMap<String, String>,
+    pub standard_environment: Option<StandardEnvironmentOrder>,
     /// What this version's manifest asked to be held to, as the control plane
     /// read it out of the manifest and sent it. `None` means the application
     /// declared nothing and takes this node's own ceilings.
@@ -111,6 +112,92 @@ pub struct DeploymentOrder {
     pub compatibility: Option<deis_bundle::CompatibilityProfile>,
 }
 
+/// Typed Edge Canon environment material sent beside a schema-2 bundle.
+/// Secret values are keyed by immutable revision and deliberately omitted
+/// from Debug output.
+pub struct StandardEnvironmentOrder {
+    pub declarations: deis_wire::EnvironmentDeclarations,
+    pub snapshot: deis_wire::EnvironmentBindingSnapshot,
+    pub snapshot_id: String,
+    pub secret_values_by_revision: HashMap<String, String>,
+}
+
+impl StandardEnvironmentOrder {
+    pub fn new(
+        declarations: deis_wire::EnvironmentDeclarations,
+        snapshot: deis_wire::EnvironmentBindingSnapshot,
+        snapshot_id: String,
+        secret_values_by_revision: HashMap<String, String>,
+        version_id: &str,
+        environment_id: &str,
+    ) -> Result<Self, String> {
+        declarations
+            .validate(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                std::iter::empty::<&str>(),
+            )
+            .map_err(|error| error.to_string())?;
+        if snapshot.deployment_version_id != version_id || snapshot.environment_id != environment_id
+        {
+            return Err(
+                "EC_ENV_SNAPSHOT_INVALID: snapshot is not bound to this deployment".to_string(),
+            );
+        }
+        let computed = snapshot.identity().map_err(|error| error.to_string())?;
+        if computed != snapshot_id {
+            return Err(
+                "EC_ENV_SNAPSHOT_IDENTITY_MISMATCH: snapshot identity does not match its content"
+                    .to_string(),
+            );
+        }
+        let expected = snapshot
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                deis_wire::EnvironmentBinding::Secret(secret) => Some(secret.revision.as_str()),
+                deis_wire::EnvironmentBinding::Config(_) => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let supplied = secret_values_by_revision
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        if expected != supplied {
+            return Err(
+                "EC_ENV_SECRET_REVISION_UNAVAILABLE: secret revision values are incomplete or contain extras"
+                    .to_string(),
+            );
+        }
+        snapshot
+            .validate(
+                &declarations,
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                |revision| secret_values_by_revision.contains_key(revision),
+            )
+            .map_err(|error| error.to_string())?;
+        for value in secret_values_by_revision.values() {
+            deis_wire::validate_secret_value(value).map_err(|error| error.to_string())?;
+        }
+        Ok(Self {
+            declarations,
+            snapshot,
+            snapshot_id,
+            secret_values_by_revision,
+        })
+    }
+}
+
+impl std::fmt::Debug for StandardEnvironmentOrder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StandardEnvironmentOrder")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("bindings", &self.snapshot.bindings.len())
+            .field("secret_values", &"<redacted>")
+            .finish()
+    }
+}
+
 impl DeploymentOrder {
     /// Which running application this order is about.
     pub fn key(&self) -> AppKey {
@@ -130,6 +217,7 @@ impl std::fmt::Debug for DeploymentOrder {
             .field("bundle_url", &self.bundle_url)
             .field("bundle_sha", &self.bundle_sha)
             .field("env", &format_args!("{names:?} = <redacted>"))
+            .field("standard_environment", &self.standard_environment)
             .field("limits", &self.limits)
             .field("compatibility", &self.compatibility.map(|c| c.describe()))
             .finish()
@@ -163,6 +251,9 @@ pub enum DeployError {
     /// The control plane tried to change a permanent tenant identity already
     /// persisted for this application environment.
     Identity(String),
+    /// Edge Canon declaration/snapshot/value material is incomplete or does
+    /// not match the immutable bundle.
+    Environment(String),
     /// The isolate would not take the new code.
     Load(String),
 }
@@ -179,6 +270,7 @@ impl std::fmt::Display for DeployError {
                 write!(f, "this node cannot honour what the version declares: {m}")
             }
             Self::Identity(m) => write!(f, "canonical tenant identity was refused: {m}"),
+            Self::Environment(m) => write!(f, "environment snapshot was refused: {m}"),
             Self::Load(m) => write!(f, "the bundle would not load: {m}"),
         }
     }
@@ -206,6 +298,7 @@ impl DeployError {
             Self::Storage(_) => "its bundle could not be put on this node's disk",
             Self::Compatibility(_) => "this node's build cannot honour what the version declares",
             Self::Identity(_) => "its canonical tenant identity conflicts with this node's record",
+            Self::Environment(_) => "its environment snapshot is incomplete or invalid",
             Self::Load(_) => "the isolate would not take the new code",
         }
     }
@@ -440,12 +533,13 @@ impl DeploymentManager {
     /// carried the secrets.
     ///
     /// The second half of that condition is what makes it safe. The other way
-    /// to be "already on this version" is to have recovered it from local
-    /// disk, where secret values are never written: that copy runs the right
-    /// code with an empty environment. Comparing version ids alone would wave
-    /// the real delivery through, and the app would keep serving with no
-    /// secrets and no storage addresses for as long as the process lived,
-    /// while the node reported itself ready.
+    /// to be "already on this version" is a legacy schema-1 deployment
+    /// recovered from local disk, where secret values are never written: that
+    /// copy runs the right code with an incomplete environment. Schema-2
+    /// standard deployments fail closed instead of recovering without their
+    /// exact snapshot. Comparing version ids alone would still wave the real
+    /// legacy delivery through, leaving it without secrets and storage
+    /// addresses while the node reported itself ready.
     pub async fn apply_from_assignment(
         &self,
         mut order: DeploymentOrder,
@@ -480,7 +574,13 @@ impl DeploymentManager {
             .map_err(|error| DeployError::Identity(error.to_string()))?;
 
         if let Some(current) = self.app_manager.installed_version(&key) {
-            if current.version_id == order.version_id {
+            let assigned_snapshot = order
+                .standard_environment
+                .as_ref()
+                .map(|environment| environment.snapshot_id.as_str());
+            if current.version_id == order.version_id
+                && current.environment_snapshot_id.as_deref() == assigned_snapshot
+            {
                 // The version record is this node's memory of what it
                 // installed; whether an isolate is still there is a separate
                 // fact, and the two come apart when one is lost without
@@ -519,7 +619,7 @@ impl DeploymentManager {
                         app_id = %key.app_id(),
                         environment = %key.environment(),
                         version_id = %order.version_id,
-                        "This version was recovered from local disk and is running without the \
+                        "This legacy version was recovered from local disk and is running without the \
                          secrets and storage addresses it declares; reloading it from the \
                          control plane's copy so that its environment is complete"
                     );
@@ -542,6 +642,10 @@ impl DeploymentManager {
             environment: order.environment.clone(),
             canonical_environment_id: order.canonical_tenant.map(|tenant| tenant.environment_id()),
             bundle_sha: order.bundle_sha.clone(),
+            environment_snapshot_id: order
+                .standard_environment
+                .as_ref()
+                .map(|environment| environment.snapshot_id.clone()),
         }
     }
 
@@ -549,9 +653,11 @@ impl DeploymentManager {
     ///
     /// This is the answer to an unreachable control plane: the node keeps
     /// serving what it was serving instead of coming up empty. The bundles on
-    /// disk carry no secrets, so an app whose manifest declares any starts up
-    /// without them; that is said out loud here rather than discovered from a
-    /// handler that reads `context.env` and finds nothing.
+    /// disk carry no secrets. A legacy schema-1 application may therefore
+    /// start with an explicitly unconfirmed environment until reconciliation.
+    /// A schema-2 application cannot reconstruct its immutable typed snapshot
+    /// from the bundle alone and is not started at all until the control plane
+    /// redelivers it.
     pub async fn recover_from_disk(&self) -> usize {
         let records = self.store.records().await;
         if records.is_empty() {
@@ -591,6 +697,7 @@ impl DeploymentManager {
                 bundle_url: String::new(),
                 bundle_sha: record.bundle_sha.clone(),
                 env: HashMap::new(),
+                standard_environment: None,
                 // Not on disk, for the same reason the secrets are not: the
                 // record this node keeps is a pointer, and the limits arrive
                 // with the deployment. Coming back on the node's own ceilings
@@ -618,7 +725,7 @@ impl DeploymentManager {
                         app_id = %record.app_id,
                         version_id = %record.version_id,
                         environment = %record.environment,
-                        "Recovered {} version {} from this node's own disk because the control \
+                        "Recovered legacy {} version {} from this node's own disk because the control \
                          plane could not be reached; it is serving, but any secret this app \
                          declares is missing until the control plane redelivers, because \
                          secret values are never written to disk, and it runs on this node's \
@@ -773,6 +880,10 @@ impl DeploymentManager {
         local_only: bool,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
+        let environment_snapshot_id = order
+            .standard_environment
+            .as_ref()
+            .map(|environment| environment.snapshot_id.clone());
         let installed_record = (!local_only).then(|| Self::record_for_order(&order));
         // Taken before the rest of the order is consumed piece by piece below.
         let limits = order.limits.take();
@@ -903,6 +1014,12 @@ impl DeploymentManager {
             ),
         }
 
+        let (standard_env, standard_node_process_env) = materialize_standard_environment(
+            &manifest,
+            order.standard_environment.as_ref(),
+            local_only,
+        )?;
+
         // The control plane already merges manifest variables with decrypted
         // secrets, so its map wins. The manifest's own variables are the base
         // so that a bundle recovered from disk still has them.
@@ -953,6 +1070,8 @@ impl DeploymentManager {
         // incomplete, no storage client is ever built, and every
         // `ctx.services.*` call answers "service not available".
         crate::runtime::wire_deployment_env(&manifest, &mut env);
+        let mut legacy_node_process_env = env.clone();
+        crate::runtime::strip_reserved_env(&mut legacy_node_process_env);
         let wired_services = env
             .get(crate::runtime::SERVICES_KEY)
             .cloned()
@@ -974,6 +1093,8 @@ impl DeploymentManager {
 
         let config = AppConfig {
             env,
+            standard_env,
+            node_process_env: standard_node_process_env.unwrap_or(legacy_node_process_env),
             routes: manifest.route_patterns(),
             // What the order carried, with anything it left out taken from
             // the version's own manifest; unjudged either way.
@@ -1004,6 +1125,7 @@ impl DeploymentManager {
             .install_version(VersionInstall {
                 key: key.clone(),
                 version_id: order.version_id.clone(),
+                environment_snapshot_id,
                 entry_point: manifest.entry.clone(),
                 code,
                 config,
@@ -1144,6 +1266,93 @@ impl DeploymentManager {
 /// Nothing is judged here. Whether a value is one this node will grant is
 /// `crate::app::ApplicationManager::effective_limits`'s decision, made once,
 /// where the node's own configuration is in scope.
+type MaterializedStandardEnvironment = (
+    Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    Option<HashMap<String, String>>,
+);
+
+fn materialize_standard_environment(
+    manifest: &deis_bundle::Manifest,
+    order: Option<&StandardEnvironmentOrder>,
+    local_only: bool,
+) -> Result<MaterializedStandardEnvironment, DeployError> {
+    match (&manifest.environment, order) {
+        (None, None) => Ok((None, None)),
+        (None, Some(_)) => Err(DeployError::Environment(
+            "EC_ENV_DECLARATION_IDENTITY_MISMATCH: wire carries an environment snapshot but the bundle is schema 1"
+                .to_string(),
+        )),
+        (Some(_), None) if local_only => Err(DeployError::Environment(
+            "EC_ENV_SECRET_REVISION_UNAVAILABLE: a schema-2 deployment cannot recover from disk without its in-memory secret revision values; wait for control-plane reconciliation"
+                .to_string(),
+        )),
+        (Some(_), None) => Err(DeployError::Environment(
+            "EC_ENV_SNAPSHOT_INVALID: schema-2 bundle has no environment snapshot"
+                .to_string(),
+        )),
+        (Some(declarations), Some(order)) => {
+            if declarations != &order.declarations {
+                return Err(DeployError::Environment(
+                    "EC_ENV_DECLARATION_IDENTITY_MISMATCH: wire declaration differs from the bundle"
+                        .to_string(),
+                ));
+            }
+            declarations
+                .validate(
+                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                    manifest.bindings.all_names(),
+                )
+                .map_err(|error| DeployError::Environment(error.to_string()))?;
+            order
+                .snapshot
+                .validate(
+                    declarations,
+                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                    |revision| order.secret_values_by_revision.contains_key(revision),
+                )
+                .map_err(|error| DeployError::Environment(error.to_string()))?;
+
+            let mut values = std::collections::BTreeMap::new();
+            let mut node_process_env = HashMap::new();
+            for binding in &order.snapshot.bindings {
+                match binding {
+                    deis_wire::EnvironmentBinding::Config(config) => {
+                        values.insert(config.name.clone(), config.value.clone());
+                        if config.value_type == deis_wire::EnvironmentValueType::String {
+                            let value = config.value.as_str().ok_or_else(|| {
+                                DeployError::Environment(
+                                    "EC_ENV_BINDING_TYPE_MISMATCH: string config binding does not contain a string"
+                                        .to_string(),
+                                )
+                            })?;
+                            node_process_env.insert(
+                                config.name.clone(),
+                                value.to_string(),
+                            );
+                        }
+                    }
+                    deis_wire::EnvironmentBinding::Secret(secret) => {
+                        let value = order
+                            .secret_values_by_revision
+                            .get(&secret.revision)
+                            .ok_or_else(|| {
+                                DeployError::Environment(
+                                    "EC_ENV_SECRET_REVISION_UNAVAILABLE: snapshot secret value is unavailable"
+                                        .to_string(),
+                                )
+                            })?;
+                        values.insert(
+                            secret.name.clone(),
+                            serde_json::Value::String(value.clone()),
+                        );
+                    }
+                }
+            }
+            Ok((Some(values), Some(node_process_env)))
+        }
+    }
+}
+
 fn limits_with_manifest(
     carried: Option<ResourceLimits>,
     manifest: &deis_bundle::Manifest,

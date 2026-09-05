@@ -51,6 +51,10 @@ pub struct InstalledRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_environment_id: Option<CanonicalId>,
     pub bundle_sha: String,
+    /// Digest identity only; environment values and secret plaintext remain
+    /// memory-only and must be redelivered after restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_snapshot_id: Option<String>,
 }
 
 impl InstalledRecord {

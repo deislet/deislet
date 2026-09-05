@@ -218,9 +218,9 @@ deis-runtime 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪�
 | APP | 有。`apps` 表 + `/api/apps` |
 | ENVIRONMENT | 有。`environments` 表；名字必须满足 `is_valid_tenant_part`（不许含 `.` `/` `\`，半边不超 64 字节），否则存储租户会被拆成三段而全废 |
 | VERSION | 有。`versions` 表，写入后永不修改；包体存控制面本地，`bundle_sha` 是内容哈希 |
-| DEPLOYMENT | 有。`deployments` 表只追加；某环境的当前版本 = 该 env 下最新一行 |
+| DEPLOYMENT | 有。`deployments` 表只追加；某环境的当前版本 = 该 env 下最新一行。schema-2 行同时固定 immutable environment snapshot identity |
 | ROUTE | 有，且被消费了。`routes` 表存 host + path_prefix + priority；`GET /api/routes` 给控制台看，另一条 `GET /api/routing-table` 给数据面看（多带环境名、所有存在的环境、整表版本号），deis-proxy 每 5 秒拉一次并按它选应用（见 §4） |
-| SECRET | 有。AES-256-GCM 落库，主密钥从 `secret_key_file` 读；面板与 CLI 只能写和删，读不回来 |
+| SECRET | 有。AES-256-GCM immutable revision + 每环境/name head；主密钥从 `secret_key_file` 读。面板与 CLI 只能写、列 metadata 和删 head，明文读不回来 |
 | CRON | 有，且挂对了对象：调度器按 `(app_id, environment)` 维护，到点调某一个节点的 `Trigger.OnScheduled` |
 | ASSET | 有。打进包里，节点建内存索引，命中直接返回并带 ETag。同一份包里还带着这个站点自己的规则——`_redirects`、`_headers` 和「路径谁都没认领时答什么」，构建期解析、装载时编译（见 §4） |
 | BINDING / NAMESPACE | 控制面**没有**这张表，也不打算建——具名绑定是**包的属性**，`bindings` 块写在 manifest 里随版本走，形状由 `deis-bundle` 唯一定义。所以「一个应用一个环境只有一份 KV」这条限制早已不在，见 §8 |
@@ -246,12 +246,12 @@ sequenceDiagram
     CLI->>R: POST /api/apps/{app}/versions（上传 zip）
     R->>R: 算 sha256，建 VERSION v(N+1)
     CLI->>R: POST /api/apps/{app}/environments（不存在才建）
-    CLI->>R: POST .../deployments（指针指向 v(N+1)）
+    CLI->>R: POST .../deployments（schema-2 原子写 snapshot + 指针）
     Dev->>CLI: deis secret set NAME（值从 stdin 进）
-    CLI->>R: PUT .../secrets/{name}（加密落库）
+    CLI->>R: PUT .../secrets/{name}（追加加密 revision；CAS head + snapshot）
 
     par 广播到已注册节点
-        R->>X: ApplyDeployment（app / version / environment / bundle_url / bundle_sha / env）
+        R->>X: ApplyDeployment（指针 + declaration + snapshot + revision values）
         X->>R: HTTP GET bundle_url，流式落盘
         X->>X: 校验 sha256 → 解包 → 建 Isolate → 切换
         X-->>R: ack
@@ -261,23 +261,25 @@ sequenceDiagram
 
     Note over Dev,X: —— 节点重启 ——
     X->>R: GET 清单（NODE_ASSIGNMENTS_ROUTE，带节点凭据）
-    R-->>X: 每个 (应用, 环境) 的版本 + bundle_url + 环境表（含解密后的密钥）
+    R-->>X: 每个 (应用, 环境) 的版本 + bundle_url + 精确 snapshot（含按 revision 索引的密钥值）
     X->>R: 逐个自取、校验、加载
     X->>X: 全部装好之后才报 healthy
 
     Note over Dev,X: —— 回滚 ——
     Dev->>CLI: deis rollback
     CLI->>R: POST .../rollback
-    R->>R: 再插一行 DEPLOYMENT 指向 v(N)
-    R->>X: ApplyDeployment(v(N))
+    R->>R: 再插一行 DEPLOYMENT 指向 v(N) 的历史 snapshot
+    R->>X: ApplyDeployment(v(N), historical snapshot)
     Note over X: 包通常已在本地，秒级完成
 ```
 
 - **包从不进 gRPC 消息**。控制面只发指针，节点自己 HTTP 取。早前的 `DeployApp`
   把整个 zip 塞进一次调用，撞 tonic 的消息上限，已删除。
 - **去重**：`bundle_sha` 相同不新建版本。
-- **部署失败不切指针**：任一节点没 ack，响应里 delivery 段会说明，指针语义由调用方
-  决定是否回退。
+- **当前实现仍先写 desired pointer 再广播**：任一节点没 ack，响应里的 delivery 段会说明，
+  但它还没有达到 ADR-009 对 `active` 的 prepare/verify/observed-state 要求；这仍是后续发布状态机
+  的明确阻断项。schema-2 已保证 snapshot 与 desired pointer 在控制面同一事务 CAS，不代表多节点
+  已原子接流量。
 - **不做百分比灰度**。全量复制下灰度需要 deis-runtime 同时驻留两个版本的 Isolate，
   本轮不做，但模型留了口子。
 - **换版先装好再切**：`RuntimePool::stage_app` 在另一条线程上把新版本建好、预热完，
@@ -715,12 +717,16 @@ fence，不把这种管理能力交给普通 producer/reader。
 ### 密钥
 
 - deis-control 用主密钥（从 `secret_key_file` 读，32 字节，不进代码不进库）
-  AES-256-GCM 加密后存 SQLite，nonce 前置。
-- 下发给 deis-runtime 时经 `ApplyDeployment` 的 `env` 表传明文，deis-runtime
-  **只放内存**，不落本地 SQLite。节点重启后从 assignments 重新拿。
-- 面板和 CLI 只能写和删，不能读回。
-- 某个环境的密钥解不开时，该行被整条剔出 assignments 并打 error，而不是发一份残缺
-  环境下去。
+  AES-256-GCM 加密后存 SQLite，nonce 前置；schema-2 的 AAD 绑定 env/name/revision，每次轮换
+  追加 immutable revision，不覆盖历史 ciphertext。
+- deployment snapshot 固定 config revision 与 secret revision；snapshot、secret head 与 deployment
+  pointer 在同一事务 compare-and-swap。rollback 重用历史 snapshot，不按 name 读取“最新值”。
+- 下发给 deis-runtime 时，schema-2 明文按 revision 索引，只在内存中物化；磁盘只记 snapshot
+  identity。节点重启后从 assignments 重新拿，控制面不可达时拒绝用不完整 schema-2 启动。
+- 面板和 CLI 只能写、列 name/revision/time 和删除 head，不能读回明文。CLI `secret set` 只从
+  非 echo stdin 读取；`deis dev` 只接受受限文件或 stdin secret document，明文不进入 argv/env。
+- 某个环境的 snapshot 或密钥解不开时，该行被整条剔出 assignments 并标记 incomplete，而不是
+  发一份残缺环境下去。
 - **因此** 清单接口（`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`）与 bundle
   下载挂在独立的 `node_auth` 上，凭据是 `node_preshared_keys`，不受面板的
   `api_auth_enabled` 影响，也不接受面板 API Key。这条路会把全部环境的明文密钥当 JSON 返回，早前它只挂在默认关闭的

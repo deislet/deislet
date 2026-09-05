@@ -78,6 +78,10 @@ pub struct Deployment {
     pub version_id: String,
     pub created_at: i64,
     pub note: Option<String>,
+    /// Immutable Edge Canon environment snapshot selected with this pointer.
+    /// Absent only on deployments written by the legacy schema-1 path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 /// A host plus path prefix bound to one environment. `host: None` matches
@@ -98,6 +102,8 @@ pub struct Route {
 #[derive(Debug, Clone, Serialize)]
 pub struct SecretMeta {
     pub name: String,
+    /// Opaque immutable revision identity. A later write creates another one.
+    pub revision: String,
     pub updated_at: i64,
 }
 
@@ -119,6 +125,7 @@ pub struct Assignment {
     pub environment: String,
     pub version_id: String,
     pub bundle_sha: String,
+    pub snapshot_id: Option<String>,
 }
 
 /// One environment's current version together with the manifest text that

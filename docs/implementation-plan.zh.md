@@ -286,7 +286,8 @@ CREATE TABLE deployments (
   env_id      TEXT NOT NULL REFERENCES environments(id),
   version_id  TEXT NOT NULL REFERENCES versions(id),
   created_at  INTEGER NOT NULL,
-  note        TEXT
+  note        TEXT,
+  snapshot_id TEXT REFERENCES environment_binding_snapshots(snapshot_id)
 );
 -- 某环境的「当前版本」= 该 env_id 下 created_at 最大的一行
 -- 回滚 = 插一行指向旧 version，不删不改
@@ -300,7 +301,7 @@ CREATE TABLE routes (
   priority    INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE secrets (
+CREATE TABLE secrets (                    -- schema-1/滚动升级兼容源
   id          TEXT PRIMARY KEY,
   app_id      TEXT NOT NULL,
   env_id      TEXT NOT NULL REFERENCES environments(id),
@@ -309,10 +310,42 @@ CREATE TABLE secrets (
   updated_at  INTEGER NOT NULL,
   UNIQUE(env_id, name)
 );
--- 密钥不随版本走：改密钥不产生新版本，但会触发一次重新下发
+
+CREATE TABLE secret_revisions (
+  revision_id TEXT PRIMARY KEY,
+  app_id      TEXT NOT NULL,
+  env_id      TEXT NOT NULL REFERENCES environments(id),
+  name        TEXT NOT NULL,
+  ciphertext  BLOB NOT NULL,
+  encryption_scheme TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE secret_heads (
+  env_id      TEXT NOT NULL REFERENCES environments(id),
+  name        TEXT NOT NULL,
+  revision_id TEXT NOT NULL REFERENCES secret_revisions(revision_id),
+  updated_at  INTEGER NOT NULL,
+  PRIMARY KEY (env_id, name)
+);
+
+CREATE TABLE environment_binding_snapshots (
+  snapshot_id TEXT PRIMARY KEY,            -- JCS document 的 SHA-256
+  app_id      TEXT NOT NULL,
+  env_id      TEXT NOT NULL REFERENCES environments(id),
+  version_id  TEXT NOT NULL REFERENCES versions(id),
+  declarations_sha256 TEXT NOT NULL,
+  document    TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+-- schema-2 的密钥每次写入都追加 revision；config/secret 的精确选择随
+-- deployment snapshot 原子激活。改密钥不产生新的应用 version。
 ```
 
 主密钥从 `deis-control` 配置的 `secret_key_file` 读取（32 字节），不进数据库、不进日志。
+revision ciphertext 的 AES-GCM AAD 同时绑定 env、name 与 revision，不能在同名历史记录间替换。
+旧 `secrets` 写入由数据库 trigger 镜像为 immutable revision/head，保证滚动升级期间新进程不读到
+静止的旧 head。
 
 上面这七张是最早那一批。后来又加了四张，都在同一个 `schema.rs` 里，形状按同样的规矩
 读：
@@ -389,7 +422,11 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
      string environment = 3;
      string bundle_url  = 4;   // 控制面上的 HTTP 下载地址
      string bundle_sha  = 5;
-     map<string, string> env = 6;   // 变量 + 解密后的密钥
+     map<string, string> env = 6;   // schema-1 环境 + 平台内部存储 wiring
+     string environment_declarations_json = 11;
+     string environment_snapshot_json = 12;
+     string environment_snapshot_id = 13;
+     map<string, string> secret_values_by_revision = 14;
    }
    ```
 2. 节点自己 HTTP GET `bundle_url`，流式落盘，校验 sha256，解包加载。
@@ -398,7 +435,9 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
 
 ```
 GET  deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE   // "/api/nodes/:id/assignments"
-→ [ { app_id, version_id, environment, bundle_url, bundle_sha, env } ]
+→ [ { app_id, version_id, environment, bundle_url, bundle_sha, env,
+      environment_declarations, environment_snapshot,
+      environment_snapshot_id, secret_values_by_revision } ]
 ```
 
 **路径写常量，不写字面量。** 服务端注册路由用 `NODE_ASSIGNMENTS_ROUTE` /
@@ -407,7 +446,12 @@ GET  deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE   // "/api/nodes/:id/assignm
 看的，会不会过期以 `crates/deis-wire/src/conventions.rs` 为准——本文档此前把登记接口
 写成 `POST .../register`，而代码里一直是 `PUT .../registration`，正是这类抄写造成的。
 
-`env` 与 `ApplyDeployment.env` 是同一张表（manifest 变量 + 当场解密的密钥 + 存储地址），因为**重启回来的节点必须拿到和推送时一样的环境**：只发指针的话，声明了密钥的应用会带着空密钥跑，声明了存储的应用连 deis-store 的地址都没有，而后者的唯一症状是每次 `context.env.<binding>` 调用失败。某个环境的密钥解不开时，该行被整条剔出清单并打 error，而不是发一份残缺环境下去。
+schema-1 的 `env` 与 `ApplyDeployment.env` 仍是同一张字符串表。schema-2 则传 declaration、精确
+snapshot identity 与按 immutable revision 索引的 secret plaintext；config/string、config/json 和
+secret/string 只从该 snapshot 物化，平台存储 wiring 仍留在内部 `env`，不会进入标准
+`context.env`。节点重启后必须从 assignments 重新取得同一个 snapshot；本地只持 snapshot digest，
+不持 config/secret value，因此控制面不可达时 schema-2 fail closed，不用 bundle 猜值。某个环境的
+snapshot 或密钥解不开时，该行被整条剔出清单并标为 incomplete，而不是发残缺环境。
 
 拉完、加载完才向控制面报 healthy。
 
@@ -543,7 +587,10 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 
 1. **资产优先**：加载版本时把 `manifest.assets` 读成内存索引。请求进来先按路径查索引，命中直接返回（带 `ETag`、`Content-Type`、`Cache-Control`），未命中才进 Isolate。
 2. **`context.params`**：`JsRequest` 现在没有 `params` 字段，所以 `context.params` 永远是空对象。按 manifest 的 `routes[].pattern` 匹配，把占位符解析结果填进去。
-3. **`context.env`**：从 `ApplyDeployment` 带来的 `env` map 注入，变量与密钥合并成一个字符串字典。密钥只留在内存，不落盘、不进日志。
+3. **`context.env`**：schema-2 从 declaration + deployment snapshot 物化；每次 invocation 得到新的
+   null-prototype 对象，JSON 值递归冻结，未声明/provider/host 值不进入其中。`process.env` 只投影
+   config/string，并在每次 invocation 重置；JSON 与 secret 不进入。schema-1 保留旧字符串 map。
+   secret plaintext 只留在内存，不落盘、不进日志。
 4. **限额可配置**：`isolate.rs` 里写死的 30 秒超时和 `RateLimiter::new(1000.0)` 提到配置，允许按应用覆盖。
 
 ---

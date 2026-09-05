@@ -14,7 +14,8 @@ pub struct Args {
     pub minify: bool,
     pub store: Option<String>,
     pub queue: Option<String>,
-    pub secrets: Vec<String>,
+    pub secrets_file: Option<PathBuf>,
+    pub secrets_stdin: bool,
 }
 
 pub async fn execute(args: Args) -> Result<()> {
@@ -28,7 +29,8 @@ pub async fn execute(args: Args) -> Result<()> {
         minify: args.minify,
         store: args.store,
         queue: args.queue,
-        secrets: args.secrets,
+        secrets_file: args.secrets_file,
+        secrets_stdin: args.secrets_stdin,
     })
     .await
 }

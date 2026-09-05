@@ -23,6 +23,16 @@ pub struct AppConfig {
     #[serde(default, skip_serializing)]
     pub env: std::collections::HashMap<String, String>,
 
+    /// Materialized EC-ENV config/secret values for schema-2 deployments.
+    /// `None` selects the legacy string map above; `Some` (including empty)
+    /// selects the typed, declaration-filtered standard environment.
+    #[serde(default, skip_serializing)]
+    pub standard_env: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+
+    /// Writable EC-NODE projection: config/string only, never JSON or secret.
+    #[serde(default, skip_serializing)]
+    pub node_process_env: std::collections::HashMap<String, String>,
+
     pub limits: Option<ResourceLimits>,
 
     /// Which of the platform's answers this application gets, resolved once
@@ -63,6 +73,17 @@ impl std::fmt::Debug for AppConfig {
         names.sort_unstable();
         f.debug_struct("AppConfig")
             .field("env", &format_args!("{names:?} = <redacted>"))
+            .field(
+                "standard_env",
+                &self
+                    .standard_env
+                    .as_ref()
+                    .map(|values| values.keys().collect::<Vec<_>>()),
+            )
+            .field(
+                "node_process_env",
+                &self.node_process_env.keys().collect::<Vec<_>>(),
+            )
             .field("limits", &self.limits)
             .field("compatibility", &self.compatibility.describe())
             .field("resources", &self.resources)

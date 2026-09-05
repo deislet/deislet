@@ -169,9 +169,14 @@ enum Commands {
         #[arg(long, value_name = "URL")]
         queue: Option<String>,
 
-        /// A secret value for this session, as NAME=VALUE. Repeatable.
-        #[arg(short = 's', long = "secret", value_name = "NAME=VALUE")]
-        secrets: Vec<String>,
+        /// Read local NAME=VALUE secrets from a restricted file. The path may
+        /// be in argv; the values never are.
+        #[arg(long, value_name = "PATH", conflicts_with = "secrets_stdin")]
+        secrets_file: Option<std::path::PathBuf>,
+
+        /// Read local NAME=VALUE secrets from stdin through EOF before start.
+        #[arg(long, conflicts_with = "secrets_file")]
+        secrets_stdin: bool,
     },
 
     /// Check the project against the specification.
@@ -934,8 +939,7 @@ enum QueueAction {
 
 #[derive(Subcommand)]
 enum SecretAction {
-    /// Store a secret. The value is read from stdin when it is not given,
-    /// which keeps it out of the shell history.
+    /// Store a secret by reading its value from stdin.
     Set {
         #[command(flatten)]
         target: Target,
@@ -945,9 +949,6 @@ enum SecretAction {
 
         /// Secret name, as `context.env` sees it.
         name: String,
-
-        /// Secret value. Omit it to be prompted, or to pipe it in.
-        value: Option<String>,
     },
 
     /// List the secret names of an environment, with when each was last set.
@@ -1100,7 +1101,8 @@ async fn run(cli: Cli) -> Result<()> {
             minify,
             store,
             queue,
-            secrets,
+            secrets_file,
+            secrets_stdin,
         } => {
             commands::dev::execute(commands::dev::Args {
                 port,
@@ -1112,7 +1114,8 @@ async fn run(cli: Cli) -> Result<()> {
                 minify,
                 store,
                 queue,
-                secrets,
+                secrets_file,
+                secrets_stdin,
             })
             .await
         }
@@ -1320,11 +1323,7 @@ async fn run(cli: Cli) -> Result<()> {
                 target,
                 format,
                 name,
-                value,
-            } => {
-                commands::secret::set(target.app, target.environment, name, value, format.into())
-                    .await
-            }
+            } => commands::secret::set(target.app, target.environment, name, format.into()).await,
             SecretAction::List { target, format } => {
                 commands::secret::list(target.app, target.environment, format.into()).await
             }
@@ -1676,6 +1675,29 @@ mod tests {
                 "{argv:?}: --env must not be accepted; it reads as context.env"
             );
         }
+    }
+
+    #[test]
+    fn secret_plaintext_has_no_command_line_form() {
+        assert!(
+            Cli::try_parse_from(["deis", "secret", "set", "TOKEN", "plaintext"]).is_err(),
+            "secret set accepted plaintext as a positional argv value"
+        );
+        assert!(
+            Cli::try_parse_from(["deis", "dev", "--secret", "TOKEN=plaintext"]).is_err(),
+            "dev accepted plaintext through the retired --secret argv flag"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "deis",
+                "dev",
+                "--secrets-file",
+                ".dev-secrets",
+                "--secrets-stdin",
+            ])
+            .is_err(),
+            "dev accepted two competing secret input channels"
+        );
     }
 
     /// Deploying targets this platform only. A `--vendor` flag here would

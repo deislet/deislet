@@ -91,6 +91,7 @@ const ObjectAssign = Object.assign;
 const ObjectCreate = Object.create;
 const ObjectDefineProperty = Object.defineProperty;
 const ObjectFreeze = Object.freeze;
+const ObjectKeys = Object.keys;
 const ArrayIsArray = Array.isArray;
 const ArrayPrototypePush = Function.prototype.call.bind(Array.prototype.push);
 const ArrayPrototypeSome = Function.prototype.call.bind(Array.prototype.some);
@@ -3642,19 +3643,44 @@ function createBindings() {
 // `context.log.info/warn/error()` among the basic features and its own cron
 // example calls it, so a scheduled handler that found `context.log` undefined
 // would fail on the first line it wrote.
+function cloneEnvironmentJson(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (ArrayIsArray(value)) {
+    const copy = [];
+    for (let index = 0; index < value.length; index += 1) {
+      copy[index] = cloneEnvironmentJson(value[index]);
+    }
+    return ObjectFreeze(copy);
+  }
+  const copy = ObjectCreate(null);
+  const keys = ObjectKeys(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    copy[key] = cloneEnvironmentJson(value[key]);
+  }
+  return ObjectFreeze(copy);
+}
+
 function createServiceContext() {
   // The application's own variables, plus the bindings the platform adds.
   // `ASSETS` is defined rather than assigned, and locked: an application that
   // ships a variable of that name has already had it removed on the Rust side,
   // and one that assigns over it here in strict mode -- which every ES module
   // is -- gets a TypeError rather than a silently disconnected binding.
-  const env = DenoCore.ops.op_deis_get_env() || {};
-  ObjectDefineProperty(env, ASSETS_BINDING_NAME, {
-    value: assetsBinding,
-    enumerable: true,
-    writable: false,
-    configurable: false,
-  });
+  const rawEnv = DenoCore.ops.op_deis_get_env() || {};
+  const standardEnvironment = DenoCore.ops.op_deis_environment_is_standard();
+  const env = ObjectCreate(null);
+  for (const name of ObjectKeys(rawEnv)) {
+    env[name] = cloneEnvironmentJson(rawEnv[name]);
+  }
+  if (!standardEnvironment) {
+    ObjectDefineProperty(env, ASSETS_BINDING_NAME, {
+      value: assetsBinding,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
 
   // Every named binding is published twice, on purpose, and they are the same
   // object either way:
@@ -3670,7 +3696,7 @@ function createServiceContext() {
   // (`Manifest::validate`), and if one somehow arrived it is overwritten here
   // rather than allowed to decide what `env.HOT` means.
   const bindings = createBindings();
-  for (const name of Object.keys(bindings)) {
+  for (const name of ObjectKeys(bindings)) {
     ObjectDefineProperty(env, name, {
       value: bindings[name],
       enumerable: true,
@@ -3678,6 +3704,7 @@ function createServiceContext() {
       configurable: false,
     });
   }
+  ObjectFreeze(env);
 
   return {
     env,

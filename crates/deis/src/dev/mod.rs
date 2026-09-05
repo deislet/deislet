@@ -53,9 +53,11 @@ pub struct Options {
     pub store: Option<String>,
     /// deis-queue address, if one is running locally.
     pub queue: Option<String>,
-    /// `NAME=VALUE` pairs standing in for the secrets the control plane
-    /// would have decrypted and sent.
-    pub secrets: Vec<String>,
+    /// Restricted file containing local `NAME=VALUE` secret values.
+    pub secrets_file: Option<PathBuf>,
+    /// Read the same document from stdin, keeping plaintext out of argv and
+    /// the process environment.
+    pub secrets_stdin: bool,
 }
 
 pub async fn run(options: Options) -> Result<()> {
@@ -80,8 +82,10 @@ pub async fn run(options: Options) -> Result<()> {
     let app = bundle.manifest.app.clone();
     crate::settings::check_name("application", &app)?;
 
-    let secrets = parse_secrets(&options.secrets)?;
+    let secrets =
+        load_secret_values(options.secrets_file.as_deref(), options.secrets_stdin).await?;
     let env = deployment_env(&bundle, &secrets, &options);
+    let config_values = crate::commands::deploy::deployment_config_values(&dir, &bundle.manifest)?;
     report_gaps(&bundle, &secrets, &options);
 
     let bundles = proxy::BundleServer::start(bundle.bytes.clone()).await?;
@@ -92,14 +96,16 @@ pub async fn run(options: Options) -> Result<()> {
 
     let (mut node, mut node_exited) =
         node::DevNode::start(&binary, runtime_port, options.debug).await?;
-    node.apply(
-        &app,
-        &options.environment,
-        &bundles.url,
-        &bundle.digest,
+    node.apply(node::DevDeployment {
+        app: &app,
+        environment: &options.environment,
+        bundle_url: &bundles.url,
+        bundle_sha: &bundle.digest,
         env,
-        &bundle.manifest,
-    )
+        config_values,
+        local_secrets: &secrets,
+        manifest: &bundle.manifest,
+    })
     .await?;
 
     let addr = front_listener
@@ -227,17 +233,28 @@ async fn reload(
     }
 
     let env = deployment_env(&bundle, secrets, options);
+    let config_values =
+        match crate::commands::deploy::deployment_config_values(dir, &bundle.manifest) {
+            Ok(values) => values,
+            Err(error) => {
+                println!("  {} {error}", "✗".red());
+                println!("  {}", "the previous build is still being served".dimmed());
+                return;
+            }
+        };
     bundles.replace(bundle.bytes.clone()).await;
 
     match node
-        .apply(
+        .apply(node::DevDeployment {
             app,
-            &options.environment,
-            &bundles.url,
-            &bundle.digest,
+            environment: &options.environment,
+            bundle_url: &bundles.url,
+            bundle_sha: &bundle.digest,
             env,
-            &bundle.manifest,
-        )
+            config_values,
+            local_secrets: secrets,
+            manifest: &bundle.manifest,
+        })
         .await
     {
         Ok(()) => println!(
@@ -335,11 +352,25 @@ fn report_gaps(bundle: &Bundle, secrets: &BTreeMap<String, String>, options: &Op
         );
     }
 
-    for name in &bundle.manifest.secrets {
+    let declared_secrets = bundle
+        .manifest
+        .environment
+        .as_ref()
+        .map(|environment| {
+            environment
+                .declarations
+                .iter()
+                .filter(|declaration| declaration.kind == deis_wire::EnvironmentKind::Secret)
+                .map(|declaration| declaration.name.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| bundle.manifest.secrets.iter().map(String::as_str).collect());
+    for name in declared_secrets {
         if !secrets.contains_key(name) {
             println!(
                 "  {} secret {name} has no local value, so context.env.{name} will be missing. \
-                 Pass --secret {name}=<value>.",
+                 pass a restricted NAME=VALUE document with --secrets-file, or pipe it to \
+                 --secrets-stdin.",
                 "!".yellow()
             );
         }
@@ -427,21 +458,96 @@ fn free_port() -> Result<u16> {
         .port())
 }
 
-/// Read `NAME=VALUE` pairs.
-fn parse_secrets(raw: &[String]) -> Result<BTreeMap<String, String>> {
-    let mut secrets = BTreeMap::new();
-    for entry in raw {
-        let Some((name, value)) = entry.split_once('=') else {
+const MAX_LOCAL_SECRET_DOCUMENT_BYTES: usize =
+    deis_wire::ENVIRONMENT_BINDING_COUNT_LIMIT * (deis_wire::ENVIRONMENT_VALUE_BYTES_LIMIT + 80);
+
+/// Read local secret plaintext through a channel that does not expose it in
+/// argv or the process environment. File mode validation is intentionally
+/// fail-closed where Rust's standard library can prove it; stdin is the
+/// portable path on systems where it cannot inspect an ACL.
+async fn load_secret_values(
+    path: Option<&std::path::Path>,
+    from_stdin: bool,
+) -> Result<BTreeMap<String, String>> {
+    let bytes = if let Some(path) = path {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("reading local secret file metadata at {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
             bail!(
-                "--secret {entry:?} is not a NAME=VALUE pair. Write it as --secret \
-                 API_KEY=local-value."
+                "local secret path {} must be a regular, non-symlink file",
+                path.display()
             );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                bail!(
+                    "local secret file {} is readable or writable by group/others; run chmod 600 on it",
+                    path.display()
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            bail!(
+                "--secrets-file cannot verify this platform's ACL yet; use --secrets-stdin so secret plaintext stays on a protected channel"
+            );
+        }
+        if metadata.len() > MAX_LOCAL_SECRET_DOCUMENT_BYTES as u64 {
+            bail!("local secret document exceeds the supported size limit");
+        }
+        tokio::fs::read(path)
+            .await
+            .with_context(|| format!("reading local secret file {}", path.display()))?
+    } else if from_stdin {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        tokio::io::stdin()
+            .take((MAX_LOCAL_SECRET_DOCUMENT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .context("reading local secrets from stdin")?;
+        bytes
+    } else {
+        return Ok(BTreeMap::new());
+    };
+    if bytes.len() > MAX_LOCAL_SECRET_DOCUMENT_BYTES {
+        bail!("local secret document exceeds the supported size limit");
+    }
+    let document = std::str::from_utf8(&bytes).context("local secret document must be UTF-8")?;
+    parse_secret_document(document)
+}
+
+fn parse_secret_document(document: &str) -> Result<BTreeMap<String, String>> {
+    let mut secrets = BTreeMap::new();
+    for (index, raw_line) in document.lines().enumerate() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            bail!("local secret line {} is not a NAME=VALUE pair", index + 1);
         };
         let name = name.trim();
         if name.is_empty() {
-            bail!("--secret {entry:?} has no name before the \"=\".");
+            bail!("local secret line {} has no name before the '='", index + 1);
         }
-        secrets.insert(name.to_string(), value.to_string());
+        deis_wire::EnvironmentDeclaration {
+            name: name.to_string(),
+            kind: deis_wire::EnvironmentKind::Secret,
+            value_type: deis_wire::EnvironmentValueType::String,
+            required: true,
+        }
+        .validate()
+        .map_err(anyhow::Error::new)?;
+        deis_wire::validate_secret_value(value).map_err(anyhow::Error::new)?;
+        if secrets
+            .insert(name.to_string(), value.to_string())
+            .is_some()
+        {
+            bail!("local secret document contains duplicate name {name}");
+        }
     }
     Ok(secrets)
 }
@@ -451,19 +557,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secrets_are_read_as_name_value_pairs() {
+    fn secret_document_is_read_as_name_value_pairs() {
         let secrets =
-            parse_secrets(&["API_KEY=abc".to_string(), "URL=http://x/?a=b".to_string()]).unwrap();
+            parse_secret_document("# local only\nAPI_KEY=abc\nURL=http://x/?a=b\n").unwrap();
         assert_eq!(secrets["API_KEY"], "abc");
         // Only the first "=" separates; a value may contain more.
         assert_eq!(secrets["URL"], "http://x/?a=b");
     }
 
     #[test]
-    fn a_secret_without_a_value_says_the_shape_it_wanted() {
-        let error = parse_secrets(&["API_KEY".to_string()])
+    fn malformed_secret_lines_do_not_echo_their_contents() {
+        let error = parse_secret_document("API_KEY-with-sensitive-suffix")
             .unwrap_err()
             .to_string();
         assert!(error.contains("NAME=VALUE"), "{error}");
+        assert!(!error.contains("sensitive-suffix"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secret_file_requires_owner_only_regular_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let secret_path = directory.path().join("secrets.env");
+        std::fs::write(&secret_path, "API_KEY=local-only\n").unwrap();
+
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = load_secret_values(Some(&secret_path), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("chmod 600"), "{error}");
+        assert!(!error.contains("local-only"), "{error}");
+
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let secrets = load_secret_values(Some(&secret_path), false).await.unwrap();
+        assert_eq!(secrets["API_KEY"], "local-only");
+
+        let symlink_path = directory.path().join("secrets-link.env");
+        symlink(&secret_path, &symlink_path).unwrap();
+        let error = load_secret_values(Some(&symlink_path), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-symlink"), "{error}");
+        assert!(!error.contains("local-only"), "{error}");
     }
 }

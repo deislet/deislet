@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-05T12:30:00+08:00",
+  "updatedAt": "2026-09-05T14:24:25+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -14,7 +14,8 @@
     "P0-SPEC-002",
     "P0-MODEL-001",
     "P1-BUILD-001",
-    "P1-PLAT-001"
+    "P1-PLAT-001",
+    "P2-DATA-001"
   ],
   "phases": [
     {
@@ -313,10 +314,20 @@
           "id": "P2-DATA-001",
           "title": "统一 env/secrets/KV/cache/SQL/blob/queue/cron/service binding",
           "owner": "joint",
-          "status": "queued",
+          "status": "active",
           "dependsOn": ["P0-MODEL-001", "P1-DEPLOY-001"],
-          "outputs": [{"type": "planned-path", "value": "resource semantic and lifecycle suites"}],
-          "verification": "API、错误、一致性、限制与生命周期 mandatory suites 全绿"
+          "outputs": [
+            {"type": "local-path", "value": "crates/deis-wire/src/environment.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/catalog/secrets.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/delivery/mod.rs"},
+            {"type": "local-path", "value": "crates/deis-runtime/src/deployment/mod.rs"},
+            {"type": "local-path", "value": "crates/deis-runtime/src/runtime/js/runtime.js"},
+            {"type": "local-path", "value": "crates/deis/src/commands/deploy.rs"},
+            {"type": "local-path", "value": "crates/deis/src/dev/mod.rs"},
+            {"type": "planned-path", "value": "resource semantic and lifecycle suites"}
+          ],
+          "verification": "EC-ENV Draft contract 已由 Deislet production path 实现：部署构造不可变 typed snapshot，secret revision/head、deployment/head CAS、同版本 rotation 与精确历史 rollback 均有 Control 回归；assignment/runtime 逐层校验标准版本、declaration、snapshot identity、revision/value map，schema-2 离线恢复失败关闭，context.env 与 process.env 逐 invocation 隔离；CLI 不接受 argv secret plaintext，并约束本地文件权限。当前只关闭 env/secrets 的 Deislet 实现切片；config 独立更新、retention/GC/销毁审计、per-tenant envelope key、加密 node transport、cluster prepare/activate/observed convergence、Cloudflare/EdgeOne live evidence，以及 KV/cache/SQL/blob/queue/cron/service binding mandatory suites 仍阻断完成"
         },
         {
           "id": "P2-STATE-001",

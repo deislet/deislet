@@ -27,10 +27,10 @@ use tracing::warn;
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::catalog::SecretMeta;
-use crate::catalog::secrets::secret_aad;
-use crate::delivery::{DeliveryReason, DeliveryReport};
+use crate::catalog::secrets::secret_revision_aad;
+use crate::delivery::DeliveryReport;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct PutSecretRequest {
     /// Plaintext value. It is encrypted before it touches the database and
     /// is never written to a log.
@@ -68,6 +68,8 @@ pub async fn put_secret(
     Json(request): Json<PutSecretRequest>,
 ) -> ApiResult<Json<SecretChangeResponse>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
+    deis_wire::validate_secret_value(&request.value)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
     // Resolve the cipher before anything else so a missing master key can
     // never end with a plaintext value in the row.
@@ -81,16 +83,67 @@ pub async fn put_secret(
         ApiError::from(e)
     })?;
 
-    let ciphertext = cipher.encrypt(request.value.as_bytes(), &secret_aad(&env.id, &name))?;
-    let secret = state.store.put_secret(&env, &name, ciphertext).await?;
+    let expected_revision = state.store.current_secret_revision(&env.id, &name).await?;
+    let revision = deis_wire::CanonicalId::new_v7().to_string();
+    let ciphertext = cipher.encrypt(
+        request.value.as_bytes(),
+        &secret_revision_aad(&env.id, &name, &revision),
+    )?;
+    let secret = state
+        .store
+        .stage_secret_revision(&env, &name, &revision, ciphertext)
+        .await?;
 
     // No new version exists to point at, so the running one is delivered
     // again with a freshly decrypted environment.
     let base = state.deliverer.base_url(&headers);
-    let delivery = state
+    let delivery_result = state
         .deliverer
-        .reload_current(&env, &base, DeliveryReason::SecretChange)
+        .activate_secret_change(
+            &env,
+            &base,
+            &name,
+            Some(&secret.revision),
+            expected_revision.as_deref(),
+        )
         .await;
+    let delivery = match delivery_result {
+        Ok(delivery) => delivery,
+        Err(error) => {
+            match state
+                .store
+                .discard_secret_revision_if_unreferenced(&env.id, &name, &secret.revision)
+                .await
+            {
+                Ok(true) => warn!(
+                    app_id = %app_id,
+                    environment = %env_name,
+                    secret = %name,
+                    revision = %secret.revision,
+                    code = "EC_ENV_STAGING_DISCARDED",
+                    "Secret activation failed; its unreferenced staged revision was removed"
+                ),
+                Ok(false) => warn!(
+                    app_id = %app_id,
+                    environment = %env_name,
+                    secret = %name,
+                    revision = %secret.revision,
+                    code = "EC_ENV_STAGING_RETAINED",
+                    "Secret activation failed; cleanup retained a revision that is now referenced"
+                ),
+                Err(cleanup) => warn!(
+                    app_id = %app_id,
+                    environment = %env_name,
+                    secret = %name,
+                    revision = %secret.revision,
+                    code = "EC_ENV_STAGING_CLEANUP_FAILED",
+                    error = %cleanup,
+                    "Secret activation failed and staged-revision cleanup must be retried"
+                ),
+            }
+            return Err(error.into());
+        }
+    };
 
     Ok(Json(SecretChangeResponse { secret, delivery }))
 }
@@ -118,15 +171,19 @@ pub async fn delete_secret(
     headers: HeaderMap,
 ) -> ApiResult<Json<SecretDeletedResponse>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
-    state.store.delete_secret(&env, &name).await?;
+    let expected_revision = state
+        .store
+        .current_secret_revision(&env.id, &name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("secret {name} in environment {}", env.id)))?;
 
     // Same reason as on write: without this the nodes would keep serving
     // the deleted value until something else moved the version pointer.
     let base = state.deliverer.base_url(&headers);
     let delivery = state
         .deliverer
-        .reload_current(&env, &base, DeliveryReason::SecretChange)
-        .await;
+        .activate_secret_change(&env, &base, &name, None, Some(&expected_revision))
+        .await?;
 
     Ok(Json(SecretDeletedResponse {
         deleted: name,
@@ -198,6 +255,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["secret"]["name"], "API_KEY");
+        let first_revision = body["secret"]["revision"].as_str().unwrap().to_string();
+        first_revision
+            .parse::<deis_wire::CanonicalId>()
+            .expect("secret writes expose an opaque UUIDv7 revision, not a value");
         assert_eq!(body["delivery"]["reason"], "secret_change");
         assert_eq!(
             body["delivery"]["version_id"], version_id,
@@ -207,6 +268,27 @@ mod tests {
             !body.to_string().contains("super-secret"),
             "neither the secret nor the delivery report may echo the value"
         );
+
+        let (status, rotated) = json(
+            &h.router,
+            "PUT",
+            "/api/apps/demo/environments/production/secrets/API_KEY",
+            serde_json::json!({"value": "rotated-secret"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rotated}");
+        let second_revision = rotated["secret"]["revision"].as_str().unwrap();
+        assert_ne!(second_revision, first_revision);
+        assert!(!rotated.to_string().contains("rotated-secret"));
+        let (status, listed) = json(
+            &h.router,
+            "GET",
+            "/api/apps/demo/environments/production/secrets",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["secrets"][0]["revision"], second_revision);
 
         // Deleting is the same story: without a redelivery the nodes would
         // keep serving a value that no longer exists.

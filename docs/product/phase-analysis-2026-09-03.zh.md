@@ -1653,3 +1653,53 @@ Application/framework source + versioned build plan
 - Deislet 新构建的 native bundle 升为 schema 2，携带同一 declaration 文档并强制旧 `env`/`secrets` 为空；schema 1 继续只为既有部署回滚可读。schema 2 缺 declaration、混入旧值字段，或 schema 1 偷带新 declaration 都会在 build/upload/load 共用校验处拒绝。实现计划中的包格式示例已同步，避免文档继续指导用户把 config 值写入 immutable bundle。
 - Cloudflare、EdgeOne/Tencent 与 Deno adapter 现在把 provider 原生 binding container 投影到 declaration 的精确名称集合；额外 account/region/deployment/host variable 默认排除。每次 invocation 创建新的 null-prototype、冻结 `context.env`，JSON 解析后深复制并递归冻结；required 缺失和类型错误 fail closed。启用 EC-NODE 时 `process.env` 只得到 config/string 可写副本，JSON、secret 与宿主环境均不进入。该切片仍只是派生产物中的统一 materializer，不等于远端 provider 的 create/update/rotate/rollback evidence 已完成。
 - 定向验证已覆盖 6 项共享 wire 测试、14 项 config 解析测试、169 项 bundle 测试、70 项 Deislet adapter 测试、三个外部 adapter 编译测试和 canonical build output 的跨临时目录确定性与 secret sentinel 扫描。继续发现并保持为 active 的下一缺陷是：控制面 `secrets` 表仍按 `(env_id,name)` 原地覆盖，deployment 不引用 snapshot，rollback 与节点重启会按名字拿到最新 secret；这直接违反 EC-ENV-LIFE-002/003/004 与 EC-ENV-CON-003，下一切片必须改为 immutable revision、version-bound snapshot 和 compare-and-set activation 后才能宣称闭环。
+
+## 57. EC-ENV 控制面、运行时与开发者入口闭环
+
+- Deislet 产品构建现在只接受与 `standards/edge-canon.lock.json` 相同的精确
+  `edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66`，不再拿输入文档自己的版本当
+  validator 版本。`deis-wire` 的编译常量与 lock source commit 建立测试不变量，bundle/control/runtime/dev
+  四处共用同一 pin；另一个语法合法但不同的 commit 以 `EC_ENV_STANDARD_PIN_INVALID` fail closed。
+- Control SQLite 新增 `secret_revisions`、`secret_heads` 与 `environment_binding_snapshots`，deployment
+  行引用 snapshot identity。新 secret ciphertext 的 AES-256-GCM AAD 同时绑定 env/name/revision；轮换只
+  追加 revision，删除只移除 head，已被 active/history snapshot 引用的 ciphertext 继续可供 rollback。
+  数据库 trigger 拒绝跨 application/environment owner、跨 name head、snapshot document/row identity
+  不一致、revision/snapshot 原地更新和 deployment snapshot 事后改写。旧 `secrets` 行启动时幂等迁移，
+  mixed-version peer 后续 insert/update/delete 也由 trigger 镜像到 revision/head，避免滚动升级读取静止 head。
+- schema-2 deploy 在写 desired pointer 前构建完整 typed snapshot：config 值只能来自 CLI 读取的
+  `.config.json`，且 declaration identity 必须与待部署 bundle 完全相同；secret 只能从当前 head 解析。
+  Control 事务同时比较 expected current deployment 和所有 declared secret heads，再原子写 immutable
+  snapshot + deployment pointer。secret rotation 先写 staging revision，再用 deployment/head 双 CAS 原子
+  激活同版本新 snapshot；竞争失败保留获胜者并只清理可证明无引用的 staging。清理扫描所有 snapshot，
+  任何解析不确定性都保留 ciphertext。required secret 删除移除 head 但保留当前可运行 snapshot；下一次
+  fresh deploy 在 required 缺失处失败。rollback 只重新激活该版本历史记录中的精确 snapshot；没有历史
+  snapshot 或缺失 revision 时在切换前失败，不以同名当前值重建。
+- Management gRPC 与 node assignments 同时携带 canonical declaration、snapshot、snapshot identity 和
+  `revision -> plaintext` 的最小 secret value map。Runtime 在下载前拒绝缺字段、identity/version/env
+  不匹配、额外/缺失 revision、类型/大小/required 错误；下载后再次与 bundle 内 declaration 比较。
+  同一 application version 但 snapshot identity 改变不再被 reconciliation 当成 AlreadyRunning，而会复用
+  已校验 bundle 重建 isolate，所以错过密钥推送的节点仍能收敛。磁盘只保存 snapshot digest，不保存 config
+  或 secret value；控制面不可达时 schema-2 明确 fail closed，schema-1 才保留旧的降级恢复语义。
+- Deislet runtime 的标准 `context.env` 每 invocation 新建 null-prototype 对象，只含 snapshot 声明值与
+  显式 logical resource bindings；JSON object/array 递归复制并冻结，默认 `ASSETS` 和 host/provider 变量不
+  混入。EC-NODE `process.env` 只投影 config/string，每 invocation 可写且重置；config/json 与所有 secret
+  均不可从该 façade 枚举。相关 Debug 实现只打印 name/count/snapshot identity，payload、assignment、
+  AppConfig 与标准 order 均不打印 plaintext。
+- `deis deploy` 已把非 secret typed config 传到 Control；`deis dev` 走与真实节点相同的 ApplyDeployment
+  contract。本地 secret 不再接受 `--secret NAME=VALUE` argv，改为互斥的 `--secrets-stdin` 或 Unix 下
+  owner-only、regular、non-symlink `--secrets-file`；文档/单值均限制输入大小，解析错误不回显原始行。
+  `deis secret set` 删除 positional value，只读非 echo stdin；list 增加 opaque revision 列。CLI set 的
+  legacy name grammar 与 Control 统一为 letter/`_` 开头、其后 letter/digit/`_`；schema-2 declaration 与
+  `deis dev` 再由 EC-ENV wire validator 收紧为 `[A-Z][A-Z0-9_]*`。
+- 本切片完整回归通过：`deis-control` 414/414、`deis-runtime` 878/878、`deis` 137/137；共享 wire、
+  bundle、build-core/build 的完整整组也通过，其中真实 Wrangler dry-run 和 Cloudflare/Tencent/Deno Node
+  façade 均执行成功。受影响 packages 的 `cargo check --all-targets` 与严格 `clippy -D warnings` 同样通过。
+  新增用例覆盖 legacy migration、
+  mixed-version trigger、deployment/head CAS、竞争 staging cleanup、历史 rollback、标准 typed/frozen/fresh
+  runtime、同版本轮换收敛、schema-2 disk recovery fail closed、CLI argv 禁止和 pin/lock 防漂移。
+- 这仍没有完成 ADR-009 的 cluster `prepare -> verify -> activate -> observed active`：Control 目前只保证
+  metadata snapshot/pointer 原子，随后才 push 节点；部分 delivery 仍会形成 desired 已变、observed 未齐的
+  状态。也尚未实现 config 独立 update API、revision retention/GC 与销毁审计、per-tenant envelope key、
+  强制加密的 node transport、可表达多行值的 `deis dev` secret document，以及 Cloudflare/EdgeOne 的真实
+  account create/rotate/delete/rollback evidence。因此本实现关闭上一节点名的 Deislet EC-ENV 数据模型与
+  materialization 缺陷，但不提升任何 provider 的 compliant/supported 状态，`P0-SPEC-002` 保持 active。

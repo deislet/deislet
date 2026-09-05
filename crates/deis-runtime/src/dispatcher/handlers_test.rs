@@ -156,6 +156,7 @@ mod the_static_site_answers_a_real_request {
             .install_version(VersionInstall {
                 key: AppKey::production(APP),
                 version_id: "v1".to_string(),
+                environment_snapshot_id: None,
                 entry_point: "worker/index.js".to_string(),
                 code: CODE.to_string(),
                 config,
