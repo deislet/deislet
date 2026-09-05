@@ -854,7 +854,10 @@ impl Drop for ProcessGroup {
 
 #[cfg(windows)]
 struct ProcessGroup {
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    // Windows kernel handles are process-wide values and may be used from a
+    // different thread. Store the non-null value as an integer so the async
+    // runner remains Send; convert it back only at the FFI boundary.
+    handle: usize,
 }
 
 #[cfg(windows)]
@@ -896,15 +899,18 @@ impl ProcessGroup {
                 CloseHandle(handle);
                 return Err(error);
             }
-            Ok(Self { handle })
+            Ok(Self {
+                handle: handle as usize,
+            })
         }
     }
 
     fn terminate(&mut self) {
+        use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         // SAFETY: handle is a live Job Object owned by self.
         unsafe {
-            TerminateJobObject(self.handle, 1);
+            TerminateJobObject(self.handle as HANDLE, 1);
         }
     }
 }
@@ -912,10 +918,10 @@ impl ProcessGroup {
 #[cfg(windows)]
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
         // SAFETY: handle is owned by self and closed exactly once here.
         unsafe {
-            CloseHandle(self.handle);
+            CloseHandle(self.handle as HANDLE);
         }
     }
 }
@@ -1213,6 +1219,12 @@ mod windows_tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn windows_process_boundary_is_send_across_async_suspension() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ProcessGroup>();
+    }
 
     fn powershell_pin() -> PinnedExecutable {
         let system_root = std::env::var_os("SystemRoot").expect("Windows defines SystemRoot");

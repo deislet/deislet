@@ -2072,3 +2072,20 @@ Application/framework source + versioned build plan
   dispatcher loop；Cloudflare、EdgeOne、Deislet 三个完整 driver 和真实账户全生命周期/conformance evidence 均未
   完成。默认 20 秒进程 timeout 与不续租的 credential lease 只适合短步骤，真实长操作还需拆为可查询异步 provider
   operation 或加入有界续租，不能用延长明文凭据存活时间代替。
+
+## 73. Registry/dispatcher 首次精确复跑暴露 Windows async Send 缺陷
+
+- 已推送提交 `f4dc7d3`（tree `8a0b71df8bb49c16856eed1f8a9124a7789f3a1d`，15,083,520-byte
+  archive SHA-256 `552ecb9b5c0974353789d29ea9b3fd2517d0de19f083fb4962a14818ac0baba3`）的同一 archive
+  在 s17 Linux 与 s67 macOS 通过 driver 47/47、Control provider-driver 专项 16/16、legacy target migration
+  1/1 和五个相关 crate 严格 Clippy；共享契约在 s17 通过 11/29。macOS/Windows 重复运行 Python 治理脚本时因主机
+  未安装 `jsonschema` 而在 Rust 前退出，该环境观察不覆盖 s17 已完成的契约结果。
+- s69 Windows 在编译 driver 时失败，未进入测试：新的 executable driver 通过 `async_trait` 要求 `execute`
+  future 为 `Send`，而既有 Windows Job Object `ProcessGroup` 跨 `await` 持有类型为裸指针的 `HANDLE`；
+  Linux/macOS 的 PID 表达不会触发该约束。因此 `f4dc7d3` 不能登记为三平台通过，已完成的两端结果也不能补足它。
+- 修复不绕过 `Send` 约束，也不增加不可靠的 unsafe trait 实现。Windows kernel handle 是进程级值；现在以已验证
+  非零的 `usize` 在 Rust future 中持有，只在 `TerminateJobObject`/`CloseHandle` FFI 边界转换回 `HANDLE`，
+  ownership 与 exactly-once close 不变。新增 Windows compile-time `ProcessGroup: Send` 断言；把该文件应用到
+  s69 的失败 archive 临时副本后，Windows driver 38/38（含三个真实 Job Object/stdin 测试）通过，证明修复方向。
+- 临时副本不是可登记证据。必须提交修复，从新 commit 重新生成一个 archive，并在 Linux/macOS/Windows 全部复跑
+  相同门禁；只有新 archive 三端通过后才能新增 portability evidence。
