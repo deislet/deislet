@@ -2181,6 +2181,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "base64 0.22.1",
  "chrono",
  "dashmap 6.2.1",
  "deis-artifact",
@@ -2189,6 +2190,7 @@ dependencies = [
  "deis-provider-driver",
  "deis-queue",
  "deis-wire",
+ "ed25519-dalek",
  "futures",
  "futures-util",
  "hex",
@@ -2237,8 +2239,10 @@ name = "deis-provider-driver"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "deis-wire",
+ "ed25519-dalek",
  "hex",
  "libc",
  "serde",

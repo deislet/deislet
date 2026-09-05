@@ -267,13 +267,32 @@ Control 现把 release/host 的验证结果写入不可改写、不可删除的�
 `edge-canon-provider-driver-v1` 进程协议传入 request/outcome；owner/epoch 绑定的短租约 credential 只进入清空后的短期
 process environment。公开 schema 禁止 vendor-specific envelope，进程超时或结果不明时仍按副作用规则 reconcile。
 
+## 发行授权与信任根
+
+archive/tree digest 只能证明内容一致，不能证明发布者授权。发行授权因此是独立于 immutable release index 的 sidecar：
+`provider-driver-release-authorization` payload 以 RFC 8785 canonical JSON 精确绑定 release SHA-256、manifest SHA-256、
+backend、driver ID/version 和有限有效期，再装入标准 DSSE v1 envelope；Ed25519 签名覆盖 DSSE PAE，因此 payload type
+也属于签名语义。一个 release 可以拥有多个不可变 authorization，以便在不改变相同发行 bytes 的情况下续期。
+
+Control 的 out-of-band trust root 固定 root version/expiry、key ID、公钥、有效期/撤销、角色 key set、阈值和授权最长
+寿命。key ID 是 32-byte raw public key 的 SHA-256。信任根文件必须为绝对路径、regular non-symlink、小于 1 MiB；
+Unix 还要求由服务身份持有且 group/other 不可写。Control 把每个见过的 canonical root/version 持久保存，拒绝版本
+回退、跳号、同版本不同内容，以及更高版本重新激活历史上已经撤销的 key；安装根与信任根必须同时配置，否则外部执行
+保持关闭。
+
+安装开始前先验证 subject、时间和多签阈值，失败时不能产生安装目录。授权记录不可改写或删除；active target 必须同时
+找到已验证 release 与至少一份授权。每次选择 executable 都用当前信任根重新验证全部候选 authorization；当前无有效
+授权时立即阻断执行，但不把内容寻址的 release 误判为损坏；补充新的有效 authorization 后可恢复。只有完整安装树校验
+失败才会把 release 永久 quarantine 并记录审计。这样 key revocation、root expiry 或 authorization expiry 会在下一次
+执行前生效，不依赖重启时的一次性检查。
+
 精确提交 `b185984da354e59a199fe600726e454a9c4f3ef9` 的同一 archive 已在 Linux、macOS、Windows 通过
 registry/dispatcher 平台适用测试、legacy migration 和五个部署控制 crate 的严格 Clippy，并登记受 Schema 与治理脚本
 约束的 evidence；它还保留前一提交在 Windows 暴露的 async `Send` 编译失败及其修复关系。该结果只证明受验证安装树到
 进程边界的三平台可移植性，并不证明任何真实 provider deployment 或 conformance。
 
-这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成 Wrangler 的真实完整安装树，也没有 release
-签名/透明日志与 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
+这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
+Sigstore/Rekor 或等价透明证明、旧根与新根双阈值验证的自动 root rotation，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
 完整 backend driver 和真实账户 evidence 也未完成。在这些完成并获得真实账户证据前，不能把当前 dispatcher 称作已部署
 的 provider 服务，更不能升级 backend 支持状态。
 
@@ -287,6 +306,9 @@ registry/dispatcher 平台适用测试、legacy migration 和五个部署控制 
 
 ## 行业资料
 
+- `https://github.com/secure-systems-lab/dsse/blob/master/protocol.md`
+- `https://theupdateframework.github.io/specification/latest/`
+- `https://docs.sigstore.dev/about/bundle/`
 - `https://developers.cloudflare.com/workers/wrangler/commands/`
 - `https://developers.cloudflare.com/workers/versions-and-deployments/`
 - `https://pages.edgeone.ai/document/edgeone-cli`

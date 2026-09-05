@@ -2540,6 +2540,9 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
           OR NEW.driver_release_sha256 != NEW.driver_distribution_sha256
           OR NOT EXISTS (
               SELECT 1 FROM provider_driver_releases r
+              JOIN provider_driver_release_authorizations a
+                ON a.release_sha256 = r.release_sha256
+               AND a.host_operating_system = r.host_operating_system
                WHERE r.release_sha256 = NEW.driver_release_sha256
                  AND r.backend_id = NEW.backend_id
                  AND r.driver_id = NEW.driver_id
@@ -2559,6 +2562,9 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
           OR NEW.driver_release_sha256 != NEW.driver_distribution_sha256
           OR NOT EXISTS (
               SELECT 1 FROM provider_driver_releases r
+              JOIN provider_driver_release_authorizations a
+                ON a.release_sha256 = r.release_sha256
+               AND a.host_operating_system = r.host_operating_system
                WHERE r.release_sha256 = NEW.driver_release_sha256
                  AND r.backend_id = NEW.backend_id
                  AND r.driver_id = NEW.driver_id
@@ -2569,6 +2575,26 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         )
         BEGIN
             SELECT RAISE(ABORT, 'provider target cannot activate without a verified driver release');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_authorization_v1
+        BEFORE INSERT ON provider_targets
+        WHEN NEW.status = 'active' AND NOT EXISTS (
+            SELECT 1 FROM provider_driver_release_authorizations a
+             WHERE a.release_sha256 = NEW.driver_release_sha256
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target has no signed driver release authorization');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_authorization_activation_v1
+        BEFORE UPDATE OF status ON provider_targets
+        WHEN NEW.status = 'active' AND NOT EXISTS (
+            SELECT 1 FROM provider_driver_release_authorizations a
+             WHERE a.release_sha256 = NEW.driver_release_sha256
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target cannot activate without a signed driver release authorization');
         END;
 
         CREATE TRIGGER IF NOT EXISTS trg_provider_targets_facts_immutable_v1
@@ -3097,13 +3123,19 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         "UPDATE provider_targets
             SET status = 'disabled', revision = revision + 1,
                 updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER))
-          WHERE status = 'active' AND driver_release_sha256 IS NULL",
+          WHERE status = 'active' AND (
+               driver_release_sha256 IS NULL
+            OR NOT EXISTS (
+                SELECT 1 FROM provider_driver_release_authorizations a
+                 WHERE a.release_sha256 = provider_targets.driver_release_sha256
+            )
+          )",
         [],
     )?;
     if disabled_targets > 0 {
         info!(
             disabled_targets,
-            "Disabled legacy provider targets that have no verified installed driver release"
+            "Disabled legacy provider targets that have no signed verified driver release"
         );
     }
     Ok(())
@@ -3158,6 +3190,74 @@ fn ensure_provider_driver_release_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_driver_releases_selection
             ON provider_driver_releases(status, backend_id, host_operating_system,
                                         driver_id, driver_version, release_sha256);
+
+        CREATE TABLE IF NOT EXISTS provider_driver_trust_roots (
+            root_version INTEGER PRIMARY KEY CHECK(root_version >= 1),
+            root_sha256  TEXT NOT NULL UNIQUE,
+            root_json    TEXT NOT NULL CHECK(json_valid(root_json)),
+            expires_at   INTEGER NOT NULL,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL CHECK(last_seen_at >= first_seen_at),
+            CHECK(length(root_sha256) = 64
+              AND lower(root_sha256) = root_sha256
+              AND root_sha256 NOT GLOB '*[^0-9a-f]*')
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_trust_roots_identity_immutable_v1
+        BEFORE UPDATE OF root_version, root_sha256, root_json, expires_at, first_seen_at
+        ON provider_driver_trust_roots
+        WHEN NEW.root_version != OLD.root_version
+          OR NEW.root_sha256 != OLD.root_sha256
+          OR NEW.root_json != OLD.root_json
+          OR NEW.expires_at != OLD.expires_at
+          OR NEW.first_seen_at != OLD.first_seen_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver trust root identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_trust_roots_seen_monotonic_v1
+        BEFORE UPDATE OF last_seen_at ON provider_driver_trust_roots
+        WHEN NEW.last_seen_at < OLD.last_seen_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver trust root observation cannot move backward');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_trust_roots_no_delete_v1
+        BEFORE DELETE ON provider_driver_trust_roots
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver trust root history cannot be deleted');
+        END;
+
+        CREATE TABLE IF NOT EXISTS provider_driver_release_authorizations (
+            release_sha256          TEXT NOT NULL,
+            host_operating_system   TEXT NOT NULL,
+            authorization_sha256    TEXT NOT NULL,
+            authorization_json      TEXT NOT NULL CHECK(json_valid(authorization_json)),
+            issued_at               INTEGER NOT NULL,
+            expires_at              INTEGER NOT NULL CHECK(expires_at > issued_at),
+            signer_key_ids_json     TEXT NOT NULL CHECK(json_valid(signer_key_ids_json)),
+            created_at              INTEGER NOT NULL,
+            PRIMARY KEY(release_sha256, host_operating_system, authorization_sha256),
+            FOREIGN KEY(release_sha256, host_operating_system)
+                REFERENCES provider_driver_releases(release_sha256, host_operating_system),
+            CHECK(length(authorization_sha256) = 64
+              AND lower(authorization_sha256) = authorization_sha256
+              AND authorization_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(host_operating_system IN
+              ('linux-amd64', 'linux-arm64', 'macos-arm64', 'windows-amd64'))
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_release_authorizations_immutable_v1
+        BEFORE UPDATE ON provider_driver_release_authorizations
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver release authorization is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_release_authorizations_no_delete_v1
+        BEFORE DELETE ON provider_driver_release_authorizations
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver release authorization cannot be deleted');
+        END;
 
         CREATE TRIGGER IF NOT EXISTS trg_provider_driver_releases_identity_immutable_v1
         BEFORE UPDATE OF release_sha256, host_operating_system,

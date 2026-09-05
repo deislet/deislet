@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import base64
 import hashlib
 import json
 import sys
@@ -30,6 +31,9 @@ EXPECTED_DOCUMENTS = {
     "operation",
     "provider-driver",
     "provider-driver-release",
+    "provider-driver-trust-root",
+    "provider-driver-release-authorization",
+    "provider-driver-release-envelope",
     "provider-driver-process",
     "identity-migration",
     "backend-migration-evidence",
@@ -388,6 +392,72 @@ def validate_cross_document_invariants(registry: dict) -> None:
                     file_digests.get(executable["path"]) == executable["sha256"]["value"],
                     f"provider driver release {distribution['hostOperatingSystem']} executable is not pinned in its file table",
                 )
+
+    trust_root = load_json("contracts/v1/fixtures/valid/provider-driver-trust-root.json")
+    signing_role = trust_root["providerDriverRelease"]
+    key_ids = signing_role["keyIds"]
+    keys = trust_root["keys"]
+    require(
+        key_ids == sorted(key_ids) and len(key_ids) == len(set(key_ids)),
+        "provider driver release signing role key IDs are not canonical",
+    )
+    require(
+        [key["keyId"] for key in keys] == sorted(key["keyId"] for key in keys)
+        and len({key["keyId"] for key in keys}) == len(keys),
+        "provider driver release trust keys are not canonical",
+    )
+    require(
+        signing_role["threshold"] <= len(key_ids)
+        and set(key_ids) <= {key["keyId"] for key in keys},
+        "provider driver release signing role threshold or keys are invalid",
+    )
+    for key in keys:
+        public_key = base64.b64decode(key["publicKey"], validate=True)
+        require(
+            len(public_key) == 32
+            and key["keyId"] == hashlib.sha256(public_key).hexdigest(),
+            "provider driver release trust key ID differs from its public key",
+        )
+
+    authorization = load_json(
+        "contracts/v1/fixtures/valid/provider-driver-release-authorization.json"
+    )
+    manifest_canonical = json.dumps(
+        driver, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    require(
+        authorization["subject"]
+        == {
+            "releaseSha256": {
+                "algorithm": "sha256",
+                "value": hashlib.sha256(release_canonical).hexdigest(),
+            },
+            "manifestSha256": {
+                "algorithm": "sha256",
+                "value": hashlib.sha256(manifest_canonical).hexdigest(),
+            },
+            "backendId": driver["backend"]["id"],
+            "driverId": driver["driver"]["id"],
+            "driverVersion": driver["driver"]["version"],
+        },
+        "provider driver release authorization subject differs from its exact documents",
+    )
+    authorization_canonical = json.dumps(
+        authorization, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    envelope = load_json("contracts/v1/fixtures/valid/provider-driver-release-envelope.json")
+    require(
+        base64.b64decode(envelope["payload"], validate=True) == authorization_canonical,
+        "provider driver release DSSE payload is not the canonical authorization",
+    )
+    envelope_signers = [signature["keyid"] for signature in envelope["signatures"]]
+    require(
+        envelope_signers == sorted(envelope_signers)
+        and len(envelope_signers) == len(set(envelope_signers))
+        and set(envelope_signers) <= set(key_ids)
+        and len(envelope_signers) >= signing_role["threshold"],
+        "provider driver release DSSE signers do not satisfy the trusted role",
+    )
 
     operation = load_json("contracts/v1/fixtures/valid/operation.json")
     provider_operation_ids = [entry["providerOperationId"] for entry in operation["providerOperations"]]

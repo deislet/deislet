@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/provider-driver-release-authorization.schema.json",
+  "title": "Provider driver release authorization payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "schemaVersion", "subject", "issuedAt", "expiresAt"],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "schemaVersion": {"const": 1},
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "releaseSha256", "manifestSha256", "backendId", "driverId", "driverVersion"
+      ],
+      "properties": {
+        "releaseSha256": {"$ref": "#/$defs/sha256"},
+        "manifestSha256": {"$ref": "#/$defs/sha256"},
+        "backendId": {
+          "enum": [
+            "deislet", "cloudflare-workers-pages", "tencent-edgeone-makers", "deno"
+          ]
+        },
+        "driverId": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)+$"
+        },
+        "driverVersion": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
+        }
+      }
+    },
+    "issuedAt": {"type": "string", "format": "date-time"},
+    "expiresAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "sha256": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": {"const": "sha256"},
+        "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

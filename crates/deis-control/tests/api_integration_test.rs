@@ -282,7 +282,8 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
         metrics_collector,
         Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
         Arc::new(config),
-    );
+    )
+    .await;
 
     let status_of = |uri: &str, credential: Option<&str>| {
         let router = api.router.clone();
@@ -386,7 +387,8 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
         metrics_collector,
         Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
         Arc::new(config),
-    );
+    )
+    .await;
     // The same startup step the binary runs: it is what files the flat key
     // where `deis token list` can show it.
     deis_control::api::announce_authorization(&api.authz).await;
@@ -565,7 +567,8 @@ async fn the_dashboards_restart_body_is_the_one_the_control_plane_accepts() {
         metrics_collector,
         Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
         Arc::new(ControlConfig::default()),
-    );
+    )
+    .await;
 
     let post = |body: &'static str| {
         let router = api.router.clone();
@@ -648,7 +651,8 @@ async fn a_router_built_without_a_node_key_registers_nobody() {
         metrics_collector,
         Arc::clone(&fleet),
         Arc::new(config),
-    );
+    )
+    .await;
 
     let request = Request::builder()
         .method("PUT")
@@ -694,7 +698,8 @@ async fn a_stop_signal_drains_in_flight_requests_before_the_server_stops() {
         metrics_collector,
         runtime_manager,
         api_config,
-    );
+    )
+    .await;
 
     // A request that stays inside its handler until the test lets it go,
     // which is what makes "in flight" observable.
@@ -805,7 +810,8 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
         metrics_collector,
         runtime_manager,
         Arc::new(config),
-    );
+    )
+    .await;
     // Assembled the same way the binary assembles it.
     let app = tonic::service::Routes::default()
         .add_service(server.build_grpc_service())
@@ -915,7 +921,8 @@ async fn pushing_config_to_an_unconnected_node_is_a_404_not_a_500() {
         metrics_collector,
         Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
         Arc::new(ControlConfig::default()),
-    );
+    )
+    .await;
 
     let post = |uri: &'static str| {
         let router = api.router.clone();

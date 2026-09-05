@@ -260,7 +260,8 @@ async fn main() -> Result<(), anyhow::Error> {
         metrics_collector,
         Arc::clone(&deis_runtime_manager),
         Arc::clone(&api_config),
-    );
+    )
+    .await;
 
     let grpc_service = server.build_grpc_service();
     let grpc_routes = Routes::default().add_service(grpc_service);

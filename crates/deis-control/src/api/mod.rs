@@ -71,7 +71,7 @@ pub struct ApiRouter {
 // Each argument is a distinct shared component; bundling them into a struct
 // would only move the same list into a builder without simplifying call sites.
 #[allow(clippy::too_many_arguments)]
-pub fn build_api_router(
+pub async fn build_api_router(
     sessions: Arc<SessionManager>,
     database: Arc<Database>,
     config_manager: Arc<ConfigManager>,
@@ -114,7 +114,8 @@ pub fn build_api_router(
         Arc::clone(&sessions),
         node_auth.clone(),
         &config,
-    );
+    )
+    .await;
     catalog::deployments::resume_on_start(catalog_state.clone());
 
     // Built after the catalog and sharing its store, not beside it with a
@@ -380,7 +381,7 @@ pub async fn anchor_bundle_paths(database: &Arc<Database>, config: &ControlConfi
 /// Both fallible pieces - the bundle directory and the secret master key -
 /// are resolved once here so a misconfiguration shows up in the startup
 /// log instead of on a request hours later.
-fn build_catalog_state(
+async fn build_catalog_state(
     database: Arc<Database>,
     nodes: Arc<RuntimeNodeManager>,
     sessions: Arc<SessionManager>,
@@ -480,50 +481,75 @@ fn build_catalog_state(
         store.as_ref().clone(),
         Arc::clone(&secrets),
     ));
-    let provider_driver_dispatcher = config
-        .provider_driver_installation_root
-        .as_ref()
-        .and_then(|root| {
-            match crate::catalog::ProviderDriverReleaseRegistry::new(
-                store.as_ref().clone(),
-                root,
-            ) {
-                Ok(registry) => {
-                    info!(
-                        installation_root = %registry.installation_root().display(),
-                        host = %registry.host(),
-                        "Verified provider driver release registry is enabled"
-                    );
-                    match crate::catalog::ProviderDriverDispatcher::new(
-                        registry,
-                        Arc::clone(&provider_credentials),
-                        deis_provider_driver::ExecutableProviderDriverConfig::default(),
-                    ) {
-                        Ok(dispatcher) => Some(Arc::new(dispatcher)),
-                        Err(error) => {
-                            error!(
-                                error = %error,
-                                "Provider driver dispatcher is unusable; external provider execution is disabled"
-                            );
-                            None
+    let provider_driver_dispatcher = match (
+        config.provider_driver_installation_root.as_ref(),
+        config.provider_driver_trust_root.as_ref(),
+    ) {
+        (Some(root), Some(trust_root_path)) => {
+            match deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file(trust_root_path)
+            {
+                Ok(trust_root) => match crate::catalog::ProviderDriverReleaseRegistry::new(
+                    store.as_ref().clone(),
+                    root,
+                    trust_root,
+                )
+                .await
+                {
+                    Ok(registry) => {
+                        info!(
+                            installation_root = %registry.installation_root().display(),
+                            host = %registry.host(),
+                            trust_root_version = registry.trust_root().get().root_version,
+                            trust_root_sha256 = %registry.trust_root().canonical_sha256(),
+                            "Signed provider driver release registry is enabled"
+                        );
+                        match crate::catalog::ProviderDriverDispatcher::new(
+                            registry,
+                            Arc::clone(&provider_credentials),
+                            deis_provider_driver::ExecutableProviderDriverConfig::default(),
+                        ) {
+                            Ok(dispatcher) => Some(Arc::new(dispatcher)),
+                            Err(error) => {
+                                error!(
+                                    error = %error,
+                                    "Provider driver dispatcher is unusable; external provider execution is disabled"
+                                );
+                                None
+                            }
                         }
                     }
-                }
+                    Err(error) => {
+                        error!(
+                            configured = %root.display(),
+                            error = %error,
+                            "Provider driver installation root is unusable; external provider execution is disabled"
+                        );
+                        None
+                    }
+                },
                 Err(error) => {
                     error!(
-                        configured = %root.display(),
+                        configured = %trust_root_path.display(),
                         error = %error,
-                        "Provider driver installation root is unusable; external provider execution is disabled"
+                        "Provider driver trust root is unusable; external provider execution is disabled"
                     );
                     None
                 }
             }
-        });
-    if config.provider_driver_installation_root.is_none() {
-        warn!(
-            "provider_driver_installation_root is not configured; external provider execution is disabled"
-        );
-    }
+        }
+        (None, None) => {
+            warn!(
+                "provider_driver_installation_root and provider_driver_trust_root are not configured; external provider execution is disabled"
+            );
+            None
+        }
+        _ => {
+            error!(
+                "provider_driver_installation_root and provider_driver_trust_root must be configured together; external provider execution is disabled"
+            );
+            None
+        }
+    };
 
     catalog::CatalogState {
         store: Arc::clone(&store),
@@ -755,7 +781,8 @@ pub async fn start_api_server(
         metrics_collector,
         deis_runtime_manager,
         config,
-    );
+    )
+    .await;
 
     let addr = format!("0.0.0.0:{}", port);
     announce_authorization(&api.authz).await;

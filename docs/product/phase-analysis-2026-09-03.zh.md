@@ -2109,3 +2109,30 @@ Application/framework source + versioned build plan
   release/process fixture 仍为合成分发物；真实 Wrangler/Deislet materialized release、签名/信任根轮换/撤销/透明记录、
   Windows service-account DACL、后台 dispatcher loop、公共 API/CLI/Web、三个完整 driver 和真实账户生命周期均未完成。
   因此 `P1-DEPLOY-001` 继续保持 active，任何 backend 的 support/conformance 状态均不提升。
+
+## 75. Provider release 的 DSSE 阈值授权与 durable trust root
+
+- 继续审查发现，现有 archive/tree/release digest 只能证明“收到的 bytes 与声明一致”，无法证明这些 bytes 由受信发布者
+  授权。任何能写入 release/manifest/archive 的主体仍可组成一套内部完全一致的恶意安装树。新边界参考 DSSE、TUF 和
+  Sigstore 的职责划分：immutable release index 保持内容身份；独立 authorization payload 以 RFC 8785 canonical JSON
+  精确绑定 release SHA-256、manifest SHA-256、backend、driver ID/version 和有限时间窗；标准 DSSE v1 envelope 的
+  Ed25519 签名覆盖 PAE(payload type, payload)。不再设计一个只签裸摘要、可被不同文档类型重解释的私有格式。
+- 新的 out-of-band trust root 固定 root version/expiry、raw public key SHA-256 key ID、key validity/revocation、release
+  role key set、threshold 和 authorization 最长寿命。解析拒绝未知字段、非 canonical base64、乱序/重复 key/signature、
+  key ID 与公钥不符、非法时间窗或未知算法；authorization 还必须是 canonical payload 并满足当前时间、subject 双摘要
+  和 distinct signer threshold。当前算法只允许 Ed25519，不接受 envelope 自选算法。
+- Control 只有在安装根与 trust-root 文件同时配置时才启用外部执行。root 文件必须是绝对路径、regular non-symlink、
+  不超过 1 MiB；Unix 使用 `O_NOFOLLOW` 并要求服务身份所有、group/other 不可写。每个 canonical root/version 进入
+  append-only durable history；版本回退、跳号、同版本不同内容及历史撤销 key 的重新激活都失败关闭。相同 release 可追加多个 immutable authorization，
+  从而允许签名元数据续期而不改变相同发行 bytes；这修正了“授权过期就必须重打相同 artifact”的错误耦合。
+- 安装器在读取/展开 archive 之前先验证授权；无效签名不能创建安装目录。数据库要求 active target 同时存在 release 与
+  authorization，旧 active target 若没有签名授权会在升级时 disabled。每次 executable selection 都用当前 root 重新
+  验证所有候选 authorization；key revocation、root/authorization expiry 或 threshold 不足会在下一次执行前阻断，
+  但不把可通过追加授权恢复的 release 误判为内容损坏。只有全安装树复验失败才永久 quarantine。专项覆盖 invalid
+  signature 零写入、authorization 续期、durable root rollback/跳号/同版本冲突、撤销 key 不可重新激活、执行前撤销和
+  授权记录不可变。
+- 共享契约现为 14 份 Schema/37 组正反 fixture；本机 provider authorization 专项 5/5、Control release 专项 4/4 和
+  两个 crate 的严格 all-target Clippy 已通过。该工作树尚未形成提交后三平台 exact-archive evidence；Windows trust-root
+  file/service-account DACL 仍未验证。当前 trust root 通过安全文件 out-of-band 置入，尚未实现 TUF 式旧根/新根双阈值
+  自动 rotation；也没有 Sigstore/Rekor bundle 或等价 transparency inclusion/checkpoint 验证。真实 materialized
+  Wrangler/Deislet release 尚未生成和签署，因此本切片不构成 live provider、供应链发布完成或 Edge Canon conformance。

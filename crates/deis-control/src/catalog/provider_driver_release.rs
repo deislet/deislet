@@ -4,17 +4,19 @@
 //! the durable bridge from that claim to one complete installation tree that
 //! the current Control host has actually verified.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use deis_provider_driver::{
     DriverInstallationError, DriverReleaseInstaller, ExecutableProviderDriver,
     ExecutableProviderDriverConfig, HostOperatingSystem, InstalledDriverRelease,
-    ProviderCredentialBroker, Sha256Digest, ValidatedProviderDriverManifest,
-    ValidatedProviderDriverRelease,
+    ProviderCredentialBroker, Sha256Digest, ValidatedDriverReleaseAuthorization,
+    ValidatedDriverReleaseTrustRoot, ValidatedProviderDriverManifest,
+    ValidatedProviderDriverRelease, VerifiedDriverReleaseAuthorization,
 };
 use deis_wire::CanonicalId;
 use rusqlite::{OptionalExtension, params};
+use sha2::{Digest as _, Sha256};
 
 use super::model::now_secs;
 use super::store::CatalogStore;
@@ -55,6 +57,7 @@ pub struct ProviderDriverReleaseRegistry {
     store: CatalogStore,
     installer: DriverReleaseInstaller,
     host: HostOperatingSystem,
+    trust_root: Arc<ValidatedDriverReleaseTrustRoot>,
 }
 
 #[derive(Clone)]
@@ -73,7 +76,16 @@ pub struct ResolvedProviderDriverRelease {
 }
 
 impl ProviderDriverReleaseRegistry {
-    pub fn new(store: CatalogStore, installation_root: impl AsRef<Path>) -> CatalogResult<Self> {
+    pub async fn new(
+        store: CatalogStore,
+        installation_root: impl AsRef<Path>,
+        trust_root: ValidatedDriverReleaseTrustRoot,
+    ) -> CatalogResult<Self> {
+        if trust_root.get().expires_at <= Utc::now() {
+            return Err(CatalogError::invalid(
+                "provider driver release trust root has expired",
+            ));
+        }
         let host = HostOperatingSystem::current().ok_or_else(|| {
             CatalogError::invalid(
                 "this Control host is not one of the provider driver release contract targets",
@@ -84,11 +96,14 @@ impl ProviderDriverReleaseRegistry {
                 "invalid provider driver installation root: {error}"
             ))
         })?;
-        Ok(Self {
+        let registry = Self {
             store,
             installer,
             host,
-        })
+            trust_root: Arc::new(trust_root),
+        };
+        registry.record_trust_root().await?;
+        Ok(registry)
     }
 
     #[must_use]
@@ -102,8 +117,138 @@ impl ProviderDriverReleaseRegistry {
     }
 
     #[must_use]
+    pub fn trust_root(&self) -> &ValidatedDriverReleaseTrustRoot {
+        &self.trust_root
+    }
+
+    #[must_use]
     pub fn belongs_to(&self, store: &CatalogStore) -> bool {
         Arc::ptr_eq(&self.store.database(), &store.database())
+    }
+
+    async fn record_trust_root(&self) -> CatalogResult<()> {
+        let root = self.trust_root.get();
+        let root_version = i64::try_from(root.root_version).map_err(|_| {
+            CatalogError::invalid("provider driver trust root version exceeds SQLite range")
+        })?;
+        let root_digest = self.trust_root.canonical_sha256().to_string();
+        let root_json = String::from_utf8(self.trust_root.canonical_json().map_err(|error| {
+            CatalogError::invalid(format!(
+                "cannot canonicalize provider driver trust root: {error}"
+            ))
+        })?)
+        .expect("JCS JSON is UTF-8");
+        let active_key_ids = root
+            .keys
+            .iter()
+            .filter(|key| key.status == deis_provider_driver::DriverReleaseSigningKeyStatus::Active)
+            .map(|key| key.key_id.clone())
+            .collect::<BTreeSet<_>>();
+        let expires_at = root.expires_at.timestamp();
+        let database = self.store.database();
+        database
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let highest_version: Option<i64> = transaction.query_row(
+                    "SELECT max(root_version) FROM provider_driver_trust_roots",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if highest_version.is_some_and(|highest| root_version < highest) {
+                    return Err(CatalogError::conflict(
+                        "provider driver trust root version would roll durable trust state backward",
+                    ));
+                }
+                let existing = transaction
+                    .query_row(
+                        "SELECT root_sha256, root_json, expires_at
+                           FROM provider_driver_trust_roots WHERE root_version = ?1",
+                        [root_version],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let now = now_secs();
+                if let Some(existing) = existing {
+                    if existing != (root_digest.clone(), root_json.clone(), expires_at) {
+                        return Err(CatalogError::conflict(
+                            "provider driver trust root version has conflicting canonical content",
+                        ));
+                    }
+                    transaction.execute(
+                        "UPDATE provider_driver_trust_roots SET last_seen_at = MAX(last_seen_at, ?2)
+                          WHERE root_version = ?1",
+                        params![root_version, now],
+                    )?;
+                } else {
+                    if let Some(highest) = highest_version {
+                        let expected = highest.checked_add(1).ok_or_else(|| {
+                            CatalogError::invalid(
+                                "provider driver trust root version exceeds SQLite range",
+                            )
+                        })?;
+                        if root_version != expected {
+                            return Err(CatalogError::conflict(
+                                "provider driver trust root versions must advance exactly once",
+                            ));
+                        }
+                    }
+                    let historical_root_json = {
+                        let mut statement = transaction.prepare(
+                            "SELECT root_json FROM provider_driver_trust_roots
+                              ORDER BY root_version",
+                        )?;
+                        statement
+                            .query_map([], |row| row.get::<_, String>(0))?
+                            .collect::<Result<Vec<_>, _>>()?
+                    };
+                    let mut permanently_revoked_key_ids = BTreeSet::new();
+                    for historical_root_json in historical_root_json {
+                        let historical_root = ValidatedDriverReleaseTrustRoot::parse_json(
+                            historical_root_json.as_bytes(),
+                        )
+                        .map_err(|error| {
+                            CatalogError::invalid(format!(
+                                "invalid durable provider driver trust root: {error}"
+                            ))
+                        })?;
+                        permanently_revoked_key_ids.extend(
+                            historical_root
+                                .get()
+                                .keys
+                                .iter()
+                                .filter(|key| {
+                                    key.status
+                                        == deis_provider_driver::DriverReleaseSigningKeyStatus::Revoked
+                                })
+                                .map(|key| key.key_id.clone()),
+                        );
+                    }
+                    if active_key_ids
+                        .iter()
+                        .any(|key_id| permanently_revoked_key_ids.contains(key_id))
+                    {
+                        return Err(CatalogError::conflict(
+                            "provider driver trust root cannot reactivate a historically revoked key",
+                        ));
+                    }
+                    transaction.execute(
+                        "INSERT INTO provider_driver_trust_roots
+                           (root_version, root_sha256, root_json, expires_at,
+                            first_seen_at, last_seen_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                        params![root_version, root_digest, root_json, expires_at, now],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
     }
 
     pub async fn release(
@@ -179,8 +324,12 @@ impl ProviderDriverReleaseRegistry {
         &self,
         release: ValidatedProviderDriverRelease,
         manifest: ValidatedProviderDriverManifest,
+        authorization: ValidatedDriverReleaseAuthorization,
         archive_path: impl AsRef<Path>,
     ) -> CatalogResult<ProviderDriverReleaseRecord> {
+        let verified_authorization = authorization
+            .verify(&release, &manifest, &self.trust_root, Utc::now())
+            .map_err(authorization_error)?;
         let installer = self.installer.clone();
         let host = self.host;
         let archive_path = archive_path.as_ref().to_path_buf();
@@ -197,15 +346,25 @@ impl ProviderDriverReleaseRegistry {
         .await
         .map_err(|error| CatalogError::invalid(format!("driver installer task failed: {error}")))?
         .map_err(installation_error)?;
-        self.register_verified(&release, &manifest, &installed)
-            .await
+        self.register_verified(
+            &release,
+            &manifest,
+            &authorization,
+            &verified_authorization,
+            &installed,
+        )
+        .await
     }
 
     pub async fn register_existing(
         &self,
         release: ValidatedProviderDriverRelease,
         manifest: ValidatedProviderDriverManifest,
+        authorization: ValidatedDriverReleaseAuthorization,
     ) -> CatalogResult<ProviderDriverReleaseRecord> {
+        let verified_authorization = authorization
+            .verify(&release, &manifest, &self.trust_root, Utc::now())
+            .map_err(authorization_error)?;
         let installer = self.installer.clone();
         let host = self.host;
         let release_for_verify = release.clone();
@@ -216,15 +375,39 @@ impl ProviderDriverReleaseRegistry {
         .await
         .map_err(|error| CatalogError::invalid(format!("driver verifier task failed: {error}")))?
         .map_err(installation_error)?;
-        self.register_verified(&release, &manifest, &installed)
-            .await
+        self.register_verified(
+            &release,
+            &manifest,
+            &authorization,
+            &verified_authorization,
+            &installed,
+        )
+        .await
     }
 
     pub async fn resolve_for_target(
         &self,
         target_id: CanonicalId,
     ) -> CatalogResult<ResolvedProviderDriverRelease> {
+        self.resolve_for_target_at(target_id, Utc::now()).await
+    }
+
+    async fn resolve_for_target_at(
+        &self,
+        target_id: CanonicalId,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<ResolvedProviderDriverRelease> {
         let stored = load_release_for_target(&self.store, target_id, self.host).await?;
+        let authorization_is_trusted = stored.authorizations.iter().any(|authorization| {
+            authorization
+                .verify(&stored.release, &stored.manifest, &self.trust_root, now)
+                .is_ok()
+        });
+        if !authorization_is_trusted {
+            return Err(CatalogError::conflict(
+                "registered provider driver release has no current authorization under the active trust root",
+            ));
+        }
         let installer = self.installer.clone();
         let release_for_verify = stored.release.clone();
         let manifest_for_verify = stored.manifest.clone();
@@ -260,6 +443,8 @@ impl ProviderDriverReleaseRegistry {
         &self,
         release: &ValidatedProviderDriverRelease,
         manifest: &ValidatedProviderDriverManifest,
+        authorization: &ValidatedDriverReleaseAuthorization,
+        verified_authorization: &VerifiedDriverReleaseAuthorization,
         installed: &InstalledDriverRelease,
     ) -> CatalogResult<ProviderDriverReleaseRecord> {
         let installed_for_verify = installed.clone();
@@ -301,6 +486,13 @@ impl ProviderDriverReleaseRegistry {
             CatalogError::invalid(format!("cannot canonicalize driver manifest: {error}"))
         })?)
         .expect("JCS JSON is UTF-8");
+        let authorization_json =
+            String::from_utf8(authorization.canonical_json().map_err(|error| {
+                CatalogError::invalid(format!(
+                    "cannot canonicalize driver release authorization: {error}"
+                ))
+            })?)
+            .expect("JCS JSON is UTF-8");
         let distribution = installed.distribution();
         let expected_dir_name = format!("{}-{}", release_digest.as_str(), self.host);
         let actual_dir_name = installed
@@ -329,6 +521,15 @@ impl ProviderDriverReleaseRegistry {
             archive_size_bytes: distribution.archive.size_bytes,
             tree_digest: distribution.tree_digest.value.clone(),
             installation_dir_name: expected_dir_name,
+            authorization: Some(ReleaseAuthorizationFacts {
+                envelope_digest: verified_authorization.envelope_sha256.clone(),
+                envelope_json: authorization_json,
+                issued_at: verified_authorization.issued_at,
+                expires_at: verified_authorization.expires_at,
+                signer_key_ids: verified_authorization.signer_key_ids.clone(),
+                trust_root_version: verified_authorization.trust_root_version,
+                trust_root_digest: verified_authorization.trust_root_sha256.clone(),
+            }),
         };
         persist_verified_release(&self.store, facts).await
     }
@@ -408,12 +609,25 @@ struct ReleaseFacts {
     archive_size_bytes: u64,
     tree_digest: Sha256Digest,
     installation_dir_name: String,
+    authorization: Option<ReleaseAuthorizationFacts>,
+}
+
+#[derive(Clone)]
+struct ReleaseAuthorizationFacts {
+    envelope_digest: Sha256Digest,
+    envelope_json: String,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    signer_key_ids: Vec<String>,
+    trust_root_version: u64,
+    trust_root_digest: Sha256Digest,
 }
 
 struct StoredRelease {
     record: ProviderDriverReleaseRecord,
     manifest: ValidatedProviderDriverManifest,
     release: ValidatedProviderDriverRelease,
+    authorizations: Vec<ValidatedDriverReleaseAuthorization>,
 }
 
 async fn persist_verified_release(
@@ -475,12 +689,34 @@ async fn persist_verified_release(
                 )?;
                 "registered"
             };
+            let audit_detail = if let Some(authorization) = &facts.authorization {
+                persist_release_authorization(
+                    &transaction,
+                    &facts.release_digest,
+                    facts.host,
+                    authorization,
+                    now,
+                )?;
+                format!(
+                    "complete installation tree and DSSE authorization verified with trust root {} ({}) and signer keys {}",
+                    authorization.trust_root_version,
+                    authorization.trust_root_digest,
+                    authorization.signer_key_ids.join(",")
+                )
+            } else {
+                #[cfg(not(test))]
+                return Err(CatalogError::invalid(
+                    "provider driver release registration requires a signed authorization",
+                ));
+                #[cfg(test)]
+                "test-only unsigned release seed; never available in production".to_owned()
+            };
             insert_audit(
                 &transaction,
                 &facts.release_digest,
                 facts.host,
                 event_type,
-                "complete installation tree verified against canonical release index",
+                &audit_detail,
                 now,
             )?;
             let record = load_release_record(
@@ -517,7 +753,12 @@ async fn load_release_for_target(
                          ON r.release_sha256 = t.driver_release_sha256
                         AND r.host_operating_system = ?2
                       WHERE t.target_id = ?1 AND t.status = 'active'
-                        AND i.status = 'active' AND r.status = 'active'",
+                        AND i.status = 'active' AND r.status = 'active'
+                        AND EXISTS (
+                            SELECT 1 FROM provider_driver_release_authorizations a
+                             WHERE a.release_sha256 = r.release_sha256
+                               AND a.host_operating_system = r.host_operating_system
+                        )",
                     params![target_id.to_string(), host.as_str()],
                     |row| {
                         Ok((
@@ -562,6 +803,45 @@ async fn load_release_for_target(
             let release = ValidatedProviderDriverRelease::parse_json(row.7.as_bytes()).map_err(
                 |error| CatalogError::invalid(format!("invalid registered driver release: {error}")),
             )?;
+            let mut statement = connection.prepare(
+                "SELECT authorization_sha256, authorization_json, issued_at,
+                        expires_at, signer_key_ids_json
+                   FROM provider_driver_release_authorizations
+                  WHERE release_sha256 = ?1 AND host_operating_system = ?2
+                  ORDER BY expires_at DESC, issued_at DESC, authorization_sha256",
+            )?;
+            let authorization_rows = statement
+                .query_map(params![row.0, host.as_str()], |authorization_row| {
+                    Ok((
+                        authorization_row.get::<_, String>(0)?,
+                        authorization_row.get::<_, String>(1)?,
+                        authorization_row.get::<_, i64>(2)?,
+                        authorization_row.get::<_, i64>(3)?,
+                        authorization_row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let authorizations = authorization_rows
+                .into_iter()
+                .map(|authorization_row| {
+                    let authorization = ValidatedDriverReleaseAuthorization::parse_json(
+                        authorization_row.1.as_bytes(),
+                    )
+                    .map_err(|error| {
+                        CatalogError::invalid(format!(
+                            "invalid registered driver release authorization: {error}"
+                        ))
+                    })?;
+                    validate_loaded_authorization(
+                        &authorization,
+                        &authorization_row.0,
+                        authorization_row.2,
+                        authorization_row.3,
+                        &authorization_row.4,
+                    )?;
+                    Ok(authorization)
+                })
+                .collect::<CatalogResult<Vec<_>>>()?;
             validate_loaded_documents(
                 &release,
                 &manifest,
@@ -597,9 +877,113 @@ async fn load_release_for_target(
                 },
                 manifest,
                 release,
+                authorizations,
             })
         })
         .await
+}
+
+fn validate_loaded_authorization(
+    authorization: &ValidatedDriverReleaseAuthorization,
+    envelope_digest: &str,
+    issued_at: i64,
+    expires_at: i64,
+    signer_key_ids_json: &str,
+) -> CatalogResult<()> {
+    let canonical = authorization.canonical_json().map_err(|error| {
+        CatalogError::invalid(format!(
+            "cannot identify registered driver release authorization: {error}"
+        ))
+    })?;
+    let computed_digest = hex::encode(Sha256::digest(&canonical));
+    let signer_key_ids: Vec<String> =
+        serde_json::from_str(signer_key_ids_json).map_err(|error| {
+            CatalogError::invalid(format!("invalid registered driver signer IDs: {error}"))
+        })?;
+    let expected_signers = authorization
+        .get()
+        .signatures
+        .iter()
+        .map(|signature| signature.keyid.clone())
+        .collect::<Vec<_>>();
+    if computed_digest != envelope_digest
+        || authorization.authorization().issued_at.timestamp() != issued_at
+        || authorization.authorization().expires_at.timestamp() != expires_at
+        || signer_key_ids != expected_signers
+    {
+        return Err(CatalogError::invalid(
+            "registered provider driver release authorization facts differ from its canonical envelope",
+        ));
+    }
+    Ok(())
+}
+
+fn persist_release_authorization(
+    connection: &rusqlite::Connection,
+    release_digest: &Sha256Digest,
+    host: HostOperatingSystem,
+    authorization: &ReleaseAuthorizationFacts,
+    now: i64,
+) -> CatalogResult<()> {
+    let signer_key_ids_json =
+        serde_json::to_string(&authorization.signer_key_ids).map_err(|error| {
+            CatalogError::invalid(format!("cannot encode driver signer IDs: {error}"))
+        })?;
+    let existing = connection
+        .query_row(
+            "SELECT authorization_sha256, authorization_json, issued_at, expires_at,
+                    signer_key_ids_json
+               FROM provider_driver_release_authorizations
+              WHERE release_sha256 = ?1 AND host_operating_system = ?2
+                AND authorization_sha256 = ?3",
+            params![
+                release_digest.as_str(),
+                host.as_str(),
+                authorization.envelope_digest.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let issued_at = authorization.issued_at.timestamp();
+    let expires_at = authorization.expires_at.timestamp();
+    if let Some(existing) = existing {
+        if existing.0 != authorization.envelope_digest.as_str()
+            || existing.1 != authorization.envelope_json
+            || existing.2 != issued_at
+            || existing.3 != expires_at
+            || existing.4 != signer_key_ids_json
+        {
+            return Err(CatalogError::conflict(
+                "provider driver release authorization conflicts with its immutable durable record",
+            ));
+        }
+        return Ok(());
+    }
+    connection.execute(
+        "INSERT INTO provider_driver_release_authorizations
+           (release_sha256, host_operating_system, authorization_sha256,
+            authorization_json, issued_at, expires_at, signer_key_ids_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            release_digest.as_str(),
+            host.as_str(),
+            authorization.envelope_digest.as_str(),
+            authorization.envelope_json,
+            issued_at,
+            expires_at,
+            signer_key_ids_json,
+            now,
+        ],
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -795,6 +1179,14 @@ fn installation_error(error: DriverInstallationError) -> CatalogError {
     ))
 }
 
+fn authorization_error(
+    error: deis_provider_driver::DriverReleaseAuthorizationError,
+) -> CatalogError {
+    CatalogError::invalid(format!(
+        "provider driver release authorization verification failed: {error}"
+    ))
+}
+
 fn parse_digest(value: &str, label: &str) -> CatalogResult<Sha256Digest> {
     value
         .parse()
@@ -842,6 +1234,15 @@ pub(crate) async fn seed_test_provider_driver_release(
         archive_size_bytes: distribution.archive.size_bytes,
         tree_digest: distribution.tree_digest.value.clone(),
         installation_dir_name: format!("{}-{host}", release.canonical_sha256().unwrap().as_str()),
+        authorization: Some(ReleaseAuthorizationFacts {
+            envelope_digest: "a".repeat(64).parse().unwrap(),
+            envelope_json: "{}".to_owned(),
+            issued_at: Utc::now() - chrono::TimeDelta::minutes(1),
+            expires_at: Utc::now() + chrono::TimeDelta::days(1),
+            signer_key_ids: vec!["b".repeat(64)],
+            trust_root_version: 1,
+            trust_root_digest: "c".repeat(64).parse().unwrap(),
+        }),
     };
     persist_verified_release(store, facts).await.unwrap();
 }
@@ -855,10 +1256,16 @@ mod tests {
         sync::Arc,
     };
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use chrono::TimeDelta;
     use deis_provider_driver::{
-        CredentialMaterial, DriverReleaseComponent, DriverReleaseFile, ProviderDriver,
-        ProviderDriverManifest, ProviderDriverRelease,
+        CredentialMaterial, DSSE_ENVELOPE_PAYLOAD_TYPE, DriverReleaseAuthorization,
+        DriverReleaseAuthorizationSubject, DriverReleaseComponent, DriverReleaseDsseEnvelope,
+        DriverReleaseDsseSignature, DriverReleaseFile, DriverReleaseSigningKey,
+        DriverReleaseSigningKeyStatus, DriverReleaseSigningRole, DriverReleaseTrustRoot,
+        ProviderDriver, ProviderDriverManifest, ProviderDriverRelease, ToolDigest,
     };
+    use ed25519_dalek::{Signer as _, SigningKey};
     use serde::Serialize;
     use sha2::{Digest as _, Sha256};
     use tempfile::TempDir;
@@ -881,6 +1288,8 @@ mod tests {
         archive: PathBuf,
         release: ValidatedProviderDriverRelease,
         manifest: ValidatedProviderDriverManifest,
+        trust_root: ValidatedDriverReleaseTrustRoot,
+        authorization: ValidatedDriverReleaseAuthorization,
         contents: BTreeMap<String, Vec<u8>>,
     }
 
@@ -930,6 +1339,7 @@ mod tests {
             manifest.supported_host_operating_systems = vec![host.as_str().to_owned()];
             manifest.driver.distribution_digest.value = release.canonical_sha256().unwrap();
             let manifest = ValidatedProviderDriverManifest::new(manifest).unwrap();
+            let (trust_root, authorization) = signed_authorization(&release, &manifest);
 
             Self {
                 temporary,
@@ -937,6 +1347,8 @@ mod tests {
                 archive,
                 release,
                 manifest,
+                trust_root,
+                authorization,
                 contents,
             }
         }
@@ -954,6 +1366,79 @@ mod tests {
         }
     }
 
+    fn signed_authorization(
+        release: &ValidatedProviderDriverRelease,
+        manifest: &ValidatedProviderDriverManifest,
+    ) -> (
+        ValidatedDriverReleaseTrustRoot,
+        ValidatedDriverReleaseAuthorization,
+    ) {
+        let now = Utc::now();
+        let signing_key = SigningKey::from_bytes(&[29; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let key_id = hex::encode(Sha256::digest(public_key));
+        let trust_root = ValidatedDriverReleaseTrustRoot::new(DriverReleaseTrustRoot {
+            schema: Some("provider-driver-trust-root.schema.json".to_owned()),
+            schema_version: 1,
+            root_version: 1,
+            expires_at: now + TimeDelta::days(30),
+            provider_driver_release: DriverReleaseSigningRole {
+                key_ids: vec![key_id.clone()],
+                threshold: 1,
+                max_authorization_lifetime_seconds: 7 * 24 * 60 * 60,
+            },
+            keys: vec![DriverReleaseSigningKey {
+                key_id: key_id.clone(),
+                key_type: "ed25519".to_owned(),
+                scheme: "ed25519".to_owned(),
+                public_key: STANDARD.encode(public_key),
+                status: DriverReleaseSigningKeyStatus::Active,
+                valid_from: now - TimeDelta::days(1),
+                valid_until: now + TimeDelta::days(90),
+                revoked_at: None,
+            }],
+        })
+        .unwrap();
+        let authorization = DriverReleaseAuthorization {
+            schema: Some("provider-driver-release-authorization.schema.json".to_owned()),
+            schema_version: 1,
+            subject: DriverReleaseAuthorizationSubject {
+                release_sha256: ToolDigest {
+                    algorithm: "sha256".to_owned(),
+                    value: release.canonical_sha256().unwrap(),
+                },
+                manifest_sha256: ToolDigest {
+                    algorithm: "sha256".to_owned(),
+                    value: manifest.canonical_sha256().unwrap(),
+                },
+                backend_id: manifest.get().backend.id.clone(),
+                driver_id: release.get().driver.id.clone(),
+                driver_version: release.get().driver.version.clone(),
+            },
+            issued_at: now - TimeDelta::minutes(1),
+            expires_at: now + TimeDelta::days(1),
+        };
+        let payload = serde_jcs::to_vec(&authorization).unwrap();
+        let mut pae = format!(
+            "DSSEv1 {} {} {} ",
+            DSSE_ENVELOPE_PAYLOAD_TYPE.len(),
+            DSSE_ENVELOPE_PAYLOAD_TYPE,
+            payload.len()
+        )
+        .into_bytes();
+        pae.extend_from_slice(&payload);
+        let authorization = ValidatedDriverReleaseAuthorization::new(DriverReleaseDsseEnvelope {
+            payload_type: DSSE_ENVELOPE_PAYLOAD_TYPE.to_owned(),
+            payload: STANDARD.encode(payload),
+            signatures: vec![DriverReleaseDsseSignature {
+                keyid: key_id,
+                sig: STANDARD.encode(signing_key.sign(&pae).to_bytes()),
+            }],
+        })
+        .unwrap();
+        (trust_root, authorization)
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             make_writable_for_cleanup(self.temporary.path());
@@ -969,11 +1454,21 @@ mod tests {
                 .unwrap(),
         );
         let store = CatalogStore::new(Arc::clone(&database));
-        let registry = ProviderDriverReleaseRegistry::new(store, &fixture.install_root).unwrap();
+        let registry = ProviderDriverReleaseRegistry::new(
+            store,
+            &fixture.install_root,
+            fixture.trust_root.clone(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             registry
-                .register_existing(fixture.release.clone(), fixture.manifest.clone())
+                .register_existing(
+                    fixture.release.clone(),
+                    fixture.manifest.clone(),
+                    fixture.authorization.clone(),
+                )
                 .await
                 .unwrap_err()
                 .to_string()
@@ -983,6 +1478,7 @@ mod tests {
             .install_and_register(
                 fixture.release.clone(),
                 fixture.manifest.clone(),
+                fixture.authorization.clone(),
                 &fixture.archive,
             )
             .await
@@ -998,7 +1494,11 @@ mod tests {
         );
 
         let verified = registry
-            .register_existing(fixture.release.clone(), fixture.manifest.clone())
+            .register_existing(
+                fixture.release.clone(),
+                fixture.manifest.clone(),
+                fixture.authorization.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(verified.revision, 2);
@@ -1013,6 +1513,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["registered", "verified"]
         );
+        let (_, renewed_authorization) = signed_authorization(&fixture.release, &fixture.manifest);
+        let renewed = registry
+            .register_existing(
+                fixture.release.clone(),
+                fixture.manifest.clone(),
+                renewed_authorization,
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed.revision, 3);
+        let release_digest = renewed.release_digest.to_string();
+        let authorization_count: i64 = database
+            .with_connection(move |connection| {
+                Ok::<i64, crate::database::DatabaseError>(connection.query_row(
+                    "SELECT count(*) FROM provider_driver_release_authorizations
+                      WHERE release_sha256 = ?1",
+                    [release_digest],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(authorization_count, 2);
         assert!(
             registry
                 .audit_events(registered.release_digest.clone(), 0)
@@ -1044,6 +1567,215 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            database
+                .with_connection(|connection| {
+                    connection.execute(
+                        "UPDATE provider_driver_release_authorizations
+                            SET signer_key_ids_json = '[]'",
+                        [],
+                    )?;
+                    Ok::<(), crate::database::DatabaseError>(())
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_dsse_is_rejected_before_archive_installation() {
+        let fixture = Fixture::new();
+        let database = Arc::new(
+            Database::init(fixture.temporary.path().join("invalid-signature.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let store = CatalogStore::new(database);
+        let registry = ProviderDriverReleaseRegistry::new(
+            store,
+            &fixture.install_root,
+            fixture.trust_root.clone(),
+        )
+        .await
+        .unwrap();
+        let mut tampered = fixture.authorization.get().clone();
+        tampered.signatures[0].sig = STANDARD.encode([0; 64]);
+        let tampered = ValidatedDriverReleaseAuthorization::new(tampered).unwrap();
+        let error = registry
+            .install_and_register(
+                fixture.release.clone(),
+                fixture.manifest.clone(),
+                tampered,
+                &fixture.archive,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("signature verification failed"));
+        assert_eq!(fs::read_dir(&fixture.install_root).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn every_driver_selection_rechecks_current_key_revocation() {
+        let fixture = Fixture::new();
+        let database = Arc::new(
+            Database::init(fixture.temporary.path().join("revocation.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let store = CatalogStore::new(Arc::clone(&database));
+        let registry = ProviderDriverReleaseRegistry::new(
+            store.clone(),
+            &fixture.install_root,
+            fixture.trust_root.clone(),
+        )
+        .await
+        .unwrap();
+        let registered = registry
+            .install_and_register(
+                fixture.release.clone(),
+                fixture.manifest.clone(),
+                fixture.authorization.clone(),
+                &fixture.archive,
+            )
+            .await
+            .unwrap();
+        let vault = Arc::new(CatalogProviderCredentialVault::new(
+            store.clone(),
+            Arc::new(SecretsBackend::Ready(Box::new(
+                SecretCipher::from_key_bytes(&[31; 32]).unwrap(),
+            ))),
+        ));
+        let credential = vault
+            .provision(
+                ProviderCredentialBindingSpec {
+                    backend_id: "cloudflare-workers-pages".to_owned(),
+                    name: "revocation-test".to_owned(),
+                },
+                CredentialMaterial::new(b"revocation-test-credential".to_vec()).unwrap(),
+                context("revocation-credential"),
+            )
+            .await
+            .unwrap();
+        let installation = store
+            .register_provider_installation(ProviderInstallationSpec {
+                backend_id: "cloudflare-workers-pages".to_owned(),
+                account_reference: "revocation-account".to_owned(),
+                region: None,
+                credential_binding_id: credential.binding_id,
+            })
+            .await
+            .unwrap();
+        let target = store
+            .register_provider_target(ProviderTargetSpec {
+                installation_id: installation.installation_id,
+                name: "revocation-target".to_owned(),
+                standard_version: "edge-canon-proposal-0001".to_owned(),
+                target_config_digest: "d".repeat(64).parse().unwrap(),
+                driver_manifest: fixture.manifest.clone(),
+            })
+            .await
+            .unwrap();
+        registry.resolve_for_target(target.target_id).await.unwrap();
+        let expired_error = registry
+            .resolve_for_target_at(target.target_id, Utc::now() + TimeDelta::days(2))
+            .await
+            .unwrap_err();
+        assert!(
+            expired_error
+                .to_string()
+                .contains("no current authorization")
+        );
+        assert_eq!(
+            registry
+                .release(registered.release_digest.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+        registry.resolve_for_target(target.target_id).await.unwrap();
+
+        let mut equivocated_root = fixture.trust_root.get().clone();
+        equivocated_root.expires_at += TimeDelta::hours(1);
+        let equivocation_error = ProviderDriverReleaseRegistry::new(
+            store.clone(),
+            &fixture.install_root,
+            ValidatedDriverReleaseTrustRoot::new(equivocated_root).unwrap(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            equivocation_error
+                .to_string()
+                .contains("conflicting canonical content")
+        );
+
+        let mut revoked_root = fixture.trust_root.get().clone();
+        revoked_root.root_version += 1;
+        revoked_root.keys[0].status = DriverReleaseSigningKeyStatus::Revoked;
+        revoked_root.keys[0].revoked_at = Some(Utc::now());
+        let revoked_registry = ProviderDriverReleaseRegistry::new(
+            store,
+            &fixture.install_root,
+            ValidatedDriverReleaseTrustRoot::new(revoked_root).unwrap(),
+        )
+        .await
+        .unwrap();
+        let error = revoked_registry
+            .resolve_for_target(target.target_id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no current authorization"));
+        assert_eq!(
+            revoked_registry
+                .release(registered.release_digest)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+        let mut skipped_root = revoked_registry.trust_root().get().clone();
+        skipped_root.root_version += 2;
+        let skipped_error = ProviderDriverReleaseRegistry::new(
+            revoked_registry.store.clone(),
+            &fixture.install_root,
+            ValidatedDriverReleaseTrustRoot::new(skipped_root).unwrap(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(skipped_error.to_string().contains("advance exactly once"));
+        let mut reactivated_root = fixture.trust_root.get().clone();
+        reactivated_root.root_version = 3;
+        let reactivation_error = ProviderDriverReleaseRegistry::new(
+            revoked_registry.store.clone(),
+            &fixture.install_root,
+            ValidatedDriverReleaseTrustRoot::new(reactivated_root).unwrap(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            reactivation_error
+                .to_string()
+                .contains("cannot reactivate a historically revoked key")
+        );
+        let rollback_error = ProviderDriverReleaseRegistry::new(
+            revoked_registry.store.clone(),
+            &fixture.install_root,
+            fixture.trust_root.clone(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            rollback_error
+                .to_string()
+                .contains("roll durable trust state backward")
+        );
     }
 
     #[tokio::test]
@@ -1055,12 +1787,18 @@ mod tests {
                 .unwrap(),
         );
         let store = CatalogStore::new(Arc::clone(&database));
-        let registry =
-            ProviderDriverReleaseRegistry::new(store.clone(), &fixture.install_root).unwrap();
+        let registry = ProviderDriverReleaseRegistry::new(
+            store.clone(),
+            &fixture.install_root,
+            fixture.trust_root.clone(),
+        )
+        .await
+        .unwrap();
         let registered = registry
             .install_and_register(
                 fixture.release.clone(),
                 fixture.manifest.clone(),
+                fixture.authorization.clone(),
                 &fixture.archive,
             )
             .await
@@ -1153,7 +1891,11 @@ mod tests {
         make_installed_file_read_only(&installed_file);
         assert!(
             registry
-                .register_existing(fixture.release.clone(), fixture.manifest.clone())
+                .register_existing(
+                    fixture.release.clone(),
+                    fixture.manifest.clone(),
+                    fixture.authorization.clone(),
+                )
                 .await
                 .unwrap_err()
                 .to_string()

@@ -16,6 +16,7 @@ mod model;
 mod orchestrator;
 mod process;
 mod release;
+mod release_authorization;
 
 pub use credential::{
     CredentialBrokerError, CredentialBrokerErrorKind, CredentialLeaseDisposition,
@@ -59,4 +60,11 @@ pub use release::{
     DriverReleaseComponentRole, DriverReleaseError, DriverReleaseExecutable, DriverReleaseFile,
     DriverReleaseIdentity, DriverReleaseImplementation, DriverReleaseInstallationPolicy,
     HostOperatingSystem, ProviderDriverRelease, ValidatedProviderDriverRelease,
+};
+pub use release_authorization::{
+    DSSE_ENVELOPE_PAYLOAD_TYPE, DriverReleaseAuthorization, DriverReleaseAuthorizationError,
+    DriverReleaseAuthorizationSubject, DriverReleaseDsseEnvelope, DriverReleaseDsseSignature,
+    DriverReleaseSigningKey, DriverReleaseSigningKeyStatus, DriverReleaseSigningRole,
+    DriverReleaseTrustRoot, ValidatedDriverReleaseAuthorization, ValidatedDriverReleaseTrustRoot,
+    VerifiedDriverReleaseAuthorization,
 };

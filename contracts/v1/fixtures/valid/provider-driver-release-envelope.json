@@ -1,0 +1,14 @@
+{
+  "payloadType": "application/vnd.deislet.provider-driver-release-authorization.v1+json",
+  "payload": "eyIkc2NoZW1hIjoicHJvdmlkZXItZHJpdmVyLXJlbGVhc2UtYXV0aG9yaXphdGlvbi5zY2hlbWEuanNvbiIsImV4cGlyZXNBdCI6IjIwMjYtMDktMTNUMDA6MDA6MDBaIiwiaXNzdWVkQXQiOiIyMDI2LTA5LTA2VDAwOjAwOjAwWiIsInNjaGVtYVZlcnNpb24iOjEsInN1YmplY3QiOnsiYmFja2VuZElkIjoiY2xvdWRmbGFyZS13b3JrZXJzLXBhZ2VzIiwiZHJpdmVySWQiOiJkZWlzbGV0LmRyaXZlci5jbG91ZGZsYXJlIiwiZHJpdmVyVmVyc2lvbiI6IjAuMS4wLWRyYWZ0LjEiLCJtYW5pZmVzdFNoYTI1NiI6eyJhbGdvcml0aG0iOiJzaGEyNTYiLCJ2YWx1ZSI6ImNhZjdmN2I4ZDhkZWFkNGM3Mzg5ZWQ0MDc2ZjU5OGQxNzAwY2I3MWRhNTdhNzIwMzA2ZTk2NjcyM2EwNTAyMjUifSwicmVsZWFzZVNoYTI1NiI6eyJhbGdvcml0aG0iOiJzaGEyNTYiLCJ2YWx1ZSI6ImUxNDhjMDU2NzgwNTdjZDUwZGVhMDg2YzY5ZDk0MzJjYmYwZDM2ZGQ2MTY3MjAzMTQ0ODY2ZjQ4ZmFlOTViMDUifX19",
+  "signatures": [
+    {
+      "keyid": "dbc298251c51321b7266e78d1c151c2b62aff8cb95b293096d3463018544face",
+      "sig": "m6WpUj5s6AdTV+/p3eDBD4HcLIUhYfbOqyIZ92L4iK9l1cqceCwtTDh9JazN1Mz+TqyWlfyf0V/S+aCHGxxwBQ=="
+    },
+    {
+      "keyid": "fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889",
+      "sig": "ekGG86V3440NcVCBKZw6JZ/Qec8q2DTjpmmwiKLoE714ZXwku3/DxdrpFfpW2/z4VrQc2yoK2Xn3ZAfgRHcrDQ=="
+    }
+  ]
+}

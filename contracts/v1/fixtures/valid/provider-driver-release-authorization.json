@@ -1,0 +1,19 @@
+{
+  "$schema": "provider-driver-release-authorization.schema.json",
+  "schemaVersion": 1,
+  "subject": {
+    "releaseSha256": {
+      "algorithm": "sha256",
+      "value": "e148c05678057cd50dea086c69d9432cbf0d36dd6167203144866f48fae95b05"
+    },
+    "manifestSha256": {
+      "algorithm": "sha256",
+      "value": "caf7f7b8d8dead4c7389ed4076f598d1700cb71da57a720306e966723a050225"
+    },
+    "backendId": "cloudflare-workers-pages",
+    "driverId": "deislet.driver.cloudflare",
+    "driverVersion": "0.1.0-draft.1"
+  },
+  "issuedAt": "2026-09-06T00:00:00Z",
+  "expiresAt": "2026-09-13T00:00:00Z"
+}
