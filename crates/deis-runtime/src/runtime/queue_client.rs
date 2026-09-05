@@ -16,6 +16,7 @@
 
 use super::bindings::StorageIdentity;
 use anyhow::{Context, Result};
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 
 pub mod proto {
@@ -175,6 +176,7 @@ pub struct NackOutcome {
 pub struct QueueClient {
     client: GrpcQueueClient<Channel>,
     identity: StorageIdentity,
+    consumer_generation: Option<MetadataValue<tonic::metadata::Ascii>>,
 }
 
 impl QueueClient {
@@ -195,7 +197,22 @@ impl QueueClient {
         Ok(Self {
             client,
             identity: identity.clone(),
+            consumer_generation: None,
         })
+    }
+
+    /// Bind pull admission to one immutable deployment generation. Only the
+    /// runtime's background consumer uses this; application producer clients
+    /// remain unable to choose or advance the fence.
+    pub(crate) fn with_consumer_generation(mut self, generation: Option<&str>) -> Result<Self> {
+        self.consumer_generation = generation
+            .map(|value| {
+                value
+                    .parse()
+                    .with_context(|| "deployment generation is not valid gRPC metadata")
+            })
+            .transpose()?;
+        Ok(self)
     }
 
     /// The tenant -- application and environment -- every call of this client
@@ -316,11 +333,17 @@ impl QueueClient {
         max_messages: u32,
         lease_seconds: u32,
     ) -> Result<Vec<LeasedMessage>> {
-        let request = self.identity.stamp(PullRequest {
+        let mut request = self.identity.stamp(PullRequest {
             queue_name: queue_name.to_string(),
             max_messages: max_messages.min(i32::MAX as u32) as i32,
             lease_seconds: lease_seconds.min(i32::MAX as u32) as i32,
         });
+        if let Some(generation) = &self.consumer_generation {
+            request.metadata_mut().insert(
+                deis_wire::conventions::DEPLOYMENT_GENERATION_HEADER,
+                generation.clone(),
+            );
+        }
 
         let mut client = self.client.clone();
         let response = client

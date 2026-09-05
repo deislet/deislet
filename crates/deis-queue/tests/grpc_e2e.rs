@@ -24,12 +24,15 @@ use deis_backend_migration::proto::{
 };
 use deis_queue::config::Config;
 use deis_queue::proto::queue::{
-    AckRequest, ListDeadLettersRequest, MessageHandle, NackRequest, PullRequest, QueueMessage,
-    ReplayDeadLettersRequest, SendBatchRequest, SendRequest, queue_client::QueueClient,
+    AckRequest, ActivateConsumerGenerationRequest, ListDeadLettersRequest, MessageHandle,
+    NackRequest, PullRequest, QueueMessage, ReplayDeadLettersRequest, SendBatchRequest,
+    SendRequest, queue_client::QueueClient,
 };
 use deis_queue::tenant::TENANT_HEADER;
 use deis_queue::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{APP_ID_HEADER, STORAGE_TOKEN_HEADER, storage_token, tenant_id};
+use deis_wire::conventions::{
+    APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, STORAGE_TOKEN_HEADER, storage_token, tenant_id,
+};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -825,6 +828,100 @@ async fn one_tenant_cannot_see_or_touch_another_tenants_messages() {
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, id);
     assert_eq!(leased[0].attempts, 1);
+}
+
+#[tokio::test]
+async fn consumer_generation_cutover_is_enforced_over_the_wire() {
+    const PLAN: &str = "018f2518-7e38-7f80-8000-000000000011";
+    const GENERATION: &str = "018f2518-7e38-7f80-8000-000000000012";
+    let harness = Harness::start().await;
+    let mut client = harness.client().await;
+    let tenant = "app-one.production";
+
+    send(&mut client, tenant, "jobs", "old lease").await;
+    send(&mut client, tenant, "jobs", "next generation").await;
+    let old = pull(&mut client, tenant, "jobs", 1, 30).await;
+    assert_eq!(old.len(), 1);
+
+    let first = client
+        .activate_consumer_generation(as_tenant(
+            tenant,
+            ActivateConsumerGenerationRequest {
+                deployment_id: PLAN.to_string(),
+                generation: GENERATION.to_string(),
+                expected_previous_generation: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!first.activated);
+    assert_eq!(first.outstanding_leases, 1);
+
+    let mut early = as_tenant(
+        tenant,
+        PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 1,
+            lease_seconds: 30,
+        },
+    );
+    early
+        .metadata_mut()
+        .insert(DEPLOYMENT_GENERATION_HEADER, GENERATION.parse().unwrap());
+    assert_eq!(
+        client.pull(early).await.unwrap_err().code(),
+        Code::FailedPrecondition,
+        "the pending generation must not lease work before old leases finish"
+    );
+
+    assert_eq!(
+        ack(&mut client, tenant, "jobs", handles(&old)).await,
+        (1, 0)
+    );
+    let active = client
+        .activate_consumer_generation(as_tenant(
+            tenant,
+            ActivateConsumerGenerationRequest {
+                deployment_id: PLAN.to_string(),
+                generation: GENERATION.to_string(),
+                expected_previous_generation: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(active.activated);
+    assert_eq!(active.active_generation, GENERATION);
+
+    let legacy = as_tenant(
+        tenant,
+        PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 1,
+            lease_seconds: 30,
+        },
+    );
+    assert_eq!(
+        client.pull(legacy).await.unwrap_err().code(),
+        Code::FailedPrecondition,
+        "an unstamped consumer must not cross the generation fence"
+    );
+
+    let mut current = as_tenant(
+        tenant,
+        PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 1,
+            lease_seconds: 30,
+        },
+    );
+    current
+        .metadata_mut()
+        .insert(DEPLOYMENT_GENERATION_HEADER, GENERATION.parse().unwrap());
+    let leased = client.pull(current).await.unwrap().into_inner().messages;
+    assert_eq!(leased.len(), 1);
+    assert_eq!(leased[0].body, b"next generation");
 }
 
 #[tokio::test]

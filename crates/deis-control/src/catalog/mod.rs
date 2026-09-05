@@ -59,12 +59,13 @@ pub use identity_migration::{
 };
 pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{
-    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, RetiredAppName, Route,
-    SecretMeta, Version,
+    App, Assignment, DeletedApp, DeployedVersion, Deployment, DeploymentDrainObservation,
+    DeploymentEvent, DeploymentGenerationDrain, DeploymentPlan, DeploymentProxyObservation,
+    DeploymentTargetObservation, Environment, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
 pub use secrets::{SecretCipher, SecretsBackend};
-pub use store::{BundlePathRepair, CatalogStore, SecretHeadChange};
+pub use store::{BundlePathRepair, CatalogStore, DeploymentPlanSpec, SecretHeadChange};
 
 use thiserror::Error;
 

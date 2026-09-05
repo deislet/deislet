@@ -125,6 +125,8 @@ async fn a_bundled_site_is_served_from_its_assets_and_falls_through_on_a_miss() 
             standard_environment: None,
             limits: None,
             compatibility: None,
+            deployment_id: None,
+            routing_generation: None,
         })
         .await
         .expect("the deployment should have been applied");

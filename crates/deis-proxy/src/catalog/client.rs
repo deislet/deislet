@@ -16,6 +16,7 @@
 //! plane that stops noticing route changes while looking perfectly healthy.
 
 use std::net::SocketAddr;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use pingora::connectors::http::Connector;
@@ -141,6 +142,8 @@ pub struct CatalogClient {
     request_timeout: Duration,
     max_table_bytes: usize,
     connector: Connector,
+    proxy_id: Option<String>,
+    observed_routing_table: RwLock<Option<String>>,
 }
 
 impl CatalogClient {
@@ -156,7 +159,24 @@ impl CatalogClient {
             request_timeout,
             max_table_bytes,
             connector: Connector::new(None),
+            proxy_id: None,
+            observed_routing_table: RwLock::new(None),
         }
+    }
+
+    pub fn with_proxy_id(mut self, proxy_id: String) -> Self {
+        self.proxy_id = Some(proxy_id);
+        self
+    }
+
+    /// Called only after ConfigManager has published the complete validated
+    /// table. The next poll carries this as observed state, deliberately one
+    /// exchange later than receipt.
+    pub fn observe_routing_table(&self, version: String) {
+        *self
+            .observed_routing_table
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(version);
     }
 
     pub fn endpoint(&self) -> &ControlEndpoint {
@@ -216,6 +236,25 @@ impl CatalogClient {
             "Authorization",
             &format!("Bearer {}", self.credential),
         )?;
+        if let Some(proxy_id) = &self.proxy_id {
+            set(
+                &mut request,
+                deis_wire::conventions::PROXY_ID_HEADER,
+                proxy_id,
+            )?;
+        }
+        if let Some(version) = self
+            .observed_routing_table
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+        {
+            set(
+                &mut request,
+                deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER,
+                version,
+            )?;
+        }
 
         session
             .write_request_header(Box::new(request))

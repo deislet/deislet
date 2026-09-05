@@ -321,6 +321,55 @@ async fn a_node_loads_everything_the_control_plane_assigned_it() {
     assert_eq!(apps.assets(&demo).unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn an_inflight_assignment_prepares_without_starting_the_current_version() {
+    const DEPLOYMENT: &str = "018f2518-7e38-7f80-8000-000000000021";
+    const GENERATION: &str = "018f2518-7e38-7f80-8000-000000000022";
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+    plane.now_assigns(serde_json::json!([{
+        "app_id": "demo",
+        "version_id": "v1",
+        "deployment_id": DEPLOYMENT,
+        "routing_generation": GENERATION,
+        "deployment_action": "prepare",
+        "environment": "production",
+        "bundle_url": format!("{}/bundle", plane.base()),
+        "bundle_sha": sha,
+    }]));
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+    let mut reconciler = Reconciler::new(&client, &deployer);
+    let prepared = reconciler.once().await.unwrap();
+    let key = AppKey::production("demo");
+    assert_eq!(prepared.installed, 1);
+    assert!(apps.installed_version(&key).is_none());
+    assert!(apps.serves_generation(&key, Some(GENERATION)).await);
+
+    plane.now_assigns(serde_json::json!([{
+        "app_id": "demo",
+        "version_id": "v1",
+        "deployment_id": DEPLOYMENT,
+        "routing_generation": GENERATION,
+        "deployment_action": "activate",
+        "environment": "production",
+        "bundle_url": format!("{}/bundle", plane.base()),
+        "bundle_sha": sha,
+    }]));
+    reconciler.once().await.unwrap();
+    assert_eq!(
+        apps.installed_version(&key)
+            .unwrap()
+            .routing_generation
+            .as_deref(),
+        Some(GENERATION)
+    );
+}
+
 #[test]
 fn an_assignment_carries_the_environment_a_push_would_have() {
     // Before the list carried this, a node that restarted came back running
@@ -630,6 +679,8 @@ async fn a_refused_push_degrades_a_node_that_has_no_next_reconcile_pass() {
         standard_environment: None,
         limits: None,
         compatibility: None,
+        deployment_id: None,
+        routing_generation: None,
     };
     let err = deployer
         .apply(refused)
@@ -1203,6 +1254,8 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_rolled_back() {
                 standard_environment: None,
                 limits: None,
                 compatibility: None,
+                deployment_id: None,
+                routing_generation: None,
             })
             .await
             .unwrap();
@@ -1258,6 +1311,8 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
                 standard_environment: None,
                 limits: None,
                 compatibility: None,
+                deployment_id: None,
+                routing_generation: None,
             })
             .await
             .unwrap();

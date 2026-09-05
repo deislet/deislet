@@ -30,6 +30,7 @@ pub(crate) struct MockControl {
     pub addr: String,
     answer: Arc<Mutex<Answer>>,
     last_authorization: Arc<Mutex<Option<String>>>,
+    last_request: Arc<Mutex<String>>,
     accepting: JoinHandle<()>,
 }
 
@@ -39,17 +40,20 @@ impl MockControl {
         let port = listener.local_addr().unwrap().port();
         let answer = Arc::new(Mutex::new(answer));
         let last_authorization = Arc::new(Mutex::new(None));
+        let last_request = Arc::new(Mutex::new(String::new()));
 
         let served = Arc::clone(&answer);
         let seen = Arc::clone(&last_authorization);
+        let captured = Arc::clone(&last_request);
         let accepting = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let served = Arc::clone(&served);
                 let seen = Arc::clone(&seen);
+                let captured = Arc::clone(&captured);
                 // Serve on the accept task itself: one request at a time is
                 // all the client ever makes, and it keeps every socket owned
                 // by the task that `stop` aborts.
-                serve(stream, served, seen).await;
+                serve(stream, served, seen, captured).await;
             }
         });
 
@@ -57,6 +61,7 @@ impl MockControl {
             addr: format!("http://127.0.0.1:{port}"),
             answer,
             last_authorization,
+            last_request,
             accepting,
         }
     }
@@ -69,6 +74,15 @@ impl MockControl {
     /// The `Authorization` header of the last request served.
     pub(crate) fn last_authorization(&self) -> Option<String> {
         self.last_authorization.lock().unwrap().clone()
+    }
+
+    pub(crate) fn last_header(&self, name: &str) -> Option<String> {
+        let expected = format!("{}:", name.to_ascii_lowercase());
+        self.last_request.lock().unwrap().lines().find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            (format!("{}:", header.to_ascii_lowercase()) == expected)
+                .then(|| value.trim().to_string())
+        })
     }
 
     /// Stop listening, so the next connection is refused. This is a control
@@ -92,6 +106,7 @@ async fn serve(
     mut stream: TcpStream,
     answer: Arc<Mutex<Answer>>,
     last_authorization: Arc<Mutex<Option<String>>>,
+    last_request: Arc<Mutex<String>>,
 ) {
     let mut request = Vec::new();
     let mut byte = [0u8; 1];
@@ -105,6 +120,7 @@ async fn serve(
         }
     }
     let text = String::from_utf8_lossy(&request).to_string();
+    *last_request.lock().unwrap() = text.clone();
     *last_authorization.lock().unwrap() = text
         .lines()
         .find_map(|line| line.strip_prefix("Authorization: "))

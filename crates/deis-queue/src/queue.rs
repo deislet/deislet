@@ -36,10 +36,10 @@ use crate::Clock;
 use crate::MAX_GRPC_MESSAGE_BYTES;
 use crate::error::{QueueError, QueueResult};
 use crate::proto::queue::{
-    AckRequest, AckResponse, DeadLetterMessage, ListDeadLettersRequest, ListDeadLettersResponse,
-    NackRequest, NackResponse, PullRequest, PullResponse, QueueMessage, ReplayDeadLettersRequest,
-    ReplayDeadLettersResponse, SendBatchRequest, SendBatchResponse, SendRequest, SendResponse,
-    queue_server::Queue,
+    AckRequest, AckResponse, ActivateConsumerGenerationRequest, ActivateConsumerGenerationResponse,
+    DeadLetterMessage, ListDeadLettersRequest, ListDeadLettersResponse, NackRequest, NackResponse,
+    PullRequest, PullResponse, QueueMessage, ReplayDeadLettersRequest, ReplayDeadLettersResponse,
+    SendBatchRequest, SendBatchResponse, SendRequest, SendResponse, queue_server::Queue,
 };
 use crate::sqlite::{PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
@@ -280,6 +280,9 @@ impl QueueService {
                      -- Rewritten on every delivery; empty while the message
                      -- is waiting, because nobody holds it.
                      lease_token TEXT    NOT NULL DEFAULT '',
+                     -- Deployment generation that acquired the current
+                     -- lease; empty for a legacy consumer.
+                     lease_generation TEXT NOT NULL DEFAULT '',
                      PRIMARY KEY (tenant, queue, id)
                  );
                  -- The one index Pull needs: it looks up a single tenant's
@@ -300,9 +303,20 @@ impl QueueService {
                      PRIMARY KEY (tenant, queue, id)
                  );
                  CREATE INDEX IF NOT EXISTS dead_letter_died_at
-                     ON dead_letter(died_at);",
+                     ON dead_letter(died_at);
+                 CREATE TABLE IF NOT EXISTS consumer_generation_fences (
+                     tenant                       TEXT PRIMARY KEY,
+                     active_generation            TEXT NOT NULL,
+                     active_deployment_id         TEXT NOT NULL DEFAULT '',
+                     pending_generation           TEXT,
+                     pending_deployment_id         TEXT,
+                     expected_previous_generation TEXT,
+                     updated_at                   INTEGER NOT NULL
+                 );",
             )?;
             add_lease_token_column(conn)?;
+            add_lease_generation_column(conn)?;
+            add_active_deployment_id_column(conn)?;
             add_dead_letter_reason_column(conn)?;
             Ok(())
         })
@@ -420,6 +434,21 @@ impl QueueService {
         max_messages: Option<i32>,
         lease_seconds: Option<i32>,
     ) -> QueueResult<Vec<LeasedMessage>> {
+        self.pull_for_generation(tenant, queue, max_messages, lease_seconds, None)
+            .await
+    }
+
+    /// Generation-aware lease admission used by the gRPC consumer path.
+    /// Validation and leasing share one IMMEDIATE transaction, so a cutover
+    /// cannot slip between "is this generation active?" and the lease write.
+    pub async fn pull_for_generation(
+        &self,
+        tenant: &TenantId,
+        queue: &str,
+        max_messages: Option<i32>,
+        lease_seconds: Option<i32>,
+        consumer_generation: Option<&str>,
+    ) -> QueueResult<Vec<LeasedMessage>> {
         let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         let wanted = self.clamp_pull_size(max_messages);
@@ -431,9 +460,11 @@ impl QueueService {
 
         let tenant_id = tenant.as_str().to_string();
         let table_queue = queue.clone();
+        let consumer_generation = consumer_generation.unwrap_or_default().to_string();
         let (leased, retired) = self
             .pool
             .with_tx(move |tx| {
+                enforce_consumer_generation(tx, &tenant_id, &consumer_generation)?;
                 // A message whose lease lapsed after its last allowed attempt
                 // is not owed another one. Retiring it here rather than
                 // handing it out means the ceiling holds even for consumers
@@ -493,7 +524,8 @@ impl QueueService {
 
                 let mut lease_stmt = tx.prepare(
                     "UPDATE messages
-                        SET visible_at = ?4, attempts = attempts + 1, lease_token = ?5
+                        SET visible_at = ?4, attempts = attempts + 1, lease_token = ?5,
+                            lease_generation = ?6
                       WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
                 )?;
                 for message in &leased {
@@ -502,7 +534,8 @@ impl QueueService {
                         table_queue,
                         message.id,
                         lease_expires_at,
-                        message.lease_token
+                        message.lease_token,
+                        consumer_generation,
                     ])?;
                 }
                 drop(lease_stmt);
@@ -525,6 +558,50 @@ impl QueueService {
             );
         }
         Ok(leased)
+    }
+
+    /// Close lease admission for the previous generation and, once its
+    /// outstanding leases are gone, atomically admit the requested one.
+    pub async fn activate_consumer_generation(
+        &self,
+        tenant: &TenantId,
+        deployment_id: &str,
+        generation: &str,
+        expected_previous_generation: Option<&str>,
+    ) -> QueueResult<ActivateConsumerGenerationResponse> {
+        let _permit = self.fences.permit(tenant.as_str()).await?;
+        deployment_id
+            .parse::<deis_wire::CanonicalId>()
+            .map_err(|error| QueueError::InvalidArgument(format!("deployment_id: {error}")))?;
+        generation
+            .parse::<deis_wire::CanonicalId>()
+            .map_err(|error| QueueError::InvalidArgument(format!("generation: {error}")))?;
+        if let Some(previous) = expected_previous_generation.filter(|value| !value.is_empty()) {
+            previous
+                .parse::<deis_wire::CanonicalId>()
+                .map_err(|error| {
+                    QueueError::InvalidArgument(format!("expected_previous_generation: {error}"))
+                })?;
+        }
+        let tenant_id = tenant.as_str().to_string();
+        let deployment_id = deployment_id.to_string();
+        let generation = generation.to_string();
+        let expected = expected_previous_generation
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let now = self.clock.now();
+        self.pool
+            .with_tx(move |tx| {
+                activate_consumer_generation_tx(
+                    tx,
+                    &tenant_id,
+                    &deployment_id,
+                    &generation,
+                    expected.as_deref(),
+                    now,
+                )
+            })
+            .await
     }
 
     /// Delete handled messages.
@@ -1253,6 +1330,172 @@ impl QueueService {
     }
 }
 
+/// Refuse a pull that could cross a deployment cutover. This is called from
+/// inside the same write transaction that leases messages.
+fn enforce_consumer_generation(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    consumer_generation: &str,
+) -> QueueResult<()> {
+    let fence: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT active_generation, pending_generation
+               FROM consumer_generation_fences WHERE tenant = ?1",
+            [tenant],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match fence {
+        None if consumer_generation.is_empty() => Ok(()),
+        None => Err(QueueError::ConsumerGenerationFenced(format!(
+            "tenant {tenant:?} has not activated generation {consumer_generation}"
+        ))),
+        Some((active, Some(pending))) => Err(QueueError::ConsumerGenerationFenced(format!(
+            "tenant {tenant:?} is draining generation {active:?} before activating {pending:?}"
+        ))),
+        Some((active, None)) if active == consumer_generation => Ok(()),
+        Some((active, None)) => Err(QueueError::ConsumerGenerationFenced(format!(
+            "tenant {tenant:?} admits generation {active:?}, not {consumer_generation:?}"
+        ))),
+    }
+}
+
+fn activate_consumer_generation_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    deployment_id: &str,
+    generation: &str,
+    expected_previous_generation: Option<&str>,
+    now: i64,
+) -> QueueResult<ActivateConsumerGenerationResponse> {
+    let stored: Option<(String, String, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT active_generation, active_deployment_id, pending_generation, pending_deployment_id
+               FROM consumer_generation_fences WHERE tenant = ?1",
+            [tenant],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let active_before = stored
+        .as_ref()
+        .map(|(active, _, _, _)| active.clone())
+        .unwrap_or_default();
+
+    match stored {
+        None => {
+            // Upgrade bootstrap: legacy consumers have no generation but may
+            // still hold leases. Represent that as an empty active value and
+            // close admission before inspecting those leases.
+            tx.execute(
+                "INSERT INTO consumer_generation_fences
+                   (tenant, active_generation, active_deployment_id, pending_generation,
+                    pending_deployment_id, expected_previous_generation, updated_at)
+                 VALUES (?1, '', '', ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    tenant,
+                    generation,
+                    deployment_id,
+                    expected_previous_generation,
+                    now
+                ],
+            )?;
+        }
+        Some((active, active_deployment, pending, pending_deployment)) => {
+            if active == generation && pending.is_none() {
+                if !active_deployment.is_empty() && active_deployment != deployment_id {
+                    return Err(QueueError::ConsumerGenerationFenced(format!(
+                        "tenant {tenant:?} generation {generation:?} is owned by deployment {active_deployment:?}, not {deployment_id:?}"
+                    )));
+                }
+                if active_deployment.is_empty() {
+                    // Upgrade adoption for a fence row written before active
+                    // deployment identity was persisted. Exactly one caller
+                    // can claim it inside this write transaction.
+                    tx.execute(
+                        "UPDATE consumer_generation_fences
+                            SET active_deployment_id = ?2, updated_at = ?3
+                          WHERE tenant = ?1 AND active_deployment_id = ''",
+                        rusqlite::params![tenant, deployment_id, now],
+                    )?;
+                }
+                return Ok(ActivateConsumerGenerationResponse {
+                    activated: true,
+                    active_generation: active,
+                    pending_generation: String::new(),
+                    outstanding_leases: 0,
+                });
+            }
+            if let Some(pending) = pending {
+                if pending != generation || pending_deployment.as_deref() != Some(deployment_id) {
+                    return Err(QueueError::ConsumerGenerationFenced(format!(
+                        "tenant {tenant:?} already has generation {pending:?} pending under deployment {:?}",
+                        pending_deployment.as_deref().unwrap_or("<unknown>")
+                    )));
+                }
+            } else {
+                if expected_previous_generation != Some(active.as_str()) {
+                    return Err(QueueError::ConsumerGenerationFenced(format!(
+                        "tenant {tenant:?} currently admits generation {active:?}; deployment {deployment_id} expected {:?}",
+                        expected_previous_generation.unwrap_or("<none>")
+                    )));
+                }
+                tx.execute(
+                    "UPDATE consumer_generation_fences
+                        SET pending_generation = ?2,
+                            pending_deployment_id = ?3,
+                            expected_previous_generation = ?4,
+                            updated_at = ?5
+                      WHERE tenant = ?1",
+                    rusqlite::params![
+                        tenant,
+                        generation,
+                        deployment_id,
+                        expected_previous_generation,
+                        now
+                    ],
+                )?;
+            }
+        }
+    }
+
+    // Pull admission is already closed by pending_generation. Existing
+    // handlers may still Ack/Nack. A lease that has expired no longer counts:
+    // at-least-once delivery already permits it to be attempted again.
+    let outstanding: i64 = tx.query_row(
+        "SELECT count(*) FROM messages
+          WHERE tenant = ?1 AND lease_token <> '' AND visible_at > ?2",
+        rusqlite::params![tenant, now],
+        |row| row.get(0),
+    )?;
+    if outstanding == 0 {
+        tx.execute(
+            "UPDATE consumer_generation_fences
+                SET active_generation = ?2,
+                    active_deployment_id = ?3,
+                    pending_generation = NULL,
+                    pending_deployment_id = NULL,
+                    expected_previous_generation = NULL,
+                    updated_at = ?4
+              WHERE tenant = ?1",
+            rusqlite::params![tenant, generation, deployment_id, now],
+        )?;
+    }
+    Ok(ActivateConsumerGenerationResponse {
+        activated: outstanding == 0,
+        active_generation: if outstanding == 0 {
+            generation.to_string()
+        } else {
+            active_before
+        },
+        pending_generation: if outstanding == 0 {
+            String::new()
+        } else {
+            generation.to_string()
+        },
+        outstanding_leases: outstanding,
+    })
+}
+
 /// Add the `lease_token` column to a `messages` table written before it
 /// existed.
 ///
@@ -1278,6 +1521,51 @@ fn add_lease_token_column(conn: &rusqlite::Connection) -> QueueResult<()> {
     tracing::info!(
         "added the lease_token column to an existing queue database; messages already in it keep \
          their place in line and are given a token by their next delivery"
+    );
+    Ok(())
+}
+
+/// Add generation attribution to leases written by older queue builds.
+fn add_lease_generation_column(conn: &rusqlite::Connection) -> QueueResult<()> {
+    let mut present = false;
+    conn.pragma(None, "table_info", "messages", |row| {
+        let column: String = row.get(1)?;
+        if column == "lease_generation" {
+            present = true;
+        }
+        Ok(())
+    })?;
+    if present {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE messages ADD COLUMN lease_generation TEXT NOT NULL DEFAULT ''",
+    )?;
+    tracing::info!(
+        "added generation attribution to existing queue leases; legacy in-flight leases drain before the first fenced deployment activates"
+    );
+    Ok(())
+}
+
+/// Bind an active consumer generation to the deployment intent that created
+/// it. Older rows are adopted by the first exact retry after upgrade.
+fn add_active_deployment_id_column(conn: &rusqlite::Connection) -> QueueResult<()> {
+    let mut present = false;
+    conn.pragma(None, "table_info", "consumer_generation_fences", |row| {
+        let column: String = row.get(1)?;
+        if column == "active_deployment_id" {
+            present = true;
+        }
+        Ok(())
+    })?;
+    if present {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE consumer_generation_fences ADD COLUMN active_deployment_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    tracing::info!(
+        "added active deployment attribution to existing queue generation fences; the first exact post-upgrade retry adopts each legacy row"
     );
     Ok(())
 }
@@ -1482,13 +1770,29 @@ impl Queue for QueueService {
 
     async fn pull(&self, request: Request<PullRequest>) -> Result<Response<PullResponse>, Status> {
         let tenant = tenant_of(&request)?;
+        let consumer_generation = request
+            .metadata()
+            .get(deis_wire::conventions::DEPLOYMENT_GENERATION_HEADER)
+            .map(|value| {
+                let value = value.to_str().map_err(|_| {
+                    QueueError::InvalidArgument(
+                        "deployment generation metadata is not ASCII".to_string(),
+                    )
+                })?;
+                value.parse::<deis_wire::CanonicalId>().map_err(|error| {
+                    QueueError::InvalidArgument(format!("deployment generation: {error}"))
+                })?;
+                Ok::<_, QueueError>(value.to_string())
+            })
+            .transpose()?;
         let req = request.into_inner();
         let leased = self
-            .pull(
+            .pull_for_generation(
                 &tenant,
                 &req.queue_name,
                 Some(req.max_messages),
                 Some(req.lease_seconds),
+                consumer_generation.as_deref(),
             )
             .await?;
 
@@ -1509,6 +1813,24 @@ impl Queue for QueueService {
             })
             .collect();
         Ok(Response::new(PullResponse { messages }))
+    }
+
+    async fn activate_consumer_generation(
+        &self,
+        request: Request<ActivateConsumerGenerationRequest>,
+    ) -> Result<Response<ActivateConsumerGenerationResponse>, Status> {
+        let tenant = tenant_of(&request)?;
+        let req = request.into_inner();
+        let response = self
+            .activate_consumer_generation(
+                &tenant,
+                &req.deployment_id,
+                &req.generation,
+                (!req.expected_previous_generation.is_empty())
+                    .then_some(req.expected_previous_generation.as_str()),
+            )
+            .await?;
+        Ok(Response::new(response))
     }
 
     async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
@@ -1664,6 +1986,98 @@ mod tests {
             .iter()
             .map(|m| String::from_utf8(m.body.clone()).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn deployment_generation_fence_drains_old_leases_before_cutover() {
+        const PLAN_ONE: &str = "018f2518-7e38-7f80-8000-000000000011";
+        const GEN_ONE: &str = "018f2518-7e38-7f80-8000-000000000012";
+        const PLAN_TWO: &str = "018f2518-7e38-7f80-8000-000000000013";
+        const GEN_TWO: &str = "018f2518-7e38-7f80-8000-000000000014";
+        let f = fixture().await;
+        let tenant = tenant("shop.production");
+        f.service
+            .send_batch(
+                &tenant,
+                "jobs",
+                vec![b"old lease".to_vec(), b"next".to_vec()],
+            )
+            .await
+            .unwrap();
+        let old = f
+            .service
+            .pull(&tenant, "jobs", Some(1), Some(60))
+            .await
+            .unwrap();
+
+        let draining = f
+            .service
+            .activate_consumer_generation(&tenant, PLAN_ONE, GEN_ONE, None)
+            .await
+            .unwrap();
+        assert!(!draining.activated);
+        assert_eq!(draining.outstanding_leases, 1);
+        assert!(matches!(
+            f.service
+                .pull_for_generation(&tenant, "jobs", Some(1), None, None)
+                .await,
+            Err(QueueError::ConsumerGenerationFenced(_))
+        ));
+        assert!(matches!(
+            f.service
+                .pull_for_generation(&tenant, "jobs", Some(1), None, Some(GEN_ONE))
+                .await,
+            Err(QueueError::ConsumerGenerationFenced(_))
+        ));
+
+        f.service.ack(&tenant, "jobs", handles(&old)).await.unwrap();
+        let active = f
+            .service
+            .activate_consumer_generation(&tenant, PLAN_ONE, GEN_ONE, None)
+            .await
+            .unwrap();
+        assert!(active.activated);
+        assert_eq!(active.active_generation, GEN_ONE);
+        assert!(matches!(
+            f.service
+                .activate_consumer_generation(&tenant, PLAN_TWO, GEN_ONE, None)
+                .await,
+            Err(QueueError::ConsumerGenerationFenced(_))
+        ));
+        assert!(matches!(
+            f.service.pull(&tenant, "jobs", Some(1), None).await,
+            Err(QueueError::ConsumerGenerationFenced(_))
+        ));
+
+        let first_generation = f
+            .service
+            .pull_for_generation(&tenant, "jobs", Some(1), Some(60), Some(GEN_ONE))
+            .await
+            .unwrap();
+        assert_eq!(bodies(&first_generation), ["next"]);
+        assert!(matches!(
+            f.service
+                .activate_consumer_generation(&tenant, PLAN_TWO, GEN_TWO, None)
+                .await,
+            Err(QueueError::ConsumerGenerationFenced(_))
+        ));
+        let second_draining = f
+            .service
+            .activate_consumer_generation(&tenant, PLAN_TWO, GEN_TWO, Some(GEN_ONE))
+            .await
+            .unwrap();
+        assert!(!second_draining.activated);
+        f.service
+            .ack(&tenant, "jobs", handles(&first_generation))
+            .await
+            .unwrap();
+        assert!(
+            f.service
+                .activate_consumer_generation(&tenant, PLAN_TWO, GEN_TWO, Some(GEN_ONE))
+                .await
+                .unwrap()
+                .activated
+        );
     }
 
     #[tokio::test]

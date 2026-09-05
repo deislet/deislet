@@ -56,7 +56,7 @@
 
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
-pub use deis_wire::conventions::{APP_ID_HEADER, ENVIRONMENT_HEADER};
+pub use deis_wire::conventions::{APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER};
 
 /// How many upstreams one request may be handed to before it is answered
 /// `502`.
@@ -144,6 +144,9 @@ pub struct RequestCtx {
     /// Set together with `app_id`; `None` only in plain reverse proxy mode
     /// where no application was resolved at all.
     pub environment: Option<String>,
+    /// Exact immutable deployment selected by the catalog snapshot. Absent
+    /// only for this machine's static configuration or plain proxy mode.
+    pub deployment_generation: Option<String>,
     /// Backend address the request was sent to, once selected. The most
     /// recent one when the request went round the retry loop.
     pub upstream: Option<String>,
@@ -176,6 +179,7 @@ impl Default for RequestCtx {
             host: String::new(),
             app_id: None,
             environment: None,
+            deployment_generation: None,
             upstream: None,
             tried_upstreams: Vec::new(),
             tls: false,
@@ -362,6 +366,7 @@ impl ResolvedFrom {
 struct Resolved {
     app_id: String,
     environment: String,
+    deployment_generation: Option<String>,
     /// Certificates, cache policy and the enabled flag. Absent for an
     /// application only the catalog knows, which is the ordinary case on an
     /// edge that is driven entirely from the control plane.
@@ -480,6 +485,7 @@ fn resolve_app(
             return Resolution::Found(Resolved {
                 app_id: app.id.clone(),
                 environment: app.environment.clone(),
+                deployment_generation: None,
                 config: Some(Arc::clone(app)),
                 from: ResolvedFrom::Header,
             });
@@ -488,6 +494,7 @@ fn resolve_app(
             Some(target) => Resolution::Found(Resolved {
                 app_id: target.app_id,
                 environment: target.environment,
+                deployment_generation: target.deployment_generation,
                 config: None,
                 from: ResolvedFrom::Header,
             }),
@@ -503,6 +510,7 @@ fn resolve_app(
         return Resolution::Found(Resolved {
             app_id: found.target.app_id,
             environment: found.target.environment,
+            deployment_generation: found.target.deployment_generation,
             config,
             from: match found.source {
                 MatchSource::Route => ResolvedFrom::Catalog,
@@ -515,6 +523,7 @@ fn resolve_app(
         Some(app) => Resolution::Found(Resolved {
             app_id: app.id.clone(),
             environment: app.environment.clone(),
+            deployment_generation: None,
             config: Some(Arc::clone(app)),
             from: ResolvedFrom::Local,
         }),
@@ -608,6 +617,9 @@ fn stamp_platform_headers(
     // never ambiguous.
     if let Some(environment) = &ctx.environment {
         upstream_request.insert_header(ENVIRONMENT_HEADER, environment.as_str())?;
+    }
+    if let Some(generation) = &ctx.deployment_generation {
+        upstream_request.insert_header(DEPLOYMENT_GENERATION_HEADER, generation.as_str())?;
     }
     Ok(())
 }
@@ -831,6 +843,7 @@ impl ProxyHttp for DeisProxy {
         );
         ctx.app_id = Some(resolved.app_id.clone());
         ctx.environment = Some(resolved.environment.clone());
+        ctx.deployment_generation = resolved.deployment_generation.clone();
 
         let tls_ports = system.tls_ports();
         let https_ready = https_redirect_allowed(&routes, resolved.config.as_deref(), &ctx.host);

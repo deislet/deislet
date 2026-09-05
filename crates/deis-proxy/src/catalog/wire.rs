@@ -23,6 +23,10 @@ pub const ROUTING_TABLE_PATH: &str = deis_wire::conventions::ROUTING_TABLE_ROUTE
 pub struct RoutingEntry {
     pub app_id: String,
     pub environment: String,
+    /// Immutable deployment selected for this target. Absent only while
+    /// reading a routing table produced by an older control plane.
+    #[serde(default)]
+    pub deployment_generation: Option<String>,
     /// Absent means "any domain". `*.example.com` is a wildcard.
     #[serde(default)]
     pub host: Option<String>,
@@ -37,6 +41,8 @@ pub struct RoutingEntry {
 pub struct EnvironmentRef {
     pub app_id: String,
     pub environment: String,
+    #[serde(default)]
+    pub deployment_generation: Option<String>,
 }
 
 /// The whole document.
@@ -75,6 +81,22 @@ pub enum DocumentError {
     RelativePrefix { index: usize, value: String },
     #[error("environment {index} has an empty {field}")]
     EmptyEnvironment { index: usize, field: &'static str },
+    #[error(
+        "environment {index} has a {field} carrying whitespace or a control character ({value:?}); it would go on the wire as a request header"
+    )]
+    NotHeaderSafeEnvironment {
+        index: usize,
+        field: &'static str,
+        value: String,
+    },
+    #[error(
+        "{location} {index} has deployment_generation {value:?}, which is not a canonical UUIDv7"
+    )]
+    InvalidGeneration {
+        location: &'static str,
+        index: usize,
+        value: String,
+    },
 }
 
 impl RoutingTableDocument {
@@ -87,6 +109,9 @@ impl RoutingTableDocument {
         for (index, route) in self.routes.iter().enumerate() {
             check_name(index, "app_id", &route.app_id)?;
             check_name(index, "environment", &route.environment)?;
+            if let Some(generation) = &route.deployment_generation {
+                check_generation("route", index, generation)?;
+            }
             if route.path_prefix.is_empty() {
                 return Err(DocumentError::Empty {
                     index,
@@ -135,9 +160,27 @@ impl RoutingTableDocument {
                     field: "environment",
                 });
             }
+            if let Some(generation) = &env.deployment_generation {
+                check_generation("environment", index, generation)?;
+            }
         }
         Ok(())
     }
+}
+
+fn check_generation(
+    location: &'static str,
+    index: usize,
+    value: &str,
+) -> Result<(), DocumentError> {
+    value
+        .parse::<deis_wire::CanonicalId>()
+        .map(|_| ())
+        .map_err(|_| DocumentError::InvalidGeneration {
+            location,
+            index,
+            value: value.to_string(),
+        })
 }
 
 fn check_name(index: usize, field: &'static str, value: &str) -> Result<(), DocumentError> {
@@ -213,6 +256,46 @@ mod tests {
             r#"[{"app_id":"shop","environment":"production","host":"  ","path_prefix":"/"}]"#,
         ] {
             assert!(document(bad).validate().is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn deployment_generations_must_be_canonical_uuidv7_on_both_wire_lists() {
+        let valid = "018f2518-7e38-7f80-8000-000000000001";
+        let route = document(&format!(
+            r#"[{{"app_id":"shop","environment":"production","deployment_generation":"{valid}","path_prefix":"/"}}]"#
+        ));
+        route.validate().unwrap();
+
+        for invalid in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "018F2518-7E38-7F80-8000-000000000001",
+            "not-a-generation",
+        ] {
+            let route = document(&format!(
+                r#"[{{"app_id":"shop","environment":"production","deployment_generation":"{invalid}","path_prefix":"/"}}]"#
+            ));
+            assert!(matches!(
+                route.validate(),
+                Err(DocumentError::InvalidGeneration {
+                    location: "route",
+                    index: 0,
+                    ..
+                })
+            ));
+
+            let environment: RoutingTableDocument = serde_json::from_str(&format!(
+                r#"{{"version":"v1","routes":[],"environments":[{{"app_id":"shop","environment":"production","deployment_generation":"{invalid}"}}]}}"#
+            ))
+            .unwrap();
+            assert!(matches!(
+                environment.validate(),
+                Err(DocumentError::InvalidGeneration {
+                    location: "environment",
+                    index: 0,
+                    ..
+                })
+            ));
         }
     }
 

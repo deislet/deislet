@@ -1362,10 +1362,12 @@ pub(crate) fn consumer_queue_client(
     tenant: &str,
     endpoint: &str,
     token: Option<&str>,
+    generation: Option<&str>,
 ) -> Result<QueueClient> {
     let identity = StorageIdentity::new(tenant, token)
         .with_context(|| format!("building the queue consumer client for {tenant}"))?;
-    QueueClient::connect_lazy(endpoint, &identity)
+    QueueClient::connect_lazy(endpoint, &identity)?
+        .with_consumer_generation(generation)
         .with_context(|| format!("building the queue consumer client for {tenant}"))
 }
 

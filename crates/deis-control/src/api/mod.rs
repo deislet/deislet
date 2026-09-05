@@ -111,9 +111,11 @@ pub fn build_api_router(
     let catalog_state = build_catalog_state(
         Arc::clone(&database),
         Arc::clone(&deis_runtime_manager),
+        Arc::clone(&sessions),
         node_auth.clone(),
         &config,
     );
+    catalog::deployments::resume_on_start(catalog_state.clone());
 
     // Built after the catalog and sharing its store, not beside it with a
     // second one: `apps::unload_app` refuses an unload the catalog would undo,
@@ -381,6 +383,7 @@ pub async fn anchor_bundle_paths(database: &Arc<Database>, config: &ControlConfi
 fn build_catalog_state(
     database: Arc<Database>,
     nodes: Arc<RuntimeNodeManager>,
+    sessions: Arc<SessionManager>,
     node_auth: middleware::NodeAuthConfig,
     config: &ControlConfig,
 ) -> catalog::CatalogState {
@@ -478,6 +481,7 @@ fn build_catalog_state(
             store, secrets, nodes, address, storage,
         )),
         node_auth,
+        sessions,
     }
 }
 

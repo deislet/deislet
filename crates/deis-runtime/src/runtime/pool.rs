@@ -922,6 +922,11 @@ struct Placement {
     threads: Vec<RuntimeThread>,
     /// `<app>.<environment>` tenant -> index into `threads`.
     of_app: HashMap<String, usize>,
+    /// Immutable deployment slots addressable by the routing generation the
+    /// trusted edge selected. Active, prepared and retained rollback slots all
+    /// live here; `of_app` remains the selector for triggers and legacy calls.
+    generations: HashMap<(String, String), GenerationSlot>,
+    active_generation: HashMap<String, String>,
     /// Tenant -> the thread building a replacement isolate for it. The entry
     /// exists from the moment the thread is claimed, so a replacement being
     /// built cannot be handed the thread the application is still serving on,
@@ -933,10 +938,20 @@ struct Placement {
     retiring: std::collections::HashSet<usize>,
 }
 
+#[derive(Clone)]
+struct GenerationSlot {
+    storage_tenant: String,
+    thread_id: usize,
+    sender: mpsc::Sender<RuntimeMessage>,
+    wiring: ServiceWiring,
+    execution_timeout: Duration,
+}
+
 impl Placement {
     /// A thread with no application on it, if there is one.
     fn idle_thread(&self) -> Option<usize> {
         let mut taken: std::collections::HashSet<usize> = self.of_app.values().copied().collect();
+        taken.extend(self.generations.values().map(|slot| slot.thread_id));
         taken.extend(self.staging.values().copied());
         taken.extend(self.retiring.iter().copied());
         (0..self.threads.len()).find(|id| !taken.contains(id))
@@ -1035,6 +1050,8 @@ impl RuntimePool {
                 placement: RwLock::new(Placement {
                     threads,
                     of_app: HashMap::new(),
+                    generations: HashMap::new(),
+                    active_generation: HashMap::new(),
                     staging: HashMap::new(),
                     retiring: std::collections::HashSet::new(),
                 }),
@@ -1178,7 +1195,10 @@ impl RuntimePool {
 
     /// Give up an application's thread, leaving it idle for the next load.
     async fn release(&self, tenant: &str) {
-        self.placement.write().await.of_app.remove(tenant);
+        let mut placement = self.placement.write().await;
+        placement.of_app.remove(tenant);
+        placement.active_generation.remove(tenant);
+        drop(placement);
         // Its record goes with it. Left behind, its consent would answer for
         // an application that is no longer here, and the caller would be told
         // "not consented" for something that is really "not deployed" - the
@@ -1396,14 +1416,28 @@ impl RuntimePool {
             // the application to another thread between the panic and now has
             // already given it a live isolate, and forgetting it here would
             // take a working application off the node.
-            let placed_here = self
-                .placement
-                .read()
-                .await
-                .of_app
-                .get(&app_id)
-                .is_some_and(|id| *id == thread_id);
-            if !placed_here {
+            let (placed_here, lost_generations) = {
+                let mut placement = self.placement.write().await;
+                let placed_here = placement
+                    .of_app
+                    .get(&app_id)
+                    .is_some_and(|id| *id == thread_id);
+                let lost: Vec<(String, String)> = placement
+                    .generations
+                    .iter()
+                    .filter(|((tenant, _), slot)| tenant == &app_id && slot.thread_id == thread_id)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in &lost {
+                    placement.generations.remove(key);
+                }
+                if placed_here {
+                    placement.of_app.remove(&app_id);
+                    placement.active_generation.remove(&app_id);
+                }
+                (placed_here, lost)
+            };
+            if !placed_here && lost_generations.is_empty() {
                 tracing::info!(
                     thread_id,
                     app_id = %app_id,
@@ -1412,6 +1446,17 @@ impl RuntimePool {
                      another thread; nothing to forget",
                     thread_id,
                     app_id
+                );
+                continue;
+            }
+
+            if !placed_here {
+                tracing::error!(
+                    thread_id,
+                    app_id = %app_id,
+                    generations = ?lost_generations.iter().map(|(_, generation)| generation).collect::<Vec<_>>(),
+                    panic = %panic,
+                    "A prepared or retained deployment generation lost its isolate before activation/drain; it is no longer addressable and the control plane must prepare it again"
                 );
                 continue;
             }
@@ -1432,7 +1477,7 @@ impl RuntimePool {
             // Before the placement goes, so no batch is leased for an
             // application that has no isolate to hand it to.
             self.stop_consumers(&app_id).await;
-            self.release(&app_id).await;
+            self.serving.write().await.remove(&app_id);
         }
     }
 
@@ -1455,6 +1500,27 @@ impl RuntimePool {
             .get(app_id)
             .ok_or_else(|| anyhow::anyhow!("App not found"))?;
         placement.threads[id].send(message)
+    }
+
+    async fn dispatch_generation(
+        &self,
+        app_id: &str,
+        generation: &str,
+        message: RuntimeMessage,
+    ) -> Result<()> {
+        self.apply_thread_faults().await;
+        let placement = self.placement.read().await;
+        let slot = placement
+            .generations
+            .get(&(app_id.to_string(), generation.to_string()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "deployment generation {generation} of {app_id} is not prepared on this node"
+                )
+            })?;
+        slot.sender
+            .try_send(message)
+            .map_err(|error| anyhow::anyhow!("runtime thread could not take request: {error}"))
     }
 
     /// Load one environment of one application.
@@ -1578,6 +1644,168 @@ impl RuntimePool {
         }
     }
 
+    /// Publish a warm staged isolate under an immutable generation without
+    /// moving the tenant's production selector or starting asynchronous
+    /// consumers. HTTP addressed to this generation can now be verified and
+    /// served explicitly while legacy/current traffic keeps using `of_app`.
+    pub async fn prepare_generation(
+        &self,
+        staged: StagedVersion,
+        generation: String,
+    ) -> Result<()> {
+        let StagedVersion {
+            tenant,
+            storage_tenant,
+            thread_id,
+            sender,
+            wiring,
+            execution_timeout,
+        } = staged;
+
+        let mut placement = self.placement.write().await;
+        match placement.staging.get(&tenant) {
+            Some(id) if *id == thread_id => {
+                placement.staging.remove(&tenant);
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "the staged isolate of {tenant} on thread {thread_id} is no longer reserved"
+                ));
+            }
+        }
+        let key = (tenant.clone(), generation.clone());
+        if placement.generations.contains_key(&key) {
+            // This should have been caught by ApplicationManager before a
+            // second isolate was built. Do not overwrite the authoritative
+            // slot and strand its thread.
+            placement.retiring.insert(thread_id);
+            drop(placement);
+            self.retire_thread(&tenant, thread_id, sender).await;
+            return Err(anyhow::anyhow!(
+                "deployment generation {generation} of {tenant} is already prepared"
+            ));
+        }
+        placement.generations.insert(
+            key,
+            GenerationSlot {
+                storage_tenant,
+                thread_id,
+                sender,
+                wiring,
+                execution_timeout,
+            },
+        );
+        tracing::info!(
+            app_id = %tenant,
+            routing_generation = %generation,
+            thread_id,
+            "Prepared an immutable deployment generation without moving production traffic"
+        );
+        Ok(())
+    }
+
+    /// Whether a prepared/active/retained generation still owns a live slot.
+    pub async fn is_generation_hosted(&self, tenant: &str, generation: &str) -> bool {
+        self.apply_thread_faults().await;
+        self.placement
+            .read()
+            .await
+            .generations
+            .contains_key(&(tenant.to_string(), generation.to_string()))
+    }
+
+    /// Move the current selector to an already prepared generation. Old
+    /// generation-addressed slots stay reachable for proxies that still hold
+    /// the previous routing snapshot and for an exact rollback.
+    pub async fn activate_generation(&self, tenant: &str, generation: &str) -> Result<()> {
+        self.apply_thread_faults().await;
+        let (slot, previous) = {
+            let mut placement = self.placement.write().await;
+            let slot = placement
+                .generations
+                .get(&(tenant.to_string(), generation.to_string()))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "deployment generation {generation} of {tenant} is not prepared"
+                    )
+                })?;
+            if placement.of_app.get(tenant) == Some(&slot.thread_id)
+                && placement.active_generation.get(tenant).map(String::as_str) == Some(generation)
+            {
+                return Ok(());
+            }
+            let previous_id = placement.of_app.insert(tenant.to_string(), slot.thread_id);
+            placement
+                .active_generation
+                .insert(tenant.to_string(), generation.to_string());
+            let previous = previous_id.filter(|id| *id != slot.thread_id).map(|id| {
+                let retained = placement
+                    .generations
+                    .values()
+                    .any(|candidate| candidate.thread_id == id);
+                if !retained {
+                    placement.retiring.insert(id);
+                }
+                (id, placement.threads[id].sender.clone(), retained)
+            });
+            (slot, previous)
+        };
+
+        self.record_serving(tenant, &slot.wiring).await;
+        self.stop_consumers(tenant).await;
+        self.start_consumers(
+            tenant,
+            &slot.storage_tenant,
+            slot.sender.clone(),
+            &slot.wiring,
+            slot.execution_timeout,
+            Some(generation),
+        )
+        .await;
+
+        if let Some((previous_id, previous_sender, retained)) = previous {
+            if retained {
+                tracing::info!(
+                    app_id = tenant,
+                    routing_generation = generation,
+                    from_thread = previous_id,
+                    to_thread = slot.thread_id,
+                    "Activated the prepared generation; the previous generation remains addressable while routing converges"
+                );
+            } else {
+                self.retire_thread(tenant, previous_id, previous_sender)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard one generation that is not the current trigger/legacy selector.
+    pub async fn discard_generation(&self, tenant: &str, generation: &str) -> Result<()> {
+        let slot = {
+            let mut placement = self.placement.write().await;
+            if placement.active_generation.get(tenant).map(String::as_str) == Some(generation) {
+                return Err(anyhow::anyhow!(
+                    "deployment generation {generation} of {tenant} is active and must be replaced before it can drain"
+                ));
+            }
+            let slot = placement
+                .generations
+                .remove(&(tenant.to_string(), generation.to_string()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "deployment generation {generation} of {tenant} is not prepared"
+                    )
+                })?;
+            placement.retiring.insert(slot.thread_id);
+            slot
+        };
+        self.retire_thread(tenant, slot.thread_id, slot.sender)
+            .await;
+        Ok(())
+    }
+
     /// Make a staged isolate the one that serves.
     ///
     /// The swap is one write under the placement lock, so a request either
@@ -1645,8 +1873,15 @@ impl RuntimePool {
         // Stop before the old isolate goes away, so a batch already leased is
         // handed to the isolate that can still handle it.
         self.stop_consumers(&tenant).await;
-        self.start_consumers(&tenant, &storage_tenant, sender, &wiring, execution_timeout)
-            .await;
+        self.start_consumers(
+            &tenant,
+            &storage_tenant,
+            sender,
+            &wiring,
+            execution_timeout,
+            None,
+        )
+        .await;
 
         match previous {
             Some((previous_id, previous_sender)) => {
@@ -1746,6 +1981,7 @@ impl RuntimePool {
         sender: mpsc::Sender<RuntimeMessage>,
         wiring: &ServiceWiring,
         execution_timeout: Duration,
+        generation: Option<&str>,
     ) {
         let specs = wiring.active_consumers(tenant);
         if specs.is_empty() {
@@ -1764,6 +2000,7 @@ impl RuntimePool {
             storage_tenant,
             endpoint,
             wiring.storage_token.as_deref(),
+            generation,
         ) {
             Ok(client) => Arc::new(client),
             Err(e) => {
@@ -1850,15 +2087,47 @@ impl RuntimePool {
         // process ends.
         self.discard_staged_for(app_id).await;
 
+        // Remove every prepared/retained generation from the addressable set
+        // in the same lock acquisition. The current thread is unloaded by the
+        // existing path below; every other generation is retired afterwards.
+        let retained = {
+            let mut placement = self.placement.write().await;
+            let active = placement.of_app.get(app_id).copied();
+            let keys: Vec<(String, String)> = placement
+                .generations
+                .keys()
+                .filter(|(tenant, _)| tenant == app_id)
+                .cloned()
+                .collect();
+            let mut retained = Vec::new();
+            for key in keys {
+                if let Some(slot) = placement.generations.remove(&key) {
+                    if Some(slot.thread_id) != active {
+                        placement.retiring.insert(slot.thread_id);
+                        retained.push(slot);
+                    }
+                }
+            }
+            placement.active_generation.remove(app_id);
+            retained
+        };
+
         let (tx, rx) = oneshot::channel();
-        self.dispatch(
-            app_id,
-            RuntimeMessage::UnloadApp {
-                app_id: app_id.to_string(),
-                response: tx,
-            },
-        )
-        .await?;
+        let dispatched = self
+            .dispatch(
+                app_id,
+                RuntimeMessage::UnloadApp {
+                    app_id: app_id.to_string(),
+                    response: tx,
+                },
+            )
+            .await;
+
+        for slot in retained {
+            self.retire_thread(app_id, slot.thread_id, slot.sender)
+                .await;
+        }
+        dispatched?;
 
         let result = rx
             .await
@@ -1906,6 +2175,38 @@ impl RuntimePool {
             // sentence rather than as its own error.
             anyhow::anyhow!(
                 "the runtime thread serving app {app_id} ended this request without answering it;                  the node's log has what happened to it"
+            )
+        })?
+    }
+
+    /// Execute against the exact generation selected by a trusted routing
+    /// table. There is deliberately no fallback to [`Self::execute_request`].
+    pub async fn execute_request_generation(
+        &self,
+        app_id: &str,
+        generation: &str,
+        url: String,
+        method: String,
+        headers: HeaderPairs,
+        body: Option<Vec<u8>>,
+    ) -> Result<FetchResult> {
+        let (tx, rx) = oneshot::channel();
+        self.dispatch_generation(
+            app_id,
+            generation,
+            RuntimeMessage::ExecuteRequest {
+                app_id: app_id.to_string(),
+                url,
+                method,
+                headers,
+                body,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await.map_err(|_| {
+            anyhow::anyhow!(
+                "the runtime thread serving generation {generation} of {app_id} ended this request without answering it"
             )
         })?
     }
@@ -1976,6 +2277,29 @@ impl RuntimePool {
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
+    pub async fn register_ws_connection_generation(
+        &self,
+        app_id: &str,
+        generation: &str,
+        ws_id: String,
+        js_to_client_tx: super::WsClientSink,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.dispatch_generation(
+            app_id,
+            generation,
+            RuntimeMessage::RegisterWsConnection {
+                app_id: app_id.to_string(),
+                ws_id,
+                js_to_client_tx,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+    }
+
     /// Send WebSocket message to JavaScript
     ///
     /// # Parameters
@@ -2008,6 +2332,29 @@ impl RuntimePool {
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
+    pub async fn send_ws_message_generation(
+        &self,
+        app_id: &str,
+        generation: &str,
+        ws_id: String,
+        message: String,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.dispatch_generation(
+            app_id,
+            generation,
+            RuntimeMessage::SendWsMessage {
+                app_id: app_id.to_string(),
+                ws_id,
+                message,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+    }
+
     /// Unregister WebSocket connection
     ///
     /// # Parameters
@@ -2029,6 +2376,27 @@ impl RuntimePool {
         )
         .await?;
 
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+    }
+
+    pub async fn unregister_ws_connection_generation(
+        &self,
+        app_id: &str,
+        generation: &str,
+        ws_id: String,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.dispatch_generation(
+            app_id,
+            generation,
+            RuntimeMessage::UnregisterWsConnection {
+                app_id: app_id.to_string(),
+                ws_id,
+                response: tx,
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }

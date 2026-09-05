@@ -245,6 +245,12 @@ Rollback 不恢复 KV/SQL/Blob/Queue 内容。Deployment preflight 必须验证�
 - EdgeOne 可能需要额外 routing layer 才能完成标准 gradual semantics。
 - 部署正确性测试必须包含多节点和故障注入，单机 happy path 不足。
 
+## 实现进度（2026-09-05）
+
+已落地严格模式第一批：immutable/JCS deployment plan、显式状态与事件、全部冻结 runtime target 的 PREPARE、generation-addressed runtime slot、proxy table generation 与 applied ACK、target observation、重启 reconcile、assignment phase、queue consumer generation lease fence、历史 snapshot rollback，以及 response stream/WebSocket 感知的 retained-generation DRAIN。部分 PREPARE 失败不会移动 production pointer；plan/generation 在 runtime 与 queue 两端均绑定同一 deployment intent。
+
+本 ADR 仍未完成。Queue barrier 当前发生在 routing pointer 提交与 proxy applied observation 之后，尚未形成 HTTP/queue/cron 的统一切换边界；多 Control deployment owner lease、per-node mTLS、可配置 retention/emergency drain、渐进权重、稳定签名 affinity、override、gate、pause/resume/progress/abort、跨 service cohort、关联遥测和 provider driver/live evidence 仍缺失。详细事实与阻断项见阶段分析第 59 节；在这些出口条件满足前，不能把局部实现称为产品级发布闭环或 provider conformance。
+
 ## 行业资料
 
 - `https://developers.cloudflare.com/workers/versions-and-deployments/`

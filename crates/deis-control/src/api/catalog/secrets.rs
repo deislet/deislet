@@ -26,9 +26,9 @@ use tracing::warn;
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::catalog::SecretMeta;
 use crate::catalog::secrets::secret_revision_aad;
-use crate::delivery::DeliveryReport;
+use crate::catalog::{DeploymentPlan, SecretMeta};
+use crate::delivery::{DeliveryReport, SecretChangePreparation};
 
 #[derive(Deserialize)]
 pub struct PutSecretRequest {
@@ -51,6 +51,8 @@ pub struct SecretChangeResponse {
     /// Nodes that picked the new environment up. A secret change creates
     /// no version, so this is the only evidence it reached anything.
     pub delivery: DeliveryReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<DeploymentPlan>,
 }
 
 /// What deleting a secret answers.
@@ -58,6 +60,8 @@ pub struct SecretChangeResponse {
 pub struct SecretDeletedResponse {
     pub deleted: String,
     pub delivery: DeliveryReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<DeploymentPlan>,
 }
 
 /// PUT /api/apps/:app_id/environments/:env/secrets/:name
@@ -99,7 +103,7 @@ pub async fn put_secret(
     let base = state.deliverer.base_url(&headers);
     let delivery_result = state
         .deliverer
-        .activate_secret_change(
+        .prepare_secret_change(
             &env,
             &base,
             &name,
@@ -107,45 +111,81 @@ pub async fn put_secret(
             expected_revision.as_deref(),
         )
         .await;
-    let delivery = match delivery_result {
-        Ok(delivery) => delivery,
+    let (delivery, plan) = match delivery_result {
+        Ok(SecretChangePreparation::Finished(delivery)) => (delivery, None),
+        Ok(SecretChangePreparation::Prepared {
+            version,
+            mut payload,
+        }) => {
+            let coordinated = super::deployments::coordinate_secret_change(
+                &state,
+                &env,
+                &version,
+                &mut payload,
+                &name,
+                Some(&secret.revision),
+                expected_revision.as_deref(),
+            )
+            .await;
+            let (_, plan, delivery) = match coordinated {
+                Ok(result) => result,
+                Err(error) => {
+                    discard_staged_revision(&state, &env, &name, &secret.revision).await;
+                    return Err(error);
+                }
+            };
+            (delivery, Some(plan))
+        }
         Err(error) => {
-            match state
-                .store
-                .discard_secret_revision_if_unreferenced(&env.id, &name, &secret.revision)
-                .await
-            {
-                Ok(true) => warn!(
-                    app_id = %app_id,
-                    environment = %env_name,
-                    secret = %name,
-                    revision = %secret.revision,
-                    code = "EC_ENV_STAGING_DISCARDED",
-                    "Secret activation failed; its unreferenced staged revision was removed"
-                ),
-                Ok(false) => warn!(
-                    app_id = %app_id,
-                    environment = %env_name,
-                    secret = %name,
-                    revision = %secret.revision,
-                    code = "EC_ENV_STAGING_RETAINED",
-                    "Secret activation failed; cleanup retained a revision that is now referenced"
-                ),
-                Err(cleanup) => warn!(
-                    app_id = %app_id,
-                    environment = %env_name,
-                    secret = %name,
-                    revision = %secret.revision,
-                    code = "EC_ENV_STAGING_CLEANUP_FAILED",
-                    error = %cleanup,
-                    "Secret activation failed and staged-revision cleanup must be retried"
-                ),
-            }
+            discard_staged_revision(&state, &env, &name, &secret.revision).await;
             return Err(error.into());
         }
     };
 
-    Ok(Json(SecretChangeResponse { secret, delivery }))
+    Ok(Json(SecretChangeResponse {
+        secret,
+        delivery,
+        plan,
+    }))
+}
+
+async fn discard_staged_revision(
+    state: &CatalogState,
+    env: &crate::catalog::Environment,
+    name: &str,
+    revision: &str,
+) {
+    match state
+        .store
+        .discard_secret_revision_if_unreferenced(&env.id, name, revision)
+        .await
+    {
+        Ok(true) => warn!(
+            app_id = %env.app_id,
+            environment = %env.name,
+            secret = %name,
+            revision = %revision,
+            code = "EC_ENV_STAGING_DISCARDED",
+            "Secret activation failed; its unreferenced staged revision was removed"
+        ),
+        Ok(false) => warn!(
+            app_id = %env.app_id,
+            environment = %env.name,
+            secret = %name,
+            revision = %revision,
+            code = "EC_ENV_STAGING_RETAINED",
+            "Secret activation failed; cleanup retained a revision that is now referenced"
+        ),
+        Err(cleanup) => warn!(
+            app_id = %env.app_id,
+            environment = %env.name,
+            secret = %name,
+            revision = %revision,
+            code = "EC_ENV_STAGING_CLEANUP_FAILED",
+            error = %cleanup,
+            "Secret activation failed and staged-revision cleanup must be retried"
+        ),
+    }
 }
 
 /// GET /api/apps/:app_id/environments/:env/secrets
@@ -180,14 +220,34 @@ pub async fn delete_secret(
     // Same reason as on write: without this the nodes would keep serving
     // the deleted value until something else moved the version pointer.
     let base = state.deliverer.base_url(&headers);
-    let delivery = state
+    let preparation = state
         .deliverer
-        .activate_secret_change(&env, &base, &name, None, Some(&expected_revision))
+        .prepare_secret_change(&env, &base, &name, None, Some(&expected_revision))
         .await?;
+    let (delivery, plan) = match preparation {
+        SecretChangePreparation::Finished(delivery) => (delivery, None),
+        SecretChangePreparation::Prepared {
+            version,
+            mut payload,
+        } => {
+            let (_, plan, delivery) = super::deployments::coordinate_secret_change(
+                &state,
+                &env,
+                &version,
+                &mut payload,
+                &name,
+                None,
+                Some(&expected_revision),
+            )
+            .await?;
+            (delivery, Some(plan))
+        }
+    };
 
     Ok(Json(SecretDeletedResponse {
         deleted: name,
         delivery,
+        plan,
     }))
 }
 

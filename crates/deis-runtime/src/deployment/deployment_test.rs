@@ -261,12 +261,164 @@ fn order_for(
         standard_environment: None,
         limits: None,
         compatibility: None,
+        deployment_id: None,
+        routing_generation: None,
     }
 }
 
 /// The production copy of the app the tests deploy.
 fn demo() -> AppKey {
     AppKey::production("demo")
+}
+
+#[tokio::test]
+async fn prepared_generations_are_exactly_addressable_before_and_after_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let v2 = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let control = ControlPlane::serving(HashMap::from([
+        ("v1".to_string(), v1.bytes.clone()),
+        ("v2".to_string(), v2.bytes.clone()),
+    ]))
+    .await;
+    let apps = Arc::new(ApplicationManager::with_threads(Some(1)));
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    let generation1 = deis_wire::CanonicalId::new_v7().to_string();
+    let generation2 = deis_wire::CanonicalId::new_v7().to_string();
+
+    let mut first = order(
+        "demo",
+        "v1",
+        control.url("v1"),
+        &v1.sha256,
+        &[("RELEASE", "v1")],
+    );
+    first.deployment_id = Some(uuid::Uuid::new_v4().to_string());
+    first.routing_generation = Some(generation1.clone());
+    deployer.apply(first).await.unwrap();
+
+    let mut candidate = order(
+        "demo",
+        "v2",
+        control.url("v2"),
+        &v2.sha256,
+        &[("RELEASE", "v2")],
+    );
+    let candidate_plan_id = uuid::Uuid::new_v4().to_string();
+    candidate.deployment_id = Some(candidate_plan_id.clone());
+    candidate.routing_generation = Some(generation2.clone());
+    deployer.prepare(candidate).await.unwrap();
+    let mut repeated_candidate = order(
+        "demo",
+        "v2",
+        control.url("v2"),
+        &v2.sha256,
+        &[("RELEASE", "v2")],
+    );
+    repeated_candidate.deployment_id = Some(candidate_plan_id);
+    repeated_candidate.routing_generation = Some(generation2.clone());
+    deployer
+        .prepare(repeated_candidate)
+        .await
+        .expect("a lost PREPARE response is safe to retry");
+    let mut conflicting_intent = order(
+        "demo",
+        "v2",
+        control.url("v2"),
+        &v2.sha256,
+        &[("RELEASE", "v2")],
+    );
+    conflicting_intent.deployment_id = Some(uuid::Uuid::new_v4().to_string());
+    conflicting_intent.routing_generation = Some(generation2.clone());
+    assert!(
+        deployer.prepare(conflicting_intent).await.is_err(),
+        "one routing generation must never be rebound to another deployment intent"
+    );
+
+    let release = |generation: Option<String>| {
+        let apps = apps.clone();
+        async move {
+            let (_, _, body) = apps
+                .execute_app_generation(
+                    &demo(),
+                    generation.as_deref(),
+                    "http://localhost/".to_string(),
+                    "GET".to_string(),
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
+            body["env"]["RELEASE"].as_str().unwrap().to_string()
+        }
+    };
+
+    assert_eq!(release(None).await, "v1");
+    assert_eq!(release(Some(generation1.clone())).await, "v1");
+    assert_eq!(release(Some(generation2.clone())).await, "v2");
+
+    deployer
+        .activate_prepared(&demo(), &generation2)
+        .await
+        .unwrap();
+    deployer
+        .activate_prepared(&demo(), &generation2)
+        .await
+        .expect("a lost ACTIVATE response is safe to retry");
+    assert_eq!(release(None).await, "v2");
+    assert_eq!(release(Some(generation2.clone())).await, "v2");
+    assert_eq!(
+        release(Some(generation1.clone())).await,
+        "v1",
+        "the previous generation must stay addressable while old proxy snapshots drain"
+    );
+
+    let aborted_generation = deis_wire::CanonicalId::new_v7().to_string();
+    let mut abandoned = order(
+        "demo",
+        "v1",
+        control.url("v1"),
+        &v1.sha256,
+        &[("RELEASE", "abandoned")],
+    );
+    abandoned.deployment_id = Some(uuid::Uuid::new_v4().to_string());
+    abandoned.routing_generation = Some(aborted_generation.clone());
+    deployer.prepare(abandoned).await.unwrap();
+    deployer
+        .abort_prepared(&demo(), &aborted_generation)
+        .await
+        .unwrap();
+    deployer
+        .abort_prepared(&demo(), &aborted_generation)
+        .await
+        .expect("a lost ABORT response is safe to retry");
+
+    let response = crate::dispatcher::handlers::hold_generation_traffic(
+        Response::new(Body::from("stream body")),
+        Some(
+            apps.begin_generation_traffic(&demo(), &generation1)
+                .unwrap(),
+        ),
+    );
+    assert!(apps
+        .drain_generation(&demo(), &generation1, std::time::Duration::from_millis(1))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("still has 1"));
+    assert!(
+        apps.begin_generation_traffic(&demo(), &generation1)
+            .is_err(),
+        "draining must close new traffic admission before it waits"
+    );
+    drop(response);
+    deployer
+        .drain_generation(&demo(), &generation1)
+        .await
+        .unwrap();
+    assert!(!apps.serves_generation(&demo(), Some(&generation1)).await);
 }
 
 #[tokio::test]
@@ -548,6 +700,8 @@ export default function handler(context) {
             standard_environment: Some(standard_environment),
             limits: None,
             compatibility: None,
+            deployment_id: None,
+            routing_generation: None,
         })
         .await
         .unwrap();
@@ -617,6 +771,8 @@ export default function handler(context) {
                 standard_environment: Some(rotated_environment),
                 limits: None,
                 compatibility: None,
+                deployment_id: None,
+                routing_generation: None,
             },
             as_of,
         )
@@ -1399,6 +1555,8 @@ async fn a_standard_snapshot_is_not_recovered_without_its_memory_only_values() {
                 standard_environment: Some(standard_environment),
                 limits: None,
                 compatibility: None,
+                deployment_id: None,
+                routing_generation: None,
             })
             .await
             .unwrap();

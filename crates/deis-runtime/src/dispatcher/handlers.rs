@@ -3,7 +3,10 @@
 use super::AppState;
 use crate::app::AppKey;
 use crate::runtime::header_list;
-use crate::{is_platform_header, APP_ID_HEADER, ENVIRONMENT_HEADER, PLATFORM_HEADER_PREFIX};
+use crate::{
+    is_platform_header, APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER,
+    PLATFORM_HEADER_PREFIX,
+};
 use axum::{
     body::{Body, Bytes},
     extract::{
@@ -347,6 +350,24 @@ pub async fn handle_request(
     };
 
     let environment = requested_environment(&headers).to_string();
+    let routing_generation = match headers
+        .get(DEPLOYMENT_GENERATION_HEADER)
+        .map(|value| value.to_str())
+    {
+        None => None,
+        Some(Ok(value)) if value.parse::<deis_wire::CanonicalId>().is_ok() => Some(value),
+        Some(_) => {
+            tracing::warn!(
+                app_id = %app_id,
+                "Refusing a request whose trusted routing generation is malformed"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid {DEPLOYMENT_GENERATION_HEADER} header"),
+            )
+                .into_response();
+        }
+    };
 
     // Check if it's a debug request
     if let Some(target_app_id) = app_id.strip_prefix("_inspect:") {
@@ -387,6 +408,55 @@ pub async fn handle_request(
         );
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+
+    // The legacy/direct path has no immutable generation to distinguish a
+    // not-yet-prepared deployment from a name this node has never seen. Keep
+    // the established API contract for that path: an unknown application is
+    // a 404. Exact-generation requests are checked below and deliberately
+    // remain 503 when this particular node has not prepared the selected
+    // generation, because that is a retryable placement/convergence fault.
+    if routing_generation.is_none() && !state.app_manager.is_loaded(&key) {
+        tracing::debug!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            method = %method,
+            path = uri.path(),
+            "No application {} is running on this node, so a request naming it is answered 404",
+            key
+        );
+        return (StatusCode::NOT_FOUND, "No such application on this node.").into_response();
+    }
+
+    if !state
+        .app_manager
+        .serves_generation(&key, routing_generation)
+        .await
+    {
+        tracing::warn!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            routing_generation = routing_generation.unwrap_or("<legacy>"),
+            "This node does not have the exact deployment generation selected by the edge; refusing instead of substituting another version"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The selected deployment generation is not prepared on this node.",
+        )
+            .into_response();
+    }
+    let generation_traffic = match routing_generation {
+        Some(generation) => match state.app_manager.begin_generation_traffic(&key, generation) {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The selected deployment generation is draining.",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
 
     // A method no application on this platform can be written to answer.
     //
@@ -446,7 +516,10 @@ pub async fn handle_request(
     // to collide with a static file is far more likely to be a route the app
     // implements than a request for the file, so those fall through.
     if matches!(method, Method::GET | Method::HEAD) {
-        if let Some(assets) = state.app_manager.assets(&key) {
+        if let Some(assets) = state
+            .app_manager
+            .assets_for_generation(&key, routing_generation)
+        {
             // Path *and* query. A `_redirects` rule matches on the path
             // alone, but the query is carried through to the target it sends
             // the visitor to, and there is nothing to carry if it was dropped
@@ -471,7 +544,7 @@ pub async fn handle_request(
                     "Answered a request from this version's static site without entering an \
                      isolate"
                 );
-                return response;
+                return hold_generation_traffic(response, generation_traffic.clone());
             }
         }
     }
@@ -693,36 +766,17 @@ pub async fn handle_request(
     // for one.
     let upgrade_offered = ws.is_some();
 
-    // An application this node does not run at all is a 404, not a 500.
-    //
-    // Without this the request went on to `execute_app`, whose "not found"
-    // came back through the error arm below as `500 Internal Server Error
-    // (incident <id>)` with an ERROR line naming the app. On the data port,
-    // which the proxy does not sit in front of for a node-to-node or a demo
-    // call, anyone who could reach it minted incident ids and ERROR lines by
-    // naming apps that do not exist -- and an operator counting incidents
-    // could not tell a real crash from a typo or a probe. An unknown app is
-    // not a failure of this node: it is answered `404` with a fixed body, and
-    // noted at debug with no incident. A name the control plane simply has
-    // not placed here yet reads the same way, which is correct -- this node
-    // cannot serve it. The proxy already answers `404` for an unknown id at
-    // the edge, so nothing a browser reaches changes.
-    if !state.app_manager.is_loaded(&key) {
-        tracing::debug!(
-            app_id = %key.app_id(),
-            environment = %key.environment(),
-            method = %method,
-            path = uri.path(),
-            "No application {} is running on this node, so a request naming it is answered 404",
-            key
-        );
-        return (StatusCode::NOT_FOUND, "No such application on this node.").into_response();
-    }
-
     // Execute application
     match state
         .app_manager
-        .execute_app(&key, url, method.to_string(), request_headers, body_opt)
+        .execute_app_generation(
+            &key,
+            routing_generation,
+            url,
+            method.to_string(),
+            request_headers,
+            body_opt,
+        )
         .await
     {
         Ok((status, resp_headers, resp_body)) => {
@@ -737,6 +791,7 @@ pub async fn handle_request(
                         let ws_id = ws_id.to_string();
                         let key_clone = key.clone();
                         let app_manager = state.app_manager.clone();
+                        let generation = routing_generation.map(str::to_string);
 
                         tracing::info!(
                             app_id = %key.app_id(),
@@ -749,7 +804,14 @@ pub async fn handle_request(
                         // Execute WebSocket upgrade and start message bridging
                         return ws_upgrade
                             .on_upgrade(move |socket| {
-                                handle_websocket_bridged(socket, key_clone, ws_id, app_manager)
+                                handle_websocket_bridged(
+                                    socket,
+                                    key_clone,
+                                    generation,
+                                    ws_id,
+                                    app_manager,
+                                    generation_traffic,
+                                )
                             })
                             .into_response();
                     }
@@ -823,7 +885,7 @@ pub async fn handle_request(
             // the runtime thread, which the client sees as a dropped connection
             // and the operator sees as a stack trace with no request in it.
             match response.body(http_body(resp_body)) {
-                Ok(response) => response.into_response(),
+                Ok(response) => hold_generation_traffic(response, generation_traffic),
                 Err(e) => {
                     tracing::error!(
                         app_id = %key.app_id(),
@@ -935,6 +997,27 @@ fn http_body(body: crate::runtime::ResponseBody) -> Body {
     }
 }
 
+/// Keep a generation's drain admission alive for the complete HTTP body,
+/// including after Hyper has consumed and dropped the response head. A
+/// response extension is insufficient here: extensions belong to the head
+/// and may be dropped while a streaming body is still being sent.
+pub(crate) fn hold_generation_traffic(
+    response: Response,
+    lease: Option<crate::app::GenerationTrafficLease>,
+) -> Response {
+    let Some(lease) = lease else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let guarded = body.into_data_stream().map(move |chunk| {
+        // Capturing the lease in the stream object, rather than merely
+        // touching it at construction, gives it exactly the body's lifetime.
+        let _keep_alive = &lease;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(guarded))
+}
+
 /// Which environment of an application a request names.
 ///
 /// An absent or unreadable header is an empty string, which
@@ -955,8 +1038,10 @@ pub(crate) fn requested_environment(headers: &HeaderMap) -> &str {
 async fn handle_websocket_bridged(
     socket: WebSocket,
     key: AppKey,
+    routing_generation: Option<String>,
     ws_id: String,
     app_manager: Arc<crate::app::ApplicationManager>,
+    _generation_traffic: Option<crate::app::GenerationTrafficLease>,
 ) {
     tracing::info!(
         app_id = %key.app_id(),
@@ -984,8 +1069,9 @@ async fn handle_websocket_bridged(
     // Register WebSocket connection in RuntimePool
     // Note: we only need to register js_to_client_tx, as client messages are sent directly via dispatch_ws_message
     if let Err(e) = app_manager
-        .register_ws_connection(
+        .register_ws_connection_generation(
             &key,
+            routing_generation.as_deref(),
             ws_id.clone(),
             crate::runtime::WsClientSink::new(js_to_client_tx, buffered.clone()),
         )
@@ -1007,6 +1093,7 @@ async fn handle_websocket_bridged(
     let key_clone = key.clone();
     let ws_id_clone = ws_id.clone();
     let app_manager_clone = app_manager.clone();
+    let generation_for_messages = routing_generation.clone();
     let client_to_js_task = tokio::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
@@ -1018,7 +1105,12 @@ async fn handle_websocket_bridged(
                     // outside the payload, so what the payload says about
                     // itself no longer decides anything.
                     if let Err(e) = app_manager_clone
-                        .send_ws_message(&key_clone, ws_id_clone.clone(), ws_frame::text(&text))
+                        .send_ws_message_generation(
+                            &key_clone,
+                            generation_for_messages.as_deref(),
+                            ws_id_clone.clone(),
+                            ws_frame::text(&text),
+                        )
                         .await
                     {
                         tracing::error!("Failed to send message to JavaScript: {}", e);
@@ -1032,7 +1124,12 @@ async fn handle_websocket_bridged(
                         ws_id_clone
                     );
                     if let Err(e) = app_manager_clone
-                        .send_ws_message(&key_clone, ws_id_clone.clone(), ws_frame::binary(&data))
+                        .send_ws_message_generation(
+                            &key_clone,
+                            generation_for_messages.as_deref(),
+                            ws_id_clone.clone(),
+                            ws_frame::binary(&data),
+                        )
                         .await
                     {
                         tracing::error!("Failed to send binary message to JavaScript: {}", e);
@@ -1129,7 +1226,7 @@ async fn handle_websocket_bridged(
 
     // Cleanup: unregister WebSocket connection
     if let Err(e) = app_manager
-        .unregister_ws_connection(&key, ws_id.clone())
+        .unregister_ws_connection_generation(&key, routing_generation.as_deref(), ws_id.clone())
         .await
     {
         tracing::error!("Failed to unregister WebSocket {}: {}", ws_id, e);

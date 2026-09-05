@@ -487,6 +487,27 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         ["api", "apps", app, "environments", env, "deployments"] => {
             Requirement::new("deploy", Verb::Deploy, named(app), named(env)).changes_state()
         }
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "deployment-plans",
+            plan,
+        ] => {
+            Requirement::new("deployment.plan.get", Verb::Read, named(app), named(env)).about(plan)
+        }
+        // Opaque plan ids do not encode their tenant. The scoped route above
+        // is for application credentials; this cluster-wide fallback is an
+        // operator diagnostic and therefore explicitly administrative.
+        ["api", "deployment-plans", plan] => Requirement::new(
+            "deployment.plan.get_global",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(plan),
         ["api", "apps", app, "environments", env, "rollback"] => {
             Requirement::new("rollback", Verb::Deploy, named(app), named(env)).changes_state()
         }
@@ -1478,6 +1499,18 @@ mod tests {
                 "/api/apps/demo/environments/production/deployments",
                 "deploy",
                 Verb::Deploy,
+            ),
+            (
+                "GET",
+                "/api/apps/demo/environments/production/deployment-plans/plan-1",
+                "deployment.plan.get",
+                Verb::Read,
+            ),
+            (
+                "GET",
+                "/api/deployment-plans/plan-1",
+                "deployment.plan.get_global",
+                Verb::Admin,
             ),
             (
                 "POST",

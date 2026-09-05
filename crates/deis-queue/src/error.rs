@@ -27,6 +27,9 @@ pub enum QueueError {
     Corrupt(String),
     /// A migration coordinator has durably fenced this tenant's mutations.
     WriteFenced(String),
+    /// A queue consumer belongs to a deployment generation that is not
+    /// currently admitted for this tenant.
+    ConsumerGenerationFenced(String),
     /// SQLite refused or failed.
     Sqlite(rusqlite::Error),
     /// The filesystem refused or failed.
@@ -48,6 +51,9 @@ impl fmt::Display for QueueError {
             Self::TooLarge(m) => write!(f, "too large: {m}"),
             Self::Corrupt(m) => write!(f, "corrupt: {m}"),
             Self::WriteFenced(m) => write!(f, "write fenced: {m}"),
+            Self::ConsumerGenerationFenced(m) => {
+                write!(f, "consumer generation fenced: {m}")
+            }
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::BlockingTask(m) => write!(f, "blocking task: {m}"),
@@ -109,7 +115,9 @@ impl From<QueueError> for Status {
             // The row is there but cannot be handed back: no retry by the
             // caller will fix it, an operator has to.
             QueueError::Corrupt(_) => Code::DataLoss,
-            QueueError::WriteFenced(_) => Code::FailedPrecondition,
+            QueueError::WriteFenced(_) | QueueError::ConsumerGenerationFenced(_) => {
+                Code::FailedPrecondition
+            }
             // Nothing the caller sent is wrong and no retry helps: the
             // service is standing on data it cannot use, and an operator has
             // to move it aside first.
@@ -145,6 +153,10 @@ mod tests {
             (QueueError::Corrupt("x".into()), Code::DataLoss),
             (
                 QueueError::WriteFenced("x".into()),
+                Code::FailedPrecondition,
+            ),
+            (
+                QueueError::ConsumerGenerationFenced("x".into()),
                 Code::FailedPrecondition,
             ),
             (

@@ -31,14 +31,16 @@
 
 use std::collections::BTreeMap;
 
-use axum::{Json, extract::State};
+use axum::{Json, extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use super::CatalogState;
 use crate::api::error::ApiResult;
-use crate::catalog::CatalogStore;
+use crate::catalog::{CatalogStore, DeploymentProxyObservation, now_secs};
+use crate::message::NodeRole;
+use crate::session::NodeState;
 
 /// Path this table is served on.
 ///
@@ -56,6 +58,10 @@ pub struct RoutingEntry {
     pub app_id: String,
     /// Environment *name*, never the id. See the module comment.
     pub environment: String,
+    /// Immutable deployment selected for this environment. Absent only when
+    /// the environment has never been deployed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_generation: Option<String>,
     pub host: Option<String>,
     pub path_prefix: String,
     /// Higher wins when several routes match the same request.
@@ -67,6 +73,8 @@ pub struct RoutingEntry {
 pub struct EnvironmentRef {
     pub app_id: String,
     pub environment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_generation: Option<String>,
 }
 
 /// The complete answer. There is no partial form on purpose: an edge that
@@ -85,8 +93,12 @@ pub struct RoutingTable {
 }
 
 /// GET `/api/routing-table`
-pub async fn routing_table(State(state): State<CatalogState>) -> ApiResult<Json<RoutingTable>> {
+pub async fn routing_table(
+    State(state): State<CatalogState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<RoutingTable>> {
     let table = build(&state.store).await?;
+    observe_applied_table(&state, &headers, &table).await?;
     debug!(
         version = %table.version,
         routes = table.routes.len(),
@@ -94,6 +106,77 @@ pub async fn routing_table(State(state): State<CatalogState>) -> ApiResult<Json<
         "Served the routing table"
     );
     Ok(Json(table))
+}
+
+/// A proxy reports the table it published on the *next* authenticated poll.
+/// Matching against the table built for this response proves that no route or
+/// generation changed between application and acknowledgement.
+async fn observe_applied_table(
+    state: &CatalogState,
+    headers: &HeaderMap,
+    table: &RoutingTable,
+) -> ApiResult<()> {
+    let Some(proxy_id) = headers
+        .get(deis_wire::conventions::PROXY_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(());
+    };
+    let Some(observed_version) = headers
+        .get(deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(());
+    };
+    if observed_version != table.version {
+        return Ok(());
+    }
+    let proxy_session = state.sessions.snapshot().into_iter().find(|session| {
+        session.node_id == proxy_id && matches!(&session.node_role, NodeRole::Proxy(_))
+    });
+    let is_live_proxy = match proxy_session {
+        Some(session) => session.get_state().await == NodeState::Active,
+        None => false,
+    };
+    if !is_live_proxy {
+        warn!(
+            proxy_id,
+            routing_table_version = observed_version,
+            "Ignored a routing observation whose claimed proxy identity has no live proxy session"
+        );
+        return Ok(());
+    }
+
+    let generations: std::collections::BTreeSet<&str> = table
+        .environments
+        .iter()
+        .filter_map(|environment| environment.deployment_generation.as_deref())
+        .collect();
+    for generation in generations {
+        let Some(plan) = state
+            .store
+            .deployment_plan_by_generation(generation)
+            .await?
+        else {
+            continue;
+        };
+        if !plan.proxy_ids.iter().any(|expected| expected == proxy_id) {
+            continue;
+        }
+        state
+            .store
+            .record_deployment_proxy_observation(DeploymentProxyObservation {
+                plan_id: plan.id.clone(),
+                proxy_id: proxy_id.to_string(),
+                observed_state: "routing_applied".to_string(),
+                routing_table_version: observed_version.to_string(),
+                routing_generation: generation.to_string(),
+                observed_at: now_secs(),
+            })
+            .await?;
+        super::deployments::reconcile_soon(state.clone(), plan);
+    }
+    Ok(())
 }
 
 /// Read the catalog and assemble the table.
@@ -109,21 +192,33 @@ pub async fn build(store: &CatalogStore) -> Result<RoutingTable, crate::catalog:
 
     // env_id -> (app_id, environment name), the join `/api/routes` is
     // missing.
-    let mut names: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut names: BTreeMap<String, (String, String, Option<String>)> = BTreeMap::new();
     let mut environments = Vec::new();
     for app in &apps {
         for env in store.list_environments(&app.id).await? {
-            names.insert(env.id.clone(), (app.id.clone(), env.name.clone()));
+            let deployment_generation = store
+                .current_deployment(&env.id)
+                .await?
+                .map(|deployment| deployment.canonical_id.to_string());
+            names.insert(
+                env.id.clone(),
+                (
+                    app.id.clone(),
+                    env.name.clone(),
+                    deployment_generation.clone(),
+                ),
+            );
             environments.push(EnvironmentRef {
                 app_id: app.id.clone(),
                 environment: env.name.clone(),
+                deployment_generation,
             });
         }
     }
 
     let mut routes = Vec::new();
     for route in store.list_routes(None, None).await? {
-        let Some((app_id, environment)) = names.get(&route.env_id) else {
+        let Some((app_id, environment, deployment_generation)) = names.get(&route.env_id) else {
             // A route row whose environment is gone. The catalog deletes
             // routes with their environment, so this is a repair case, not a
             // normal one; dropping the row is right because there is nothing
@@ -140,6 +235,7 @@ pub async fn build(store: &CatalogStore) -> Result<RoutingTable, crate::catalog:
         routes.push(RoutingEntry {
             app_id: app_id.clone(),
             environment: environment.clone(),
+            deployment_generation: deployment_generation.clone(),
             host: route.host,
             path_prefix: route.path_prefix,
             priority: route.priority,
@@ -188,6 +284,14 @@ fn digest(routes: &[RoutingEntry], environments: &[EnvironmentRef]) -> String {
         hasher.update(FIELD);
         hasher.update(route.environment.as_bytes());
         hasher.update(FIELD);
+        hasher.update(
+            route
+                .deployment_generation
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        hasher.update(FIELD);
         hasher.update(route.host.as_deref().unwrap_or("").as_bytes());
         hasher.update(FIELD);
         hasher.update(route.path_prefix.as_bytes());
@@ -202,6 +306,13 @@ fn digest(routes: &[RoutingEntry], environments: &[EnvironmentRef]) -> String {
         hasher.update(env.app_id.as_bytes());
         hasher.update(FIELD);
         hasher.update(env.environment.as_bytes());
+        hasher.update(FIELD);
+        hasher.update(
+            env.deployment_generation
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
         hasher.update(RECORD);
     }
     hex::encode(hasher.finalize())
@@ -332,6 +443,7 @@ mod tests {
             vec![RoutingEntry {
                 app_id: "shop".to_string(),
                 environment: "pr-42".to_string(),
+                deployment_generation: None,
                 host: Some("example.com".to_string()),
                 path_prefix: "/api".to_string(),
                 priority: 10,
@@ -346,10 +458,12 @@ mod tests {
                 EnvironmentRef {
                     app_id: "shop".to_string(),
                     environment: "pr-42".to_string(),
+                    deployment_generation: None,
                 },
                 EnvironmentRef {
                     app_id: "shop".to_string(),
                     environment: "production".to_string(),
+                    deployment_generation: None,
                 },
             ]
         );

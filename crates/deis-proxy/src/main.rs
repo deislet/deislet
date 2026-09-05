@@ -579,7 +579,8 @@ fn main() -> Result<()> {
                             control.secret.clone(),
                             control.request_timeout_duration(),
                             routing.max_table_bytes(),
-                        ),
+                        )
+                        .with_proxy_id(control.associated_id.clone()),
                         Arc::clone(&config),
                         Duration::from_secs(routing.control_poll_interval_secs()),
                     );

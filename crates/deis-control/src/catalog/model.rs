@@ -84,6 +84,89 @@ pub struct Deployment {
     pub snapshot_id: Option<String>,
 }
 
+/// Immutable deployment intent plus its durable coordinator state.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentPlan {
+    pub id: String,
+    pub routing_generation: CanonicalId,
+    pub app_id: String,
+    pub env_id: String,
+    pub version_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_deployment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_generation: Option<String>,
+    pub expected_secret_heads: std::collections::BTreeMap<String, Option<String>>,
+    /// Fresh deploys compare every selected head; historical rollback
+    /// deliberately reactivates retained revisions regardless of current heads.
+    pub compare_secret_heads: bool,
+    pub target_ids: Vec<String>,
+    pub proxy_ids: Vec<String>,
+    pub policy: serde_json::Value,
+    pub plan_sha256: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentTargetObservation {
+    pub plan_id: String,
+    pub node_id: String,
+    pub observed_state: String,
+    pub version_id: Option<String>,
+    pub routing_generation: Option<String>,
+    pub message: Option<String>,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentProxyObservation {
+    pub plan_id: String,
+    pub proxy_id: String,
+    pub observed_state: String,
+    pub routing_table_version: String,
+    pub routing_generation: String,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentEvent {
+    pub sequence: i64,
+    pub plan_id: String,
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub detail: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentGenerationDrain {
+    pub plan_id: String,
+    pub generation: String,
+    pub target_ids: Vec<String>,
+    pub not_before: i64,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentDrainObservation {
+    pub plan_id: String,
+    pub node_id: String,
+    pub generation: String,
+    pub observed_state: String,
+    pub message: Option<String>,
+    pub observed_at: i64,
+}
+
 /// A host plus path prefix bound to one environment. `host: None` matches
 /// any domain.
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +209,12 @@ pub struct Assignment {
     pub version_id: String,
     pub bundle_sha: String,
     pub snapshot_id: Option<String>,
+    pub deployment_id: String,
+    pub routing_generation: String,
+    /// Durable coordinator state for this pointer. `None` identifies a
+    /// deployment written before plans existed and is treated as active for
+    /// rolling compatibility.
+    pub deployment_state: Option<String>,
 }
 
 /// One environment's current version together with the manifest text that

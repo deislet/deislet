@@ -20,15 +20,17 @@ use std::sync::Arc;
 use deis_wire::EnvironmentBindingSnapshot;
 use deis_wire::{CanonicalId, CanonicalIdError};
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::domains::{DomainGrant, EVERY_ENVIRONMENT, GrantPattern, HostClaim, grant_allows};
 use super::model::{
-    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, MAX_ROUTES_PER_APP,
-    MAX_ROUTES_PER_ENVIRONMENT, RetiredAppName, Route, SecretMeta, Version, now_secs,
-    validate_app_id, validate_environment_name, validate_path_prefix, validate_route_priority,
-    validate_secret_name,
+    App, Assignment, DeletedApp, DeployedVersion, Deployment, DeploymentDrainObservation,
+    DeploymentGenerationDrain, DeploymentPlan, DeploymentProxyObservation,
+    DeploymentTargetObservation, Environment, MAX_ROUTES_PER_APP, MAX_ROUTES_PER_ENVIRONMENT,
+    RetiredAppName, Route, SecretMeta, Version, now_secs, validate_app_id,
+    validate_environment_name, validate_path_prefix, validate_route_priority, validate_secret_name,
 };
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
@@ -42,6 +44,7 @@ const DEPLOYMENT_COLUMNS: &str =
 const ROUTE_COLUMNS: &str = "id, app_id, env_id, host, path_prefix, priority";
 const RETIRED_NAME_COLUMNS: &str = "app_id, retired_at, environments, released_at";
 const DOMAIN_GRANT_COLUMNS: &str = "pattern, app_id, environment, created_at, note";
+const DEFAULT_GENERATION_RETENTION_SECONDS: i64 = 300;
 
 /// One compare-and-swap update to a secret head, committed with the new
 /// deployment snapshot that references it.
@@ -49,6 +52,23 @@ pub struct SecretHeadChange<'a> {
     pub name: &'a str,
     pub replacement_revision: Option<&'a str>,
     pub expected_revision: Option<&'a str>,
+}
+
+/// Immutable inputs for one durable deployment plan.
+///
+/// Keeping the policy inputs together prevents call sites from swapping a
+/// run of booleans and vectors while the plan contract evolves.
+#[derive(Debug, Clone)]
+pub struct DeploymentPlanSpec {
+    pub snapshot_id: Option<String>,
+    pub expected_secret_heads: std::collections::BTreeMap<String, Option<String>>,
+    pub compare_secret_heads: bool,
+    pub target_ids: Vec<String>,
+    pub proxy_ids: Vec<String>,
+    pub queue_fence: bool,
+    pub operation_kind: String,
+    pub secret_change: Option<serde_json::Value>,
+    pub note: Option<String>,
 }
 
 struct DeploymentActivation<'a> {
@@ -59,6 +79,8 @@ struct DeploymentActivation<'a> {
     expected_secret_heads: Option<std::collections::BTreeMap<String, Option<String>>>,
     note: Option<String>,
     secret_change: Option<(String, Option<String>, Option<String>)>,
+    deployment_identity: Option<(String, CanonicalId)>,
+    advance_plan: bool,
 }
 
 /// Ordering that defines "the current deployment of an environment".
@@ -785,9 +807,841 @@ impl CatalogStore {
             .await
     }
 
+    pub async fn get_environment_by_id(&self, id: &str) -> CatalogResult<Environment> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                &format!("SELECT {ENVIRONMENT_COLUMNS} FROM environments WHERE id = ?1"),
+                [&id],
+                map_environment,
+            )
+            .optional()?
+            .ok_or_else(|| CatalogError::not_found(format!("environment {id}")))
+        })
+        .await
+    }
+
     // ----------------------------------------------------------------
     // Deployments (pointer rows, never mutated)
     // ----------------------------------------------------------------
+
+    /// Persist immutable deployment intent before contacting a runtime. The
+    /// target set is the configured serving set at this instant; a later node
+    /// joining is reconciled from assignments and cannot retroactively make a
+    /// failed prepare look successful.
+    pub async fn create_deployment_plan(
+        &self,
+        env: &Environment,
+        version: &Version,
+        mut spec: DeploymentPlanSpec,
+    ) -> CatalogResult<DeploymentPlan> {
+        if !matches!(
+            spec.operation_kind.as_str(),
+            "deployment" | "rollback" | "secret_change"
+        ) {
+            return Err(CatalogError::invalid(
+                "unknown deployment plan operation kind",
+            ));
+        }
+        spec.target_ids.sort();
+        spec.target_ids.dedup();
+        spec.proxy_ids.sort();
+        spec.proxy_ids.dedup();
+        let current = self.current_deployment(&env.id).await?;
+        let id = CanonicalId::new_v7().to_string();
+        let routing_generation = CanonicalId::new_v7();
+        let policy = serde_json::json!({
+            "activation": "strict_all",
+            "traffic": [{"generation": routing_generation.to_string(), "basisPoints": 10000}],
+            "affinity": "stable",
+            "queueFence": spec.queue_fence,
+            "drain": {
+                "retentionSeconds": DEFAULT_GENERATION_RETENTION_SECONDS,
+                "timeoutSeconds": 30
+            },
+            "operation": spec.operation_kind,
+            "secretChange": spec.secret_change,
+        });
+        let expected_secret_heads_json = serde_json::to_string(&spec.expected_secret_heads)
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        let target_ids_json = serde_json::to_string(&spec.target_ids)
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        let policy_json = serde_json::to_string(&policy)
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        let immutable_document = serde_json::json!({
+            "id": id,
+            "routingGeneration": routing_generation.to_string(),
+            "applicationId": env.app_id,
+            "environmentId": env.id,
+            "versionId": version.id,
+            "snapshotId": spec.snapshot_id,
+            "previousDeploymentId": current.as_ref().map(|row| row.id.as_str()),
+            "previousGeneration": current.as_ref().map(|row| row.canonical_id.to_string()),
+            "expectedSecretHeads": spec.expected_secret_heads,
+            "compareSecretHeads": spec.compare_secret_heads,
+            "targetIds": spec.target_ids,
+            "proxyIds": spec.proxy_ids,
+            "policy": policy,
+            "note": spec.note,
+        });
+        let canonical = serde_jcs::to_vec(&immutable_document).map_err(|error| {
+            CatalogError::invalid(format!(
+                "deployment plan is not RFC 8785 canonical JSON: {error}"
+            ))
+        })?;
+        let plan_sha256 = hex::encode(Sha256::digest(canonical));
+        let now = now_secs();
+        let plan = DeploymentPlan {
+            id: id.clone(),
+            routing_generation,
+            app_id: env.app_id.clone(),
+            env_id: env.id.clone(),
+            version_id: version.id.clone(),
+            snapshot_id: spec.snapshot_id,
+            previous_deployment_id: current.as_ref().map(|row| row.id.clone()),
+            previous_generation: current.map(|row| row.canonical_id.to_string()),
+            expected_secret_heads: spec.expected_secret_heads,
+            compare_secret_heads: spec.compare_secret_heads,
+            target_ids: spec.target_ids,
+            proxy_ids: spec.proxy_ids,
+            policy,
+            plan_sha256,
+            state: "preparing".to_string(),
+            note: spec.note,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let inserted = plan.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let in_flight: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM deployment_plans
+                      WHERE env_id = ?1
+                        AND state IN ('preparing','prepared','activating','reconciling','degraded')
+                      LIMIT 1",
+                    [&inserted.env_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = in_flight {
+                return Err(CatalogError::conflict(format!(
+                    "deployment plan {existing} is already in progress for this environment"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO deployment_plans
+                   (id, routing_generation, app_id, env_id, version_id, snapshot_id,
+                    previous_deployment_id, previous_generation, expected_secret_heads,
+                    compare_secret_heads, target_ids, proxy_ids, policy, plan_sha256, state, note, last_error,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         ?14, ?15, ?16, NULL, ?17, ?17)",
+                params![
+                    inserted.id,
+                    inserted.routing_generation.to_string(),
+                    inserted.app_id,
+                    inserted.env_id,
+                    inserted.version_id,
+                    inserted.snapshot_id,
+                    inserted.previous_deployment_id,
+                    inserted.previous_generation,
+                    expected_secret_heads_json,
+                    inserted.compare_secret_heads,
+                    target_ids_json,
+                    serde_json::to_string(&inserted.proxy_ids)
+                        .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                    policy_json,
+                    inserted.plan_sha256,
+                    inserted.state,
+                    inserted.note,
+                    inserted.created_at,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO deployment_events
+                   (plan_id, from_state, to_state, detail, created_at)
+                 VALUES (?1, NULL, 'preparing', 'plan persisted before prepare', ?2)",
+                params![inserted.id, inserted.created_at],
+            )?;
+            if let Some(generation) = inserted.previous_generation.as_deref() {
+                // The old generation lives on the previous plan's frozen
+                // runtime set, not necessarily on this plan's set. A scale
+                // change between the two deployments must not strand an old
+                // isolate on a node removed from the new serving set. Legacy
+                // deployment rows have no plan to consult, so the current
+                // serving set is the only truthful fallback available.
+                let previous_targets_json: Option<String> =
+                    if let Some(previous_id) = inserted.previous_deployment_id.as_deref() {
+                        tx.query_row(
+                            "SELECT target_ids FROM deployment_plans WHERE id = ?1",
+                            [previous_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                    } else {
+                        None
+                    };
+                let drain_target_ids = previous_targets_json
+                    .map(|targets| {
+                        serde_json::from_str::<Vec<String>>(&targets).map_err(|error| {
+                            CatalogError::invalid(format!(
+                                "previous deployment drain target set: {error}"
+                            ))
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| inserted.target_ids.clone());
+                tx.execute(
+                    "INSERT INTO deployment_generation_drains
+                       (plan_id, generation, target_ids, not_before, state, last_error, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 'retained', NULL, ?5)",
+                    params![
+                        inserted.id,
+                        generation,
+                        serde_json::to_string(&drain_target_ids)
+                            .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                        inserted.created_at.saturating_add(DEFAULT_GENERATION_RETENTION_SECONDS),
+                        inserted.created_at,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+        Ok(plan)
+    }
+
+    pub async fn deployment_plan(&self, id: &str) -> CatalogResult<DeploymentPlan> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT id, routing_generation, app_id, env_id, version_id, snapshot_id,
+                        previous_deployment_id, previous_generation, expected_secret_heads,
+                        compare_secret_heads, target_ids, proxy_ids, policy,
+                        plan_sha256, state, note, last_error, created_at, updated_at
+                   FROM deployment_plans WHERE id = ?1",
+                [&id],
+                map_deployment_plan,
+            )
+            .optional()?
+            .ok_or_else(|| CatalogError::not_found(format!("deployment plan {id}")))
+        })
+        .await
+    }
+
+    pub async fn deployment_plan_by_generation(
+        &self,
+        generation: &str,
+    ) -> CatalogResult<Option<DeploymentPlan>> {
+        let generation = generation.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT id, routing_generation, app_id, env_id, version_id, snapshot_id,
+                        previous_deployment_id, previous_generation, expected_secret_heads,
+                        compare_secret_heads, target_ids, proxy_ids, policy, plan_sha256, state, note, last_error,
+                        created_at, updated_at
+                   FROM deployment_plans WHERE routing_generation = ?1",
+                [&generation],
+                map_deployment_plan,
+            )
+            .optional()
+            .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    pub async fn nonterminal_deployment_plans(&self) -> CatalogResult<Vec<DeploymentPlan>> {
+        self.with_conn(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT id, routing_generation, app_id, env_id, version_id, snapshot_id,
+                        previous_deployment_id, previous_generation, expected_secret_heads,
+                        compare_secret_heads, target_ids, proxy_ids, policy, plan_sha256, state,
+                        note, last_error, created_at, updated_at
+                   FROM deployment_plans
+                  WHERE state IN ('preparing','prepared','activating','reconciling','degraded')
+                  ORDER BY created_at, id",
+            )?;
+            statement
+                .query_map([], map_deployment_plan)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    pub async fn transition_deployment_plan(
+        &self,
+        id: &str,
+        expected_state: &str,
+        next_state: &str,
+        detail: Option<&str>,
+    ) -> CatalogResult<DeploymentPlan> {
+        let allowed = matches!(
+            (expected_state, next_state),
+            ("preparing", "prepared" | "failed" | "aborted")
+                | ("prepared", "failed" | "aborted")
+                | ("activating", "active" | "reconciling" | "degraded")
+                | ("reconciling", "active" | "degraded")
+                | ("degraded", "active" | "reconciling")
+        );
+        if !allowed {
+            return Err(CatalogError::invalid(format!(
+                "deployment plan transition {expected_state} -> {next_state} is not allowed"
+            )));
+        }
+        let id = id.to_string();
+        let expected_state = expected_state.to_string();
+        let next_state = next_state.to_string();
+        let detail = detail.map(str::to_string);
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let changed = tx.execute(
+                "UPDATE deployment_plans
+                    SET state = ?1, last_error = ?2, updated_at = ?3
+                  WHERE id = ?4 AND state = ?5",
+                params![next_state, detail, now_secs(), id, expected_state],
+            )?;
+            if changed != 1 {
+                let actual: Option<String> = tx
+                    .query_row(
+                        "SELECT state FROM deployment_plans WHERE id = ?1",
+                        [&id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                return Err(CatalogError::conflict(format!(
+                    "deployment plan {id} expected state {expected_state}, found {}",
+                    actual.as_deref().unwrap_or("<missing>")
+                )));
+            }
+            tx.execute(
+                "INSERT INTO deployment_events
+                   (plan_id, from_state, to_state, detail, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, expected_state, next_state, detail, now_secs()],
+            )?;
+            tx.commit()?;
+            conn.query_row(
+                "SELECT id, routing_generation, app_id, env_id, version_id, snapshot_id,
+                        previous_deployment_id, previous_generation, expected_secret_heads,
+                        compare_secret_heads, target_ids, proxy_ids, policy,
+                        plan_sha256, state, note, last_error, created_at, updated_at
+                   FROM deployment_plans WHERE id = ?1",
+                [&id],
+                map_deployment_plan,
+            )
+            .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    pub async fn record_deployment_target_observation(
+        &self,
+        observation: DeploymentTargetObservation,
+    ) -> CatalogResult<()> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO deployment_target_observations
+                   (plan_id, node_id, observed_state, version_id, routing_generation, message, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(plan_id, node_id) DO UPDATE SET
+                   observed_state = excluded.observed_state,
+                   version_id = excluded.version_id,
+                   routing_generation = excluded.routing_generation,
+                   message = excluded.message,
+                   observed_at = excluded.observed_at",
+                params![
+                    observation.plan_id,
+                    observation.node_id,
+                    observation.observed_state,
+                    observation.version_id,
+                    observation.routing_generation,
+                    observation.message,
+                    observation.observed_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn deployment_target_observations(
+        &self,
+        plan_id: &str,
+    ) -> CatalogResult<Vec<DeploymentTargetObservation>> {
+        let plan_id = plan_id.to_string();
+        self.with_conn(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT plan_id, node_id, observed_state, version_id, routing_generation,
+                        message, observed_at
+                   FROM deployment_target_observations WHERE plan_id = ?1 ORDER BY node_id",
+            )?;
+            statement
+                .query_map([plan_id], |row| {
+                    Ok(DeploymentTargetObservation {
+                        plan_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        observed_state: row.get(2)?,
+                        version_id: row.get(3)?,
+                        routing_generation: row.get(4)?,
+                        message: row.get(5)?,
+                        observed_at: row.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    pub async fn record_deployment_proxy_observation(
+        &self,
+        observation: DeploymentProxyObservation,
+    ) -> CatalogResult<()> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO deployment_proxy_observations
+                   (plan_id, proxy_id, observed_state, routing_table_version,
+                    routing_generation, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(plan_id, proxy_id) DO UPDATE SET
+                   observed_state = excluded.observed_state,
+                   routing_table_version = excluded.routing_table_version,
+                   routing_generation = excluded.routing_generation,
+                   observed_at = excluded.observed_at",
+                params![
+                    observation.plan_id,
+                    observation.proxy_id,
+                    observation.observed_state,
+                    observation.routing_table_version,
+                    observation.routing_generation,
+                    observation.observed_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn deployment_proxy_observations(
+        &self,
+        plan_id: &str,
+    ) -> CatalogResult<Vec<DeploymentProxyObservation>> {
+        let plan_id = plan_id.to_string();
+        self.with_conn(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT plan_id, proxy_id, observed_state, routing_table_version,
+                        routing_generation, observed_at
+                   FROM deployment_proxy_observations WHERE plan_id = ?1 ORDER BY proxy_id",
+            )?;
+            statement
+                .query_map([plan_id], |row| {
+                    Ok(DeploymentProxyObservation {
+                        plan_id: row.get(0)?,
+                        proxy_id: row.get(1)?,
+                        observed_state: row.get(2)?,
+                        routing_table_version: row.get(3)?,
+                        routing_generation: row.get(4)?,
+                        observed_at: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    pub async fn deployment_events(
+        &self,
+        plan_id: &str,
+    ) -> CatalogResult<Vec<crate::catalog::DeploymentEvent>> {
+        let plan_id = plan_id.to_string();
+        self.with_conn(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT sequence, plan_id, from_state, to_state, detail, created_at
+                   FROM deployment_events WHERE plan_id = ?1 ORDER BY sequence",
+            )?;
+            statement
+                .query_map([plan_id], |row| {
+                    Ok(crate::catalog::DeploymentEvent {
+                        sequence: row.get(0)?,
+                        plan_id: row.get(1)?,
+                        from_state: row.get(2)?,
+                        to_state: row.get(3)?,
+                        detail: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    pub async fn deployment_generation_drain(
+        &self,
+        plan_id: &str,
+    ) -> CatalogResult<Option<DeploymentGenerationDrain>> {
+        let plan_id = plan_id.to_string();
+        self.with_conn(move |conn| {
+            type DrainRow = (String, String, String, i64, String, Option<String>, i64);
+            let row: Option<DrainRow> = conn
+                .query_row(
+                    "SELECT plan_id, generation, target_ids, not_before, state, last_error, updated_at
+                       FROM deployment_generation_drains WHERE plan_id = ?1",
+                    [plan_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(plan_id, generation, target_ids, not_before, state, last_error, updated_at)| {
+                Ok(DeploymentGenerationDrain {
+                    plan_id,
+                    generation,
+                    target_ids: serde_json::from_str(&target_ids).map_err(|error| {
+                        CatalogError::invalid(format!("deployment drain target set: {error}"))
+                    })?,
+                    not_before,
+                    state,
+                    last_error,
+                    updated_at,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn due_deployment_generation_drains(
+        &self,
+        now: i64,
+    ) -> CatalogResult<Vec<DeploymentGenerationDrain>> {
+        self.with_conn(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT drain.plan_id, drain.generation, drain.target_ids, drain.not_before,
+                        drain.state, drain.last_error, drain.updated_at
+                   FROM deployment_generation_drains drain
+                   JOIN deployment_plans plan ON plan.id = drain.plan_id
+                  WHERE plan.state = 'active'
+                    AND drain.state IN ('retained','draining')
+                    AND drain.not_before <= ?1
+                  ORDER BY drain.not_before, drain.plan_id",
+            )?;
+            let rows = statement
+                .query_map([now], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(
+                    |(
+                        plan_id,
+                        generation,
+                        target_ids,
+                        not_before,
+                        state,
+                        last_error,
+                        updated_at,
+                    )| {
+                        Ok(DeploymentGenerationDrain {
+                            plan_id,
+                            generation,
+                            target_ids: serde_json::from_str(&target_ids).map_err(|error| {
+                                CatalogError::invalid(format!(
+                                    "deployment drain target set: {error}"
+                                ))
+                            })?,
+                            not_before,
+                            state,
+                            last_error,
+                            updated_at,
+                        })
+                    },
+                )
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn record_deployment_drain_observation(
+        &self,
+        observation: DeploymentDrainObservation,
+    ) -> CatalogResult<()> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO deployment_drain_observations
+                   (plan_id, node_id, generation, observed_state, message, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(plan_id, node_id) DO UPDATE SET
+                   generation = excluded.generation,
+                   observed_state = excluded.observed_state,
+                   message = excluded.message,
+                   observed_at = excluded.observed_at",
+                params![
+                    observation.plan_id,
+                    observation.node_id,
+                    observation.generation,
+                    observation.observed_state,
+                    observation.message,
+                    observation.observed_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn deployment_drain_observations(
+        &self,
+        plan_id: &str,
+    ) -> CatalogResult<Vec<DeploymentDrainObservation>> {
+        let plan_id = plan_id.to_string();
+        self.with_conn(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT plan_id, node_id, generation, observed_state, message, observed_at
+                   FROM deployment_drain_observations WHERE plan_id = ?1 ORDER BY node_id",
+            )?;
+            statement
+                .query_map([plan_id], |row| {
+                    Ok(DeploymentDrainObservation {
+                        plan_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        generation: row.get(2)?,
+                        observed_state: row.get(3)?,
+                        message: row.get(4)?,
+                        observed_at: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    pub async fn set_deployment_generation_drain_state(
+        &self,
+        plan_id: &str,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> CatalogResult<()> {
+        if !matches!(state, "draining" | "drained") {
+            return Err(CatalogError::invalid("unknown deployment drain state"));
+        }
+        let plan_id = plan_id.to_string();
+        let state = state.to_string();
+        let last_error = last_error.map(str::to_string);
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let changed = tx.execute(
+                "UPDATE deployment_generation_drains
+                    SET state = ?1, last_error = ?2, updated_at = ?3
+                  WHERE plan_id = ?4 AND state != 'drained'",
+                params![state, last_error, now_secs(), plan_id],
+            )?;
+            if changed == 0 {
+                let actual: Option<String> = tx
+                    .query_row(
+                        "SELECT state FROM deployment_generation_drains WHERE plan_id = ?1",
+                        [&plan_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if actual.as_deref() == Some("drained") && state == "drained" {
+                    return Ok(());
+                }
+                return Err(CatalogError::conflict(format!(
+                    "deployment generation drain {plan_id} is {}",
+                    actual.as_deref().unwrap_or("missing")
+                )));
+            }
+            if state == "drained" {
+                tx.execute(
+                    "INSERT INTO deployment_events
+                       (plan_id, from_state, to_state, detail, created_at)
+                     VALUES (?1, 'active', 'active', 'previous generation drained after retention window', ?2)",
+                    params![plan_id, now_secs()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Commit the production selector using the exact identity reserved by a
+    /// prepared plan. This is the only point at which the newest deployment
+    /// pointer changes.
+    pub async fn commit_deployment_plan(
+        &self,
+        plan: &DeploymentPlan,
+        env: &Environment,
+        snapshot: Option<&EnvironmentBindingSnapshot>,
+    ) -> CatalogResult<Deployment> {
+        if plan.state != "prepared"
+            || plan.app_id != env.app_id
+            || plan.env_id != env.id
+            || plan.snapshot_id.as_deref()
+                != snapshot
+                    .map(|document| document.identity())
+                    .transpose()
+                    .map_err(|error| CatalogError::invalid(error.to_string()))?
+                    .as_deref()
+        {
+            return Err(CatalogError::conflict(
+                "deployment plan is not a prepared plan for this exact environment snapshot",
+            ));
+        }
+        if let Some(snapshot) = snapshot {
+            let operation = plan
+                .policy
+                .get("operation")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| CatalogError::invalid("deployment plan has no operation kind"))?;
+            let secret_change = if operation == "secret_change" {
+                let value = plan
+                    .policy
+                    .get("secretChange")
+                    .filter(|value| !value.is_null())
+                    .ok_or_else(|| {
+                        CatalogError::invalid("secret-change deployment plan has no head change")
+                    })?;
+                let name = value
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        CatalogError::invalid("secret-change deployment plan has no secret name")
+                    })?;
+                validate_secret_name(name)?;
+                let replacement = value
+                    .get("replacementRevision")
+                    .and_then(|revision| revision.as_str())
+                    .map(str::to_string);
+                let expected = value
+                    .get("expectedRevision")
+                    .and_then(|revision| revision.as_str())
+                    .map(str::to_string);
+                for revision in [replacement.as_deref(), expected.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    revision.parse::<CanonicalId>().map_err(|_| {
+                        CatalogError::invalid(
+                            "secret-change revisions must be lowercase UUIDv7 identities",
+                        )
+                    })?;
+                }
+                Some((name.to_string(), replacement, expected))
+            } else {
+                if !matches!(operation, "deployment" | "rollback")
+                    || plan
+                        .policy
+                        .get("secretChange")
+                        .is_some_and(|value| !value.is_null())
+                {
+                    return Err(CatalogError::invalid(
+                        "deployment plan operation and secret change disagree",
+                    ));
+                }
+                None
+            };
+            return self
+                .activate_deployment_inner(DeploymentActivation {
+                    env,
+                    version_id: &plan.version_id,
+                    snapshot,
+                    expected_current_deployment: plan.previous_deployment_id.as_deref(),
+                    expected_secret_heads: plan
+                        .compare_secret_heads
+                        .then(|| plan.expected_secret_heads.clone()),
+                    note: plan.note.clone(),
+                    secret_change,
+                    deployment_identity: Some((plan.id.clone(), plan.routing_generation)),
+                    advance_plan: true,
+                })
+                .await;
+        }
+
+        let app_id = plan.app_id.clone();
+        let env_id = plan.env_id.clone();
+        let version_id = plan.version_id.clone();
+        let expected = plan.previous_deployment_id.clone();
+        let deployment = Deployment {
+            id: plan.id.clone(),
+            canonical_id: plan.routing_generation,
+            app_id,
+            env_id,
+            version_id,
+            created_at: now_secs(),
+            note: plan.note.clone(),
+            snapshot_id: None,
+        };
+        let inserted = deployment.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            load_version(&tx, &inserted.app_id, &inserted.version_id)?;
+            let current = current_deployment(&tx, &inserted.env_id)?;
+            if current.as_ref().map(|row| row.id.as_str()) != expected.as_deref() {
+                return Err(CatalogError::conflict(
+                    "deployment changed while the plan was prepared; reconcile before retrying",
+                ));
+            }
+            tx.execute(
+                &format!(
+                    "INSERT INTO deployments ({DEPLOYMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)"
+                ),
+                params![
+                    inserted.id,
+                    inserted.canonical_id.to_string(),
+                    inserted.app_id,
+                    inserted.env_id,
+                    inserted.version_id,
+                    inserted.created_at,
+                    inserted.note,
+                ],
+            )?;
+            let advanced = tx.execute(
+                "UPDATE deployment_plans
+                    SET state = 'activating', last_error = NULL, updated_at = ?1
+                  WHERE id = ?2 AND state = 'prepared'",
+                params![now_secs(), inserted.id],
+            )?;
+            if advanced != 1 {
+                return Err(CatalogError::conflict(
+                    "deployment plan left prepared state before its pointer commit",
+                ));
+            }
+            tx.execute(
+                "INSERT INTO deployment_events
+                   (plan_id, from_state, to_state, detail, created_at)
+                 VALUES (?1, 'prepared', 'activating', 'production pointer committed', ?2)",
+                params![inserted.id, now_secs()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+        Ok(deployment)
+    }
 
     /// Point an environment at a version by inserting a new pointer row.
     /// Used by both deploy and rollback; only the note differs.
@@ -867,6 +1721,8 @@ impl CatalogStore {
             expected_secret_heads: Some(expected_secret_heads.clone()),
             note,
             secret_change: None,
+            deployment_identity: None,
+            advance_plan: false,
         })
         .await
     }
@@ -890,6 +1746,8 @@ impl CatalogStore {
             expected_secret_heads: None,
             note,
             secret_change: None,
+            deployment_identity: None,
+            advance_plan: false,
         })
         .await
     }
@@ -924,6 +1782,8 @@ impl CatalogStore {
                 change.replacement_revision.map(str::to_string),
                 change.expected_revision.map(str::to_string),
             )),
+            deployment_identity: None,
+            advance_plan: false,
         })
         .await
     }
@@ -940,6 +1800,8 @@ impl CatalogStore {
             expected_secret_heads,
             note,
             secret_change,
+            deployment_identity,
+            advance_plan,
         } = activation;
         if snapshot.deployment_version_id != version_id
             || snapshot.environment_id != env.canonical_id.to_string()
@@ -1062,9 +1924,11 @@ impl CatalogStore {
                     ));
                 }
 
+                let (deployment_id, canonical_id) = deployment_identity
+                    .unwrap_or_else(|| (Uuid::new_v4().to_string(), CanonicalId::new_v7()));
                 let deployment = Deployment {
-                    id: Uuid::new_v4().to_string(),
-                    canonical_id: CanonicalId::new_v7(),
+                    id: deployment_id,
+                    canonical_id,
                     app_id,
                     env_id,
                     version_id: version.id,
@@ -1087,6 +1951,25 @@ impl CatalogStore {
                         deployment.snapshot_id,
                     ],
                 )?;
+                if advance_plan {
+                    let advanced = tx.execute(
+                        "UPDATE deployment_plans
+                            SET state = 'activating', last_error = NULL, updated_at = ?1
+                          WHERE id = ?2 AND state = 'prepared'",
+                        params![now_secs(), deployment.id],
+                    )?;
+                    if advanced != 1 {
+                        return Err(CatalogError::conflict(
+                            "deployment plan left prepared state before its pointer commit",
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT INTO deployment_events
+                           (plan_id, from_state, to_state, detail, created_at)
+                         VALUES (?1, 'prepared', 'activating', 'production pointer committed', ?2)",
+                        params![deployment.id, now_secs()],
+                    )?;
+                }
                 tx.commit()?;
                 Ok(deployment)
             })
@@ -2034,7 +2917,8 @@ impl CatalogStore {
                 // reconciling against this answer should indeed be running
                 // nothing for it.
                 let mut stmt = conn.prepare(
-                    "SELECT e.app_id, e.id, e.name, d.version_id, v.bundle_sha, d.snapshot_id
+                    "SELECT e.app_id, e.id, e.name, d.version_id, v.bundle_sha, d.snapshot_id,
+                            d.id, d.canonical_id, plan.state
                      FROM environments e
                      JOIN deployments d ON d.id = (
                          SELECT inner_d.id FROM deployments inner_d
@@ -2042,6 +2926,7 @@ impl CatalogStore {
                          ORDER BY inner_d.created_at DESC, inner_d.rowid DESC LIMIT 1
                      )
                      LEFT JOIN versions v ON v.id = d.version_id
+                     LEFT JOIN deployment_plans plan ON plan.id = d.id
                      ORDER BY e.app_id, e.name",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -2052,14 +2937,26 @@ impl CatalogStore {
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 })?;
 
                 let mut assignments = Vec::new();
                 let mut undescribable = Vec::new();
                 for row in rows {
-                    let (app_id, environment_id, environment, version_id, bundle_sha, snapshot_id) =
-                        row?;
+                    let (
+                        app_id,
+                        environment_id,
+                        environment,
+                        version_id,
+                        bundle_sha,
+                        snapshot_id,
+                        deployment_id,
+                        routing_generation,
+                        deployment_state,
+                    ) = row?;
                     match bundle_sha {
                         Some(bundle_sha) => assignments.push(Assignment {
                             app_id,
@@ -2068,6 +2965,9 @@ impl CatalogStore {
                             version_id,
                             bundle_sha,
                             snapshot_id,
+                            deployment_id,
+                            routing_generation,
+                            deployment_state,
                         }),
                         None => undescribable.push(UndescribableEnvironment {
                             app_id,
@@ -2121,8 +3021,11 @@ impl CatalogStore {
                 "SELECT e.app_id, e.name, d.version_id, v.manifest
                  FROM environments e
                  JOIN deployments d ON d.id = (
-                     SELECT inner_d.id FROM deployments inner_d
+                     SELECT inner_d.id
+                       FROM deployments inner_d
+                       LEFT JOIN deployment_plans plan ON plan.id = inner_d.id
                      WHERE inner_d.env_id = e.id
+                       AND (plan.id IS NULL OR plan.state = 'active')
                      ORDER BY inner_d.created_at DESC, inner_d.rowid DESC LIMIT 1
                  )
                  JOIN versions v ON v.id = d.version_id
@@ -2456,6 +3359,52 @@ fn current_deployment(conn: &Connection, env_id: &str) -> CatalogResult<Option<D
     Ok(deployment)
 }
 
+fn map_deployment_plan(row: &Row<'_>) -> rusqlite::Result<DeploymentPlan> {
+    let routing_generation: String = row.get(1)?;
+    let expected_secret_heads_json: String = row.get(8)?;
+    let target_ids_json: String = row.get(10)?;
+    let proxy_ids_json: String = row.get(11)?;
+    let policy_json: String = row.get(12)?;
+    let parse_failure = |index: usize, kind: rusqlite::types::Type, error: serde_json::Error| {
+        rusqlite::Error::FromSqlConversionFailure(index, kind, Box::new(error))
+    };
+    let expected_secret_heads = serde_json::from_str(&expected_secret_heads_json)
+        .map_err(|error| parse_failure(8, rusqlite::types::Type::Text, error))?;
+    let target_ids = serde_json::from_str(&target_ids_json)
+        .map_err(|error| parse_failure(10, rusqlite::types::Type::Text, error))?;
+    let proxy_ids = serde_json::from_str(&proxy_ids_json)
+        .map_err(|error| parse_failure(11, rusqlite::types::Type::Text, error))?;
+    let policy = serde_json::from_str(&policy_json)
+        .map_err(|error| parse_failure(12, rusqlite::types::Type::Text, error))?;
+    Ok(DeploymentPlan {
+        id: row.get(0)?,
+        routing_generation: routing_generation.parse().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        app_id: row.get(2)?,
+        env_id: row.get(3)?,
+        version_id: row.get(4)?,
+        snapshot_id: row.get(5)?,
+        previous_deployment_id: row.get(6)?,
+        previous_generation: row.get(7)?,
+        expected_secret_heads,
+        compare_secret_heads: row.get(9)?,
+        target_ids,
+        proxy_ids,
+        policy,
+        plan_sha256: row.get(13)?,
+        state: row.get(14)?,
+        note: row.get(15)?,
+        last_error: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2737,6 +3686,225 @@ mod tests {
         assert_eq!(history.len(), 4);
         assert_eq!(history[0].version_id, v1.id);
         assert_eq!(history[3].version_id, v1.id);
+    }
+
+    #[tokio::test]
+    async fn deployment_plan_is_immutable_single_flight_and_commits_with_its_generation() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        let first_version = version(&store, "demo", "sha-plan").await;
+        let plan = store
+            .create_deployment_plan(
+                &env,
+                &first_version,
+                DeploymentPlanSpec {
+                    snapshot_id: None,
+                    expected_secret_heads: std::collections::BTreeMap::new(),
+                    compare_secret_heads: true,
+                    target_ids: vec!["node-a".to_string()],
+                    proxy_ids: vec!["proxy-a".to_string()],
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: Some("release".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.state, "preparing");
+        assert_eq!(plan.plan_sha256.len(), 64);
+        let immutable_document = serde_json::json!({
+            "id": plan.id,
+            "routingGeneration": plan.routing_generation.to_string(),
+            "applicationId": plan.app_id,
+            "environmentId": plan.env_id,
+            "versionId": plan.version_id,
+            "snapshotId": plan.snapshot_id,
+            "previousDeploymentId": plan.previous_deployment_id,
+            "previousGeneration": plan.previous_generation,
+            "expectedSecretHeads": plan.expected_secret_heads,
+            "compareSecretHeads": plan.compare_secret_heads,
+            "targetIds": plan.target_ids,
+            "proxyIds": plan.proxy_ids,
+            "policy": plan.policy,
+            "note": plan.note,
+        });
+        assert_eq!(
+            plan.plan_sha256,
+            hex::encode(Sha256::digest(
+                serde_jcs::to_vec(&immutable_document).unwrap()
+            )),
+            "the persisted digest must cover the RFC 8785 canonical immutable plan"
+        );
+
+        let concurrent = store
+            .create_deployment_plan(
+                &env,
+                &first_version,
+                DeploymentPlanSpec {
+                    snapshot_id: None,
+                    expected_secret_heads: std::collections::BTreeMap::new(),
+                    compare_secret_heads: true,
+                    target_ids: vec!["node-b".to_string()],
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(concurrent, CatalogError::Conflict(_)));
+
+        let plan_id = plan.id.clone();
+        let immutable = store
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE deployment_plans SET version_id = 'tampered' WHERE id = ?1",
+                    [plan_id],
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(immutable.is_err());
+        assert!(
+            store
+                .transition_deployment_plan(&plan.id, "preparing", "active", None)
+                .await
+                .is_err()
+        );
+
+        let prepared = store
+            .transition_deployment_plan(&plan.id, "preparing", "prepared", Some("ready"))
+            .await
+            .unwrap();
+        let deployment = store
+            .commit_deployment_plan(&prepared, &env, None)
+            .await
+            .unwrap();
+        assert_eq!(deployment.id, plan.id);
+        assert_eq!(deployment.canonical_id, plan.routing_generation);
+        assert_eq!(
+            store.deployment_plan(&plan.id).await.unwrap().state,
+            "activating"
+        );
+        assert!(
+            store.list_deployed_versions().await.unwrap().is_empty(),
+            "cron must not observe a first deployment before activation completes"
+        );
+        let events = store.deployment_events(&plan.id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.to_state.as_str())
+                .collect::<Vec<_>>(),
+            ["preparing", "prepared", "activating"]
+        );
+
+        store
+            .transition_deployment_plan(&plan.id, "activating", "active", Some("applied"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_deployed_versions().await.unwrap()[0].version_id,
+            first_version.id
+        );
+        let next_version = version(&store, "demo", "sha-plan-next").await;
+        let next = store
+            .create_deployment_plan(
+                &env,
+                &next_version,
+                DeploymentPlanSpec {
+                    snapshot_id: None,
+                    expected_secret_heads: std::collections::BTreeMap::new(),
+                    compare_secret_heads: true,
+                    target_ids: vec!["node-b".to_string()],
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+        let retained = store
+            .deployment_generation_drain(&next.id)
+            .await
+            .unwrap()
+            .expect("a replacement plan retains the previous generation");
+        assert_eq!(retained.generation, plan.routing_generation.to_string());
+        assert_eq!(
+            retained.target_ids,
+            ["node-a"],
+            "drain follows the previous plan's frozen set across a fleet change"
+        );
+        assert!(
+            store
+                .due_deployment_generation_drains(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a candidate plan must not drain the production generation"
+        );
+
+        let next = store
+            .transition_deployment_plan(&next.id, "preparing", "prepared", None)
+            .await
+            .unwrap();
+        store
+            .commit_deployment_plan(&next, &env, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_deployed_versions().await.unwrap()[0].version_id,
+            first_version.id,
+            "cron keeps the prior active version while a replacement is only activating"
+        );
+        store
+            .transition_deployment_plan(&next.id, "activating", "active", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_deployed_versions().await.unwrap()[0].version_id,
+            next_version.id
+        );
+        assert_eq!(
+            store
+                .due_deployment_generation_drains(i64::MAX)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .record_deployment_drain_observation(DeploymentDrainObservation {
+                plan_id: next.id.clone(),
+                node_id: "node-a".to_string(),
+                generation: retained.generation,
+                observed_state: "drained".to_string(),
+                message: None,
+                observed_at: now_secs(),
+            })
+            .await
+            .unwrap();
+        store
+            .set_deployment_generation_drain_state(&next.id, "drained", None)
+            .await
+            .unwrap();
+        store
+            .set_deployment_generation_drain_state(&next.id, "drained", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .deployment_drain_observations(&next.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -196,6 +196,33 @@ message ApplyDeploymentRequest {
     // snapshot. Names and config values remain in the canonical snapshot;
     // this map is the only secret-bearing addition and must never be logged.
     map<string, string> secret_values_by_revision = 14;
+
+    // Durable control-plane operation identity. Empty only for an older
+    // producer or local development. It is echoed in every observation so a
+    // retry cannot be mistaken for a different deployment.
+    string deployment_id = 15;
+
+    // Immutable routing generation. For Deislet this is the deployment's
+    // canonical UUIDv7 identity and is what deis-proxy stamps on every
+    // production request. A runtime must serve this exact generation or
+    // refuse; it may not fall back to the node's current version.
+    string routing_generation = 16;
+
+    // PREPARE builds and verifies a candidate without moving production;
+    // ACTIVATE enables triggers/current-version bookkeeping after the route
+    // selector has committed; ABORT discards an unactivated candidate. The
+    // unspecified/legacy value preserves rolling compatibility with an older
+    // control plane and performs the historical one-call apply.
+    DeploymentAction action = 17;
+}
+
+enum DeploymentAction {
+    DEPLOYMENT_ACTION_UNSPECIFIED = 0;
+    LEGACY_APPLY = 1;
+    PREPARE = 2;
+    ACTIVATE = 3;
+  ABORT = 4;
+  DRAIN = 5;
 }
 
 // A version's compatibility declaration, exactly as its manifest spells it.
@@ -228,6 +255,16 @@ message ApplyDeploymentResponse {
     // the node kept running, which is what makes a rejected deployment
     // readable rather than merely failed.
     string version_id = 3;
+
+    // Correlates the observation to the durable plan and immutable routing
+    // generation that produced it. Empty for a legacy request.
+    string deployment_id = 4;
+    string routing_generation = 5;
+
+    // Machine-readable observed state: prepared, active, aborted, rejected,
+    // or legacy_applied. `success` alone cannot distinguish readiness from
+    // production activation.
+    string observed_state = 6;
 }
 
 // Application configuration

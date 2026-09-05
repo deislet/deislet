@@ -8,8 +8,46 @@ use crate::config::ExecutionLimits;
 use crate::runtime::{FetchPolicy, IsolateSpec, OpMetricsSummary, RuntimePool};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use tokio::sync::Notify;
+
+struct GenerationTraffic {
+    accepting: AtomicBool,
+    in_flight: AtomicUsize,
+    changed: Notify,
+}
+
+impl GenerationTraffic {
+    fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            in_flight: AtomicUsize::new(0),
+            changed: Notify::new(),
+        }
+    }
+}
+
+struct GenerationLeaseDrop {
+    traffic: Arc<GenerationTraffic>,
+}
+
+impl Drop for GenerationLeaseDrop {
+    fn drop(&mut self) {
+        self.traffic.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.traffic.changed.notify_waiters();
+    }
+}
+
+/// Keeps one exact-generation HTTP response stream or WebSocket attached to
+/// its isolate until the connection/body is dropped. Clones share one count,
+/// which is required because HTTP response extensions may be cloned by the
+/// serving stack.
+#[derive(Clone)]
+pub struct GenerationTrafficLease {
+    _drop: Arc<GenerationLeaseDrop>,
+}
 
 /// One deployed version of one app, as this node currently runs it.
 ///
@@ -18,6 +56,11 @@ use std::time::SystemTime;
 /// for it, and a version that fails to load needs something to fall back to.
 pub struct VersionRecord {
     pub version_id: String,
+    /// Immutable coordinator intent that owns `routing_generation`.
+    pub deployment_id: Option<String>,
+    /// Immutable deployment generation accepted on the trusted proxy hop.
+    /// `None` is the rolling-compatible legacy/local path.
+    pub routing_generation: Option<String>,
     /// Immutable standard environment snapshot materialized in this isolate.
     /// `None` identifies the legacy schema-1 environment path.
     pub environment_snapshot_id: Option<String>,
@@ -45,6 +88,7 @@ impl std::fmt::Debug for VersionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VersionRecord")
             .field("version_id", &self.version_id)
+            .field("routing_generation", &self.routing_generation)
             .field("environment_snapshot_id", &self.environment_snapshot_id)
             .field("env_confirmed", &self.env_confirmed)
             .field("entry_point", &self.entry_point)
@@ -59,6 +103,8 @@ pub struct VersionInstall {
     /// so a preview cannot land in production's slot.
     pub key: AppKey,
     pub version_id: String,
+    pub deployment_id: Option<String>,
+    pub routing_generation: Option<String>,
     pub environment_snapshot_id: Option<String>,
     pub entry_point: String,
     pub code: String,
@@ -75,6 +121,7 @@ pub struct VersionInstall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledVersion {
     pub version_id: String,
+    pub routing_generation: Option<String>,
     pub environment_snapshot_id: Option<String>,
     /// See [`VersionRecord::env_confirmed`].
     pub env_confirmed: bool,
@@ -120,6 +167,11 @@ pub struct ApplicationManager {
     /// Deployed versions. Only apps installed from a bundle appear here; the
     /// built-in `_system` app has no version.
     versions: DashMap<AppKey, Arc<VersionRecord>>,
+    /// All immutable generation-addressable versions retained on this node,
+    /// including candidates that are prepared but not active and previous
+    /// generations kept while proxies converge.
+    generation_versions: DashMap<(AppKey, String), Arc<VersionRecord>>,
+    generation_traffic: DashMap<(AppKey, String), Arc<GenerationTraffic>>,
     runtime_pool: Arc<RuntimePool>,
     /// Debug sessions: (app, environment) -> (token, expires_at)
     inspect_sessions: DashMap<AppKey, (String, SystemTime)>,
@@ -154,6 +206,8 @@ impl ApplicationManager {
         Self {
             apps: DashMap::new(),
             versions: DashMap::new(),
+            generation_versions: DashMap::new(),
+            generation_traffic: DashMap::new(),
             runtime_pool: RuntimePool::new(num_threads),
             inspect_sessions: DashMap::new(),
             default_limits: ExecutionLimits::default(),
@@ -166,6 +220,8 @@ impl ApplicationManager {
         Self {
             apps: DashMap::new(),
             versions: DashMap::new(),
+            generation_versions: DashMap::new(),
+            generation_traffic: DashMap::new(),
             runtime_pool: RuntimePool::new_with_repo(num_threads, Some(app_repo)),
             inspect_sessions: DashMap::new(),
             default_limits: ExecutionLimits::default(),
@@ -678,9 +734,17 @@ impl ApplicationManager {
     /// A new version that will not build leaves the old one serving and
     /// untouched -- nothing was taken away, so there is nothing to put back.
     pub async fn install_version(&self, install: VersionInstall) -> Result<()> {
+        if let Some(generation) = install.routing_generation.clone() {
+            let key = install.key.clone();
+            self.prepare_version(install).await?;
+            self.activate_prepared(&key, &generation).await?;
+            return Ok(());
+        }
         let VersionInstall {
             key,
             version_id,
+            deployment_id,
+            routing_generation,
             environment_snapshot_id,
             entry_point,
             code,
@@ -691,6 +755,8 @@ impl ApplicationManager {
 
         let record = Arc::new(VersionRecord {
             version_id: version_id.clone(),
+            deployment_id,
+            routing_generation,
             environment_snapshot_id,
             env_confirmed,
             entry_point: entry_point.clone(),
@@ -793,6 +859,193 @@ impl ApplicationManager {
         Ok(())
     }
 
+    /// Build and publish one immutable generation without moving the current
+    /// selector or starting its asynchronous triggers.
+    pub async fn prepare_version(&self, install: VersionInstall) -> Result<()> {
+        let VersionInstall {
+            key,
+            version_id,
+            deployment_id,
+            routing_generation,
+            environment_snapshot_id,
+            entry_point,
+            code,
+            config,
+            env_confirmed,
+            assets,
+        } = install;
+        let generation = routing_generation
+            .ok_or_else(|| anyhow!("prepare requires an immutable routing generation"))?;
+        let generation_key = (key.clone(), generation.clone());
+        if let Some(existing) = self.generation_versions.get(&generation_key) {
+            let same = existing.version_id == version_id
+                && existing.deployment_id == deployment_id
+                && existing.environment_snapshot_id == environment_snapshot_id;
+            drop(existing);
+            if same {
+                if self
+                    .runtime_pool
+                    .is_generation_hosted(&key.tenant_id(), &generation)
+                    .await
+                {
+                    return Ok(());
+                }
+                self.generation_versions.remove(&generation_key);
+            } else {
+                return Err(anyhow!(
+                    "routing generation {generation} of {key} already names a different immutable version or environment snapshot"
+                ));
+            }
+        }
+
+        let record = Arc::new(VersionRecord {
+            version_id: version_id.clone(),
+            deployment_id,
+            routing_generation: Some(generation.clone()),
+            environment_snapshot_id,
+            env_confirmed,
+            entry_point,
+            code,
+            config,
+            assets,
+        });
+        let staged = self
+            .runtime_pool
+            .stage_app(key.tenant_id(), record.code.clone(), self.spec_for(&key, &record))
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "version {version_id} of {key} could not be prepared for generation {generation}: {error}"
+                )
+            })?;
+        self.runtime_pool
+            .prepare_generation(staged, generation.clone())
+            .await?;
+        self.generation_versions.insert(generation_key, record);
+        self.generation_traffic
+            .entry((key, generation))
+            .or_insert_with(|| Arc::new(GenerationTraffic::new()));
+        Ok(())
+    }
+
+    /// Make one prepared generation the current version for triggers and
+    /// legacy/direct traffic. Generation-addressed HTTP was already possible
+    /// after prepare; this method does not need to rebuild it.
+    pub async fn activate_prepared(&self, key: &AppKey, generation: &str) -> Result<()> {
+        let record = self
+            .generation_versions
+            .get(&(key.clone(), generation.to_string()))
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| anyhow!("generation {generation} of {key} is not prepared"))?;
+        self.runtime_pool
+            .activate_generation(&key.tenant_id(), generation)
+            .await?;
+        let now = SystemTime::now();
+        self.apps.insert(
+            key.clone(),
+            App {
+                id: key.app_id().to_string(),
+                environment: key.environment().to_string(),
+                state: AppState::Running,
+                config: record.config.clone(),
+                created_at: now,
+                updated_at: now,
+                error: None,
+            },
+        );
+        self.versions.insert(key.clone(), record);
+        Ok(())
+    }
+
+    /// Drop an unactivated candidate or a retained old generation.
+    pub async fn discard_generation(&self, key: &AppKey, generation: &str) -> Result<()> {
+        if self
+            .versions
+            .get(key)
+            .is_some_and(|current| current.routing_generation.as_deref() == Some(generation))
+        {
+            return Err(anyhow!(
+                "generation {generation} of {key} is active and cannot be discarded"
+            ));
+        }
+        self.runtime_pool
+            .discard_generation(&key.tenant_id(), generation)
+            .await?;
+        self.generation_versions
+            .remove(&(key.clone(), generation.to_string()));
+        self.generation_traffic
+            .remove(&(key.clone(), generation.to_string()));
+        Ok(())
+    }
+
+    /// Stop new exact-generation requests, wait for response bodies and
+    /// WebSockets already admitted under it, then retire its isolate.
+    pub async fn drain_generation(
+        &self,
+        key: &AppKey,
+        generation: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        if self
+            .versions
+            .get(key)
+            .is_some_and(|current| current.routing_generation.as_deref() == Some(generation))
+        {
+            return Err(anyhow!(
+                "generation {generation} of {key} is current and cannot drain"
+            ));
+        }
+        let traffic = self
+            .generation_traffic
+            .get(&(key.clone(), generation.to_string()))
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| anyhow!("generation {generation} of {key} is not retained"))?;
+        traffic.accepting.store(false, Ordering::Release);
+        let wait = async {
+            loop {
+                let notified = traffic.changed.notified();
+                if traffic.in_flight.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            anyhow!(
+                "generation {generation} of {key} still has {} request/stream/WebSocket lease(s) after {}s",
+                traffic.in_flight.load(Ordering::Acquire),
+                timeout.as_secs()
+            )
+        })?;
+        self.discard_generation(key, generation).await
+    }
+
+    /// Acquire the race-free admission token that a response/connection holds
+    /// for its full lifetime.
+    pub fn begin_generation_traffic(
+        &self,
+        key: &AppKey,
+        generation: &str,
+    ) -> Result<GenerationTrafficLease> {
+        let traffic = self
+            .generation_traffic
+            .get(&(key.clone(), generation.to_string()))
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| anyhow!("generation {generation} of {key} has no traffic slot"))?;
+        if !traffic.accepting.load(Ordering::Acquire) {
+            return Err(anyhow!("generation {generation} of {key} is draining"));
+        }
+        traffic.in_flight.fetch_add(1, Ordering::AcqRel);
+        if !traffic.accepting.load(Ordering::Acquire) {
+            traffic.in_flight.fetch_sub(1, Ordering::AcqRel);
+            traffic.changed.notify_waiters();
+            return Err(anyhow!("generation {generation} of {key} is draining"));
+        }
+        Ok(GenerationTrafficLease {
+            _drop: Arc::new(GenerationLeaseDrop { traffic }),
+        })
+    }
+
     /// How one version's code is to be built into an isolate.
     fn spec_for(&self, key: &AppKey, record: &VersionRecord) -> IsolateSpec {
         IsolateSpec {
@@ -830,13 +1083,28 @@ impl ApplicationManager {
     /// The static files of the version currently running, for the HTTP entry
     /// to consult before anything reaches an isolate.
     pub fn assets(&self, key: &AppKey) -> Option<Arc<AssetBundle>> {
-        self.versions.get(key).map(|e| e.assets.clone())
+        self.assets_for_generation(key, None)
+    }
+
+    pub fn assets_for_generation(
+        &self,
+        key: &AppKey,
+        generation: Option<&str>,
+    ) -> Option<Arc<AssetBundle>> {
+        match generation {
+            Some(generation) => self
+                .generation_versions
+                .get(&(key.clone(), generation.to_string()))
+                .map(|entry| entry.assets.clone()),
+            None => self.versions.get(key).map(|entry| entry.assets.clone()),
+        }
     }
 
     /// Which version this node runs for one environment of one app.
     pub fn installed_version(&self, key: &AppKey) -> Option<InstalledVersion> {
         self.versions.get(key).map(|e| InstalledVersion {
             version_id: e.version_id.clone(),
+            routing_generation: e.routing_generation.clone(),
             environment_snapshot_id: e.environment_snapshot_id.clone(),
             env_confirmed: e.env_confirmed,
         })
@@ -851,6 +1119,7 @@ impl ApplicationManager {
                     e.key().clone(),
                     InstalledVersion {
                         version_id: e.version_id.clone(),
+                        routing_generation: e.routing_generation.clone(),
                         environment_snapshot_id: e.environment_snapshot_id.clone(),
                         env_confirmed: e.env_confirmed,
                     },
@@ -878,6 +1147,27 @@ impl ApplicationManager {
 
     pub fn is_loaded(&self, key: &AppKey) -> bool {
         self.apps.contains_key(key)
+    }
+
+    /// Whether the exact immutable deployment selected by the trusted edge is
+    /// installed in the slot that would answer this request.
+    ///
+    /// No generation is the rolling-compatible direct/local path. Once a
+    /// generation is present it is never treated as a hint: a mismatch must
+    /// be refused before static assets or application code can come from a
+    /// different deployment.
+    pub async fn serves_generation(&self, key: &AppKey, generation: Option<&str>) -> bool {
+        match generation {
+            None => self.is_loaded(key),
+            Some(generation) => {
+                self.generation_versions
+                    .contains_key(&(key.clone(), generation.to_string()))
+                    && self
+                        .runtime_pool
+                        .is_generation_hosted(&key.tenant_id(), generation)
+                        .await
+            }
+        }
     }
 
     /// Throw away an environment's isolate while leaving this node's record
@@ -989,6 +1279,10 @@ impl ApplicationManager {
         // asset index must not answer requests for an app that is no longer
         // loaded.
         self.versions.remove(key);
+        self.generation_versions
+            .retain(|(candidate, _), _| candidate != key);
+        self.generation_traffic
+            .retain(|(candidate, _), _| candidate != key);
         self.inspect_sessions.remove(key);
         match self.apps.remove(key) {
             Some(_) => {
@@ -1029,6 +1323,39 @@ impl ApplicationManager {
         self.runtime_pool
             .execute_request(&key.tenant_id(), url, method, headers, body)
             .await
+    }
+
+    /// Execute the exact generation selected by the trusted routing layer.
+    /// `None` is the legacy/direct path and preserves the existing current
+    /// selector; `Some` never falls back to it.
+    pub async fn execute_app_generation(
+        &self,
+        key: &AppKey,
+        generation: Option<&str>,
+        url: String,
+        method: String,
+        headers: crate::runtime::HeaderPairs,
+        body: Option<Vec<u8>>,
+    ) -> Result<(
+        u16,
+        crate::runtime::HeaderPairs,
+        crate::runtime::ResponseBody,
+    )> {
+        match generation {
+            Some(generation) => {
+                self.runtime_pool
+                    .execute_request_generation(
+                        &key.tenant_id(),
+                        generation,
+                        url,
+                        method,
+                        headers,
+                        body,
+                    )
+                    .await
+            }
+            None => self.execute_app(key, url, method, headers, body).await,
+        }
     }
 
     /// Hand a batch of queue messages to one application's queue handler.
@@ -1173,6 +1500,31 @@ impl ApplicationManager {
             .await
     }
 
+    pub async fn register_ws_connection_generation(
+        &self,
+        key: &AppKey,
+        generation: Option<&str>,
+        ws_id: String,
+        js_to_client_tx: crate::runtime::WsClientSink,
+    ) -> Result<()> {
+        match generation {
+            Some(generation) => {
+                self.runtime_pool
+                    .register_ws_connection_generation(
+                        &key.tenant_id(),
+                        generation,
+                        ws_id,
+                        js_to_client_tx,
+                    )
+                    .await
+            }
+            None => {
+                self.register_ws_connection(key, ws_id, js_to_client_tx)
+                    .await
+            }
+        }
+    }
+
     /// Send WebSocket message to JavaScript
     ///
     /// # Parameters
@@ -1190,6 +1542,23 @@ impl ApplicationManager {
             .await
     }
 
+    pub async fn send_ws_message_generation(
+        &self,
+        key: &AppKey,
+        generation: Option<&str>,
+        ws_id: String,
+        message: String,
+    ) -> Result<()> {
+        match generation {
+            Some(generation) => {
+                self.runtime_pool
+                    .send_ws_message_generation(&key.tenant_id(), generation, ws_id, message)
+                    .await
+            }
+            None => self.send_ws_message(key, ws_id, message).await,
+        }
+    }
+
     /// Unregister WebSocket connection
     ///
     /// # Parameters
@@ -1199,6 +1568,22 @@ impl ApplicationManager {
         self.runtime_pool
             .unregister_ws_connection(&key.tenant_id(), ws_id)
             .await
+    }
+
+    pub async fn unregister_ws_connection_generation(
+        &self,
+        key: &AppKey,
+        generation: Option<&str>,
+        ws_id: String,
+    ) -> Result<()> {
+        match generation {
+            Some(generation) => {
+                self.runtime_pool
+                    .unregister_ws_connection_generation(&key.tenant_id(), generation, ws_id)
+                    .await
+            }
+            None => self.unregister_ws_connection(key, ws_id).await,
+        }
     }
 }
 

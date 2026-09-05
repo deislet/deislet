@@ -427,6 +427,9 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
      string environment_snapshot_json = 12;
      string environment_snapshot_id = 13;
      map<string, string> secret_values_by_revision = 14;
+     string deployment_id = 15;       // lowercase UUIDv7 plan identity
+     string routing_generation = 16;  // immutable route/consumer generation
+     DeploymentAction action = 17;    // PREPARE / ACTIVATE / ABORT / DRAIN
    }
    ```
 2. 节点自己 HTTP GET `bundle_url`，流式落盘，校验 sha256，解包加载。
@@ -437,7 +440,8 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
 GET  deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE   // "/api/nodes/:id/assignments"
 → [ { app_id, version_id, environment, bundle_url, bundle_sha, env,
       environment_declarations, environment_snapshot,
-      environment_snapshot_id, secret_values_by_revision } ]
+      environment_snapshot_id, secret_values_by_revision,
+      deployment_id, routing_generation, deployment_action } ]
 ```
 
 **路径写常量，不写字面量。** 服务端注册路由用 `NODE_ASSIGNMENTS_ROUTE` /
@@ -453,7 +457,8 @@ secret/string 只从该 snapshot 物化，平台存储 wiring 仍留在内部 `e
 不持 config/secret value，因此控制面不可达时 schema-2 fail closed，不用 bundle 猜值。某个环境的
 snapshot 或密钥解不开时，该行被整条剔出清单并标为 incomplete，而不是发残缺环境。
 
-拉完、加载完才向控制面报 healthy。
+authoritative assignment 会按 durable plan state 发 `prepare` 或 `activate`；节点重启遇到未完成计划时只能
+恢复精确 generation，不能提前移动 current selector 或启动异步 trigger。拉完、加载完才向控制面报 healthy。
 
 ### 存储地址走 env 的保留键
 
@@ -474,10 +479,9 @@ snapshot 或密钥解不开时，该行被整条剔出清单并标为 incomplete
 `assignments.rs` 拉清单并向控制面登记自己，`fetch.rs` 流式取包校验 sha256。
 节点没登记也照样自取并服务它拉到的应用，只是收不到推送、也不会被选去跑 cron。
 
-**留着的一处旧毛病**：`management.proto` 的 `UpdateApp` 仍带 `bytes package_data`，
-与被删的 `DeployApp` 同源。RPC 本身已改成 `Unimplemented` 并在错误信息里指向
-`ApplyDeployment`，但那个字段还在消息里；删它要同时改 proto 与
-`crates/deis-runtime/src/management/`。
+`management.proto` 的旧 `UpdateApp.package_data` 已删除并保留字段号/字段名为 `reserved`；RPC 本身仍
+明确返回 `Unimplemented` 并指向 `ApplyDeployment`。严格发布的 durable plan、phase 与 observation 当前
+实现见 ADR-009 和阶段分析第 59 节；渐进发布与统一 trigger 切换边界尚未完成。
 
 ---
 

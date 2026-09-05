@@ -6,6 +6,7 @@ pub mod types;
 
 pub use key::{AppKey, InvalidAppKey};
 pub use manager::{
-    ApplicationManager, InstalledVersion, ScheduledFailure, VersionInstall, VersionRecord,
+    ApplicationManager, GenerationTrafficLease, InstalledVersion, ScheduledFailure, VersionInstall,
+    VersionRecord,
 };
 pub use types::{AppConfig, AppState};

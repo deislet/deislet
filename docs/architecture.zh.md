@@ -246,17 +246,20 @@ sequenceDiagram
     CLI->>R: POST /api/apps/{app}/versions（上传 zip）
     R->>R: 算 sha256，建 VERSION v(N+1)
     CLI->>R: POST /api/apps/{app}/environments（不存在才建）
-    CLI->>R: POST .../deployments（schema-2 原子写 snapshot + 指针）
+    CLI->>R: POST .../deployments（先持久化 immutable plan）
+    par PREPARE 全部冻结节点
+        R->>X: ApplyDeployment(PREPARE, plan, generation, snapshot)
+        X->>X: 校验包 → 建 staged isolate；不切 current/triggers
+        X-->>R: prepared(plan, generation)
+    end
+    R->>R: 全部 prepared 后 CAS 写 snapshot + desired pointer
+    R->>R: 等待冻结 Proxy applied-table observation 与 queue lease fence
+    R->>X: ApplyDeployment(ACTIVATE, plan, generation)
+    X-->>R: active(plan, generation)
     Dev->>CLI: deis secret set NAME（值从 stdin 进）
     CLI->>R: PUT .../secrets/{name}（追加加密 revision；CAS head + snapshot）
 
-    par 广播到已注册节点
-        R->>X: ApplyDeployment（指针 + declaration + snapshot + revision values）
-        X->>R: HTTP GET bundle_url，流式落盘
-        X->>X: 校验 sha256 → 解包 → 建 Isolate → 切换
-        X-->>R: ack
-    end
-    R-->>CLI: 响应里的 delivery 段说明哪些节点落到了、哪些没有
+    R-->>CLI: plan/status/event 与 delivery.phase 说明实际阶段和各节点 observation
     CLI-->>Dev: 没落到的节点单独红色列出，命令以非零退出
 
     Note over Dev,X: —— 节点重启 ——
@@ -269,21 +272,23 @@ sequenceDiagram
     Dev->>CLI: deis rollback
     CLI->>R: POST .../rollback
     R->>R: 再插一行 DEPLOYMENT 指向 v(N) 的历史 snapshot
-    R->>X: ApplyDeployment(v(N), historical snapshot)
+    R->>X: PREPARE/ACTIVATE(v(N), historical snapshot, new generation)
     Note over X: 包通常已在本地，秒级完成
 ```
 
 - **包从不进 gRPC 消息**。控制面只发指针，节点自己 HTTP 取。早前的 `DeployApp`
   把整个 zip 塞进一次调用，撞 tonic 的消息上限，已删除。
 - **去重**：`bundle_sha` 相同不新建版本。
-- **当前实现仍先写 desired pointer 再广播**：任一节点没 ack，响应里的 delivery 段会说明，
-  但它还没有达到 ADR-009 对 `active` 的 prepare/verify/observed-state 要求；这仍是后续发布状态机
-  的明确阻断项。schema-2 已保证 snapshot 与 desired pointer 在控制面同一事务 CAS，不代表多节点
-  已原子接流量。
+- **严格发布第一批已改为先 PREPARE、后写 desired pointer**：任一冻结 runtime target 没有按同一
+  plan/generation 回报 prepared，候选会 ABORT，pointer 不变。写 pointer 后仍要等冻结 Proxy 的
+  applied-table observation、queue lease fence 和 runtime ACTIVATE 才标 `active`；未知结果由持久计划重试。
+  当前 queue fence 顺序尚未与 HTTP/cron 构成同一个可证明切换边界，多 Control owner lease、渐进发布、
+  gate/affinity/override 和 provider evidence 也仍是 ADR-009 阻断项。
 - **不做百分比灰度**。全量复制下灰度需要 deis-runtime 同时驻留两个版本的 Isolate，
   本轮不做，但模型留了口子。
-- **换版先装好再切**：`RuntimePool::stage_app` 在另一条线程上把新版本建好、预热完，
-  `activate` 才把流量换过去，旧版本在这期间一直在应答。所以换版没有可用性空档。
+- **换版先装好再切**：`RuntimePool::stage_app` 在另一条线程上把新版本建好、预热完，PREPARE 后按
+  generation 精确可寻址，ACTIVATE 才移动 current/triggers。旧 generation 默认保留 300 秒；之后停止新
+  admission，等 response body、stream 与 WebSocket 的引用归零再卸载，所以正常换版没有可用性空档。
 
 ---
 

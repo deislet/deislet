@@ -43,7 +43,7 @@ use tracing::{debug, error, info, warn};
 use crate::catalog::secrets::{secret_aad, secret_revision_aad};
 use crate::catalog::{
     CatalogError, CatalogResult, CatalogStore, DeclaredCompatibility, DeclaredLimits, Environment,
-    SecretHeadChange, SecretsBackend, Version, declared_compatibility, declared_limits,
+    SecretsBackend, Version, declared_compatibility, declared_limits,
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
 
@@ -217,6 +217,70 @@ impl StorageWiring {
         self.store.is_none() && self.queue.is_none()
     }
 
+    /// Whether this version has asynchronous consumers whose lease admission
+    /// must participate in deployment activation.
+    pub fn requires_consumer_fence(&self, version: &Version) -> CatalogResult<bool> {
+        if self.queue.is_none() {
+            return Ok(false);
+        }
+        let manifest = deis_bundle::Manifest::parse(&version.manifest)
+            .map_err(|error| CatalogError::BundleStorage(error.to_string()))?;
+        Ok(!manifest.queues.is_empty())
+    }
+
+    /// Ask deis-queue to drain the previous generation and atomically admit
+    /// the new one. `activated = false` is progress, not failure: outstanding
+    /// leases are still allowed to Ack/Nack and the durable reconciler calls
+    /// this again after they finish or expire.
+    pub async fn activate_consumer_generation(
+        &self,
+        app_id: &str,
+        environment: &str,
+        deployment_id: &str,
+        generation: &str,
+        expected_previous_generation: Option<&str>,
+    ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
+        use deis_queue::proto::queue::{
+            ActivateConsumerGenerationRequest, queue_client::QueueClient,
+        };
+        use tonic::transport::Endpoint;
+
+        let endpoint = self
+            .queue
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("queue endpoint is not configured"))?;
+        let channel = Endpoint::from_shared(endpoint.to_string())?
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_lazy();
+        let tenant = deis_wire::conventions::tenant_id(app_id, environment);
+        let mut request = tonic::Request::new(ActivateConsumerGenerationRequest {
+            deployment_id: deployment_id.to_string(),
+            generation: generation.to_string(),
+            expected_previous_generation: expected_previous_generation
+                .unwrap_or_default()
+                .to_string(),
+        });
+        request.metadata_mut().insert(
+            deis_wire::conventions::TENANT_HEADER,
+            tenant.parse().map_err(|error| {
+                anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
+            })?,
+        );
+        if let Some(token) = self.token_for(app_id, environment) {
+            request.metadata_mut().insert(
+                deis_wire::conventions::STORAGE_TOKEN_HEADER,
+                token.parse().map_err(|error| {
+                    anyhow::anyhow!("queue capability is not valid gRPC metadata: {error}")
+                })?,
+            );
+        }
+        Ok(QueueClient::new(channel)
+            .activate_consumer_generation(request)
+            .await?
+            .into_inner())
+    }
+
     /// True when this control plane mints capability tokens at all.
     pub fn mints_tokens(&self) -> bool {
         self.auth_secret.is_some()
@@ -316,6 +380,12 @@ pub struct DeploymentPayload {
     /// authority, which keeps a version's semantics attached to the version
     /// rather than to the message that happened to deliver it.
     pub compatibility: DeclaredCompatibility,
+    /// Durable operation identity and immutable route generation. Kept out of
+    /// application environment material and attached only by the activation
+    /// coordinator after it has selected a deployment identity.
+    deployment_id: Option<String>,
+    routing_generation: Option<String>,
+    action: proto::DeploymentAction,
 }
 
 impl std::fmt::Debug for DeploymentPayload {
@@ -335,6 +405,9 @@ impl std::fmt::Debug for DeploymentPayload {
             .field("secrets", &self.secret_names)
             .field("values", &"<redacted>")
             .field("environment_snapshot_id", &self.environment_snapshot_id)
+            .field("deployment_id", &self.deployment_id)
+            .field("routing_generation", &self.routing_generation)
+            .field("action", &self.action.as_str_name())
             .field("store_endpoint", &self.storage.store)
             .field("queue_endpoint", &self.storage.queue)
             .field(
@@ -348,6 +421,32 @@ impl std::fmt::Debug for DeploymentPayload {
 }
 
 impl DeploymentPayload {
+    /// Bind this payload to one durable deployment instruction. The
+    /// generation is immutable and must be the same value published in the
+    /// routing table.
+    pub fn set_instruction(
+        &mut self,
+        deployment_id: impl Into<String>,
+        routing_generation: impl Into<String>,
+        action: proto::DeploymentAction,
+    ) {
+        self.deployment_id = Some(deployment_id.into());
+        self.routing_generation = Some(routing_generation.into());
+        self.action = action;
+    }
+
+    pub fn deployment_id(&self) -> Option<&str> {
+        self.deployment_id.as_deref()
+    }
+
+    pub fn routing_generation(&self) -> Option<&str> {
+        self.routing_generation.as_deref()
+    }
+
+    pub fn action(&self) -> proto::DeploymentAction {
+        self.action
+    }
+
     /// Names of the entries that came from the manifest rather than from a
     /// secret. Safe to log.
     pub fn variable_names(&self) -> Vec<&str> {
@@ -475,6 +574,9 @@ impl DeploymentPayload {
             environment_snapshot_json: self.environment_snapshot_json.clone().unwrap_or_default(),
             environment_snapshot_id: self.environment_snapshot_id.clone().unwrap_or_default(),
             secret_values_by_revision: self.secret_values_by_revision.clone().into_iter().collect(),
+            deployment_id: self.deployment_id.clone().unwrap_or_default(),
+            routing_generation: self.routing_generation.clone().unwrap_or_default(),
+            action: self.action as i32,
         }
     }
 }
@@ -563,24 +665,40 @@ pub struct NodeFailure {
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryReport {
     pub reason: DeliveryReason,
+    /// Wire phase this report actually observed. This prevents a successful
+    /// PREPARE acknowledgement from being presented as though production had
+    /// already activated.
+    pub phase: &'static str,
     pub app_id: String,
     pub environment: String,
     pub version_id: String,
-    /// Nodes that applied the version and now serve it.
+    /// Nodes that acknowledged the requested phase with the exact plan and
+    /// generation identity.
     pub delivered: Vec<String>,
     /// Nodes that did not. They keep serving whatever they had until they
     /// refetch their assignments.
     pub failed: Vec<NodeFailure>,
-    /// Set when nothing was sent at all, with the reason. Not an error:
-    /// a control plane with no configured nodes is a valid setup, and
-    /// nodes pull their assignments on startup anyway.
+    /// Set when nothing was sent at all, with the reason. A deployment
+    /// coordinator must not read this as successful prepare.
     pub skipped: Option<String>,
+}
+
+/// Result of preparing a secret-head change. Standard deployments return a
+/// candidate payload before either the secret head or production pointer is
+/// changed; legacy/undeployed cases finish locally and retain their explicit
+/// delivery report.
+pub enum SecretChangePreparation {
+    Finished(DeliveryReport),
+    Prepared {
+        version: Version,
+        payload: Box<DeploymentPayload>,
+    },
 }
 
 impl DeliveryReport {
     /// True when every node that was asked took the version.
     pub fn fully_delivered(&self) -> bool {
-        self.failed.is_empty() && self.skipped.is_none()
+        !self.delivered.is_empty() && self.failed.is_empty() && self.skipped.is_none()
     }
 }
 
@@ -626,6 +744,8 @@ pub struct DeploymentDeliverer {
 }
 
 impl DeploymentDeliverer {
+    const CONTESTED_TARGET_PREFIX: &'static str = "contested:";
+
     pub fn new(
         store: Arc<CatalogStore>,
         secrets: Arc<SecretsBackend>,
@@ -645,6 +765,55 @@ impl DeploymentDeliverer {
     /// The base URL bundle links in this delivery should carry.
     pub fn base_url(&self, headers: &HeaderMap) -> String {
         self.address.resolve(headers)
+    }
+
+    /// Stable address used by restart reconciliation, where no original HTTP
+    /// request headers exist. PublicAddress already prefers explicit config;
+    /// the fallback is the same bind-derived address normal deploys use.
+    pub fn reconciliation_base_url(&self) -> String {
+        self.address
+            .configured
+            .clone()
+            .unwrap_or_else(|| self.address.fallback.clone())
+    }
+
+    pub fn requires_consumer_fence(&self, version: &Version) -> CatalogResult<bool> {
+        self.storage.requires_consumer_fence(version)
+    }
+
+    pub async fn activate_consumer_generation(
+        &self,
+        environment: &Environment,
+        plan: &crate::catalog::DeploymentPlan,
+    ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
+        self.storage
+            .activate_consumer_generation(
+                &environment.app_id,
+                &environment.name,
+                &plan.id,
+                &plan.routing_generation.to_string(),
+                plan.previous_generation.as_deref(),
+            )
+            .await
+    }
+
+    /// Freeze the runtime serving set for a deployment plan. Lost nodes stay
+    /// in the set, and a refused duplicate-id claimant gets its own durable
+    /// target key so it cannot be overwritten by the holder's successful ACK.
+    pub fn serving_target_ids(&self) -> Vec<String> {
+        let mut ids = self.nodes.ids();
+        ids.extend(self.nodes.departed().into_iter().map(|node| node.id));
+        ids.extend(self.nodes.contested().into_iter().map(|node| {
+            format!(
+                "{}{}@{}",
+                Self::CONTESTED_TARGET_PREFIX,
+                node.id,
+                node.claimant_addr
+            )
+        }));
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// Assemble what the nodes need for one version of one environment.
@@ -1026,6 +1195,9 @@ impl DeploymentDeliverer {
             storage: self.storage.clone(),
             limits,
             compatibility,
+            deployment_id: None,
+            routing_generation: None,
+            action: proto::DeploymentAction::Unspecified,
         })
     }
 
@@ -1055,28 +1227,74 @@ impl DeploymentDeliverer {
             .store
             .get_version(&assignment.app_id, &assignment.version_id)
             .await?;
-        if let Some(snapshot_id) = &assignment.snapshot_id {
+        let mut payload = if let Some(snapshot_id) = &assignment.snapshot_id {
             let snapshot = self.store.get_environment_snapshot(snapshot_id).await?;
             self.payload_for_snapshot(&env, &version, base_url, snapshot)
                 .await
         } else {
             self.payload(&env, &version, base_url).await
-        }
+        }?;
+        payload.set_instruction(
+            &assignment.deployment_id,
+            &assignment.routing_generation,
+            match assignment.deployment_state.as_deref() {
+                // A pointer exists only from `activating` onward in the new
+                // protocol, but accepting the two earlier non-terminal
+                // states here keeps a restored/hand-repaired catalog safe:
+                // an uncertain generation may be made addressable, never
+                // allowed to start triggers early.
+                Some("preparing" | "prepared" | "activating" | "reconciling") => {
+                    proto::DeploymentAction::Prepare
+                }
+                Some("active") | None => proto::DeploymentAction::LegacyApply,
+                Some(state) => {
+                    return Err(CatalogError::conflict(format!(
+                        "current deployment {} has terminal or unknown plan state {state}",
+                        assignment.deployment_id
+                    )));
+                }
+            },
+        );
+        Ok(payload)
     }
 
     /// Push a payload to every configured node, concurrently.
     ///
-    /// Never fails as a whole: a node that is down is reported, not
-    /// propagated, because the deployment itself is already recorded and
-    /// the node will pick the version up when it refetches its
-    /// assignments.
+    /// Never fails as a whole: a node that is down is represented in the
+    /// report. The strict coordinator decides whether that means abort before
+    /// pointer commit or durable reconciliation after commit; transport code
+    /// must not erase that distinction.
     pub async fn push(
         &self,
         payload: &DeploymentPayload,
         reason: DeliveryReason,
     ) -> DeliveryReport {
+        let targets = self.serving_target_ids();
+        self.push_to(payload, reason, &targets).await
+    }
+
+    /// Push one phase to the serving set frozen in the plan. Fleet membership
+    /// may change while a deployment is in flight; recomputing it here could
+    /// silently omit a lost node or require a newly joined node to satisfy an
+    /// intent that never named it.
+    pub async fn push_to(
+        &self,
+        payload: &DeploymentPayload,
+        reason: DeliveryReason,
+        target_ids: &[String],
+    ) -> DeliveryReport {
+        let phase = match payload.action() {
+            proto::DeploymentAction::Prepare => "prepare",
+            proto::DeploymentAction::Activate => "activate",
+            proto::DeploymentAction::Abort => "abort",
+            proto::DeploymentAction::Drain => "drain",
+            proto::DeploymentAction::LegacyApply | proto::DeploymentAction::Unspecified => {
+                "legacy_apply"
+            }
+        };
         let mut report = DeliveryReport {
             reason,
+            phase,
             app_id: payload.app_id.clone(),
             environment: payload.environment.clone(),
             version_id: payload.version_id.clone(),
@@ -1085,22 +1303,8 @@ impl DeploymentDeliverer {
             skipped: None,
         };
 
-        let node_ids = self.nodes.ids();
-        // Read before anything is sent. A node that dropped off the fleet list
-        // is not on `ids()` at all, so a report built from that list alone
-        // described only the half of the fleet this control plane can still
-        // reach - and came back green while a live node kept serving the old
-        // version. See `RuntimeNodeManager::departed`.
-        let departed = self.nodes.departed();
-        // The second way a live machine is missing from `ids()`: it registered
-        // a node id another machine already answers for and was refused, so it
-        // has no entry of its own and everything sent to that id goes to the
-        // other machine. See `RuntimeNodeManager::contested`.
-        let contested = self.nodes.contested();
-        if node_ids.is_empty() && departed.is_empty() && contested.is_empty() {
-            let reason_text = "no runtime nodes are configured on this control plane; \
-                 the deployment is recorded and any node that starts later picks it up \
-                 from its assignment list"
+        if target_ids.is_empty() {
+            let reason_text = "no runtime nodes belong to this deployment plan; strict activation requires at least one prepared serving target"
                 .to_string();
             info!(
                 app_id = %payload.app_id,
@@ -1118,26 +1322,74 @@ impl DeploymentDeliverer {
             environment = %payload.environment,
             version_id = %payload.version_id,
             reason = reason.as_str(),
-            nodes = node_ids.len(),
+            nodes = target_ids.len(),
             variables = payload.variable_count(),
             secrets = ?payload.secret_names(),
             "Delivering a deployment to every runtime node"
         );
 
-        let results = futures::future::join_all(node_ids.iter().map(|node| {
+        let mut unavailable = std::collections::BTreeMap::new();
+        for node in self.nodes.departed() {
+            unavailable.insert(node.id.clone(), node.describe());
+        }
+        for node in self.nodes.contested() {
+            unavailable.insert(
+                format!(
+                    "{}{}@{}",
+                    Self::CONTESTED_TARGET_PREFIX,
+                    node.id,
+                    node.claimant_addr
+                ),
+                node.describe(),
+            );
+        }
+        let results = futures::future::join_all(target_ids.iter().map(|target| {
             let request = payload.to_request();
+            let unavailable = unavailable.get(target).cloned();
             async move {
+                if let Some(detail) = unavailable {
+                    return (
+                        target.clone(),
+                        Err(crate::runtime_client::NodeError::Transport(detail)),
+                    );
+                }
                 (
-                    node.clone(),
-                    self.nodes.apply_deployment(node, request).await,
+                    target.clone(),
+                    self.nodes.apply_deployment(target, request).await,
                 )
             }
         }))
         .await;
 
+        let expected_state = match payload.action() {
+            proto::DeploymentAction::Prepare => "prepared",
+            proto::DeploymentAction::Activate => "active",
+            proto::DeploymentAction::Abort => "aborted",
+            proto::DeploymentAction::Drain => "drained",
+            proto::DeploymentAction::LegacyApply | proto::DeploymentAction::Unspecified => {
+                "legacy_applied"
+            }
+        };
         for (node, result) in results {
             match result {
-                Ok(resp) if resp.success => report.delivered.push(node),
+                Ok(resp)
+                    if resp.success
+                        && payload.deployment_id().is_none_or(|expected| {
+                            resp.deployment_id == expected
+                                && resp.routing_generation
+                                    == payload.routing_generation().unwrap_or_default()
+                        })
+                        && resp.observed_state == expected_state =>
+                {
+                    report.delivered.push(node)
+                }
+                Ok(resp) if resp.success => report.failed.push(NodeFailure {
+                    node,
+                    error: format!(
+                        "node acknowledged the wrong deployment observation: plan {:?}, generation {:?}, state {:?}",
+                        resp.deployment_id, resp.routing_generation, resp.observed_state
+                    ),
+                }),
                 Ok(resp) => report.failed.push(NodeFailure {
                     node,
                     error: if resp.message.is_empty() {
@@ -1151,19 +1403,6 @@ impl DeploymentDeliverer {
                     error: e.to_string(),
                 }),
             }
-        }
-
-        for node in &departed {
-            report.failed.push(NodeFailure {
-                node: node.id.clone(),
-                error: node.describe(),
-            });
-        }
-        for node in &contested {
-            report.failed.push(NodeFailure {
-                node: node.id.clone(),
-                error: node.describe(),
-            });
         }
 
         let failed_nodes: Vec<&str> = report.failed.iter().map(|f| f.node.as_str()).collect();
@@ -1183,8 +1422,6 @@ impl DeploymentDeliverer {
                 version_id = %payload.version_id,
                 reason = reason.as_str(),
                 nodes = ?failed_nodes,
-                lost_nodes = departed.len(),
-                contested_ids = contested.len(),
                 errors = ?report.failed.iter().map(|f| f.error.as_str()).collect::<Vec<_>>(),
                 "No runtime node took this version; the whole fleet still serves the previous one until a node refetches its assignments"
             );
@@ -1196,8 +1433,6 @@ impl DeploymentDeliverer {
                 reason = reason.as_str(),
                 delivered = report.delivered.len(),
                 failed = ?failed_nodes,
-                lost_nodes = departed.len(),
-                contested_ids = contested.len(),
                 "{} of the fleet took this version and {} did not; the listed nodes still serve the previous one, so requests hit two different versions until they catch up",
                 report.delivered.len(),
                 failed_nodes.len()
@@ -1332,6 +1567,7 @@ impl DeploymentDeliverer {
     ) -> DeliveryReport {
         let skipped = |version_id: String, text: String| DeliveryReport {
             reason,
+            phase: "legacy_apply",
             app_id: env.app_id.clone(),
             environment: env.name.clone(),
             version_id,
@@ -1415,17 +1651,18 @@ impl DeploymentDeliverer {
     /// Activate a new snapshot for a secret rotation/deletion without changing
     /// the application version. Legacy schema-1 deployments keep their old
     /// reload behavior; schema-2 deployments always append a pointer row.
-    pub async fn activate_secret_change(
+    pub async fn prepare_secret_change(
         &self,
         env: &Environment,
         base_url: &str,
         name: &str,
         revision: Option<&str>,
         expected_secret_revision: Option<&str>,
-    ) -> CatalogResult<DeliveryReport> {
+    ) -> CatalogResult<SecretChangePreparation> {
         let reason = DeliveryReason::SecretChange;
         let skipped = |version_id: String, text: String| DeliveryReport {
             reason,
+            phase: "legacy_apply",
             app_id: env.app_id.clone(),
             environment: env.name.clone(),
             version_id,
@@ -1439,18 +1676,20 @@ impl DeploymentDeliverer {
                 self.store
                     .promote_secret_change(env, name, revision, expected_secret_revision)
                     .await?;
-                return Ok(skipped(
+                return Ok(SecretChangePreparation::Finished(skipped(
                     String::new(),
                     "the environment has never been deployed; the secret head will be selected on its first deployment"
                         .to_string(),
-                ));
+                )));
             }
         };
         let Some(snapshot_id) = deployment.snapshot_id.as_deref() else {
             self.store
                 .promote_secret_change(env, name, revision, expected_secret_revision)
                 .await?;
-            return Ok(self.reload_current(env, base_url, reason).await);
+            return Ok(SecretChangePreparation::Finished(
+                self.reload_current(env, base_url, reason).await,
+            ));
         };
         let version = self
             .store
@@ -1475,34 +1714,34 @@ impl DeploymentDeliverer {
             self.store
                 .promote_secret_change(env, name, revision, expected_secret_revision)
                 .await?;
-            return Ok(skipped(
+            return Ok(SecretChangePreparation::Finished(skipped(
                 version.id,
                 format!(
                     "secret {name} is not declared by the running version; its active snapshot is unchanged"
                 ),
-            ));
+            )));
         };
         if declaration.kind != deis_wire::EnvironmentKind::Secret {
             self.store
                 .promote_secret_change(env, name, revision, expected_secret_revision)
                 .await?;
-            return Ok(skipped(
+            return Ok(SecretChangePreparation::Finished(skipped(
                 version.id,
                 format!(
                     "{name} is declared as config, so a secret write cannot replace its active value"
                 ),
-            ));
+            )));
         }
         if revision.is_none() && declaration.required {
             self.store
                 .promote_secret_change(env, name, None, expected_secret_revision)
                 .await?;
-            return Ok(skipped(
+            return Ok(SecretChangePreparation::Finished(skipped(
                 version.id,
                 format!(
                     "required secret {name} was deleted from the current head; the active snapshot keeps its retained revision until a deploy supplies a valid replacement"
                 ),
-            ));
+            )));
         }
         let mut snapshot = self.store.get_environment_snapshot(snapshot_id).await?;
         snapshot.bindings.retain(|binding| binding.name() != name);
@@ -1519,21 +1758,10 @@ impl DeploymentDeliverer {
         let payload = self
             .payload_for_snapshot(env, &version, base_url, snapshot.clone())
             .await?;
-        self.store
-            .activate_deployment_with_secret_change(
-                env,
-                &version.id,
-                &snapshot,
-                Some(&deployment.id),
-                SecretHeadChange {
-                    name,
-                    replacement_revision: revision,
-                    expected_revision: expected_secret_revision,
-                },
-                Some(format!("secret {name} revision changed")),
-            )
-            .await?;
-        Ok(self.push(&payload, reason).await)
+        Ok(SecretChangePreparation::Prepared {
+            version,
+            payload: Box::new(payload),
+        })
     }
 }
 
@@ -2376,9 +2604,8 @@ mod tests {
         assert!(!report.fully_delivered());
     }
 
-    /// A node that cannot be reached is reported, not propagated: the
-    /// deployment is already recorded and the node will pick the version
-    /// up from its assignment list.
+    /// A node that cannot be reached is represented in the report; the
+    /// coordinator, not this transport helper, owns the phase consequence.
     #[tokio::test]
     async fn an_unreachable_node_is_reported_and_never_fails_the_push() {
         let (ready, store) = deliverer(true).await;

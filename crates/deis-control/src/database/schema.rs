@@ -510,6 +510,124 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     )?;
     ensure_deployment_snapshot_column(conn)?;
 
+    // Durable deployment coordination. The plan is immutable evidence of the
+    // selected version/snapshot/serving set; mutable progress and observations
+    // live beside it so a control-plane restart can reconcile an uncertain
+    // operation instead of replaying a deploy blindly.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS deployment_plans (
+            id                       TEXT PRIMARY KEY,
+            routing_generation       TEXT NOT NULL UNIQUE,
+            app_id                   TEXT NOT NULL,
+            env_id                   TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+            version_id               TEXT NOT NULL REFERENCES versions(id),
+            snapshot_id              TEXT,
+            previous_deployment_id   TEXT,
+            previous_generation      TEXT,
+            expected_secret_heads    TEXT NOT NULL CHECK(json_valid(expected_secret_heads)),
+            compare_secret_heads     INTEGER NOT NULL CHECK(compare_secret_heads IN (0, 1)),
+            target_ids               TEXT NOT NULL CHECK(json_valid(target_ids)),
+            proxy_ids                TEXT NOT NULL CHECK(json_valid(proxy_ids)),
+            policy                   TEXT NOT NULL CHECK(json_valid(policy)),
+            plan_sha256              TEXT NOT NULL,
+            state                    TEXT NOT NULL,
+            note                     TEXT,
+            last_error               TEXT,
+            created_at               INTEGER NOT NULL,
+            updated_at               INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_deployment_plans_environment
+            ON deployment_plans(env_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_deployment_plans_state
+            ON deployment_plans(state, updated_at);
+        DROP INDEX IF EXISTS idx_deployment_plans_one_inflight_environment;
+        CREATE UNIQUE INDEX idx_deployment_plans_one_inflight_environment
+            ON deployment_plans(env_id)
+            WHERE state IN ('preparing', 'prepared', 'activating', 'reconciling', 'degraded');
+
+        CREATE TABLE IF NOT EXISTS deployment_target_observations (
+            plan_id             TEXT NOT NULL REFERENCES deployment_plans(id) ON DELETE CASCADE,
+            node_id             TEXT NOT NULL,
+            observed_state      TEXT NOT NULL,
+            version_id          TEXT,
+            routing_generation  TEXT,
+            message             TEXT,
+            observed_at         INTEGER NOT NULL,
+            PRIMARY KEY(plan_id, node_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS deployment_proxy_observations (
+            plan_id             TEXT NOT NULL REFERENCES deployment_plans(id) ON DELETE CASCADE,
+            proxy_id            TEXT NOT NULL,
+            observed_state      TEXT NOT NULL,
+            routing_table_version TEXT NOT NULL,
+            routing_generation  TEXT NOT NULL,
+            observed_at         INTEGER NOT NULL,
+            PRIMARY KEY(plan_id, proxy_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS deployment_events (
+            sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id        TEXT NOT NULL REFERENCES deployment_plans(id) ON DELETE CASCADE,
+            from_state     TEXT,
+            to_state       TEXT NOT NULL,
+            detail         TEXT,
+            created_at     INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_deployment_events_plan
+            ON deployment_events(plan_id, sequence);
+
+        CREATE TABLE IF NOT EXISTS deployment_generation_drains (
+            plan_id          TEXT PRIMARY KEY REFERENCES deployment_plans(id) ON DELETE CASCADE,
+            generation       TEXT NOT NULL,
+            target_ids       TEXT NOT NULL CHECK(json_valid(target_ids)),
+            not_before       INTEGER NOT NULL,
+            state            TEXT NOT NULL CHECK(state IN ('retained','draining','drained')),
+            last_error       TEXT,
+            updated_at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_deployment_generation_drains_due
+            ON deployment_generation_drains(state, not_before);
+        CREATE TABLE IF NOT EXISTS deployment_drain_observations (
+            plan_id          TEXT NOT NULL REFERENCES deployment_plans(id) ON DELETE CASCADE,
+            node_id          TEXT NOT NULL,
+            generation       TEXT NOT NULL,
+            observed_state   TEXT NOT NULL,
+            message          TEXT,
+            observed_at      INTEGER NOT NULL,
+            PRIMARY KEY(plan_id, node_id)
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_deployment_plans_immutable_v1
+        BEFORE UPDATE OF id, routing_generation, app_id, env_id, version_id,
+                         snapshot_id, previous_deployment_id, previous_generation,
+                         expected_secret_heads, compare_secret_heads, target_ids, proxy_ids,
+                         policy, plan_sha256,
+                         note, created_at
+        ON deployment_plans
+        WHEN NEW.id IS NOT OLD.id
+          OR NEW.routing_generation IS NOT OLD.routing_generation
+          OR NEW.app_id IS NOT OLD.app_id
+          OR NEW.env_id IS NOT OLD.env_id
+          OR NEW.version_id IS NOT OLD.version_id
+          OR NEW.snapshot_id IS NOT OLD.snapshot_id
+          OR NEW.previous_deployment_id IS NOT OLD.previous_deployment_id
+          OR NEW.previous_generation IS NOT OLD.previous_generation
+          OR NEW.expected_secret_heads IS NOT OLD.expected_secret_heads
+          OR NEW.target_ids IS NOT OLD.target_ids
+          OR NEW.compare_secret_heads IS NOT OLD.compare_secret_heads
+          OR NEW.proxy_ids IS NOT OLD.proxy_ids
+          OR NEW.policy IS NOT OLD.policy
+          OR NEW.plan_sha256 IS NOT OLD.plan_sha256
+          OR NEW.note IS NOT OLD.note
+          OR NEW.created_at IS NOT OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'deployment plan is immutable');
+        END;
+        "#,
+    )?;
+
     // Existing ciphertext was authenticated against (env_id, name). Give it
     // an immutable revision without decrypting it during schema migration;
     // the recorded scheme tells the delivery boundary which AAD to use.

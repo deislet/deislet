@@ -21,8 +21,9 @@ use crate::deployment::DeploymentManager;
 use crate::health::NodeHealth;
 use crate::management::proto::runtime_management_server::RuntimeManagement;
 use crate::management::proto::{
-    ApplyDeploymentRequest, CompatibilityDeclaration, ConfigType, ExecuteCommandRequest,
-    GetStatusRequest, PushConfigRequest, StartInspectRequest, UnloadAppRequest, UpdateAppRequest,
+    ApplyDeploymentRequest, CompatibilityDeclaration, ConfigType, DeploymentAction,
+    ExecuteCommandRequest, GetStatusRequest, PushConfigRequest, StartInspectRequest,
+    UnloadAppRequest, UpdateAppRequest,
 };
 use crate::runtime::metrics::{recorder, RequestOutcome};
 
@@ -319,6 +320,56 @@ fn an_empty_declaration_on_the_wire_is_the_oldest_behaviour() {
     assert!(!profile.is_on(deis_bundle::Flag::MultipleSetCookieHeaders));
 }
 
+#[tokio::test]
+async fn deployment_phase_identity_is_validated_before_payload_work() {
+    let _turn = test_host::take();
+    let dir = tempfile::tempdir().unwrap();
+    let (_apps, service) = service_with(dir.path(), "phase-id", &[]).await;
+
+    for (deployment_id, routing_generation, action, expected) in [
+        (
+            "not-a-canonical-id",
+            "018f2518-7e38-7f80-8000-000000000012",
+            DeploymentAction::Prepare,
+            "lowercase UUIDv7",
+        ),
+        (
+            "018f2518-7e38-7f80-8000-000000000011",
+            "",
+            DeploymentAction::Prepare,
+            "present together",
+        ),
+        ("", "", DeploymentAction::Activate, "requires deployment_id"),
+    ] {
+        let response = service
+            .apply_deployment(Request::new(ApplyDeploymentRequest {
+                deployment_id: deployment_id.to_string(),
+                routing_generation: routing_generation.to_string(),
+                action: action as i32,
+                // This URL must never be reached: phase identity is an
+                // admission boundary before canonical environment decoding
+                // or bundle I/O.
+                bundle_url: "http://127.0.0.1:1/not-fetched".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.success);
+        assert!(response.message.contains(expected), "{}", response.message);
+        assert_eq!(response.observed_state, "rejected");
+    }
+
+    let status = service
+        .apply_deployment(Request::new(ApplyDeploymentRequest {
+            action: i32::MAX,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
 /// The mixed-fleet refusal, at the door.
 ///
 /// A control plane built after this node accepts a date this node has never
@@ -355,6 +406,9 @@ async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_an
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
             secret_values_by_revision: Default::default(),
+            deployment_id: String::new(),
+            routing_generation: String::new(),
+            action: DeploymentAction::LegacyApply as i32,
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -411,6 +465,9 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_i
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
             secret_values_by_revision: Default::default(),
+            deployment_id: String::new(),
+            routing_generation: String::new(),
+            action: DeploymentAction::LegacyApply as i32,
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -458,6 +515,9 @@ async fn a_partial_canonical_identity_is_refused_before_the_bundle_is_fetched() 
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
             secret_values_by_revision: Default::default(),
+            deployment_id: String::new(),
+            routing_generation: String::new(),
+            action: DeploymentAction::LegacyApply as i32,
         }))
         .await
         .unwrap()

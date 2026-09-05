@@ -38,6 +38,7 @@ use axum::{
 use crate::api::middleware::{NodeAuthConfig, node_auth};
 use crate::catalog::{BundleStore, CatalogStore, SecretsBackend};
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
+use crate::session::SessionManager;
 
 /// Largest bundle the control plane will accept in one upload. Bundles
 /// carry the worker code plus every static asset, so this is generous;
@@ -69,6 +70,9 @@ pub struct CatalogState {
     /// caller that presented one, and when none is configured every caller
     /// is anonymous and no secret value may be served.
     pub node_auth: NodeAuthConfig,
+    /// Live proxy identities are frozen into deployment plans and checked
+    /// again when a proxy reports that a routing table is applied.
+    pub sessions: Arc<SessionManager>,
 }
 
 /// Build the human half of the catalog router: everything the dashboard
@@ -116,8 +120,16 @@ pub fn router(state: CatalogState) -> Router {
             get(deployments::list_deployments).post(deployments::deploy),
         )
         .route(
+            "/api/apps/:app_id/environments/:env/deployment-plans/:id",
+            get(deployments::deployment_plan_for_environment),
+        )
+        .route(
             "/api/apps/:app_id/environments/:env/rollback",
             post(deployments::rollback),
+        )
+        .route(
+            "/api/deployment-plans/:id",
+            get(deployments::deployment_plan),
         )
         .route(
             "/api/apps/:app_id/environments/:env/routes",
@@ -207,7 +219,112 @@ pub(crate) mod tests {
 
     pub(crate) struct Harness {
         pub router: Router,
+        pub sessions: Arc<SessionManager>,
         pub _bundle_dir: tempfile::TempDir,
+        pub _runtime_shutdown: tokio::sync::oneshot::Sender<()>,
+    }
+
+    struct PreparedRuntime;
+
+    #[tonic::async_trait]
+    impl crate::runtime_client::proto::runtime_management_server::RuntimeManagement
+        for PreparedRuntime
+    {
+        async fn apply_deployment(
+            &self,
+            request: tonic::Request<crate::runtime_client::proto::ApplyDeploymentRequest>,
+        ) -> Result<
+            tonic::Response<crate::runtime_client::proto::ApplyDeploymentResponse>,
+            tonic::Status,
+        > {
+            let request = request.into_inner();
+            let action = crate::runtime_client::proto::DeploymentAction::try_from(request.action)
+                .unwrap_or(crate::runtime_client::proto::DeploymentAction::Unspecified);
+            let observed_state = match action {
+                crate::runtime_client::proto::DeploymentAction::Prepare => "prepared",
+                crate::runtime_client::proto::DeploymentAction::Activate => "active",
+                crate::runtime_client::proto::DeploymentAction::Abort => "aborted",
+                crate::runtime_client::proto::DeploymentAction::Drain => "drained",
+                crate::runtime_client::proto::DeploymentAction::LegacyApply
+                | crate::runtime_client::proto::DeploymentAction::Unspecified => "legacy_applied",
+            };
+            Ok(tonic::Response::new(
+                crate::runtime_client::proto::ApplyDeploymentResponse {
+                    success: true,
+                    message: observed_state.to_string(),
+                    version_id: request.version_id,
+                    deployment_id: request.deployment_id,
+                    routing_generation: request.routing_generation,
+                    observed_state: observed_state.to_string(),
+                },
+            ))
+        }
+
+        async fn unload_app(
+            &self,
+            _request: tonic::Request<crate::runtime_client::proto::UnloadAppRequest>,
+        ) -> Result<tonic::Response<crate::runtime_client::proto::UnloadAppResponse>, tonic::Status>
+        {
+            Ok(tonic::Response::new(
+                crate::runtime_client::proto::UnloadAppResponse {
+                    success: true,
+                    message: "unloaded".to_string(),
+                    environments: Vec::new(),
+                },
+            ))
+        }
+
+        async fn push_config(
+            &self,
+            _request: tonic::Request<crate::runtime_client::proto::PushConfigRequest>,
+        ) -> Result<tonic::Response<crate::runtime_client::proto::PushConfigResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by catalog tests"))
+        }
+
+        async fn update_app(
+            &self,
+            _request: tonic::Request<crate::runtime_client::proto::UpdateAppRequest>,
+        ) -> Result<tonic::Response<crate::runtime_client::proto::UpdateAppResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by catalog tests"))
+        }
+
+        async fn get_status(
+            &self,
+            _request: tonic::Request<crate::runtime_client::proto::GetStatusRequest>,
+        ) -> Result<tonic::Response<crate::runtime_client::proto::GetStatusResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by catalog tests"))
+        }
+
+        async fn execute_command(
+            &self,
+            _request: tonic::Request<crate::runtime_client::proto::ExecuteCommandRequest>,
+        ) -> Result<
+            tonic::Response<crate::runtime_client::proto::ExecuteCommandResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by catalog tests"))
+        }
+
+        async fn health_check(
+            &self,
+            _request: tonic::Request<crate::runtime_client::proto::HealthCheckRequest>,
+        ) -> Result<tonic::Response<crate::runtime_client::proto::HealthCheckResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by catalog tests"))
+        }
+
+        async fn start_inspect(
+            &self,
+            _request: tonic::Request<crate::runtime_client::proto::StartInspectRequest>,
+        ) -> Result<
+            tonic::Response<crate::runtime_client::proto::StartInspectResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by catalog tests"))
+        }
     }
 
     /// The node key every harness below is built with. There is no
@@ -246,6 +363,28 @@ pub(crate) mod tests {
         node_keys: Vec<String>,
         storage: crate::delivery::StorageWiring,
     ) -> Harness {
+        harness_with_storage_and_failed_runtime(secrets_ready, node_keys, storage, false).await
+    }
+
+    /// A strict-deployment fixture with one healthy runtime and one endpoint
+    /// that cannot acknowledge PREPARE. Used to prove a partial prepare never
+    /// moves the production pointer.
+    pub(crate) async fn harness_with_failed_runtime(secrets_ready: bool) -> Harness {
+        harness_with_storage_and_failed_runtime(
+            secrets_ready,
+            vec![TEST_NODE_KEY.to_string()],
+            storage_wiring(None),
+            true,
+        )
+        .await
+    }
+
+    async fn harness_with_storage_and_failed_runtime(
+        secrets_ready: bool,
+        node_keys: Vec<String>,
+        storage: crate::delivery::StorageWiring,
+        include_failed_runtime: bool,
+    ) -> Harness {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
         let bundle_dir = tempfile::tempdir().unwrap();
         let secrets = if secrets_ready {
@@ -261,22 +400,53 @@ pub(crate) mod tests {
             configured: Some("http://control.test".to_string()),
             fallback: "http://127.0.0.1:8080".to_string(),
         });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_addr = listener.local_addr().unwrap();
+        let (runtime_shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::runtime_client::proto::runtime_management_server::RuntimeManagementServer::new(
+                        PreparedRuntime,
+                    ),
+                )
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        let mut node_configs = vec![crate::config::RuntimeNodeConfig {
+            id: "runtime-test".to_string(),
+            addr: format!("http://{runtime_addr}"),
+        }];
+        if include_failed_runtime {
+            node_configs.push(crate::config::RuntimeNodeConfig {
+                id: "runtime-failed".to_string(),
+                // Port zero cannot be a remote listener, so this is a
+                // deterministic transport refusal rather than a timing race.
+                addr: "http://127.0.0.1:0".to_string(),
+            });
+        }
+        let runtime_nodes = Arc::new(RuntimeNodeManager::new(node_configs, 15));
+        let sessions = Arc::new(SessionManager::new());
         let state = CatalogState {
             store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
             secrets: Arc::clone(&secrets),
             storage: storage.clone(),
-            // No runtime nodes: a delivery is reported as skipped, which
-            // is exactly the shape these tests want to see travel through
-            // the deploy and secret endpoints.
             deliverer: Arc::new(DeploymentDeliverer::new(
                 store,
                 secrets,
-                Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
+                runtime_nodes,
                 address,
                 storage,
             )),
             node_auth: NodeAuthConfig::new(node_keys),
+            sessions: Arc::clone(&sessions),
         };
         Harness {
             // Both halves, mounted the way the API mounts them: the node
@@ -293,6 +463,8 @@ pub(crate) mod tests {
                 .layer(axum::middleware::from_fn(supply_test_principal))
                 .merge(node_router(state)),
             _bundle_dir: bundle_dir,
+            _runtime_shutdown: runtime_shutdown,
+            sessions,
         }
     }
 

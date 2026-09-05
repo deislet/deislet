@@ -6,8 +6,8 @@
 // `DEFAULT_ENVIRONMENT`, so a caller that only knows about applications still
 // reaches production.
 pub use deis_wire::conventions::{
-    APP_ID_HEADER, DEFAULT_ENVIRONMENT, ENVIRONMENT_HEADER, MAX_GRPC_MESSAGE_BYTES,
-    STREAM_CHUNK_BYTES,
+    APP_ID_HEADER, DEFAULT_ENVIRONMENT, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER,
+    MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES,
 };
 
 /// The prefix the platform reserves for headers it writes about itself.

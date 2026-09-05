@@ -48,6 +48,14 @@ service Queue {
   // calling pins nothing on the server.
   rpc Pull(PullRequest) returns (PullResponse);
 
+  // Move one tenant's asynchronous consumers to an immutable deployment
+  // generation. The first call closes admission for the previous generation;
+  // subsequent idempotent calls report activated only after its outstanding
+  // leases have finished or expired. Pull then admits only the new
+  // generation. Ack and Nack remain valid while the barrier is draining.
+  rpc ActivateConsumerGeneration(ActivateConsumerGenerationRequest)
+      returns (ActivateConsumerGenerationResponse);
+
   // Report messages as handled. They are deleted and never delivered again.
   rpc Ack(AckRequest) returns (AckResponse);
 
@@ -119,6 +127,21 @@ message PullRequest {
   // the handler is still working causes a second delivery of a message that
   // is already being handled.
   int32 lease_seconds = 3;
+}
+
+message ActivateConsumerGenerationRequest {
+  string deployment_id = 1;
+  string generation = 2;
+  // Empty for the first generation. A non-empty value is a compare-and-swap
+  // precondition and prevents two coordinators from crossing deployments.
+  string expected_previous_generation = 3;
+}
+
+message ActivateConsumerGenerationResponse {
+  bool activated = 1;
+  string active_generation = 2;
+  string pending_generation = 3;
+  int64 outstanding_leases = 4;
 }
 
 message QueueMessage {

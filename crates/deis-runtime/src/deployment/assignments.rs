@@ -66,6 +66,15 @@ pub struct Assignment {
     #[serde(default)]
     pub canonical_application_id: Option<CanonicalId>,
     pub version_id: String,
+    #[serde(default)]
+    pub deployment_id: Option<String>,
+    #[serde(default)]
+    pub routing_generation: Option<String>,
+    /// Absent on older control planes, where every assignment was an
+    /// immediate activation. New control planes explicitly hold an
+    /// in-flight generation in prepare state until the durable plan commits.
+    #[serde(default)]
+    pub deployment_action: AssignmentDeploymentAction,
     pub environment: String,
     #[serde(default)]
     pub canonical_environment_id: Option<CanonicalId>,
@@ -121,6 +130,9 @@ impl std::fmt::Debug for Assignment {
             .field("app_id", &self.app_id)
             .field("canonical_application_id", &self.canonical_application_id)
             .field("version_id", &self.version_id)
+            .field("deployment_id", &self.deployment_id)
+            .field("routing_generation", &self.routing_generation)
+            .field("deployment_action", &self.deployment_action)
             .field("environment", &self.environment)
             .field("canonical_environment_id", &self.canonical_environment_id)
             .field("bundle_url", &self.bundle_url)
@@ -218,8 +230,20 @@ impl Assignment {
             standard_environment,
             limits: self.limits,
             compatibility: resolved,
+            deployment_id: self.deployment_id,
+            routing_generation: self.routing_generation,
         })
     }
+}
+
+/// Assignment-list phase. The default preserves compatibility with control
+/// planes that predate durable deployment plans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentDeploymentAction {
+    Prepare,
+    #[default]
+    Activate,
 }
 
 /// Why the assignment list could not be obtained.
@@ -599,6 +623,7 @@ impl<'a> Reconciler<'a> {
             let app_id = assignment.app_id.clone();
             let environment = assignment.environment.clone();
             let version_id = assignment.version_id.clone();
+            let deployment_action = assignment.deployment_action;
             let order = match assignment.into_order() {
                 Ok(order) => order,
                 Err(error) => {
@@ -613,7 +638,15 @@ impl<'a> Reconciler<'a> {
                     continue;
                 }
             };
-            match self.deployer.apply_from_assignment(order, as_of).await {
+            let applied = match deployment_action {
+                AssignmentDeploymentAction::Prepare => {
+                    self.deployer.prepare_from_assignment(order, as_of).await
+                }
+                AssignmentDeploymentAction::Activate => {
+                    self.deployer.apply_from_assignment(order, as_of).await
+                }
+            };
+            match applied {
                 Ok(Applied::Installed { reused_bundle }) => {
                     outcome.installed += 1;
                     info!(

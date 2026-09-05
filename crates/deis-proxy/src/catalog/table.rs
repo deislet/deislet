@@ -20,7 +20,7 @@
 //! beats `/` at equal priority and an operator can still override that with
 //! `priority`. The first candidate whose prefix matches wins.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use deis_wire::conventions::{APP_ID_HEADER, DEFAULT_ENVIRONMENT};
 use tracing::warn;
@@ -107,6 +107,7 @@ fn is_dns_label(label: &str) -> bool {
 pub struct Target {
     pub app_id: String,
     pub environment: String,
+    pub deployment_generation: Option<String>,
 }
 
 /// One route, compiled.
@@ -167,7 +168,7 @@ pub struct CatalogRoutes {
     preview: HashMap<String, Target>,
     /// App ids that have a default environment, for the `x-deis-app-id`
     /// header path, which names an application and not an environment.
-    apps_with_default_env: HashSet<String>,
+    apps_with_default_env: HashMap<String, Target>,
     route_count: usize,
     environment_count: usize,
 }
@@ -196,6 +197,7 @@ impl CatalogRoutes {
                 target: Target {
                     app_id: entry.app_id.clone(),
                     environment: entry.environment.clone(),
+                    deployment_generation: entry.deployment_generation.clone(),
                 },
                 path_prefix: entry.path_prefix.clone(),
                 priority: entry.priority,
@@ -227,12 +229,20 @@ impl CatalogRoutes {
 
         for env in &document.environments {
             if env.environment == DEFAULT_ENVIRONMENT {
-                table.apps_with_default_env.insert(env.app_id.clone());
+                table.apps_with_default_env.insert(
+                    env.app_id.clone(),
+                    Target {
+                        app_id: env.app_id.clone(),
+                        environment: env.environment.clone(),
+                        deployment_generation: env.deployment_generation.clone(),
+                    },
+                );
             }
             let Some(zone) = zone else { continue };
             let target = Target {
                 app_id: env.app_id.clone(),
                 environment: env.environment.clone(),
+                deployment_generation: env.deployment_generation.clone(),
             };
             // The default environment answers on both `<app>.<zone>` and
             // `production--<app>.<zone>`, so one form works for every
@@ -416,10 +426,7 @@ impl CatalogRoutes {
     /// one honest answer: the default one. An application whose catalog has
     /// no default environment is not resolvable this way at all.
     pub fn target_by_app_id(&self, app_id: &str) -> Option<Target> {
-        self.apps_with_default_env.contains(app_id).then(|| Target {
-            app_id: app_id.to_string(),
-            environment: DEFAULT_ENVIRONMENT.to_string(),
-        })
+        self.apps_with_default_env.get(app_id).cloned()
     }
 
     /// Every rule in this table, one canonical line each.
@@ -449,7 +456,7 @@ impl CatalogRoutes {
         // The header path is a rule too, and for a platform with no routes
         // yet it is the only one. Leaving it out described a table that had
         // just made three applications reachable by name as "0 added".
-        for app_id in &self.apps_with_default_env {
+        for app_id in self.apps_with_default_env.keys() {
             lines.insert(format!(
                 "{APP_ID_HEADER}: {app_id} -> {app_id}/{DEFAULT_ENVIRONMENT}"
             ));
@@ -661,7 +668,8 @@ mod tests {
             table.target_by_app_id("api"),
             Some(Target {
                 app_id: "api".to_string(),
-                environment: "production".to_string()
+                environment: "production".to_string(),
+                deployment_generation: None,
             })
         );
         assert_eq!(table.target_by_app_id("nothing-like-it"), None);

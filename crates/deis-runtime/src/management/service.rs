@@ -112,6 +112,67 @@ impl RuntimeManagement for RuntimeManagementService {
         request: Request<ApplyDeploymentRequest>,
     ) -> Result<Response<ApplyDeploymentResponse>, Status> {
         let req = request.into_inner();
+        let deployment_id = req.deployment_id.clone();
+        let routing_generation = req.routing_generation.clone();
+        let action = DeploymentAction::try_from(req.action).map_err(|_| {
+            Status::invalid_argument(format!("unknown deployment action {}", req.action))
+        })?;
+        let instruction = match (
+            req.deployment_id.trim().is_empty(),
+            req.routing_generation.trim().is_empty(),
+        ) {
+            (true, true) => (None, None),
+            (false, false) => {
+                if req.deployment_id.parse::<deis_wire::CanonicalId>().is_err()
+                    || req
+                        .routing_generation
+                        .parse::<deis_wire::CanonicalId>()
+                        .is_err()
+                {
+                    return Ok(Response::new(ApplyDeploymentResponse {
+                        success: false,
+                        message: "deployment_id and routing_generation must be lowercase UUIDv7 identities"
+                            .to_string(),
+                        version_id: String::new(),
+                        deployment_id,
+                        routing_generation,
+                        observed_state: "rejected".to_string(),
+                    }));
+                }
+                (
+                    Some(req.deployment_id.clone()),
+                    Some(req.routing_generation.clone()),
+                )
+            }
+            _ => {
+                return Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: "deployment_id and routing_generation must be present together"
+                        .to_string(),
+                    version_id: String::new(),
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
+                }));
+            }
+        };
+        if !matches!(
+            action,
+            DeploymentAction::Unspecified | DeploymentAction::LegacyApply
+        ) && instruction.0.is_none()
+        {
+            return Ok(Response::new(ApplyDeploymentResponse {
+                success: false,
+                message: format!(
+                    "deployment action {} requires deployment_id and routing_generation",
+                    action.as_str_name()
+                ),
+                version_id: String::new(),
+                deployment_id,
+                routing_generation,
+                observed_state: "rejected".to_string(),
+            }));
+        }
         info!(
             app_id = %req.app_id,
             version_id = %req.version_id,
@@ -145,6 +206,9 @@ impl RuntimeManagement for RuntimeManagementService {
                     success: false,
                     message: reason.to_string(),
                     version_id: kept,
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
                 }));
             }
         };
@@ -194,6 +258,9 @@ impl RuntimeManagement for RuntimeManagementService {
                     success: false,
                     message: reason,
                     version_id: kept,
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
                 }));
             }
         };
@@ -231,6 +298,9 @@ impl RuntimeManagement for RuntimeManagementService {
                     success: false,
                     message: reason,
                     version_id: kept,
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
                 }));
             }
         };
@@ -246,9 +316,104 @@ impl RuntimeManagement for RuntimeManagementService {
             standard_environment,
             limits,
             compatibility,
+            deployment_id: instruction.0,
+            routing_generation: instruction.1,
         };
 
         let key = order.key();
+
+        if action == DeploymentAction::Prepare {
+            return match self.deployer.prepare(order).await {
+                Ok(_) => Ok(Response::new(ApplyDeploymentResponse {
+                    success: true,
+                    message: "Deployment generation prepared".to_string(),
+                    version_id: req.version_id,
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "prepared".to_string(),
+                })),
+                Err(error) => Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: error.to_string(),
+                    version_id: self.running_version(&key),
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
+                })),
+            };
+        }
+        if action == DeploymentAction::Activate {
+            return match self
+                .deployer
+                .activate_prepared(&key, &req.routing_generation)
+                .await
+            {
+                Ok(()) => Ok(Response::new(ApplyDeploymentResponse {
+                    success: true,
+                    message: "Deployment generation activated".to_string(),
+                    version_id: req.version_id,
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "active".to_string(),
+                })),
+                Err(error) => Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: error.to_string(),
+                    version_id: self.running_version(&key),
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
+                })),
+            };
+        }
+        if action == DeploymentAction::Abort {
+            return match self
+                .deployer
+                .abort_prepared(&key, &req.routing_generation)
+                .await
+            {
+                Ok(()) => Ok(Response::new(ApplyDeploymentResponse {
+                    success: true,
+                    message: "Deployment generation aborted".to_string(),
+                    version_id: self.running_version(&key),
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "aborted".to_string(),
+                })),
+                Err(error) => Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: error.to_string(),
+                    version_id: self.running_version(&key),
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
+                })),
+            };
+        }
+        if action == DeploymentAction::Drain {
+            return match self
+                .deployer
+                .drain_generation(&key, &req.routing_generation)
+                .await
+            {
+                Ok(()) => Ok(Response::new(ApplyDeploymentResponse {
+                    success: true,
+                    message: "Deployment generation drained".to_string(),
+                    version_id: self.running_version(&key),
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "drained".to_string(),
+                })),
+                Err(error) => Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: error.to_string(),
+                    version_id: self.running_version(&key),
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "draining".to_string(),
+                })),
+            };
+        }
 
         match self.deployer.apply(order).await {
             Ok(Applied::Installed { reused_bundle }) => {
@@ -263,12 +428,18 @@ impl RuntimeManagement for RuntimeManagementService {
                     success: true,
                     message: "Deployment applied".to_string(),
                     version_id: req.version_id,
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "legacy_applied".to_string(),
                 }))
             }
             Ok(Applied::AlreadyRunning) => Ok(Response::new(ApplyDeploymentResponse {
                 success: true,
                 message: "Already running this version".to_string(),
                 version_id: req.version_id,
+                deployment_id,
+                routing_generation,
+                observed_state: "legacy_applied".to_string(),
             })),
             // A push is never superseded: only a reconciliation carries a
             // stamp saying how old its instruction is, and `apply` has none.
@@ -291,6 +462,9 @@ impl RuntimeManagement for RuntimeManagementService {
                     success: false,
                     message: "deployment was superseded by a newer change on this node".to_string(),
                     version_id: kept,
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
                 }))
             }
             Err(e) => {
@@ -308,6 +482,9 @@ impl RuntimeManagement for RuntimeManagementService {
                     success: false,
                     message: e.to_string(),
                     version_id: kept,
+                    deployment_id,
+                    routing_generation,
+                    observed_state: "rejected".to_string(),
                 }))
             }
         }

@@ -110,6 +110,10 @@ pub struct DeploymentOrder {
     /// plane and the bundle disagree about what a version declared, one of
     /// them is wrong and an operator has to be told which.
     pub compatibility: Option<deis_bundle::CompatibilityProfile>,
+    /// Durable control-plane operation and immutable route generation. Both
+    /// are absent together only for a legacy/local producer.
+    pub deployment_id: Option<String>,
+    pub routing_generation: Option<String>,
 }
 
 /// Typed Edge Canon environment material sent beside a schema-2 bundle.
@@ -220,6 +224,8 @@ impl std::fmt::Debug for DeploymentOrder {
             .field("standard_environment", &self.standard_environment)
             .field("limits", &self.limits)
             .field("compatibility", &self.compatibility.map(|c| c.describe()))
+            .field("deployment_id", &self.deployment_id)
+            .field("routing_generation", &self.routing_generation)
             .finish()
     }
 }
@@ -339,6 +345,10 @@ pub struct DeploymentManager {
     /// different app, or another environment of the same app - still run side
     /// by side. Startup and a control-plane push race exactly here.
     locks: DashMap<AppKey, Arc<tokio::sync::Mutex<()>>>,
+    /// Disk record to publish only after its prepared generation activates.
+    /// A candidate must never become the restart/default version merely
+    /// because its bundle finished downloading.
+    prepared_records: DashMap<(AppKey, String), InstalledRecord>,
     /// Counts every change this node has made to what it runs, in the order
     /// the changes happened.
     ///
@@ -388,6 +398,7 @@ impl DeploymentManager {
             cache_control: Arc::from(config.assets.cache_control.as_str()),
             max_asset_bytes: config.assets.max_bytes,
             locks: DashMap::new(),
+            prepared_records: DashMap::new(),
             changes: AtomicU64::new(0),
             last_change: DashMap::new(),
             health: ArcSwapOption::empty(),
@@ -479,7 +490,7 @@ impl DeploymentManager {
             .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
             .await
         {
-            Ok(()) => self.install(order, false).await,
+            Ok(()) => self.install(order, false, true).await,
             Err(error) => Err(DeployError::Identity(error.to_string())),
         };
 
@@ -508,6 +519,128 @@ impl DeploymentManager {
             }
         }
         applied
+    }
+
+    /// Prepare one immutable generation without moving the current selector.
+    pub async fn prepare(&self, mut order: DeploymentOrder) -> Result<Applied, DeployError> {
+        let key = order.key();
+        let generation = order
+            .routing_generation
+            .clone()
+            .ok_or_else(|| DeployError::Load("prepare requires routing_generation".to_string()))?;
+        if order.deployment_id.is_none() {
+            return Err(DeployError::Load(
+                "prepare requires deployment_id".to_string(),
+            ));
+        }
+        let lock = self.lock_for(&key);
+        let _guard = lock.lock().await;
+        self.store
+            .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
+            .await
+            .map_err(|error| DeployError::Identity(error.to_string()))?;
+        let result = self.install(order, false, false).await;
+        if result.is_ok() {
+            debug!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                routing_generation = %generation,
+                "Deployment candidate is prepared and current traffic is unchanged"
+            );
+        }
+        result
+    }
+
+    /// Activate an already prepared generation for trigger/current-version
+    /// bookkeeping. Generation-addressed HTTP was made reachable by prepare.
+    pub async fn activate_prepared(
+        &self,
+        key: &AppKey,
+        generation: &str,
+    ) -> Result<(), DeployError> {
+        let lock = self.lock_for(key);
+        let _guard = lock.lock().await;
+        if self
+            .app_manager
+            .installed_version(key)
+            .is_some_and(|version| version.routing_generation.as_deref() == Some(generation))
+            && self.app_manager.is_hosted(key).await
+        {
+            return Ok(());
+        }
+        let record = self
+            .prepared_records
+            .get(&(key.clone(), generation.to_string()))
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| {
+                DeployError::Load(format!(
+                    "generation {generation} of {key} has no prepared durable record"
+                ))
+            })?;
+        self.app_manager
+            .activate_prepared(key, generation)
+            .await
+            .map_err(|error| DeployError::Load(error.to_string()))?;
+        self.prepared_records
+            .remove(&(key.clone(), generation.to_string()));
+        let version_id = record.version_id.clone();
+        self.store.remember(record).await;
+        self.store.prune(key, &version_id).await;
+        self.record_change(key);
+        if let Some(health) = self.readiness() {
+            health.note_serving(self.installed_app_count());
+        }
+        Ok(())
+    }
+
+    /// Abort a candidate that never became active.
+    pub async fn abort_prepared(&self, key: &AppKey, generation: &str) -> Result<(), DeployError> {
+        let lock = self.lock_for(key);
+        let _guard = lock.lock().await;
+        let record_key = (key.clone(), generation.to_string());
+        if !self.prepared_records.contains_key(&record_key) {
+            if !self
+                .app_manager
+                .serves_generation(key, Some(generation))
+                .await
+            {
+                // Retrying an already completed abort is success. This is
+                // required after a lost gRPC response: the coordinator must
+                // never recreate a candidate merely to learn it is gone.
+                return Ok(());
+            }
+            return Err(DeployError::Load(format!(
+                "generation {generation} of {key} is active or retained, not an abortable prepared candidate"
+            )));
+        }
+        self.app_manager
+            .discard_generation(key, generation)
+            .await
+            .map_err(|error| DeployError::Load(error.to_string()))?;
+        self.prepared_records.remove(&record_key);
+        Ok(())
+    }
+
+    /// Stop admitting traffic to a retained generation and retire it only
+    /// after every response body and WebSocket admitted under it has ended.
+    pub async fn drain_generation(
+        &self,
+        key: &AppKey,
+        generation: &str,
+    ) -> Result<(), DeployError> {
+        if !self
+            .app_manager
+            .serves_generation(key, Some(generation))
+            .await
+        {
+            // A retry after success, or a restart that reconstructed only the
+            // active assignment, has nothing retained to clean up.
+            return Ok(());
+        }
+        self.app_manager
+            .drain_generation(key, generation, std::time::Duration::from_secs(30))
+            .await
+            .map_err(|error| DeployError::Load(error.to_string()))
     }
 
     /// Apply a deployment from an assignment list.
@@ -627,7 +760,51 @@ impl DeploymentManager {
             }
         }
 
-        self.install(order, false).await
+        self.install(order, false, true).await
+    }
+
+    /// Prepare an assignment-list generation without making it current.
+    ///
+    /// This is the recovery/new-node equivalent of the management PREPARE
+    /// phase. It retains the assignment freshness check so an older HTTP
+    /// response cannot undo a newer push, while publishing the immutable
+    /// generation for exact HTTP routing and deliberately leaving current
+    /// selectors and background consumers untouched.
+    pub async fn prepare_from_assignment(
+        &self,
+        mut order: DeploymentOrder,
+        as_of: u64,
+    ) -> Result<Applied, DeployError> {
+        let key = order.key();
+        let generation = order.routing_generation.clone().ok_or_else(|| {
+            DeployError::Load("prepare assignment requires routing_generation".to_string())
+        })?;
+        if order.deployment_id.is_none() {
+            return Err(DeployError::Load(
+                "prepare assignment requires deployment_id".to_string(),
+            ));
+        }
+        let lock = self.lock_for(&key);
+        let _guard = lock.lock().await;
+        if self.changed_since(&key, as_of) {
+            let running_version_id = self
+                .app_manager
+                .installed_version(&key)
+                .map(|current| current.version_id);
+            return Ok(Applied::Superseded { running_version_id });
+        }
+        self.store
+            .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
+            .await
+            .map_err(|error| DeployError::Identity(error.to_string()))?;
+        let applied = self.install(order, false, false).await?;
+        debug!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            routing_generation = %generation,
+            "Prepared an in-flight assignment generation without activating triggers"
+        );
+        Ok(applied)
     }
 
     async fn remember_order(&self, order: &DeploymentOrder) {
@@ -716,9 +893,11 @@ impl DeploymentManager {
                 // failure the mechanism exists to prevent, so it must not be
                 // the recovery path that causes it.
                 compatibility: None,
+                deployment_id: None,
+                routing_generation: None,
             };
 
-            match self.install(order, true).await {
+            match self.install(order, true, true).await {
                 Ok(_) => {
                     recovered += 1;
                     warn!(
@@ -878,6 +1057,7 @@ impl DeploymentManager {
         &self,
         mut order: DeploymentOrder,
         local_only: bool,
+        activate: bool,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
         let environment_snapshot_id = order
@@ -885,6 +1065,7 @@ impl DeploymentManager {
             .as_ref()
             .map(|environment| environment.snapshot_id.clone());
         let installed_record = (!local_only).then(|| Self::record_for_order(&order));
+        let routing_generation = order.routing_generation.clone();
         // Taken before the rest of the order is consumed piece by piece below.
         let limits = order.limits.take();
         // Both halves of the key become a directory name here and a storage
@@ -1121,33 +1302,46 @@ impl DeploymentManager {
             "Installing a deployment"
         );
 
-        self.app_manager
-            .install_version(VersionInstall {
-                key: key.clone(),
-                version_id: order.version_id.clone(),
-                environment_snapshot_id,
-                entry_point: manifest.entry.clone(),
-                code,
-                config,
-                // A local recovery reconstructs everything except the secrets,
-                // which are never on disk. Saying so here is what lets the
-                // next delivery of this same version be recognised as the one
-                // that completes it, instead of being skipped as redundant.
-                env_confirmed: !local_only,
-                assets: Arc::new(assets),
-            })
-            .await
-            .map_err(|e| DeployError::Load(e.to_string()))?;
+        let install = VersionInstall {
+            key: key.clone(),
+            version_id: order.version_id.clone(),
+            deployment_id: order.deployment_id.clone(),
+            routing_generation: order.routing_generation.clone(),
+            environment_snapshot_id,
+            entry_point: manifest.entry.clone(),
+            code,
+            config,
+            // A local recovery reconstructs everything except the secrets,
+            // which are never on disk. Saying so here is what lets the
+            // next delivery of this same version be recognised as the one
+            // that completes it, instead of being skipped as redundant.
+            env_confirmed: !local_only,
+            assets: Arc::new(assets),
+        };
+        if activate {
+            self.app_manager.install_version(install).await
+        } else {
+            self.app_manager.prepare_version(install).await
+        }
+        .map_err(|e| DeployError::Load(e.to_string()))?;
 
         if let Some(record) = installed_record {
-            self.store.remember(record).await;
+            if activate {
+                self.store.remember(record).await;
+            } else {
+                let generation = routing_generation.expect("prepare validated a generation");
+                self.prepared_records
+                    .insert((key.clone(), generation), record);
+            }
         }
-        self.store.prune(&key, &order.version_id).await;
+        if activate {
+            self.store.prune(&key, &order.version_id).await;
 
-        // Stamped after the swap, so a reconciliation that reads the stamp
-        // before it asks the control plane anything can tell that this
-        // environment moved under it.
-        self.record_change(&key);
+            // Stamped after the swap, so a reconciliation that reads the stamp
+            // before it asks the control plane anything can tell that this
+            // environment moved under it.
+            self.record_change(&key);
+        }
 
         Ok(Applied::Installed { reused_bundle })
     }

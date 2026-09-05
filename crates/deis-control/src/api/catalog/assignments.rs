@@ -77,6 +77,14 @@ pub struct AssignmentView {
     /// Permanent application identity used by the canonical tenant contract.
     pub canonical_application_id: deis_wire::CanonicalId,
     pub version_id: String,
+    /// Durable plan and immutable route generation of the current pointer.
+    pub deployment_id: String,
+    pub routing_generation: String,
+    /// `prepare` publishes this exact generation for generation-addressed
+    /// HTTP without moving the runtime's current selector or starting
+    /// triggers. `activate` makes it current. This keeps assignment-based
+    /// recovery inside the same barrier as push delivery.
+    pub deployment_action: &'static str,
     /// The environment *name*, `production` or a preview name. Application
     /// code and rolling-upgrade routing still branch on it; permanent storage
     /// authority comes from the separate canonical id below.
@@ -180,8 +188,25 @@ pub async fn for_node(
             canonical_application_id,
             canonical_environment_id,
             standard_environment,
+            deployment_action,
         ) = match state.deliverer.assignment_payload(assignment, &base).await {
             Ok(payload) => {
+                let deployment_action = match payload.action() {
+                    crate::runtime_client::proto::DeploymentAction::Prepare => "prepare",
+                    crate::runtime_client::proto::DeploymentAction::LegacyApply
+                    | crate::runtime_client::proto::DeploymentAction::Activate => "activate",
+                    crate::runtime_client::proto::DeploymentAction::Abort
+                    | crate::runtime_client::proto::DeploymentAction::Drain
+                    | crate::runtime_client::proto::DeploymentAction::Unspecified => {
+                        error!(
+                            node = %node_id,
+                            deployment_id = %assignment.deployment_id,
+                            "Assignment payload resolved to an action that cannot appear in an authoritative assignment list"
+                        );
+                        withheld += 1;
+                        continue;
+                    }
+                };
                 let standard_environment = payload.standard_environment_for_wire();
                 (
                     payload.env_for_wire(),
@@ -190,6 +215,7 @@ pub async fn for_node(
                     payload.canonical_application_id,
                     payload.canonical_environment_id,
                     standard_environment,
+                    deployment_action,
                 )
             }
             Err(e) => {
@@ -215,6 +241,9 @@ pub async fn for_node(
             app_id: assignment.app_id.clone(),
             canonical_application_id,
             version_id: assignment.version_id.clone(),
+            deployment_id: assignment.deployment_id.clone(),
+            routing_generation: assignment.routing_generation.clone(),
+            deployment_action,
             environment: assignment.environment.clone(),
             canonical_environment_id,
             bundle_sha: assignment.bundle_sha.clone(),

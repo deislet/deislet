@@ -51,6 +51,7 @@ impl CatalogPoller {
                     );
                 }
                 self.config.apply_routing_table(&document);
+                self.client.observe_routing_table(document.version.clone());
                 0
             }
             Err(e) => {
@@ -193,6 +194,46 @@ mod tests {
             control.last_authorization().as_deref(),
             Some("Bearer node-psk"),
             "the routing table is on the node channel, so the node credential has to be presented"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_reports_only_a_table_it_has_already_published() {
+        let control = MockControl::start(Answer::Ok(V1.to_string())).await;
+        let config = config_manager().await;
+        let endpoint = ControlEndpoint::parse(&control.addr).unwrap();
+        let poller = CatalogPoller::new(
+            CatalogClient::new(
+                endpoint,
+                "node-psk".to_string(),
+                Duration::from_secs(5),
+                1024 * 1024,
+            )
+            .with_proxy_id("proxy-a".to_string()),
+            config,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(poller.poll_once(0).await, 0);
+        assert_eq!(
+            control
+                .last_header(deis_wire::conventions::PROXY_ID_HEADER)
+                .as_deref(),
+            Some("proxy-a")
+        );
+        assert!(
+            control
+                .last_header(deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER)
+                .is_none(),
+            "receipt of the first response is not yet an applied observation"
+        );
+
+        assert_eq!(poller.poll_once(0).await, 0);
+        assert_eq!(
+            control
+                .last_header(deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER)
+                .as_deref(),
+            Some("v1")
         );
     }
 

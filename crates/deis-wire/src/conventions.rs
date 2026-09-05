@@ -27,6 +27,24 @@ pub const APP_ID_HEADER: &str = "x-deis-app-id";
 /// the app id still reaches production rather than being refused.
 pub const ENVIRONMENT_HEADER: &str = "x-deis-environment";
 
+/// Immutable deployment generation selected by the trusted routing layer.
+///
+/// Application and environment say *which logical target* a request belongs
+/// to; this value says which immutable deployment of that target must answer.
+/// A proxy stamps it from one atomically accepted routing-table snapshot and a
+/// runtime must never silently substitute whatever version happens to be
+/// current on that node.  Keeping the name here makes the edge/runtime hop one
+/// shared protocol rather than two matching string literals.
+pub const DEPLOYMENT_GENERATION_HEADER: &str = "x-deis-deployment-generation";
+/// Durable deployment plan associated with a generation-fenced queue
+/// consumer. Kept in metadata rather than message bodies so existing queue
+/// producers remain wire-compatible.
+pub const DEPLOYMENT_ID_HEADER: &str = "x-deis-deployment-id";
+/// Identity claimed by a proxy on the authenticated node channel.
+pub const PROXY_ID_HEADER: &str = "x-deis-proxy-id";
+/// Last routing table a proxy has fully validated and published locally.
+pub const OBSERVED_ROUTING_TABLE_HEADER: &str = "x-deis-observed-routing-table";
+
 /// The environment a request belongs to when nothing says otherwise.
 pub const DEFAULT_ENVIRONMENT: &str = "production";
 

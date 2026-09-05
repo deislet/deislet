@@ -312,6 +312,9 @@ impl DevNode {
                 environment_snapshot_json,
                 environment_snapshot_id,
                 secret_values_by_revision,
+                deployment_id: String::new(),
+                routing_generation: String::new(),
+                action: proto::DeploymentAction::LegacyApply as i32,
             })
             .await
             .map_err(|e| {
