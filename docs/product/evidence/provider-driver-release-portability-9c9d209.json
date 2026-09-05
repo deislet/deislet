@@ -1,0 +1,146 @@
+{
+  "$schema": "./provider-driver-release-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-driver-release-portability-9c9d209-2026-09-06",
+  "collectedAt": "2026-09-06T01:25:22+08:00",
+  "outcome": "passed",
+  "scope": "The exact source commit passes the complete platform-applicable deis-provider-driver test suite, including release-index validation and verified installation behavior, plus strict all-target lint on Linux, macOS, and Windows with the repository-pinned Rust toolchain.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "9c9d20979e2e3ab5560e0b9f7b00dbdf8aa77169",
+    "tree": "dc313868f95fd0430abfce6e0b7cdeb6720e386d",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "a8213e92cf4f2849ebe0a5c02d5b82b15da51ffe784f0738fe9346e76e93e2b8",
+      "sizeBytes": 14929920
+    }
+  },
+  "buildEnvironment": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "commands": {
+    "test": "cargo +1.96.0 test -p deis-provider-driver",
+    "clippy": "cargo +1.96.0 clippy -p deis-provider-driver --all-targets -- -D warnings"
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "9c9d20979e2e3ab5560e0b9f7b00dbdf8aa77169",
+      "archiveSha256": "a8213e92cf4f2849ebe0a5c02d5b82b15da51ffe784f0738fe9346e76e93e2b8",
+      "test": {"outcome": "passed", "exitCode": 0, "passed": 39, "failed": 0, "ignored": 0},
+      "lint": {"outcome": "passed", "exitCode": 0}
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "9c9d20979e2e3ab5560e0b9f7b00dbdf8aa77169",
+      "archiveSha256": "a8213e92cf4f2849ebe0a5c02d5b82b15da51ffe784f0738fe9346e76e93e2b8",
+      "test": {
+        "outcome": "passed",
+        "exitCode": 0,
+        "passed": 39,
+        "failed": 0,
+        "ignored": 0,
+        "note": "Unix installation-root ownership/mode and process-group tests are enabled."
+      },
+      "lint": {"outcome": "passed", "exitCode": 0}
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "9c9d20979e2e3ab5560e0b9f7b00dbdf8aa77169",
+      "archiveSha256": "a8213e92cf4f2849ebe0a5c02d5b82b15da51ffe784f0738fe9346e76e93e2b8",
+      "test": {
+        "outcome": "passed",
+        "exitCode": 0,
+        "passed": 31,
+        "failed": 0,
+        "ignored": 0,
+        "note": "Seven platform-applicable installer tests and two Windows Job Object tests are enabled; Unix-only root-mode, process-group, and environment tests are not compiled."
+      },
+      "lint": {"outcome": "passed", "exitCode": 0}
+    }
+  ],
+  "priorFailedAttempts": [
+    {
+      "commit": "6d90ed1c9f55f6ccc6b2b37b835a928c8d58c7de",
+      "tree": "5e30acb944759c34fd3132de4e799771c72d6a5e",
+      "archiveSha256": "c6e4eb2628524a2443c298526c907e16d8695b342811d60440bf0b8777b75aa8",
+      "hostAlias": "s69",
+      "operatingSystem": "windows",
+      "checks": [
+        {"id": "test", "outcome": "passed", "exitCode": 0, "passed": 31, "failed": 0, "ignored": 0},
+        {
+          "id": "clippy",
+          "outcome": "failed",
+          "exitCode": 101,
+          "note": "Strict lint rejected three Windows-only set_readonly(false) calls under clippy::permissions_set_readonly_false."
+        }
+      ],
+      "cause": "The Windows cleanup path used the cross-platform Permissions::set_readonly(false) API. Its Windows behavior was tested, but strict lint correctly rejected an API whose accidental Unix use would create an unsafe permission change.",
+      "fixedBy": "9c9d20979e2e3ab5560e0b9f7b00dbdf8aa77169"
+    },
+    {
+      "commit": "439e0c99c41a4f8cf078bb804d8294adca42095a",
+      "tree": "d6a7793efde87d068a499be6140d1805529565a3",
+      "archiveSha256": "8258de75b4486cbfd6078914b9d436daddb4bb671721d98a726495f869f5a720",
+      "hostAlias": "s69",
+      "operatingSystem": "windows",
+      "checks": [
+        {
+          "id": "test",
+          "outcome": "failed",
+          "exitCode": 101,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "note": "Compilation failed before tests because std::os::windows::fs::PermissionsExt and its attribute methods do not exist in Rust 1.96.0."
+        },
+        {"id": "clippy", "outcome": "not-run", "exitCode": null}
+      ],
+      "cause": "The first fix assumed a Windows std permission extension that Rust does not provide; Linux and macOS builds could not expose this target-specific compile error.",
+      "fixedBy": "9c9d20979e2e3ab5560e0b9f7b00dbdf8aa77169"
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "exactArchiveVerifiedOnEveryHost": true,
+    "windowsReadonlyAttributeIsNotAcl": true,
+    "noTrustedReleaseClaim": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "The release-index fixture is synthetic; this evidence does not prove a real Wrangler, EdgeOne, Deislet, or other provider release archive.",
+    "The installer validates bytes, paths, files, component membership, and content-addressed publication, but release signing, trust-root rotation, revocation, and transparency are not implemented.",
+    "On Windows, read-only file attributes are verified but no service-account DACL is configured or validated; this is not an equivalent authorization boundary.",
+    "Control has no durable installed-release registry or production dispatcher that selects the current host release and re-verifies its full tree before every driver execution.",
+    "No live provider account is used, and this evidence does not certify any backend against Edge Canon."
+  ]
+}

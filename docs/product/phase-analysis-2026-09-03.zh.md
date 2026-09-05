@@ -2012,3 +2012,29 @@ Application/framework source + versioned build plan
   Windows service account DACL 验证、Control 持久 installed-release registry、dispatcher 与每次命令前强制全树校验
   也未接入生产调用链。完成这些并在精确提交 Linux/macOS/Windows 复跑前，roadmap 只能把“安装契约/核心”记为已落地，
   不能关闭受信发行、完整 driver、live deployment 或 conformance 阻断项。
+
+## 71. Driver release/installer 三平台精确验证与两次 Windows 修复
+
+- 首次以提交 `6d90ed1c9f55f6ccc6b2b37b835a928c8d58c7de`（tree
+  `5e30acb944759c34fd3132de4e799771c72d6a5e`，archive SHA-256
+  `c6e4eb2628524a2443c298526c907e16d8695b342811d60440bf0b8777b75aa8`）复跑时，Linux 39 项、macOS
+  39 项和 Windows 31 项平台适用测试均通过；但 Windows 严格 Clippy 拒绝三处仅在该目标编译的
+  `Permissions::set_readonly(false)`。该 API 在 Windows 的测试行为正确，但同一调用一旦误入 Unix 会扩大写权限，
+  所以测试绿灯不能覆盖质量门失败，该提交没有登记为通过证据。
+- 第一版修复提交 `439e0c99c41a4f8cf078bb804d8294adca42095a`（tree
+  `d6a7793efde87d068a499be6140d1805529565a3`，archive SHA-256
+  `8258de75b4486cbfd6078914b9d436daddb4bb671721d98a726495f869f5a720`）把逻辑收窄为 Windows 分支，
+  但错误假定 Rust 1.96.0 提供 `std::os::windows::fs::PermissionsExt`。Linux/macOS 测试与 Clippy 通过，Windows
+  在测试执行前编译失败，Clippy 因前序失败未运行；这再次证明本机非目标编译不能替代 Windows 实机验证。
+- 最终修复改用已有 `windows-sys` 的 `GetFileAttributesW/SetFileAttributesW`，只清除同一路径已有属性中的
+  `FILE_ATTRIBUTE_READONLY`，保留其他属性并对 NUL、读取或写入失败关闭。提交
+  `9c9d20979e2e3ab5560e0b9f7b00dbdf8aa77169`（tree
+  `dc313868f95fd0430abfce6e0b7cdeb6720e386d`，14,929,920-byte archive SHA-256
+  `a8213e92cf4f2849ebe0a5c02d5b82b15da51ffe784f0738fe9346e76e93e2b8`）先通过本机 Windows MSVC
+  target check/Clippy，再由同一 archive 在 s17 Linux、s67 macOS、s69 Windows 复跑。Linux/macOS 各 39/39，
+  Windows 31/31（含七项安装器与两项 Job Object），三端严格 all-target Clippy 全部通过。
+- 新的 `provider-driver-release-portability` evidence Schema 不只验证最终 outcome、三种 OS 顺序、精确
+  commit/archive、测试计数和 lint，还强制保留两个前置失败及其到最终修复的关系。证据明确声明：当前只证明合成
+  release contract/installer 核心的目标可移植性；Windows read-only attribute 不是 service-account DACL，且没有
+  真实 materialized vendor release、签名/撤销/透明机制、Control installed-release registry/dispatcher、live
+  provider deployment 或 Edge Canon conformance。因此 `P1-DEPLOY-001` 继续保持 active。
