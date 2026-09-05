@@ -48,8 +48,8 @@
         "command": {"const": "python3 scripts/check-shared-contracts.py"},
         "outcome": {"const": "passed"},
         "exitCode": {"const": 0},
-        "schemas": {"enum": [11, 14]},
-        "fixtures": {"enum": [29, 37]}
+        "schemas": {"enum": [11, 14, 15]},
+        "fixtures": {"enum": [29, 37, 42]}
       }
     },
     "requiredOperatingSystems": {
@@ -70,6 +70,11 @@
       "minItems": 0,
       "items": {"$ref": "#/$defs/priorFailedAttempt"}
     },
+    "collectionObservations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/collectionObservation"}
+    },
     "assertions": {
       "type": "object",
       "additionalProperties": false,
@@ -86,7 +91,10 @@
         "noLiveProviderClaim": {"const": true},
         "noProviderConformanceClaim": {"const": true},
         "signedReleaseAuthorizationValidated": {"const": true},
-        "trustRootLoaderCompiledOnWindows": {"const": true}
+        "trustRootLoaderCompiledOnWindows": {"const": true},
+        "rootRotationValidated": {"const": true},
+        "legacyTrustRootMigrationValidated": {"const": true},
+        "transientSpawnRetryBoundaryValidated": {"const": true}
       }
     },
     "limitations": {
@@ -193,11 +201,28 @@
       "required": ["source", "hostAlias", "operatingSystem", "checks", "cause", "fixedBy"],
       "properties": {
         "source": {"$ref": "#/$defs/source"},
-        "hostAlias": {"const": "s69"},
-        "operatingSystem": {"const": "windows"},
+        "hostAlias": {"type": "string", "minLength": 1},
+        "operatingSystem": {"enum": ["linux", "macos", "windows"]},
         "checks": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/checkResult"}},
         "cause": {"type": "string", "minLength": 1},
         "fixedBy": {"$ref": "#/$defs/gitSha"}
+      }
+    },
+    "collectionObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source", "hostAlias", "operatingSystem", "classification", "outcome",
+        "description", "resolution"
+      ],
+      "properties": {
+        "source": {"$ref": "#/$defs/source"},
+        "hostAlias": {"type": "string", "minLength": 1},
+        "operatingSystem": {"enum": ["linux", "macos", "windows"]},
+        "classification": {"enum": ["harness", "environment"]},
+        "outcome": {"const": "inconclusive"},
+        "description": {"type": "string", "minLength": 1},
+        "resolution": {"type": "string", "minLength": 1}
       }
     }
   }

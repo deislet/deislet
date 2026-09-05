@@ -28,7 +28,7 @@
 - [provider driver 三平台可移植性证据](evidence/provider-driver-portability-db10a9c.json)及其[Schema](evidence/provider-driver-portability.schema.json)
 - [provider deployment 控制层三平台证据](evidence/provider-deployment-portability-80a4a35.json)及其[Schema](evidence/provider-deployment-portability.schema.json)
 - [provider driver release/installer 三平台证据](evidence/provider-driver-release-portability-9c9d209.json)及其[Schema](evidence/provider-driver-release-portability.schema.json)
-- [provider driver registry/dispatcher 三平台证据](evidence/provider-driver-dispatcher-portability-b185984.json)及其[Schema](evidence/provider-driver-dispatcher-portability.schema.json)
+- [provider driver registry/dispatcher、发行授权与根轮换三平台证据](evidence/provider-driver-dispatcher-portability-a934ff5.json)及其[Schema](evidence/provider-driver-dispatcher-portability.schema.json)
 - [仓库校验器](../../scripts/check-product-governance.py)
 
 ## 更新规则

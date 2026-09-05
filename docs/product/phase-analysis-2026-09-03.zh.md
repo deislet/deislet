@@ -2209,3 +2209,26 @@ Application/framework source + versioned build plan
   失败关闭。由于失败发生在 OS 明确确认进程未启动的边界，该重试不会重复 provider side effect。专项锁定可重试错误
   白名单，原断言也会在未来失败时打印完整结构化错误。必须从包含该修复的新提交重建归档，并让三个原生 OS 的相同
   门禁全部一次通过，才能新增证据。
+
+## 79. Root rotation 与 transient spawn 修复的三平台精确证据
+
+- 修复提交 `a934ff5003dc66745db2b0a08cdbd9050225700a`（tree
+  `e9afa1371b99a5d8c2f09e1717408ecdcbf1ec77`）生成 15,288,320-byte `git archive`，SHA-256 为
+  `eceff577182469f6a87c9f57990c20db0eee19e7b2f3b4923785827a556ee6f0`。s17、s67、s69 都先验证同一摘要，再只从该
+  archive 解包运行，使用 Rust/Cargo/Clippy 1.96.0、`CARGO_INCREMENTAL=0` 与
+  `CARGO_PROFILE_TEST_DEBUG=0`。
+- Linux 与 macOS 的 provider-driver 各 55/55，Windows 为 45/45；三端 Control provider 专项各 19/19、legacy
+  active-target migration 各 1/1，五个部署控制 crate 的严格 all-target Clippy 全部通过。Windows 集合真实编译并运行
+  DSSE/Ed25519 授权、显式 root role、旧/新根双阈值、旧格式根迁移、trust material 的 reparse/share-write 防护、
+  stdin 与 Job Object 边界；Unix-only 测试不虚报为 Windows 执行。Linux 同一 archive 另通过 15 份 Schema/42 组
+  fixture。修复提交前，本地 10 次连续 provider-driver 全量也全部通过，但它们仅作为稳定性补充，不替代这组三平台
+  exact-archive 结果。
+- 正式 evidence 为 `docs/product/evidence/provider-driver-dispatcher-portability-a934ff5.json`。Schema 已允许把 prior
+  code failure 绑定到实际发生的主机/操作系统，并为不产生代码结论的取证环境观察建立独立类型。证据保留 `5f79e47`
+  在 s17 首轮 53/54 及其到 `a934ff5` 的修复关系，也保留 s69 的 PowerShell harness 首轮 inconclusive；新 harness
+  使用 `$ErrorActionPreference=Continue` 并只按 `$LASTEXITCODE` 判断 native command 成败。后续全绿不能反向改写
+  两项历史事实。
+- 这项证据关闭 root rotation/旧根迁移与 transient spawn 边界的三平台可移植性阻断，不关闭供应链或 provider 产品
+  完成度。fixture 仍为合成 release/key/root；Sigstore/Rekor 或等价 transparency inclusion/checkpoint、真实签署的
+  materialized release、Windows service-account DACL、公共 API/CLI/Web、后台 dispatcher loop、三家完整 driver 和
+  真实账户 lifecycle/conformance evidence 仍未完成。`P1-DEPLOY-001` 保持 active，所有 backend 的支持状态不变。

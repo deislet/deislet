@@ -312,6 +312,14 @@ release role 阈值作为旧 root role；它不能用于全新 bootstrap，下�
 执行真实 Ed25519 双阈值验证，而不把 Python 结构检查冒充密码学证据。该设计遵循 TUF 对连续 intermediate root、旧/新
 root threshold 及只在更新结束检查最终 trusted root expiry 的要求。
 
+精确提交 `a934ff5003dc66745db2b0a08cdbd9050225700a` 的同一 archive 已在 Linux、macOS、Windows 通过
+provider driver 平台适用测试、Control provider 专项、legacy migration 与五个部署控制 crate 的严格 Clippy；Linux
+另通过 15 份共享 Schema/42 组 fixture。证据保留父提交 `5f79e47` 在 Linux 首次进程启动失败以及 Windows 取证脚本
+误判 Cargo stderr 的事实，不能用后续绿灯改写。runner 只在操作系统明确报告进程尚未创建的 `WouldBlock`、
+`Interrupted` 或 Unix `ETXTBSY` 上做有界启动重试，仍受原调用 deadline 约束；其他错误立即失败，因而不会以重试
+重复 provider side effect。该证据同时覆盖显式 root role、旧/新根双阈值、过期旧根恢复、最终新根有效期、不可变轮换
+记录，以及 pre-root-role v1 历史根重启和一次性迁移。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
 Sigstore/Rekor 或等价透明证明，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
 完整 backend driver 和真实账户 evidence 也未完成。在这些完成并获得真实账户证据前，不能把当前 dispatcher 称作已部署
