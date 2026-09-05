@@ -2038,3 +2038,37 @@ Application/framework source + versioned build plan
   release contract/installer 核心的目标可移植性；Windows read-only attribute 不是 service-account DACL，且没有
   真实 materialized vendor release、签名/撤销/透明机制、Control installed-release registry/dispatcher、live
   provider deployment 或 Edge Canon conformance。因此 `P1-DEPLOY-001` 继续保持 active。
+
+## 72. Control installed-release registry 与统一 driver 进程协议
+
+- 继续接入 release 安装器时发现，最初设计仍允许生产调用方把任意内存 `ProviderDriver` 交给部署协调器，再由一个
+  registry wrapper 只核对其 manifest。这样“已安装 release”并不真正决定执行代码，任意实现仍可绕过安装树与进程
+  边界，统一抽象没有执行约束。该入口已在提交前删除：生产 `drive_provider_deployment_once` 只接受由 Control
+  创建、绑定同一 catalog database 与 credential vault 的 `ProviderDriverDispatcher`；任意内存 driver 只保留在
+  `#[cfg(test)]` 的协调状态机测试入口。
+- Control 新增 host-specific `provider_driver_releases` 与 append-only audit。登记前必须实际安装或解析已发布的
+  content-addressed 目录，并重新核对 canonical manifest/release、host archive、完整 file/component tree、权限与
+  executable；持久 identity/facts 不可改写或删除，重复复核只递增 revision。target 注册必须精确绑定当前 Control
+  host 上同 backend、driver/version、manifest 与 release digest 的 active record；旧数据库中没有 release pin 的
+  active target 升级时 disabled。选择或每次 durable claim 后的全树复验一旦失败，release 只允许 active →
+  quarantined → revoked，不能通过修补目录或重新登记恢复 active；审计保留该事实。
+  登记前与 entrypoint 选择时的完整树扫描均在专用 blocking task 执行，避免真实 dependency tree 阻塞 Control 的
+  Tokio 请求执行线程；这不减少任一道复验。
+- 新增 `edge-canon-provider-driver-v1` 统一子进程协议和共享
+  `provider-driver-process.schema.json`。stdin 是不含 credential 的严格 request envelope，stdout 只能返回同协议
+  succeeded/failed outcome；未知字段、vendor-specific protocol 或不匹配的 receipt/error 均失败关闭。credential
+  只能由当前 operation owner/epoch 的 broker lease 取得，通过清空环境后的短生命周期变量传给进程；公开 stdin 与
+  credential stdin 互斥，并扫描 argv、工作目录、公开环境和输入，拒绝凭据值泄漏。进程 deadline 必须短于 lease，
+  stdout/stderr 有界，Unix process group/Windows Job Object 负责终止进程树；side-effecting timeout、异常退出或
+  无效结果继续标记 possible 并要求 reconcile。
+- 当前本机固定 Rust 1.96.0 已通过共享契约 11 份 Schema/29 组正反 fixture、provider driver 47/47、Control
+  456/456、五个相关 crate 严格 all-target Clippy 和产品治理。真实 Unix 子进程回归从只读 release 启动 driver，
+  核对精确 request/argv/credential 并验证 lease succeeded release；Windows 下新增公开 stdin 传输回归。Linux 上
+  对完整 Control 做 MSVC 交叉检查因宿主没有 Windows SDK、`bzip2-sys` 找不到 `windows.h` 而未形成代码结论；
+  必须在提交后的 s69 原生 Windows exact archive 验证，且 macOS/Linux 也必须复跑后才可登记新 portability evidence。
+- `P1-DEPLOY-001` 仍为 active。当前 release 仍由合成测试 bytes 构造，尚无包含固定 runtime、完整 dependency
+  tree 与 native optional packages 的 Wrangler/Deislet 受信 materialized release，也没有签名/撤销/透明日志或
+  Windows service-account DACL。registry/vault/release/target/deployment 尚无公共 API/CLI/Web，Control 也没有后台
+  dispatcher loop；Cloudflare、EdgeOne、Deislet 三个完整 driver 和真实账户全生命周期/conformance evidence 均未
+  完成。默认 20 秒进程 timeout 与不续租的 credential lease 只适合短步骤，真实长操作还需拆为可查询异步 provider
+  operation 或加入有界续租，不能用延长明文凭据存活时间代替。

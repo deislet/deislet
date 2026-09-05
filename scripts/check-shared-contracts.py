@@ -30,6 +30,7 @@ EXPECTED_DOCUMENTS = {
     "operation",
     "provider-driver",
     "provider-driver-release",
+    "provider-driver-process",
     "identity-migration",
     "backend-migration-evidence",
     "backend-restore-set",

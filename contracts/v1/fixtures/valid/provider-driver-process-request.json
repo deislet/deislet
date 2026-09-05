@@ -1,0 +1,27 @@
+{
+  "messageType": "request",
+  "schemaVersion": 1,
+  "protocol": "edge-canon-provider-driver-v1",
+  "request": {
+    "schemaVersion": 1,
+    "operationId": "018f7f32-7c42-7a1b-8c2d-4e5f60718293",
+    "operation": "preflight",
+    "desiredStateDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "applicationId": "018f7f32-7c42-7a1b-8c2d-4e5f60718294",
+    "environmentId": "018f7f32-7c42-7a1b-8c2d-4e5f60718295",
+    "target": {
+      "providerTargetId": "018f7f32-7c42-7a1b-8c2d-4e5f60718296",
+      "providerInstallationId": "018f7f32-7c42-7a1b-8c2d-4e5f60718297",
+      "backendId": "cloudflare-workers-pages",
+      "targetConfigDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "artifact": null,
+    "plan": {
+      "bindingSnapshotDigest": null,
+      "routePlanDigest": null,
+      "triggerPlanDigest": null,
+      "trafficPolicyDigest": null,
+      "priorDeploymentId": null
+    }
+  }
+}

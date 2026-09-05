@@ -480,6 +480,50 @@ fn build_catalog_state(
         store.as_ref().clone(),
         Arc::clone(&secrets),
     ));
+    let provider_driver_dispatcher = config
+        .provider_driver_installation_root
+        .as_ref()
+        .and_then(|root| {
+            match crate::catalog::ProviderDriverReleaseRegistry::new(
+                store.as_ref().clone(),
+                root,
+            ) {
+                Ok(registry) => {
+                    info!(
+                        installation_root = %registry.installation_root().display(),
+                        host = %registry.host(),
+                        "Verified provider driver release registry is enabled"
+                    );
+                    match crate::catalog::ProviderDriverDispatcher::new(
+                        registry,
+                        Arc::clone(&provider_credentials),
+                        deis_provider_driver::ExecutableProviderDriverConfig::default(),
+                    ) {
+                        Ok(dispatcher) => Some(Arc::new(dispatcher)),
+                        Err(error) => {
+                            error!(
+                                error = %error,
+                                "Provider driver dispatcher is unusable; external provider execution is disabled"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!(
+                        configured = %root.display(),
+                        error = %error,
+                        "Provider driver installation root is unusable; external provider execution is disabled"
+                    );
+                    None
+                }
+            }
+        });
+    if config.provider_driver_installation_root.is_none() {
+        warn!(
+            "provider_driver_installation_root is not configured; external provider execution is disabled"
+        );
+    }
 
     catalog::CatalogState {
         store: Arc::clone(&store),
@@ -487,6 +531,7 @@ fn build_catalog_state(
         artifacts: Arc::new(artifacts),
         secrets: Arc::clone(&secrets),
         provider_credentials,
+        provider_driver_dispatcher,
         // The same wiring the deliverer writes into every deployment, so the
         // token `deis kv` is handed is bit-for-bit the one the application's
         // own storage calls carry.

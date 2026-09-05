@@ -320,6 +320,12 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # backend_restore_driver_config = "/etc/deislet/deis-backend-topology.toml"
 # backend_restore_driver_timeout_secs = 900
 
+# Absolute, pre-created root for content-addressed provider driver releases.
+# External provider execution stays disabled when this is unset. On Unix,
+# create it as the Control service account with mode 0700; Control refuses a
+# symlink or a directory writable by group/others and never searches PATH.
+# provider_driver_installation_root = "/var/lib/deis-control/provider-drivers"
+
 # Seconds between cron scheduler ticks (1..=60). A tick rebuilds the task
 # list from the catalog and fires whatever came due, so the default means a
 # newly deployed schedule is noticed within a minute and fires within a

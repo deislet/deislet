@@ -53,6 +53,14 @@ impl<'a> DriverExecutionContext<'a> {
 pub trait ProviderDriver: Send + Sync {
     fn manifest(&self) -> &ValidatedProviderDriverManifest;
 
+    /// Revalidate any executable or other local material selected for this
+    /// call after the durable claim is acquired and before credentials or
+    /// provider-side work begin. In-memory/native drivers have no external
+    /// material and keep the default.
+    async fn verify_before_execution(&self) -> Result<(), DriverContractError> {
+        Ok(())
+    }
+
     /// Execute exactly one durable lifecycle operation. Credentials are an
     /// implementation concern and must be obtained inside the driver security
     /// boundary, never added to [`DriverRequest`].
@@ -66,7 +74,7 @@ pub trait ProviderDriver: Send + Sync {
 pub struct DriverContractError(&'static str);
 
 impl DriverContractError {
-    pub(crate) const fn new(message: &'static str) -> Self {
+    pub const fn new(message: &'static str) -> Self {
         Self(message)
     }
 }

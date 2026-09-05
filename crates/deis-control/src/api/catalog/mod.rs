@@ -38,7 +38,8 @@ use axum::{
 
 use crate::api::middleware::{NodeAuthConfig, node_auth};
 use crate::catalog::{
-    ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore, SecretsBackend,
+    ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore,
+    ProviderDriverDispatcher, SecretsBackend,
 };
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
 use crate::session::SessionManager;
@@ -61,6 +62,10 @@ pub struct CatalogState {
     /// Encrypts provider-management credentials and authorizes their
     /// operation-scoped driver leases against the same catalog database.
     pub provider_credentials: Arc<CatalogProviderCredentialVault>,
+    /// Host-specific, fully verified external driver releases. `None` means
+    /// provider execution is disabled, never that an arbitrary binary may be
+    /// selected.
+    pub provider_driver_dispatcher: Option<Arc<ProviderDriverDispatcher>>,
     /// Pushes a deployment out to the nodes. Deploy, rollback and secret
     /// change all end here; see [`crate::delivery`].
     pub deliverer: Arc<DeploymentDeliverer>,
@@ -514,6 +519,7 @@ pub(crate) mod tests {
             artifacts: Arc::new(ArtifactStore::beside_bundles(bundle_dir.path())),
             secrets: Arc::clone(&secrets),
             provider_credentials,
+            provider_driver_dispatcher: None,
             storage: storage.clone(),
             deliverer: Arc::new(DeploymentDeliverer::new(
                 store,

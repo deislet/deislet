@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/provider-driver-process.schema.json",
+  "title": "Provider driver process protocol v1",
+  "oneOf": [
+    {"$ref": "#/$defs/processRequest"},
+    {"$ref": "#/$defs/processOutcome"}
+  ],
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "operation": {
+      "enum": [
+        "preflight", "plan", "prepare", "upload", "verify", "activate",
+        "observe", "rollback", "inspect", "reconcile", "delete", "cleanup"
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerTargetId", "providerInstallationId", "backendId", "targetConfigDigest"
+      ],
+      "properties": {
+        "providerTargetId": {"$ref": "#/$defs/canonicalId"},
+        "providerInstallationId": {"$ref": "#/$defs/canonicalId"},
+        "backendId": {"enum": ["deislet", "cloudflare-workers-pages", "tencent-edgeone-makers", "deno"]},
+        "targetConfigDigest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactVersionId", "canonicalArtifactSha256", "providerPayloadSha256"],
+      "properties": {
+        "artifactVersionId": {"$ref": "#/$defs/canonicalId"},
+        "canonicalArtifactSha256": {"$ref": "#/$defs/sha256"},
+        "providerPayloadSha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bindingSnapshotDigest": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "routePlanDigest": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "triggerPlanDigest": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "trafficPolicyDigest": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "priorDeploymentId": {"anyOf": [{"$ref": "#/$defs/canonicalId"}, {"type": "null"}]}
+      }
+    },
+    "driverRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "operationId", "operation", "desiredStateDigest",
+        "applicationId", "environmentId", "target", "plan"
+      ],
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "operationId": {"$ref": "#/$defs/canonicalId"},
+        "operation": {"$ref": "#/$defs/operation"},
+        "desiredStateDigest": {"$ref": "#/$defs/sha256"},
+        "applicationId": {"$ref": "#/$defs/canonicalId"},
+        "environmentId": {"$ref": "#/$defs/canonicalId"},
+        "target": {"$ref": "#/$defs/target"},
+        "artifact": {"anyOf": [{"$ref": "#/$defs/artifact"}, {"type": "null"}]},
+        "plan": {"$ref": "#/$defs/plan"}
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "operationId", "operation", "desiredStateDigest", "state",
+        "sideEffect", "providerResourceIds", "observedAt", "nextAction"
+      ],
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "operationId": {"$ref": "#/$defs/canonicalId"},
+        "operation": {"$ref": "#/$defs/operation"},
+        "desiredStateDigest": {"$ref": "#/$defs/sha256"},
+        "state": {"enum": ["succeeded", "failed", "unknown"]},
+        "deploymentState": {"enum": ["planned", "preparing", "uploaded", "verifying", "ready", "activating", "active", "degraded", "failed", "rolled-back", null]},
+        "sideEffect": {"enum": ["none", "possible", "confirmed"]},
+        "providerRequestId": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+        "providerVersionId": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+        "providerDeploymentId": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+        "providerResourceIds": {
+          "type": "object",
+          "maxProperties": 1024,
+          "propertyNames": {"pattern": "^[a-z][a-z0-9-]{0,127}$"},
+          "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 512}
+        },
+        "observedAt": {"type": "string", "format": "date-time"},
+        "nextAction": {"enum": ["none", "retry", "observe", "reconcile", "rollback", "manual-intervention"]},
+        "diagnostic": {"type": ["string", "null"], "maxLength": 4096}
+      }
+    },
+    "driverError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId", "operation", "desiredStateDigest", "category", "code", "message",
+        "retryable", "sideEffect", "nextAction"
+      ],
+      "properties": {
+        "operationId": {"$ref": "#/$defs/canonicalId"},
+        "operation": {"$ref": "#/$defs/operation"},
+        "desiredStateDigest": {"$ref": "#/$defs/sha256"},
+        "category": {"enum": ["authentication", "permission", "quota", "configuration", "build", "upload", "resource", "verification", "activation", "transient-provider", "unknown-state", "driver-integrity", "internal"]},
+        "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,127}$"},
+        "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "retryable": {"type": "boolean"},
+        "sideEffect": {"enum": ["none", "possible", "confirmed"]},
+        "nextAction": {"enum": ["none", "retry", "observe", "reconcile", "rollback", "manual-intervention"]},
+        "providerRequestId": {"type": ["string", "null"], "minLength": 1, "maxLength": 512}
+      }
+    },
+    "processRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messageType", "schemaVersion", "protocol", "request"],
+      "properties": {
+        "messageType": {"const": "request"},
+        "schemaVersion": {"const": 1},
+        "protocol": {"const": "edge-canon-provider-driver-v1"},
+        "request": {"$ref": "#/$defs/driverRequest"}
+      }
+    },
+    "processOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messageType", "schemaVersion", "protocol", "outcome"],
+      "properties": {
+        "messageType": {"const": "outcome"},
+        "schemaVersion": {"const": 1},
+        "protocol": {"const": "edge-canon-provider-driver-v1"},
+        "outcome": {"enum": ["succeeded", "failed"]},
+        "receipt": {"$ref": "#/$defs/receipt"},
+        "error": {"$ref": "#/$defs/driverError"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"outcome": {"const": "succeeded"}}, "required": ["outcome"]},
+          "then": {"required": ["receipt"], "not": {"required": ["error"]}},
+          "else": {"required": ["error"], "not": {"required": ["receipt"]}}
+        }
+      ]
+    }
+  }
+}

@@ -14,6 +14,7 @@ mod lifecycle;
 mod manifest;
 mod model;
 mod orchestrator;
+mod process;
 mod release;
 
 pub use credential::{
@@ -47,6 +48,11 @@ pub use orchestrator::{
     DriverOperationClaim, DriverOperationClaimOutcome, DriverOperationStore,
     DriverOrchestrationOutcome, DriverOrchestrator, DriverOrchestratorConfig,
     DriverOrchestratorConfigError, DriverOrchestratorError, ProviderDriverPin,
+};
+pub use process::{
+    DRIVER_PROCESS_CREDENTIAL_ENV, DRIVER_PROCESS_PROTOCOL_V1, DriverProcessOutcome,
+    DriverProcessRequest, DriverProcessResult, ExecutableProviderDriver,
+    ExecutableProviderDriverConfig,
 };
 pub use release::{
     DriverHostDistribution, DriverReleaseArchive, DriverReleaseComponent,

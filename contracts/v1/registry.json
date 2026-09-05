@@ -12,6 +12,7 @@
     {"id": "operation", "schema": "contracts/v1/operation.schema.json"},
     {"id": "provider-driver", "schema": "contracts/v1/provider-driver.schema.json"},
     {"id": "provider-driver-release", "schema": "contracts/v1/provider-driver-release.schema.json"},
+    {"id": "provider-driver-process", "schema": "contracts/v1/provider-driver-process.schema.json"},
     {"id": "identity-migration", "schema": "contracts/v1/identity-migration.schema.json"},
     {"id": "backend-migration-evidence", "schema": "contracts/v1/backend-migration-evidence.schema.json"},
     {"id": "backend-restore-set", "schema": "contracts/v1/backend-restore-set.schema.json"},

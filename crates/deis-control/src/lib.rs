@@ -30,8 +30,10 @@ pub use catalog::{
     CatalogProviderCredentialVault, CatalogStore, DeployedVersion, Deployment, Environment,
     IdentityMigrationCoordinator, IdentityMigrationPlan, IdentityMigrationRun,
     IdentityMigrationState, MigrationCoordinatorError, OperationRequestContext,
-    ProviderCredentialAuditEvent, ProviderCredentialBinding, ProviderCredentialBindingSpec, Route,
-    SecretCipher, SecretsBackend, Version,
+    ProviderCredentialAuditEvent, ProviderCredentialBinding, ProviderCredentialBindingSpec,
+    ProviderDriverDispatcher, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
+    ProviderDriverReleaseRegistry, ResolvedProviderDriverRelease, Route, SecretCipher,
+    SecretsBackend, Version,
 };
 pub use command::{CommandExecutor, CommandRequest, CommandResponse, CommandType, ExecuteError};
 pub use config::{ControlConfig, RuntimeNodeConfig, TlsConfig};

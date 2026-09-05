@@ -19,6 +19,7 @@ sha2 = "0.10"
 tar = "0.4"
 tempfile = "3"
 tokio = { workspace = true }
+tracing = "0.1"
 zeroize = "1.8"
 
 [target.'cfg(unix)'.dependencies]

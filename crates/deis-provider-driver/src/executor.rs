@@ -23,6 +23,7 @@ use crate::{DriverNextAction, Sha256Digest};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
+const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const REDACTED: &str = "[REDACTED]";
@@ -130,6 +131,7 @@ pub struct CommandInvocation {
     working_directory: PathBuf,
     environment: BTreeMap<OsString, OsString>,
     credentials: Vec<SecretInjection>,
+    stdin: Option<Vec<u8>>,
     timeout: Duration,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
@@ -148,6 +150,7 @@ impl CommandInvocation {
             working_directory: working_directory.into(),
             environment: BTreeMap::new(),
             credentials: Vec::new(),
+            stdin: None,
             timeout: DEFAULT_TIMEOUT,
             max_stdout_bytes: DEFAULT_OUTPUT_LIMIT,
             max_stderr_bytes: DEFAULT_OUTPUT_LIMIT,
@@ -169,6 +172,18 @@ impl CommandInvocation {
     pub fn credential(&mut self, credential: SecretInjection) -> &mut Self {
         self.credentials.push(credential);
         self
+    }
+
+    pub fn stdin(&mut self, value: impl Into<Vec<u8>>) -> Result<&mut Self, CommandExecutionError> {
+        let value = value.into();
+        if value.len() > MAX_STDIN_BYTES {
+            return Err(CommandExecutionError::before_start(
+                CommandExecutionErrorKind::InvalidInvocation,
+                "official tool stdin exceeds the 16 MiB input bound",
+            ));
+        }
+        self.stdin = Some(value);
+        Ok(self)
     }
 
     pub fn timeout(&mut self, value: Duration) -> Result<&mut Self, CommandExecutionError> {
@@ -210,6 +225,7 @@ impl fmt::Debug for CommandInvocation {
                 &self.environment.keys().collect::<Vec<_>>(),
             )
             .field("credentials", &self.credentials)
+            .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
             .field("timeout", &self.timeout)
             .field("max_stdout_bytes", &self.max_stdout_bytes)
             .field("max_stderr_bytes", &self.max_stderr_bytes)
@@ -375,7 +391,7 @@ impl PinnedCommandRunner {
         let stdout_task = tokio::spawn(read_bounded(stdout, invocation.max_stdout_bytes));
         let stderr_task = tokio::spawn(read_bounded(stderr, invocation.max_stderr_bytes));
 
-        match timeout_at(deadline, write_stdin(&mut child, &invocation.credentials)).await {
+        match timeout_at(deadline, write_stdin(&mut child, invocation)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 terminate(&mut child, &mut process_group).await;
@@ -530,6 +546,12 @@ fn validate_invocation(invocation: &CommandInvocation) -> Result<(), CommandExec
             "only one credential payload may use stdin",
         ));
     }
+    if invocation.stdin.is_some() && stdin_count != 0 {
+        return Err(CommandExecutionError::before_start(
+            CommandExecutionErrorKind::InvalidInvocation,
+            "public stdin and a credential stdin payload cannot share one invocation",
+        ));
+    }
     let credential_environment = invocation
         .credentials
         .iter()
@@ -638,6 +660,10 @@ fn reject_secret_in_public_inputs(
                 .working_directory
                 .to_string_lossy()
                 .contains(secret)
+    }) || invocation.stdin.as_deref().is_some_and(|stdin| {
+        secrets
+            .iter()
+            .any(|secret| contains_bytes(stdin, secret.as_bytes()))
     }) || invocation.arguments.iter().any(|argument| {
         let argument = argument.to_string_lossy();
         secrets.iter().any(|secret| argument.contains(secret))
@@ -657,18 +683,30 @@ fn reject_secret_in_public_inputs(
     Ok(())
 }
 
-async fn write_stdin(child: &mut Child, credentials: &[SecretInjection]) -> io::Result<()> {
-    let stdin_secret = credentials.iter().find_map(|credential| match credential {
-        SecretInjection::Stdin(value) => Some(value.expose()),
-        SecretInjection::ShortLivedEnvironment { .. } => None,
-    });
+async fn write_stdin(child: &mut Child, invocation: &CommandInvocation) -> io::Result<()> {
+    let stdin_secret = invocation
+        .credentials
+        .iter()
+        .find_map(|credential| match credential {
+            SecretInjection::Stdin(value) => Some(value.expose()),
+            SecretInjection::ShortLivedEnvironment { .. } => None,
+        });
     if let Some(mut stdin) = child.stdin.take() {
-        if let Some(secret) = stdin_secret {
+        if let Some(value) = &invocation.stdin {
+            stdin.write_all(value).await?;
+        } else if let Some(secret) = stdin_secret {
             stdin.write_all(secret.as_bytes()).await?;
         }
         stdin.shutdown().await?;
     }
     Ok(())
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 struct Capture {
@@ -978,6 +1016,54 @@ printf '{"ok":true,"echo":"%s","%s":"key"}' "$PROVIDER_TOKEN" "$PROVIDER_TOKEN"
     }
 
     #[tokio::test]
+    async fn delivers_bounded_public_stdin_without_confusing_it_for_a_credential() {
+        let temp = TempDir::new().unwrap();
+        let pin = executable(&temp, "public-stdin", "cat");
+        let mut invocation = CommandInvocation::new(
+            temp.path(),
+            Vec::<String>::new(),
+            SideEffectPolicy::ReadOnly,
+        );
+        invocation
+            .stdin(br#"{"received":"public"}"#.to_vec())
+            .unwrap();
+        let output = PinnedCommandRunner.run(&pin, &invocation).await.unwrap();
+        assert_eq!(output.structured["received"], "public");
+        assert!(
+            !format!("{invocation:?}").contains("received"),
+            "Debug reports only the input size"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_stdin_cannot_contain_an_injected_secret() {
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("started-from-stdin");
+        let pin = executable(
+            &temp,
+            "stdin-must-not-run",
+            &format!("touch '{}'\nprintf '{{}}'", marker.display()),
+        );
+        let secret = "stdin-public-secret";
+        let mut invocation = CommandInvocation::new(
+            temp.path(),
+            Vec::<String>::new(),
+            SideEffectPolicy::ReadOnly,
+        );
+        invocation.stdin(secret.as_bytes().to_vec()).unwrap();
+        invocation.credential(
+            SecretInjection::environment("PROVIDER_TOKEN", SecretString::new(secret).unwrap())
+                .unwrap(),
+        );
+        let error = PinnedCommandRunner
+            .run(&pin, &invocation)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CommandExecutionErrorKind::InvalidInvocation);
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
     async fn refuses_argv_secret_before_the_tool_can_start() {
         let temp = TempDir::new().unwrap();
         let marker = temp.path().join("started");
@@ -1170,6 +1256,23 @@ mod windows_tests {
             .await
             .unwrap();
         assert_eq!(output.structured["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn windows_driver_process_receives_public_stdin() {
+        let temp = TempDir::new().unwrap();
+        let mut invocation = powershell_invocation(
+            &temp,
+            "$value = [Console]::In.ReadToEnd(); Write-Output $value",
+        );
+        invocation
+            .stdin(br#"{"received":"public"}"#.to_vec())
+            .unwrap();
+        let output = PinnedCommandRunner
+            .run(&powershell_pin(), &invocation)
+            .await
+            .unwrap();
+        assert_eq!(output.structured["received"], "public");
     }
 
     #[tokio::test]

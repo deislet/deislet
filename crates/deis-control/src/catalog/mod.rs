@@ -40,6 +40,7 @@ pub mod model;
 pub mod operation;
 pub mod provider_credential;
 pub mod provider_driver_operation;
+pub mod provider_driver_release;
 pub mod secrets;
 pub mod store;
 
@@ -77,6 +78,10 @@ pub use provider_driver_operation::{
     PROVIDER_DEPLOYMENT_STEPS, ProviderDeploymentDriveOutcome, ProviderDeploymentSpec,
     ProviderDeploymentStep, ProviderDeploymentWorkflow, ProviderDriverOperationRecord,
     ProviderInstallation, ProviderInstallationSpec, ProviderTarget, ProviderTargetSpec,
+};
+pub use provider_driver_release::{
+    ProviderDriverDispatcher, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
+    ProviderDriverReleaseRegistry, ResolvedProviderDriverRelease,
 };
 pub use secrets::{SecretCipher, SecretsBackend};
 pub use store::{

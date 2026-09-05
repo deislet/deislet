@@ -266,6 +266,13 @@ where
                 .map_err(DriverOrchestratorError::Store)?;
             return Err(DriverOrchestratorError::Contract(error));
         }
+        if let Err(error) = driver.verify_before_execution().await {
+            self.store
+                .record_contract_failure(&claim, &error.to_string())
+                .await
+                .map_err(DriverOrchestratorError::Store)?;
+            return Err(DriverOrchestratorError::Contract(error));
+        }
 
         let execution_context =
             DriverExecutionContext::new(&claim.request, claim.owner_id, claim.claim_epoch);
@@ -463,6 +470,30 @@ mod tests {
         fail: bool,
     }
 
+    struct VerificationRejectingDriver {
+        manifest: ValidatedProviderDriverManifest,
+    }
+
+    #[async_trait]
+    impl ProviderDriver for VerificationRejectingDriver {
+        fn manifest(&self) -> &ValidatedProviderDriverManifest {
+            &self.manifest
+        }
+
+        async fn verify_before_execution(&self) -> Result<(), DriverContractError> {
+            Err(DriverContractError::new(
+                "installed driver material failed its final integrity check",
+            ))
+        }
+
+        async fn execute(
+            &self,
+            _context: &DriverExecutionContext<'_>,
+        ) -> Result<DriverReceipt, DriverError> {
+            panic!("a driver that failed pre-execution verification must never run")
+        }
+    }
+
     #[async_trait]
     impl ProviderDriver for FakeDriver {
         fn manifest(&self) -> &ValidatedProviderDriverManifest {
@@ -624,6 +655,28 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, DriverOrchestratorError::Contract(_)));
         assert!(store.0.lock().await.contract_failure.is_some());
+    }
+
+    #[tokio::test]
+    async fn pre_execution_verification_failure_is_persisted_before_driver_code_runs() {
+        let request = request();
+        let store = FakeStore::default();
+        store.0.lock().await.request = Some(request.clone());
+        let driver = VerificationRejectingDriver {
+            manifest: manifest(),
+        };
+        let orchestrator = DriverOrchestrator::new(store.clone(), Default::default()).unwrap();
+        let error = orchestrator
+            .execute(request.operation_id, CanonicalId::new_v7(), &driver)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DriverOrchestratorError::Contract(_)));
+        let state = store.0.lock().await;
+        assert_eq!(
+            state.contract_failure.as_deref(),
+            Some("installed driver material failed its final integrity check")
+        );
+        assert!(state.owner.is_none());
     }
 
     #[tokio::test]

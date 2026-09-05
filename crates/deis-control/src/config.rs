@@ -198,6 +198,13 @@ pub struct ControlConfig {
     /// waiting for reconciliation rather than guessing whether data moved.
     #[serde(default = "default_backend_restore_driver_timeout_secs")]
     pub backend_restore_driver_timeout_secs: u64,
+    /// Absolute, pre-created directory that holds verified provider driver
+    /// releases. When unset or invalid, external provider execution is
+    /// disabled; Control never falls back to PATH or an unregistered binary.
+    /// On Unix it must be owned by the Control service identity and not be
+    /// writable by group or others.
+    #[serde(default)]
+    pub provider_driver_installation_root: Option<PathBuf>,
     /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).
     ///
     /// A tick does two things: it rebuilds the task list from the catalog,
@@ -294,6 +301,7 @@ impl Default for ControlConfig {
             backend_restore_driver_executable: None,
             backend_restore_driver_config: None,
             backend_restore_driver_timeout_secs: default_backend_restore_driver_timeout_secs(),
+            provider_driver_installation_root: None,
             cron_tick_seconds: default_cron_tick_seconds(),
             node_registration_ttl_secs: default_node_registration_ttl(),
         }
@@ -366,6 +374,10 @@ impl std::fmt::Debug for ControlConfig {
             .field(
                 "backend_restore_driver_timeout_secs",
                 &self.backend_restore_driver_timeout_secs,
+            )
+            .field(
+                "provider_driver_installation_root",
+                &self.provider_driver_installation_root,
             )
             .field("cron_tick_seconds", &self.cron_tick_seconds)
             .field(

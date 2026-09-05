@@ -77,6 +77,10 @@ impl fmt::Debug for CatalogProviderCredentialVault {
 }
 
 impl CatalogProviderCredentialVault {
+    pub(crate) fn belongs_to(&self, store: &CatalogStore) -> bool {
+        Arc::ptr_eq(&self.store.database(), &store.database())
+    }
+
     #[must_use]
     pub fn new(store: CatalogStore, secrets: Arc<SecretsBackend>) -> Self {
         Self { store, secrets }
@@ -1063,6 +1067,10 @@ mod tests {
             .await
             .unwrap();
         let manifest = manifest();
+        crate::catalog::provider_driver_release::seed_test_provider_driver_release(
+            &store, &manifest,
+        )
+        .await;
         let target = store
             .register_provider_target(ProviderTargetSpec {
                 installation_id: installation.installation_id,

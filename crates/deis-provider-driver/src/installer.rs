@@ -114,6 +114,37 @@ impl DriverReleaseInstaller {
             distribution: distribution.clone(),
         })
     }
+
+    /// Resolve an already-published release for this host and re-verify the
+    /// complete tree. This never creates, repairs, or replaces an install.
+    pub fn resolve(
+        &self,
+        release: &ValidatedProviderDriverRelease,
+        manifest: &ValidatedProviderDriverManifest,
+        host: HostOperatingSystem,
+    ) -> Result<InstalledDriverRelease, DriverInstallationError> {
+        validate_installation_root(&self.root)?;
+        release.bind_to_manifest(manifest)?;
+        let distribution = release
+            .distribution_for(host)
+            .ok_or(DriverInstallationError::UnsupportedHost(host))?;
+        let release_digest = release.canonical_sha256()?;
+        let final_root = self
+            .root
+            .join(format!("{}-{host}", release_digest.as_str()));
+        verify_install_tree(&final_root, distribution)?;
+        Ok(InstalledDriverRelease {
+            release_digest,
+            host_operating_system: host,
+            root: final_root,
+            distribution: distribution.clone(),
+        })
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 impl InstalledDriverRelease {
@@ -144,6 +175,11 @@ impl InstalledDriverRelease {
                     })
             })
             .collect())
+    }
+
+    #[must_use]
+    pub fn distribution(&self) -> &DriverHostDistribution {
+        &self.distribution
     }
 }
 
@@ -1082,6 +1118,12 @@ mod tests {
 
         let second = fixture.install().unwrap();
         assert_eq!(first.root, second.root);
+        let resolved = fixture
+            .installer()
+            .resolve(&fixture.release, &fixture.manifest, fixture.host)
+            .unwrap();
+        assert_eq!(resolved.root, first.root);
+        resolved.verify().unwrap();
         assert_eq!(
             first.release_digest,
             fixture.manifest.get().driver.distribution_digest.value

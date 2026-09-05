@@ -260,9 +260,17 @@ archive handle 复核长度和摘要，在隔离 staging 中拒绝 link、非 re
 才按 release digest + host 原子发布只读目录，随后再次遍历完整树；已有目录必须逐文件一致，绝不原位修补。崩溃留下的
 专用 staging 只在持有同一安装锁时清理。
 
-这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成 Wrangler 的真实完整安装树，也未把 release
-签名/透明日志、Windows service account DACL、Control 持久安装 registry 和 runtime dispatcher 接入生产路径。
-在这些完成并形成精确提交三平台证据前，不能把验证安装器称作已部署的受信 driver 服务，更不能升级 backend 支持状态。
+Control 现把 release/host 的验证结果写入不可改写、不可删除的持久 registry，并让 active target 精确绑定该 release。
+没有 pin 的旧 target 在升级时 disabled；全树校验失败会把 release 永久 quarantined 并追加审计。唯一公开执行入口只
+接受由 Control 创建的 dispatcher，不再接受调用方提供的任意内存 driver。dispatcher 从 target 的 host-specific 安装树
+选择唯一 driver entrypoint，在 durable claim 后再次核对全树和 executable digest，再以统一
+`edge-canon-provider-driver-v1` 进程协议传入 request/outcome；owner/epoch 绑定的短租约 credential 只进入清空后的短期
+process environment。公开 schema 禁止 vendor-specific envelope，进程超时或结果不明时仍按副作用规则 reconcile。
+
+这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成 Wrangler 的真实完整安装树，也没有 release
+签名/透明日志与 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
+完整 backend driver 和真实账户 evidence 也未完成。在这些完成并形成精确提交三平台证据前，不能把当前 dispatcher
+称作已部署的 provider 服务，更不能升级 backend 支持状态。
 
 ## 后果
 

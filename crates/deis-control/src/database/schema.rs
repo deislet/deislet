@@ -2307,6 +2307,8 @@ fn ensure_product_operation_schema(conn: &Connection) -> Result<()> {
 /// isolated in immutable credential revisions; serializable driver requests,
 /// deployment records and operation journals contain binding identities only.
 fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
+    ensure_provider_driver_release_schema(conn)?;
+    ensure_provider_target_release_column(conn)?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS provider_credential_bindings (
@@ -2483,6 +2485,7 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             driver_id                  TEXT NOT NULL CHECK(length(driver_id) BETWEEN 3 AND 128),
             driver_version             TEXT NOT NULL CHECK(length(driver_version) BETWEEN 1 AND 128),
             driver_distribution_sha256 TEXT NOT NULL,
+            driver_release_sha256      TEXT,
             driver_manifest_sha256     TEXT NOT NULL,
             driver_manifest_json       TEXT NOT NULL CHECK(json_valid(driver_manifest_json)),
             status                     TEXT NOT NULL CHECK(status IN ('active', 'disabled')),
@@ -2505,6 +2508,10 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             CHECK(length(driver_distribution_sha256) = 64
               AND lower(driver_distribution_sha256) = driver_distribution_sha256
               AND driver_distribution_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(driver_release_sha256 IS NULL OR
+                 (length(driver_release_sha256) = 64
+                  AND lower(driver_release_sha256) = driver_release_sha256
+                  AND driver_release_sha256 NOT GLOB '*[^0-9a-f]*')),
             CHECK(length(driver_manifest_sha256) = 64
               AND lower(driver_manifest_sha256) = driver_manifest_sha256
               AND driver_manifest_sha256 NOT GLOB '*[^0-9a-f]*'),
@@ -2526,11 +2533,50 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             SELECT RAISE(ABORT, 'provider target installation/backend mismatch');
         END;
 
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_release_v1
+        BEFORE INSERT ON provider_targets
+        WHEN NEW.status = 'active' AND (
+             NEW.driver_release_sha256 IS NULL
+          OR NEW.driver_release_sha256 != NEW.driver_distribution_sha256
+          OR NOT EXISTS (
+              SELECT 1 FROM provider_driver_releases r
+               WHERE r.release_sha256 = NEW.driver_release_sha256
+                 AND r.backend_id = NEW.backend_id
+                 AND r.driver_id = NEW.driver_id
+                 AND r.driver_version = NEW.driver_version
+                 AND r.manifest_sha256 = NEW.driver_manifest_sha256
+                 AND r.status = 'active'
+          )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target has no matching verified driver release');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_release_activation_v1
+        BEFORE UPDATE OF status ON provider_targets
+        WHEN NEW.status = 'active' AND (
+             NEW.driver_release_sha256 IS NULL
+          OR NEW.driver_release_sha256 != NEW.driver_distribution_sha256
+          OR NOT EXISTS (
+              SELECT 1 FROM provider_driver_releases r
+               WHERE r.release_sha256 = NEW.driver_release_sha256
+                 AND r.backend_id = NEW.backend_id
+                 AND r.driver_id = NEW.driver_id
+                 AND r.driver_version = NEW.driver_version
+                 AND r.manifest_sha256 = NEW.driver_manifest_sha256
+                 AND r.status = 'active'
+          )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target cannot activate without a verified driver release');
+        END;
+
         CREATE TRIGGER IF NOT EXISTS trg_provider_targets_facts_immutable_v1
         BEFORE UPDATE OF target_id, installation_id, backend_id, name,
                          standard_version, target_config_sha256, driver_id,
                          driver_version, driver_distribution_sha256,
-                         driver_manifest_sha256, driver_manifest_json, created_at
+                         driver_release_sha256, driver_manifest_sha256,
+                         driver_manifest_json, created_at
         ON provider_targets
         WHEN NEW.target_id != OLD.target_id
           OR NEW.installation_id != OLD.installation_id
@@ -2541,6 +2587,7 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
           OR NEW.driver_id != OLD.driver_id
           OR NEW.driver_version != OLD.driver_version
           OR NEW.driver_distribution_sha256 != OLD.driver_distribution_sha256
+          OR NEW.driver_release_sha256 IS NOT OLD.driver_release_sha256
           OR NEW.driver_manifest_sha256 != OLD.driver_manifest_sha256
           OR NEW.driver_manifest_json != OLD.driver_manifest_json
           OR NEW.created_at != OLD.created_at
@@ -3046,6 +3093,181 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             "Revoked legacy provider installations whose credential binding cannot be resolved"
         );
     }
+    let disabled_targets = conn.execute(
+        "UPDATE provider_targets
+            SET status = 'disabled', revision = revision + 1,
+                updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER))
+          WHERE status = 'active' AND driver_release_sha256 IS NULL",
+        [],
+    )?;
+    if disabled_targets > 0 {
+        info!(
+            disabled_targets,
+            "Disabled legacy provider targets that have no verified installed driver release"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_provider_driver_release_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS provider_driver_releases (
+            release_sha256        TEXT NOT NULL,
+            host_operating_system TEXT NOT NULL
+                                       CHECK(host_operating_system IN
+                                         ('linux-amd64', 'linux-arm64',
+                                          'macos-arm64', 'windows-amd64')),
+            driver_contract_version TEXT NOT NULL
+                                       CHECK(length(driver_contract_version) BETWEEN 1 AND 128),
+            backend_id            TEXT NOT NULL
+                                       CHECK(backend_id IN ('deislet',
+                                                            'cloudflare-workers-pages',
+                                                            'tencent-edgeone-makers', 'deno')),
+            driver_id             TEXT NOT NULL CHECK(length(driver_id) BETWEEN 3 AND 128),
+            driver_version        TEXT NOT NULL CHECK(length(driver_version) BETWEEN 1 AND 128),
+            manifest_sha256       TEXT NOT NULL,
+            manifest_json         TEXT NOT NULL CHECK(json_valid(manifest_json)),
+            release_json          TEXT NOT NULL CHECK(json_valid(release_json)),
+            archive_sha256        TEXT NOT NULL,
+            archive_size_bytes    INTEGER NOT NULL CHECK(archive_size_bytes > 0),
+            tree_sha256           TEXT NOT NULL,
+            installation_dir_name TEXT NOT NULL CHECK(length(installation_dir_name) BETWEEN 1 AND 256),
+            status                TEXT NOT NULL CHECK(status IN ('active', 'quarantined', 'revoked')),
+            revision              INTEGER NOT NULL CHECK(revision >= 1),
+            verified_at           INTEGER NOT NULL,
+            created_at            INTEGER NOT NULL,
+            updated_at            INTEGER NOT NULL,
+            PRIMARY KEY(release_sha256, host_operating_system),
+            CHECK(length(release_sha256) = 64
+              AND lower(release_sha256) = release_sha256
+              AND release_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(manifest_sha256) = 64
+              AND lower(manifest_sha256) = manifest_sha256
+              AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(archive_sha256) = 64
+              AND lower(archive_sha256) = archive_sha256
+              AND archive_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(tree_sha256) = 64
+              AND lower(tree_sha256) = tree_sha256
+              AND tree_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(verified_at >= created_at AND updated_at >= created_at),
+            UNIQUE(driver_id, driver_version, host_operating_system)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_driver_releases_selection
+            ON provider_driver_releases(status, backend_id, host_operating_system,
+                                        driver_id, driver_version, release_sha256);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_releases_identity_immutable_v1
+        BEFORE UPDATE OF release_sha256, host_operating_system,
+                         driver_contract_version, backend_id, driver_id, driver_version,
+                         manifest_sha256, manifest_json, release_json,
+                         archive_sha256, archive_size_bytes, tree_sha256,
+                         installation_dir_name, created_at
+        ON provider_driver_releases
+        WHEN NEW.release_sha256 != OLD.release_sha256
+          OR NEW.host_operating_system != OLD.host_operating_system
+          OR NEW.driver_contract_version != OLD.driver_contract_version
+          OR NEW.backend_id != OLD.backend_id
+          OR NEW.driver_id != OLD.driver_id
+          OR NEW.driver_version != OLD.driver_version
+          OR NEW.manifest_sha256 != OLD.manifest_sha256
+          OR NEW.manifest_json != OLD.manifest_json
+          OR NEW.release_json != OLD.release_json
+          OR NEW.archive_sha256 != OLD.archive_sha256
+          OR NEW.archive_size_bytes != OLD.archive_size_bytes
+          OR NEW.tree_sha256 != OLD.tree_sha256
+          OR NEW.installation_dir_name != OLD.installation_dir_name
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver release identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_releases_transition_v1
+        BEFORE UPDATE ON provider_driver_releases
+        WHEN NEW.revision != OLD.revision + 1
+          OR NEW.updated_at < OLD.updated_at
+          OR NEW.verified_at < OLD.verified_at
+          OR OLD.status = 'revoked'
+          OR (OLD.status = 'quarantined' AND NEW.status != 'revoked')
+          OR (OLD.status = 'active' AND NEW.status NOT IN ('active', 'quarantined', 'revoked'))
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid provider driver release transition');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_releases_no_delete_v1
+        BEFORE DELETE ON provider_driver_releases
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver releases cannot be deleted');
+        END;
+
+        CREATE TABLE IF NOT EXISTS provider_driver_release_audit (
+            event_id              TEXT PRIMARY KEY,
+            release_sha256        TEXT NOT NULL,
+            host_operating_system TEXT NOT NULL,
+            event_type            TEXT NOT NULL
+                                       CHECK(event_type IN
+                                         ('registered', 'verified', 'quarantined', 'revoked')),
+            detail                TEXT NOT NULL CHECK(length(detail) BETWEEN 1 AND 2048),
+            observed_at           INTEGER NOT NULL,
+            FOREIGN KEY(release_sha256, host_operating_system)
+                REFERENCES provider_driver_releases(release_sha256, host_operating_system),
+            CHECK(length(event_id) = 36
+              AND lower(event_id) = event_id
+              AND substr(event_id, 9, 1) = '-'
+              AND substr(event_id, 14, 1) = '-'
+              AND substr(event_id, 15, 1) = '7'
+              AND substr(event_id, 19, 1) = '-'
+              AND substr(event_id, 20, 1) GLOB '[89ab]'
+              AND substr(event_id, 24, 1) = '-'
+              AND length(replace(event_id, '-', '')) = 32
+              AND replace(event_id, '-', '') NOT GLOB '*[^0-9a-f]*')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_driver_release_audit_release
+            ON provider_driver_release_audit(release_sha256, host_operating_system,
+                                             observed_at, event_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_release_audit_immutable_v1
+        BEFORE UPDATE ON provider_driver_release_audit
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver release audit is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_release_audit_no_delete_v1
+        BEFORE DELETE ON provider_driver_release_audit
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver release audit cannot be deleted');
+        END;
+        "#,
+    )
+}
+
+fn ensure_provider_target_release_column(conn: &Connection) -> Result<()> {
+    let target_table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_targets'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !target_table_exists {
+        return Ok(());
+    }
+    let has_release = conn
+        .prepare("PRAGMA table_info(provider_targets)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "driver_release_sha256");
+    if !has_release {
+        conn.execute(
+            "ALTER TABLE provider_targets ADD COLUMN driver_release_sha256 TEXT",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -3488,6 +3710,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(upgraded, ("revoked".to_owned(), 2));
+    }
+
+    #[test]
+    fn legacy_active_provider_targets_without_a_verified_release_are_disabled() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE provider_installations (
+                installation_id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                backend_id TEXT NOT NULL,
+                account_reference TEXT NOT NULL,
+                region TEXT,
+                credential_binding_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(organization_id, backend_id, account_reference)
+            );
+            CREATE TABLE provider_targets (
+                target_id TEXT PRIMARY KEY,
+                installation_id TEXT NOT NULL,
+                backend_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                standard_version TEXT NOT NULL,
+                target_config_sha256 TEXT NOT NULL,
+                driver_id TEXT NOT NULL,
+                driver_version TEXT NOT NULL,
+                driver_distribution_sha256 TEXT NOT NULL,
+                driver_manifest_sha256 TEXT NOT NULL,
+                driver_manifest_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(installation_id, name)
+            );",
+        )
+        .unwrap();
+        let installation_id = CanonicalId::new_v7().to_string();
+        let target_id = CanonicalId::new_v7().to_string();
+        conn.execute(
+            "INSERT INTO provider_installations
+               (installation_id, organization_id, backend_id, account_reference,
+                region, credential_binding_id, status, revision, created_at, updated_at)
+             VALUES (?1, ?2, 'cloudflare-workers-pages', 'legacy-account', NULL,
+                     ?3, 'active', 1, 1, 1)",
+            rusqlite::params![
+                installation_id,
+                CanonicalId::new_v7().to_string(),
+                CanonicalId::new_v7().to_string(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_targets
+               (target_id, installation_id, backend_id, name, standard_version,
+                target_config_sha256, driver_id, driver_version,
+                driver_distribution_sha256, driver_manifest_sha256,
+                driver_manifest_json, status, revision, created_at, updated_at)
+             VALUES (?1, ?2, 'cloudflare-workers-pages', 'legacy-target',
+                     'edge-canon-proposal-0001', ?3, 'deislet.driver.cloudflare',
+                     '0.1.0-draft.1', ?4, ?5, '{}', 'active', 1, 1, 1)",
+            rusqlite::params![
+                target_id,
+                installation_id,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+            ],
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+        let upgraded: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, revision, driver_release_sha256
+                   FROM provider_targets WHERE name = 'legacy-target'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(upgraded, ("disabled".to_owned(), 2, None));
     }
 
     #[test]

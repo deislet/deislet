@@ -29,6 +29,7 @@ use super::operation::{
     OperationRequestContext, actor_id, default_organization_id, find_operation_request_tx,
     load_operation_tx, transition_operation_tx,
 };
+use super::provider_driver_release::ProviderDriverDispatcher;
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
 
@@ -74,6 +75,7 @@ pub struct ProviderTarget {
     pub driver_id: String,
     pub driver_version: String,
     pub driver_distribution_digest: Sha256Digest,
+    pub driver_release_digest: Sha256Digest,
     pub driver_manifest_digest: Sha256Digest,
     pub status: String,
     pub revision: u64,
@@ -266,6 +268,11 @@ impl CatalogStore {
         let driver_id = manifest.driver.id.clone();
         let driver_version = manifest.driver.version.clone();
         let driver_distribution_digest = manifest.driver.distribution_digest.value.clone();
+        let host = deis_provider_driver::HostOperatingSystem::current().ok_or_else(|| {
+            CatalogError::invalid(
+                "this Control host is not a supported provider driver release target",
+            )
+        })?;
         let target_id = CanonicalId::new_v7();
         let now = now_secs();
         self.database()
@@ -282,13 +289,37 @@ impl CatalogStore {
                         "provider target must use an active installation for the same backend",
                     ));
                 }
+                let release_matches = connection
+                    .query_row(
+                        "SELECT 1 FROM provider_driver_releases
+                          WHERE release_sha256 = ?1 AND host_operating_system = ?2
+                            AND backend_id = ?3 AND driver_id = ?4 AND driver_version = ?5
+                            AND manifest_sha256 = ?6 AND status = 'active'",
+                        params![
+                            driver_distribution_digest.as_str(),
+                            host.as_str(),
+                            backend_id,
+                            driver_id,
+                            driver_version,
+                            manifest_digest.as_str(),
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !release_matches {
+                    return Err(CatalogError::conflict(
+                        "provider target needs a matching verified driver release on this Control host",
+                    ));
+                }
                 connection.execute(
                     "INSERT INTO provider_targets
                        (target_id, installation_id, backend_id, name, standard_version,
                         target_config_sha256, driver_id, driver_version,
-                        driver_distribution_sha256, driver_manifest_sha256,
-                        driver_manifest_json, status, revision, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                        driver_distribution_sha256, driver_release_sha256,
+                        driver_manifest_sha256, driver_manifest_json,
+                        status, revision, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11,
                              'active', 1, ?12, ?12)",
                     params![
                         target_id.to_string(),
@@ -550,10 +581,43 @@ impl CatalogStore {
         &self,
         operation_id: CanonicalId,
         owner_id: CanonicalId,
+        dispatcher: &ProviderDriverDispatcher,
+        config: DriverOrchestratorConfig,
+    ) -> CatalogResult<ProviderDeploymentDriveOutcome> {
+        if !dispatcher.belongs_to(self) {
+            return Err(CatalogError::invalid(
+                "provider driver dispatcher belongs to a different catalog database",
+            ));
+        }
+        let workflow = self.prepare_provider_deployment(operation_id).await?;
+        let driver = dispatcher
+            .driver_for_target(workflow.provider_target_id)
+            .await?;
+        self.drive_prepared_provider_deployment_once(workflow, owner_id, &driver, config)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn drive_provider_deployment_once_for_test(
+        &self,
+        operation_id: CanonicalId,
+        owner_id: CanonicalId,
         driver: &dyn ProviderDriver,
         config: DriverOrchestratorConfig,
     ) -> CatalogResult<ProviderDeploymentDriveOutcome> {
         let workflow = self.prepare_provider_deployment(operation_id).await?;
+        self.drive_prepared_provider_deployment_once(workflow, owner_id, driver, config)
+            .await
+    }
+
+    async fn drive_prepared_provider_deployment_once(
+        &self,
+        workflow: ProviderDeploymentWorkflow,
+        owner_id: CanonicalId,
+        driver: &dyn ProviderDriver,
+        config: DriverOrchestratorConfig,
+    ) -> CatalogResult<ProviderDeploymentDriveOutcome> {
+        let operation_id = workflow.operation.operation_id;
         if workflow.operation.state == OperationState::Succeeded {
             return Ok(ProviderDeploymentDriveOutcome::Succeeded(workflow));
         }
@@ -2350,7 +2414,8 @@ fn load_target(
             "SELECT t.target_id, t.installation_id, t.backend_id, t.name,
                     t.standard_version, t.target_config_sha256, t.driver_id,
                     t.driver_version, t.driver_distribution_sha256,
-                    t.driver_manifest_sha256, t.driver_manifest_json, t.status,
+                    t.driver_release_sha256, t.driver_manifest_sha256,
+                    t.driver_manifest_json, t.status,
                     t.revision, t.created_at, t.updated_at, i.organization_id, i.status
                FROM provider_targets t
                JOIN provider_installations i ON i.installation_id = t.installation_id
@@ -2367,20 +2432,29 @@ fn load_target(
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(9)?,
                     row.get::<_, String>(10)?,
                     row.get::<_, String>(11)?,
-                    row.get::<_, i64>(12)?,
+                    row.get::<_, String>(12)?,
                     row.get::<_, i64>(13)?,
                     row.get::<_, i64>(14)?,
-                    row.get::<_, String>(15)?,
+                    row.get::<_, i64>(15)?,
                     row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
                 ))
             },
         )
         .optional()?
         .map(|row| {
-            let manifest = ValidatedProviderDriverManifest::parse_json(row.10.as_bytes()).map_err(
+            let release_digest: Sha256Digest = row
+                .9
+                .as_deref()
+                .ok_or_else(|| CatalogError::conflict("provider target has no driver release pin"))?
+                .parse()
+                .map_err(|error| {
+                    CatalogError::invalid(format!("invalid provider release digest: {error}"))
+                })?;
+            let manifest = ValidatedProviderDriverManifest::parse_json(row.11.as_bytes()).map_err(
                 |error| {
                     CatalogError::invalid(format!("invalid persisted provider manifest: {error}"))
                 },
@@ -2388,7 +2462,7 @@ fn load_target(
             let computed = manifest.canonical_sha256().map_err(|error| {
                 CatalogError::invalid(format!("invalid persisted provider manifest: {error}"))
             })?;
-            let persisted: Sha256Digest = row.9.parse().map_err(|error| {
+            let persisted: Sha256Digest = row.10.parse().map_err(|error| {
                 CatalogError::invalid(format!("invalid provider manifest digest: {error}"))
             })?;
             if computed != persisted
@@ -2396,6 +2470,7 @@ fn load_target(
                 || manifest.get().driver.id != row.6
                 || manifest.get().driver.version != row.7
                 || manifest.get().driver.distribution_digest.value.as_str() != row.8
+                || release_digest.as_str() != row.8
             {
                 return Err(CatalogError::invalid(
                     "persisted provider target does not match its exact driver manifest",
@@ -2418,14 +2493,15 @@ fn load_target(
                             "invalid driver distribution digest: {error}"
                         ))
                     })?,
+                    driver_release_digest: release_digest,
                     driver_manifest_digest: persisted,
-                    status: row.11,
-                    revision: to_u64(row.12, "provider target revision")?,
-                    created_at: timestamp(row.13, "provider target created time")?,
-                    updated_at: timestamp(row.14, "provider target updated time")?,
+                    status: row.12,
+                    revision: to_u64(row.13, "provider target revision")?,
+                    created_at: timestamp(row.14, "provider target created time")?,
+                    updated_at: timestamp(row.15, "provider target updated time")?,
                 },
-                organization_id: parse_id(&row.15, "provider organization")?,
-                installation_status: row.16,
+                organization_id: parse_id(&row.16, "provider organization")?,
+                installation_status: row.17,
                 manifest,
             })
         })
@@ -2759,13 +2835,19 @@ mod tests {
             })
             .await
             .unwrap();
+        let driver_manifest = manifest();
+        crate::catalog::provider_driver_release::seed_test_provider_driver_release(
+            &store,
+            &driver_manifest,
+        )
+        .await;
         let target = store
             .register_provider_target(ProviderTargetSpec {
                 installation_id: installation.installation_id,
                 name: "production".to_owned(),
                 standard_version: "edge-canon-proposal-0001".to_owned(),
                 target_config_digest: "b".repeat(64).parse().unwrap(),
-                driver_manifest: manifest(),
+                driver_manifest,
             })
             .await
             .unwrap();
@@ -3362,7 +3444,7 @@ mod tests {
         for completed in 1..=PROVIDER_DEPLOYMENT_STEPS.len() {
             let outcome = harness
                 .store
-                .drive_provider_deployment_once(
+                .drive_provider_deployment_once_for_test(
                     parent.operation_id,
                     CanonicalId::new_v7(),
                     &driver,
@@ -3508,7 +3590,7 @@ mod tests {
             assert!(matches!(
                 harness
                     .store
-                    .drive_provider_deployment_once(
+                    .drive_provider_deployment_once_for_test(
                         parent.operation_id,
                         CanonicalId::new_v7(),
                         &driver,
@@ -3521,7 +3603,7 @@ mod tests {
         }
         let unknown = harness
             .store
-            .drive_provider_deployment_once(
+            .drive_provider_deployment_once_for_test(
                 parent.operation_id,
                 CanonicalId::new_v7(),
                 &driver,
@@ -3538,7 +3620,7 @@ mod tests {
 
         let reconciled = harness
             .store
-            .drive_provider_deployment_once(
+            .drive_provider_deployment_once_for_test(
                 parent.operation_id,
                 CanonicalId::new_v7(),
                 &driver,
@@ -3554,7 +3636,7 @@ mod tests {
         assert_eq!(reconciled.operation.phase, "observe");
         let completed = harness
             .store
-            .drive_provider_deployment_once(
+            .drive_provider_deployment_once_for_test(
                 parent.operation_id,
                 CanonicalId::new_v7(),
                 &driver,
@@ -3604,7 +3686,7 @@ mod tests {
         assert!(matches!(
             harness
                 .store
-                .drive_provider_deployment_once(
+                .drive_provider_deployment_once_for_test(
                     parent.operation_id,
                     CanonicalId::new_v7(),
                     &driver,
@@ -3616,7 +3698,7 @@ mod tests {
         ));
         let failed = harness
             .store
-            .drive_provider_deployment_once(
+            .drive_provider_deployment_once_for_test(
                 parent.operation_id,
                 CanonicalId::new_v7(),
                 &driver,
@@ -3677,7 +3759,7 @@ mod tests {
         };
         let outcome = harness
             .store
-            .drive_provider_deployment_once(
+            .drive_provider_deployment_once_for_test(
                 parent.operation_id,
                 CanonicalId::new_v7(),
                 &driver,
@@ -3739,7 +3821,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let outcome = replacement_store
-            .drive_provider_deployment_once(
+            .drive_provider_deployment_once_for_test(
                 parent.operation_id,
                 CanonicalId::new_v7(),
                 &driver,
