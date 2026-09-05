@@ -15,7 +15,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     task::JoinHandle,
-    time::{Instant, timeout_at},
+    time::{Instant, sleep, timeout_at},
 };
 use zeroize::Zeroizing;
 
@@ -26,6 +26,8 @@ const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
 const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_TRANSIENT_SPAWN_ATTEMPTS: u8 = 3;
+const TRANSIENT_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
 const REDACTED: &str = "[REDACTED]";
 
 /// A credential value that zeroizes its owned allocation and never exposes
@@ -266,6 +268,15 @@ impl CommandExecutionError {
         }
     }
 
+    fn before_start_retryable(kind: CommandExecutionErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            next_action: DriverNextAction::Retry,
+            diagnostic: None,
+        }
+    }
+
     fn after_start(
         kind: CommandExecutionErrorKind,
         message: impl Into<String>,
@@ -340,12 +351,55 @@ impl PinnedCommandRunner {
         configure_process_group(&mut command);
 
         let deadline = Instant::now() + invocation.timeout;
-        let mut child = command.spawn().map_err(|error| {
-            CommandExecutionError::before_start(
-                CommandExecutionErrorKind::Spawn,
-                format!("could not start pinned official tool: {error}"),
-            )
-        })?;
+        let mut spawn_attempt = 1_u8;
+        let mut child = loop {
+            if spawn_attempt > 1 && Instant::now() >= deadline {
+                return Err(CommandExecutionError::before_start_retryable(
+                    CommandExecutionErrorKind::Spawn,
+                    format!(
+                        "could not start pinned official tool after {} attempt(s): invocation deadline elapsed during a transient spawn failure",
+                        spawn_attempt - 1
+                    ),
+                ));
+            }
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if spawn_attempt < MAX_TRANSIENT_SPAWN_ATTEMPTS
+                        && transient_spawn_error(&error)
+                        && Instant::now() < deadline =>
+                {
+                    if timeout_at(deadline, sleep(TRANSIENT_SPAWN_RETRY_DELAY))
+                        .await
+                        .is_err()
+                    {
+                        return Err(CommandExecutionError::before_start_retryable(
+                            CommandExecutionErrorKind::Spawn,
+                            format!(
+                                "could not start pinned official tool after {spawn_attempt} attempt(s): invocation deadline elapsed during a transient spawn failure"
+                            ),
+                        ));
+                    }
+                    spawn_attempt += 1;
+                }
+                Err(error) => {
+                    let message = format!(
+                        "could not start pinned official tool after {spawn_attempt} attempt(s): {error}"
+                    );
+                    return Err(if transient_spawn_error(&error) {
+                        CommandExecutionError::before_start_retryable(
+                            CommandExecutionErrorKind::Spawn,
+                            message,
+                        )
+                    } else {
+                        CommandExecutionError::before_start(
+                            CommandExecutionErrorKind::Spawn,
+                            message,
+                        )
+                    });
+                }
+            }
+        };
         // Drop the std/tokio command builder immediately so its private copy
         // of the short-lived credential environment is not retained for the
         // duration of the provider operation.
@@ -947,6 +1001,20 @@ async fn terminate(child: &mut Child, process_group: &mut ProcessGroup) {
     let _ = child.wait().await;
 }
 
+fn transient_spawn_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ETXTBSY) {
+        return true;
+    }
+    false
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -964,6 +1032,22 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let digest = hex::encode(Sha256::digest(bytes)).parse().unwrap();
         PinnedExecutable::new(path, name, "1.0.0", digest)
+    }
+
+    #[test]
+    fn only_explicitly_transient_spawn_errors_are_retryable() {
+        assert!(transient_spawn_error(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(transient_spawn_error(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
+        assert!(transient_spawn_error(&io::Error::from_raw_os_error(
+            libc::ETXTBSY
+        )));
+        assert!(!transient_spawn_error(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
     }
 
     #[tokio::test]
@@ -1199,7 +1283,11 @@ printf '{"ok":true,"echo":"%s","%s":"key"}' "$PROVIDER_TOKEN" "$PROVIDER_TOKEN"
             .run(&failed, &read_only)
             .await
             .unwrap_err();
-        assert_eq!(error.kind, CommandExecutionErrorKind::ExitStatus);
+        assert_eq!(
+            error.kind,
+            CommandExecutionErrorKind::ExitStatus,
+            "unexpected failure: {error:?}"
+        );
         assert_eq!(error.next_action, DriverNextAction::Retry);
 
         let text = executable(&temp, "text", "printf 'human output'");

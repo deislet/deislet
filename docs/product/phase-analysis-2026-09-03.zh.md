@@ -2188,3 +2188,24 @@ Application/framework source + versioned build plan
   release、离线签署 ceremony、Sigstore/Rekor 或等价 transparency inclusion/checkpoint、Windows service-account DACL、
   公共 API/CLI/Web 或后台 dispatcher loop。`P1-DEPLOY-001` 保持 active，所有 backend 的 live/support/conformance
   状态保持不变。
+
+## 78. 首次 root-rotation 精确归档复跑暴露 transient spawn 与 Windows 取证脚本问题
+
+- 已推送提交 `5f79e47aea20cd05793092a89064b403d1f09f66`（tree
+  `2a10f0529d7f6e6a5823e7f05a6ba29658b62128`）生成 15,288,320-byte `git archive`，SHA-256 为
+  `a42c7c27fc9d4387959921528eb402f383f3a623b85fa0ccb059498256af1af7`；s17、s67、s69 均复核为同一摘要。
+  s67 macOS 26.6 arm64 对该归档通过 provider-driver、Control provider 专项、legacy migration 和五 crate 严格
+  Clippy，但由于另外两个主机未形成同组通过，不能登记为三平台 portability evidence。
+- s17 Linux 的首次 provider-driver 全量在 54 项中通过 53 项；既有
+  `nonzero_and_non_json_outputs_are_not_success` 本应观察子进程 exit 7，却在进程启动前收到 `Spawn`，因旧断言没有输出
+  underlying I/O error，日志不能把它可靠归类为 `EAGAIN`、`EINTR` 或 `ETXTBSY`。同一归档随后单项复跑通过，连续五次
+  全量也全部通过，证明它是非确定性启动失败而非 root-rotation 语义回归；但按“flake 阻断证据”规则，不能用重跑绿灯
+  覆盖首次失败。
+- s69 Windows 尚未得出代码结论：PowerShell 5.1 在 `$ErrorActionPreference=Stop` 下把 Cargo 写到 stderr 的正常
+  `Compiling` 进度包装成 `NativeCommandError`，取证脚本在首项编译中提前退出。下一轮脚本必须以 native exit code
+  为唯一成败判据并继续保留完整日志，不能把脚本异常写成 Rust 失败。
+- 对 Linux 暴露的真实产品边界，runner 现在只在 `spawn` 明确返回 `WouldBlock`、`Interrupted` 或 Unix `ETXTBSY`
+  时做最多三次、每次 10 ms 的启动前重试；等待受原 invocation deadline 约束，超时不再启动进程，其他错误仍立即
+  失败关闭。由于失败发生在 OS 明确确认进程未启动的边界，该重试不会重复 provider side effect。专项锁定可重试错误
+  白名单，原断言也会在未来失败时打印完整结构化错误。必须从包含该修复的新提交重建归档，并让三个原生 OS 的相同
+  门禁全部一次通过，才能新增证据。
