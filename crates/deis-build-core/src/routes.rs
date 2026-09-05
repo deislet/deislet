@@ -140,8 +140,20 @@ const EdgeCanonReadableStream = globalThis.ReadableStream;
 const EdgeCanonResponse = globalThis.Response;
 const EdgeCanonTypeError = globalThis.TypeError;
 const edgeCanonObjectAssign = EdgeCanonObject.assign.bind(EdgeCanonObject);
+const edgeCanonObjectCreate = EdgeCanonObject.create.bind(EdgeCanonObject);
 const edgeCanonObjectDefineProperty = EdgeCanonObject.defineProperty.bind(EdgeCanonObject);
 const edgeCanonObjectFreeze = EdgeCanonObject.freeze.bind(EdgeCanonObject);
+const edgeCanonObjectGetPrototypeOf = EdgeCanonObject.getPrototypeOf.bind(EdgeCanonObject);
+const edgeCanonObjectHasOwn = EdgeCanonObject.hasOwn.bind(EdgeCanonObject);
+const edgeCanonObjectIsFrozen = EdgeCanonObject.isFrozen.bind(EdgeCanonObject);
+const edgeCanonObjectKeys = EdgeCanonObject.keys.bind(EdgeCanonObject);
+const edgeCanonArrayIsArray = globalThis.Array.isArray.bind(globalThis.Array);
+const edgeCanonNumberIsFinite = globalThis.Number.isFinite.bind(globalThis.Number);
+const edgeCanonJsonParse = globalThis.JSON.parse.bind(globalThis.JSON);
+const EdgeCanonWeakSet = globalThis.WeakSet;
+const edgeCanonWeakSetAdd = globalThis.Function.prototype.call.bind(EdgeCanonWeakSet.prototype.add);
+const edgeCanonWeakSetDelete = globalThis.Function.prototype.call.bind(EdgeCanonWeakSet.prototype.delete);
+const edgeCanonWeakSetHas = globalThis.Function.prototype.call.bind(EdgeCanonWeakSet.prototype.has);
 const edgeCanonPromiseCatch = globalThis.Function.prototype.call.bind(EdgeCanonPromise.prototype.catch);
 const edgeCanonPromiseResolve = EdgeCanonPromise.resolve.bind(EdgeCanonPromise);
 const edgeCanonConsoleError = globalThis.console && typeof globalThis.console.error === 'function'
@@ -170,6 +182,100 @@ function copiedRecord(value) {
   return edgeCanonObjectFreeze(edgeCanonObjectAssign({}, value || {}));
 }
 
+function edgeCanonEnvironmentError(code, message) {
+  throw edgeCanonTypeError(code, message);
+}
+
+function copiedEnvironmentJson(value, seen) {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return value;
+  if (typeof value === 'number') {
+    if (!edgeCanonNumberIsFinite(value)) {
+      edgeCanonEnvironmentError('EC_ENV_VALUE_INVALID', 'environment JSON contains a non-finite number');
+    }
+    return value;
+  }
+  if (typeof value !== 'object' || edgeCanonWeakSetHas(seen, value)) {
+    edgeCanonEnvironmentError('EC_ENV_VALUE_INVALID', 'environment JSON is not a finite JSON value');
+  }
+  edgeCanonWeakSetAdd(seen, value);
+  let copy;
+  if (edgeCanonArrayIsArray(value)) {
+    copy = [];
+    for (let index = 0; index < value.length; index += 1) {
+      copy[index] = copiedEnvironmentJson(value[index], seen);
+    }
+  } else {
+    const prototype = edgeCanonObjectGetPrototypeOf(value);
+    if (prototype !== EdgeCanonObject.prototype && prototype !== null) {
+      edgeCanonEnvironmentError('EC_ENV_VALUE_INVALID', 'environment JSON contains a non-JSON object');
+    }
+    copy = edgeCanonObjectCreate(null);
+    const keys = edgeCanonObjectKeys(value);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      copy[key] = copiedEnvironmentJson(value[key], seen);
+    }
+  }
+  edgeCanonWeakSetDelete(seen, value);
+  return edgeCanonObjectFreeze(copy);
+}
+
+/**
+ * Project a provider binding container onto the exact EC-ENV declaration.
+ * Extra provider/account/host fields are never copied. A new null-prototype,
+ * recursively frozen value graph is produced on every call.
+ */
+export function materializeEdgeCanonEnvironment(providerEnvironment, declarations) {
+  const source = providerEnvironment && typeof providerEnvironment === 'object'
+    ? providerEnvironment
+    : edgeCanonObjectCreate(null);
+  const environment = edgeCanonObjectCreate(null);
+  const declared = declarations || [];
+  for (let index = 0; index < declared.length; index += 1) {
+    const declaration = declared[index];
+    const present = edgeCanonObjectHasOwn(source, declaration.name);
+    if (!present) {
+      if (declaration.required) {
+        edgeCanonEnvironmentError('EC_ENV_REQUIRED_MISSING', 'required environment binding is unavailable');
+      }
+      continue;
+    }
+    let value = source[declaration.name];
+    if (declaration.valueType === 'string') {
+      if (typeof value !== 'string') {
+        edgeCanonEnvironmentError('EC_ENV_VALUE_INVALID', 'string environment binding has a non-string value');
+      }
+    } else if (declaration.kind === 'config' && declaration.valueType === 'json') {
+      if (typeof value === 'string') {
+        try {
+          value = edgeCanonJsonParse(value);
+        } catch (_) {
+          edgeCanonEnvironmentError('EC_ENV_VALUE_INVALID', 'JSON environment binding does not parse');
+        }
+      }
+      value = copiedEnvironmentJson(value, new EdgeCanonWeakSet());
+    } else {
+      edgeCanonEnvironmentError('EC_ENV_DECLARATION_INVALID', 'environment declaration kind or value type is unsupported');
+    }
+    environment[declaration.name] = value;
+  }
+  return edgeCanonObjectFreeze(environment);
+}
+
+/** Writable Node compatibility projection: config/string only. */
+export function edgeCanonProcessEnvironment(environment, declarations) {
+  const projection = edgeCanonObjectCreate(null);
+  const declared = declarations || [];
+  for (let index = 0; index < declared.length; index += 1) {
+    const declaration = declared[index];
+    if (declaration.kind === 'config' && declaration.valueType === 'string'
+        && edgeCanonObjectHasOwn(environment, declaration.name)) {
+      projection[declaration.name] = environment[declaration.name];
+    }
+  }
+  return projection;
+}
+
 export function createEdgeCanonContext(request, environment, params, nativeWaitUntil) {
   if (typeof nativeWaitUntil !== 'function') {
     throw edgeCanonTypeError(
@@ -180,9 +286,14 @@ export function createEdgeCanonContext(request, environment, params, nativeWaitU
 
   let closed = false;
   let registeredBackgroundTaskCount = 0;
+  const contextEnvironment = environment
+    && edgeCanonObjectGetPrototypeOf(environment) === null
+    && edgeCanonObjectIsFrozen(environment)
+      ? environment
+      : edgeCanonObjectFreeze(edgeCanonObjectAssign(edgeCanonObjectCreate(null), environment || {}));
   const context = {
     request,
-    env: copiedRecord(environment),
+    env: contextEnvironment,
     params: copiedRecord(params),
     waitUntil(promise) {
       if (closed) {

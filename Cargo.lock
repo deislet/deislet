@@ -2048,6 +2048,7 @@ dependencies = [
  "deis-build-core",
  "deis-bundle",
  "deis-runtime",
+ "deis-wire",
  "hex",
  "indicatif",
  "pathdiff",
@@ -2090,6 +2091,7 @@ dependencies = [
  "anyhow",
  "deis-build-core",
  "deis-bundle",
+ "deis-wire",
  "hex",
  "serde",
  "serde_json",
@@ -2125,6 +2127,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deis-node-contract",
+ "deis-wire",
  "dunce",
  "rolldown",
  "rolldown_common",

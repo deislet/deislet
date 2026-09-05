@@ -25,7 +25,8 @@ pub const MANIFEST_SCHEMA: &str =
     "https://github.com/deislet/edge-canon/schemas/canonical-build-output.schema.json";
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
-const REQUIRED_DOCUMENTS: [&str; 4] = [
+const REQUIRED_DOCUMENTS: [&str; 5] = [
+    "environment-secrets",
     "provenance",
     "runtime-entrypoints",
     "sbom",
@@ -1039,6 +1040,11 @@ mod tests {
                 br#"{"result":"pass","schemaVersion":1}\n"#.as_slice(),
             ),
             (
+                "documents/environment-secrets.json",
+                "application/json",
+                br#"{"access":{"extraProviderBindings":"excluded","surface":"context.env"},"declarations":[],"format":"edge-canon.environment-secrets/v1","limits":{"bindingCount":64,"measurement":"utf-8","valueBytes":5120},"schemaVersion":1,"standardVersion":"edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66"}\n"#.as_slice(),
+            ),
+            (
                 "functions/main.js",
                 "text/javascript; charset=utf-8",
                 marker.as_bytes(),
@@ -1062,6 +1068,11 @@ mod tests {
                     "documents/validation-report.json".into(),
                 ),
                 ("provenance".into(), 1, "documents/provenance.json".into()),
+                (
+                    "environment-secrets".into(),
+                    1,
+                    "documents/environment-secrets.json".into(),
+                ),
             ],
             build: BuildMetadata {
                 source_tree_sha256: digest("source"),

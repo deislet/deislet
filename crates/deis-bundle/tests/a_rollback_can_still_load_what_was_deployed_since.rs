@@ -145,19 +145,19 @@ fn a_schema_this_build_does_not_know_is_still_refused_whole() {
     // change an older build could not have ignored safely takes a new schema
     // number, and then the refusal is total, immediate and by name rather
     // than an application running on half a manifest.
-    let future = FROM_A_NEWER_BUILDER.replace("\"schema\": 1", "\"schema\": 2");
+    let future = FROM_A_NEWER_BUILDER.replace("\"schema\": 1", "\"schema\": 3");
     let bundle = zip_with(&[(MANIFEST_ENTRY, &future), (WORKER_ENTRY, "export {}")]);
 
     let err = read_manifest(&bundle).expect_err("a schema this build does not know is refused");
     assert_eq!(
         err,
         BundleError::UnsupportedSchema {
-            found: 2,
+            found: 3,
             supported: SUPPORTED_SCHEMA
         }
     );
     let message = err.to_string();
-    assert!(message.contains('2'), "{message}");
+    assert!(message.contains('3'), "{message}");
     assert!(
         message.contains(&SUPPORTED_SCHEMA.to_string()),
         "the refusal has to name both numbers: {message}"

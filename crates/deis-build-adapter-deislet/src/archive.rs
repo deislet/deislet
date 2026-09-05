@@ -117,7 +117,7 @@ mod tests {
 
     fn manifest() -> Manifest {
         Manifest {
-            schema: deis_bundle::SUPPORTED_SCHEMA,
+            schema: deis_bundle::MIN_SUPPORTED_SCHEMA,
             app: "demo".to_string(),
             entry: WORKER_ENTRY.to_string(),
             runtime: Some("standard-v1".to_string()),
@@ -126,6 +126,7 @@ mod tests {
             callable_by: Vec::new(),
             env: Default::default(),
             secrets: Vec::new(),
+            environment: None,
             routes: Vec::new(),
             cron: Vec::new(),
             queues: Vec::new(),

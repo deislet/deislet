@@ -104,7 +104,7 @@ assets/                  # 静态资产，原样保留目录结构
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "app": "my-app",
   "entry": "worker/index.js",
   "runtime": "standard-v1",
@@ -116,8 +116,18 @@ assets/                  # 静态资产，原样保留目录结构
   },
   "callable_by": ["storefront"],
   "compatibility": { "date": "2026-09-01", "flags": ["multiple_set_cookie_headers"] },
-  "env": { "LOG_LEVEL": "info" },
-  "secrets": ["API_KEY"],
+  "environment": {
+    "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
+    "schemaVersion": 1,
+    "format": "edge-canon.environment-secrets/v1",
+    "standardVersion": "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+    "access": { "surface": "context.env", "extraProviderBindings": "excluded" },
+    "limits": { "bindingCount": 64, "valueBytes": 5120, "measurement": "utf-8" },
+    "declarations": [
+      { "name": "LOG_LEVEL", "kind": "config", "valueType": "string", "required": true },
+      { "name": "API_KEY", "kind": "secret", "valueType": "string", "required": true }
+    ]
+  },
   "routes": [ { "pattern": "/api/users/:id", "methods": ["GET"] } ],
   "cron": [ "0 */6 * * *" ],
   "queues": [ { "name": "jobs", "batch_size": 10, "max_concurrency": 2 } ],
@@ -181,7 +191,11 @@ assets/                  # 静态资产，原样保留目录结构
   `Manifest::parse`/`validate` 里，而在 `Manifest::compatibility_profile()`，所以
   manifest 照样解析、别的字段照样能读，拒绝理由里写着两个日期，同一个包在新一版的节点
   上照样 `Ok`。
-- `secrets` 只列名字，值永远不进包。
+- schema 2 的 `environment` 是 canonical artifact 中同一份 Edge Canon declaration：只含名称、
+  `kind`、`valueType` 与 `required`，不含 config 值或 secret 明文。部署时另建不可变的
+  `environment-binding-snapshot/v1`，把它绑定到版本、环境、config revision 与 secret revision；
+  `context.env` 只从该 snapshot 物化。旧 schema 1 的 `env`/`secrets` 仍可读取以支持历史版本
+  回滚，但新构建不再写入这两个字段；schema 2 若携带它们会被拒绝，避免同时存在两套真源。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
 - `services` 的四个键是 schema 1 的旧式无名资源声明，只为迁移既有 bundle 与数据保留；
   新标准应用只声明 `bindings`，生成的 HTTP context 不暴露 `context.services`。

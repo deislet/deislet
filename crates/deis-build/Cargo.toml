@@ -28,6 +28,7 @@ deis-build-adapter-deno = { version = "0.1.0", path = "../deis-build-adapter-den
 deis-build-adapter-tencent = { version = "0.1.0", path = "../deis-build-adapter-tencent" }
 deis-build-adapter-deislet = { version = "0.1.0", path = "../deis-build-adapter-deislet" }
 deis-bundle = { path = "../deis-bundle" }
+deis-wire = { workspace = true }
 
 clap = { version = "4.4", features = ["derive", "cargo"] }
 colored = "2.1"

@@ -44,6 +44,9 @@ pub fn generate_with_node_compat(
     node_compat: bool,
 ) -> anyhow::Result<AdapterArtifacts> {
     refuse_unplanned_resources(config)?;
+    let environment_declarations =
+        deis_build_core::resolve_environment_declaration_entries(config)?;
+    let environment_declarations_json = serde_json::to_string(&environment_declarations)?;
     let has_kv = config
         .services
         .as_ref()
@@ -59,7 +62,8 @@ pub fn generate_with_node_compat(
         .unwrap_or(false);
 
     // 1. Generate Context Builder Code
-    let context_builder_code = generate_context_builder_code(has_kv);
+    let context_builder_code =
+        generate_context_builder_code(has_kv, &environment_declarations_json);
 
     // 2. Generate KV Adapter Code
     let kv_adapter_code = if has_kv {
@@ -69,7 +73,8 @@ pub fn generate_with_node_compat(
     };
 
     // 3. Generate Router Code
-    let router_code = generate_router_code(routes, has_kv, node_compat);
+    let router_code =
+        generate_router_code(routes, has_kv, node_compat, &environment_declarations_json);
 
     // 4. Generate Config Files
     let mut config_files = Vec::new();
@@ -204,7 +209,12 @@ fn refuse_unplanned_resources(config: &ProjectConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: bool) -> String {
+fn generate_router_code(
+    routes: &[(String, String)],
+    has_kv: bool,
+    node_compat: bool,
+    environment_declarations_json: &str,
+) -> String {
     let mut imports = String::new();
     let mut route_handlers = String::new();
 
@@ -219,7 +229,9 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: 
         imports.push_str(&format!("import handler{i} from {import_literal};\n"));
 
         let invocation = if node_compat {
-            format!("runWithEdgeCanonNodeEnv(env, () => handler{i}(context))")
+            format!(
+                "runWithEdgeCanonNodeEnv(edgeCanonProcessEnvironment(context.env, EDGE_CANON_ENVIRONMENT_DECLARATIONS), () => handler{i}(context))"
+            )
         } else {
             format!("handler{i}(context)")
         };
@@ -239,7 +251,7 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: 
         ""
     };
     let node_runtime_import = if node_compat {
-        "import { runWithEdgeCanonNodeEnv } from 'edge-canon:node-runtime';\n"
+        "import { runWithEdgeCanonNodeEnv } from 'edge-canon:node-runtime';\nimport { edgeCanonProcessEnvironment } from './edge-canon-runtime.js';\n"
     } else {
         ""
     };
@@ -259,6 +271,7 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool, node_compat: 
 import {{ invokeEdgeCanonHandler, edgeCanonFailureResponse, matchRoute }} from './edge-canon-runtime.js';
 import {{ createContextBuilder }} from './adapters/context-builder';
 {node_runtime_import}{imports}
+const EDGE_CANON_ENVIRONMENT_DECLARATIONS = {environment_declarations_json};
 
 export default {{
   async fetch(request, env, ctx) {{
@@ -279,7 +292,7 @@ export default {{
     )
 }
 
-fn generate_context_builder_code(has_kv: bool) -> String {
+fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &str) -> String {
     let kv_import = if has_kv {
         "import { createKVAdapter } from './kv-adapter';\n"
     } else {
@@ -298,12 +311,17 @@ fn generate_context_builder_code(has_kv: bool) -> String {
  * request, env, params and waitUntil, as required by EC-WEB v1.
  */
 
-{kv_import}import {{ createEdgeCanonContext, extractParams }} from '../edge-canon-runtime.js';
+{kv_import}import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
+
+const EDGE_CANON_ENVIRONMENT_DECLARATIONS = {environment_declarations_json};
 
 export function createContextBuilder(env: any, ctx: any) {{
   return function buildContext(request: Request, route: string = '/', wildcardName: string | null = null) {{
     const url = new URL(request.url);
-    const standardEnv: Record<string, unknown> = Object.assign({{}}, env || {{}});
+    const standardEnv: Record<string, unknown> = materializeEdgeCanonEnvironment(
+      env,
+      EDGE_CANON_ENVIRONMENT_DECLARATIONS
+    );
     {kv_binding}
     return createEdgeCanonContext(
       request,

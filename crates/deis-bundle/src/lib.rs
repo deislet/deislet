@@ -73,7 +73,9 @@ pub use site::{
 /// on half of it. It is the first of the few gates [`forward::GATES`] names,
 /// and the only one that is about the document rather than one value in it.
 /// See [`forward`] for the rule and what it costs an operator rolling back.
-pub const SUPPORTED_SCHEMA: u32 = 1;
+pub const SUPPORTED_SCHEMA: u32 = 2;
+/// Oldest native bundle schema this release can still load for rollback.
+pub const MIN_SUPPORTED_SCHEMA: u32 = 1;
 
 /// Name of the manifest at the root of the archive.
 pub const MANIFEST_ENTRY: &str = "manifest.json";
@@ -249,6 +251,10 @@ pub struct Manifest {
     /// delivered to a node at deploy time, never carried in a bundle.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Exact Edge Canon environment declaration carried by schema 2 bundles.
+    /// Runtime values and secret plaintext never belong here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<deis_wire::EnvironmentDeclarations>,
     #[serde(default)]
     pub routes: Vec<Route>,
     /// Cron expressions this app wants to be triggered on.
@@ -357,7 +363,7 @@ impl Manifest {
 
     /// Checks that hold regardless of who is reading the bundle.
     pub fn validate(&self) -> Result<()> {
-        if self.schema != SUPPORTED_SCHEMA {
+        if !(MIN_SUPPORTED_SCHEMA..=SUPPORTED_SCHEMA).contains(&self.schema) {
             return Err(BundleError::UnsupportedSchema {
                 found: self.schema,
                 supported: SUPPORTED_SCHEMA,
@@ -386,6 +392,32 @@ impl Manifest {
             .validate(&self.app)
             .map_err(BundleError::InvalidManifest)?;
         validate_callable_by(&self.callable_by).map_err(BundleError::InvalidManifest)?;
+
+        match (self.schema, &self.environment) {
+            (1, Some(_)) => {
+                return Err(BundleError::InvalidManifest(
+                    "schema 1 cannot carry the mandatory Edge Canon environment declaration; use schema 2"
+                        .into(),
+                ));
+            }
+            (2, Some(environment)) => {
+                environment
+                    .validate(&environment.standard_version, self.bindings.all_names())
+                    .map_err(|error| BundleError::InvalidManifest(error.to_string()))?;
+                if !self.env.is_empty() || !self.secrets.is_empty() {
+                    return Err(BundleError::InvalidManifest(
+                        "schema 2 keeps runtime config and secret values outside the bundle; legacy env/secrets fields must be empty"
+                            .into(),
+                    ));
+                }
+            }
+            (2, None) => {
+                return Err(BundleError::InvalidManifest(
+                    "schema 2 requires an Edge Canon environment declaration".into(),
+                ));
+            }
+            _ => {}
+        }
 
         // A binding is published on the environment table beside the
         // application's own variables, and the platform's property wins, so a
@@ -609,6 +641,48 @@ mod tests {
                 supported: SUPPORTED_SCHEMA
             }
         );
+    }
+
+    #[test]
+    fn schema_two_requires_only_the_standard_environment_declaration() {
+        let missing = r#"{"schema":2,"app":"demo","entry":"e.js"}"#;
+        let error = Manifest::parse(missing).unwrap_err().to_string();
+        assert!(error.contains("requires an Edge Canon environment declaration"));
+
+        let declaration = serde_json::to_value(deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "TOKEN".into(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        ))
+        .unwrap();
+        let valid = serde_json::json!({
+            "schema": 2,
+            "app": "demo",
+            "entry": "e.js",
+            "environment": declaration
+        });
+        let parsed = Manifest::parse(&valid.to_string()).unwrap();
+        assert!(parsed.environment.is_some());
+        assert!(parsed.env.is_empty());
+        assert!(parsed.secrets.is_empty());
+
+        let mut carries_legacy_value = valid.clone();
+        carries_legacy_value["env"] = serde_json::json!({"TOKEN":"must-not-enter"});
+        let error = Manifest::parse(&carries_legacy_value.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the bundle"));
+
+        let mut legacy_with_declaration = valid;
+        legacy_with_declaration["schema"] = serde_json::json!(1);
+        let error = Manifest::parse(&legacy_with_declaration.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("schema 1 cannot carry"));
     }
 
     #[test]

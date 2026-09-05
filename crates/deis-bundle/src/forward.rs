@@ -254,6 +254,7 @@ pub const MANIFEST_FIELDS: &[&str] = &[
     "callable_by",
     "env",
     "secrets",
+    "environment",
     "routes",
     "cron",
     "queues",
@@ -619,6 +620,10 @@ mod tests {
                 .into_iter()
                 .collect(),
             secrets: vec!["API_KEY".to_string()],
+            environment: Some(deis_wire::EnvironmentDeclarations::new(
+                "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+                Vec::new(),
+            )),
             routes: vec![Route {
                 pattern: "/api/users/:id".to_string(),
                 methods: vec!["GET".to_string()],
@@ -912,12 +917,12 @@ mod tests {
         );
 
         // `schema`: the whole manifest, in `validate`.
-        let future = FROM_A_NEWER_BUILDER.replace("\"schema\": 1", "\"schema\": 2");
+        let future = FROM_A_NEWER_BUILDER.replace("\"schema\": 1", "\"schema\": 3");
         assert!(matches!(
             Manifest::parse(&future),
             Err(BundleError::UnsupportedSchema {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: crate::SUPPORTED_SCHEMA
             })
         ));
 

@@ -81,6 +81,7 @@ async fn canonical_identity_is_portable_complete_and_secret_free() {
     assert!(paths.contains(&"static/css/app.css"));
     assert!(paths.contains(&"documents/routing-static-assets.json"));
     for required in [
+        "environment-secrets",
         "provenance",
         "runtime-entrypoints",
         "sbom",
@@ -96,6 +97,17 @@ async fn canonical_identity_is_portable_complete_and_secret_free() {
             "{required}"
         );
     }
+
+    let environment_bytes = std::fs::read(first_root.join("documents/environment-secrets.json"))
+        .expect("environment declaration document");
+    let environment: deis_wire::EnvironmentDeclarations =
+        serde_json::from_slice(&environment_bytes).expect("standard environment document");
+    assert_eq!(environment.declarations.len(), 2);
+    assert_eq!(environment.declarations[0].name, "PUBLIC_NAME");
+    assert_eq!(environment.declarations[1].name, "TOKEN");
+    assert!(!environment_bytes
+        .windows(b"EC_RUNTIME_VALUE_MUST_NOT_ENTER_ARTIFACT".len())
+        .any(|window| window == b"EC_RUNTIME_VALUE_MUST_NOT_ENTER_ARTIFACT"));
 
     let first_bytes =
         std::fs::read(first_root.join(canonical_artifact::MANIFEST_PATH)).expect("manifest bytes");
@@ -158,6 +170,14 @@ async fn provider_payload_is_bound_to_the_exact_canonical_parent() {
         Some(&canonical.artifact_sha256),
     )
     .expect("provider payload validates");
+
+    let bundle =
+        std::fs::read(Path::new(&provider.output_path).join("bundle.zip")).expect("native bundle");
+    let native = deis_bundle::read_manifest(&bundle).expect("schema two native bundle");
+    assert_eq!(native.manifest.schema, 2);
+    assert!(native.manifest.environment.is_some());
+    assert!(native.manifest.env.is_empty());
+    assert!(native.manifest.secrets.is_empty());
 
     std::fs::write(
         Path::new(&provider.output_path).join("bundle.zip"),

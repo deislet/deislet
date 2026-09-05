@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use deis_wire::{
+    EnvironmentConfigBinding, EnvironmentDeclaration, EnvironmentDeclarations, EnvironmentKind,
+    EnvironmentValueType,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -102,10 +107,171 @@ fn default_function_root() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentConfig {
+    /// Portable runtime-binding declarations. These are the only environment
+    /// facts that enter the canonical artifact.
+    #[serde(default)]
+    pub declarations: Vec<EnvironmentDeclaration>,
+    /// Deployment-time config values. They are deliberately separate from
+    /// declarations and never participate in canonical build identity.
+    #[serde(default)]
+    pub values: Option<HashMap<String, serde_json::Value>>,
+    /// Legacy config/string values. Each name implies a required
+    /// `config/string` declaration; the value remains deployment-only.
     #[serde(default)]
     pub variables: Option<HashMap<String, String>>,
+    /// Legacy required `secret/string` declaration names. Secret plaintext is
+    /// never accepted in the project file.
     #[serde(default)]
     pub secrets: Option<Vec<String>>,
+}
+
+/// Build the one standard declaration document implied by a project.
+///
+/// The legacy `variables` and `secrets` spellings remain readable, but only as
+/// shorthand for required declarations. Variable values do not enter this
+/// result, so changing a deployment value cannot move canonical identity.
+pub fn resolve_environment_declarations(
+    config: &ProjectConfig,
+    standard_version: &str,
+) -> anyhow::Result<EnvironmentDeclarations> {
+    let declarations = resolve_environment_declaration_entries(config)?;
+    let document = EnvironmentDeclarations::new(standard_version, declarations);
+    document
+        .validate(standard_version, config.bindings.keys())
+        .map_err(anyhow::Error::new)?;
+    Ok(document)
+}
+
+/// Resolve declaration rows without attaching a standard pin. Provider
+/// adapters use these rows to compile their runtime filter; the canonical
+/// document remains the authority for version and identity.
+pub fn resolve_environment_declaration_entries(
+    config: &ProjectConfig,
+) -> anyhow::Result<Vec<EnvironmentDeclaration>> {
+    let environment = config.environment.as_ref();
+    let mut declarations = BTreeMap::<String, EnvironmentDeclaration>::new();
+    if let Some(environment) = environment {
+        for declaration in &environment.declarations {
+            if declarations
+                .insert(declaration.name.clone(), declaration.clone())
+                .is_some()
+            {
+                anyhow::bail!(
+                    "EC_ENV_DUPLICATE_NAME: environment declarations contain a duplicate name"
+                );
+            }
+        }
+
+        if let Some(variables) = &environment.variables {
+            for name in variables.keys() {
+                insert_legacy_declaration(
+                    &mut declarations,
+                    name,
+                    EnvironmentKind::Config,
+                    EnvironmentValueType::String,
+                )?;
+            }
+        }
+        if let Some(secrets) = &environment.secrets {
+            for name in secrets {
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                insert_legacy_declaration(
+                    &mut declarations,
+                    name,
+                    EnvironmentKind::Secret,
+                    EnvironmentValueType::String,
+                )?;
+            }
+        }
+    }
+
+    if declarations.len() > deis_wire::ENVIRONMENT_BINDING_COUNT_LIMIT {
+        anyhow::bail!(
+            "EC_ENV_BINDING_LIMIT_EXCEEDED: environment declaration count exceeds the v1 limit"
+        );
+    }
+    for declaration in declarations.values() {
+        declaration.validate().map_err(anyhow::Error::new)?;
+        if config.bindings.contains_key(&declaration.name) {
+            anyhow::bail!(
+                "EC_ENV_NAMESPACE_COLLISION: environment and logical-resource declarations share a name"
+            );
+        }
+    }
+    Ok(declarations.into_values().collect())
+}
+
+fn insert_legacy_declaration(
+    declarations: &mut BTreeMap<String, EnvironmentDeclaration>,
+    name: &str,
+    kind: EnvironmentKind,
+    value_type: EnvironmentValueType,
+) -> anyhow::Result<()> {
+    match declarations.get(name) {
+        Some(existing) if existing.kind == kind && existing.value_type == value_type => Ok(()),
+        Some(_) => anyhow::bail!(
+            "EC_ENV_BINDING_TYPE_MISMATCH: a legacy environment entry conflicts with its explicit declaration"
+        ),
+        None => {
+            declarations.insert(
+                name.to_string(),
+                EnvironmentDeclaration {
+                    name: name.to_string(),
+                    kind,
+                    value_type,
+                    required: true,
+                },
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Resolve only deployment-time non-secret values and validate them against
+/// the canonical declaration document.
+pub fn resolve_environment_config_values(
+    config: &ProjectConfig,
+    declarations: &EnvironmentDeclarations,
+) -> anyhow::Result<BTreeMap<String, serde_json::Value>> {
+    let mut values = BTreeMap::new();
+    let Some(environment) = &config.environment else {
+        return Ok(values);
+    };
+
+    if let Some(legacy) = &environment.variables {
+        for (name, value) in legacy {
+            values.insert(name.clone(), serde_json::Value::String(value.clone()));
+        }
+    }
+    if let Some(configured) = &environment.values {
+        for (name, value) in configured {
+            if values.insert(name.clone(), value.clone()).is_some() {
+                anyhow::bail!(
+                    "EC_ENV_DUPLICATE_NAME: config value is supplied by both variables and values"
+                );
+            }
+        }
+    }
+
+    let declared = declarations.by_name();
+    for (name, value) in &values {
+        let declaration = declared.get(name.as_str()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "EC_ENV_BINDING_UNDECLARED: deployment config contains an undeclared name"
+            )
+        })?;
+        if declaration.kind != EnvironmentKind::Config {
+            anyhow::bail!(
+                "EC_ENV_BINDING_TYPE_MISMATCH: deployment config supplies a value for a secret declaration"
+            );
+        }
+        EnvironmentConfigBinding::new(name, declaration.value_type, value.clone())
+            .map_err(anyhow::Error::new)?;
+    }
+    Ok(values)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,5 +654,69 @@ mod tests {
                 "key {key}"
             );
         }
+    }
+
+    const STANDARD: &str = "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66";
+
+    #[test]
+    fn legacy_environment_values_become_declarations_without_entering_the_document() {
+        let mut json = minimal();
+        json["environment"] = serde_json::json!({
+            "variables": {"PUBLIC_NAME": "sentinel-must-not-enter"},
+            "secrets": ["TOKEN"]
+        });
+        let config = parse(json);
+        let declarations = resolve_environment_declarations(&config, STANDARD).unwrap();
+        assert_eq!(declarations.declarations.len(), 2);
+        let encoded = serde_json::to_string(&declarations).unwrap();
+        assert!(!encoded.contains("sentinel-must-not-enter"));
+        assert!(encoded.contains("PUBLIC_NAME"));
+        assert!(encoded.contains("TOKEN"));
+    }
+
+    #[test]
+    fn explicit_json_and_optional_declarations_validate_values_by_type() {
+        let mut json = minimal();
+        json["environment"] = serde_json::json!({
+            "declarations": [
+                {"name":"OPTIONS","kind":"config","valueType":"json","required":false},
+                {"name":"TOKEN","kind":"secret","valueType":"string","required":true}
+            ],
+            "values": {"OPTIONS":{"enabled":true}}
+        });
+        let config = parse(json);
+        let declarations = resolve_environment_declarations(&config, STANDARD).unwrap();
+        let values = resolve_environment_config_values(&config, &declarations).unwrap();
+        assert_eq!(values["OPTIONS"], serde_json::json!({"enabled":true}));
+    }
+
+    #[test]
+    fn a_runtime_value_cannot_escape_its_declaration_or_resource_namespace() {
+        let mut json = minimal();
+        json["environment"] = serde_json::json!({
+            "declarations": [
+                {"name":"TOKEN","kind":"secret","valueType":"string","required":true}
+            ],
+            "values": {"TOKEN":"plaintext-is-not-config"}
+        });
+        let config = parse(json);
+        let declarations = resolve_environment_declarations(&config, STANDARD).unwrap();
+        assert!(resolve_environment_config_values(&config, &declarations).is_err());
+
+        let mut json = minimal();
+        json["bindings"] = serde_json::json!({"CACHE":{"kind":"kv"}});
+        json["environment"] = serde_json::json!({
+            "declarations": [
+                {"name":"CACHE","kind":"config","valueType":"string","required":true}
+            ]
+        });
+        assert_eq!(
+            resolve_environment_declarations(&parse(json), STANDARD)
+                .unwrap_err()
+                .to_string()
+                .split(':')
+                .next(),
+            Some("EC_ENV_NAMESPACE_COLLISION")
+        );
     }
 }

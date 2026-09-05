@@ -97,7 +97,10 @@ fn test_context_structure() {
         .contains("const request = context.request"));
     assert!(result
         .context_builder_code
-        .contains("Object.assign({}, context.env || {})"));
+        .contains("materializeEdgeCanonEnvironment("));
+    assert!(result
+        .context_builder_code
+        .contains("EDGE_CANON_ENVIRONMENT_DECLARATIONS"));
     assert!(result.context_builder_code.contains("extractParams"));
     assert!(!result.context_builder_code.contains("services:"));
     assert!(!result.context_builder_code.contains("cookies:"));
@@ -180,7 +183,9 @@ fn context_bridge_avoids_object_spread_syntax() {
     let result = generate(&routes, &config, &[]).unwrap();
 
     assert!(!result.context_builder_code.contains("...context"));
-    assert!(result.context_builder_code.contains("Object.assign"));
+    assert!(result
+        .context_builder_code
+        .contains("materializeEdgeCanonEnvironment"));
 }
 
 #[test]

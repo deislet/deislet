@@ -65,6 +65,10 @@ fn a_manifest_holding_every_field() -> Manifest {
             .into_iter()
             .collect(),
         secrets: vec!["API_KEY".to_string()],
+        environment: Some(deis_wire::EnvironmentDeclarations::new(
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            Vec::new(),
+        )),
         routes: vec![Route {
             pattern: "/api/users/:id".to_string(),
             methods: vec!["GET".to_string()],

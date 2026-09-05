@@ -11,6 +11,7 @@ description = "Deislet adapter for deis-build: entry module and application bund
 [dependencies]
 deis-build-core = { version = "0.1.0", path = "../deis-build-core" }
 deis-bundle = { path = "../deis-bundle" }
+deis-wire = { workspace = true }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

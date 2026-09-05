@@ -23,8 +23,7 @@ struct CanonicalApplicationPlan {
     format: String,
     standard_version: String,
     config: ProjectConfig,
-    environment_variable_names: Vec<String>,
-    secret_names: Vec<String>,
+    environment_declarations_sha256: String,
     routes: Vec<CanonicalRoute>,
     uses_node_npm: bool,
     build: CanonicalBuildPlan,
@@ -1198,8 +1197,8 @@ impl Compiler {
                 )
             },
         )?;
-        if plan.schema_version != 1
-            || plan.format != "deislet.application-plan/v1"
+        if plan.schema_version != 2
+            || plan.format != "deislet.application-plan/v2"
             || plan.standard_version != standard_version
         {
             return Err(anyhow::anyhow!(
@@ -1207,7 +1206,23 @@ impl Compiler {
             ));
         }
 
-        Self::validate_deployment_environment(deployment_config, &plan)?;
+        let environment_bytes =
+            Self::read_canonical_document(canonical_root, &manifest, "environment-secrets")?;
+        let environment: deis_wire::EnvironmentDeclarations =
+            serde_json::from_slice(&environment_bytes).map_err(|_| {
+                anyhow::anyhow!(
+                    "EC_ENV_DOCUMENT_INVALID: canonical environment declaration does not match v1"
+                )
+            })?;
+        environment
+            .validate(&standard_version, plan.config.bindings.keys())
+            .map_err(anyhow::Error::new)?;
+        if environment.identity()? != plan.environment_declarations_sha256 {
+            return Err(anyhow::anyhow!(
+                "EC_ENV_DECLARATION_IDENTITY_MISMATCH: application plan does not bind the canonical environment declaration"
+            ));
+        }
+        Self::validate_deployment_environment(deployment_config, &plan, &environment)?;
         Self::refuse_canonical_event_target(vendor, &plan)?;
         Self::refuse_unimplemented_resource_target(vendor, &plan.config)?;
         let routing_bytes =
@@ -1231,7 +1246,12 @@ impl Compiler {
         };
         let mut derived_config = plan.config.clone();
         derived_config.function_root = "./functions".into();
-        derived_config.environment = deployment_config.environment.clone();
+        derived_config.environment = Some(deis_build_core::EnvironmentConfig {
+            declarations: environment.declarations.clone(),
+            values: None,
+            variables: None,
+            secrets: None,
+        });
         derived_config.vendors = None;
         derived_config.build = Some(deis_build_core::BuildConfig {
             out_dir: provider_staging
@@ -1425,26 +1445,18 @@ impl Compiler {
     fn validate_deployment_environment(
         deployment_config: &ProjectConfig,
         plan: &CanonicalApplicationPlan,
+        canonical: &deis_wire::EnvironmentDeclarations,
     ) -> anyhow::Result<()> {
-        let mut variable_names = deployment_config
-            .environment
-            .as_ref()
-            .and_then(|environment| environment.variables.as_ref())
-            .map(|variables| variables.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        variable_names.sort();
-        let mut secret_names = deployment_config
-            .environment
-            .as_ref()
-            .and_then(|environment| environment.secrets.clone())
-            .unwrap_or_default();
-        secret_names.sort();
-        secret_names.dedup();
-        if variable_names != plan.environment_variable_names || secret_names != plan.secret_names {
+        let supplied = deis_build_core::resolve_environment_declarations(
+            deployment_config,
+            &plan.standard_version,
+        )?;
+        if supplied.identity()? != canonical.identity()? {
             return Err(anyhow::anyhow!(
-                "EC_ARTIFACT_DERIVATION_INPUT_MISMATCH: deployment environment names differ from the canonical plan"
+                "EC_ARTIFACT_DERIVATION_INPUT_MISMATCH: deployment environment declarations differ from the canonical parent"
             ));
         }
+        deis_build_core::resolve_environment_config_values(deployment_config, canonical)?;
         Ok(())
     }
 
@@ -2691,23 +2703,10 @@ impl Compiler {
                 serde_json::json!({"kind": kind, "pattern": pattern, "source": source})
             })
             .collect::<Vec<_>>();
-        let environment_names = config
-            .environment
-            .as_ref()
-            .and_then(|environment| environment.variables.as_ref())
-            .map(|variables| {
-                let mut names = variables.keys().cloned().collect::<Vec<_>>();
-                names.sort();
-                names
-            })
-            .unwrap_or_default();
-        let mut secret_names = config
-            .environment
-            .as_ref()
-            .and_then(|environment| environment.secrets.clone())
-            .unwrap_or_default();
-        secret_names.sort();
-        secret_names.dedup();
+        let environment_document =
+            deis_build_core::resolve_environment_declarations(config, &standard_version)?;
+        let environment_declarations_sha256 = environment_document.identity()?;
+        let environment_document_bytes = canonical_json_bytes(&environment_document)?;
 
         // This document intentionally excludes environment values, provider
         // selection/configuration and output paths. It is the provider-neutral
@@ -2721,12 +2720,11 @@ impl Compiler {
             assets.dir = "./public".into();
         }
         let application_plan = serde_json::json!({
-            "schemaVersion": 1,
-            "format": "deislet.application-plan/v1",
+            "schemaVersion": 2,
+            "format": "deislet.application-plan/v2",
             "standardVersion": standard_version.clone(),
             "config": canonical_config,
-            "environmentVariableNames": environment_names,
-            "secretNames": secret_names,
+            "environmentDeclarationsSha256": environment_declarations_sha256,
             "routes": route_rows,
             "usesNodeNpm": uses_node_npm,
             "build": {"minify": minify, "sourceMap": source_map},
@@ -2856,6 +2854,11 @@ impl Compiler {
                 1,
                 "documents/routing-static-assets.json".into(),
             ),
+            (
+                "environment-secrets".into(),
+                1,
+                "documents/environment-secrets.json".into(),
+            ),
         ];
         for (path, media_type, document) in [
             (
@@ -2887,6 +2890,11 @@ impl Compiler {
                 "documents/routing-static-assets.json",
                 "application/json",
                 routing_document_bytes,
+            ),
+            (
+                "documents/environment-secrets.json",
+                "application/json",
+                environment_document_bytes,
             ),
         ] {
             files.insert(
@@ -3080,7 +3088,15 @@ impl Compiler {
         let assets =
             deis_build_adapter_deislet::collect_assets(&Self::assets_dir(project_dir, config))?;
 
-        let manifest = deis_build_adapter_deislet::build_manifest(config, &plan.routes, &assets)?;
+        let standard_version = Self::locked_standard_version()?;
+        let environment =
+            deis_build_core::resolve_environment_declarations(config, &standard_version)?;
+        let manifest = deis_build_adapter_deislet::build_manifest_with_environment(
+            config,
+            &plan.routes,
+            &assets,
+            environment,
+        )?;
         let bytes = deis_build_adapter_deislet::write_bundle(&manifest, worker_js, &assets)?;
         let digest = deis_build_adapter_deislet::bundle_sha256(&bytes);
 

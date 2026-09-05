@@ -13,7 +13,7 @@ use anyhow::{bail, Result};
 use deis_build_core::ProjectConfig;
 use deis_bundle::{
     Asset, Binding, BindingKind, DeclaredBindings, DeclaredCompatibility, DeclaredLimits, Manifest,
-    QueueConsumer, Route, SUPPORTED_SCHEMA,
+    QueueConsumer, Route, MIN_SUPPORTED_SCHEMA, SUPPORTED_SCHEMA,
 };
 
 use crate::assets::StagedAsset;
@@ -60,7 +60,7 @@ pub fn build_manifest(
     let site = build_site_config(config, assets)?;
 
     let manifest = Manifest {
-        schema: SUPPORTED_SCHEMA,
+        schema: MIN_SUPPORTED_SCHEMA,
         app: app.to_string(),
         entry: WORKER_ENTRY.to_string(),
         runtime: Some(RUNTIME_PROFILE.to_string()),
@@ -69,6 +69,7 @@ pub fn build_manifest(
         callable_by: callable_by(config),
         env: environment(config),
         secrets: secret_names(config),
+        environment: None,
         routes: routes
             .iter()
             .map(|route| Route {
@@ -110,6 +111,23 @@ pub fn build_manifest(
     // than finding out when a deploy is rejected.
     manifest.validate()?;
 
+    Ok(manifest)
+}
+
+/// Assemble a schema 2 native bundle manifest from the verified canonical
+/// environment document. No deployment value is copied into the bundle.
+pub fn build_manifest_with_environment(
+    config: &ProjectConfig,
+    routes: &[RouteEntry],
+    assets: &[StagedAsset],
+    environment: deis_wire::EnvironmentDeclarations,
+) -> Result<Manifest> {
+    let mut manifest = build_manifest(config, routes, assets)?;
+    manifest.schema = SUPPORTED_SCHEMA;
+    manifest.env.clear();
+    manifest.secrets.clear();
+    manifest.environment = Some(environment);
+    manifest.validate()?;
     Ok(manifest)
 }
 
@@ -352,7 +370,7 @@ mod tests {
     fn the_entry_points_at_the_bundled_worker() {
         let manifest = build_manifest(&config(serde_json::json!({})), &[], &[]).unwrap();
         assert_eq!(manifest.entry, WORKER_ENTRY);
-        assert_eq!(manifest.schema, SUPPORTED_SCHEMA);
+        assert_eq!(manifest.schema, MIN_SUPPORTED_SCHEMA);
         assert_eq!(manifest.app, "demo");
         assert_eq!(manifest.runtime.as_deref(), Some(RUNTIME_PROFILE));
     }
@@ -403,6 +421,34 @@ mod tests {
             !json.contains("password"),
             "no value ever accompanies a name"
         );
+    }
+
+    #[test]
+    fn standard_environment_builds_schema_two_without_runtime_values() {
+        let project = config(serde_json::json!({
+            "environment": {
+                "declarations": [
+                    {"name":"OPTIONS","kind":"config","valueType":"json","required":false},
+                    {"name":"TOKEN","kind":"secret","valueType":"string","required":true}
+                ],
+                "values": {"OPTIONS":{"sentinel":"must-not-enter"}}
+            }
+        }));
+        let declarations = deis_build_core::resolve_environment_declarations(
+            &project,
+            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+        )
+        .unwrap();
+        let manifest =
+            build_manifest_with_environment(&project, &[], &[], declarations.clone()).unwrap();
+
+        assert_eq!(manifest.schema, SUPPORTED_SCHEMA);
+        assert_eq!(manifest.environment, Some(declarations));
+        assert!(manifest.env.is_empty());
+        assert!(manifest.secrets.is_empty());
+        assert!(!serde_json::to_string(&manifest)
+            .unwrap()
+            .contains("must-not-enter"));
     }
 
     #[test]
