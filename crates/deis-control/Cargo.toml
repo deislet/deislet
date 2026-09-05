@@ -7,6 +7,7 @@ authors = ["kookyleo <kookyleo@gmail.com>"]
 
 [dependencies]
 deis-bundle = { path = "../deis-bundle" }
+deis-build = { path = "../deis-build" }
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"
@@ -70,6 +71,7 @@ rand = "0.8"
 
 # Application bundles: zip container plus streamed HTTP download
 zip = "0.6"
+walkdir = "2.4"
 tokio-util = { version = "0.7", features = ["io"] }
 
 # Secret encryption at rest (AES-256-GCM, nonce prefixed)

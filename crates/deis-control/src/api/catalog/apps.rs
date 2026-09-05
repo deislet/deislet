@@ -39,6 +39,7 @@ pub struct DeleteAppResponse {
     pub app_id: String,
     pub removed: crate::catalog::DeletedApp,
     pub bundle_files_removed: usize,
+    pub artifact_directories_removed: usize,
     /// Which nodes stopped serving the app, and which did not.
     ///
     /// A node in `failed` is still running the deleted application - its
@@ -148,6 +149,24 @@ pub async fn delete_app(
         }
     }
 
+    let mut artifact_directories_removed = 0usize;
+    for path in &removed.artifact_paths {
+        match state.artifacts.remove(std::path::Path::new(path)) {
+            Ok(true) => artifact_directories_removed += 1,
+            Ok(false) => warn!(
+                app_id = %app_id,
+                path = %path,
+                "Canonical artifact directory of a deleted app was already gone"
+            ),
+            Err(e) => warn!(
+                app_id = %app_id,
+                path = %path,
+                error = %e,
+                "Could not delete a canonical artifact directory; it is now unreferenced"
+            ),
+        }
+    }
+
     // Best effort: an empty per-app directory is noise, but a leftover one
     // is harmless, so a failure here is not worth a warning.
     let app_dir = state.bundles.root().join(&app_id);
@@ -159,6 +178,7 @@ pub async fn delete_app(
         info!(
             app_id = %app_id,
             bundle_files_removed,
+            artifact_directories_removed,
             nodes = unloaded.unloaded.len(),
             "App deletion finished; nothing serves it any more"
         );
@@ -166,6 +186,7 @@ pub async fn delete_app(
         warn!(
             app_id = %app_id,
             bundle_files_removed,
+            artifact_directories_removed,
             still_serving = ?unloaded.failed.iter().map(|f| f.node.as_str()).collect::<Vec<_>>(),
             "App deletion finished in the catalog only; the listed nodes were not reached and keep serving the deleted application until they are restarted"
         );
@@ -183,6 +204,7 @@ pub async fn delete_app(
         retained,
         removed,
         bundle_files_removed,
+        artifact_directories_removed,
         unloaded,
     }))
 }

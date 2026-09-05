@@ -451,6 +451,25 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         // it is stored and put nowhere. Whoever may deploy into any one of
         // this application's environments may upload the bundle they will
         // deploy.
+        ["api", "apps", app, "artifacts"] if !writing => {
+            Requirement::new("artifact.list", Verb::Read, named(app), Resource::Any)
+        }
+        ["api", "apps", app, "artifacts"] => {
+            Requirement::new("artifact.upload", Verb::Deploy, named(app), Resource::Any)
+                .changes_state()
+        }
+        ["api", "apps", app, "artifacts", artifact] if !writing => {
+            Requirement::new("artifact.get", Verb::Read, named(app), Resource::Any).about(artifact)
+        }
+        ["api", "apps", app, "artifacts", artifact, "versions"] => Requirement::new(
+            "version.upload_lineage",
+            Verb::Deploy,
+            named(app),
+            Resource::Any,
+        )
+        .about(artifact)
+        .changes_state(),
+
         ["api", "apps", app, "versions"] if !writing => {
             Requirement::new("version.list", Verb::Read, named(app), Resource::Any)
         }

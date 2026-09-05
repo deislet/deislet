@@ -46,6 +46,12 @@ pub struct Version {
     /// The per-application counter a person says out loud: "v3".
     pub number: i64,
     pub bundle_sha: String,
+    /// Exact canonical parent and provider derivation. Absent on versions
+    /// uploaded through the pre-lineage compatibility endpoint.
+    #[serde(default)]
+    pub canonical_artifact_id: Option<CanonicalId>,
+    #[serde(default)]
+    pub provider_derivation_sha256: Option<String>,
     pub created_at: i64,
     #[serde(default)]
     pub manifest: serde_json::Value,
@@ -73,6 +79,30 @@ pub struct UploadResponse {
     pub version: Version,
     /// False when a byte-identical bundle was already stored, in which case
     /// the existing version is returned unchanged and no new number is used.
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalArtifactRecord {
+    pub artifact_id: CanonicalId,
+    pub application_id: CanonicalId,
+    pub state: String,
+    pub deployable: bool,
+    pub canonical_output: CanonicalOutputIdentity,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalOutputIdentity {
+    pub artifact_sha256: String,
+    pub content_root_sha256: String,
+    pub file_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactUploadResponse {
+    pub artifact: CanonicalArtifactRecord,
     pub created: bool,
 }
 
@@ -626,6 +656,52 @@ impl Control {
             .header(reqwest::header::CONTENT_TYPE, "application/zip")
             .body(bundle),
             &format!("uploading a bundle for app {app_id}"),
+        )
+        .await
+    }
+
+    /// Upload and revalidate the provider-neutral Build Output before any
+    /// provider payload derived from it can become a version.
+    pub async fn upload_canonical_artifact(
+        &self,
+        app_id: &str,
+        transport: Vec<u8>,
+        artifact_sha256: &str,
+    ) -> Result<ArtifactUploadResponse> {
+        self.send(
+            self.request(
+                Method::POST,
+                &format!("/api/apps/{app_id}/artifacts?sha256={artifact_sha256}"),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/zip")
+            .body(transport),
+            &format!("uploading canonical artifact for app {app_id}"),
+        )
+        .await
+    }
+
+    /// Upload a native bundle only through the derivation that binds it to a
+    /// previously verified canonical parent.
+    pub async fn upload_version_with_lineage(
+        &self,
+        app_id: &str,
+        artifact_id: CanonicalId,
+        envelope: Vec<u8>,
+        bundle_sha256: &str,
+    ) -> Result<UploadResponse> {
+        self.send(
+            self.request(
+                Method::POST,
+                &format!(
+                    "/api/apps/{app_id}/artifacts/{artifact_id}/versions?sha256={bundle_sha256}"
+                ),
+            )
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/vnd.deislet.provider-envelope.v1+zip",
+            )
+            .body(envelope),
+            &format!("uploading a lineage-bound bundle for app {app_id}"),
         )
         .await
     }

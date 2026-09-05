@@ -46,19 +46,27 @@ payload 本身也经隔离 staging、全量回读和原子 rename 发布到
 `deis deploy` 在读取/上传 bundle 前重新校验 parent、record 和 payload。路由、资产、事件和
 逻辑资源若当前 target 尚无标准语义映射，会在 provider 产物写出前以稳定错误拒绝，不再静默
 丢失或降级。Memory 模式同样经过临时 canonical parent，但不会把临时 identity 当成持久结果。
+Control 现在提供 application-scoped canonical artifact API：上传 zip 只作为 HTTP 传输容器，
+服务端在隔离目录内拒绝路径穿越、链接、非普通文件、重复项和容量越界，重新执行锁定 Edge Canon
+validator 后才把目录按 application UUIDv7 与 manifest SHA-256 原子发布。SQLite 保存不可变的
+canonical artifact record 和 provider derivation；新构建的 Deislet version 必须同时引用精确 parent
+与 derivation，数据库 trigger 拒绝跨应用、跨 provider、半截或事后改写的 lineage。CLI 上传 parent
+后再上传包含精确 derivation record 与 native bundle 的 provider envelope，并对返回 identity 复核。
+旧 `--bundle` 仍显式走无 lineage 的兼容入口，不会被伪装成新链路；删除应用会同时回收受约束的
+内容寻址目录与对应 catalog 行。
 所有 protobuf 代码生成入口显式使用 Cargo.lock 固定的 `protoc-bin-vendored` 3.2.0；构建脚本把
 对应平台的可执行文件直接交给 `prost-build`，不读取宿主 PATH 中的 `protoc`。CI 也不预装系统
 protobuf compiler，因而无法用 runner 的偶然状态掩盖未声明工具链输入。
 
 以下仍是完成本 ADR 的明确缺口：
 
-- current selector 只在整次构建成功后原子切换，并在读取时复核 payload/derivation；它仍是本地最近构建状态，不是跨机器 artifact catalog 或控制面部署 identity；
+- current selector 只在整次构建成功后原子切换，并在读取时复核 payload/derivation；Control 已持久化上传后的 artifact 与 version lineage，但本地 selector 本身仍只是最近构建状态；
 - canonical semantic document 的 schema 覆盖尚未扩展到 logical resource、environment/secret、queue/cron、SSR/ISR、middleware 与 Stateful Object；未实现 target 目前只能 fail closed；
-- 缺少 artifact signature、受信 builder identity、透明/远端 build job、build log 生命周期和控制面 canonical artifact record 持久化；
+- 控制面 canonical artifact record 与 version lineage 已落地；仍缺 artifact signature、受信 builder identity、透明/远端 build job 和 build log 生命周期；当前标准仍是 proposal，因此 record 固定 `deployable: false` 且 signatures 为空，实验性 Deislet 部署入口不能被解释为正式认证；
 - 没有通用 source checkout、framework build、monorepo root、远端 build cache 和官方 framework adapter；`deis build --watch` 仍明确未实现；
 - npm lock/install 已有严格路径，但 native dependency 的目标平台构建、完整多框架矩阵和 cache reuse 未完成；
 - provider 官方 CLI 检查可缺席并形成 warning；统一 driver API、固定工具版本、账户级 prepare/deploy/verify/activate/rollback 及 deployment identity 尚未实现；
-- Linux 上的 determinism 已有回归；Windows 已与 Linux 对同一提交和 fixture 产生相同真实 compiler identity，但 macOS 仍受开发机可用构建空间阻断，因此三平台完整证据尚未取得；
+- Linux、macOS 与 Windows 已对同一提交和 fixture 产生相同 canonical 与四个 provider identity；历史失败 observation 仍保留 macOS `/var` alias 与 Windows verbatim-prefix 两类根因；持续 CI matrix 与发布安装验证仍未完成；
 - 当前结果只是 artifact generation/integrity 证据，不是 provider compliance 或产品 support 结论；registry 状态不得据此提升。
 
 ## 分层架构

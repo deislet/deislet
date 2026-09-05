@@ -57,6 +57,14 @@ identity 迁移已完成八个可执行切片。第一段让 `application`、`en
 
 UUIDv7 目前是 draft 实现选择：它标准化、可跨进程生成并按时间大致排序；其时间部分不是秘密，因此授权永远另行校验。若安全或存储评审否决该格式，必须在 v1 冻结前更新所有 schema/fixture；已发布后不得原地换格式。
 
+Control 已执行该 artifact record 的首个持久化路径。`POST /api/apps/:app/artifacts` 接收的 zip
+仅是传输封装；解包后必须由锁定的 Edge Canon validator 完整验证，目录按 application canonical ID
+和 manifest SHA-256 内容寻址保存，record 中的 contract、requirements 与 artifact schema 摘要来自
+同一仓库锁。Deislet provider derivation 作为独立不可变记录绑定 parent、provider、standard 与
+payload root，新 version 同时引用 artifact ID 与 derivation SHA-256。当前锁定标准仍为 proposal，
+所以生成的控制面 record 必须保持 `deployable: false`、`signatures: []`；旧 raw bundle 上传只作
+明确的兼容路径，其 version lineage 为空，不能冒充已验证供应链。
+
 ## Operation 不变量
 
 [`operation-transitions.json`](operation-transitions.json) 是唯一状态转换表：

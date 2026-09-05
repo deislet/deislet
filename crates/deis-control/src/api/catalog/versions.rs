@@ -1,6 +1,10 @@
 //! Version endpoints: upload a bundle to create one, list them, and serve
 //! the bundle back to nodes as a stream.
 
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path as FsPath, PathBuf};
+
 use axum::{
     Json,
     body::{Body, Bytes},
@@ -17,7 +21,7 @@ use tracing::{info, warn};
 use super::CatalogState;
 use crate::api::bindings::{BindingRefusal, check_service_bindings};
 use crate::api::error::{ApiError, ApiResult};
-use crate::catalog::Version;
+use crate::catalog::{ProviderDerivationSpec, StoredBundle, Version};
 use crate::identity::Principal;
 
 /// Version as seen from outside. `bundle_path` is deliberately absent: it
@@ -29,6 +33,12 @@ pub struct VersionView {
     pub app_id: String,
     pub number: i64,
     pub bundle_sha: String,
+    /// Exact provider-neutral parent and provider derivation. Both are absent
+    /// only for legacy raw-bundle uploads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_artifact_id: Option<CanonicalId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_derivation_sha256: Option<String>,
     pub created_at: i64,
     /// The manifest as structured JSON, parsed from the stored text.
     pub manifest: Value,
@@ -85,6 +95,8 @@ impl From<&Version> for VersionView {
             app_id: version.app_id.clone(),
             number: version.number,
             bundle_sha: version.bundle_sha.clone(),
+            canonical_artifact_id: version.canonical_artifact_id,
+            provider_derivation_sha256: version.provider_derivation_sha256.clone(),
             created_at: version.created_at,
             manifest,
             compatibility,
@@ -114,6 +126,12 @@ pub struct VersionsResponse {
     pub versions: Vec<VersionView>,
     pub total: usize,
 }
+
+/// The provider upload envelope has a small derivation record beside the
+/// native bundle. The HTTP body itself remains bounded by the route.
+pub const MAX_PROVIDER_ENVELOPE_BYTES: usize = super::MAX_BUNDLE_BYTES + 4 * 1024 * 1024;
+const DERIVATION_ENTRY: &str = ".deislet/provider-derivation.json";
+const BUNDLE_ENTRY: &str = "payload/bundle.zip";
 
 /// POST /api/apps/:app_id/versions
 ///
@@ -151,6 +169,90 @@ pub async fn upload_version(
         ApiError::InternalError(format!("bundle processing task failed to complete: {e}"))
     })??;
 
+    record_stored_bundle(
+        &state,
+        &app_id,
+        principal,
+        &headers,
+        received_bytes,
+        stored,
+        None,
+    )
+    .await
+}
+
+/// POST /api/apps/:app_id/artifacts/:artifact_id/versions
+///
+/// The envelope contains exactly an immutable provider derivation record and
+/// the Deislet native bundle it binds. Control revalidates the stored
+/// canonical parent, the derivation, the payload root and the native bundle
+/// before creating one lineage-bound version row.
+pub async fn upload_version_with_lineage(
+    State(state): State<CatalogState>,
+    Path((app_id, artifact_id)): Path<(String, String)>,
+    Query(query): Query<UploadQuery>,
+    principal: Option<Extension<Principal>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<UploadResponse>)> {
+    let artifact_id = artifact_id.parse::<CanonicalId>().map_err(|error| {
+        ApiError::BadRequest(format!("canonical artifact id is invalid: {error}"))
+    })?;
+    let artifact = state
+        .store
+        .get_canonical_artifact(&app_id, artifact_id)
+        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    let expected_artifact_path = state
+        .artifacts
+        .path_for(app.canonical_id, &artifact.artifact_sha256);
+    if FsPath::new(&artifact.storage_path) != expected_artifact_path {
+        return Err(ApiError::InternalError(
+            "canonical artifact catalog path is outside its application store".into(),
+        ));
+    }
+    let bundles = state.bundles.clone();
+    let app_for_task = app_id.clone();
+    let expected_bundle = query.sha256.clone();
+    let envelope = body.to_vec();
+    let received_bytes = envelope.len();
+    let (stored, derivation) = tokio::task::spawn_blocking(move || {
+        let derivation = validate_deislet_envelope(&artifact, &envelope)?;
+        let stored = bundles.store(
+            &app_for_task,
+            &derivation.bundle,
+            expected_bundle.as_deref(),
+        )?;
+        Ok::<_, crate::catalog::CatalogError>((stored, derivation.spec))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::InternalError(format!(
+            "lineage-bound bundle processing task failed to complete: {error}"
+        ))
+    })??;
+
+    record_stored_bundle(
+        &state,
+        &app_id,
+        principal,
+        &headers,
+        received_bytes,
+        stored,
+        Some((artifact_id, derivation)),
+    )
+    .await
+}
+
+async fn record_stored_bundle(
+    state: &CatalogState,
+    app_id: &str,
+    principal: Option<Extension<Principal>>,
+    headers: &axum::http::HeaderMap,
+    received_bytes: usize,
+    stored: StoredBundle,
+    lineage: Option<(CanonicalId, ProviderDerivationSpec)>,
+) -> ApiResult<(StatusCode, Json<UploadResponse>)> {
     // The second gate, and the only one that can be applied here: a service
     // binding in this bundle is this application claiming a right to call
     // another, and the route the upload arrived on named only this one. See
@@ -227,15 +329,32 @@ pub async fn upload_version(
         );
     }
 
-    let (version, created) = state
-        .store
-        .create_version(
-            &app_id,
-            &stored.sha256,
-            &stored.path.to_string_lossy(),
-            &stored.manifest_json,
-        )
-        .await?;
+    let (version, created) = match lineage {
+        Some((artifact_id, derivation)) => {
+            state
+                .store
+                .create_version_with_lineage(
+                    app_id,
+                    &stored.sha256,
+                    &stored.path.to_string_lossy(),
+                    &stored.manifest_json,
+                    artifact_id,
+                    derivation,
+                )
+                .await?
+        }
+        None => {
+            state
+                .store
+                .create_version(
+                    app_id,
+                    &stored.sha256,
+                    &stored.path.to_string_lossy(),
+                    &stored.manifest_json,
+                )
+                .await?
+        }
+    };
 
     info!(
         app_id = %app_id,
@@ -247,8 +366,8 @@ pub async fn upload_version(
         "Bundle upload accepted"
     );
 
-    let base = state.deliverer.base_url(&headers);
-    let bundle_url = crate::delivery::bundle_url(&base, &app_id, &version.id);
+    let base = state.deliverer.base_url(headers);
+    let bundle_url = crate::delivery::bundle_url(&base, app_id, &version.id);
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -262,6 +381,217 @@ pub async fn upload_version(
             bundle_url,
         }),
     ))
+}
+
+#[derive(Debug)]
+struct ValidatedEnvelope {
+    bundle: Vec<u8>,
+    spec: ProviderDerivationSpec,
+}
+
+fn validate_deislet_envelope(
+    artifact: &crate::catalog::CanonicalArtifact,
+    bytes: &[u8],
+) -> crate::catalog::CatalogResult<ValidatedEnvelope> {
+    if bytes.is_empty() || bytes.len() > MAX_PROVIDER_ENVELOPE_BYTES {
+        return Err(crate::catalog::CatalogError::invalid(format!(
+            "provider envelope must contain 1 to {MAX_PROVIDER_ENVELOPE_BYTES} bytes"
+        )));
+    }
+
+    // Re-read the parent immediately before accepting its child. A database
+    // row is not proof that the directory survived disk damage or tampering.
+    let parent = deis_build::canonical_artifact::validate(
+        FsPath::new(&artifact.storage_path),
+        Some(deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION),
+        &[],
+    )
+    .map_err(|error| {
+        crate::catalog::CatalogError::BundleStorage(format!(
+            "stored canonical parent failed deployment-time validation: {error}"
+        ))
+    })?;
+    if parent.artifact_sha256 != artifact.artifact_sha256
+        || parent.content_root_sha256 != artifact.content_root_sha256
+        || parent.standard_version != artifact.standard_version
+    {
+        return Err(crate::catalog::CatalogError::BundleStorage(
+            "stored canonical parent differs from its immutable catalog record".into(),
+        ));
+    }
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|error| {
+        crate::catalog::CatalogError::invalid(format!(
+            "provider envelope is not a readable zip: {error}"
+        ))
+    })?;
+    let mut derivation = None;
+    let mut bundle = None;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            crate::catalog::CatalogError::invalid(format!(
+                "provider envelope entry is invalid: {error}"
+            ))
+        })?;
+        if entry.is_dir() {
+            if !matches!(entry.name(), ".deislet/" | "payload/") {
+                return Err(crate::catalog::CatalogError::invalid(
+                    "provider envelope contains an unexpected directory",
+                ));
+            }
+            continue;
+        }
+        let limit = match entry.name() {
+            DERIVATION_ENTRY => 4 * 1024 * 1024,
+            BUNDLE_ENTRY => super::MAX_BUNDLE_BYTES,
+            _ => {
+                return Err(crate::catalog::CatalogError::invalid(
+                    "provider envelope contains an unexpected file",
+                ));
+            }
+        };
+        let kind = entry.unix_mode().unwrap_or(0) & 0o170000;
+        if !matches!(kind, 0 | 0o100000) || entry.size() > limit as u64 {
+            return Err(crate::catalog::CatalogError::invalid(
+                "provider envelope entry is not one bounded regular file",
+            ));
+        }
+        let mut content = Vec::with_capacity(entry.size() as usize);
+        entry
+            .by_ref()
+            .take(limit as u64 + 1)
+            .read_to_end(&mut content)
+            .map_err(|error| {
+                crate::catalog::CatalogError::invalid(format!(
+                    "provider envelope entry could not be read: {error}"
+                ))
+            })?;
+        if content.len() > limit || content.len() as u64 != entry.size() {
+            return Err(crate::catalog::CatalogError::invalid(
+                "provider envelope entry exceeds its declared bound",
+            ));
+        }
+        match entry.name() {
+            DERIVATION_ENTRY => {
+                if derivation.replace(content).is_some() {
+                    return Err(crate::catalog::CatalogError::invalid(
+                        "provider envelope repeats its derivation record",
+                    ));
+                }
+            }
+            BUNDLE_ENTRY => {
+                if bundle.replace(content).is_some() {
+                    return Err(crate::catalog::CatalogError::invalid(
+                        "provider envelope repeats its native bundle",
+                    ));
+                }
+            }
+            _ => unreachable!("entry names were checked above"),
+        }
+    }
+    let derivation = derivation.ok_or_else(|| {
+        crate::catalog::CatalogError::invalid("provider envelope has no derivation record")
+    })?;
+    let bundle = bundle.ok_or_else(|| {
+        crate::catalog::CatalogError::invalid("provider envelope has no native bundle")
+    })?;
+
+    let derivation_sha256 = deis_build::canonical_artifact::sha256(&derivation);
+    let declared: deis_build::provider_derivation::ProviderDerivationManifest =
+        serde_json::from_slice(&derivation).map_err(|_| {
+            crate::catalog::CatalogError::invalid("provider derivation is not valid JSON")
+        })?;
+    if !is_sha256(&declared.payload.root_sha256) {
+        return Err(crate::catalog::CatalogError::invalid(
+            "provider derivation payload root is not a lowercase SHA-256",
+        ));
+    }
+    let app_root = FsPath::new(&artifact.storage_path)
+        .parent()
+        .ok_or_else(|| {
+            crate::catalog::CatalogError::BundleStorage(
+                "canonical artifact storage path has no application directory".into(),
+            )
+        })?;
+    let staging_path = app_root.join(format!(".provider-upload-{}", CanonicalId::new_v7()));
+    fs::create_dir(&staging_path).map_err(|error| {
+        crate::catalog::CatalogError::BundleStorage(format!(
+            "cannot create provider envelope staging directory: {error}"
+        ))
+    })?;
+    let staging = ProviderStaging(staging_path);
+    let payload_root = staging.0.join(&declared.payload.root_sha256);
+    let record_root = staging.0.join("records");
+    fs::create_dir_all(&payload_root)
+        .and_then(|_| fs::create_dir_all(&record_root))
+        .map_err(|error| {
+            crate::catalog::CatalogError::BundleStorage(format!(
+                "cannot prepare provider envelope staging tree: {error}"
+            ))
+        })?;
+    write_new(&payload_root.join("bundle.zip"), &bundle)?;
+    let record_path = record_root.join(format!("{derivation_sha256}.json"));
+    write_new(&record_path, &derivation)?;
+    let summary = deis_build::provider_derivation::validate(
+        &record_path,
+        &payload_root,
+        Some("deislet"),
+        Some(&artifact.standard_version),
+        Some(&artifact.artifact_sha256),
+    )
+    .map_err(|error| crate::catalog::CatalogError::invalid(error.to_string()))?;
+    if summary.parent_content_root_sha256 != artifact.content_root_sha256 {
+        return Err(crate::catalog::CatalogError::invalid(
+            "provider derivation content root differs from its canonical parent",
+        ));
+    }
+    let manifest = String::from_utf8(derivation).map_err(|_| {
+        crate::catalog::CatalogError::invalid("provider derivation is not UTF-8 JSON")
+    })?;
+    Ok(ValidatedEnvelope {
+        bundle,
+        spec: ProviderDerivationSpec {
+            manifest_sha256: summary.manifest_sha256,
+            provider: "deislet".into(),
+            standard_version: artifact.standard_version.clone(),
+            payload_root_sha256: summary.payload_root_sha256,
+            manifest,
+        },
+    })
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn write_new(path: &FsPath, bytes: &[u8]) -> crate::catalog::CatalogResult<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| {
+            crate::catalog::CatalogError::BundleStorage(format!(
+                "cannot create provider envelope staging file: {error}"
+            ))
+        })?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            crate::catalog::CatalogError::BundleStorage(format!(
+                "cannot write provider envelope staging file: {error}"
+            ))
+        })
+}
+
+struct ProviderStaging(PathBuf);
+
+impl Drop for ProviderStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// GET /api/apps/:app_id/versions
@@ -350,4 +680,56 @@ pub async fn download_bundle(
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+    use crate::catalog::CanonicalArtifact;
+    use std::io::Write;
+
+    #[test]
+    fn an_untrusted_payload_root_is_rejected_before_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("application/canonical");
+        let parent = crate::catalog::artifact::tests::source_artifact(&root);
+        let artifact = CanonicalArtifact {
+            id: CanonicalId::new_v7(),
+            app_id: "demo".into(),
+            artifact_sha256: parent.artifact_sha256.clone(),
+            content_root_sha256: parent.content_root_sha256.clone(),
+            standard_version: parent.standard_version.clone(),
+            file_count: parent.file_count as i64,
+            storage_path: parent.root.to_string_lossy().into_owned(),
+            record: serde_json::Value::Null,
+            created_at: 1,
+        };
+        let derivation = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "format": deis_build::provider_derivation::FORMAT,
+            "provider": "deislet",
+            "standardVersion": parent.standard_version,
+            "parent": {
+                "artifactSha256": parent.artifact_sha256,
+                "contentRootSha256": parent.content_root_sha256
+            },
+            "payload": {
+                "algorithm": "sha256-merkle-v1",
+                "rootSha256": "../../escape",
+                "files": []
+            }
+        }))
+        .unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::FileOptions::default().unix_permissions(0o644);
+        writer.start_file(DERIVATION_ENTRY, options).unwrap();
+        writer.write_all(&derivation).unwrap();
+        writer.start_file(BUNDLE_ENTRY, options).unwrap();
+        writer.write_all(b"bundle").unwrap();
+        let envelope = writer.finish().unwrap().into_inner();
+
+        let error = validate_deislet_envelope(&artifact, &envelope).unwrap_err();
+        assert!(error.to_string().contains("lowercase SHA-256"), "{error}");
+        assert!(!temp.path().join("application/escape").exists());
+    }
 }

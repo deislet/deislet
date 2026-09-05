@@ -762,7 +762,9 @@ fn validate_sha256(value: &str, message: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_portable_path(value: &str) -> Result<()> {
+/// Validate the cross-platform relative path grammar used by both completed
+/// artifacts and their transport containers.
+pub fn validate_portable_path(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 1024
         || value.starts_with('/')
@@ -932,7 +934,9 @@ pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn sha256(bytes: &[u8]) -> String {
+/// Lowercase SHA-256 used for canonical manifests, transport preconditions
+/// and immutable provider derivation records.
+pub fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 

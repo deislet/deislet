@@ -5,6 +5,8 @@
 //! own tooling deploys, and this CLI does not deploy them.
 
 use std::env;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -151,6 +153,61 @@ pub struct Bundle {
     pub digest: String,
     /// The manifest inside the archive, parsed with the shared reader.
     pub manifest: deis_bundle::Manifest,
+    /// Exact provider-neutral parent and derivation sidecar. A manually
+    /// supplied historical bundle has no such local evidence and therefore
+    /// uses the explicit compatibility upload path.
+    pub lineage: Option<BundleLineage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BundleLineage {
+    pub canonical_root: PathBuf,
+    pub artifact_sha256: String,
+    pub content_root_sha256: String,
+    pub derivation_manifest_path: PathBuf,
+    pub derivation_manifest_sha256: String,
+}
+
+impl Bundle {
+    /// Deterministic transport for the canonical directory. This zip is only
+    /// an HTTP carrier; Control expands and validates the upstream directory
+    /// contract before storing it.
+    pub fn canonical_transport(&self) -> Result<Vec<u8>> {
+        let lineage = self
+            .lineage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this bundle has no retained canonical parent"))?;
+        zip_directory_files(&lineage.canonical_root)
+            .context("packing the canonical Build Output for upload")
+    }
+
+    /// Transport the exact derivation record beside the native payload it
+    /// binds. The outer zip is never recorded as an artifact identity.
+    pub fn provider_envelope(&self) -> Result<Vec<u8>> {
+        let lineage = self
+            .lineage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this bundle has no retained provider derivation"))?;
+        let derivation = fs::read(&lineage.derivation_manifest_path).with_context(|| {
+            format!(
+                "reading provider derivation {}",
+                lineage.derivation_manifest_path.display()
+            )
+        })?;
+        if deis_build::canonical_artifact::sha256(&derivation) != lineage.derivation_manifest_sha256
+        {
+            bail!("the provider derivation identity changed before upload");
+        }
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o644);
+        writer.start_file(".deislet/provider-derivation.json", options)?;
+        writer.write_all(&derivation)?;
+        writer.start_file("payload/bundle.zip", options)?;
+        writer.write_all(&self.bytes)?;
+        Ok(writer.finish()?.into_inner())
+    }
 }
 
 /// Build the project for this platform and read the bundle back.
@@ -222,7 +279,58 @@ pub async fn deislet_bundle(project_dir: &Path, minify: bool) -> Result<Bundle> 
     }
 
     let path = Path::new(&build.output_path).join(deis_build::adapter_deislet::BUNDLE_FILE_NAME);
-    read_bundle(&path)
+    let mut bundle = read_bundle(&path)?;
+    bundle.lineage = Some(BundleLineage {
+        canonical_root: canonical_summary.root,
+        artifact_sha256: canonical_summary.artifact_sha256,
+        content_root_sha256: canonical_summary.content_root_sha256,
+        derivation_manifest_path: derived.manifest_path,
+        derivation_manifest_sha256: derived.manifest_sha256,
+    });
+    Ok(bundle)
+}
+
+/// Read the last completed, fully verified Deislet payload and its retained
+/// canonical lineage for `deis deploy --no-build`.
+pub fn last_deislet_bundle(project_dir: &Path) -> Result<Bundle> {
+    let config = deis_build::load_project_config(&project_dir.to_string_lossy())
+        .context("reading .config.json to find the last build")?;
+    let output_base = project_dir.join(
+        config
+            .build
+            .as_ref()
+            .map(|build| build.out_dir.as_str())
+            .unwrap_or("./dist"),
+    );
+    let selected =
+        deis_build::provider_derivation::resolve_current_summary(&output_base, DEISLET_VENDOR)
+            .context("resolving the last fully verified Deislet provider payload")?;
+    let canonical_root = output_base
+        .join("canonical")
+        .join(&selected.parent_artifact_sha256);
+    let canonical = deis_build::canonical_artifact::validate(
+        &canonical_root,
+        Some(&selected.standard_version),
+        &[],
+    )
+    .context("revalidating the retained canonical parent")?;
+    if canonical.artifact_sha256 != selected.parent_artifact_sha256
+        || canonical.content_root_sha256 != selected.parent_content_root_sha256
+    {
+        bail!("the retained canonical parent differs from the current provider selection");
+    }
+    let path = selected
+        .payload_root
+        .join(deis_build::adapter_deislet::BUNDLE_FILE_NAME);
+    let mut bundle = read_bundle(&path)?;
+    bundle.lineage = Some(BundleLineage {
+        canonical_root,
+        artifact_sha256: selected.parent_artifact_sha256,
+        content_root_sha256: selected.parent_content_root_sha256,
+        derivation_manifest_path: selected.derivation_manifest_path,
+        derivation_manifest_sha256: selected.derivation_manifest_sha256,
+    });
+    Ok(bundle)
 }
 
 /// Read a bundle off disk and parse its manifest.
@@ -248,7 +356,39 @@ pub fn read_bundle(path: &Path) -> Result<Bundle> {
         bytes,
         digest,
         manifest: parsed.manifest,
+        lineage: None,
     })
+}
+
+fn zip_directory_files(root: &Path) -> Result<Vec<u8>> {
+    let mut files = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    files.retain(|entry| entry.file_type().is_file());
+    files.sort_by(|left, right| left.path().cmp(right.path()));
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    for entry in files {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("canonical artifact transport contains a non-regular file");
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)?
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("canonical artifact path is not UTF-8"))?
+            .replace('\\', "/");
+        if relative != deis_build::canonical_artifact::MANIFEST_PATH {
+            deis_build::canonical_artifact::validate_portable_path(&relative)?;
+        }
+        writer.start_file(relative, options)?;
+        writer.write_all(&fs::read(entry.path())?)?;
+    }
+    Ok(writer.finish()?.into_inner())
 }
 
 /// Hex sha256 of a bundle, computed the same way the control plane and every
@@ -263,6 +403,7 @@ pub fn digest_of(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     /// The digest travels to the control plane, which rejects an upload that
     /// does not hash to it, so it has to be the plain sha256 of the bytes.
@@ -284,5 +425,71 @@ mod tests {
         };
         let error = error.to_string();
         assert!(error.contains("deis build --vendor deislet"), "{error}");
+    }
+
+    #[test]
+    fn canonical_transport_preserves_the_directory_contract() {
+        let root = tempfile::tempdir().expect("canonical root");
+        fs::create_dir_all(root.path().join(".edge-canon")).expect("metadata directory");
+        fs::create_dir_all(root.path().join("worker")).expect("worker directory");
+        fs::write(root.path().join(".edge-canon/output.json"), b"{}").expect("canonical manifest");
+        fs::write(root.path().join("worker/index.js"), b"export default {}")
+            .expect("worker source");
+
+        let bytes = zip_directory_files(root.path()).expect("transport");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        assert_eq!(archive.len(), 2);
+        let mut manifest = String::new();
+        archive
+            .by_name(".edge-canon/output.json")
+            .expect("manifest entry")
+            .read_to_string(&mut manifest)
+            .expect("manifest bytes");
+        assert_eq!(manifest, "{}");
+        assert!(archive.by_name("worker/index.js").is_ok());
+    }
+
+    #[test]
+    fn provider_envelope_binds_the_exact_derivation_and_payload() {
+        let root = tempfile::tempdir().expect("lineage root");
+        let derivation_path = root.path().join("derivation.json");
+        let derivation = br#"{"schemaVersion":1}"#;
+        fs::write(&derivation_path, derivation).expect("derivation");
+        let bytes = b"native payload".to_vec();
+        let bundle = Bundle {
+            path: root.path().join("bundle.zip"),
+            digest: digest_of(&bytes),
+            bytes: bytes.clone(),
+            manifest: deis_bundle::Manifest::parse(
+                r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#,
+            )
+            .expect("manifest"),
+            lineage: Some(BundleLineage {
+                canonical_root: root.path().to_path_buf(),
+                artifact_sha256: "a".repeat(64),
+                content_root_sha256: "b".repeat(64),
+                derivation_manifest_path: derivation_path,
+                derivation_manifest_sha256: deis_build::canonical_artifact::sha256(derivation),
+            }),
+        };
+
+        let transport = bundle.provider_envelope().expect("provider envelope");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(transport)).expect("provider zip");
+        assert_eq!(archive.len(), 2);
+        let mut actual_derivation = Vec::new();
+        archive
+            .by_name(".deislet/provider-derivation.json")
+            .expect("derivation entry")
+            .read_to_end(&mut actual_derivation)
+            .expect("derivation bytes");
+        assert_eq!(actual_derivation, derivation);
+        let mut actual_payload = Vec::new();
+        archive
+            .by_name("payload/bundle.zip")
+            .expect("payload entry")
+            .read_to_end(&mut actual_payload)
+            .expect("payload bytes");
+        assert_eq!(actual_payload, bytes);
     }
 }

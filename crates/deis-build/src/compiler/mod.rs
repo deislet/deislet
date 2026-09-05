@@ -2807,7 +2807,7 @@ impl Compiler {
             "schemaVersion": 1,
             "standardVersion": standard_version.clone(),
             "result": "pass",
-            "requirementsDigest": hex::encode(Sha256::digest(standard_version.as_bytes())),
+            "requirementsDigest": deis_wire::CURRENT_EDGE_CANON_REQUIREMENTS_SHA256,
             "checks": [
                 "source-policy",
                 "module-closure",

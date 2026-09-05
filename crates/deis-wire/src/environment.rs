@@ -24,6 +24,19 @@ pub const ENVIRONMENT_VALUE_BYTES_LIMIT: usize = 5_120;
 /// to guess compatible behavior.
 pub const CURRENT_EDGE_CANON_STANDARD_VERSION: &str =
     "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654";
+/// SHA-256 of the exact standard contract at [`CURRENT_EDGE_CANON_STANDARD_VERSION`].
+/// Artifact records carry this independently from the source revision so an
+/// operator can prove which bytes were used even when a repository checkout
+/// is unavailable.
+pub const CURRENT_EDGE_CANON_CONTRACT_SHA256: &str =
+    "926fc7a3fa67426b1cb3c3447949492f5172c18f25d7895f3a67f8b3437acbb8";
+/// SHA-256 of the requirements registry used by this product build.
+pub const CURRENT_EDGE_CANON_REQUIREMENTS_SHA256: &str =
+    "399407bd897f76d9c7ac6e36f4b4ad33934cbec57121d04537413a685dd809cc";
+/// SHA-256 of the canonical Build Output JSON Schema used by every builder,
+/// control-plane ingestion path and provider packager in this build.
+pub const CURRENT_EDGE_CANON_ARTIFACT_SCHEMA_SHA256: &str =
+    "2711f0fd63103f9e40b5a2909279e16e9025db6b8616ab5dd4f1265d3ccb5191";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentError {
@@ -740,6 +753,23 @@ mod tests {
             CURRENT_EDGE_CANON_STANDARD_VERSION,
             format!("{contract}@{commit}"),
             "the compiled protocol pin drifted from standards/edge-canon.lock.json"
+        );
+        assert_eq!(
+            CURRENT_EDGE_CANON_CONTRACT_SHA256,
+            lock["source"]["contractSha256"].as_str().unwrap(),
+            "the compiled contract digest drifted from the standard lock"
+        );
+        assert_eq!(
+            CURRENT_EDGE_CANON_REQUIREMENTS_SHA256,
+            lock["source"]["requirementsSha256"].as_str().unwrap(),
+            "the compiled requirements digest drifted from the standard lock"
+        );
+        assert_eq!(
+            CURRENT_EDGE_CANON_ARTIFACT_SCHEMA_SHA256,
+            lock["source"]["canonicalArtifactSchemaSha256"]
+                .as_str()
+                .unwrap(),
+            "the compiled canonical artifact schema digest drifted from the standard lock"
         );
     }
 }

@@ -54,10 +54,7 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     // must not create an app, an environment or a version.
     let bundle = match &args.bundle {
         Some(path) => build::read_bundle(path)?,
-        None if args.no_build => {
-            let path = default_bundle_path(&dir)?;
-            build::read_bundle(&path)?
-        }
+        None if args.no_build => build::last_deislet_bundle(&dir)?,
         None => {
             // The compiler reports its progress on stdout; in --json mode
             // that would land in front of the document. See crate::quiet.
@@ -77,6 +74,11 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     }
 
     let config_values = deployment_config_values(&dir, &bundle.manifest)?;
+    let lineage_transport = if bundle.lineage.is_some() {
+        Some((bundle.canonical_transport()?, bundle.provider_envelope()?))
+    } else {
+        None
+    };
 
     output.line(format!(
         "  {} built {} ({}, sha256 {})",
@@ -103,10 +105,62 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     }
 
     let size = bundle.bytes.len();
-    let upload = session
-        .control
-        .upload_version(&app, bundle.bytes, &bundle.digest)
-        .await?;
+    let (upload, artifact_record) = if let Some((canonical_transport, provider_envelope)) =
+        lineage_transport
+    {
+        let lineage = bundle.lineage.as_ref().expect("checked above");
+        let artifact = session
+            .control
+            .upload_canonical_artifact(&app, canonical_transport, &lineage.artifact_sha256)
+            .await?;
+        if artifact.artifact.canonical_output.artifact_sha256 != lineage.artifact_sha256
+            || artifact.artifact.canonical_output.content_root_sha256 != lineage.content_root_sha256
+        {
+            bail!("the control plane recorded a different canonical artifact identity");
+        }
+        output.line(format!(
+            "  {} canonical artifact {} {}",
+            if artifact.created {
+                "✓".green()
+            } else {
+                "•".yellow()
+            },
+            short_digest(&lineage.artifact_sha256),
+            if artifact.created {
+                "recorded"
+            } else {
+                "reused"
+            }
+        ));
+        let upload = session
+            .control
+            .upload_version_with_lineage(
+                &app,
+                artifact.artifact.artifact_id,
+                provider_envelope,
+                &bundle.digest,
+            )
+            .await?;
+        if upload.version.canonical_artifact_id != Some(artifact.artifact.artifact_id)
+            || upload.version.provider_derivation_sha256.as_deref()
+                != Some(lineage.derivation_manifest_sha256.as_str())
+        {
+            bail!("the control plane version does not preserve the uploaded artifact lineage");
+        }
+        (upload, Some(artifact.artifact))
+    } else {
+        output.line(format!(
+            "  {} this manually supplied bundle has no canonical/derivation evidence; using the legacy compatibility upload",
+            "•".yellow()
+        ));
+        (
+            session
+                .control
+                .upload_version(&app, bundle.bytes.clone(), &bundle.digest)
+                .await?,
+            None,
+        )
+    };
 
     if upload.created {
         output.line(format!(
@@ -158,7 +212,10 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
                 "sha256": deployment.version.bundle_sha,
                 "created_at": deployment.version.created_at,
                 "compatibility": deployment.version.compatibility,
+                "canonical_artifact_id": deployment.version.canonical_artifact_id,
+                "provider_derivation_sha256": deployment.version.provider_derivation_sha256,
             },
+            "canonical_artifact": artifact_record,
             "deployment": deployment.deployment,
             "delivery": deployment.delivery,
             "plan": deployment.plan,
@@ -275,6 +332,7 @@ pub fn fail_on_incomplete_delivery(
 }
 
 /// Where a previous build left the bundle, honouring `build.outDir`.
+#[cfg(test)]
 pub fn default_bundle_path(project_dir: &Path) -> Result<PathBuf> {
     let config = deis_build::load_project_config(&project_dir.to_string_lossy())
         .context("reading .config.json to find where the last build wrote its bundle")?;

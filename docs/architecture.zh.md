@@ -95,7 +95,7 @@ flowchart TB
     canon -.规范.-> deis-runtime
     deis --委托--> deis-build
     deis-build --产出第三方代码--> third
-    deis-build --产出应用包--> deis-control
+    deis-build --"canonical artifact + provider derivation"--> deis-control
 
     deis-proxy --转发--> deis-runtime
     deis-runtime --"context.env 的 KV/Database/Blob binding"--> deis-store
@@ -117,12 +117,20 @@ flowchart TB
     class coraza,capkit gap
 ```
 
-绿色是已经跑通的；虚线橙色是还没接进来的：只剩 coraza 与 capkit 两个外部件。
+绿色表示图中基础调用链已有可执行实现；虚线橙色是尚未接入的两个外部件。产品级欠缺并不只剩
+这两个外部件，完整清单与状态以阶段分析和 roadmap 为准。
 
 `deis` 也是绿的：它已经补全到平台侧（deploy / versions / rollback / status /
 secret / logs / tail），后来又加了读调用轨迹的 `trace` 和数据面的 `kv` / `db` /
 `blob`。`scripts/demo.sh` 的部署动作全部走 CLI，脚本里没有一处对控制面 REST 的
 `curl`。
+
+新构建的部署链不再只把 Deislet bundle 当作来源。CLI 先上传同一 provider-neutral Edge Canon
+Build Output；Control 在隔离目录中完整验证并按 application UUIDv7/manifest SHA-256 保存，再接收
+绑定该 parent 的 Deislet derivation 与 native bundle。版本记录同时保存两项 lineage，后续 deployment
+继续引用不可变 version。历史 `--bundle` 仍可经兼容入口上传，但没有 lineage；它不会被标成已验证
+canonical artifact。当前 Edge Canon 锁仍是 proposal，因而 catalog record 的 `deployable` 保持 false，
+这与实验性自建后端允许测试部署是两个不同状态，也不构成 provider compliance/support 证据。
 
 ### deis-runtime 的定位变化
 

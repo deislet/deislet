@@ -204,10 +204,15 @@ def validate_standard_lock() -> str:
             hashlib.sha256(local_fixture.read_bytes()).hexdigest() == digest,
             f"vendored fixture differs from the standard lock: {local_name}",
         )
-    require(
-        bool(SHA256.fullmatch(source.get("canonicalArtifactSchemaSha256", ""))),
-        "standard lock canonical artifact schema digest is not SHA-256",
-    )
+    for key, label in (
+        ("contractSha256", "contract"),
+        ("requirementsSha256", "requirements registry"),
+        ("canonicalArtifactSchemaSha256", "canonical artifact schema"),
+    ):
+        require(
+            bool(SHA256.fullmatch(source.get(key, ""))),
+            f"standard lock {label} digest is not SHA-256",
+        )
     require(
         bool(SHA256.fullmatch(source.get("routingSchemaSha256", ""))),
         "standard lock routing schema digest is not SHA-256",

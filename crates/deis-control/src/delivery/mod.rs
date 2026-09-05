@@ -2103,6 +2103,8 @@ mod tests {
             bundle_sha: "abc123".to_string(),
             bundle_path: "/tmp/never-read.zip".to_string(),
             manifest: manifest.to_string(),
+            canonical_artifact_id: None,
+            provider_derivation_sha256: None,
             created_at: 0,
         }
     }

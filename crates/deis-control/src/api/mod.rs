@@ -30,7 +30,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     audit::AuditStore,
-    catalog::{BundleStore, CatalogStore, SecretsBackend},
+    catalog::{ArtifactStore, BundleStore, CatalogStore, SecretsBackend},
     command::CommandExecutor,
     config::ControlConfig,
     config_manager::ConfigManager,
@@ -388,6 +388,7 @@ fn build_catalog_state(
     config: &ControlConfig,
 ) -> catalog::CatalogState {
     let bundles = BundleStore::new(config.bundle_dir.clone());
+    let artifacts = ArtifactStore::beside_bundles(bundles.root());
     // Both paths, because they differ exactly when `bundle_dir` is relative -
     // and then the resolved one is the whole answer to "where did my versions
     // go?" after this process is next started somewhere else.
@@ -403,6 +404,13 @@ fn build_catalog_state(
             error = %e,
             "Bundle directory is not usable; every bundle upload will fail and nodes cannot fetch any version until this path is writable"
         ),
+    }
+    if let Err(e) = artifacts.ensure_root() {
+        error!(
+            artifact_dir = %artifacts.root().display(),
+            error = %e,
+            "Canonical artifact directory is not usable; canonical uploads and lineage-bound deploys will fail until it is writable"
+        );
     }
 
     let secrets = SecretsBackend::load(config.secret_key_file.as_deref());
@@ -472,6 +480,7 @@ fn build_catalog_state(
     catalog::CatalogState {
         store: Arc::clone(&store),
         bundles: Arc::new(bundles),
+        artifacts: Arc::new(artifacts),
         secrets: Arc::clone(&secrets),
         // The same wiring the deliverer writes into every deployment, so the
         // token `deis kv` is handed is bit-for-bit the one the application's

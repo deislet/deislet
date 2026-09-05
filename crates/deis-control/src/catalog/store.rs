@@ -26,19 +26,20 @@ use uuid::Uuid;
 
 use super::domains::{DomainGrant, EVERY_ENVIRONMENT, GrantPattern, HostClaim, grant_allows};
 use super::model::{
-    App, Assignment, DeletedApp, DeployedVersion, Deployment, DeploymentDrainObservation,
-    DeploymentGenerationDrain, DeploymentPlan, DeploymentProxyObservation,
-    DeploymentQueueObservation, DeploymentTargetObservation, Environment, MAX_ROUTES_PER_APP,
-    MAX_ROUTES_PER_ENVIRONMENT, RetiredAppName, Route, SecretMeta, Version, now_secs,
-    validate_app_id, validate_environment_name, validate_path_prefix, validate_route_priority,
-    validate_secret_name,
+    App, Assignment, CanonicalArtifact, DeletedApp, DeployedVersion, Deployment,
+    DeploymentDrainObservation, DeploymentGenerationDrain, DeploymentPlan,
+    DeploymentProxyObservation, DeploymentQueueObservation, DeploymentTargetObservation,
+    Environment, MAX_ROUTES_PER_APP, MAX_ROUTES_PER_ENVIRONMENT, ProviderDerivation,
+    RetiredAppName, Route, SecretMeta, Version, now_secs, validate_app_id,
+    validate_environment_name, validate_path_prefix, validate_route_priority, validate_secret_name,
 };
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
 const APP_COLUMNS: &str = "id, canonical_id, revision, created_at";
-const VERSION_COLUMNS: &str =
-    "id, canonical_id, app_id, number, bundle_sha, bundle_path, manifest, created_at";
+const VERSION_COLUMNS: &str = "id, canonical_id, app_id, number, bundle_sha, bundle_path, manifest, canonical_artifact_id, provider_derivation_sha256, created_at";
+const CANONICAL_ARTIFACT_COLUMNS: &str = "id, app_id, artifact_sha256, content_root_sha256, standard_version, file_count, storage_path, record, created_at";
+const PROVIDER_DERIVATION_COLUMNS: &str = "manifest_sha256, artifact_id, provider, standard_version, payload_root_sha256, manifest, created_at";
 const ENVIRONMENT_COLUMNS: &str = "id, canonical_id, app_id, name, created_at";
 const DEPLOYMENT_COLUMNS: &str =
     "id, canonical_id, app_id, env_id, version_id, created_at, note, snapshot_id";
@@ -58,6 +59,16 @@ pub struct SecretHeadChange<'a> {
     pub name: &'a str,
     pub replacement_revision: Option<&'a str>,
     pub expected_revision: Option<&'a str>,
+}
+
+/// Fully checked lineage accompanying one native provider payload.
+#[derive(Debug, Clone)]
+pub struct ProviderDerivationSpec {
+    pub manifest_sha256: String,
+    pub provider: String,
+    pub standard_version: String,
+    pub payload_root_sha256: String,
+    pub manifest: String,
 }
 
 /// Immutable inputs for one durable deployment plan.
@@ -293,6 +304,13 @@ impl CatalogStore {
                     }
                     paths
                 };
+                let artifact_paths: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT storage_path FROM canonical_artifacts WHERE app_id = ?1",
+                    )?;
+                    let rows = stmt.query_map(params![app_id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
 
                 // Read before the rows go: an application on a node is
                 // keyed by (app_id, environment), and after this
@@ -325,6 +343,15 @@ impl CatalogStore {
                 )?;
                 let versions =
                     tx.execute("DELETE FROM versions WHERE app_id = ?1", params![app_id])?;
+                let provider_derivations = tx.execute(
+                    "DELETE FROM provider_derivations WHERE artifact_id IN \
+                     (SELECT id FROM canonical_artifacts WHERE app_id = ?1)",
+                    params![app_id],
+                )?;
+                let canonical_artifacts = tx.execute(
+                    "DELETE FROM canonical_artifacts WHERE app_id = ?1",
+                    params![app_id],
+                )?;
                 tx.execute("DELETE FROM apps WHERE id = ?1", params![app_id])?;
 
                 // In the same transaction as the deletion, and that is the
@@ -365,12 +392,15 @@ impl CatalogStore {
                 tx.commit()?;
 
                 Ok(DeletedApp {
+                    canonical_artifacts,
+                    provider_derivations,
                     versions,
                     environments,
                     deployments,
                     routes,
                     secrets,
                     bundle_paths,
+                    artifact_paths,
                     environment_names,
                     retired,
                 })
@@ -495,6 +525,200 @@ impl CatalogStore {
     }
 
     // ----------------------------------------------------------------
+    // Canonical artifacts and provider derivations (append-only)
+    // ----------------------------------------------------------------
+
+    /// Record a Build Output only after [`super::ArtifactStore`] has
+    /// revalidated and atomically published its complete directory.
+    /// Byte-identical uploads for one application converge on the same
+    /// canonical resource identity.
+    pub async fn create_canonical_artifact(
+        &self,
+        app_id: &str,
+        stored: &super::StoredCanonicalArtifact,
+    ) -> CatalogResult<(CanonicalArtifact, bool)> {
+        let app_id = app_id.to_string();
+        let artifact_sha256 = stored.summary.artifact_sha256.clone();
+        let content_root_sha256 = stored.summary.content_root_sha256.clone();
+        let standard_version = stored.summary.standard_version.clone();
+        let file_count = i64::try_from(stored.summary.file_count)
+            .map_err(|_| CatalogError::invalid("canonical artifact file count is too large"))?;
+        let storage_path = stored.path.to_string_lossy().into_owned();
+        let documents = stored.manifest.documents.clone();
+
+        self.with_conn(move |conn| {
+            let app = load_app(conn, &app_id)?;
+            if let Some(existing) = conn
+                .query_row(
+                    &format!(
+                        "SELECT {CANONICAL_ARTIFACT_COLUMNS} FROM canonical_artifacts \
+                         WHERE app_id = ?1 AND artifact_sha256 = ?2"
+                    ),
+                    params![app_id, artifact_sha256],
+                    map_canonical_artifact,
+                )
+                .optional()?
+            {
+                if existing.content_root_sha256 != content_root_sha256
+                    || existing.standard_version != standard_version
+                    || existing.file_count != file_count
+                {
+                    return Err(CatalogError::Conflict(
+                        "canonical artifact identity is already bound to different metadata"
+                            .into(),
+                    ));
+                }
+                return Ok((existing, false));
+            }
+
+            let document = |kind: &str| {
+                documents
+                    .iter()
+                    .find(|document| document.kind == kind)
+                    .ok_or_else(|| {
+                        CatalogError::invalid(format!(
+                            "canonical artifact is missing required {kind} document"
+                        ))
+                    })
+            };
+            let validation = document("validation-report")?;
+            let sbom = document("sbom")?;
+            let provenance = document("provenance")?;
+            let source_commit = standard_version
+                .strip_prefix("edge-canon.next@")
+                .ok_or_else(|| CatalogError::invalid("canonical standard version is not exact"))?;
+            let id = CanonicalId::new_v7();
+            let created_at = now_secs();
+            let created_at_rfc3339 = chrono::DateTime::from_timestamp(created_at, 0)
+                .ok_or_else(|| CatalogError::invalid("artifact creation time is outside RFC 3339"))?
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let locator = format!(
+                "canonical/{}/{}",
+                app.canonical_id, artifact_sha256
+            );
+            let digest = |value: &str| serde_json::json!({
+                "algorithm": "sha256",
+                "value": value
+            });
+            let record = serde_json::json!({
+                "$schema": "https://github.com/deislet/deislet/contracts/v1/canonical-artifact.schema.json",
+                "schemaVersion": 1,
+                "recordType": "deislet.canonical-artifact-record/v1",
+                "artifactId": id,
+                "applicationId": app.canonical_id,
+                "state": "verified",
+                // The locked Edge Canon revision is still a proposal. It is
+                // valid input to experimental drivers, but cannot be called a
+                // published-standard deployable record or signed as one.
+                "deployable": false,
+                "createdAt": created_at_rfc3339,
+                "canonicalOutput": {
+                    "format": "edge-canon.build-output/v1",
+                    "manifestPath": ".edge-canon/output.json",
+                    "artifactSha256": artifact_sha256,
+                    "contentRootSha256": content_root_sha256,
+                    "fileCount": file_count,
+                    "storage": {"kind": "directory", "locator": locator}
+                },
+                "standard": {
+                    "contractId": "edge-canon.next",
+                    "version": standard_version,
+                    "releaseStatus": "proposal",
+                    "sourceCommit": source_commit,
+                    "contractDigest": digest(deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256),
+                    "artifactSchemaPath": "schemas/canonical-build-output.schema.json",
+                    "artifactSchemaDigest": digest(deis_wire::CURRENT_EDGE_CANON_ARTIFACT_SCHEMA_SHA256)
+                },
+                "validation": {
+                    "status": "passed",
+                    "requirementsDigest": digest(deis_wire::CURRENT_EDGE_CANON_REQUIREMENTS_SHA256),
+                    "reportPath": validation.path,
+                    "reportDigest": digest(&validation.sha256)
+                },
+                "attestations": {
+                    "sbom": {"path": sbom.path, "digest": digest(&sbom.sha256)},
+                    "provenance": {"path": provenance.path, "digest": digest(&provenance.sha256)}
+                },
+                "signatures": []
+            });
+            let record_text = serde_json::to_string(&record).map_err(|error| {
+                CatalogError::invalid(format!("canonical artifact record is not JSON: {error}"))
+            })?;
+            let artifact = CanonicalArtifact {
+                id,
+                app_id,
+                artifact_sha256,
+                content_root_sha256,
+                standard_version,
+                file_count,
+                storage_path,
+                record,
+                created_at,
+            };
+            conn.execute(
+                &format!(
+                    "INSERT INTO canonical_artifacts ({CANONICAL_ARTIFACT_COLUMNS}) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                ),
+                params![
+                    artifact.id.to_string(),
+                    artifact.app_id,
+                    artifact.artifact_sha256,
+                    artifact.content_root_sha256,
+                    artifact.standard_version,
+                    artifact.file_count,
+                    artifact.storage_path,
+                    record_text,
+                    artifact.created_at,
+                ],
+            )?;
+            Ok((artifact, true))
+        })
+        .await
+    }
+
+    pub async fn get_canonical_artifact(
+        &self,
+        app_id: &str,
+        artifact_id: CanonicalId,
+    ) -> CatalogResult<CanonicalArtifact> {
+        let app_id = app_id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {CANONICAL_ARTIFACT_COLUMNS} FROM canonical_artifacts \
+                     WHERE app_id = ?1 AND id = ?2"
+                ),
+                params![app_id, artifact_id.to_string()],
+                map_canonical_artifact,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CatalogError::not_found(format!("canonical artifact {artifact_id} of app {app_id}"))
+            })
+        })
+        .await
+    }
+
+    pub async fn list_canonical_artifacts(
+        &self,
+        app_id: &str,
+    ) -> CatalogResult<Vec<CanonicalArtifact>> {
+        let app_id = app_id.to_string();
+        self.with_conn(move |conn| {
+            load_app(conn, &app_id)?;
+            let mut statement = conn.prepare(&format!(
+                "SELECT {CANONICAL_ARTIFACT_COLUMNS} FROM canonical_artifacts \
+                 WHERE app_id = ?1 ORDER BY created_at DESC, rowid DESC"
+            ))?;
+            let rows = statement.query_map(params![app_id], map_canonical_artifact)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    // ----------------------------------------------------------------
     // Versions (append-only)
     // ----------------------------------------------------------------
 
@@ -613,6 +837,39 @@ impl CatalogStore {
         bundle_path: &str,
         manifest: &str,
     ) -> CatalogResult<(Version, bool)> {
+        self.create_version_record(app_id, bundle_sha, bundle_path, manifest, None)
+            .await
+    }
+
+    /// Create a version whose native payload has been checked against an
+    /// immutable provider derivation and canonical parent.
+    pub async fn create_version_with_lineage(
+        &self,
+        app_id: &str,
+        bundle_sha: &str,
+        bundle_path: &str,
+        manifest: &str,
+        artifact_id: CanonicalId,
+        derivation: ProviderDerivationSpec,
+    ) -> CatalogResult<(Version, bool)> {
+        self.create_version_record(
+            app_id,
+            bundle_sha,
+            bundle_path,
+            manifest,
+            Some((artifact_id, derivation)),
+        )
+        .await
+    }
+
+    async fn create_version_record(
+        &self,
+        app_id: &str,
+        bundle_sha: &str,
+        bundle_path: &str,
+        manifest: &str,
+        lineage: Option<(CanonicalId, ProviderDerivationSpec)>,
+    ) -> CatalogResult<(Version, bool)> {
         let app_id = app_id.to_string();
         let bundle_sha = bundle_sha.to_string();
         let bundle_path = bundle_path.to_string();
@@ -621,23 +878,111 @@ impl CatalogStore {
         let (version, created) = self
             .with_conn(move |conn| {
                 load_app(conn, &app_id)?;
+                let tx = conn.unchecked_transaction()?;
 
-                let existing: Option<Version> = conn
-                    .query_row(
+                let lineage_ids = if let Some((artifact_id, derivation)) = &lineage {
+                    let artifact = tx
+                        .query_row(
+                            &format!(
+                                "SELECT {CANONICAL_ARTIFACT_COLUMNS} FROM canonical_artifacts \
+                                 WHERE app_id = ?1 AND id = ?2"
+                            ),
+                            params![app_id, artifact_id.to_string()],
+                            map_canonical_artifact,
+                        )
+                        .optional()?
+                        .ok_or_else(|| {
+                            CatalogError::not_found(format!(
+                                "canonical artifact {artifact_id} of app {app_id}"
+                            ))
+                        })?;
+                    if derivation.provider != "deislet"
+                        || derivation.standard_version != artifact.standard_version
+                    {
+                        return Err(CatalogError::invalid(
+                            "provider derivation target or standard differs from its canonical parent",
+                        ));
+                    }
+                    let existing_derivation: Option<ProviderDerivation> = tx
+                        .query_row(
+                            &format!(
+                                "SELECT {PROVIDER_DERIVATION_COLUMNS} FROM provider_derivations \
+                                 WHERE manifest_sha256 = ?1"
+                            ),
+                            params![derivation.manifest_sha256],
+                            map_provider_derivation,
+                        )
+                        .optional()?;
+                    if let Some(existing) = existing_derivation {
+                        if existing.artifact_id != *artifact_id
+                            || existing.provider != derivation.provider
+                            || existing.standard_version != derivation.standard_version
+                            || existing.payload_root_sha256 != derivation.payload_root_sha256
+                            || existing.manifest != derivation.manifest
+                        {
+                            return Err(CatalogError::Conflict(
+                                "provider derivation identity is already bound to different evidence"
+                                    .into(),
+                            ));
+                        }
+                    } else {
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO provider_derivations ({PROVIDER_DERIVATION_COLUMNS}) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                            ),
+                            params![
+                                derivation.manifest_sha256,
+                                artifact_id.to_string(),
+                                derivation.provider,
+                                derivation.standard_version,
+                                derivation.payload_root_sha256,
+                                derivation.manifest,
+                                now_secs(),
+                            ],
+                        )?;
+                    }
+                    Some((artifact_id.to_string(), derivation.manifest_sha256.clone()))
+                } else {
+                    None
+                };
+
+                let existing: Option<Version> = if let Some((artifact_id, derivation_id)) = &lineage_ids {
+                    tx.query_row(
+                        &format!(
+                            "SELECT {VERSION_COLUMNS} FROM versions
+                             WHERE app_id = ?1 AND canonical_artifact_id = ?2
+                               AND provider_derivation_sha256 = ?3
+                             ORDER BY number DESC LIMIT 1"
+                        ),
+                        params![app_id, artifact_id, derivation_id],
+                        map_version,
+                    )
+                    .optional()?
+                } else {
+                    tx.query_row(
                         &format!(
                             "SELECT {VERSION_COLUMNS} FROM versions
                              WHERE app_id = ?1 AND bundle_sha = ?2
+                               AND canonical_artifact_id IS NULL
                              ORDER BY number DESC LIMIT 1"
                         ),
                         params![app_id, bundle_sha],
                         map_version,
                     )
-                    .optional()?;
+                    .optional()?
+                };
                 if let Some(version) = existing {
+                    if version.bundle_sha != bundle_sha {
+                        return Err(CatalogError::Conflict(
+                            "provider derivation is already bound to a different bundle digest"
+                                .into(),
+                        ));
+                    }
+                    tx.commit()?;
                     return Ok((version, false));
                 }
 
-                let tx = conn.unchecked_transaction()?;
                 let number: i64 = tx.query_row(
                     "SELECT COALESCE(MAX(number), 0) + 1 FROM versions WHERE app_id = ?1",
                     params![app_id],
@@ -651,11 +996,19 @@ impl CatalogStore {
                     bundle_sha,
                     bundle_path,
                     manifest,
+                    canonical_artifact_id: lineage_ids
+                        .as_ref()
+                        .map(|(artifact_id, _)| artifact_id.parse())
+                        .transpose()
+                        .map_err(|error: CanonicalIdError| CatalogError::invalid(error.to_string()))?,
+                    provider_derivation_sha256: lineage_ids
+                        .as_ref()
+                        .map(|(_, derivation_id)| derivation_id.clone()),
                     created_at: now_secs(),
                 };
                 tx.execute(
                     &format!(
-                        "INSERT INTO versions ({VERSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                        "INSERT INTO versions ({VERSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
                     ),
                     params![
                         version.id,
@@ -665,6 +1018,8 @@ impl CatalogStore {
                         version.bundle_sha,
                         version.bundle_path,
                         version.manifest,
+                        version.canonical_artifact_id.map(|id| id.to_string()),
+                        version.provider_derivation_sha256,
                         version.created_at,
                     ],
                 )?;
@@ -3576,7 +3931,39 @@ fn map_version(row: &Row<'_>) -> rusqlite::Result<Version> {
         bundle_sha: row.get(4)?,
         bundle_path: row.get(5)?,
         manifest: row.get(6)?,
-        created_at: row.get(7)?,
+        canonical_artifact_id: map_optional_canonical_id(row, 7)?,
+        provider_derivation_sha256: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+fn map_canonical_artifact(row: &Row<'_>) -> rusqlite::Result<CanonicalArtifact> {
+    let record_text: String = row.get(7)?;
+    let record = serde_json::from_str(&record_text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(CanonicalArtifact {
+        id: map_canonical_id(row, 0)?,
+        app_id: row.get(1)?,
+        artifact_sha256: row.get(2)?,
+        content_root_sha256: row.get(3)?,
+        standard_version: row.get(4)?,
+        file_count: row.get(5)?,
+        storage_path: row.get(6)?,
+        record,
+        created_at: row.get(8)?,
+    })
+}
+
+fn map_provider_derivation(row: &Row<'_>) -> rusqlite::Result<ProviderDerivation> {
+    Ok(ProviderDerivation {
+        manifest_sha256: row.get(0)?,
+        artifact_id: map_canonical_id(row, 1)?,
+        provider: row.get(2)?,
+        standard_version: row.get(3)?,
+        payload_root_sha256: row.get(4)?,
+        manifest: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -3612,6 +3999,21 @@ fn map_canonical_id(row: &Row<'_>, index: usize) -> rusqlite::Result<CanonicalId
             Box::new(error),
         )
     })
+}
+
+fn map_optional_canonical_id(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<CanonicalId>> {
+    let value: Option<String> = row.get(index)?;
+    value
+        .map(|value| {
+            value.parse().map_err(|error: CanonicalIdError| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn map_route(row: &Row<'_>) -> rusqlite::Result<Route> {

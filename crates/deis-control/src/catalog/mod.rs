@@ -27,6 +27,7 @@
 //!   older version, so the history stays complete and a rollback is as
 //!   cheap as a deploy.
 
+pub mod artifact;
 pub mod backend_migration;
 pub mod backend_restore;
 pub mod backend_restore_driver;
@@ -40,6 +41,7 @@ pub mod operation;
 pub mod secrets;
 pub mod store;
 
+pub use artifact::{ArtifactStore, StoredCanonicalArtifact};
 pub use backend_migration::{
     BackendAttemptState, BackendMigrationAttempt, BackendMigrationEvidence,
     IdentityMigrationCoordinator, IdentityMigrationRun, MigrationCoordinatorError,
@@ -59,14 +61,16 @@ pub use identity_migration::{
 };
 pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{
-    App, Assignment, DeletedApp, DeployedVersion, Deployment, DeploymentDrainObservation,
-    DeploymentEvent, DeploymentGenerationDrain, DeploymentPlan, DeploymentProxyObservation,
-    DeploymentQueueObservation, DeploymentTargetObservation, Environment, RetiredAppName, Route,
-    SecretMeta, Version, now_secs,
+    App, Assignment, CanonicalArtifact, DeletedApp, DeployedVersion, Deployment,
+    DeploymentDrainObservation, DeploymentEvent, DeploymentGenerationDrain, DeploymentPlan,
+    DeploymentProxyObservation, DeploymentQueueObservation, DeploymentTargetObservation,
+    Environment, ProviderDerivation, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
 pub use secrets::{SecretCipher, SecretsBackend};
-pub use store::{BundlePathRepair, CatalogStore, DeploymentPlanSpec, SecretHeadChange};
+pub use store::{
+    BundlePathRepair, CatalogStore, DeploymentPlanSpec, ProviderDerivationSpec, SecretHeadChange,
+};
 
 use thiserror::Error;
 

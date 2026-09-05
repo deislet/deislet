@@ -82,6 +82,18 @@ struct CurrentProviderPayload {
     derivation_manifest_sha256: String,
 }
 
+/// Fully revalidated selection left by the most recent successful build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProviderPayload {
+    pub payload_root: PathBuf,
+    pub derivation_manifest_path: PathBuf,
+    pub standard_version: String,
+    pub parent_artifact_sha256: String,
+    pub parent_content_root_sha256: String,
+    pub payload_root_sha256: String,
+    pub derivation_manifest_sha256: String,
+}
+
 /// Atomically select an already-published immutable provider payload as the
 /// most recent successful build for `--no-build` and local tooling.
 pub fn publish_current(
@@ -188,6 +200,15 @@ pub fn publish_current(
 
 /// Resolve and fully revalidate the latest successful immutable payload.
 pub fn resolve_current(output_base: &Path, provider: &str) -> Result<PathBuf> {
+    Ok(resolve_current_summary(output_base, provider)?.payload_root)
+}
+
+/// Resolve the latest payload together with the exact canonical parent and
+/// derivation sidecar needed by a lineage-bound deployment upload.
+pub fn resolve_current_summary(
+    output_base: &Path,
+    provider: &str,
+) -> Result<ResolvedProviderPayload> {
     validate_provider(provider)?;
     let path = output_base
         .join(".deislet/current")
@@ -264,7 +285,15 @@ pub fn resolve_current(output_base: &Path, provider: &str) -> Result<PathBuf> {
             "current provider selection differs from its immutable derivation",
         ));
     }
-    Ok(payload)
+    Ok(ResolvedProviderPayload {
+        payload_root: payload,
+        derivation_manifest_path: record,
+        standard_version: selection.standard_version,
+        parent_artifact_sha256: selection.parent_artifact_sha256,
+        parent_content_root_sha256: selection.parent_content_root_sha256,
+        payload_root_sha256: selection.payload_root_sha256,
+        derivation_manifest_sha256: selection.derivation_manifest_sha256,
+    })
 }
 
 /// Copy one completed provider transport tree into an immutable store.

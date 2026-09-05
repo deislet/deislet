@@ -53,6 +53,40 @@ pub struct Version {
     pub bundle_path: String,
     /// Verbatim `manifest.json` text as it was found inside the bundle.
     pub manifest: String,
+    /// Exact provider-neutral parent. `None` identifies an upload made
+    /// through the legacy raw-bundle endpoint before lineage was recorded.
+    pub canonical_artifact_id: Option<CanonicalId>,
+    /// SHA-256 identity of the immutable provider derivation manifest.
+    pub provider_derivation_sha256: Option<String>,
+    pub created_at: i64,
+}
+
+/// One verified provider-neutral artifact held by the control plane.
+/// `record` is the schema-conforming public control-plane record; the local
+/// storage path is kept separate and never serialized by the REST layer.
+#[derive(Debug, Clone)]
+pub struct CanonicalArtifact {
+    pub id: CanonicalId,
+    pub app_id: String,
+    pub artifact_sha256: String,
+    pub content_root_sha256: String,
+    pub standard_version: String,
+    pub file_count: i64,
+    pub storage_path: String,
+    pub record: serde_json::Value,
+    pub created_at: i64,
+}
+
+/// Immutable evidence that a provider payload was derived from a canonical
+/// parent. Its identity is the SHA-256 of `manifest`'s canonical bytes.
+#[derive(Debug, Clone)]
+pub struct ProviderDerivation {
+    pub manifest_sha256: String,
+    pub artifact_id: CanonicalId,
+    pub provider: String,
+    pub standard_version: String,
+    pub payload_root_sha256: String,
+    pub manifest: String,
     pub created_at: i64,
 }
 
@@ -260,6 +294,8 @@ pub struct DeployedVersion {
 /// the bundle files on disk and log exactly how much history was destroyed.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DeletedApp {
+    pub canonical_artifacts: usize,
+    pub provider_derivations: usize,
     pub versions: usize,
     pub environments: usize,
     pub deployments: usize,
@@ -269,6 +305,9 @@ pub struct DeletedApp {
     /// control-plane local paths.
     #[serde(skip)]
     pub bundle_paths: Vec<String>,
+    /// Canonical artifact directories now unreferenced by the catalog.
+    #[serde(skip)]
+    pub artifact_paths: Vec<String>,
     /// Names of the environments that were removed, read before the rows
     /// were deleted.
     ///

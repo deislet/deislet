@@ -17,6 +17,7 @@
 //!   a flag whose purpose is to make a dashboard convenient.
 
 pub mod apps;
+pub mod artifacts;
 pub mod assignments;
 pub mod deployments;
 pub mod domains;
@@ -36,7 +37,7 @@ use axum::{
 };
 
 use crate::api::middleware::{NodeAuthConfig, node_auth};
-use crate::catalog::{BundleStore, CatalogStore, SecretsBackend};
+use crate::catalog::{ArtifactStore, BundleStore, CatalogStore, SecretsBackend};
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
 use crate::session::SessionManager;
 
@@ -50,6 +51,10 @@ pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 pub struct CatalogState {
     pub store: Arc<CatalogStore>,
     pub bundles: Arc<BundleStore>,
+    /// Verified provider-neutral Build Output directories. This is a
+    /// separate namespace beneath the bundle root; provider payloads never
+    /// become canonical merely by being uploaded here.
+    pub artifacts: Arc<ArtifactStore>,
     pub secrets: Arc<SecretsBackend>,
     /// Pushes a deployment out to the nodes. Deploy, rollback and secret
     /// change all end here; see [`crate::delivery`].
@@ -91,6 +96,23 @@ pub fn router(state: CatalogState) -> Router {
         .route(
             "/api/retired-apps/:app_id",
             delete(apps::release_retired_app),
+        )
+        .route(
+            "/api/apps/:app_id/artifacts",
+            get(artifacts::list_artifacts)
+                .post(artifacts::upload_artifact)
+                .layer(DefaultBodyLimit::max(
+                    crate::catalog::artifact::MAX_CANONICAL_TRANSPORT_BYTES,
+                )),
+        )
+        .route(
+            "/api/apps/:app_id/artifacts/:artifact_id",
+            get(artifacts::get_artifact),
+        )
+        .route(
+            "/api/apps/:app_id/artifacts/:artifact_id/versions",
+            post(versions::upload_version_with_lineage)
+                .layer(DefaultBodyLimit::max(versions::MAX_PROVIDER_ENVELOPE_BYTES)),
         )
         .route(
             "/api/apps/:app_id/versions",
@@ -215,6 +237,8 @@ pub(crate) mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
     use tower::ServiceExt;
 
     pub(crate) struct Harness {
@@ -478,6 +502,7 @@ pub(crate) mod tests {
         let state = CatalogState {
             store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
+            artifacts: Arc::new(ArtifactStore::beside_bundles(bundle_dir.path())),
             secrets: Arc::clone(&secrets),
             storage: storage.clone(),
             deliverer: Arc::new(DeploymentDeliverer::new(
@@ -1472,5 +1497,127 @@ pub(crate) mod tests {
         let (_, body) =
             get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
         assert_eq!(body.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn canonical_upload_and_native_version_preserve_exact_lineage() {
+        let h = harness(true).await;
+        let router = &h.router;
+        let (_, app) = json(
+            router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+
+        let source = tempfile::tempdir().unwrap();
+        let canonical = crate::catalog::artifact::tests::source_artifact(source.path());
+        let canonical_transport = crate::catalog::artifact::tests::transport(&canonical.root);
+        let (status, artifact_response) = call(
+            router,
+            "POST",
+            &format!(
+                "/api/apps/demo/artifacts?sha256={}",
+                canonical.artifact_sha256
+            ),
+            Body::from(canonical_transport),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{artifact_response}");
+        let artifact = &artifact_response["artifact"];
+        let artifact_id = artifact["artifactId"].as_str().unwrap();
+        assert_eq!(artifact["applicationId"], app["canonical_id"]);
+        assert_eq!(
+            artifact["canonicalOutput"]["artifactSha256"],
+            canonical.artifact_sha256
+        );
+        assert_eq!(
+            artifact["standard"]["contractDigest"]["value"],
+            deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256
+        );
+        assert_eq!(
+            artifact["validation"]["requirementsDigest"]["value"],
+            deis_wire::CURRENT_EDGE_CANON_REQUIREMENTS_SHA256
+        );
+
+        let payload = tempfile::tempdir().unwrap();
+        let bundle = sample_bundle("demo");
+        std::fs::write(payload.path().join("bundle.zip"), &bundle).unwrap();
+        let payload_store = tempfile::tempdir().unwrap();
+        let published_payload =
+            deis_build::provider_derivation::publish_payload(payload_store.path(), payload.path())
+                .unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let derivation = deis_build::provider_derivation::publish(
+            records.path(),
+            &published_payload.root,
+            "deislet",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            &canonical.artifact_sha256,
+            &canonical.content_root_sha256,
+        )
+        .unwrap();
+        let derivation_bytes = std::fs::read(&derivation.manifest_path).unwrap();
+        let mut envelope = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o644);
+        envelope
+            .start_file(".deislet/provider-derivation.json", options)
+            .unwrap();
+        envelope.write_all(&derivation_bytes).unwrap();
+        envelope.start_file("payload/bundle.zip", options).unwrap();
+        envelope.write_all(&bundle).unwrap();
+        let envelope = envelope.finish().unwrap().into_inner();
+        let bundle_sha = hex::encode(Sha256::digest(&bundle));
+
+        let upload_uri =
+            format!("/api/apps/demo/artifacts/{artifact_id}/versions?sha256={bundle_sha}");
+        let (status, version_response) = call(
+            router,
+            "POST",
+            &upload_uri,
+            Body::from(envelope.clone()),
+            "application/vnd.deislet.provider-envelope.v1+zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{version_response}");
+        assert_eq!(
+            version_response["version"]["canonical_artifact_id"],
+            artifact_id
+        );
+        assert_eq!(
+            version_response["version"]["provider_derivation_sha256"],
+            derivation.manifest_sha256
+        );
+
+        let (status, replay) = call(
+            router,
+            "POST",
+            &upload_uri,
+            Body::from(envelope),
+            "application/vnd.deislet.provider-envelope.v1+zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["created"], false);
+        assert_eq!(replay["version"]["id"], version_response["version"]["id"]);
+
+        let artifact_path = h
+            .state
+            .store
+            .get_canonical_artifact("demo", artifact_id.parse().unwrap())
+            .await
+            .unwrap()
+            .storage_path;
+        assert!(std::path::Path::new(&artifact_path).exists());
+        let (status, deleted) = json(router, "DELETE", "/api/apps/demo", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{deleted}");
+        assert_eq!(deleted["removed"]["canonical_artifacts"], 1);
+        assert_eq!(deleted["removed"]["provider_derivations"], 1);
+        assert_eq!(deleted["artifact_directories_removed"], 1);
+        assert!(!std::path::Path::new(&artifact_path).exists());
     }
 }

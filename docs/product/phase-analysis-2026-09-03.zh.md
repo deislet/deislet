@@ -1758,3 +1758,36 @@ Application/framework source + versioned build plan
 - M2 以短期 EdDSA JOSE capability 表达精确 audience、subject、tenant/binding、deployment/version/generation、operation/action、expiry、auth epoch 与 `cnf` key thumbprint。Store/Queue/Telemetry 同时验证 mTLS role、JWT signature/kid/time/audience/cnf 和 method→action/resource mapping；Control→Runtime 及 migration/restore 也使用 operation-scoped capability。当前 tenant-wide HMAC、fleet PSK 和静态 backend admin bearer 只能在 `dual` 迁移窗存在，不能算 production-secure。
 - 滚动顺序固定为 inventory/audit → 独立 machine listener 与 dual trust → routing/bundle/assignment read path → management actions → data capability → strict。每个 endpoint 只有在新路径正负测试通过、旧用量静默超过规定窗口后才不可逆关闭 legacy；不能先关 PSK 再滚节点，也不能在同一 human listener 上突然强制 client cert。strict readiness 要求 legacy usage 为零且配置/代码路径拒绝 PSK/shared HMAC/static bearer。
 - 验收必须使用真实 TLS listener，覆盖错误 CA/trust-domain/EKU/role/name、过期/未来/撤销证书、enrollment 并发单用、CSR SAN 注入、轮换 overlap、克隆实例 lease 竞争、跨 node/tenant/binding/action/audience/generation、偷取 JWT 但无 `cnf` 私钥、旧 auth epoch、长连接换证、dual 互操作、strict 无降级和日志/snapshot 无 secret。M1、M2、strict fleet 迁移与生产演练全部通过前，ADR-025 只能是已接受契约，不能登记为已实现。
+
+## 61. Canonical artifact 控制面入库与 version 精确 lineage
+
+- 复核确认此前构建端虽然已经生成并复核 Edge Canon parent 与 provider derivation，Control 却只保存
+  Deislet 原生 bundle。部署记录无法证明它来自哪个 canonical artifact，也无法区分经过验证的新链路和
+  手工上传的历史包；`contracts/v1/canonical-artifact.schema.json` 因而只有纸面 fixture，没有真实 producer。
+- Control 新增 application-scoped artifact API 和内容寻址目录。zip 只作 HTTP 传输，不进入 artifact
+  identity；服务端在独立 staging 中限制压缩/展开大小和项数，拒绝路径穿越、绝对/非 UTF-8 路径、重复项、
+  链接及非普通文件，然后以仓库锁定的精确 Edge Canon 版本重新验证 manifest、完整文件表和 content root。
+  通过后的目录才按 application UUIDv7 与 manifest SHA-256 原子发布；既有或并发命中的目录必须全量回读
+  相同才可复用。实际解压读取以声明大小加一为硬上限，不能用伪造 zip directory size 绕过总量限制。
+  删除只允许处理该两级内容寻址布局并拒绝 symlink application/artifact 目录，数据库路径不能扩大成任意
+  递归删除目标。
+- SQLite 新增不可变 `canonical_artifacts` 与 `provider_derivations`。artifact record 使用共享 v1 形状并绑定
+  当前 contract、requirements registry 和 canonical artifact schema 的真实 SHA-256；provider derivation
+  绑定 exact parent、provider、standard 与 payload root。新 Deislet version 同时引用 artifact UUIDv7 和
+  derivation SHA-256；数据库 trigger 拒绝只填一半、跨 application/provider 的引用及 lineage 事后改写。
+  相同 parent/derivation/bundle 重放复用原 version，冲突字节失败关闭。
+- `deis deploy` 对普通构建与 `--no-build` 都重新验证本地 parent、current selector、derivation 与 payload，先
+  生成 canonical transport 和 provider envelope，再执行两次受身份复核的上传。Control 从 envelope 中只接受
+  `.deislet/provider-derivation.json` 与 `payload/bundle.zip`，先校验精确 parent/standard/provider/payload root，
+  且在把 payload root 用作 staging 路径前先要求它是 lowercase SHA-256，再保存 bundle 与 version lineage。
+  显式 `--bundle` 保留旧 raw upload 兼容并输出警告，其 version lineage 为
+  空；兼容存在不改变标准链路的定义。
+- 正向、完全相同重放与应用删除端到端用例已证明 record 摘要、version lineage、catalog 计数和受约束目录回收；
+  CLI 回归证明 canonical transport 保持目录契约，provider envelope 绑定 exact derivation 与 payload；数据库迁移
+  测试证明旧库可幂等加入两列。编译时常量与 `standards/edge-canon.lock.json` 的 contract、requirements、artifact
+  schema 三个摘要建立防漂移测试，治理脚本同时校验其 SHA-256 形状。
+- 该切片只关闭“控制面没有 canonical record/lineage”这一缺陷。当前标准仍为 proposal，所以 record 诚实保持
+  `deployable: false` 且 `signatures: []`；实验性 Deislet 部署不等于已发布标准或认证。受信 builder、签名验证、
+  远端 build/日志/cache、framework adapter、通用 provider driver、Cloudflare/EdgeOne 真实账户 lifecycle 和
+  旧 raw bundle 退场仍是完成阻断项。Control 暂时复用 `deis-build` 中的 validator，后续应把纯 artifact/derivation
+  契约下沉为不链接 compiler/adapter 的小型共享 crate；在完成前这是部署体积与依赖边界欠缺，不是另一套语义。

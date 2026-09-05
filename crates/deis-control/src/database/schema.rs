@@ -295,6 +295,104 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // A canonical artifact is the provider-neutral input from which every
+    // deployable payload is derived. The control plane stores the verified
+    // directory separately from a native bundle and keeps this record
+    // immutable for as long as its application exists.
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS canonical_artifacts (
+            id                  TEXT PRIMARY KEY,
+            app_id              TEXT NOT NULL REFERENCES apps(id),
+            artifact_sha256     TEXT NOT NULL,
+            content_root_sha256 TEXT NOT NULL,
+            standard_version    TEXT NOT NULL,
+            file_count          INTEGER NOT NULL,
+            storage_path        TEXT NOT NULL,
+            record              TEXT NOT NULL,
+            created_at          INTEGER NOT NULL,
+            UNIQUE(app_id, artifact_sha256)
+        )
+        "#,
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_canonical_artifacts_app ON canonical_artifacts(app_id, created_at DESC)",
+        [],
+    )?;
+
+    // A provider derivation is content addressed by its canonical JSON
+    // manifest. It binds one exact provider payload root to one exact
+    // canonical parent and is therefore shared by every idempotent retry of
+    // the same upload.
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS provider_derivations (
+            manifest_sha256    TEXT PRIMARY KEY,
+            artifact_id        TEXT NOT NULL REFERENCES canonical_artifacts(id),
+            provider           TEXT NOT NULL,
+            standard_version   TEXT NOT NULL,
+            payload_root_sha256 TEXT NOT NULL,
+            manifest           TEXT NOT NULL,
+            created_at         INTEGER NOT NULL,
+            UNIQUE(artifact_id, provider, payload_root_sha256)
+        )
+        "#,
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_provider_derivations_artifact ON provider_derivations(artifact_id, provider)",
+        [],
+    )?;
+
+    ensure_version_lineage_columns(conn)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_versions_artifact ON versions(app_id, canonical_artifact_id)",
+        [],
+    )?;
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS trg_versions_lineage_insert_v1
+        BEFORE INSERT ON versions
+        WHEN (NEW.canonical_artifact_id IS NULL) != (NEW.provider_derivation_sha256 IS NULL)
+          OR (
+            NEW.canonical_artifact_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM provider_derivations d
+                  JOIN canonical_artifacts a ON a.id = d.artifact_id
+                 WHERE d.manifest_sha256 = NEW.provider_derivation_sha256
+                   AND d.artifact_id = NEW.canonical_artifact_id
+                   AND d.provider = 'deislet'
+                   AND a.app_id = NEW.app_id
+            )
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'version canonical/provider lineage mismatch');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_versions_lineage_update_v1
+        BEFORE UPDATE OF canonical_artifact_id, provider_derivation_sha256 ON versions
+        WHEN NEW.canonical_artifact_id IS NOT OLD.canonical_artifact_id
+          OR NEW.provider_derivation_sha256 IS NOT OLD.provider_derivation_sha256
+        BEGIN
+            SELECT RAISE(ABORT, 'version lineage is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_canonical_artifacts_immutable_v1
+        BEFORE UPDATE ON canonical_artifacts
+        BEGIN
+            SELECT RAISE(ABORT, 'canonical artifact is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_derivations_immutable_v1
+        BEFORE UPDATE ON provider_derivations
+        BEGIN
+            SELECT RAISE(ABORT, 'provider derivation is immutable');
+        END;
+        "#,
+    )?;
+
     // Environments: production plus any number of preview environments.
     // Deployment pointers, routes and secrets all hang off an environment,
     // never off the bare app.
@@ -998,6 +1096,29 @@ fn ensure_deployment_snapshot_column(conn: &Connection) -> Result<()> {
     if !has_snapshot {
         conn.execute(
             "ALTER TABLE deployments ADD COLUMN snapshot_id TEXT REFERENCES environment_binding_snapshots(snapshot_id)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_version_lineage_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(versions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "canonical_artifact_id") {
+        conn.execute(
+            "ALTER TABLE versions ADD COLUMN canonical_artifact_id TEXT REFERENCES canonical_artifacts(id)",
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|name| name == "provider_derivation_sha256")
+    {
+        conn.execute(
+            "ALTER TABLE versions ADD COLUMN provider_derivation_sha256 TEXT REFERENCES provider_derivations(manifest_sha256)",
             [],
         )?;
     }
@@ -3117,6 +3238,8 @@ mod tests {
             "commands",
             "events",
             "apps",
+            "canonical_artifacts",
+            "provider_derivations",
             "versions",
             "environments",
             "deployments",
@@ -3136,6 +3259,20 @@ mod tests {
             assert!(
                 names.iter().any(|n| n == expected),
                 "table {expected} is missing after migration"
+            );
+        }
+
+        let version_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(versions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        for expected in ["canonical_artifact_id", "provider_derivation_sha256"] {
+            assert!(
+                version_columns.iter().any(|column| column == expected),
+                "versions.{expected} is missing after migration"
             );
         }
     }
