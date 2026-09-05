@@ -2610,6 +2610,153 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         BEGIN
             SELECT RAISE(ABORT, 'provider driver operation request and pins are immutable');
         END;
+
+        CREATE TABLE IF NOT EXISTS provider_deployment_workflows (
+            operation_id               TEXT PRIMARY KEY
+                                                REFERENCES product_operations(operation_id),
+            application_id             TEXT NOT NULL,
+            environment_id             TEXT NOT NULL,
+            provider_target_id         TEXT NOT NULL REFERENCES provider_targets(target_id),
+            target_revision            INTEGER NOT NULL CHECK(target_revision >= 1),
+            artifact_version_id        TEXT NOT NULL,
+            canonical_artifact_sha256  TEXT NOT NULL,
+            provider_payload_sha256    TEXT NOT NULL,
+            desired_state_sha256       TEXT NOT NULL,
+            desired_state_json         TEXT NOT NULL CHECK(json_valid(desired_state_json)),
+            plan_json                  TEXT NOT NULL CHECK(json_valid(plan_json)),
+            state                      TEXT NOT NULL
+                                                CHECK(state IN ('queued', 'running', 'waiting',
+                                                                'succeeded', 'failed')),
+            next_step_index            INTEGER NOT NULL CHECK(next_step_index BETWEEN 0 AND 7),
+            revision                   INTEGER NOT NULL CHECK(revision >= 1),
+            created_at                 INTEGER NOT NULL,
+            updated_at                 INTEGER NOT NULL,
+            CHECK(length(operation_id) = 36
+              AND lower(operation_id) = operation_id
+              AND substr(operation_id, 9, 1) = '-'
+              AND substr(operation_id, 14, 1) = '-'
+              AND substr(operation_id, 15, 1) = '7'
+              AND substr(operation_id, 19, 1) = '-'
+              AND substr(operation_id, 20, 1) GLOB '[89ab]'
+              AND substr(operation_id, 24, 1) = '-'
+              AND length(replace(operation_id, '-', '')) = 32
+              AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(application_id) = 36
+              AND lower(application_id) = application_id
+              AND substr(application_id, 9, 1) = '-'
+              AND substr(application_id, 14, 1) = '-'
+              AND substr(application_id, 15, 1) = '7'
+              AND substr(application_id, 19, 1) = '-'
+              AND substr(application_id, 20, 1) GLOB '[89ab]'
+              AND substr(application_id, 24, 1) = '-'
+              AND length(replace(application_id, '-', '')) = 32
+              AND replace(application_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(environment_id) = 36
+              AND lower(environment_id) = environment_id
+              AND substr(environment_id, 9, 1) = '-'
+              AND substr(environment_id, 14, 1) = '-'
+              AND substr(environment_id, 15, 1) = '7'
+              AND substr(environment_id, 19, 1) = '-'
+              AND substr(environment_id, 20, 1) GLOB '[89ab]'
+              AND substr(environment_id, 24, 1) = '-'
+              AND length(replace(environment_id, '-', '')) = 32
+              AND replace(environment_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(artifact_version_id) = 36
+              AND lower(artifact_version_id) = artifact_version_id
+              AND substr(artifact_version_id, 9, 1) = '-'
+              AND substr(artifact_version_id, 14, 1) = '-'
+              AND substr(artifact_version_id, 15, 1) = '7'
+              AND substr(artifact_version_id, 19, 1) = '-'
+              AND substr(artifact_version_id, 20, 1) GLOB '[89ab]'
+              AND substr(artifact_version_id, 24, 1) = '-'
+              AND length(replace(artifact_version_id, '-', '')) = 32
+              AND replace(artifact_version_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(canonical_artifact_sha256) = 64
+              AND lower(canonical_artifact_sha256) = canonical_artifact_sha256
+              AND canonical_artifact_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(provider_payload_sha256) = 64
+              AND lower(provider_payload_sha256) = provider_payload_sha256
+              AND provider_payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(desired_state_sha256) = 64
+              AND lower(desired_state_sha256) = desired_state_sha256
+              AND desired_state_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK((state = 'succeeded' AND next_step_index = 7)
+               OR state != 'succeeded')
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_deployment_one_active_target
+            ON provider_deployment_workflows(application_id, environment_id, provider_target_id)
+            WHERE state NOT IN ('succeeded', 'failed');
+
+        CREATE INDEX IF NOT EXISTS idx_provider_deployment_reconcile
+            ON provider_deployment_workflows(state, updated_at, operation_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_workflow_facts_immutable_v1
+        BEFORE UPDATE OF operation_id, application_id, environment_id,
+                         provider_target_id, target_revision, artifact_version_id,
+                         canonical_artifact_sha256, provider_payload_sha256,
+                         desired_state_sha256, desired_state_json, plan_json, created_at
+        ON provider_deployment_workflows
+        WHEN NEW.operation_id != OLD.operation_id
+          OR NEW.application_id != OLD.application_id
+          OR NEW.environment_id != OLD.environment_id
+          OR NEW.provider_target_id != OLD.provider_target_id
+          OR NEW.target_revision != OLD.target_revision
+          OR NEW.artifact_version_id != OLD.artifact_version_id
+          OR NEW.canonical_artifact_sha256 != OLD.canonical_artifact_sha256
+          OR NEW.provider_payload_sha256 != OLD.provider_payload_sha256
+          OR NEW.desired_state_sha256 != OLD.desired_state_sha256
+          OR NEW.desired_state_json != OLD.desired_state_json
+          OR NEW.plan_json != OLD.plan_json
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider deployment desired state is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_workflow_transition_v1
+        BEFORE UPDATE OF state, next_step_index, revision, updated_at
+        ON provider_deployment_workflows
+        WHEN NEW.revision != OLD.revision + 1
+          OR NEW.updated_at < OLD.updated_at
+          OR NEW.next_step_index < OLD.next_step_index
+          OR NEW.next_step_index > OLD.next_step_index + 1
+          OR (NEW.state != OLD.state AND NOT (
+               (OLD.state = 'queued' AND NEW.state IN ('running', 'failed'))
+            OR (OLD.state = 'running' AND NEW.state IN ('waiting', 'succeeded', 'failed'))
+            OR (OLD.state = 'waiting' AND NEW.state IN ('running', 'failed'))
+          ))
+          OR (OLD.state IN ('succeeded', 'failed')
+              AND (NEW.state != OLD.state OR NEW.next_step_index != OLD.next_step_index))
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid provider deployment workflow transition');
+        END;
+
+        CREATE TABLE IF NOT EXISTS provider_deployment_steps (
+            parent_operation_id TEXT NOT NULL
+                                     REFERENCES provider_deployment_workflows(operation_id),
+            sequence            INTEGER NOT NULL CHECK(sequence BETWEEN 0 AND 6),
+            driver_operation    TEXT NOT NULL
+                                     CHECK(driver_operation IN
+                                       ('preflight', 'plan', 'prepare', 'upload',
+                                        'verify', 'activate', 'observe')),
+            child_operation_id  TEXT NOT NULL UNIQUE
+                                     REFERENCES provider_driver_operations(operation_id),
+            created_at          INTEGER NOT NULL,
+            PRIMARY KEY(parent_operation_id, sequence),
+            CHECK((sequence = 0 AND driver_operation = 'preflight')
+               OR (sequence = 1 AND driver_operation = 'plan')
+               OR (sequence = 2 AND driver_operation = 'prepare')
+               OR (sequence = 3 AND driver_operation = 'upload')
+               OR (sequence = 4 AND driver_operation = 'verify')
+               OR (sequence = 5 AND driver_operation = 'activate')
+               OR (sequence = 6 AND driver_operation = 'observe'))
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_steps_immutable_v1
+        BEFORE UPDATE ON provider_deployment_steps
+        BEGIN
+            SELECT RAISE(ABORT, 'provider deployment steps are immutable');
+        END;
         "#,
     )?;
     Ok(())

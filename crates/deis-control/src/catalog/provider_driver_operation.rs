@@ -10,17 +10,19 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deis_provider_driver::{
-    DriverError, DriverNextAction, DriverOperation, DriverOperationClaim,
-    DriverOperationClaimOutcome, DriverOperationStore, DriverReceipt, DriverRequest,
-    DriverStepState, ProviderDriverPin, ProviderTargetRef, Sha256Digest, SideEffect,
-    ValidatedProviderDriverManifest, validate_driver_error, validate_driver_request,
-    validate_driver_response,
+    ArtifactVersionRef, DriverError, DriverNextAction, DriverOperation, DriverOperationClaim,
+    DriverOperationClaimOutcome, DriverOperationStore, DriverOrchestrationOutcome,
+    DriverOrchestrator, DriverOrchestratorConfig, DriverOrchestratorError, DriverReceipt,
+    DriverRequest, DriverStepState, ProviderDriver, ProviderDriverPin, ProviderNeutralPlan,
+    ProviderTargetRef, Sha256Digest, SideEffect, ValidatedProviderDriverManifest,
+    validate_driver_error, validate_driver_request, validate_driver_response,
 };
 use deis_wire::{
-    CanonicalId, OperationError, OperationKind, OperationState, ProviderOperation,
-    ProviderOperationState,
+    CanonicalId, OperationError, OperationKind, OperationState, ProductOperation,
+    ProviderOperation, ProviderOperationState,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use super::model::now_secs;
 use super::operation::{
@@ -100,6 +102,74 @@ pub struct ProviderDriverOperationRecord {
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The standard deployment path. Rollback, delete and cleanup are separate
+/// product intents and never appear as a hidden success-path step.
+pub const PROVIDER_DEPLOYMENT_STEPS: [DriverOperation; 7] = [
+    DriverOperation::Preflight,
+    DriverOperation::Plan,
+    DriverOperation::Prepare,
+    DriverOperation::Upload,
+    DriverOperation::Verify,
+    DriverOperation::Activate,
+    DriverOperation::Observe,
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderDeploymentSpec {
+    pub application_id: CanonicalId,
+    pub environment_id: CanonicalId,
+    pub provider_target_id: CanonicalId,
+    pub artifact: ArtifactVersionRef,
+    pub plan: ProviderNeutralPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderDeploymentStep {
+    pub sequence: usize,
+    pub operation: DriverOperation,
+    pub child_operation_id: CanonicalId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderDeploymentWorkflow {
+    pub operation: ProductOperation,
+    pub provider_target_id: CanonicalId,
+    pub target_revision: u64,
+    pub desired_state_digest: Sha256Digest,
+    pub artifact: ArtifactVersionRef,
+    pub plan: ProviderNeutralPlan,
+    pub next_step_index: usize,
+    pub steps: Vec<ProviderDeploymentStep>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderDeploymentDriveOutcome {
+    /// Another coordinator owns the current provider child operation.
+    Busy(ProviderDeploymentWorkflow),
+    /// One durable child attempt settled; call again to run/reconcile the
+    /// current or following step.
+    Advanced(ProviderDeploymentWorkflow),
+    /// The provider requires retry, observation, reconciliation or operator
+    /// action. The same child identity remains current.
+    Waiting(ProviderDeploymentWorkflow),
+    Succeeded(ProviderDeploymentWorkflow),
+    Failed(ProviderDeploymentWorkflow),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct ProviderDeploymentDesiredState {
+    schema_version: u32,
+    application_id: CanonicalId,
+    environment_id: CanonicalId,
+    target: ProviderTargetRef,
+    target_revision: u64,
+    standard_version: String,
+    artifact: ArtifactVersionRef,
+    plan: ProviderNeutralPlan,
 }
 
 #[derive(Debug)]
@@ -228,121 +298,15 @@ impl CatalogStore {
         request: DriverRequest,
         context: OperationRequestContext,
     ) -> CatalogResult<deis_wire::ProductOperation> {
-        let request_json = canonical_json(&request, "provider driver request")?;
         let request_digest = provider_request_fingerprint(&request)?;
         let context = context
             .for_request_fact("driver-request-sha256", &request_digest)
             .for_target("provider-target", request.target.provider_target_id);
-        let operation_id = request.operation_id;
         self.database()
             .with_connection(move |connection| {
                 let transaction = connection.unchecked_transaction()?;
-                let target = load_target(&transaction, request.target.provider_target_id)?
-                    .ok_or_else(|| {
-                        CatalogError::not_found(format!(
-                            "provider target {}",
-                            request.target.provider_target_id
-                        ))
-                    })?;
-                validate_operation_target(&target, &request)?;
-                validate_driver_request(&target.manifest, &request).map_err(|error| {
-                    CatalogError::invalid(format!("invalid provider driver request: {error}"))
-                })?;
-                resolve_application_environment(&transaction, &request)?;
-                if let Some(existing_id) =
-                    find_operation_request_tx(&transaction, OperationKind::Provider, &context)?
-                {
-                    let exists = transaction
-                        .query_row(
-                            "SELECT 1 FROM provider_driver_operations WHERE operation_id = ?1",
-                            [existing_id.to_string()],
-                            |_| Ok(()),
-                        )
-                        .optional()?
-                        .is_some();
-                    if !exists {
-                        return Err(CatalogError::conflict(format!(
-                            "provider operation {existing_id} is missing its durable driver record"
-                        )));
-                    }
-                    return load_operation_tx(&transaction, existing_id)?.ok_or_else(|| {
-                        CatalogError::not_found(format!("operation {existing_id}"))
-                    });
-                }
-                let now = now_secs();
-                let actor_id = actor_id(&transaction, &context.actor_subject, now)?;
-                let summary = provider_summary(
-                    operation_id,
-                    request.target.provider_target_id,
-                    &target.target.driver_id,
-                    ProviderOperationState::Pending,
-                    None,
-                    None,
-                    now,
-                )?;
-                let provider_operations = serde_json::to_string(&[summary]).map_err(|error| {
-                    CatalogError::invalid(format!("invalid provider operation summary: {error}"))
-                })?;
-                transaction.execute(
-                    "INSERT INTO product_operations
-                       (operation_id, kind, organization_id, application_id, environment_id,
-                        target_kind, target_id, expected_revision, state, phase, revision,
-                        idempotency_key_sha256, request_fingerprint_sha256, actor_id,
-                        request_id, correlation_id, progress, cancellable, retryable,
-                        child_operation_ids, provider_operations, error_json,
-                        created_at, started_at, updated_at, finished_at)
-                     VALUES (?1, 'provider', ?2, ?3, ?4, 'provider-target', ?5, ?6,
-                             'queued', ?7, 1, ?8, ?9, ?10, ?11, ?12, NULL, 0, 1,
-                             '[]', ?13, NULL, ?14, NULL, ?14, NULL)",
-                    params![
-                        operation_id.to_string(),
-                        target.organization_id.to_string(),
-                        request.application_id.to_string(),
-                        request.environment_id.to_string(),
-                        request.target.provider_target_id.to_string(),
-                        i64::try_from(target.target.revision).map_err(|_| {
-                            CatalogError::invalid("provider target revision exceeds SQLite range")
-                        })?,
-                        request.operation.as_str(),
-                        context.idempotency_key_sha256,
-                        context.request_fingerprint_sha256,
-                        actor_id.to_string(),
-                        context.request_id.to_string(),
-                        context.correlation_id.to_string(),
-                        provider_operations,
-                        now,
-                    ],
-                )?;
-                transaction.execute(
-                    "INSERT INTO provider_driver_operations
-                       (operation_id, provider_target_id, target_revision, original_operation,
-                        desired_state_sha256, driver_id, driver_version,
-                        driver_distribution_sha256, driver_manifest_sha256, request_json,
-                        state, last_attempt_operation, receipt_json, driver_error_json,
-                        contract_failure, side_effect, next_action, native_operation_id,
-                        attempt_count, owner_id, claim_epoch, lease_expires_at,
-                        revision, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                             'pending', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                             0, NULL, 0, NULL, 1, ?11, ?11)",
-                    params![
-                        operation_id.to_string(),
-                        request.target.provider_target_id.to_string(),
-                        i64::try_from(target.target.revision).map_err(|_| {
-                            CatalogError::invalid("provider target revision exceeds SQLite range")
-                        })?,
-                        request.operation.as_str(),
-                        request.desired_state_digest.as_str(),
-                        target.target.driver_id,
-                        target.target.driver_version,
-                        target.target.driver_distribution_digest.as_str(),
-                        target.target.driver_manifest_digest.as_str(),
-                        request_json,
-                        now,
-                    ],
-                )?;
-                let operation = load_operation_tx(&transaction, operation_id)?
-                    .ok_or_else(|| CatalogError::not_found(format!("operation {operation_id}")))?;
+                let operation =
+                    insert_provider_driver_operation_tx(&transaction, &request, &context)?;
                 transaction.commit()?;
                 Ok(operation)
             })
@@ -356,6 +320,1027 @@ impl CatalogStore {
         self.database()
             .with_connection(move |connection| load_driver_operation(connection, operation_id))
             .await
+    }
+
+    pub async fn begin_provider_deployment(
+        &self,
+        spec: ProviderDeploymentSpec,
+        context: OperationRequestContext,
+    ) -> CatalogResult<ProductOperation> {
+        let operation_id = CanonicalId::new_v7();
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let target = load_target(&transaction, spec.provider_target_id)?.ok_or_else(|| {
+                    CatalogError::not_found(format!(
+                        "provider target {}",
+                        spec.provider_target_id
+                    ))
+                })?;
+                let target_ref = provider_target_ref(&target);
+                let validation_request = DriverRequest {
+                    schema_version: 1,
+                    operation_id: CanonicalId::new_v7(),
+                    operation: DriverOperation::Preflight,
+                    desired_state_digest: "0".repeat(64).parse().expect("valid SHA-256"),
+                    application_id: spec.application_id,
+                    environment_id: spec.environment_id,
+                    target: target_ref.clone(),
+                    artifact: Some(spec.artifact.clone()),
+                    plan: spec.plan.clone(),
+                };
+                validate_operation_target(&target, &validation_request)?;
+                resolve_application_environment(&transaction, &validation_request)?;
+                validate_artifact_lineage(&transaction, &target, &validation_request)?;
+                let desired = ProviderDeploymentDesiredState {
+                    schema_version: 1,
+                    application_id: spec.application_id,
+                    environment_id: spec.environment_id,
+                    target: target_ref,
+                    target_revision: target.target.revision,
+                    standard_version: target.target.standard_version.clone(),
+                    artifact: spec.artifact.clone(),
+                    plan: spec.plan.clone(),
+                };
+                let desired_state_json = canonical_json(&desired, "provider desired state")?;
+                let desired_state_digest: Sha256Digest = sha256_hex(desired_state_json.as_bytes())
+                    .parse()
+                    .expect("SHA-256 formatter is canonical");
+                let plan_json = canonical_json(&spec.plan, "provider deployment plan")?;
+                let context = context
+                    .for_request_fact("provider-deployment-sha256", desired_state_digest.as_str())
+                    .for_target("provider-target", spec.provider_target_id);
+                if let Some(existing_id) =
+                    find_operation_request_tx(&transaction, OperationKind::Deploy, &context)?
+                {
+                    let existing = load_provider_deployment_workflow(&transaction, existing_id)?
+                        .ok_or_else(|| {
+                            CatalogError::conflict(format!(
+                                "deployment operation {existing_id} is missing its provider workflow"
+                            ))
+                        })?;
+                    transaction.commit()?;
+                    return Ok(existing.operation);
+                }
+                if let Some(active_id) = transaction
+                    .query_row(
+                        "SELECT operation_id FROM provider_deployment_workflows
+                          WHERE application_id = ?1 AND environment_id = ?2
+                            AND provider_target_id = ?3
+                            AND state NOT IN ('succeeded', 'failed')",
+                        params![
+                            spec.application_id.to_string(),
+                            spec.environment_id.to_string(),
+                            spec.provider_target_id.to_string(),
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    return Err(CatalogError::conflict(format!(
+                        "provider target already has active deployment operation {active_id} for this environment"
+                    )));
+                }
+                let now = now_secs();
+                let actor = actor_id(&transaction, &context.actor_subject, now)?;
+                transaction.execute(
+                    "INSERT INTO product_operations
+                       (operation_id, kind, organization_id, application_id, environment_id,
+                        target_kind, target_id, expected_revision, state, phase, revision,
+                        idempotency_key_sha256, request_fingerprint_sha256, actor_id,
+                        request_id, correlation_id, progress, cancellable, retryable,
+                        child_operation_ids, provider_operations, error_json,
+                        created_at, started_at, updated_at, finished_at)
+                     VALUES (?1, 'deploy', ?2, ?3, ?4, 'provider-target', ?5, ?6,
+                             'queued', 'preflight', 1, ?7, ?8, ?9, ?10, ?11,
+                             0, 0, 1, '[]', '[]', NULL, ?12, NULL, ?12, NULL)",
+                    params![
+                        operation_id.to_string(),
+                        target.organization_id.to_string(),
+                        spec.application_id.to_string(),
+                        spec.environment_id.to_string(),
+                        spec.provider_target_id.to_string(),
+                        i64::try_from(target.target.revision).map_err(|_| {
+                            CatalogError::invalid("provider target revision exceeds SQLite range")
+                        })?,
+                        context.idempotency_key_sha256,
+                        context.request_fingerprint_sha256,
+                        actor.to_string(),
+                        context.request_id.to_string(),
+                        context.correlation_id.to_string(),
+                        now,
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO provider_deployment_workflows
+                       (operation_id, application_id, environment_id, provider_target_id,
+                        target_revision, artifact_version_id, canonical_artifact_sha256,
+                        provider_payload_sha256, desired_state_sha256, desired_state_json,
+                        plan_json, state, next_step_index, revision, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                             'queued', 0, 1, ?12, ?12)",
+                    params![
+                        operation_id.to_string(),
+                        spec.application_id.to_string(),
+                        spec.environment_id.to_string(),
+                        spec.provider_target_id.to_string(),
+                        i64::try_from(target.target.revision).map_err(|_| {
+                            CatalogError::invalid("provider target revision exceeds SQLite range")
+                        })?,
+                        spec.artifact.artifact_version_id.to_string(),
+                        spec.artifact.canonical_artifact_sha256.as_str(),
+                        spec.artifact.provider_payload_sha256.as_str(),
+                        desired_state_digest.as_str(),
+                        desired_state_json,
+                        plan_json,
+                        now,
+                    ],
+                )?;
+                create_provider_deployment_step_tx(
+                    &transaction,
+                    operation_id,
+                    0,
+                    &desired,
+                    &desired_state_digest,
+                    &context,
+                )?;
+                let operation = load_operation_tx(&transaction, operation_id)?.ok_or_else(|| {
+                    CatalogError::not_found(format!("operation {operation_id}"))
+                })?;
+                transaction.commit()?;
+                Ok(operation)
+            })
+            .await
+    }
+
+    pub async fn provider_deployment_workflow(
+        &self,
+        operation_id: CanonicalId,
+    ) -> CatalogResult<Option<ProviderDeploymentWorkflow>> {
+        self.database()
+            .with_connection(move |connection| {
+                load_provider_deployment_workflow(connection, operation_id)
+            })
+            .await
+    }
+
+    /// Recovery queue for a restarted coordinator. Terminal rows are durable
+    /// history and are never returned as runnable work.
+    pub async fn nonterminal_provider_deployments(
+        &self,
+        limit: usize,
+    ) -> CatalogResult<Vec<ProviderDeploymentWorkflow>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CatalogError::invalid(
+                "provider deployment recovery limit must be between 1 and 1000",
+            ));
+        }
+        self.database()
+            .with_connection(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT operation_id FROM provider_deployment_workflows
+                      WHERE state NOT IN ('succeeded', 'failed')
+                      ORDER BY updated_at, operation_id LIMIT ?1",
+                )?;
+                let ids = statement
+                    .query_map(
+                        [i64::try_from(limit).map_err(|_| {
+                            CatalogError::invalid(
+                                "provider deployment recovery limit exceeds SQLite range",
+                            )
+                        })?],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                ids.into_iter()
+                    .map(|id| {
+                        let id = parse_id(&id, "provider deployment operation")?;
+                        load_provider_deployment_workflow(connection, id)?.ok_or_else(|| {
+                            CatalogError::not_found(format!("provider deployment operation {id}"))
+                        })
+                    })
+                    .collect()
+            })
+            .await
+    }
+
+    /// Execute at most one durable provider child. Repeated calls, concurrent
+    /// coordinators and restart recovery all converge through the child
+    /// operation's owner/epoch fence and this parent's immutable step table.
+    pub async fn drive_provider_deployment_once(
+        &self,
+        operation_id: CanonicalId,
+        owner_id: CanonicalId,
+        driver: &dyn ProviderDriver,
+        config: DriverOrchestratorConfig,
+    ) -> CatalogResult<ProviderDeploymentDriveOutcome> {
+        let workflow = self.prepare_provider_deployment(operation_id).await?;
+        if workflow.operation.state == OperationState::Succeeded {
+            return Ok(ProviderDeploymentDriveOutcome::Succeeded(workflow));
+        }
+        if workflow.operation.state == OperationState::Failed {
+            return Ok(ProviderDeploymentDriveOutcome::Failed(workflow));
+        }
+        let child = workflow
+            .steps
+            .get(workflow.next_step_index)
+            .ok_or_else(|| {
+                CatalogError::invalid(format!(
+                    "provider deployment {operation_id} has no current durable step"
+                ))
+            })?
+            .child_operation_id;
+        let orchestrator = DriverOrchestrator::new(self.clone(), config).map_err(|error| {
+            CatalogError::invalid(format!("invalid provider orchestrator config: {error}"))
+        })?;
+        match orchestrator.execute(child, owner_id, driver).await {
+            Ok(
+                DriverOrchestrationOutcome::Succeeded(_)
+                | DriverOrchestrationOutcome::DriverFailed(_),
+            )
+            | Err(DriverOrchestratorError::NotRunnable { .. })
+            | Err(DriverOrchestratorError::Contract(_)) => {}
+            Err(DriverOrchestratorError::AlreadyClaimed { .. }) => {
+                let current = self
+                    .provider_deployment_workflow(operation_id)
+                    .await?
+                    .ok_or_else(|| {
+                        CatalogError::not_found(format!(
+                            "provider deployment operation {operation_id}"
+                        ))
+                    })?;
+                return Ok(ProviderDeploymentDriveOutcome::Busy(current));
+            }
+            Err(DriverOrchestratorError::Store(error)) => return Err(error),
+        }
+        let workflow = self.refresh_provider_deployment(operation_id).await?;
+        Ok(classify_provider_deployment(workflow))
+    }
+
+    async fn prepare_provider_deployment(
+        &self,
+        operation_id: CanonicalId,
+    ) -> CatalogResult<ProviderDeploymentWorkflow> {
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let workflow = advance_provider_deployment_tx(&transaction, operation_id, true)?;
+                transaction.commit()?;
+                Ok(workflow)
+            })
+            .await
+    }
+
+    async fn refresh_provider_deployment(
+        &self,
+        operation_id: CanonicalId,
+    ) -> CatalogResult<ProviderDeploymentWorkflow> {
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let workflow = advance_provider_deployment_tx(&transaction, operation_id, false)?;
+                transaction.commit()?;
+                Ok(workflow)
+            })
+            .await
+    }
+}
+
+fn insert_provider_driver_operation_tx(
+    connection: &Connection,
+    request: &DriverRequest,
+    context: &OperationRequestContext,
+) -> CatalogResult<deis_wire::ProductOperation> {
+    let request_json = canonical_json(request, "provider driver request")?;
+    let target = load_target(connection, request.target.provider_target_id)?.ok_or_else(|| {
+        CatalogError::not_found(format!(
+            "provider target {}",
+            request.target.provider_target_id
+        ))
+    })?;
+    validate_operation_target(&target, request)?;
+    validate_driver_request(&target.manifest, request).map_err(|error| {
+        CatalogError::invalid(format!("invalid provider driver request: {error}"))
+    })?;
+    resolve_application_environment(connection, request)?;
+    validate_artifact_lineage(connection, &target, request)?;
+    if let Some(existing_id) =
+        find_operation_request_tx(connection, OperationKind::Provider, context)?
+    {
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM provider_driver_operations WHERE operation_id = ?1",
+                [existing_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(CatalogError::conflict(format!(
+                "provider operation {existing_id} is missing its durable driver record"
+            )));
+        }
+        return load_operation_tx(connection, existing_id)?
+            .ok_or_else(|| CatalogError::not_found(format!("operation {existing_id}")));
+    }
+    let operation_id = request.operation_id;
+    let now = now_secs();
+    let actor_id = actor_id(connection, &context.actor_subject, now)?;
+    let summary = provider_summary(
+        operation_id,
+        request.target.provider_target_id,
+        &target.target.driver_id,
+        ProviderOperationState::Pending,
+        None,
+        None,
+        now,
+    )?;
+    let provider_operations = serde_json::to_string(&[summary]).map_err(|error| {
+        CatalogError::invalid(format!("invalid provider operation summary: {error}"))
+    })?;
+    connection.execute(
+        "INSERT INTO product_operations
+           (operation_id, kind, organization_id, application_id, environment_id,
+            target_kind, target_id, expected_revision, state, phase, revision,
+            idempotency_key_sha256, request_fingerprint_sha256, actor_id,
+            request_id, correlation_id, progress, cancellable, retryable,
+            child_operation_ids, provider_operations, error_json,
+            created_at, started_at, updated_at, finished_at)
+         VALUES (?1, 'provider', ?2, ?3, ?4, 'provider-target', ?5, ?6,
+                 'queued', ?7, 1, ?8, ?9, ?10, ?11, ?12, NULL, 0, 1,
+                 '[]', ?13, NULL, ?14, NULL, ?14, NULL)",
+        params![
+            operation_id.to_string(),
+            target.organization_id.to_string(),
+            request.application_id.to_string(),
+            request.environment_id.to_string(),
+            request.target.provider_target_id.to_string(),
+            i64::try_from(target.target.revision).map_err(|_| {
+                CatalogError::invalid("provider target revision exceeds SQLite range")
+            })?,
+            request.operation.as_str(),
+            context.idempotency_key_sha256,
+            context.request_fingerprint_sha256,
+            actor_id.to_string(),
+            context.request_id.to_string(),
+            context.correlation_id.to_string(),
+            provider_operations,
+            now,
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO provider_driver_operations
+           (operation_id, provider_target_id, target_revision, original_operation,
+            desired_state_sha256, driver_id, driver_version,
+            driver_distribution_sha256, driver_manifest_sha256, request_json,
+            state, last_attempt_operation, receipt_json, driver_error_json,
+            contract_failure, side_effect, next_action, native_operation_id,
+            attempt_count, owner_id, claim_epoch, lease_expires_at,
+            revision, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 'pending', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                 0, NULL, 0, NULL, 1, ?11, ?11)",
+        params![
+            operation_id.to_string(),
+            request.target.provider_target_id.to_string(),
+            i64::try_from(target.target.revision).map_err(|_| {
+                CatalogError::invalid("provider target revision exceeds SQLite range")
+            })?,
+            request.operation.as_str(),
+            request.desired_state_digest.as_str(),
+            target.target.driver_id,
+            target.target.driver_version,
+            target.target.driver_distribution_digest.as_str(),
+            target.target.driver_manifest_digest.as_str(),
+            request_json,
+            now,
+        ],
+    )?;
+    load_operation_tx(connection, operation_id)?
+        .ok_or_else(|| CatalogError::not_found(format!("operation {operation_id}")))
+}
+
+fn provider_target_ref(target: &StoredTarget) -> ProviderTargetRef {
+    ProviderTargetRef {
+        provider_target_id: target.target.target_id,
+        provider_installation_id: target.target.installation_id,
+        backend_id: target.target.backend_id.clone(),
+        target_config_digest: target.target.target_config_digest.clone(),
+    }
+}
+
+fn create_provider_deployment_step_tx(
+    connection: &Connection,
+    parent_operation_id: CanonicalId,
+    sequence: usize,
+    desired: &ProviderDeploymentDesiredState,
+    desired_state_digest: &Sha256Digest,
+    parent_context: &OperationRequestContext,
+) -> CatalogResult<CanonicalId> {
+    let operation = *PROVIDER_DEPLOYMENT_STEPS.get(sequence).ok_or_else(|| {
+        CatalogError::invalid(format!(
+            "provider deployment step index {sequence} is outside the standard lifecycle"
+        ))
+    })?;
+    let child_operation_id = CanonicalId::new_v7();
+    let request = DriverRequest {
+        schema_version: 1,
+        operation_id: child_operation_id,
+        operation,
+        desired_state_digest: desired_state_digest.clone(),
+        application_id: desired.application_id,
+        environment_id: desired.environment_id,
+        target: desired.target.clone(),
+        artifact: Some(desired.artifact.clone()),
+        plan: desired.plan.clone(),
+    };
+    let child_context = OperationRequestContext::new(
+        &format!("provider-deployment:{parent_operation_id}:{sequence}"),
+        &format!(
+            "internal provider deployment child\nparent:{parent_operation_id}\nsequence:{sequence}"
+        ),
+        parent_context.actor_subject.clone(),
+        parent_context.request_id,
+        parent_context.correlation_id,
+    )?
+    .for_request_fact(
+        "driver-request-sha256",
+        &provider_request_fingerprint(&request)?,
+    )
+    .for_target("provider-target", desired.target.provider_target_id);
+    let child = insert_provider_driver_operation_tx(connection, &request, &child_context)?;
+    connection.execute(
+        "INSERT INTO provider_deployment_steps
+           (parent_operation_id, sequence, driver_operation, child_operation_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            parent_operation_id.to_string(),
+            i64::try_from(sequence)
+                .map_err(|_| CatalogError::invalid("provider step index exceeds SQLite range"))?,
+            operation.as_str(),
+            child.operation_id.to_string(),
+            now_secs(),
+        ],
+    )?;
+    sync_parent_provider_details_tx(connection, parent_operation_id)?;
+    Ok(child.operation_id)
+}
+
+fn sync_parent_provider_details_tx(
+    connection: &Connection,
+    parent_operation_id: CanonicalId,
+) -> CatalogResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT step.child_operation_id, child.provider_operations
+           FROM provider_deployment_steps step
+           JOIN product_operations child ON child.operation_id = step.child_operation_id
+          WHERE step.parent_operation_id = ?1
+          ORDER BY step.sequence",
+    )?;
+    let rows = statement
+        .query_map([parent_operation_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut child_ids = Vec::with_capacity(rows.len());
+    let mut provider_operations = Vec::with_capacity(rows.len());
+    for (child_id, summaries) in rows {
+        child_ids.push(parse_id(&child_id, "provider deployment child")?);
+        let mut summaries: Vec<ProviderOperation> =
+            parse_json(&summaries, "provider child operation summaries")?;
+        if summaries.len() != 1 {
+            return Err(CatalogError::invalid(
+                "provider deployment child must expose exactly one provider summary",
+            ));
+        }
+        provider_operations.push(summaries.remove(0));
+    }
+    let child_json = serde_json::to_string(&child_ids).map_err(|error| {
+        CatalogError::invalid(format!(
+            "invalid provider deployment child identities: {error}"
+        ))
+    })?;
+    let provider_json = serde_json::to_string(&provider_operations).map_err(|error| {
+        CatalogError::invalid(format!("invalid provider deployment summaries: {error}"))
+    })?;
+    let changed = connection.execute(
+        "UPDATE product_operations
+            SET child_operation_ids = ?2, provider_operations = ?3,
+                revision = revision + 1, updated_at = ?4
+          WHERE operation_id = ?1 AND kind = 'deploy'",
+        params![
+            parent_operation_id.to_string(),
+            child_json,
+            provider_json,
+            now_secs(),
+        ],
+    )?;
+    ensure_parent_change(changed, parent_operation_id, "synchronize child operations")
+}
+
+fn load_provider_deployment_workflow(
+    connection: &Connection,
+    operation_id: CanonicalId,
+) -> CatalogResult<Option<ProviderDeploymentWorkflow>> {
+    let row = connection
+        .query_row(
+            "SELECT application_id, environment_id, provider_target_id, target_revision,
+                    artifact_version_id, canonical_artifact_sha256,
+                    provider_payload_sha256, desired_state_sha256,
+                    desired_state_json, plan_json, state, next_step_index
+               FROM provider_deployment_workflows WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let application_id = parse_id(&row.0, "provider deployment application")?;
+    let environment_id = parse_id(&row.1, "provider deployment environment")?;
+    let provider_target_id = parse_id(&row.2, "provider deployment target")?;
+    let target_revision = to_u64(row.3, "provider deployment target revision")?;
+    let artifact = ArtifactVersionRef {
+        artifact_version_id: parse_id(&row.4, "provider deployment artifact version")?,
+        canonical_artifact_sha256: row.5.parse().map_err(|error| {
+            CatalogError::invalid(format!("invalid canonical artifact digest: {error}"))
+        })?,
+        provider_payload_sha256: row.6.parse().map_err(|error| {
+            CatalogError::invalid(format!("invalid provider payload digest: {error}"))
+        })?,
+    };
+    let desired_state_digest: Sha256Digest = row.7.parse().map_err(|error| {
+        CatalogError::invalid(format!("invalid provider desired state digest: {error}"))
+    })?;
+    let desired: ProviderDeploymentDesiredState =
+        parse_json(&row.8, "provider deployment desired state")?;
+    let plan: ProviderNeutralPlan = parse_json(&row.9, "provider deployment plan")?;
+    let computed_json = canonical_json(&desired, "provider deployment desired state")?;
+    let computed_digest = sha256_hex(computed_json.as_bytes());
+    if computed_json != row.8
+        || computed_digest != desired_state_digest.as_str()
+        || desired.application_id != application_id
+        || desired.environment_id != environment_id
+        || desired.target.provider_target_id != provider_target_id
+        || desired.target_revision != target_revision
+        || desired.artifact != artifact
+        || desired.plan != plan
+    {
+        return Err(CatalogError::invalid(
+            "provider deployment desired state does not match its durable facts",
+        ));
+    }
+    let workflow_state = parse_deployment_operation_state(&row.10)?;
+    let next_step_index = usize::try_from(row.11).map_err(|_| {
+        CatalogError::invalid(format!("invalid provider deployment step index {}", row.11))
+    })?;
+    let operation = load_operation_tx(connection, operation_id)?
+        .ok_or_else(|| CatalogError::not_found(format!("operation {operation_id}")))?;
+    if operation.kind != OperationKind::Deploy
+        || operation.state != workflow_state
+        || operation.scope.application_id != Some(application_id)
+        || operation.scope.environment_id != Some(environment_id)
+        || operation.target.kind != "provider-target"
+        || operation.target.id != provider_target_id
+        || operation.target.expected_revision != target_revision
+    {
+        return Err(CatalogError::invalid(
+            "provider deployment workflow and parent operation disagree",
+        ));
+    }
+    let mut statement = connection.prepare(
+        "SELECT step.sequence, step.driver_operation, step.child_operation_id,
+                child.original_operation, child.provider_target_id,
+                child.desired_state_sha256
+           FROM provider_deployment_steps step
+           JOIN provider_driver_operations child
+             ON child.operation_id = step.child_operation_id
+          WHERE step.parent_operation_id = ?1
+          ORDER BY step.sequence",
+    )?;
+    let raw_steps = statement
+        .query_map([operation_id.to_string()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut steps = Vec::with_capacity(raw_steps.len());
+    for (expected_sequence, row) in raw_steps.into_iter().enumerate() {
+        let sequence = usize::try_from(row.0).map_err(|_| {
+            CatalogError::invalid("provider deployment has a negative step sequence")
+        })?;
+        let operation = parse_driver_operation(&row.1)?;
+        if sequence != expected_sequence
+            || PROVIDER_DEPLOYMENT_STEPS.get(sequence) != Some(&operation)
+            || row.1 != row.3
+            || parse_id(&row.4, "provider child target")? != provider_target_id
+            || row.5 != desired_state_digest.as_str()
+        {
+            return Err(CatalogError::invalid(
+                "provider deployment step sequence or child identity drifted",
+            ));
+        }
+        steps.push(ProviderDeploymentStep {
+            sequence,
+            operation,
+            child_operation_id: parse_id(&row.2, "provider deployment child")?,
+        });
+    }
+    if (workflow_state == OperationState::Succeeded
+        && (next_step_index != PROVIDER_DEPLOYMENT_STEPS.len()
+            || steps.len() != PROVIDER_DEPLOYMENT_STEPS.len()))
+        || (workflow_state != OperationState::Succeeded
+            && (next_step_index >= PROVIDER_DEPLOYMENT_STEPS.len()
+                || steps.len() != next_step_index + 1))
+        || operation.child_operation_ids
+            != steps
+                .iter()
+                .map(|step| step.child_operation_id)
+                .collect::<Vec<_>>()
+    {
+        return Err(CatalogError::invalid(
+            "provider deployment parent and step journal disagree",
+        ));
+    }
+    Ok(Some(ProviderDeploymentWorkflow {
+        operation,
+        provider_target_id,
+        target_revision,
+        desired_state_digest,
+        artifact,
+        plan,
+        next_step_index,
+        steps,
+    }))
+}
+
+fn advance_provider_deployment_tx(
+    connection: &Connection,
+    operation_id: CanonicalId,
+    resume: bool,
+) -> CatalogResult<ProviderDeploymentWorkflow> {
+    let mut workflow =
+        load_provider_deployment_workflow(connection, operation_id)?.ok_or_else(|| {
+            CatalogError::not_found(format!("provider deployment operation {operation_id}"))
+        })?;
+    if workflow.operation.state.terminal() {
+        return Ok(workflow);
+    }
+    let step = workflow
+        .steps
+        .get(workflow.next_step_index)
+        .ok_or_else(|| CatalogError::invalid("provider deployment current step is missing"))?;
+    let child = load_operation_tx(connection, step.child_operation_id)?.ok_or_else(|| {
+        CatalogError::not_found(format!(
+            "provider child operation {}",
+            step.child_operation_id
+        ))
+    })?;
+    sync_parent_provider_details_tx(connection, operation_id)?;
+    match child.state {
+        OperationState::Succeeded => {
+            let next_index = workflow.next_step_index + 1;
+            ensure_parent_running_tx(
+                connection,
+                operation_id,
+                step.operation.as_str(),
+                progress_for_step(next_index),
+            )?;
+            update_provider_deployment_state_tx(
+                connection,
+                operation_id,
+                OperationState::Running,
+                workflow.next_step_index,
+            )?;
+            if next_index == PROVIDER_DEPLOYMENT_STEPS.len() {
+                transition_operation_tx(
+                    connection,
+                    operation_id,
+                    None,
+                    deis_wire::OperationEvent::Succeeded,
+                    "complete",
+                    None,
+                )?;
+                connection.execute(
+                    "UPDATE product_operations SET progress = 10000, retryable = 0
+                      WHERE operation_id = ?1",
+                    [operation_id.to_string()],
+                )?;
+                update_provider_deployment_state_tx(
+                    connection,
+                    operation_id,
+                    OperationState::Succeeded,
+                    next_index,
+                )?;
+            } else {
+                let desired: ProviderDeploymentDesiredState = connection
+                    .query_row(
+                        "SELECT desired_state_json FROM provider_deployment_workflows
+                      WHERE operation_id = ?1",
+                        [operation_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(CatalogError::from)
+                    .and_then(|json| parse_json(&json, "provider deployment desired state"))?;
+                let actor_subject: String = connection.query_row(
+                    "SELECT actor.subject
+                       FROM product_operations operation
+                       JOIN operation_actors actor ON actor.actor_id = operation.actor_id
+                      WHERE operation.operation_id = ?1",
+                    [operation_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let parent_context = OperationRequestContext {
+                    idempotency_key_sha256: workflow.operation.idempotency_key_digest.value.clone(),
+                    request_fingerprint_sha256: sha256_hex(
+                        format!("provider-deployment:{operation_id}").as_bytes(),
+                    ),
+                    actor_subject,
+                    request_id: workflow.operation.request_id,
+                    correlation_id: workflow.operation.correlation_id,
+                };
+                create_provider_deployment_step_tx(
+                    connection,
+                    operation_id,
+                    next_index,
+                    &desired,
+                    &workflow.desired_state_digest,
+                    &parent_context,
+                )?;
+                update_parent_phase_tx(
+                    connection,
+                    operation_id,
+                    PROVIDER_DEPLOYMENT_STEPS[next_index].as_str(),
+                    progress_for_step(next_index),
+                    true,
+                )?;
+                update_provider_deployment_state_tx(
+                    connection,
+                    operation_id,
+                    OperationState::Running,
+                    next_index,
+                )?;
+            }
+        }
+        OperationState::Failed | OperationState::Cancelled => {
+            let error = child.error.unwrap_or_else(|| OperationError {
+                code: "PROVIDER_DEPLOYMENT_STEP_FAILED".to_owned(),
+                message: format!(
+                    "provider deployment step {} ended without a reusable result",
+                    step.operation.as_str()
+                ),
+                retryable: false,
+                retry_after_seconds: None,
+                remediation: Some("inspect the durable provider child operation".to_owned()),
+            });
+            transition_operation_tx(
+                connection,
+                operation_id,
+                None,
+                deis_wire::OperationEvent::Failed,
+                step.operation.as_str(),
+                Some(&error),
+            )?;
+            connection.execute(
+                "UPDATE product_operations SET retryable = ?2 WHERE operation_id = ?1",
+                params![operation_id.to_string(), error.retryable],
+            )?;
+            update_provider_deployment_state_tx(
+                connection,
+                operation_id,
+                OperationState::Failed,
+                workflow.next_step_index,
+            )?;
+        }
+        OperationState::Waiting if !resume => {
+            ensure_parent_waiting_tx(connection, operation_id, step.operation.as_str())?;
+            update_provider_deployment_state_tx(
+                connection,
+                operation_id,
+                OperationState::Waiting,
+                workflow.next_step_index,
+            )?;
+        }
+        OperationState::Queued | OperationState::Running | OperationState::Waiting => {
+            ensure_parent_running_tx(
+                connection,
+                operation_id,
+                step.operation.as_str(),
+                progress_for_step(workflow.next_step_index),
+            )?;
+            update_provider_deployment_state_tx(
+                connection,
+                operation_id,
+                OperationState::Running,
+                workflow.next_step_index,
+            )?;
+        }
+        OperationState::Cancelling => {
+            return Err(CatalogError::invalid(
+                "provider child operation entered unsupported cancellation state",
+            ));
+        }
+    }
+    workflow = load_provider_deployment_workflow(connection, operation_id)?.ok_or_else(|| {
+        CatalogError::not_found(format!("provider deployment operation {operation_id}"))
+    })?;
+    Ok(workflow)
+}
+
+fn ensure_parent_running_tx(
+    connection: &Connection,
+    operation_id: CanonicalId,
+    phase: &str,
+    progress: u16,
+) -> CatalogResult<()> {
+    let state: String = connection.query_row(
+        "SELECT state FROM product_operations WHERE operation_id = ?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    match OperationState::parse(&state) {
+        Some(OperationState::Queued) => transition_operation_tx(
+            connection,
+            operation_id,
+            None,
+            deis_wire::OperationEvent::Start,
+            phase,
+            None,
+        )?,
+        Some(OperationState::Waiting) => transition_operation_tx(
+            connection,
+            operation_id,
+            None,
+            deis_wire::OperationEvent::Resume,
+            phase,
+            None,
+        )?,
+        Some(OperationState::Running) => {}
+        Some(other) => {
+            return Err(CatalogError::conflict(format!(
+                "provider deployment {operation_id} cannot resume from {other:?}"
+            )));
+        }
+        None => {
+            return Err(CatalogError::invalid(
+                "provider deployment has unknown state",
+            ));
+        }
+    }
+    update_parent_phase_tx(connection, operation_id, phase, progress, true)
+}
+
+fn ensure_parent_waiting_tx(
+    connection: &Connection,
+    operation_id: CanonicalId,
+    phase: &str,
+) -> CatalogResult<()> {
+    let state: String = connection.query_row(
+        "SELECT state FROM product_operations WHERE operation_id = ?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    match OperationState::parse(&state) {
+        Some(OperationState::Running) => transition_operation_tx(
+            connection,
+            operation_id,
+            None,
+            deis_wire::OperationEvent::Wait,
+            phase,
+            None,
+        ),
+        Some(OperationState::Waiting) => Ok(()),
+        Some(other) => Err(CatalogError::conflict(format!(
+            "provider deployment {operation_id} cannot wait from {other:?}"
+        ))),
+        None => Err(CatalogError::invalid(
+            "provider deployment has unknown state",
+        )),
+    }
+}
+
+fn update_parent_phase_tx(
+    connection: &Connection,
+    operation_id: CanonicalId,
+    phase: &str,
+    progress: u16,
+    retryable: bool,
+) -> CatalogResult<()> {
+    let changed = connection.execute(
+        "UPDATE product_operations
+            SET phase = ?2, progress = ?3, retryable = ?4,
+                revision = revision + 1, updated_at = ?5
+          WHERE operation_id = ?1 AND state IN ('queued', 'running', 'waiting')",
+        params![
+            operation_id.to_string(),
+            phase,
+            i64::from(progress),
+            retryable,
+            now_secs(),
+        ],
+    )?;
+    ensure_parent_change(changed, operation_id, "update phase")
+}
+
+fn update_provider_deployment_state_tx(
+    connection: &Connection,
+    operation_id: CanonicalId,
+    state: OperationState,
+    next_step_index: usize,
+) -> CatalogResult<()> {
+    let current: (String, i64) = connection.query_row(
+        "SELECT state, next_step_index FROM provider_deployment_workflows
+          WHERE operation_id = ?1",
+        [operation_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let next_i64 = i64::try_from(next_step_index)
+        .map_err(|_| CatalogError::invalid("provider step index exceeds SQLite range"))?;
+    if current.0 == state.as_str() && current.1 == next_i64 {
+        return Ok(());
+    }
+    let changed = connection.execute(
+        "UPDATE provider_deployment_workflows
+            SET state = ?2, next_step_index = ?3,
+                revision = revision + 1, updated_at = ?4
+          WHERE operation_id = ?1",
+        params![
+            operation_id.to_string(),
+            state.as_str(),
+            next_i64,
+            now_secs(),
+        ],
+    )?;
+    ensure_parent_change(changed, operation_id, "advance workflow")
+}
+
+fn ensure_parent_change(
+    changed: usize,
+    operation_id: CanonicalId,
+    action: &str,
+) -> CatalogResult<()> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(CatalogError::conflict(format!(
+            "provider deployment {operation_id} could not {action}"
+        )))
+    }
+}
+
+fn progress_for_step(completed_steps: usize) -> u16 {
+    u16::try_from(completed_steps.saturating_mul(10_000) / PROVIDER_DEPLOYMENT_STEPS.len())
+        .expect("provider deployment progress is bounded")
+}
+
+fn parse_deployment_operation_state(value: &str) -> CatalogResult<OperationState> {
+    match OperationState::parse(value) {
+        Some(
+            state @ (OperationState::Queued
+            | OperationState::Running
+            | OperationState::Waiting
+            | OperationState::Succeeded
+            | OperationState::Failed),
+        ) => Ok(state),
+        _ => Err(CatalogError::invalid(format!(
+            "unknown provider deployment state {value:?}"
+        ))),
+    }
+}
+
+fn classify_provider_deployment(
+    workflow: ProviderDeploymentWorkflow,
+) -> ProviderDeploymentDriveOutcome {
+    match workflow.operation.state {
+        OperationState::Succeeded => ProviderDeploymentDriveOutcome::Succeeded(workflow),
+        OperationState::Failed | OperationState::Cancelled => {
+            ProviderDeploymentDriveOutcome::Failed(workflow)
+        }
+        OperationState::Waiting => ProviderDeploymentDriveOutcome::Waiting(workflow),
+        OperationState::Queued | OperationState::Running | OperationState::Cancelling => {
+            ProviderDeploymentDriveOutcome::Advanced(workflow)
+        }
     }
 }
 
@@ -1232,6 +2217,68 @@ fn resolve_application_environment(
     }
 }
 
+/// Refuse a driver request whose public artifact identity was merely asserted
+/// by its caller. The provider payload may be a sibling derivation of the
+/// version's canonical parent, but all three identities and the target's
+/// standard/backend must resolve to durable catalog facts before any
+/// operation record can be created.
+fn validate_artifact_lineage(
+    connection: &Connection,
+    target: &StoredTarget,
+    request: &DriverRequest,
+) -> CatalogResult<()> {
+    let Some(artifact) = request.artifact.as_ref() else {
+        return Ok(());
+    };
+    let provider = match target.target.backend_id.as_str() {
+        "deislet" => "deislet",
+        "cloudflare-workers-pages" => "cloudflare",
+        "tencent-edgeone-makers" => "tencent",
+        "deno" => "deno",
+        _ => {
+            return Err(CatalogError::invalid(
+                "provider target has no canonical artifact derivation mapping",
+            ));
+        }
+    };
+    let exists = connection
+        .query_row(
+            "SELECT 1
+               FROM versions v
+               JOIN apps app ON app.id = v.app_id
+               JOIN canonical_artifacts artifact
+                 ON artifact.id = v.canonical_artifact_id
+                AND artifact.app_id = v.app_id
+               JOIN provider_derivations derivation
+                 ON derivation.artifact_id = artifact.id
+              WHERE v.canonical_id = ?1
+                AND app.canonical_id = ?2
+                AND artifact.artifact_sha256 = ?3
+                AND derivation.payload_root_sha256 = ?4
+                AND artifact.standard_version = ?5
+                AND derivation.standard_version = ?5
+                AND derivation.provider = ?6",
+            params![
+                artifact.artifact_version_id.to_string(),
+                request.application_id.to_string(),
+                artifact.canonical_artifact_sha256.as_str(),
+                artifact.provider_payload_sha256.as_str(),
+                target.target.standard_version,
+                provider,
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(CatalogError::conflict(
+            "provider request artifact does not resolve to the exact application, standard, canonical parent and provider derivation",
+        ))
+    }
+}
+
 fn load_installation(
     connection: &Connection,
     installation_id: CanonicalId,
@@ -1631,9 +2678,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    use deis_provider_driver::{DeploymentState, ProviderDriverManifest, ProviderNeutralPlan};
+    use deis_provider_driver::{
+        ArtifactVersionRef, DeploymentState, ProviderDriverManifest, ProviderNeutralPlan,
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -1728,6 +2777,89 @@ mod tests {
         .unwrap()
     }
 
+    async fn attach_cloudflare_artifact(harness: &Harness) -> ArtifactVersionRef {
+        let application_id = harness.application_id;
+        let standard_version = harness.target.standard_version.clone();
+        let artifact_id = CanonicalId::new_v7();
+        let artifact_version_id = CanonicalId::new_v7();
+        let canonical_sha256: Sha256Digest = "1".repeat(64).parse().unwrap();
+        let provider_sha256: Sha256Digest = "2".repeat(64).parse().unwrap();
+        let canonical_for_insert = canonical_sha256.clone();
+        let provider_for_insert = provider_sha256.clone();
+        harness
+            .database
+            .with_connection(move |connection| {
+                let app_id: String = connection.query_row(
+                    "SELECT id FROM apps WHERE canonical_id = ?1",
+                    [application_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                connection.execute(
+                    "INSERT INTO canonical_artifacts
+                       (id, app_id, artifact_sha256, content_root_sha256,
+                        standard_version, file_count, storage_path, record, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, '/test/canonical', '{}', ?6)",
+                    params![
+                        artifact_id.to_string(),
+                        app_id,
+                        canonical_for_insert.as_str(),
+                        "3".repeat(64),
+                        standard_version,
+                        now_secs(),
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO provider_derivations
+                       (manifest_sha256, artifact_id, provider, standard_version,
+                        payload_root_sha256, manifest, created_at)
+                     VALUES (?1, ?2, 'deislet', ?3, ?4, '{}', ?5)",
+                    params![
+                        "4".repeat(64),
+                        artifact_id.to_string(),
+                        standard_version,
+                        "5".repeat(64),
+                        now_secs(),
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO provider_derivations
+                       (manifest_sha256, artifact_id, provider, standard_version,
+                        payload_root_sha256, manifest, created_at)
+                     VALUES (?1, ?2, 'cloudflare', ?3, ?4, '{}', ?5)",
+                    params![
+                        "6".repeat(64),
+                        artifact_id.to_string(),
+                        standard_version,
+                        provider_for_insert.as_str(),
+                        now_secs(),
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO versions
+                       (id, canonical_id, app_id, number, bundle_sha, bundle_path,
+                        manifest, canonical_artifact_id, provider_derivation_sha256, created_at)
+                     VALUES (?1, ?2, ?3, 1, ?4, '/test/bundle.zip', '{}', ?5, ?6, ?7)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        artifact_version_id.to_string(),
+                        app_id,
+                        "7".repeat(64),
+                        artifact_id.to_string(),
+                        "4".repeat(64),
+                        now_secs(),
+                    ],
+                )?;
+                Ok::<(), crate::database::DatabaseError>(())
+            })
+            .await
+            .unwrap();
+        ArtifactVersionRef {
+            artifact_version_id,
+            canonical_artifact_sha256: canonical_sha256,
+            provider_payload_sha256: provider_sha256,
+        }
+    }
+
     fn succeeded_receipt(claim: &DriverOperationClaim) -> DriverReceipt {
         DriverReceipt {
             schema_version: 1,
@@ -1744,6 +2876,120 @@ mod tests {
             observed_at: Utc::now(),
             next_action: DriverNextAction::None,
             diagnostic: None,
+        }
+    }
+
+    struct SuccessfulDriver {
+        manifest: ValidatedProviderDriverManifest,
+        calls: Mutex<Vec<DriverOperation>>,
+    }
+
+    #[async_trait]
+    impl ProviderDriver for SuccessfulDriver {
+        fn manifest(&self) -> &ValidatedProviderDriverManifest {
+            &self.manifest
+        }
+
+        async fn execute(&self, request: &DriverRequest) -> Result<DriverReceipt, DriverError> {
+            self.calls.lock().unwrap().push(request.operation);
+            Ok(success_driver_receipt(request))
+        }
+    }
+
+    fn success_driver_receipt(request: &DriverRequest) -> DriverReceipt {
+        let confirmed = matches!(
+            request.operation,
+            DriverOperation::Upload | DriverOperation::Activate
+        );
+        DriverReceipt {
+            schema_version: 1,
+            operation_id: request.operation_id,
+            operation: request.operation,
+            desired_state_digest: request.desired_state_digest.clone(),
+            state: DriverStepState::Succeeded,
+            deployment_state: Some(match request.operation {
+                DriverOperation::Preflight | DriverOperation::Plan => DeploymentState::Planned,
+                DriverOperation::Prepare => DeploymentState::Preparing,
+                DriverOperation::Upload => DeploymentState::Uploaded,
+                DriverOperation::Verify => DeploymentState::Ready,
+                DriverOperation::Activate => DeploymentState::Activating,
+                DriverOperation::Observe | DriverOperation::Reconcile => DeploymentState::Active,
+                _ => unreachable!("deployment workflow uses only its seven standard steps"),
+            }),
+            side_effect: if confirmed {
+                SideEffect::Confirmed
+            } else {
+                SideEffect::None
+            },
+            provider_request_id: Some(format!("request-{}", request.operation.as_str())),
+            provider_version_id: (request.operation == DriverOperation::Upload)
+                .then(|| "provider-version-1".to_owned()),
+            provider_deployment_id: matches!(
+                request.operation,
+                DriverOperation::Activate | DriverOperation::Observe | DriverOperation::Reconcile
+            )
+            .then(|| "provider-deployment-1".to_owned()),
+            provider_resource_ids: Default::default(),
+            observed_at: Utc::now(),
+            next_action: DriverNextAction::None,
+            diagnostic: None,
+        }
+    }
+
+    struct ReconcileOnceDriver {
+        manifest: ValidatedProviderDriverManifest,
+        calls: Mutex<Vec<DriverOperation>>,
+    }
+
+    #[async_trait]
+    impl ProviderDriver for ReconcileOnceDriver {
+        fn manifest(&self) -> &ValidatedProviderDriverManifest {
+            &self.manifest
+        }
+
+        async fn execute(&self, request: &DriverRequest) -> Result<DriverReceipt, DriverError> {
+            self.calls.lock().unwrap().push(request.operation);
+            if request.operation == DriverOperation::Activate {
+                return Ok(DriverReceipt {
+                    state: DriverStepState::Unknown,
+                    deployment_state: Some(DeploymentState::Activating),
+                    side_effect: SideEffect::Possible,
+                    provider_deployment_id: Some("possibly-active-deployment".to_owned()),
+                    next_action: DriverNextAction::Reconcile,
+                    diagnostic: Some("activation response was lost".to_owned()),
+                    ..success_driver_receipt(request)
+                });
+            }
+            Ok(success_driver_receipt(request))
+        }
+    }
+
+    struct FailsPlanDriver {
+        manifest: ValidatedProviderDriverManifest,
+    }
+
+    #[async_trait]
+    impl ProviderDriver for FailsPlanDriver {
+        fn manifest(&self) -> &ValidatedProviderDriverManifest {
+            &self.manifest
+        }
+
+        async fn execute(&self, request: &DriverRequest) -> Result<DriverReceipt, DriverError> {
+            if request.operation == DriverOperation::Plan {
+                return Err(DriverError {
+                    operation_id: request.operation_id,
+                    operation: request.operation,
+                    desired_state_digest: request.desired_state_digest.clone(),
+                    category: deis_provider_driver::DriverErrorCategory::Configuration,
+                    code: "PROVIDER_PLAN_REJECTED".to_owned(),
+                    message: "provider rejected the immutable deployment plan".to_owned(),
+                    retryable: false,
+                    side_effect: SideEffect::None,
+                    next_action: DriverNextAction::None,
+                    provider_request_id: None,
+                });
+            }
+            Ok(success_driver_receipt(request))
         }
     }
 
@@ -1959,6 +3205,506 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_identity_must_resolve_to_exact_catalog_lineage() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let mut valid = request(&harness);
+        valid.operation = DriverOperation::Upload;
+        valid.artifact = Some(artifact.clone());
+        harness
+            .store
+            .begin_provider_driver_operation(valid, context("provider-artifact-valid"))
+            .await
+            .unwrap();
+
+        let mut forged_parent = request(&harness);
+        forged_parent.operation = DriverOperation::Upload;
+        forged_parent.artifact = Some(ArtifactVersionRef {
+            canonical_artifact_sha256: "8".repeat(64).parse().unwrap(),
+            ..artifact.clone()
+        });
+        assert!(
+            harness
+                .store
+                .begin_provider_driver_operation(
+                    forged_parent,
+                    context("provider-artifact-forged-parent"),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("exact application, standard, canonical parent")
+        );
+
+        let mut forged_payload = request(&harness);
+        forged_payload.operation = DriverOperation::Upload;
+        forged_payload.artifact = Some(ArtifactVersionRef {
+            provider_payload_sha256: "9".repeat(64).parse().unwrap(),
+            ..artifact
+        });
+        assert!(
+            harness
+                .store
+                .begin_provider_driver_operation(
+                    forged_payload,
+                    context("provider-artifact-forged-payload"),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_parent_runs_the_exact_seven_step_sequence() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let spec = ProviderDeploymentSpec {
+            application_id: harness.application_id,
+            environment_id: harness.environment_id,
+            provider_target_id: harness.target.target_id,
+            artifact,
+            plan: ProviderNeutralPlan::default(),
+        };
+        let request_context = context("provider-deployment-sequence");
+        let parent = harness
+            .store
+            .begin_provider_deployment(spec.clone(), request_context.clone())
+            .await
+            .unwrap();
+        assert_eq!(parent.kind, OperationKind::Deploy);
+        assert_eq!(parent.state, OperationState::Queued);
+        assert_eq!(parent.child_operation_ids.len(), 1);
+        assert_eq!(
+            harness
+                .store
+                .nonterminal_provider_deployments(100)
+                .await
+                .unwrap()
+                .iter()
+                .map(|workflow| workflow.operation.operation_id)
+                .collect::<Vec<_>>(),
+            [parent.operation_id]
+        );
+
+        let replay = harness
+            .store
+            .begin_provider_deployment(spec.clone(), request_context)
+            .await
+            .unwrap();
+        assert_eq!(replay.operation_id, parent.operation_id);
+        let competing = harness
+            .store
+            .begin_provider_deployment(spec, context("provider-deployment-competing"))
+            .await
+            .unwrap_err();
+        assert!(
+            competing
+                .to_string()
+                .contains("active deployment operation")
+        );
+
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        for completed in 1..=PROVIDER_DEPLOYMENT_STEPS.len() {
+            let outcome = harness
+                .store
+                .drive_provider_deployment_once(
+                    parent.operation_id,
+                    CanonicalId::new_v7(),
+                    &driver,
+                    DriverOrchestratorConfig::default(),
+                )
+                .await
+                .unwrap();
+            let workflow = match outcome {
+                ProviderDeploymentDriveOutcome::Advanced(workflow)
+                    if completed < PROVIDER_DEPLOYMENT_STEPS.len() =>
+                {
+                    workflow
+                }
+                ProviderDeploymentDriveOutcome::Succeeded(workflow)
+                    if completed == PROVIDER_DEPLOYMENT_STEPS.len() =>
+                {
+                    workflow
+                }
+                other => panic!("unexpected deployment outcome at step {completed}: {other:?}"),
+            };
+            assert_eq!(
+                workflow.steps.len(),
+                completed.min(PROVIDER_DEPLOYMENT_STEPS.len() - 1) + 1
+            );
+            assert_eq!(
+                workflow.next_step_index,
+                completed.min(PROVIDER_DEPLOYMENT_STEPS.len())
+            );
+        }
+
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workflow.operation.state, OperationState::Succeeded);
+        assert_eq!(workflow.operation.progress, Some(10_000));
+        assert_eq!(workflow.operation.child_operation_ids.len(), 7);
+        assert_eq!(workflow.operation.provider_operations.len(), 7);
+        assert_eq!(workflow.steps.len(), 7);
+        assert_eq!(*driver.calls.lock().unwrap(), PROVIDER_DEPLOYMENT_STEPS);
+        for step in workflow.steps {
+            assert_eq!(
+                harness
+                    .store
+                    .provider_driver_operation(step.child_operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ProviderOperationState::Succeeded
+            );
+        }
+        assert!(
+            harness
+                .store
+                .nonterminal_provider_deployments(100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_desired_state_and_step_journal_are_immutable() {
+        let harness = harness().await;
+        let parent = harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: attach_cloudflare_artifact(&harness).await,
+                    plan: ProviderNeutralPlan::default(),
+                },
+                context("provider-deployment-immutable"),
+            )
+            .await
+            .unwrap();
+        let operation_id = parent.operation_id;
+        assert!(
+            harness
+                .database
+                .with_connection(move |connection| {
+                    connection.execute(
+                        "UPDATE provider_deployment_workflows
+                            SET desired_state_sha256 = ?2
+                          WHERE operation_id = ?1",
+                        params![operation_id.to_string(), "f".repeat(64)],
+                    )?;
+                    Ok::<(), crate::database::DatabaseError>(())
+                })
+                .await
+                .is_err()
+        );
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let child_id = workflow.steps[0].child_operation_id;
+        assert!(
+            harness
+                .database
+                .with_connection(move |connection| {
+                    connection.execute(
+                        "UPDATE provider_deployment_steps SET child_operation_id = ?2
+                          WHERE parent_operation_id = ?1",
+                        params![operation_id.to_string(), child_id.to_string()],
+                    )?;
+                    Ok::<(), crate::database::DatabaseError>(())
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_parent_reconciles_an_unknown_activation_before_observe() {
+        let harness = harness().await;
+        let parent = harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: attach_cloudflare_artifact(&harness).await,
+                    plan: ProviderNeutralPlan::default(),
+                },
+                context("provider-deployment-reconcile"),
+            )
+            .await
+            .unwrap();
+        let driver = ReconcileOnceDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        for _ in 0..5 {
+            assert!(matches!(
+                harness
+                    .store
+                    .drive_provider_deployment_once(
+                        parent.operation_id,
+                        CanonicalId::new_v7(),
+                        &driver,
+                        DriverOrchestratorConfig::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ProviderDeploymentDriveOutcome::Advanced(_)
+            ));
+        }
+        let unknown = harness
+            .store
+            .drive_provider_deployment_once(
+                parent.operation_id,
+                CanonicalId::new_v7(),
+                &driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+        let waiting = match unknown {
+            ProviderDeploymentDriveOutcome::Waiting(workflow) => workflow,
+            other => panic!("unknown activation did not wait: {other:?}"),
+        };
+        assert_eq!(waiting.next_step_index, 5);
+        assert_eq!(waiting.operation.phase, "activate");
+
+        let reconciled = harness
+            .store
+            .drive_provider_deployment_once(
+                parent.operation_id,
+                CanonicalId::new_v7(),
+                &driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+        let reconciled = match reconciled {
+            ProviderDeploymentDriveOutcome::Advanced(workflow) => workflow,
+            other => panic!("reconciliation did not advance: {other:?}"),
+        };
+        assert_eq!(reconciled.next_step_index, 6);
+        assert_eq!(reconciled.operation.phase, "observe");
+        let completed = harness
+            .store
+            .drive_provider_deployment_once(
+                parent.operation_id,
+                CanonicalId::new_v7(),
+                &driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            completed,
+            ProviderDeploymentDriveOutcome::Succeeded(_)
+        ));
+        assert_eq!(
+            *driver.calls.lock().unwrap(),
+            [
+                DriverOperation::Preflight,
+                DriverOperation::Plan,
+                DriverOperation::Prepare,
+                DriverOperation::Upload,
+                DriverOperation::Verify,
+                DriverOperation::Activate,
+                DriverOperation::Reconcile,
+                DriverOperation::Observe,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_parent_propagates_terminal_child_failure() {
+        let harness = harness().await;
+        let parent = harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: attach_cloudflare_artifact(&harness).await,
+                    plan: ProviderNeutralPlan::default(),
+                },
+                context("provider-deployment-failure"),
+            )
+            .await
+            .unwrap();
+        let driver = FailsPlanDriver {
+            manifest: manifest(),
+        };
+        assert!(matches!(
+            harness
+                .store
+                .drive_provider_deployment_once(
+                    parent.operation_id,
+                    CanonicalId::new_v7(),
+                    &driver,
+                    DriverOrchestratorConfig::default(),
+                )
+                .await
+                .unwrap(),
+            ProviderDeploymentDriveOutcome::Advanced(_)
+        ));
+        let failed = harness
+            .store
+            .drive_provider_deployment_once(
+                parent.operation_id,
+                CanonicalId::new_v7(),
+                &driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+        let failed = match failed {
+            ProviderDeploymentDriveOutcome::Failed(workflow) => workflow,
+            other => panic!("terminal child failure did not fail parent: {other:?}"),
+        };
+        assert_eq!(failed.operation.state, OperationState::Failed);
+        assert_eq!(
+            failed.operation.error.unwrap().code,
+            "PROVIDER_PLAN_REJECTED"
+        );
+        assert_eq!(failed.next_step_index, 1);
+        assert_eq!(failed.steps.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deployment_parent_does_not_bypass_a_live_child_owner() {
+        let harness = harness().await;
+        let parent = harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: attach_cloudflare_artifact(&harness).await,
+                    plan: ProviderNeutralPlan::default(),
+                },
+                context("provider-deployment-busy"),
+            )
+            .await
+            .unwrap();
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        harness
+            .store
+            .claim(
+                workflow.steps[0].child_operation_id,
+                CanonicalId::new_v7(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let outcome = harness
+            .store
+            .drive_provider_deployment_once(
+                parent.operation_id,
+                CanonicalId::new_v7(),
+                &driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ProviderDeploymentDriveOutcome::Busy(_)));
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deployment_recovery_advances_a_child_settled_before_parent_refresh() {
+        let harness = harness().await;
+        let parent = harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: attach_cloudflare_artifact(&harness).await,
+                    plan: ProviderNeutralPlan::default(),
+                },
+                context("provider-deployment-crash-window"),
+            )
+            .await
+            .unwrap();
+        let started = harness
+            .store
+            .prepare_provider_deployment(parent.operation_id)
+            .await
+            .unwrap();
+        let child_id = started.steps[0].child_operation_id;
+        let claim = harness
+            .store
+            .claim(child_id, CanonicalId::new_v7(), Duration::from_secs(30))
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        harness
+            .store
+            .record_receipt(&claim, &success_driver_receipt(&claim.request))
+            .await
+            .unwrap();
+
+        let replacement_store = CatalogStore::new(Arc::clone(&harness.database));
+        assert_eq!(
+            replacement_store
+                .nonterminal_provider_deployments(10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let outcome = replacement_store
+            .drive_provider_deployment_once(
+                parent.operation_id,
+                CanonicalId::new_v7(),
+                &driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+        let recovered = match outcome {
+            ProviderDeploymentDriveOutcome::Advanced(workflow) => workflow,
+            other => panic!("replacement coordinator did not advance: {other:?}"),
+        };
+        assert_eq!(recovered.next_step_index, 2);
+        assert_eq!(recovered.operation.phase, "prepare");
+        assert_eq!(*driver.calls.lock().unwrap(), [DriverOperation::Plan]);
+    }
+
+    #[tokio::test]
     async fn retryable_error_waits_and_reclaims_the_original_operation() {
         let harness = harness().await;
         let request = request(&harness);
@@ -2092,6 +3838,8 @@ mod tests {
                     "provider_targets",
                     "provider_driver_operations",
                     "provider_driver_attempts",
+                    "provider_deployment_workflows",
+                    "provider_deployment_steps",
                 ] {
                     columns.extend(
                         connection

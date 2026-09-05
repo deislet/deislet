@@ -1895,3 +1895,29 @@ Application/framework source + versioned build plan
 - `P1-DEPLOY-001` 因而只关闭“精确提交三平台复跑”子项，仍保持 active。部署父流程、credential lease/use
   audit、受信 driver installer、完整 CLI dependency-tree lock、三个 backend driver、API/CLI/Web 接线和真实
   账户全生命周期证据继续阻断完成。
+
+## 66. Provider deployment 父流程与 artifact lineage 入库校验
+
+- 继续审查单步 provider operation 时确认，`DriverRequest.artifact` 此前虽然要求字段格式和非空，却没有查询
+  Control catalog；内部调用者可以提交不存在的 version、伪造 canonical artifact SHA-256 或 provider payload
+  SHA-256，而该声明仍会作为 immutable request 入库。现已在创建任何 driver operation 前，把 artifact version
+  解析到同 application 的 canonical parent，并要求 parent/derivation 与 target 的标准版本及 backend 映射完全
+  一致。旧 raw bundle、跨应用 version、错误 parent、错误 provider derivation 或错误 digest 均失败关闭。
+- Control 新增统一 provider deployment application service。一个 `deploy` ProductOperation 以 JCS desired-state
+  SHA-256 固定 application/environment、target revision、standard version、artifact lineage 和
+  provider-neutral plan；同 actor/idempotency key/desired state 返回原父 operation，不同请求冲突，同一
+  application/environment/target 同时最多一个非终态 deployment。
+- happy path 严格固定七个 durable child：`preflight → plan → prepare → upload → verify → activate → observe`。
+  child 逐个、惰性创建，父 Operation 保存有序 child IDs、七份 provider summary、当前 phase 与以 7 为真实分母的
+  basis-point progress。desired state 和 step journal 都有 SQLite immutability trigger；step sequence 与 child 的
+  operation/target/digest 会在每次读取时交叉验证。
+- 父层不另持有一个会在 provider 长调用期间过期的重复 lease：并发控制者先在 SQLite 中收敛到唯一 current child，
+  再复用 child 的 owner UUIDv7、单调 epoch、lease/heartbeat。第二个 coordinator 只能得到 busy；expired/unknown
+  child 仍只能 reconcile。外部 driver 调用期间不持有 SQLite。子步骤已经落账但父流程尚未刷新时，重启扫描会从
+  immutable journal 推进；已完成步骤不重建，terminal child error 结构化上卷到 parent。
+- 新增 6 项父流程专项回归，覆盖七步成功、幂等与 single-flight、desired/step immutability、unknown activation→
+  reconcile→observe、terminal error propagation、live child owner exclusion，以及 child settle/parent refresh 间
+  崩溃窗口的 replacement coordinator 恢复。Control 当前全量为 446/446。
+- `P1-DEPLOY-001` 仍保持 active。该 application service 尚未挂到公共 API/CLI/Web，也尚无 credential vault
+  lease/use audit、受信 installer、Deislet/Cloudflare/EdgeOne 完整 driver 与真实账户 lifecycle evidence；当前
+  mock driver 只证明统一协调语义，不是 provider deployment 或 conformance 证据。

@@ -69,8 +69,9 @@ pub use model::{
 };
 pub use operation::OperationRequestContext;
 pub use provider_driver_operation::{
-    ProviderDriverOperationRecord, ProviderInstallation, ProviderInstallationSpec, ProviderTarget,
-    ProviderTargetSpec,
+    PROVIDER_DEPLOYMENT_STEPS, ProviderDeploymentDriveOutcome, ProviderDeploymentSpec,
+    ProviderDeploymentStep, ProviderDeploymentWorkflow, ProviderDriverOperationRecord,
+    ProviderInstallation, ProviderInstallationSpec, ProviderTarget, ProviderTargetSpec,
 };
 pub use secrets::{SecretCipher, SecretsBackend};
 pub use store::{
