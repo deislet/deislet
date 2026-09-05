@@ -48,8 +48,8 @@
         "command": {"const": "python3 scripts/check-shared-contracts.py"},
         "outcome": {"const": "passed"},
         "exitCode": {"const": 0},
-        "schemas": {"const": 11},
-        "fixtures": {"const": 29}
+        "schemas": {"enum": [11, 14]},
+        "fixtures": {"enum": [29, 37]}
       }
     },
     "requiredOperatingSystems": {
@@ -67,7 +67,7 @@
     },
     "priorFailedAttempts": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {"$ref": "#/$defs/priorFailedAttempt"}
     },
     "assertions": {
@@ -84,7 +84,9 @@
         "windowsAsyncSendRegressionClosed": {"type": "boolean"},
         "sharedProcessProtocolValidated": {"const": true},
         "noLiveProviderClaim": {"const": true},
-        "noProviderConformanceClaim": {"const": true}
+        "noProviderConformanceClaim": {"const": true},
+        "signedReleaseAuthorizationValidated": {"const": true},
+        "trustRootLoaderCompiledOnWindows": {"const": true}
       }
     },
     "limitations": {

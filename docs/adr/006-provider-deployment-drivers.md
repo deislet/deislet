@@ -291,6 +291,12 @@ registry/dispatcher 平台适用测试、legacy migration 和五个部署控制 
 约束的 evidence；它还保留前一提交在 Windows 暴露的 async `Send` 编译失败及其修复关系。该结果只证明受验证安装树到
 进程边界的三平台可移植性，并不证明任何真实 provider deployment 或 conformance。
 
+精确提交 `b574d58f1894d7a23e4d146bbb8a082e1d17c0c8` 进一步以同一 archive 在 Linux/macOS 各通过 provider
+driver 52 项、Windows 43 项，三端均通过 Control provider 专项 18 项、legacy migration 1 项和严格 Clippy；共享
+DSSE fixture 的真实 Ed25519 阈值签名也由 Rust verifier 验证。证据登记完整 commit/tree/archive 身份、逐主机计数及
+Windows reparse/share-write 文件边界。macOS 未安装 Python `jsonschema`，因此共享 14 份 Schema/37 组 fixture 只在
+Linux 执行；该环境缺项不冒充三端契约运行。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
 Sigstore/Rekor 或等价透明证明、旧根与新根双阈值验证的自动 root rotation，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
 完整 backend driver 和真实账户 evidence 也未完成。在这些完成并获得真实账户证据前，不能把当前 dispatcher 称作已部署

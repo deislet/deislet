@@ -1,0 +1,116 @@
+{
+  "$schema": "./provider-driver-dispatcher-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-driver-dispatcher-portability-b574d58-2026-09-06",
+  "collectedAt": "2026-09-06T04:19:00+08:00",
+  "outcome": "passed",
+  "scope": "The exact source archive passes the platform-applicable signed provider-driver release, trust-root loading, verified process, Control release/operation, legacy migration, and strict deployment-control lint checks on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "b574d58f1894d7a23e4d146bbb8a082e1d17c0c8",
+    "tree": "ef39ec12fa5f22705855cb8e67a8f24b83078de1",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "3ea6bf92311cf906a9441f3b7ae017487b0a942d47e7670a4f5e471353dc20e9",
+      "sizeBytes": 15216640
+    }
+  },
+  "buildEnvironment": {"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_TEST_DEBUG": "0"},
+  "commands": [
+    {"id": "provider-driver-tests", "command": "cargo +1.96.0 test -p deis-provider-driver"},
+    {"id": "provider-driver-control-tests", "command": "cargo +1.96.0 test -p deis-control provider_driver -- --nocapture"},
+    {"id": "legacy-target-migration-test", "command": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"},
+    {"id": "strict-clippy", "command": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"}
+  ],
+  "sharedContractCheck": {
+    "hostAlias": "s17",
+    "command": "python3 scripts/check-shared-contracts.py",
+    "outcome": "passed",
+    "exitCode": 0,
+    "schemas": 14,
+    "fixtures": 37
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "b574d58f1894d7a23e4d146bbb8a082e1d17c0c8",
+      "archiveSha256": "3ea6bf92311cf906a9441f3b7ae017487b0a942d47e7670a4f5e471353dc20e9",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 52, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 18, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "b574d58f1894d7a23e4d146bbb8a082e1d17c0c8",
+      "archiveSha256": "3ea6bf92311cf906a9441f3b7ae017487b0a942d47e7670a4f5e471353dc20e9",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 52, "failed": 0, "ignored": 0, "note": "Unix full-tree, process-group, trust-root file, and real shell release/credential process checks are enabled."},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 18, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "Serv69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "b574d58f1894d7a23e4d146bbb8a082e1d17c0c8",
+      "archiveSha256": "3ea6bf92311cf906a9441f3b7ae017487b0a942d47e7670a4f5e471353dc20e9",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 43, "failed": 0, "ignored": 0, "note": "Windows compiles and runs DSSE/Ed25519 authorization, non-share-write trust-root loading with reparse-point rejection, public stdin, and Job Object boundaries; Unix-only checks are not compiled."},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 18, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    }
+  ],
+  "priorFailedAttempts": [],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "exactArchiveVerifiedOnEveryHost": true,
+    "windowsAsyncSendRegressionClosed": true,
+    "sharedProcessProtocolValidated": true,
+    "signedReleaseAuthorizationValidated": true,
+    "trustRootLoaderCompiledOnWindows": true,
+    "noLiveProviderClaim": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "The release, keys, and process fixtures are synthetic; this evidence does not execute a real signed Wrangler, EdgeOne, Deislet, or other provider release or account.",
+    "Automatic old-root/new-root dual-threshold rotation and Sigstore/Rekor or equivalent transparency inclusion/checkpoint verification are not implemented.",
+    "Windows rejects reparse points and concurrent write/delete sharing while reading the trust root, but service-account DACL ownership is not validated.",
+    "The registry and dispatcher have no public API/CLI/Web management surface or background execution loop in this evidence.",
+    "The exact archive does not contain generated Control dashboard assets, so the existing build warning and dashboard 404 remain outside this Rust control-path record.",
+    "macOS did not run the shared-contract Python script because jsonschema is absent; the same exact archive passed all 14 schemas and 37 fixtures on Linux.",
+    "Passing contract, unit, migration, and lint checks does not certify any backend against Edge Canon."
+  ]
+}

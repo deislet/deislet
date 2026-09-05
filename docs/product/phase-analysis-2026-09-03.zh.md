@@ -2136,3 +2136,23 @@ Application/framework source + versioned build plan
   file/service-account DACL 仍未验证。当前 trust root 通过安全文件 out-of-band 置入，尚未实现 TUF 式旧根/新根双阈值
   自动 rotation；也没有 Sigstore/Rekor bundle 或等价 transparency inclusion/checkpoint 验证。真实 materialized
   Wrangler/Deislet release 尚未生成和签署，因此本切片不构成 live provider、供应链发布完成或 Edge Canon conformance。
+
+## 76. Provider release 授权的三平台精确归档证据
+
+- `b574d58f1894d7a23e4d146bbb8a082e1d17c0c8`（tree `ef39ec12fa5f22705855cb8e67a8f24b83078de1`）的
+  `git archive` 为 15,216,640 bytes，SHA-256 为
+  `3ea6bf92311cf906a9441f3b7ae017487b0a942d47e7670a4f5e471353dc20e9`。s17、s67、s69 都只解包并验证这一份归档，
+  使用 Rust/Cargo/Clippy 1.96.0、`CARGO_INCREMENTAL=0` 和 `CARGO_PROFILE_TEST_DEBUG=0`。
+- provider-driver 在 Linux/macOS 分别 52/52、Windows 43/43；Windows 集合包含 DSSE/Ed25519、trust-root
+  non-share-write/reparse 拒绝、public stdin 与 Job Object 边界，Unix-only 检查不会虚报为 Windows 运行。三端 Control
+  provider 专项均 18/18，legacy active-target fail-closed migration 均 1/1，五个部署控制 crate 的严格 all-target Clippy
+  均通过。Linux 同一归档另通过 14 份 Schema/37 组正反 fixture；macOS 因未安装 Python `jsonschema` 未运行共享契约
+  脚本，该环境事实明确保留而不写成三端契约证据。
+- 正式 evidence 为 `docs/product/evidence/provider-driver-dispatcher-portability-b574d58.json`，由既有 dispatcher
+  portability Schema 与治理脚本验证 exact commit/archive、命令顺序、逐平台计数、全平台绿灯及禁止 live provider/
+  conformance 宣称。验证过程在 macOS 首次因临时盘空间不足中断；清理的仅为可由 Git archive 重建的历史验证临时目录，
+  随后同一归档完整重跑通过。该基础设施观察不改变代码测试结果，也不被写成产品失败。
+- 这项证据关闭的是“签名授权/信任根实现是否能在三个目标 OS 编译并按约定失败关闭”的风险，不关闭真实供应链发布。
+  仍缺真实 Wrangler/Deislet materialized release 与离线签署流程、Sigstore/Rekor 或等价透明 inclusion/checkpoint、旧根/
+  新根双阈值自动 rotation、Windows service-account DACL、公共 API/CLI/Web 与后台 dispatcher loop，更不构成任何 backend
+  的 live lifecycle 或 Edge Canon conformance。
