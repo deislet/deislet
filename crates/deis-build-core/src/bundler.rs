@@ -169,7 +169,15 @@ impl BuildBundler {
     /// developer happened to stand is not a bundle that can be content-
     /// addressed, which is what the platform does with it.
     pub fn with_cwd(mut self, cwd: PathBuf) -> Self {
-        self.options.cwd = Some(cwd);
+        // Module resolution canonicalizes input paths.  The cwd must use the
+        // same spelling or a platform-level directory alias can escape into
+        // an inline source map: macOS resolves `/var` as `/private/var`, for
+        // example.  Besides disclosing a temporary host path, that made the
+        // exact same source produce different artifact identities on macOS
+        // and Linux.  Keep the original path only when the caller supplied a
+        // path which does not exist yet; rolldown will report that condition
+        // through its ordinary build error.
+        self.options.cwd = Some(cwd.canonicalize().unwrap_or(cwd));
         self
     }
 
@@ -389,6 +397,45 @@ impl BuildBundler {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_filesystem_alias_cannot_enter_an_inline_source_map() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let project = root.path().join("project");
+        fs::create_dir(&project).expect("project directory");
+        fs::write(
+            project.join("entry.mjs"),
+            "export default () => new Response('portable');\n",
+        )
+        .expect("entry module");
+        let alias = root.path().join("project-alias");
+        symlink(&project, &alias).expect("project alias");
+
+        let build = |cwd: PathBuf| async move {
+            let entry = cwd.join("entry.mjs");
+            BuildBundler::new(
+                entry.to_str().expect("UTF-8 entry"),
+                TargetPlatform::Canonical,
+            )
+            .with_cwd(cwd)
+            .with_source_map(true)
+            .generate()
+            .await
+            .expect("bundle through path spelling")
+            .0
+        };
+
+        let direct = build(project).await;
+        let through_alias = build(alias).await;
+        assert_eq!(
+            through_alias, direct,
+            "a canonicalized module path and an aliased cwd must not expose the alias boundary"
+        );
+        assert!(!through_alias.contains(root.path().to_string_lossy().as_ref()));
+    }
 
     #[tokio::test]
     async fn every_node_target_uses_the_edge_canon_package_condition() {

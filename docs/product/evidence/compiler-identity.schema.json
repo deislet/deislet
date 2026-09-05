@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/docs/product/evidence/compiler-identity.schema.json",
+  "title": "Deislet real compiler identity evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "evidenceId",
+    "collectedAt",
+    "outcome",
+    "scope",
+    "source",
+    "fixture",
+    "expectedIdentities",
+    "requiredOperatingSystems",
+    "observations",
+    "assertions",
+    "limitations"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": 1},
+    "evidenceId": {"type": "string", "minLength": 1},
+    "collectedAt": {"type": "string", "format": "date-time"},
+    "outcome": {"enum": ["passed", "partial", "failed"]},
+    "scope": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit", "archive"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "commit": {"$ref": "#/$defs/sha1"},
+        "archive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fileName", "sha256"],
+          "properties": {
+            "fileName": {"type": "string", "minLength": 1},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "files"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "files": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "expectedIdentities": {"$ref": "#/$defs/identities"},
+    "requiredOperatingSystems": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/operatingSystem"}
+    },
+    "observations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/observation"}
+    },
+    "assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allPassingObservationsMatchExpected",
+        "missingPassingOperatingSystems"
+      ],
+      "properties": {
+        "allPassingObservationsMatchExpected": {"const": true},
+        "missingPassingOperatingSystems": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/operatingSystem"}
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "operatingSystem": {"enum": ["linux", "macos", "windows"]},
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical", "providers"],
+      "properties": {
+        "canonical": {"$ref": "#/$defs/sha256"},
+        "providers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cloudflare", "deno", "tencent", "deislet"],
+          "properties": {
+            "cloudflare": {"$ref": "#/$defs/sha256"},
+            "deno": {"$ref": "#/$defs/sha256"},
+            "tencent": {"$ref": "#/$defs/sha256"},
+            "deislet": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "hostAlias",
+        "hostName",
+        "operatingSystem",
+        "osRelease",
+        "architecture",
+        "result",
+        "commit",
+        "archiveSha256"
+      ],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "hostAlias": {"type": "string", "minLength": 1},
+        "hostName": {"type": "string", "minLength": 1},
+        "operatingSystem": {"$ref": "#/$defs/operatingSystem"},
+        "osRelease": {"type": "string", "minLength": 1},
+        "kernel": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "powershell": {"type": "string", "minLength": 1},
+        "rustc": {"type": "string", "minLength": 1},
+        "cargo": {"type": "string", "minLength": 1},
+        "result": {"enum": ["passed", "blocked", "failed"]},
+        "commit": {"$ref": "#/$defs/sha1"},
+        "archiveSha256": {"$ref": "#/$defs/sha256"},
+        "identities": {"$ref": "#/$defs/identities"},
+        "reason": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"result": {"const": "passed"}}},
+          "then": {"required": ["rustc", "cargo", "identities"]},
+          "else": {"required": ["reason"]}
+        }
+      ]
+    }
+  }
+}

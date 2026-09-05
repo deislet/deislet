@@ -1,0 +1,183 @@
+{
+  "$schema": "./compiler-identity.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-compiler-identity-ffb1591-2026-09-05",
+  "collectedAt": "2026-09-05T11:45:10+08:00",
+  "outcome": "failed",
+  "scope": "The real deis-build compiler produces the same canonical and provider payload identities from one byte-identical source archive and fixture on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "ffb1591b96d67f75d46995e98aa0a8909fe31ce8",
+    "archive": {
+      "fileName": "deislet-ffb1591.tar.gz",
+      "sha256": "7274af278c83bb2d6d4abed6a50d493b4a06473582818c5af94c3dcae02e205f"
+    }
+  },
+  "fixture": {
+    "path": "scripts/demo-assets/portable-app",
+    "files": {
+      ".config.json": "4e57dc50f08496349ae3b9819ccc873e27159305d6167763b837a3a9db432cdf",
+      "functions/api/where.ts": "34af2ed3e5c34b014f7a41a78f8ef283741483f02f3425196979ee090b2ef3fe"
+    }
+  },
+  "expectedIdentities": {
+    "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+    "providers": {
+      "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+      "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+      "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+      "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+    }
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "ffb1591b96d67f75d46995e98aa0a8909fe31ce8",
+      "archiveSha256": "7274af278c83bb2d6d4abed6a50d493b4a06473582818c5af94c3dcae02e205f",
+      "identities": {
+        "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s68-linux-x86_64",
+      "hostAlias": "s68",
+      "hostName": "Serv68",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-117-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "ffb1591b96d67f75d46995e98aa0a8909fe31ce8",
+      "archiveSha256": "7274af278c83bb2d6d4abed6a50d493b4a06473582818c5af94c3dcae02e205f",
+      "identities": {
+        "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s90-linux-x86_64",
+      "hostAlias": "s90",
+      "hostName": "s90-canary",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-117-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "ffb1591b96d67f75d46995e98aa0a8909fe31ce8",
+      "archiveSha256": "7274af278c83bb2d6d4abed6a50d493b4a06473582818c5af94c3dcae02e205f",
+      "identities": {
+        "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s91-linux-x86_64",
+      "hostAlias": "s91",
+      "hostName": "s91-llap",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-117-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "ffb1591b96d67f75d46995e98aa0a8909fe31ce8",
+      "archiveSha256": "7274af278c83bb2d6d4abed6a50d493b4a06473582818c5af94c3dcae02e205f",
+      "identities": {
+        "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "ffb1591b96d67f75d46995e98aa0a8909fe31ce8",
+      "archiveSha256": "7274af278c83bb2d6d4abed6a50d493b4a06473582818c5af94c3dcae02e205f",
+      "identities": {
+        "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "failed",
+      "commit": "ffb1591b96d67f75d46995e98aa0a8909fe31ce8",
+      "archiveSha256": "7274af278c83bb2d6d4abed6a50d493b4a06473582818c5af94c3dcae02e205f",
+      "identities": {
+        "canonical": "7cdc927f9ae113624318dded46e4f2f2af80ee574ff2b63c9d2dd8a51a6b687f",
+        "providers": {
+          "cloudflare": "b6cfb30e4f60ffeb53650047c5a7a7caeef922348f3a4b718c47005802b4eccd",
+          "deno": "2a34e746cd9f29b7bb4728fbd2eb8710777c984a303aad5f9c23417e8d0f12c2",
+          "tencent": "11c7e4c93ff5f35f0a8a7de5fc0f2b853c9955b2f41cc635a76c27c85baed206",
+          "deislet": "99658d597dafb9efed4a61d4933032ab32bdfed8652db98556253b2e6c83f52d"
+        }
+      },
+      "reason": "The build completed, but macOS resolved /var as /private/var while the bundler retained the aliased cwd. Host-specific temporary paths entered the inline source map and changed the canonical and every derived provider identity."
+    }
+  ],
+  "assertions": {
+    "allPassingObservationsMatchExpected": true,
+    "missingPassingOperatingSystems": ["macos"]
+  },
+  "limitations": [
+    "This evidence covers compiler output identity, not provider-account deployment, runtime conformance, or backend certification.",
+    "Provider CLI absence warnings do not change the emitted bytes and are not interpreted as provider verification.",
+    "The native compiler executables are platform-specific and are not themselves compared byte-for-byte."
+  ]
+}

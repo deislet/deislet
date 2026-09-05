@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-05T10:20:00+08:00",
+  "updatedAt": "2026-09-05T11:50:00+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -13,7 +13,8 @@
   "nextActions": [
     "P0-SPEC-002",
     "P0-MODEL-001",
-    "P1-BUILD-001"
+    "P1-BUILD-001",
+    "P1-PLAT-001"
   ],
   "phases": [
     {
@@ -215,9 +216,10 @@
             {"type": "local-path", "value": "crates/deis-build/src/canonical_routing.rs"},
             {"type": "local-path", "value": "crates/deis-build/src/provider_derivation.rs"},
             {"type": "local-path", "value": "crates/deis-build/tests/canonical_build_output.rs"},
-            {"type": "local-path", "value": "crates/deis-build/tests/provider_resource_bindings.rs"}
+            {"type": "local-path", "value": "crates/deis-build/tests/provider_resource_bindings.rs"},
+            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-ffb1591.json"}
           ],
-          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload 按文件集摘要原子发布和复用、current selector 只在全构建成功后切换、payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；protobuf 代码生成已固定并显式调用 vendored protoc 3.2.0，CI 不再安装系统 protoc；Windows 与 Linux 已在同一修复前提交产生相同真实 compiler identity，修复后证据和 macOS 仍待完成；全部 semantic document schema、签名、受信 build/control-plane record 和 framework/provider 集成继续阻断完成"
+          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload 按文件集摘要原子发布和复用、current selector 只在全构建成功后切换、payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；protobuf 代码生成已固定并显式调用 vendored protoc 3.2.0，CI 不再安装系统 protoc；提交 ffb1591 在 s17/s68/s90/s91 Linux 与 s69 Windows 对同一归档、fixture 和固定 Rust 1.96.0 产生相同 identity，但 macOS 因 /var 与 /private/var 路径别名进入内联 source map 而失败；当前修复已规范化 bundler cwd 并有符号链接回归测试，修复提交的三平台复验尚待完成；全部 semantic document schema、签名、受信 build/control-plane record 和 framework/provider 集成继续阻断完成"
         },
         {
           "id": "P1-DEPLOY-001",
@@ -241,10 +243,14 @@
           "id": "P1-PLAT-001",
           "title": "建立 Linux/macOS/Windows 开发工具 CI 与实机 determinism",
           "owner": "deislet",
-          "status": "queued",
+          "status": "active",
           "dependsOn": ["P1-BUILD-001"],
-          "outputs": [{"type": "planned-path", "value": "cross-platform CI and s17/s67/s69 evidence"}],
-          "verification": "相同 fixture 在三种 OS 产生同一 canonical digest"
+          "outputs": [
+            {"type": "local-path", "value": "docs/product/evidence/compiler-identity.schema.json"},
+            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-ffb1591.json"},
+            {"type": "planned-path", "value": "Linux/macOS/Windows CI matrix"}
+          ],
+          "verification": "提交 ffb1591 的实机证据覆盖 Linux、macOS、Windows：Linux 与 Windows identity 一致，macOS 暴露 /var 与 /private/var 路径别名进入内联 source map 的确定性缺陷；当前修复已有本地回归测试，修复提交的三平台实机复验及持续 CI matrix 未完成，故保持 active"
         }
       ]
     },
