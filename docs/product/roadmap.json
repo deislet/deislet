@@ -225,9 +225,10 @@
           "status": "active",
           "dependsOn": ["P0-MODEL-001", "P0-SPEC-002"],
           "outputs": [
-            {"type": "local-path", "value": "crates/deis-build/src/canonical_artifact.rs"},
+            {"type": "local-path", "value": "crates/deis-artifact/src/canonical_artifact.rs"},
+            {"type": "local-path", "value": "crates/deis-artifact/src/lib.rs"},
             {"type": "local-path", "value": "crates/deis-build/src/canonical_routing.rs"},
-            {"type": "local-path", "value": "crates/deis-build/src/provider_derivation.rs"},
+            {"type": "local-path", "value": "crates/deis-artifact/src/provider_derivation.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/catalog/artifact.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/api/catalog/artifacts.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/api/catalog/versions.rs"},
@@ -238,7 +239,7 @@
             {"type": "local-path", "value": "docs/product/evidence/compiler-identity-94fb8fb.json"},
             {"type": "local-path", "value": "docs/product/evidence/compiler-identity-3eb581e.json"}
           ],
-          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload 按文件集摘要原子发布和复用、current selector 只在全构建成功后切换、payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；Control 现把 zip 仅作传输，在隔离 staging 中限制大小/项数并拒绝 traversal/link/duplicate/non-regular entry，以锁定标准复核后原子保存 canonical directory 与共享 record；provider envelope 绑定 exact derivation/native payload，新 version 保存不可变 parent/derivation lineage，CLI 普通 build 与 --no-build 都走该路径，完全相同重放和删除回收已有端到端测试。三个锁定摘要建立编译期防漂移校验。protobuf 代码生成已固定并显式调用 vendored protoc 3.2.0，CI 不再安装系统 protoc；ffb1591 暴露 macOS /var 别名，94fb8fb 暴露 Windows verbatim-prefix，两次失败 observation 和根因均保留；修复提交 3eb581e 的同一 archive/fixture 已在 Linux x86_64、macOS arm64、Windows AMD64 产生相同 canonical identity 786f483d 与四个 provider identity，机器 evidence 通过治理重算；标准仍为 proposal，record 保持 deployable false/signatures empty；全部 semantic document schema、签名、受信 builder、远端 build/log/cache 和 framework/provider 集成继续阻断完成"
+          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload 按文件集摘要原子发布和复用、current selector 只在全构建成功后切换、payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；Control 现把 zip 仅作传输，在隔离 staging 中限制大小/项数并拒绝 traversal/link/duplicate/non-regular entry，以锁定标准复核后原子保存 canonical directory 与共享 record；provider envelope 绑定 exact derivation/native payload，新 version 保存不可变 parent/derivation lineage，CLI 普通 build 与 --no-build 都走该路径，完全相同重放和删除回收已有端到端测试。纯 canonical artifact/provider derivation 真源已迁入 deis-artifact；Control 依赖树不再包含完整 compiler、build core 或 adapter，deis-build 以同名 re-export 保持调用兼容。三个锁定摘要建立编译期防漂移校验。protobuf 代码生成已固定并显式调用 vendored protoc 3.2.0，CI 不再安装系统 protoc；ffb1591 暴露 macOS /var 别名，94fb8fb 暴露 Windows verbatim-prefix，两次失败 observation 和根因均保留；修复提交 3eb581e 的同一 archive/fixture 已在 Linux x86_64、macOS arm64、Windows AMD64 产生相同 canonical identity 786f483d 与四个 provider identity，机器 evidence 通过治理重算；标准仍为 proposal，record 保持 deployable false/signatures empty；全部 semantic document schema、签名、受信 builder、远端 build/log/cache 和 framework/provider 集成继续阻断完成"
         },
         {
           "id": "P1-DEPLOY-001",

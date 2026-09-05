@@ -401,7 +401,7 @@ fn validate_deislet_envelope(
 
     // Re-read the parent immediately before accepting its child. A database
     // row is not proof that the directory survived disk damage or tampering.
-    let parent = deis_build::canonical_artifact::validate(
+    let parent = deis_artifact::canonical_artifact::validate(
         FsPath::new(&artifact.storage_path),
         Some(deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION),
         &[],
@@ -496,8 +496,8 @@ fn validate_deislet_envelope(
         crate::catalog::CatalogError::invalid("provider envelope has no native bundle")
     })?;
 
-    let derivation_sha256 = deis_build::canonical_artifact::sha256(&derivation);
-    let declared: deis_build::provider_derivation::ProviderDerivationManifest =
+    let derivation_sha256 = deis_artifact::canonical_artifact::sha256(&derivation);
+    let declared: deis_artifact::provider_derivation::ProviderDerivationManifest =
         serde_json::from_slice(&derivation).map_err(|_| {
             crate::catalog::CatalogError::invalid("provider derivation is not valid JSON")
         })?;
@@ -532,7 +532,7 @@ fn validate_deislet_envelope(
     write_new(&payload_root.join("bundle.zip"), &bundle)?;
     let record_path = record_root.join(format!("{derivation_sha256}.json"));
     write_new(&record_path, &derivation)?;
-    let summary = deis_build::provider_derivation::validate(
+    let summary = deis_artifact::provider_derivation::validate(
         &record_path,
         &payload_root,
         Some("deislet"),
@@ -706,7 +706,7 @@ mod lineage_tests {
         };
         let derivation = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 1,
-            "format": deis_build::provider_derivation::FORMAT,
+            "format": deis_artifact::provider_derivation::FORMAT,
             "provider": "deislet",
             "standardVersion": parent.standard_version,
             "parent": {

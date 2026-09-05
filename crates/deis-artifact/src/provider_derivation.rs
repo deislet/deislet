@@ -16,7 +16,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::canonical_artifact::{
-    self, canonical_json_bytes, file_set_sha256, ArtifactFile, FILE_SET_ALGORITHM,
+    self, ArtifactFile, FILE_SET_ALGORITHM, canonical_json_bytes, file_set_sha256,
 };
 
 pub const FORMAT: &str = "deislet.provider-derivation/v1";
@@ -412,7 +412,7 @@ pub fn publish_payload(payload_store: &Path, source: &Path) -> Result<ProviderPa
             return Err(derivation_error(
                 "EC_DERIVATION_PUBLISH_FAILED",
                 "provider payload could not be published atomically",
-            ))
+            ));
         }
     };
     let mut published = validate_payload(&final_root, Some(&payload_root_sha256))?;
@@ -607,7 +607,7 @@ pub fn publish(
                 return Err(derivation_error(
                     "EC_DERIVATION_PUBLISH_FAILED",
                     "provider derivation record could not be created",
-                ))
+                ));
             }
         }
     }
@@ -839,7 +839,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
     let source = source
@@ -890,7 +890,7 @@ impl PayloadStaging {
                     return Err(derivation_error(
                         "EC_DERIVATION_PUBLISH_FAILED",
                         "isolated provider payload staging directory could not be created",
-                    ))
+                    ));
                 }
             }
         }

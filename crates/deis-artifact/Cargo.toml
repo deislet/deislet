@@ -1,0 +1,25 @@
+[package]
+name = "deis-artifact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository = "https://github.com/deislet/deislet"
+description = "Edge Canon artifact and provider-derivation integrity contracts"
+
+[dependencies]
+anyhow.workspace = true
+hex = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs = "0.2.0"
+sha2 = "0.10"
+tracing.workspace = true
+unicode-normalization = "0.1"
+walkdir = "2.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1546,11 +1546,13 @@ pub(crate) mod tests {
         let bundle = sample_bundle("demo");
         std::fs::write(payload.path().join("bundle.zip"), &bundle).unwrap();
         let payload_store = tempfile::tempdir().unwrap();
-        let published_payload =
-            deis_build::provider_derivation::publish_payload(payload_store.path(), payload.path())
-                .unwrap();
+        let published_payload = deis_artifact::provider_derivation::publish_payload(
+            payload_store.path(),
+            payload.path(),
+        )
+        .unwrap();
         let records = tempfile::tempdir().unwrap();
-        let derivation = deis_build::provider_derivation::publish(
+        let derivation = deis_artifact::provider_derivation::publish(
             records.path(),
             &published_payload.root,
             "deislet",

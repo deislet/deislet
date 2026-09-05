@@ -53,10 +53,9 @@
 //! ```
 
 // Core compiler module
-pub mod canonical_artifact;
+pub use deis_artifact::{canonical_artifact, provider_derivation};
 pub mod canonical_routing;
 pub mod compiler;
-pub mod provider_derivation;
 
 // Parser module
 pub mod parser;

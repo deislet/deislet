@@ -22,6 +22,7 @@ name = "deis-build"
 path = "src/main.rs"
 
 [dependencies]
+deis-artifact = { version = "0.1.0", path = "../deis-artifact" }
 deis-build-core = { version = "0.1.0", path = "../deis-build-core" }
 deis-build-adapter-cloudflare = { version = "0.1.0", path = "../deis-build-adapter-cloudflare" }
 deis-build-adapter-deno = { version = "0.1.0", path = "../deis-build-adapter-deno" }

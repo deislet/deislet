@@ -1995,6 +1995,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "deis-artifact"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+ "unicode-normalization",
+ "walkdir",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "deis-backend-migration"
 version = "0.1.0"
 dependencies = [
@@ -2042,6 +2059,7 @@ dependencies = [
  "base64 0.22.1",
  "clap 4.6.6",
  "colored",
+ "deis-artifact",
  "deis-build-adapter-cloudflare",
  "deis-build-adapter-deislet",
  "deis-build-adapter-deno",
@@ -2164,8 +2182,8 @@ dependencies = [
  "axum-server",
  "chrono",
  "dashmap 6.2.1",
+ "deis-artifact",
  "deis-backend-migration",
- "deis-build",
  "deis-bundle",
  "deis-queue",
  "deis-wire",

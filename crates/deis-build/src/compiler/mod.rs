@@ -3026,7 +3026,7 @@ impl Compiler {
                 let mut digest = Sha256::new();
                 for bytes in [
                     include_bytes!("mod.rs").as_slice(),
-                    include_bytes!("../canonical_artifact.rs").as_slice(),
+                    include_bytes!("../../../deis-artifact/src/canonical_artifact.rs").as_slice(),
                     include_bytes!("../../../../Cargo.lock").as_slice(),
                 ] {
                     digest.update((bytes.len() as u64).to_be_bytes());

@@ -999,13 +999,13 @@ impl StagingDirectory {
 
 impl Drop for StagingDirectory {
     fn drop(&mut self) {
-        if self.armed {
-            if let Err(error) = fs::remove_dir_all(&self.path) {
-                tracing::warn!(
-                    error = %error,
-                    "canonical artifact staging cleanup failed"
-                );
-            }
+        if self.armed
+            && let Err(error) = fs::remove_dir_all(&self.path)
+        {
+            tracing::warn!(
+                error = %error,
+                "canonical artifact staging cleanup failed"
+            );
         }
     }
 }

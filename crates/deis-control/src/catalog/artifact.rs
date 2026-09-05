@@ -11,7 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use deis_build::canonical_artifact::{self, CanonicalArtifactSummary, CanonicalManifest};
+use deis_artifact::canonical_artifact::{self, CanonicalArtifactSummary, CanonicalManifest};
 use deis_wire::CanonicalId;
 use tracing::{debug, info};
 use zip::ZipArchive;
@@ -448,7 +448,7 @@ impl Drop for StagingDirectory {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use deis_build::canonical_artifact::{
+    use deis_artifact::canonical_artifact::{
         ArtifactFileInput, BuildMetadata, CanonicalArtifactInput, Toolchain, canonical_json_bytes,
     };
     use std::collections::BTreeMap;

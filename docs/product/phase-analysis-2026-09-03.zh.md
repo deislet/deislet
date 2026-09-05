@@ -1789,5 +1789,8 @@ Application/framework source + versioned build plan
 - 该切片只关闭“控制面没有 canonical record/lineage”这一缺陷。当前标准仍为 proposal，所以 record 诚实保持
   `deployable: false` 且 `signatures: []`；实验性 Deislet 部署不等于已发布标准或认证。受信 builder、签名验证、
   远端 build/日志/cache、framework adapter、通用 provider driver、Cloudflare/EdgeOne 真实账户 lifecycle 和
-  旧 raw bundle 退场仍是完成阻断项。Control 暂时复用 `deis-build` 中的 validator，后续应把纯 artifact/derivation
-  契约下沉为不链接 compiler/adapter 的小型共享 crate；在完成前这是部署体积与依赖边界欠缺，不是另一套语义。
+  旧 raw bundle 退场仍是完成阻断项。
+- 后续依赖审计发现 Control 为复用 validator 曾直接依赖完整 `deis-build`，会把 SWC、Rolldown 与四套 adapter
+  带入控制面编译/链接边界。纯 canonical artifact 和 provider derivation 真源现已迁到独立
+  `deis-artifact` crate；`deis-build` 保持同名 re-export 兼容，Control 只依赖轻量 crate。依赖树回归证明
+  Control 不再包含 `deis-build`、`deis-build-core` 或任一 adapter，CI compiler shard 显式测试该 crate。

@@ -24,7 +24,7 @@ EXPECTED_TEST_SHARD_TIMEOUT_MINUTES = 90
 EXPECTED_TEST_SHARDS = {
     "runtime-tests": "cargo test -p deis-runtime --no-fail-fast",
     "compiler-cli-tests": (
-        "cargo test -p deis-bundle -p deis-node-contract -p deis-build-core "
+        "cargo test -p deis-bundle -p deis-node-contract -p deis-artifact -p deis-build-core "
         "-p deis-build-adapter-cloudflare -p deis-build-adapter-deislet "
         "-p deis-build-adapter-deno -p deis-build-adapter-tencent "
         "-p deis-build -p deis --no-fail-fast"
@@ -464,6 +464,40 @@ def validate_compiler_identity_evidence(evidence_path: str) -> None:
 
 
 def validate_integration() -> None:
+    control_manifest = tomllib.loads(read_text("crates/deis-control/Cargo.toml"))
+    control_dependencies = set(control_manifest.get("dependencies", {}))
+    require(
+        "deis-artifact" in control_dependencies,
+        "Control must use the shared artifact integrity boundary",
+    )
+    require(
+        not control_dependencies.intersection(
+            {
+                "deis-build",
+                "deis-build-core",
+                "deis-build-adapter-cloudflare",
+                "deis-build-adapter-deislet",
+                "deis-build-adapter-deno",
+                "deis-build-adapter-tencent",
+            }
+        ),
+        "Control must not link compiler or provider-adapter crates",
+    )
+    artifact_manifest = tomllib.loads(read_text("crates/deis-artifact/Cargo.toml"))
+    artifact_dependencies = set(artifact_manifest.get("dependencies", {}))
+    require(
+        not any(
+            dependency.startswith("deis-build")
+            for dependency in artifact_dependencies
+        ),
+        "the artifact integrity crate must not depend on the compiler layer",
+    )
+    build_manifest = tomllib.loads(read_text("crates/deis-build/Cargo.toml"))
+    require(
+        "deis-artifact" in build_manifest.get("dependencies", {}),
+        "the compiler must reuse the shared artifact integrity boundary",
+    )
+
     workflow = read_text(".github/workflows/checks.yml")
     require(
         "python3 scripts/check-product-governance.py" in workflow,
