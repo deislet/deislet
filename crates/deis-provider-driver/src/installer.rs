@@ -327,14 +327,7 @@ fn set_removal_permissions(path: &Path, directory: bool) -> Result<(), DriverIns
 
 #[cfg(windows)]
 fn set_removal_permissions(path: &Path, _directory: bool) -> Result<(), DriverInstallationError> {
-    use std::os::windows::fs::PermissionsExt as _;
-    const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
-
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| DriverInstallationError::io("inspect stale driver permissions", error))?
-        .permissions();
-    permissions.set_attributes(permissions.attributes() & !FILE_ATTRIBUTE_READONLY);
-    fs::set_permissions(path, permissions)
+    set_windows_writable(path)
         .map_err(|error| DriverInstallationError::io("make stale driver staging removable", error))
 }
 
@@ -347,6 +340,38 @@ fn set_removal_permissions(path: &Path, _directory: bool) -> Result<(), DriverIn
     permissions.set_readonly(false);
     fs::set_permissions(path, permissions)
         .map_err(|error| DriverInstallationError::io("make stale driver staging removable", error))
+}
+
+#[cfg(windows)]
+fn set_windows_writable(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_READONLY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+    };
+
+    let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows provider driver path contains NUL",
+        ));
+    }
+    encoded.push(0);
+
+    // SAFETY: `encoded` is NUL-terminated and remains alive for the call.
+    let attributes = unsafe { GetFileAttributesW(encoded.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes & FILE_ATTRIBUTE_READONLY == 0 {
+        return Ok(());
+    }
+    // SAFETY: the path pointer is valid as above, and the attributes came from
+    // the same path with only FILE_ATTRIBUTE_READONLY cleared.
+    if unsafe { SetFileAttributesW(encoded.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1010,14 +1035,7 @@ mod tests {
 
     #[cfg(windows)]
     fn set_cleanup_permissions(path: &Path, _directory: bool) {
-        use std::os::windows::fs::PermissionsExt as _;
-        const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
-
-        if let Ok(metadata) = fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            permissions.set_attributes(permissions.attributes() & !FILE_ATTRIBUTE_READONLY);
-            let _ = fs::set_permissions(path, permissions);
-        }
+        let _ = set_windows_writable(path);
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1038,12 +1056,7 @@ mod tests {
 
     #[cfg(windows)]
     fn make_test_file_writable(path: &Path) {
-        use std::os::windows::fs::PermissionsExt as _;
-        const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
-
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_attributes(permissions.attributes() & !FILE_ATTRIBUTE_READONLY);
-        fs::set_permissions(path, permissions).unwrap();
+        set_windows_writable(path).unwrap();
     }
 
     #[cfg(not(any(unix, windows)))]
