@@ -551,7 +551,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn successful_result_is_heartbeat_protected_and_persisted() {
         let request = request();
         let store = FakeStore::default();

@@ -1082,7 +1082,11 @@ printf '{"ok":true,"echo":"%s","%s":"key"}' "$PROVIDER_TOKEN" "$PROVIDER_TOKEN"
             Vec::<String>::new(),
             SideEffectPolicy::ReadOnly,
         );
-        invocation.timeout(Duration::from_millis(500)).unwrap();
+        // This is a process-tree cleanup assertion, not a scheduler latency
+        // benchmark. The background child sleeps for ten seconds, so five
+        // seconds still fails decisively if cleanup regresses while leaving
+        // enough margin for a cold, concurrently compiling macOS host.
+        invocation.timeout(Duration::from_secs(5)).unwrap();
         let output = PinnedCommandRunner
             .run(&pin, &invocation)
             .await

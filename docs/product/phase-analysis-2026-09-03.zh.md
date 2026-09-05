@@ -1863,3 +1863,17 @@ Application/framework source + versioned build plan
   与完整 materialized tool tree、Deislet/Cloudflare 完整 driver、EdgeOne 安全 API/SDK transport、API/CLI/Web
   接线和真实账户 preview→verify→activate→observe→rollback→delete/cleanup 仍未完成；不得因 durable 单步层
   已完成就宣称 provider deployment 或 conformance 完成。
+
+## 64. 精确提交跨平台测试的墙钟假设
+
+- 对已推送的 `c0f788c` 以仓库 archive 在固定 Rust 1.96.0 上复跑 provider-driver。Linux 本机 25/25；
+  macOS arm64 为 24/25，`successful_parent_cannot_leave_a_background_capture_process` 在冷编译并发负载下
+  超过测试写死的 500 ms deadline。该用例验证 process-group cleanup，不定义 500 ms 产品 SLO；后台 child
+  自身 sleep 10 秒，因此把测试 deadline 调整为 5 秒仍能在 cleanup 回归时确定失败，同时不再把宿主调度抖动
+  当成实现失败。
+- Windows 10 AMD64 同一提交为 18/19，driver Job Object 两项真实测试均通过；失败的是
+  `successful_result_is_heartbeat_protected_and_persisted` 对 20/40/45 ms 真实墙钟顺序和至少两次 renew 的
+  假设。Windows 调度下只观察到一次 renew。heartbeat/lease 契约本身未失败，但测试证据不稳定；用例改用
+  Tokio paused clock 确定性推进 20、40、45 ms，并显式启用仅测试使用的 `test-util` feature。
+- 两个结果均按失败记录，不能算 `c0f788c` 三平台通过。修订提交必须重新在 Linux、macOS、Windows 跑完整
+  provider-driver suite 与严格 Clippy；只有新提交全部通过后才能形成通过证据。
