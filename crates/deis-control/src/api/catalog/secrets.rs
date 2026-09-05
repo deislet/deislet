@@ -19,7 +19,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -70,7 +70,7 @@ pub async fn put_secret(
     Path((app_id, env_name, name)): Path<(String, String, String)>,
     headers: HeaderMap,
     Json(request): Json<PutSecretRequest>,
-) -> ApiResult<Json<SecretChangeResponse>> {
+) -> ApiResult<(StatusCode, HeaderMap, Json<SecretChangeResponse>)> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
     deis_wire::validate_secret_value(&request.value)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
@@ -142,11 +142,24 @@ pub async fn put_secret(
         }
     };
 
-    Ok(Json(SecretChangeResponse {
-        secret,
-        delivery,
-        plan,
-    }))
+    let status = if plan.as_ref().is_some_and(|plan| plan.state != "active") {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    let response_headers = plan
+        .as_ref()
+        .map(|plan| super::deployments::deployment_plan_location(&app_id, &env_name, &plan.id))
+        .unwrap_or_default();
+    Ok((
+        status,
+        response_headers,
+        Json(SecretChangeResponse {
+            secret,
+            delivery,
+            plan,
+        }),
+    ))
 }
 
 async fn discard_staged_revision(
@@ -209,7 +222,7 @@ pub async fn delete_secret(
     State(state): State<CatalogState>,
     Path((app_id, env_name, name)): Path<(String, String, String)>,
     headers: HeaderMap,
-) -> ApiResult<Json<SecretDeletedResponse>> {
+) -> ApiResult<(StatusCode, HeaderMap, Json<SecretDeletedResponse>)> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
     let expected_revision = state
         .store
@@ -244,11 +257,24 @@ pub async fn delete_secret(
         }
     };
 
-    Ok(Json(SecretDeletedResponse {
-        deleted: name,
-        delivery,
-        plan,
-    }))
+    let status = if plan.as_ref().is_some_and(|plan| plan.state != "active") {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    let response_headers = plan
+        .as_ref()
+        .map(|plan| super::deployments::deployment_plan_location(&app_id, &env_name, &plan.id))
+        .unwrap_or_default();
+    Ok((
+        status,
+        response_headers,
+        Json(SecretDeletedResponse {
+            deleted: name,
+            delivery,
+            plan,
+        }),
+    ))
 }
 
 #[cfg(test)]

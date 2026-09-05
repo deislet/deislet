@@ -23,7 +23,7 @@ pub const ENVIRONMENT_VALUE_BYTES_LIMIT: usize = 5_120;
 /// naming another syntactically valid commit are future input, not a request
 /// to guess compatible behavior.
 pub const CURRENT_EDGE_CANON_STANDARD_VERSION: &str =
-    "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13";
+    "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentError {
@@ -580,7 +580,7 @@ fn valid_identity(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    const STANDARD: &str = "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13";
+    const STANDARD: &str = "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654";
 
     fn declarations() -> EnvironmentDeclarations {
         EnvironmentDeclarations::new(

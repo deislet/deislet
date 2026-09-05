@@ -56,6 +56,7 @@ pub async fn set(
             "environment": environment,
             "secret": response.secret,
             "delivery": response.delivery,
+            "plan": response.plan,
         }))?;
     } else {
         println!(
@@ -166,6 +167,7 @@ pub async fn remove(
             "environment": environment,
             "deleted": response.deleted,
             "delivery": response.delivery,
+            "plan": response.plan,
         }))?;
     } else {
         println!(

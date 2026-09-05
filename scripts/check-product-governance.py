@@ -14,7 +14,7 @@ import jsonschema
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_ADRS = list(range(1, 25))
+EXPECTED_ADRS = list(range(1, 26))
 EXPECTED_PHASES = [f"phase-{number}" for number in range(6)]
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -254,7 +254,7 @@ def validate_standard_lock() -> str:
     verification = lock.get("verification", {})
     require(verification.get("upstreamResult") == "passed", "locked upstream governance check did not pass")
     require(verification.get("expectedCapabilityFamilies") == 15, "unexpected capability family count")
-    require(verification.get("expectedDraftClauses") == 217, "unexpected draft clause count")
+    require(verification.get("expectedDraftClauses") == 223, "unexpected draft clause count")
     require(verification.get("expectedConformanceSuites") == 15, "unexpected conformance suite count")
     require(verification.get("expectedBackends") == 4, "unexpected backend record count")
 

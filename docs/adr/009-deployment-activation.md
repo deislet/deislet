@@ -4,7 +4,7 @@
 - 日期：2026-09-03
 - 决策者：产品负责人
 - 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-008
-- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/proposals/0001-unified-platform-contract/README.zh.md)
+- 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 背景
 
@@ -175,16 +175,18 @@ Rollback 不恢复 KV/SQL/Blob/Queue 内容。Deployment preflight 必须验证�
 
 ## Deislet 自建实现
 
-需要替换当前流程：
+严格全量模式当前按以下顺序执行：
 
-1. Control 创建 candidate version，但不移动 active environment generation。
-2. 所有选中 runtime nodes 下载并校验 bundle digest。
-3. 每节点创建 staged isolate/pool，完成 bindings 和 readiness。
-4. 节点上报 prepared generation。
-5. Proxy 获取同时包含 old/new versions、weights 和 affinity 的候选 routing table。
-6. Control 提交新的 routing generation。
-7. Proxy ack 后开始流量；节点 observed state 持续 reconcile。
-8. 未准备节点不进入该 deployment 服务集合，并在 status 中显式显示。
+1. Control 持久化 immutable plan 与候选 environment snapshot，但不移动 active environment generation。
+2. 所有冻结 runtime nodes 下载并校验 bundle digest，创建 generation-addressed staged isolate/pool，完成 bindings 与 readiness，并回报 `PREPARE`。
+3. Queue `PREPARE` 在与 Pull 相同的持久事务边界关闭旧 generation 的新租约入口，并等待仍有效的旧 lease 结清；此时不会开放候选 generation。
+4. Queue 尚在 drain 时，部署/回滚接口返回 `202 Accepted`，响应中的 `deployment` 为空；plan、target 与 queue observation 是后续查询依据，production pointer 与 secret head 均未改变。
+5. Runtime 与 Queue 均 prepared 后，Control 以 compare-and-swap 原子提交 deployment pointer；secret rotation/deletion 同时提交 head。
+6. Proxy 拉取带精确 deployment generation 的 routing table，并由冻结 proxy 集合逐一回报 applied ACK。
+7. 全部 Proxy ACK 后，Queue `ACTIVATE` 才原子开放候选 generation；随后 Control 向全部冻结 runtime target 发送 `ACTIVATE`，开始其 current selector、Queue consumer 与 Cron trigger。
+8. Runtime、Proxy 与需要的 Queue observation 全部指向同一 plan/generation 后，计划才进入 `active`。旧 HTTP generation 在 retention 窗口后 drain。
+
+任何 pre-commit 失败都先把计划持久推进到 `aborting`：Queue `ABORT` 清除该计划的 pending generation、恢复旧 generation 的租约入口，然后 Runtime `ABORT` 清理候选。Queue 持久保留最近一次已补偿 candidate 的 deployment/generation tombstone；首次调用返回有副作用，精确重试返回无新副作用，任一 identity 分量不同均冲突。只有两侧补偿均确认后计划才进入失败终态；丢失响应由相同 plan/generation 的幂等调用继续核对，不能把未知结果当成成功或直接重做另一项发布。
 
 默认 mini cluster atomic 策略要求配置的全部 serving nodes ready。未来容量组/故障域可在不暴露给应用的前提下定义 readiness policy。
 
@@ -247,9 +249,13 @@ Rollback 不恢复 KV/SQL/Blob/Queue 内容。Deployment preflight 必须验证�
 
 ## 实现进度（2026-09-05）
 
-已落地严格模式第一批：immutable/JCS deployment plan、显式状态与事件、全部冻结 runtime target 的 PREPARE、generation-addressed runtime slot、proxy table generation 与 applied ACK、target observation、重启 reconcile、assignment phase、queue consumer generation lease fence、历史 snapshot rollback，以及 response stream/WebSocket 感知的 retained-generation DRAIN。部分 PREPARE 失败不会移动 production pointer；plan/generation 在 runtime 与 queue 两端均绑定同一 deployment intent。
+已落地严格模式第一批及统一有序切换屏障：immutable/JCS deployment plan、在任何 runtime I/O 前与计划同事务保存的候选 snapshot、显式状态与事件、全部冻结 runtime target 的 PREPARE、generation-addressed runtime slot、拆分的 Queue `PREPARE/ACTIVATE/ABORT`、持久 queue observation、proxy table generation 与 applied ACK、target observation、重启 reconcile、assignment phase、历史 snapshot rollback，以及 response stream/WebSocket 感知的 retained-generation DRAIN。实际顺序固定为 `runtime PREPARE → queue PREPARE/drain → pointer/head CAS → proxy ACK → queue ACTIVATE → runtime ACTIVATE`。Queue drain 尚未结束时接口以 `202 Accepted` 返回可继续查询的计划、`Location` 状态地址和空 `deployment`；部分 PREPARE 或 pre-commit CAS 失败则进入持久 `aborting`，恢复旧 Queue admission 后再清理 runtime candidate。Queue 响应和 observation 均携带 active/pending 的 deployment/generation owner，Control 精确核验；exact abort tombstone 允许丢响应重试但拒绝错误 candidate。plan/generation 在 runtime 与 queue 两端均绑定同一 deployment intent。
 
-本 ADR 仍未完成。Queue barrier 当前发生在 routing pointer 提交与 proxy applied observation 之后，尚未形成 HTTP/queue/cron 的统一切换边界；多 Control deployment owner lease、per-node mTLS、可配置 retention/emergency drain、渐进权重、稳定签名 affinity、override、gate、pause/resume/progress/abort、跨 service cohort、关联遥测和 provider driver/live evidence 仍缺失。详细事实与阻断项见阶段分析第 59 节；在这些出口条件满足前，不能把局部实现称为产品级发布闭环或 provider conformance。
+API、后台 reconcile 与到期 generation drain 每次使用独立 UUIDv7 coordinator owner；30 秒持久租约和 10 秒 heartbeat 在每个 runtime/queue 外部动作前续期。状态迁移、observation、snapshot/secret/pointer commit 与 drain 更新都在事务内校验 owner 和有效期；过期可由另一 Control 接管，旧 owner 不能再写。失败计划补偿确认后立即销毁无引用 staged secret，后台再按 24 小时窗口、每批 1000 条回收 orphan revision，并保留不可变、无 ciphertext 的销毁 ledger。
+
+Queue 还修正了一个会破坏该屏障的租约边界：即使消息尚未再次投递，`visible_at` 已到期的旧 token 也必须把 Ack/Nack 记为 stale，不能在 Queue 已证明旧 lease 排空后再删除或改写消息。
+
+本 ADR 仍未完成。当前证据已有双调用者单赢家、owner lease 过期接管与 stale owner 写入拒绝，但仍以单进程、定向和端到端回归为主，尚缺每个持久化边界的进程崩溃/丢响应注入和真实多 Control 故障演练；snapshot retention/GC、secret retention 配置与销毁查询面也未闭环。per-node mTLS、可配置 generation retention/emergency drain、渐进权重、稳定签名 affinity、override、gate、pause/resume/progress/abort、跨 service cohort、关联遥测和 provider driver/live evidence 仍缺失。详细事实与阻断项见阶段分析第 59–60 节；在这些出口条件满足前，不能把局部实现称为产品级发布闭环或 provider conformance。
 
 ## 行业资料
 

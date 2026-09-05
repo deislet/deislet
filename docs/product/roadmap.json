@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-05T17:22:40+08:00",
+  "updatedAt": "2026-09-05T19:53:45+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -24,7 +24,7 @@
       "status": "active",
       "dependsOn": [],
       "exitCriteria": [
-        "24 份 Accepted ADR 在仓库内可追溯且无临时路径",
+        "25 份 Accepted ADR 在仓库内可追溯且无临时路径",
         "Edge Canon proposal、机器契约、schema 与 registry 经 CI 校验",
         "目标版本所有能力族的 API、错误、一致性、生命周期、保证、fixture 与 oracle 均达到 normative-complete",
         "compiler 只依据标准版本验证，不读取 provider capability profile",
@@ -34,7 +34,7 @@
       "workItems": [
         {
           "id": "P0-DEC-001",
-          "title": "迁移阶段分析并建立 24 份正式 ADR",
+          "title": "迁移阶段分析并建立 25 份正式 ADR",
           "owner": "deislet",
           "status": "done",
           "dependsOn": [],
@@ -51,10 +51,10 @@
           "status": "done",
           "dependsOn": ["P0-DEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/proposals/0001-unified-platform-contract/README.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/contract.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/contract.json"}
           ],
-          "verification": "在 Edge Canon commit c926687f7539453ab31776cd16f8341133d82a13 运行 python3 scripts/check-governance.py"
+          "verification": "在 Edge Canon commit a41a4caadeaf8e5751ebe57ef5be673d18384654 运行 python3 scripts/check-governance.py"
         },
         {
           "id": "P0-CONF-001",
@@ -63,8 +63,8 @@
           "status": "done",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/registry.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/conformance-registry.schema.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/registry.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/conformance-registry.schema.json"}
           ],
           "verification": "registry 中 proposal 不能 compliant，supported 必须蕴含 compliant"
         },
@@ -89,45 +89,45 @@
           "status": "active",
           "dependsOn": ["P0-SPEC-001"],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements/web-fetch-events.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/kit.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/web-fetch-events/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/web-fetch-events/provider-adapter-protocol.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/web-fetch-events/oracle.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements/canonical-build-artifact.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/canonical-build-output.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/canonical-build-artifact/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements/routing-static-assets.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/routing-static-assets.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/routing-static-assets/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/evidence/routing-static-assets-platforms-2026-09-04.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements/web-platform-apis.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/web-platform-apis.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/web-platform-apis/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/evidence/web-platform-apis-platforms-2026-09-04.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements/environment-secrets.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/environment-secrets.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/environment-binding-snapshot.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/environment-secrets/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/evidence/environment-secrets-platforms-2026-09-05.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements/deployment-preview-rollback.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/deployment-plan.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/deployment-status.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/deployment-preview-rollback/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/evidence/deployment-preview-rollback-platforms-2026-09-05.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements/streams-websockets-background-work.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/schemas/streams-websockets-background-work.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/streams-websockets-background-work/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/streams-websockets-background-work/provider-runtime-protocol.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/streams-websockets-background-work/provider-runtime-fixture.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/streams-websockets-background-work/provider-runtime-collect.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/streams-websockets-background-work/provider-runtime-oracle.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json"}
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/web-fetch-events.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/kit.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/provider-adapter-protocol.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/oracle.mjs"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/canonical-build-artifact.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/canonical-build-output.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/canonical-build-artifact/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/routing-static-assets.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/routing-static-assets.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/routing-static-assets/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/routing-static-assets-platforms-2026-09-04.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/web-platform-apis.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/web-platform-apis.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-platform-apis/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/web-platform-apis-platforms-2026-09-04.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/environment-secrets.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/environment-secrets.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/environment-binding-snapshot.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/environment-secrets/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/environment-secrets-platforms-2026-09-05.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/deployment-preview-rollback.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/deployment-plan.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/deployment-status.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/deployment-preview-rollback/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/deployment-preview-rollback-platforms-2026-09-05.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/streams-websockets-background-work.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/streams-websockets-background-work.schema.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-protocol.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-fixture.mjs"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-collect.mjs"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-oracle.mjs"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json"}
           ],
-          "verification": "Edge Canon commit c926687f7539453ab31776cd16f8341133d82a13 已通过 Node 24.20.0 全库 120 项测试、217 条 Draft clause 治理和 python3 scripts/check-governance.py；最新远端 governance run 33920965672 对应旧提交 8a209c9a003fbbf9328f80fb77acf39b850d88fe，不作为当前提交的远端执行证据。EC-WEB T001–T015 的同源 fixture/oracle、artifact lineage、安全进程边界、身份绑定 deploy、at-most-once invoke 和 provider-neutral collect 已落地；Cloudflare/Deislet 另有精确单次 CPU、cleanup 与可恢复 run。EC-ARTIFACT、EC-ROUTING、EC-WEBAPI、EC-STREAM、EC-NODE、EC-ENV 与 EC-DEPLOY 均已有 Draft schema、case、reference harness 和 oracle，并在 Linux、macOS、Windows 生成一致 identity。EC-DEPLOY 的 37 条条款固定 immutable version/plan/status、全 serving-set prepare、generation-addressed activate、proxy/target observed active、双版本 basis-point、稳定 affinity、签名 override、gate、drain、rollback、retention、CAS 与未知结果 reconcile；这些仍是 reference portability 证据，不是 provider conformance。EdgeOne collect/cleanup/run、三个真实账户 evidence、真实 framework/provider 集成、尚未冻结的资源/生命周期维度及其余 7 个能力族继续阻断完成"
+          "verification": "Edge Canon commit a41a4caadeaf8e5751ebe57ef5be673d18384654 已通过 Node 24.20.0 全库 127 项测试、223 条 Draft clause 治理和 python3 scripts/check-governance.py；最新远端 governance run 33920965672 对应旧提交 8a209c9a003fbbf9328f80fb77acf39b850d88fe，不作为当前提交的远端执行证据。EC-WEB T001–T015 的同源 fixture/oracle、artifact lineage、安全进程边界、身份绑定 deploy、at-most-once invoke 和 provider-neutral collect 已落地；Cloudflare/Deislet 另有精确单次 CPU、cleanup 与可恢复 run。EC-ARTIFACT、EC-ROUTING、EC-WEBAPI、EC-STREAM、EC-NODE、EC-ENV 与 EC-DEPLOY 均已有 Draft schema、case、reference harness 和 oracle。其中 EC-DEPLOY 的既有三平台 evidence 精确绑定旧 T001–T012；新增 T013/T014 尚只有本地 reference 结果。EC-DEPLOY 的 43 条条款固定完整 previous owner、统一 trigger barrier、T013/T014，以及 immutable version/plan/status、全 serving-set prepare、generation-addressed activate、proxy/target observed active、双版本 basis-point、稳定 affinity、签名 override、gate、drain、rollback、retention、CAS 与未知结果 reconcile；这些仍是 reference portability 证据，不是 provider conformance。EdgeOne collect/cleanup/run、三个真实账户 evidence、真实 framework/provider 集成、尚未冻结的资源/生命周期维度及其余 7 个能力族继续阻断完成"
         },
         {
           "id": "P0-EVID-001",
@@ -297,10 +297,10 @@
           "dependsOn": ["P1-BUILD-001", "P0-SPEC-002"],
           "outputs": [
             {"type": "path", "value": "standards/edge-canon.lock.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements/node-npm-subset.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/node-npm-subset/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/node-npm-subset/provider-runtime-protocol.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/harness/node-npm-subset/provider-runtime-oracle.mjs"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/node-npm-subset.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/harness.json"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/provider-runtime-protocol.zh.md"},
+            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/provider-runtime-oracle.mjs"},
             {"type": "path", "value": "crates/deis-build-core/src/node_npm.rs"},
             {"type": "path", "value": "crates/deis-runtime/src/runtime/node_compat.rs"}
           ],
@@ -332,7 +332,7 @@
             {"type": "local-path", "value": "crates/deis/src/dev/mod.rs"},
             {"type": "planned-path", "value": "resource semantic and lifecycle suites"}
           ],
-          "verification": "EC-ENV Draft contract 已由 Deislet production path 实现：部署构造不可变 typed snapshot，secret revision/head、deployment/head CAS、同版本 rotation 与精确历史 rollback 均有 Control 回归；assignment/runtime 逐层校验标准版本、declaration、snapshot identity、revision/value map，schema-2 离线恢复失败关闭，context.env 与 process.env 逐 invocation 隔离；CLI 不接受 argv secret plaintext，并约束本地文件权限。当前只关闭 env/secrets 的 Deislet 实现切片；config 独立更新、retention/GC/销毁审计、per-tenant envelope key、加密 node transport、cluster prepare/activate/observed convergence、Cloudflare/EdgeOne live evidence，以及 KV/cache/SQL/blob/queue/cron/service binding mandatory suites 仍阻断完成"
+          "verification": "EC-ENV Draft contract 已由 Deislet production path 实现：部署构造不可变 typed snapshot，secret revision/head、deployment/head CAS、同版本 rotation 与精确历史 rollback 均有 Control 回归；assignment/runtime 逐层校验标准版本、declaration、snapshot identity、revision/value map，schema-2 离线恢复失败关闭，context.env 与 process.env 逐 invocation 隔离；CLI 不接受 argv secret plaintext，并约束本地文件权限。Queue fence 已按 pre-commit PREPARE/drain、post-proxy ACTIVATE 和补偿 ABORT 拆分；响应和持久 observation 均携带 active/pending deployment/generation owner，Control 精确核验，exact abort tombstone 允许丢响应重试并拒绝错误 candidate。过期 lease 的旧 Ack/Nack 在重投前也按 stale 拒绝。未引用 staged secret 在补偿确认后立即销毁，orphan revision 由 24 小时 retention、每批 1000 条的 GC 清理，并写入不可变无值销毁 ledger。当前只关闭 env/secrets 与严格有序切换的 Deislet 实现切片；config 独立更新、可配置 revision/snapshot retention 与销毁查询、per-tenant envelope key、加密 node transport、逐边界故障注入、完整 cluster convergence、Cloudflare/EdgeOne live evidence，以及 KV/cache/SQL/blob/queue/cron/service binding mandatory suites 仍阻断完成"
         },
         {
           "id": "P2-STATE-001",
@@ -377,7 +377,7 @@
             {"type": "local-path", "value": "crates/deis-proxy/src/catalog/table.rs"},
             {"type": "local-path", "value": "crates/deis-queue/src/queue.rs"}
           ],
-          "verification": "当前只覆盖严格模式第一批：partial prepare 不移动 pointer、精确 generation routing/observation、queue lease fence、历史 snapshot rollback 和 stream/WebSocket drain；完成仍要求统一 trigger 切换边界、故障接管、渐进权重/亲和/gate/override、遥测、provider driver 与真实后端证据"
+          "verification": "严格模式已固定 runtime PREPARE → queue PREPARE/drain → pointer/head CAS → proxy ACK → queue ACTIVATE → runtime ACTIVATE；覆盖 pre-commit 202/scoped Location/空 deployment、CLI 等待精确 plan 并复核 current pointer、持久 aborting、target/proxy/queue owner observation、partial prepare 不移动 pointer、精确 generation routing、exact abort tombstone、错误 candidate 拒绝、历史 snapshot rollback、stream/WebSocket drain，以及过期 lease Ack/Nack stale 边界。API、后台 reconcile 和终态 generation drain 使用不同 UUIDv7 owner、30 秒持久 lease 与 10 秒 heartbeat；所有 runtime/queue 外部动作、observation、transition 和 pointer commit 均受 owner/expiry fence，覆盖单赢家、过期接管与 stale owner 拒绝。完成仍要求逐持久化边界进程故障/丢响应注入、snapshot 生命周期、渐进权重/亲和/gate/override、遥测、provider driver 与真实后端证据"
         },
         {
           "id": "P3-SEC-001",
@@ -385,8 +385,11 @@
           "owner": "deislet",
           "status": "queued",
           "dependsOn": ["P0-MODEL-001"],
-          "outputs": [{"type": "planned-path", "value": "mTLS, RBAC, envelope secrets and security gates"}],
-          "verification": "非 dev 配置缺少认证/密钥/隔离条件时拒绝启动"
+          "outputs": [
+            {"type": "local-path", "value": "docs/adr/025-machine-identity-and-capabilities.md"},
+            {"type": "planned-path", "value": "mTLS, RBAC, envelope secrets and security gates"}
+          ],
+          "verification": "ADR-025 M1/M2 acceptance matrix 全绿；strict 模式移除 fleet PSK/shared HMAC/static backend bearer，非 dev 配置缺少身份、认证、密钥、撤销或隔离条件时 fail closed"
         },
         {
           "id": "P3-HA-001",

@@ -120,7 +120,7 @@ assets/                  # 静态资产，原样保留目录结构
     "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
     "schemaVersion": 1,
     "format": "edge-canon.environment-secrets/v1",
-    "standardVersion": "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+    "standardVersion": "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
     "access": { "surface": "context.env", "extraProviderBindings": "excluded" },
     "limits": { "bindingCount": 64, "valueBytes": 5120, "measurement": "utf-8" },
     "declarations": [

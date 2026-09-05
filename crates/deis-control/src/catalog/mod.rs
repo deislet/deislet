@@ -61,7 +61,8 @@ pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{
     App, Assignment, DeletedApp, DeployedVersion, Deployment, DeploymentDrainObservation,
     DeploymentEvent, DeploymentGenerationDrain, DeploymentPlan, DeploymentProxyObservation,
-    DeploymentTargetObservation, Environment, RetiredAppName, Route, SecretMeta, Version, now_secs,
+    DeploymentQueueObservation, DeploymentTargetObservation, Environment, RetiredAppName, Route,
+    SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
 pub use secrets::{SecretCipher, SecretsBackend};

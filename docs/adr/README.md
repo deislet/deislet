@@ -1,14 +1,14 @@
 # Deislet Architecture Decision Records
 
-本目录保存从 2026-09-03 产品梳理开始已接受的 24 项决策。`Accepted` 表示 Deislet 的产品与实现方向已经确定；涉及应用标准的条款仍须经 Edge Canon 独立治理进入某个不可变标准版本。
+本目录保存从 2026-09-03 产品梳理开始已接受的 25 项决策。`Accepted` 表示 Deislet 的产品与实现方向已经确定；涉及应用标准的条款仍须经 Edge Canon 独立治理进入某个不可变标准版本。
 
 - 决策事实与问题来源：[阶段分析](../product/phase-analysis-2026-09-03.zh.md)
 - 可执行工程路线：[产品级路线](../product/roadmap.zh.md)
-- 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/proposals/0001-unified-platform-contract/README.zh.md)
-- 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/contract.json)
-- 上游逐条要求：[standard/requirements.json](https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/standard/requirements.json)
-- 上游测试入口：[conformance/kit.json](https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/kit.json)
-- 上游证据 registry：[conformance/registry.json](https://github.com/deislet/edge-canon/blob/c926687f7539453ab31776cd16f8341133d82a13/conformance/registry.json)
+- 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
+- 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/contract.json)
+- 上游逐条要求：[standard/requirements.json](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements.json)
+- 上游测试入口：[conformance/kit.json](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/kit.json)
+- 上游证据 registry：[conformance/registry.json](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/registry.json)
 
 | ADR | 决策 | 状态 |
 |---|---|---|
@@ -36,5 +36,6 @@
 | [022](022-entry-plan-resource-baseline.md) | 最低免费或入门档共同资源基线 | Accepted；局部取代 ADR-005 |
 | [023](023-backend-migration-fence-and-inventory.md) | 后端迁移清单与真实写入栅栏 | Accepted |
 | [024](024-coordinated-embedded-backend-restore.md) | Embedded 后端一致恢复与可对账拓扑驱动 | Accepted |
+| [025](025-machine-identity-and-capabilities.md) | 每实例机器身份、独立管理通道与持有证明能力 | Accepted |
 
 ADR 不原地改写已接受决策。方向改变时新增 superseding ADR，并在旧记录与索引中建立双向链接。

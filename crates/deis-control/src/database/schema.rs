@@ -495,6 +495,32 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             PRIMARY KEY(env_id, name)
         );
 
+        -- Ciphertext destruction is irreversible, so retain a value-free
+        -- ledger after the revision row itself is gone. This is intentionally
+        -- not a foreign key to secret_revisions.
+        CREATE TABLE IF NOT EXISTS secret_revision_destructions (
+            revision_id TEXT PRIMARY KEY,
+            app_id       TEXT NOT NULL,
+            env_id       TEXT NOT NULL,
+            name         TEXT NOT NULL,
+            reason       TEXT NOT NULL,
+            destroyed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_secret_revision_destructions_env
+            ON secret_revision_destructions(env_id, destroyed_at DESC);
+
+        CREATE TRIGGER IF NOT EXISTS trg_secret_revision_destructions_immutable_update_v1
+        BEFORE UPDATE ON secret_revision_destructions
+        BEGIN
+            SELECT RAISE(ABORT, 'secret revision destruction evidence is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_secret_revision_destructions_immutable_delete_v1
+        BEFORE DELETE ON secret_revision_destructions
+        BEGIN
+            SELECT RAISE(ABORT, 'secret revision destruction evidence is immutable');
+        END;
+
         CREATE TABLE IF NOT EXISTS environment_binding_snapshots (
             snapshot_id        TEXT PRIMARY KEY,
             app_id             TEXT NOT NULL,
@@ -534,8 +560,12 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             state                    TEXT NOT NULL,
             note                     TEXT,
             last_error               TEXT,
+            coordinator_id           TEXT,
+            lease_expires_at         INTEGER CHECK(lease_expires_at IS NULL OR lease_expires_at >= 0),
             created_at               INTEGER NOT NULL,
-            updated_at               INTEGER NOT NULL
+            updated_at               INTEGER NOT NULL,
+            CHECK((coordinator_id IS NULL AND lease_expires_at IS NULL)
+               OR (coordinator_id IS NOT NULL AND lease_expires_at IS NOT NULL))
         );
         CREATE INDEX IF NOT EXISTS idx_deployment_plans_environment
             ON deployment_plans(env_id, created_at DESC);
@@ -544,7 +574,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         DROP INDEX IF EXISTS idx_deployment_plans_one_inflight_environment;
         CREATE UNIQUE INDEX idx_deployment_plans_one_inflight_environment
             ON deployment_plans(env_id)
-            WHERE state IN ('preparing', 'prepared', 'activating', 'reconciling', 'degraded');
+            WHERE state IN ('preparing', 'prepared', 'aborting', 'activating', 'reconciling', 'degraded');
 
         CREATE TABLE IF NOT EXISTS deployment_target_observations (
             plan_id             TEXT NOT NULL REFERENCES deployment_plans(id) ON DELETE CASCADE,
@@ -565,6 +595,18 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             routing_generation  TEXT NOT NULL,
             observed_at         INTEGER NOT NULL,
             PRIMARY KEY(plan_id, proxy_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS deployment_queue_observations (
+            plan_id             TEXT PRIMARY KEY REFERENCES deployment_plans(id) ON DELETE CASCADE,
+            observed_state      TEXT NOT NULL,
+            active_generation   TEXT NOT NULL,
+            active_deployment_id TEXT NOT NULL DEFAULT '',
+            pending_generation  TEXT,
+            pending_deployment_id TEXT,
+            outstanding_leases  INTEGER NOT NULL CHECK(outstanding_leases >= 0),
+            message             TEXT,
+            observed_at         INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS deployment_events (
@@ -624,6 +666,64 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
           OR NEW.created_at IS NOT OLD.created_at
         BEGIN
             SELECT RAISE(ABORT, 'deployment plan is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_deployment_plan_snapshot_owner_v1
+        BEFORE INSERT ON deployment_plans
+        WHEN NEW.snapshot_id IS NOT NULL
+        BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM environment_binding_snapshots snapshot
+                 WHERE snapshot.snapshot_id = NEW.snapshot_id
+                   AND snapshot.app_id = NEW.app_id
+                   AND snapshot.env_id = NEW.env_id
+                   AND snapshot.version_id = NEW.version_id
+            ) THEN RAISE(ABORT, 'deployment plan snapshot owner mismatch') END;
+        END;
+        "#,
+    )?;
+    ensure_deployment_plan_lease_columns(conn)?;
+    ensure_deployment_queue_observation_owner_columns(conn)?;
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS trg_deployment_plan_lease_identity_insert_v1
+        BEFORE INSERT ON deployment_plans
+        WHEN (NEW.coordinator_id IS NULL) != (NEW.lease_expires_at IS NULL)
+          OR NEW.lease_expires_at < 0
+          OR (NEW.coordinator_id IS NOT NULL AND (
+                 length(NEW.coordinator_id) != 36
+              OR lower(NEW.coordinator_id) != NEW.coordinator_id
+              OR substr(NEW.coordinator_id, 9, 1) != '-'
+              OR substr(NEW.coordinator_id, 14, 1) != '-'
+              OR substr(NEW.coordinator_id, 15, 1) != '7'
+              OR substr(NEW.coordinator_id, 19, 1) != '-'
+              OR substr(NEW.coordinator_id, 20, 1) NOT GLOB '[89ab]'
+              OR substr(NEW.coordinator_id, 24, 1) != '-'
+              OR length(replace(NEW.coordinator_id, '-', '')) != 32
+              OR replace(NEW.coordinator_id, '-', '') GLOB '*[^0-9a-f]*'
+          ))
+        BEGIN
+            SELECT RAISE(ABORT, 'deployment coordinator lease identity is invalid');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_deployment_plan_lease_identity_v1
+        BEFORE UPDATE OF coordinator_id, lease_expires_at ON deployment_plans
+        WHEN (NEW.coordinator_id IS NULL) != (NEW.lease_expires_at IS NULL)
+          OR NEW.lease_expires_at < 0
+          OR (NEW.coordinator_id IS NOT NULL AND (
+                 length(NEW.coordinator_id) != 36
+              OR lower(NEW.coordinator_id) != NEW.coordinator_id
+              OR substr(NEW.coordinator_id, 9, 1) != '-'
+              OR substr(NEW.coordinator_id, 14, 1) != '-'
+              OR substr(NEW.coordinator_id, 15, 1) != '7'
+              OR substr(NEW.coordinator_id, 19, 1) != '-'
+              OR substr(NEW.coordinator_id, 20, 1) NOT GLOB '[89ab]'
+              OR substr(NEW.coordinator_id, 24, 1) != '-'
+              OR length(replace(NEW.coordinator_id, '-', '')) != 32
+              OR replace(NEW.coordinator_id, '-', '') GLOB '*[^0-9a-f]*'
+          ))
+        BEGIN
+            SELECT RAISE(ABORT, 'deployment coordinator lease identity is invalid');
         END;
         "#,
     )?;
@@ -898,6 +998,46 @@ fn ensure_deployment_snapshot_column(conn: &Connection) -> Result<()> {
     if !has_snapshot {
         conn.execute(
             "ALTER TABLE deployments ADD COLUMN snapshot_id TEXT REFERENCES environment_binding_snapshots(snapshot_id)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_deployment_plan_lease_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(deployment_plans)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "coordinator_id") {
+        conn.execute(
+            "ALTER TABLE deployment_plans ADD COLUMN coordinator_id TEXT",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|name| name == "lease_expires_at") {
+        conn.execute(
+            "ALTER TABLE deployment_plans ADD COLUMN lease_expires_at INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_deployment_queue_observation_owner_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(deployment_queue_observations)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "active_deployment_id") {
+        conn.execute(
+            "ALTER TABLE deployment_queue_observations ADD COLUMN active_deployment_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|name| name == "pending_deployment_id") {
+        conn.execute(
+            "ALTER TABLE deployment_queue_observations ADD COLUMN pending_deployment_id TEXT",
             [],
         )?;
     }
@@ -3250,5 +3390,39 @@ mod tests {
             [],
         );
         assert!(duplicate.is_err(), "duplicate version number was accepted");
+    }
+
+    #[test]
+    fn queue_observation_owner_columns_upgrade_additively() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute("DROP TABLE deployment_queue_observations", [])
+            .unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE deployment_queue_observations (
+                plan_id             TEXT PRIMARY KEY REFERENCES deployment_plans(id) ON DELETE CASCADE,
+                observed_state      TEXT NOT NULL,
+                active_generation   TEXT NOT NULL,
+                pending_generation  TEXT,
+                outstanding_leases  INTEGER NOT NULL CHECK(outstanding_leases >= 0),
+                message             TEXT,
+                observed_at         INTEGER NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+        create_tables(&conn).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(deployment_queue_observations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.iter().any(|name| name == "active_deployment_id"));
+        assert!(columns.iter().any(|name| name == "pending_deployment_id"));
     }
 }

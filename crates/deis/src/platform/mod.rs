@@ -10,7 +10,7 @@ pub mod telemetry;
 
 use anyhow::{Context, Result, bail};
 use deis_wire::CanonicalId;
-use reqwest::{Method, StatusCode};
+use reqwest::{Method, StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 
 /// How long one control-plane call may take.
@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 /// node that is slow to load a version is not a reason to abandon a deploy
 /// that has already been recorded.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// A CLI mutation remains synchronous from a developer's point of view even
+/// when Control returns a durable `202 Accepted` plan while queues drain.
+const DEPLOYMENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const DEPLOYMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// An application as the catalog records it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -116,6 +120,39 @@ pub struct DeploymentResponse {
     /// Absent when nothing was pushed, which is the case for a plain read.
     #[serde(default)]
     pub delivery: Option<DeliveryReport>,
+    /// Durable operation identity and terminal state on current Control
+    /// versions. Absent when reading an older deployment.
+    #[serde(default)]
+    pub plan: Option<DeploymentPlanSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeploymentPlanSummary {
+    pub id: String,
+    pub routing_generation: CanonicalId,
+    pub state: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// Mutation responses may be accepted before a production pointer exists.
+/// This shape is deliberately private so ordinary current-deployment callers
+/// still receive a statically required pointer.
+#[derive(Debug, Deserialize)]
+struct DeploymentMutationResponse {
+    #[serde(default)]
+    deployment: Option<Deployment>,
+    environment: String,
+    version: Version,
+    #[serde(default)]
+    delivery: Option<DeliveryReport>,
+    #[serde(default)]
+    plan: Option<DeploymentPlanSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeploymentPlanStatusResponse {
+    plan: DeploymentPlanSummary,
 }
 
 #[cfg(test)]
@@ -150,6 +187,10 @@ mod canonical_identity_tests {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeliveryReport {
     pub reason: String,
+    /// Exact wire phase observed by this report. Older controls omitted it
+    /// and therefore read as the legacy single-step apply path.
+    #[serde(default = "legacy_delivery_phase")]
+    pub phase: String,
     pub app_id: String,
     pub environment: String,
     pub version_id: String,
@@ -162,6 +203,10 @@ pub struct DeliveryReport {
     /// Set when nothing was pushed at all, with the reason.
     #[serde(default)]
     pub skipped: Option<String>,
+}
+
+fn legacy_delivery_phase() -> String {
+    "legacy_apply".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -190,12 +235,16 @@ pub struct SecretsResponse {
 pub struct SecretChangeResponse {
     pub secret: SecretMeta,
     pub delivery: DeliveryReport,
+    #[serde(default)]
+    pub plan: Option<DeploymentPlanSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecretDeletedResponse {
     pub deleted: String,
     pub delivery: DeliveryReport,
+    #[serde(default)]
+    pub plan: Option<DeploymentPlanSummary>,
 }
 
 /// What `deis kv`, `deis db` and `deis blob` need to reach deis-store as one
@@ -423,18 +472,33 @@ impl Control {
         builder: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<T> {
+        let (_, _, body) = self.send_with_metadata(builder, what).await?;
+        Ok(body)
+    }
+
+    /// Send a request while retaining status and response headers. Durable
+    /// mutations use this to distinguish a completed `201`/`200` from a
+    /// `202` whose `Location` must be reconciled before the CLI reports
+    /// success.
+    async fn send_with_metadata<T: serde::de::DeserializeOwned>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<(StatusCode, HeaderMap, T)> {
         let response = builder.send().await.map_err(|e| self.transport_error(e))?;
         let status = response.status();
+        let headers = response.headers().clone();
         let body = response.bytes().await.unwrap_or_default();
         if !status.is_success() {
             bail!(self.http_error(status, &body, what));
         }
-        serde_json::from_slice(&body).with_context(|| {
+        let body = serde_json::from_slice(&body).with_context(|| {
             format!(
                 "{what}: the control plane answered {status} with a body this CLI could not read; \
                  it may be a newer or older version than this build"
             )
-        })
+        })?;
+        Ok((status, headers, body))
     }
 
     fn transport_error(&self, e: reqwest::Error) -> anyhow::Error {
@@ -638,15 +702,19 @@ impl Control {
         if !config_values.is_empty() {
             body["config_values"] = serde_json::to_value(config_values)?;
         }
-        self.send(
-            self.request(
-                Method::POST,
-                &format!("/api/apps/{app_id}/environments/{environment}/deployments"),
+        let what = format!("pointing {environment} of app {app_id} at a version");
+        let (status, headers, response) = self
+            .send_with_metadata::<DeploymentMutationResponse>(
+                self.request(
+                    Method::POST,
+                    &format!("/api/apps/{app_id}/environments/{environment}/deployments"),
+                )
+                .json(&body),
+                &what,
             )
-            .json(&body),
-            &format!("pointing {environment} of app {app_id} at a version"),
-        )
-        .await
+            .await?;
+        self.finish_deployment_mutation(app_id, environment, status, &headers, response, &what)
+            .await
     }
 
     /// Move the pointer backwards. `version_number` unset means "the previous
@@ -665,15 +733,181 @@ impl Control {
         if let Some(note) = note {
             body.insert("note".to_string(), serde_json::json!(note));
         }
-        self.send(
-            self.request(
-                Method::POST,
-                &format!("/api/apps/{app_id}/environments/{environment}/rollback"),
+        let what = format!("rolling {environment} of app {app_id} back");
+        let (status, headers, response) = self
+            .send_with_metadata::<DeploymentMutationResponse>(
+                self.request(
+                    Method::POST,
+                    &format!("/api/apps/{app_id}/environments/{environment}/rollback"),
+                )
+                .json(&serde_json::Value::Object(body)),
+                &what,
             )
-            .json(&serde_json::Value::Object(body)),
-            &format!("rolling {environment} of app {app_id} back"),
-        )
-        .await
+            .await?;
+        self.finish_deployment_mutation(app_id, environment, status, &headers, response, &what)
+            .await
+    }
+
+    async fn finish_deployment_mutation(
+        &self,
+        app_id: &str,
+        environment: &str,
+        status: StatusCode,
+        headers: &HeaderMap,
+        mut response: DeploymentMutationResponse,
+        what: &str,
+    ) -> Result<DeploymentResponse> {
+        let plan = self
+            .await_mutation_plan(
+                app_id,
+                environment,
+                status,
+                headers,
+                response.plan.take(),
+                what,
+            )
+            .await?;
+        if let Some(plan) = &plan {
+            response.plan = Some(plan.clone());
+        }
+
+        // A waited plan is complete only when its exact pointer is visible
+        // through the ordinary scoped read path. This also prevents a stale
+        // or malformed 202 body from being printed as the current deployment.
+        if plan.as_ref().is_some_and(|plan| plan.state == "active")
+            && (status == StatusCode::ACCEPTED || response.deployment.is_none())
+        {
+            let current = match self.current_deployment(app_id, environment).await? {
+                EnvironmentView::Running(current) => *current,
+                EnvironmentView::NeverDeployed => bail!(
+                    "deployment plan {} is active but {environment} of app {app_id} has no production pointer",
+                    plan.as_ref().expect("active plan was checked").id
+                ),
+                EnvironmentView::NotPermitted => bail!(
+                    "deployment plan {} completed, but this credential cannot verify the production pointer of {environment} of app {app_id}",
+                    plan.as_ref().expect("active plan was checked").id
+                ),
+            };
+            let plan_id = &plan.as_ref().expect("active plan was checked").id;
+            if current.deployment.id != *plan_id {
+                bail!(
+                    "deployment plan {plan_id} became active, but {environment} of app {app_id} points at deployment {}; refusing to report the wrong version as this operation's result",
+                    current.deployment.id
+                );
+            }
+            response.deployment = Some(current.deployment);
+        }
+
+        let deployment = response.deployment.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what}: the control plane returned no production deployment after the operation completed"
+            )
+        })?;
+        if let Some(delivery) = &mut response.delivery
+            && plan.as_ref().is_some_and(|plan| plan.state == "active")
+        {
+            delivery.phase = "activate".to_string();
+        }
+        Ok(DeploymentResponse {
+            deployment,
+            environment: response.environment,
+            version: response.version,
+            delivery: response.delivery,
+            plan: response.plan,
+        })
+    }
+
+    /// Wait for an accepted plan through the same application/environment
+    /// scope as the mutation. `Location` is validated rather than followed as
+    /// an arbitrary URL, so a compromised or incompatible Control response
+    /// cannot turn the CLI into a credential-bearing redirect client.
+    async fn await_mutation_plan(
+        &self,
+        app_id: &str,
+        environment: &str,
+        status: StatusCode,
+        headers: &HeaderMap,
+        plan: Option<DeploymentPlanSummary>,
+        what: &str,
+    ) -> Result<Option<DeploymentPlanSummary>> {
+        let Some(plan) = plan else {
+            if status == StatusCode::ACCEPTED {
+                bail!("{what}: the control plane accepted the operation without a durable plan");
+            }
+            return Ok(None);
+        };
+        if plan.state == "active" && status != StatusCode::ACCEPTED {
+            return Ok(Some(plan));
+        }
+
+        let path = format!(
+            "/api/apps/{app_id}/environments/{environment}/deployment-plans/{}",
+            plan.id
+        );
+        let location = headers
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| anyhow::anyhow!("{what}: accepted plan {} has no Location", plan.id))?
+            .to_str()
+            .context("reading deployment plan Location")?;
+        if location != path {
+            bail!(
+                "{what}: deployment plan {} returned Location {location:?}, expected the scoped path {path:?}",
+                plan.id
+            );
+        }
+        self.wait_for_deployment_plan(&path, &plan.id, what)
+            .await
+            .map(Some)
+    }
+
+    async fn wait_for_deployment_plan(
+        &self,
+        path: &str,
+        expected_plan_id: &str,
+        what: &str,
+    ) -> Result<DeploymentPlanSummary> {
+        let deadline = tokio::time::Instant::now() + DEPLOYMENT_WAIT_TIMEOUT;
+        loop {
+            let response: DeploymentPlanStatusResponse = self
+                .send(
+                    self.request(Method::GET, path),
+                    &format!("reconciling deployment plan {expected_plan_id}"),
+                )
+                .await?;
+            if response.plan.id != expected_plan_id {
+                bail!(
+                    "{what}: plan status returned {}, expected {expected_plan_id}",
+                    response.plan.id
+                );
+            }
+            match response.plan.state.as_str() {
+                "active" => return Ok(response.plan),
+                "failed" | "aborted" => {
+                    let detail = response
+                        .plan
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("no failure detail was recorded");
+                    bail!(
+                        "{what}: deployment plan {expected_plan_id} ended as {}: {detail}",
+                        response.plan.state
+                    );
+                }
+                "preparing" | "prepared" | "aborting" | "activating" | "reconciling"
+                | "degraded" => {}
+                state => bail!(
+                    "{what}: deployment plan {expected_plan_id} returned unknown state {state:?}"
+                ),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "{what}: deployment plan {expected_plan_id} is still {} after {} seconds; its durable status remains at {path}",
+                    response.plan.state,
+                    DEPLOYMENT_WAIT_TIMEOUT.as_secs()
+                );
+            }
+            tokio::time::sleep(DEPLOYMENT_POLL_INTERVAL).await;
+        }
     }
 
     /// The version an environment currently points at, or why this credential
@@ -724,15 +958,35 @@ impl Control {
         name: &str,
         value: &str,
     ) -> Result<SecretChangeResponse> {
-        self.send(
-            self.request(
-                Method::PUT,
-                &format!("/api/apps/{app_id}/environments/{environment}/secrets/{name}"),
+        let what = format!("storing secret {name} of {environment}");
+        let (status, headers, mut response) = self
+            .send_with_metadata::<SecretChangeResponse>(
+                self.request(
+                    Method::PUT,
+                    &format!("/api/apps/{app_id}/environments/{environment}/secrets/{name}"),
+                )
+                .json(&serde_json::json!({ "value": value })),
+                &what,
             )
-            .json(&serde_json::json!({ "value": value })),
-            &format!("storing secret {name} of {environment}"),
-        )
-        .await
+            .await?;
+        response.plan = self
+            .await_mutation_plan(
+                app_id,
+                environment,
+                status,
+                &headers,
+                response.plan.take(),
+                &what,
+            )
+            .await?;
+        if response
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.state == "active")
+        {
+            response.delivery.phase = "activate".to_string();
+        }
+        Ok(response)
     }
 
     pub async fn list_secrets(&self, app_id: &str, environment: &str) -> Result<Vec<SecretMeta>> {
@@ -754,14 +1008,34 @@ impl Control {
         environment: &str,
         name: &str,
     ) -> Result<SecretDeletedResponse> {
-        self.send(
-            self.request(
-                Method::DELETE,
-                &format!("/api/apps/{app_id}/environments/{environment}/secrets/{name}"),
-            ),
-            &format!("deleting secret {name} of {environment}"),
-        )
-        .await
+        let what = format!("deleting secret {name} of {environment}");
+        let (status, headers, mut response) = self
+            .send_with_metadata::<SecretDeletedResponse>(
+                self.request(
+                    Method::DELETE,
+                    &format!("/api/apps/{app_id}/environments/{environment}/secrets/{name}"),
+                ),
+                &what,
+            )
+            .await?;
+        response.plan = self
+            .await_mutation_plan(
+                app_id,
+                environment,
+                status,
+                &headers,
+                response.plan.take(),
+                &what,
+            )
+            .await?;
+        if response
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.state == "active")
+        {
+            response.delivery.phase = "activate".to_string();
+        }
+        Ok(response)
     }
 
     // ---- storage --------------------------------------------------------
@@ -957,5 +1231,163 @@ impl Control {
             Ok(status) => Ok(Some(status.apps)),
             Err(_) => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod deployment_plan_tests {
+    use super::*;
+    use axum::{Json, Router, http::header::LOCATION, response::IntoResponse, routing::get};
+
+    const PLAN_ID: &str = "018f2518-7e38-7f80-8000-000000000001";
+    const GENERATION: &str = "018f2518-7e38-7f80-8000-000000000002";
+    const PLAN_PATH: &str = "/api/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001";
+
+    fn version() -> serde_json::Value {
+        serde_json::json!({
+            "id": "version-1",
+            "app_id": "demo",
+            "number": 1,
+            "bundle_sha": "sha256",
+            "created_at": 1
+        })
+    }
+
+    fn delivery(phase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "reason": "deployment",
+            "phase": phase,
+            "app_id": "demo",
+            "environment": "production",
+            "version_id": "version-1",
+            "delivered": ["runtime-1"],
+            "failed": []
+        })
+    }
+
+    fn plan(state: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": PLAN_ID,
+            "routing_generation": GENERATION,
+            "state": state
+        })
+    }
+
+    fn deployment() -> serde_json::Value {
+        serde_json::json!({
+            "id": PLAN_ID,
+            "canonical_id": GENERATION,
+            "app_id": "demo",
+            "env_id": "environment-1",
+            "version_id": "version-1",
+            "created_at": 2
+        })
+    }
+
+    async fn accepted_deploy() -> impl IntoResponse {
+        (
+            StatusCode::ACCEPTED,
+            [(LOCATION, PLAN_PATH)],
+            Json(serde_json::json!({
+                "environment": "production",
+                "version": version(),
+                "delivery": delivery("prepare"),
+                "plan": plan("prepared")
+            })),
+        )
+    }
+
+    async fn accepted_without_location() -> impl IntoResponse {
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "environment": "production",
+                "version": version(),
+                "delivery": delivery("prepare"),
+                "plan": plan("prepared")
+            })),
+        )
+    }
+
+    async fn active_plan() -> impl IntoResponse {
+        Json(serde_json::json!({"plan": plan("active")}))
+    }
+
+    async fn current_deployment() -> impl IntoResponse {
+        Json(serde_json::json!({
+            "deployment": deployment(),
+            "environment": "production",
+            "version": version(),
+            "plan": plan("active")
+        }))
+    }
+
+    async fn control_for(router: Router) -> (Control, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        (
+            Control::new(&format!("http://{address}"), None).unwrap(),
+            shutdown,
+        )
+    }
+
+    #[tokio::test]
+    async fn accepted_deploy_waits_for_the_exact_plan_and_pointer() {
+        let router = Router::new()
+            .route(
+                "/api/apps/demo/environments/production/deployments",
+                axum::routing::post(accepted_deploy),
+            )
+            .route(PLAN_PATH, get(active_plan))
+            .route(
+                "/api/apps/demo/environments/production/deployment",
+                get(current_deployment),
+            );
+        let (control, shutdown) = control_for(router).await;
+        let response = control
+            .deploy(
+                "demo",
+                "production",
+                "version-1",
+                None,
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.deployment.id, PLAN_ID);
+        assert_eq!(response.plan.unwrap().state, "active");
+        assert_eq!(response.delivery.unwrap().phase, "activate");
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn accepted_deploy_without_location_is_not_reported_as_success() {
+        let router = Router::new().route(
+            "/api/apps/demo/environments/production/deployments",
+            axum::routing::post(accepted_without_location),
+        );
+        let (control, shutdown) = control_for(router).await;
+        let error = control
+            .deploy(
+                "demo",
+                "production",
+                "version-1",
+                None,
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no Location"), "{error}");
+        let _ = shutdown.send(());
     }
 }

@@ -892,7 +892,7 @@ impl Drop for PayloadStaging {
 mod tests {
     use super::*;
 
-    const STANDARD: &str = "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13";
+    const STANDARD: &str = "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654";
 
     #[test]
     fn record_binds_parent_and_exact_payload() {

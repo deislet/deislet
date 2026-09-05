@@ -656,7 +656,7 @@ mod tests {
         }
     }
 
-    const STANDARD: &str = "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13";
+    const STANDARD: &str = "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654";
 
     #[test]
     fn legacy_environment_values_become_declarations_without_entering_the_document() {

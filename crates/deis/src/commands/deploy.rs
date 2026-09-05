@@ -161,6 +161,7 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
             },
             "deployment": deployment.deployment,
             "delivery": deployment.delivery,
+            "plan": deployment.plan,
         }))?;
     } else {
         print_result(&deployment);
@@ -316,6 +317,7 @@ mod tests {
     ) -> DeliveryReport {
         DeliveryReport {
             reason: "deployment".to_string(),
+            phase: "activate".to_string(),
             app_id: "demo".to_string(),
             environment: "production".to_string(),
             version_id: "v".to_string(),
@@ -387,7 +389,7 @@ mod tests {
         let config = deis_build::load_project_config(&project.path().to_string_lossy()).unwrap();
         let declarations = deis_build::resolve_environment_declarations(
             &config,
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
         )
         .unwrap();
         let manifest = deis_bundle::Manifest::parse(
@@ -411,7 +413,7 @@ mod tests {
 
     #[test]
     fn no_build_resolves_the_verified_content_addressed_bundle() {
-        const STANDARD: &str = "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13";
+        const STANDARD: &str = "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654";
 
         let project = tempfile::tempdir().expect("project");
         std::fs::write(

@@ -8,19 +8,25 @@ use axum::{
     Json,
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
 };
+use deis_wire::CanonicalId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 use tracing::{info, warn};
 
 use super::CatalogState;
 use super::versions::VersionView;
 use crate::api::error::{ApiError, ApiResult};
 use crate::catalog::{
-    Deployment, DeploymentDrainObservation, DeploymentEvent, DeploymentGenerationDrain,
-    DeploymentPlan, DeploymentPlanSpec, DeploymentProxyObservation, DeploymentTargetObservation,
-    Environment, Version, now_secs,
+    CatalogError, CatalogStore, Deployment, DeploymentDrainObservation, DeploymentEvent,
+    DeploymentGenerationDrain, DeploymentPlan, DeploymentPlanSpec, DeploymentProxyObservation,
+    DeploymentQueueObservation, DeploymentTargetObservation, Environment, Version, now_secs,
 };
 use crate::delivery::{DeliveryReason, DeliveryReport, DeploymentPayload};
 use crate::message::NodeRole;
@@ -28,6 +34,118 @@ use crate::message::NodeRole;
 /// Default and maximum number of history rows returned at once.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const MAX_HISTORY_LIMIT: usize = 500;
+const SECRET_REVISION_GC_INTERVAL_SECONDS: i64 = 300;
+const DEPLOYMENT_COORDINATOR_LEASE_SECONDS: u64 = 30;
+const DEPLOYMENT_COORDINATOR_HEARTBEAT_SECONDS: u64 = 10;
+
+/// One coordination attempt owns one distinct durable lease identity. Keeping
+/// this separate from a process identity also excludes the request handler and
+/// background reconciler inside the same Control instance.
+struct DeploymentPlanLease {
+    store: Arc<CatalogStore>,
+    plan_id: String,
+    coordinator_id: CanonicalId,
+    lost: Arc<AtomicBool>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    heartbeat: tokio::task::JoinHandle<()>,
+}
+
+impl DeploymentPlanLease {
+    fn start(store: Arc<CatalogStore>, plan_id: String, coordinator_id: CanonicalId) -> Self {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let heartbeat_store = Arc::clone(&store);
+        let heartbeat_plan = plan_id.clone();
+        let lost = Arc::new(AtomicBool::new(false));
+        let heartbeat_lost = Arc::clone(&lost);
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = tokio::time::sleep(Duration::from_secs(
+                        DEPLOYMENT_COORDINATOR_HEARTBEAT_SECONDS,
+                    )) => {
+                        if let Err(error) = heartbeat_store
+                            .renew_deployment_plan_lease(
+                                &heartbeat_plan,
+                                coordinator_id,
+                                DEPLOYMENT_COORDINATOR_LEASE_SECONDS,
+                            )
+                            .await
+                        {
+                            heartbeat_lost.store(true, Ordering::Release);
+                            warn!(
+                                deployment_plan = %heartbeat_plan,
+                                %coordinator_id,
+                                %error,
+                                "Deployment coordinator lost its durable lease; no next phase action may be sent"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            store,
+            plan_id,
+            coordinator_id,
+            lost,
+            stop: Some(stop),
+            heartbeat,
+        }
+    }
+
+    fn coordinator_id(&self) -> CanonicalId {
+        self.coordinator_id
+    }
+
+    /// Fence every external action with a synchronous renewal. The heartbeat
+    /// keeps long RPCs alive; this check prevents an attempt that already lost
+    /// ownership from sending the next idempotent phase command.
+    async fn ensure(&self) -> ApiResult<()> {
+        if self.lost.load(Ordering::Acquire) {
+            return Err(ApiError::Conflict(format!(
+                "deployment plan {} coordinator lease was lost",
+                self.plan_id
+            )));
+        }
+        if let Err(error) = self
+            .store
+            .renew_deployment_plan_lease(
+                &self.plan_id,
+                self.coordinator_id,
+                DEPLOYMENT_COORDINATOR_LEASE_SECONDS,
+            )
+            .await
+        {
+            self.lost.store(true, Ordering::Release);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let _ = self.heartbeat.await;
+        if let Err(error) = self
+            .store
+            .release_deployment_plan_lease(&self.plan_id, self.coordinator_id)
+            .await
+        {
+            // A newer owner is never cleared: release is fenced by the exact
+            // owner identity. The message is still useful if shutdown or an
+            // expired pass handed work to another reconciler meanwhile.
+            warn!(
+                deployment_plan = %self.plan_id,
+                coordinator_id = %self.coordinator_id,
+                %error,
+                "Deployment coordinator lease release did not apply"
+            );
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DeployRequest {
@@ -64,7 +182,10 @@ pub struct HistoryQuery {
 
 #[derive(Debug, Serialize)]
 pub struct DeploymentResponse {
-    pub deployment: Deployment,
+    /// Absent while an accepted plan is still draining its pre-commit queue
+    /// barrier. No production pointer exists for that plan yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<Deployment>,
     pub environment: String,
     pub version: VersionView,
     /// Which nodes took this version. Absent when the response only reads
@@ -80,6 +201,8 @@ pub struct DeploymentPlanResponse {
     pub plan: DeploymentPlan,
     pub targets: Vec<DeploymentTargetObservation>,
     pub proxies: Vec<DeploymentProxyObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<DeploymentQueueObservation>,
     pub events: Vec<DeploymentEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<DeploymentGenerationDrain>,
@@ -94,17 +217,17 @@ pub struct DeploymentHistoryResponse {
 
 /// POST /api/apps/:app_id/environments/:env/deployments
 ///
-/// Three steps, in this order: build what the nodes will be sent, record
-/// the pointer, push it. Building first is the point of the ordering - an
-/// environment whose secrets cannot be decrypted is refused outright,
-/// rather than recorded as deployed and then delivered with half its
-/// environment missing.
+/// Build the exact payload, persist a plan and snapshot, prepare every frozen
+/// runtime and trigger, then commit the pointer before activating them. An
+/// environment whose secrets cannot be decrypted is refused before the plan
+/// or pointer exists; a plan still draining its pre-commit barrier is returned
+/// as `202 Accepted` and remains queryable through `Location`.
 pub async fn deploy(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
     headers: HeaderMap,
     Json(request): Json<DeployRequest>,
-) -> ApiResult<(StatusCode, Json<DeploymentResponse>)> {
+) -> ApiResult<(StatusCode, HeaderMap, Json<DeploymentResponse>)> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
     let version = resolve_version(
         &state,
@@ -146,6 +269,7 @@ pub async fn deploy(
 
     Ok((
         status,
+        deployment_plan_location(&app_id, &env_name, &plan.id),
         Json(response(
             &env,
             deployment,
@@ -158,14 +282,16 @@ pub async fn deploy(
 
 /// POST /api/apps/:app_id/environments/:env/rollback
 ///
-/// Inserts a pointer row aimed at an older version. Nothing is mutated and
-/// nothing is deleted, so the rollback itself is just as reversible.
+/// Coordinate a new immutable deployment aimed at an older version and its
+/// historical binding snapshot. The current pointer is changed only after
+/// the same strict prepare barrier used by a forward deployment, so rollback
+/// remains reversible and never silently rebinds secrets by name.
 pub async fn rollback(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> ApiResult<(StatusCode, Json<DeploymentResponse>)> {
+) -> ApiResult<(StatusCode, HeaderMap, Json<DeploymentResponse>)> {
     let request = parse_rollback_body(&body).map_err(|detail| {
         warn!(
             app_id = %app_id,
@@ -258,6 +384,7 @@ pub async fn rollback(
         } else {
             StatusCode::ACCEPTED
         },
+        deployment_plan_location(&app_id, &env_name, &plan.id),
         Json(response(
             &env,
             deployment,
@@ -266,6 +393,22 @@ pub async fn rollback(
             Some(plan),
         )),
     ))
+}
+
+pub(super) fn deployment_plan_location(
+    app_id: &str,
+    environment: &str,
+    plan_id: &str,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let location =
+        format!("/api/apps/{app_id}/environments/{environment}/deployment-plans/{plan_id}");
+    headers.insert(
+        LOCATION,
+        HeaderValue::from_str(&location)
+            .expect("a canonical deployment plan id is a valid URI path"),
+    );
+    headers
 }
 
 /// GET /api/apps/:app_id/environments/:env/deployment
@@ -290,7 +433,7 @@ pub async fn current_deployment(
         .get_version(&app_id, &deployment.version_id)
         .await?;
     let plan = state.store.deployment_plan(&deployment.id).await.ok();
-    Ok(Json(response(&env, deployment, &version, None, plan)))
+    Ok(Json(response(&env, Some(deployment), &version, None, plan)))
 }
 
 /// GET /api/deployment-plans/:id
@@ -325,6 +468,7 @@ async fn deployment_plan_response(
     let plan = state.store.deployment_plan(id).await?;
     let targets = state.store.deployment_target_observations(id).await?;
     let proxies = state.store.deployment_proxy_observations(id).await?;
+    let queue = state.store.deployment_queue_observation(id).await?;
     let events = state.store.deployment_events(id).await?;
     let drain = state.store.deployment_generation_drain(id).await?;
     let drain_observations = state.store.deployment_drain_observations(id).await?;
@@ -332,6 +476,7 @@ async fn deployment_plan_response(
         plan,
         targets,
         proxies,
+        queue,
         events,
         drain,
         drain_observations,
@@ -363,7 +508,7 @@ async fn coordinate_strict_deployment(
     payload: &mut DeploymentPayload,
     note: Option<String>,
     reason: DeliveryReason,
-) -> ApiResult<(Deployment, DeploymentPlan, DeliveryReport)> {
+) -> ApiResult<(Option<Deployment>, DeploymentPlan, DeliveryReport)> {
     coordinate_plan(state, env, version, payload, note, reason, None).await
 }
 
@@ -375,7 +520,7 @@ pub(super) async fn coordinate_secret_change(
     name: &str,
     replacement_revision: Option<&str>,
     expected_revision: Option<&str>,
-) -> ApiResult<(Deployment, DeploymentPlan, DeliveryReport)> {
+) -> ApiResult<(Option<Deployment>, DeploymentPlan, DeliveryReport)> {
     coordinate_plan(
         state,
         env,
@@ -400,13 +545,8 @@ async fn coordinate_plan(
     note: Option<String>,
     reason: DeliveryReason,
     secret_change: Option<serde_json::Value>,
-) -> ApiResult<(Deployment, DeploymentPlan, DeliveryReport)> {
+) -> ApiResult<(Option<Deployment>, DeploymentPlan, DeliveryReport)> {
     let expected_secret_heads = payload.expected_secret_heads().unwrap_or_default();
-    let snapshot_id = payload
-        .environment_snapshot()
-        .map(|snapshot| snapshot.identity())
-        .transpose()
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
     let target_ids = state.deliverer.serving_target_ids();
     let mut proxy_ids: Vec<String> = state
         .sessions
@@ -423,6 +563,7 @@ async fn coordinate_plan(
         DeliveryReason::SecretChange => "secret_change",
     };
     let queue_fence = state.deliverer.requires_consumer_fence(version)?;
+    let coordinator_id = CanonicalId::new_v7();
 
     let plan = state
         .store
@@ -430,7 +571,7 @@ async fn coordinate_plan(
             env,
             version,
             DeploymentPlanSpec {
-                snapshot_id,
+                snapshot: payload.environment_snapshot().cloned(),
                 expected_secret_heads,
                 compare_secret_heads: reason != DeliveryReason::Rollback && secret_change.is_none(),
                 target_ids,
@@ -440,116 +581,150 @@ async fn coordinate_plan(
                 secret_change,
                 note,
             },
+            coordinator_id,
+            DEPLOYMENT_COORDINATOR_LEASE_SECONDS,
         )
         .await?;
-    payload.set_instruction(
-        &plan.id,
-        plan.routing_generation.to_string(),
-        crate::runtime_client::proto::DeploymentAction::Prepare,
-    );
-    let prepared = state
-        .deliverer
-        .push_to(payload, reason, &plan.target_ids)
-        .await;
-    record_target_report(state, &plan, &prepared, "prepared").await?;
-    if !prepared.fully_delivered() {
+    let plan_id = plan.id.clone();
+    let lease = DeploymentPlanLease::start(state.store.clone(), plan_id.clone(), coordinator_id);
+    let result = async {
         payload.set_instruction(
             &plan.id,
             plan.routing_generation.to_string(),
-            crate::runtime_client::proto::DeploymentAction::Abort,
+            crate::runtime_client::proto::DeploymentAction::Prepare,
         );
-        if !prepared.delivered.is_empty() {
-            let abort = state
-                .deliverer
-                .push_to(payload, reason, &prepared.delivered)
-                .await;
-            record_target_report(state, &plan, &abort, "aborted").await?;
+        lease.ensure().await?;
+        let prepared = state
+            .deliverer
+            .push_to(payload, reason, &plan.target_ids)
+            .await;
+        record_target_report(state, &plan, &prepared, "prepared", &lease).await?;
+        if !prepared.fully_delivered() {
+            let detail = delivery_failure_detail(&prepared);
+            let aborting = state
+                .store
+                .transition_deployment_plan(
+                    &plan.id,
+                    "preparing",
+                    "aborting",
+                    Some(&detail),
+                    lease.coordinator_id(),
+                )
+                .await?;
+            let _ = abort_prepared_plan(state, env, &aborting, payload, reason, &lease).await?;
+            return Err(ApiError::ServiceUnavailable(format!(
+                "deployment plan {} failed during prepare; the production pointer was not changed: {}",
+                plan.id, detail
+            )));
         }
-        let detail = delivery_failure_detail(&prepared);
-        state
-            .store
-            .transition_deployment_plan(&plan.id, "preparing", "failed", Some(&detail))
-            .await?;
-        return Err(ApiError::ServiceUnavailable(format!(
-            "deployment plan {} failed during prepare; the production pointer was not changed: {}",
-            plan.id, detail
-        )));
-    }
 
-    let plan = state
-        .store
-        .transition_deployment_plan(
-            &plan.id,
-            "preparing",
-            "prepared",
-            Some("every frozen runtime target acknowledged the exact candidate generation"),
-        )
-        .await?;
-    let deployment = match state
-        .store
-        .commit_deployment_plan(&plan, env, payload.environment_snapshot())
-        .await
-    {
-        Ok(deployment) => deployment,
-        Err(error) => {
-            payload.set_instruction(
+        let plan = state
+            .store
+            .transition_deployment_plan(
                 &plan.id,
-                plan.routing_generation.to_string(),
-                crate::runtime_client::proto::DeploymentAction::Abort,
-            );
-            let abort = state
-                .deliverer
-                .push_to(payload, reason, &plan.target_ids)
-                .await;
-            record_target_report(state, &plan, &abort, "aborted").await?;
-            let detail = error.to_string();
+                "preparing",
+                "prepared",
+                Some("every frozen runtime target acknowledged the exact candidate generation"),
+                lease.coordinator_id(),
+            )
+            .await?;
+        if !prepare_queue_fence(state, env, &plan, &lease).await? {
+            return Ok((None, state.store.deployment_plan(&plan.id).await?, prepared));
+        }
+        lease.ensure().await?;
+        let deployment = match state
+            .store
+            .commit_deployment_plan(
+                &plan,
+                env,
+                payload.environment_snapshot(),
+                lease.coordinator_id(),
+            )
+            .await
+        {
+            Ok(deployment) => deployment,
+            Err(error) => {
+                if matches!(
+                    &error,
+                    CatalogError::Conflict(_)
+                        | CatalogError::RevisionConflict(_)
+                        | CatalogError::Invalid(_)
+                ) {
+                    let detail = error.to_string();
+                    let aborting = state
+                        .store
+                        .transition_deployment_plan(
+                            &plan.id,
+                            "prepared",
+                            "aborting",
+                            Some(&detail),
+                            lease.coordinator_id(),
+                        )
+                        .await?;
+                    let _ =
+                        abort_prepared_plan(state, env, &aborting, payload, reason, &lease).await?;
+                }
+                return Err(error.into());
+            }
+        };
+
+        // A prepared generation already serves exact HTTP requests. Keep node
+        // current selectors and asynchronous triggers on the baseline until every
+        // frozen proxy proves the new routing generation is locally published.
+        if !plan.proxy_ids.is_empty() {
+            return Ok((
+                Some(deployment),
+                state.store.deployment_plan(&plan.id).await?,
+                prepared,
+            ));
+        }
+
+        let activating_plan = state.store.deployment_plan(&plan.id).await?;
+        if !activate_queue_fence(state, env, &activating_plan, &lease).await? {
+            return Ok((
+                Some(deployment),
+                state.store.deployment_plan(&plan.id).await?,
+                prepared,
+            ));
+        }
+
+        payload.set_instruction(
+            &plan.id,
+            plan.routing_generation.to_string(),
+            crate::runtime_client::proto::DeploymentAction::Activate,
+        );
+        lease.ensure().await?;
+        let activated = state
+            .deliverer
+            .push_to(payload, reason, &plan.target_ids)
+            .await;
+        record_target_report(state, &plan, &activated, "active", &lease).await?;
+        if !activated.fully_delivered() {
+            let detail = delivery_failure_detail(&activated);
             state
                 .store
-                .transition_deployment_plan(&plan.id, "prepared", "failed", Some(&detail))
+                .transition_deployment_plan(
+                    &plan.id,
+                    "activating",
+                    "reconciling",
+                    Some(&detail),
+                    lease.coordinator_id(),
+                )
                 .await?;
-            return Err(error.into());
         }
-    };
-
-    // A prepared generation already serves exact HTTP requests. Keep node
-    // current selectors and asynchronous triggers on the baseline until every
-    // frozen proxy proves the new routing generation is locally published.
-    if !plan.proxy_ids.is_empty() {
-        return Ok((
+        let plan = finalize_if_observed(state, &plan.id, &lease).await?;
+        Ok((Some(deployment), plan, activated))
+    }
+    .await;
+    lease.finish().await;
+    match result {
+        Ok((deployment, _, delivery)) => Ok((
             deployment,
-            state.store.deployment_plan(&plan.id).await?,
-            prepared,
-        ));
+            state.store.deployment_plan(&plan_id).await?,
+            delivery,
+        )),
+        Err(error) => Err(error),
     }
-
-    let activating_plan = state.store.deployment_plan(&plan.id).await?;
-    if !advance_queue_fence(state, env, &activating_plan).await? {
-        return Ok((
-            deployment,
-            state.store.deployment_plan(&plan.id).await?,
-            prepared,
-        ));
-    }
-
-    payload.set_instruction(
-        &plan.id,
-        plan.routing_generation.to_string(),
-        crate::runtime_client::proto::DeploymentAction::Activate,
-    );
-    let activated = state
-        .deliverer
-        .push_to(payload, reason, &plan.target_ids)
-        .await;
-    record_target_report(state, &plan, &activated, "active").await?;
-    if !activated.fully_delivered() {
-        let detail = delivery_failure_detail(&activated);
-        state
-            .store
-            .transition_deployment_plan(&plan.id, "activating", "reconciling", Some(&detail))
-            .await?;
-    }
-    let plan = finalize_if_observed(state, &plan.id).await?;
-    Ok((deployment, plan, activated))
 }
 
 async fn record_target_report(
@@ -557,33 +732,40 @@ async fn record_target_report(
     plan: &DeploymentPlan,
     report: &DeliveryReport,
     delivered_state: &str,
+    lease: &DeploymentPlanLease,
 ) -> ApiResult<()> {
     for node_id in &report.delivered {
         state
             .store
-            .record_deployment_target_observation(DeploymentTargetObservation {
-                plan_id: plan.id.clone(),
-                node_id: node_id.clone(),
-                observed_state: delivered_state.to_string(),
-                version_id: Some(plan.version_id.clone()),
-                routing_generation: Some(plan.routing_generation.to_string()),
-                message: None,
-                observed_at: now_secs(),
-            })
+            .record_deployment_target_observation(
+                DeploymentTargetObservation {
+                    plan_id: plan.id.clone(),
+                    node_id: node_id.clone(),
+                    observed_state: delivered_state.to_string(),
+                    version_id: Some(plan.version_id.clone()),
+                    routing_generation: Some(plan.routing_generation.to_string()),
+                    message: None,
+                    observed_at: now_secs(),
+                },
+                lease.coordinator_id(),
+            )
             .await?;
     }
     for failure in &report.failed {
         state
             .store
-            .record_deployment_target_observation(DeploymentTargetObservation {
-                plan_id: plan.id.clone(),
-                node_id: failure.node.clone(),
-                observed_state: "unconfirmed".to_string(),
-                version_id: Some(plan.version_id.clone()),
-                routing_generation: Some(plan.routing_generation.to_string()),
-                message: Some(failure.error.clone()),
-                observed_at: now_secs(),
-            })
+            .record_deployment_target_observation(
+                DeploymentTargetObservation {
+                    plan_id: plan.id.clone(),
+                    node_id: failure.node.clone(),
+                    observed_state: "unconfirmed".to_string(),
+                    version_id: Some(plan.version_id.clone()),
+                    routing_generation: Some(plan.routing_generation.to_string()),
+                    message: Some(failure.error.clone()),
+                    observed_at: now_secs(),
+                },
+                lease.coordinator_id(),
+            )
             .await?;
     }
     Ok(())
@@ -604,9 +786,10 @@ fn delivery_failure_detail(report: &DeliveryReport) -> String {
 /// Advance `active` only from durable observations, never merely because a
 /// pointer row exists. Called after runtime activation and after each proxy
 /// reports a locally published routing table.
-pub(super) async fn finalize_if_observed(
+async fn finalize_if_observed(
     state: &CatalogState,
     plan_id: &str,
+    lease: &DeploymentPlanLease,
 ) -> ApiResult<DeploymentPlan> {
     let plan = state.store.deployment_plan(plan_id).await?;
     if plan.state == "active" {
@@ -636,7 +819,22 @@ pub(super) async fn finalize_if_observed(
                 && observation.routing_generation == generation
         })
     });
-    if all_targets_active && all_proxies_applied {
+    let queue_active = if plan_requires_queue_fence(&plan)? {
+        state
+            .store
+            .deployment_queue_observation(plan_id)
+            .await?
+            .is_some_and(|observation| {
+                observation.observed_state == "active"
+                    && observation.active_generation == generation
+                    && observation.active_deployment_id == plan.id
+                    && observation.pending_generation.is_none()
+                    && observation.pending_deployment_id.is_none()
+            })
+    } else {
+        true
+    };
+    if all_targets_active && all_proxies_applied && queue_active {
         return Ok(state
             .store
             .transition_deployment_plan(
@@ -644,6 +842,7 @@ pub(super) async fn finalize_if_observed(
                 &plan.state,
                 "active",
                 Some("all frozen runtime and proxy targets report the exact production generation"),
+                lease.coordinator_id(),
             )
             .await?);
     }
@@ -657,6 +856,7 @@ pub(crate) fn resume_on_start(state: CatalogState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut next_secret_revision_gc = 0;
         loop {
             interval.tick().await;
             let plans = match state.store.nonterminal_deployment_plans().await {
@@ -674,6 +874,29 @@ pub(crate) fn resume_on_start(state: CatalogState) {
                         error = ?error,
                         "Deployment reconciliation pass did not converge; the durable plan remains visible and will be retried"
                     );
+                }
+            }
+            let cycle_now = now_secs();
+            if cycle_now >= next_secret_revision_gc {
+                match state
+                    .store
+                    .reap_unreferenced_secret_revisions(cycle_now)
+                    .await
+                {
+                    Ok(removed) => {
+                        if !removed.is_empty() {
+                            info!(
+                                revisions = removed.len(),
+                                "Destroyed expired, unreferenced staged secret ciphertext and recorded immutable evidence"
+                            );
+                        }
+                        next_secret_revision_gc =
+                            cycle_now.saturating_add(SECRET_REVISION_GC_INTERVAL_SECONDS);
+                    }
+                    Err(error) => warn!(
+                        error = %error,
+                        "Could not reconcile staged-secret retention; ciphertext was retained and the next pass will retry"
+                    ),
                 }
             }
             let drains = match state
@@ -705,10 +928,32 @@ async fn reconcile_generation_drain(
     state: &CatalogState,
     drain: DeploymentGenerationDrain,
 ) -> ApiResult<()> {
-    let plan = state.store.deployment_plan(&drain.plan_id).await?;
-    if plan.state != "active" {
-        return Ok(());
-    }
+    let coordinator_id = CanonicalId::new_v7();
+    let plan = match state
+        .store
+        .claim_deployment_generation_drain(
+            &drain.plan_id,
+            coordinator_id,
+            DEPLOYMENT_COORDINATOR_LEASE_SECONDS,
+        )
+        .await
+    {
+        Ok(plan) => plan,
+        Err(CatalogError::Conflict(_)) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let lease = DeploymentPlanLease::start(state.store.clone(), plan.id.clone(), coordinator_id);
+    let result = reconcile_claimed_generation_drain(state, drain, plan, &lease).await;
+    lease.finish().await;
+    result
+}
+
+async fn reconcile_claimed_generation_drain(
+    state: &CatalogState,
+    drain: DeploymentGenerationDrain,
+    plan: DeploymentPlan,
+    lease: &DeploymentPlanLease,
+) -> ApiResult<()> {
     let env = state.store.get_environment_by_id(&plan.env_id).await?;
     let version = state
         .store
@@ -731,8 +976,9 @@ async fn reconcile_generation_drain(
     );
     state
         .store
-        .set_deployment_generation_drain_state(&plan.id, "draining", None)
+        .set_deployment_generation_drain_state(&plan.id, "draining", None, lease.coordinator_id())
         .await?;
+    lease.ensure().await?;
     let report = state
         .deliverer
         .push_to(&payload, plan_delivery_reason(&plan)?, &drain.target_ids)
@@ -740,33 +986,44 @@ async fn reconcile_generation_drain(
     for node_id in &report.delivered {
         state
             .store
-            .record_deployment_drain_observation(DeploymentDrainObservation {
-                plan_id: plan.id.clone(),
-                node_id: node_id.clone(),
-                generation: drain.generation.clone(),
-                observed_state: "drained".to_string(),
-                message: None,
-                observed_at: now_secs(),
-            })
+            .record_deployment_drain_observation(
+                DeploymentDrainObservation {
+                    plan_id: plan.id.clone(),
+                    node_id: node_id.clone(),
+                    generation: drain.generation.clone(),
+                    observed_state: "drained".to_string(),
+                    message: None,
+                    observed_at: now_secs(),
+                },
+                lease.coordinator_id(),
+            )
             .await?;
     }
     for failure in &report.failed {
         state
             .store
-            .record_deployment_drain_observation(DeploymentDrainObservation {
-                plan_id: plan.id.clone(),
-                node_id: failure.node.clone(),
-                generation: drain.generation.clone(),
-                observed_state: "draining".to_string(),
-                message: Some(failure.error.clone()),
-                observed_at: now_secs(),
-            })
+            .record_deployment_drain_observation(
+                DeploymentDrainObservation {
+                    plan_id: plan.id.clone(),
+                    node_id: failure.node.clone(),
+                    generation: drain.generation.clone(),
+                    observed_state: "draining".to_string(),
+                    message: Some(failure.error.clone()),
+                    observed_at: now_secs(),
+                },
+                lease.coordinator_id(),
+            )
             .await?;
     }
     if report.fully_delivered() {
         state
             .store
-            .set_deployment_generation_drain_state(&plan.id, "drained", None)
+            .set_deployment_generation_drain_state(
+                &plan.id,
+                "drained",
+                None,
+                lease.coordinator_id(),
+            )
             .await?;
     } else {
         state
@@ -775,6 +1032,7 @@ async fn reconcile_generation_drain(
                 &plan.id,
                 "draining",
                 Some(&delivery_failure_detail(&report)),
+                lease.coordinator_id(),
             )
             .await?;
     }
@@ -795,14 +1053,63 @@ pub(super) fn reconcile_soon(state: CatalogState, plan: DeploymentPlan) {
 }
 
 async fn reconcile_plan(state: &CatalogState, plan: DeploymentPlan) -> ApiResult<()> {
+    let coordinator_id = CanonicalId::new_v7();
+    let plan = match state
+        .store
+        .claim_deployment_plan(
+            &plan.id,
+            coordinator_id,
+            DEPLOYMENT_COORDINATOR_LEASE_SECONDS,
+        )
+        .await
+    {
+        Ok(plan) => plan,
+        // Another request or reconciliation pass is making progress. This is
+        // expected under both HA and the local immediate/periodic race.
+        Err(CatalogError::Conflict(_)) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let lease = DeploymentPlanLease::start(state.store.clone(), plan.id.clone(), coordinator_id);
+    let result = reconcile_claimed_plan(state, plan, &lease).await;
+    lease.finish().await;
+    result
+}
+
+async fn reconcile_claimed_plan(
+    state: &CatalogState,
+    plan: DeploymentPlan,
+    lease: &DeploymentPlanLease,
+) -> ApiResult<()> {
     if plan.target_ids.is_empty() {
+        let aborting = match plan.state.as_str() {
+            "preparing" | "prepared" => {
+                state
+                    .store
+                    .transition_deployment_plan(
+                        &plan.id,
+                        &plan.state,
+                        "aborting",
+                        Some("strict deployment plan has no runtime serving target"),
+                        lease.coordinator_id(),
+                    )
+                    .await?
+            }
+            "aborting" => plan.clone(),
+            state_name => {
+                return Err(ApiError::Conflict(format!(
+                    "deployment plan {} has no runtime serving target after entering post-commit state {state_name}",
+                    plan.id
+                )));
+            }
+        };
         state
             .store
             .transition_deployment_plan(
-                &plan.id,
-                &plan.state,
+                &aborting.id,
+                "aborting",
                 "failed",
                 Some("strict deployment plan has no runtime serving target"),
+                lease.coordinator_id(),
             )
             .await?;
         return Ok(());
@@ -831,11 +1138,12 @@ async fn reconcile_plan(state: &CatalogState, plan: DeploymentPlan) -> ApiResult
                 plan.routing_generation.to_string(),
                 crate::runtime_client::proto::DeploymentAction::Prepare,
             );
+            lease.ensure().await?;
             let report = state
                 .deliverer
                 .push_to(&payload, reason, &plan.target_ids)
                 .await;
-            record_target_report(state, &plan, &report, "prepared").await?;
+            record_target_report(state, &plan, &report, "prepared", lease).await?;
             if report.fully_delivered() {
                 state
                     .store
@@ -844,45 +1152,66 @@ async fn reconcile_plan(state: &CatalogState, plan: DeploymentPlan) -> ApiResult
                         "preparing",
                         "prepared",
                         Some("restart reconciliation confirmed every prepared target"),
+                        lease.coordinator_id(),
                     )
                     .await?;
             }
         }
         "prepared" => {
+            if !prepare_queue_fence(state, &env, &plan, lease).await? {
+                return Ok(());
+            }
+            lease.ensure().await?;
             match state
                 .store
-                .commit_deployment_plan(&plan, &env, payload.environment_snapshot())
+                .commit_deployment_plan(
+                    &plan,
+                    &env,
+                    payload.environment_snapshot(),
+                    lease.coordinator_id(),
+                )
                 .await
             {
                 Ok(_) => {}
                 Err(error) => {
-                    payload.set_instruction(
-                        &plan.id,
-                        plan.routing_generation.to_string(),
-                        crate::runtime_client::proto::DeploymentAction::Abort,
-                    );
-                    let report = state
-                        .deliverer
-                        .push_to(&payload, reason, &plan.target_ids)
-                        .await;
-                    record_target_report(state, &plan, &report, "aborted").await?;
-                    state
-                        .store
-                        .transition_deployment_plan(
-                            &plan.id,
-                            "prepared",
-                            "failed",
-                            Some(&error.to_string()),
+                    if matches!(
+                        &error,
+                        CatalogError::Conflict(_)
+                            | CatalogError::RevisionConflict(_)
+                            | CatalogError::Invalid(_)
+                    ) {
+                        let detail = error.to_string();
+                        let aborting = state
+                            .store
+                            .transition_deployment_plan(
+                                &plan.id,
+                                "prepared",
+                                "aborting",
+                                Some(&detail),
+                                lease.coordinator_id(),
+                            )
+                            .await?;
+                        let _ = abort_prepared_plan(
+                            state,
+                            &env,
+                            &aborting,
+                            &mut payload,
+                            reason,
+                            lease,
                         )
                         .await?;
+                    }
                 }
             }
+        }
+        "aborting" => {
+            let _ = abort_prepared_plan(state, &env, &plan, &mut payload, reason, lease).await?;
         }
         "activating" | "reconciling" | "degraded" => {
             if !all_proxies_observed(state, &plan).await? {
                 return Ok(());
             }
-            if !advance_queue_fence(state, &env, &plan).await? {
+            if !activate_queue_fence(state, &env, &plan, lease).await? {
                 return Ok(());
             }
             payload.set_instruction(
@@ -890,11 +1219,12 @@ async fn reconcile_plan(state: &CatalogState, plan: DeploymentPlan) -> ApiResult
                 plan.routing_generation.to_string(),
                 crate::runtime_client::proto::DeploymentAction::Activate,
             );
+            lease.ensure().await?;
             let report = state
                 .deliverer
                 .push_to(&payload, reason, &plan.target_ids)
                 .await;
-            record_target_report(state, &plan, &report, "active").await?;
+            record_target_report(state, &plan, &report, "active", lease).await?;
             if !report.fully_delivered() && plan.state == "activating" {
                 state
                     .store
@@ -903,10 +1233,11 @@ async fn reconcile_plan(state: &CatalogState, plan: DeploymentPlan) -> ApiResult
                         "activating",
                         "reconciling",
                         Some(&delivery_failure_detail(&report)),
+                        lease.coordinator_id(),
                     )
                     .await?;
             }
-            finalize_if_observed(state, &plan.id).await?;
+            finalize_if_observed(state, &plan.id, lease).await?;
         }
         _ => {}
     }
@@ -941,45 +1272,157 @@ fn plan_requires_queue_fence(plan: &DeploymentPlan) -> ApiResult<bool> {
         })
 }
 
-/// Advance the durable queue lease barrier. Transport failures after the
-/// pointer commit are reconciliable state, not a false rollback response: the
-/// plan remains non-terminal and the periodic worker retries it.
-async fn advance_queue_fence(
+async fn record_queue_observation(
+    state: &CatalogState,
+    lease: &DeploymentPlanLease,
+    observation: DeploymentQueueObservation,
+) -> ApiResult<()> {
+    state
+        .store
+        .record_deployment_queue_observation(observation, lease.coordinator_id())
+        .await?;
+    Ok(())
+}
+
+/// Pre-commit half of the durable queue barrier. It closes all Pull admission
+/// and waits for valid old leases, but cannot make the candidate active.
+async fn prepare_queue_fence(
     state: &CatalogState,
     env: &Environment,
     plan: &DeploymentPlan,
+    lease: &DeploymentPlanLease,
 ) -> ApiResult<bool> {
     if !plan_requires_queue_fence(plan)? {
         return Ok(true);
     }
+    lease.ensure().await?;
+    match state.deliverer.prepare_consumer_generation(env, plan).await {
+        Ok(progress) => {
+            let observed_state = if progress.prepared {
+                "prepared"
+            } else {
+                "draining"
+            };
+            record_queue_observation(
+                state,
+                lease,
+                DeploymentQueueObservation {
+                    plan_id: plan.id.clone(),
+                    observed_state: observed_state.to_string(),
+                    active_generation: progress.active_generation.clone(),
+                    active_deployment_id: progress.active_deployment_id.clone(),
+                    pending_generation: (!progress.pending_generation.is_empty())
+                        .then(|| progress.pending_generation.clone()),
+                    pending_deployment_id: (!progress.pending_deployment_id.is_empty())
+                        .then(|| progress.pending_deployment_id.clone()),
+                    outstanding_leases: progress.outstanding_leases,
+                    message: None,
+                    observed_at: now_secs(),
+                },
+            )
+            .await?;
+            info!(
+                deployment_plan = %plan.id,
+                routing_generation = %plan.routing_generation,
+                outstanding_leases = progress.outstanding_leases,
+                prepared = progress.prepared,
+                "Queue admission is closed at the pre-commit generation barrier"
+            );
+            Ok(progress.prepared)
+        }
+        Err(error) => {
+            record_queue_observation(
+                state,
+                lease,
+                DeploymentQueueObservation {
+                    plan_id: plan.id.clone(),
+                    observed_state: "error".to_string(),
+                    active_generation: String::new(),
+                    active_deployment_id: String::new(),
+                    pending_generation: None,
+                    pending_deployment_id: None,
+                    outstanding_leases: 0,
+                    message: Some(error.to_string()),
+                    observed_at: now_secs(),
+                },
+            )
+            .await?;
+            warn!(
+                deployment_plan = %plan.id,
+                routing_generation = %plan.routing_generation,
+                error = %error,
+                "Queue generation prepare did not converge; production pointer remains unchanged and reconciliation will retry"
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Post-routing half of the queue barrier. At this point the pointer is
+/// durable and every frozen proxy has published it, so admitting the new
+/// generation cannot expose work ahead of HTTP routing.
+async fn activate_queue_fence(
+    state: &CatalogState,
+    env: &Environment,
+    plan: &DeploymentPlan,
+    lease: &DeploymentPlanLease,
+) -> ApiResult<bool> {
+    if !plan_requires_queue_fence(plan)? {
+        return Ok(true);
+    }
+    lease.ensure().await?;
     match state
         .deliverer
         .activate_consumer_generation(env, plan)
         .await
     {
-        Ok(progress) if progress.activated => {
-            info!(
-                deployment_plan = %plan.id,
-                routing_generation = %plan.routing_generation,
-                "Queue lease admission moved to the deployment generation"
-            );
-            Ok(true)
-        }
         Ok(progress) => {
-            info!(
-                deployment_plan = %plan.id,
-                routing_generation = %plan.routing_generation,
-                outstanding_leases = progress.outstanding_leases,
-                "Queue admission is closed while the previous generation's leases drain"
-            );
-            Ok(false)
+            record_queue_observation(
+                state,
+                lease,
+                DeploymentQueueObservation {
+                    plan_id: plan.id.clone(),
+                    observed_state: if progress.activated {
+                        "active".to_string()
+                    } else {
+                        "prepared".to_string()
+                    },
+                    active_generation: progress.active_generation.clone(),
+                    active_deployment_id: progress.active_deployment_id.clone(),
+                    pending_generation: (!progress.pending_generation.is_empty())
+                        .then(|| progress.pending_generation.clone()),
+                    pending_deployment_id: (!progress.pending_deployment_id.is_empty())
+                        .then(|| progress.pending_deployment_id.clone()),
+                    outstanding_leases: progress.outstanding_leases,
+                    message: None,
+                    observed_at: now_secs(),
+                },
+            )
+            .await?;
+            Ok(progress.activated)
         }
         Err(error) => {
+            record_queue_observation(
+                state,
+                lease,
+                DeploymentQueueObservation {
+                    plan_id: plan.id.clone(),
+                    observed_state: "error".to_string(),
+                    active_generation: String::new(),
+                    active_deployment_id: String::new(),
+                    pending_generation: None,
+                    pending_deployment_id: None,
+                    outstanding_leases: 0,
+                    message: Some(error.to_string()),
+                    observed_at: now_secs(),
+                },
+            )
+            .await?;
             warn!(
                 deployment_plan = %plan.id,
                 routing_generation = %plan.routing_generation,
                 error = %error,
-                "Queue generation fence did not converge; runtime activation remains blocked and reconciliation will retry"
+                "Queue generation activation is uncertain; runtime activation remains blocked and reconciliation will retry"
             );
             if plan.state == "activating" {
                 state
@@ -988,12 +1431,139 @@ async fn advance_queue_fence(
                         &plan.id,
                         "activating",
                         "reconciling",
-                        Some(&format!("queue generation fence: {error}")),
+                        Some(&format!("queue generation activation: {error}")),
+                        lease.coordinator_id(),
                     )
                     .await?;
             }
             Ok(false)
         }
+    }
+}
+
+/// Compensate only a plan that durably owns pre-commit abort state. Queue
+/// admission is reopened before the candidate runtime generation is removed.
+async fn abort_prepared_plan(
+    state: &CatalogState,
+    env: &Environment,
+    plan: &DeploymentPlan,
+    payload: &mut DeploymentPayload,
+    reason: DeliveryReason,
+    lease: &DeploymentPlanLease,
+) -> ApiResult<bool> {
+    if plan.state != "aborting" {
+        return Err(ApiError::Conflict(format!(
+            "deployment plan {} is {}, not aborting",
+            plan.id, plan.state
+        )));
+    }
+    if plan_requires_queue_fence(plan)? {
+        lease.ensure().await?;
+        match state.deliverer.abort_consumer_generation(env, plan).await {
+            Ok(progress) => {
+                record_queue_observation(
+                    state,
+                    lease,
+                    DeploymentQueueObservation {
+                        plan_id: plan.id.clone(),
+                        observed_state: "aborted".to_string(),
+                        active_generation: progress.active_generation,
+                        active_deployment_id: progress.active_deployment_id,
+                        pending_generation: None,
+                        pending_deployment_id: None,
+                        outstanding_leases: 0,
+                        message: None,
+                        observed_at: now_secs(),
+                    },
+                )
+                .await?;
+            }
+            Err(error) => {
+                record_queue_observation(
+                    state,
+                    lease,
+                    DeploymentQueueObservation {
+                        plan_id: plan.id.clone(),
+                        observed_state: "error".to_string(),
+                        active_generation: String::new(),
+                        active_deployment_id: String::new(),
+                        pending_generation: Some(plan.routing_generation.to_string()),
+                        pending_deployment_id: Some(plan.id.clone()),
+                        outstanding_leases: 0,
+                        message: Some(error.to_string()),
+                        observed_at: now_secs(),
+                    },
+                )
+                .await?;
+                return Ok(false);
+            }
+        }
+    }
+    payload.set_instruction(
+        &plan.id,
+        plan.routing_generation.to_string(),
+        crate::runtime_client::proto::DeploymentAction::Abort,
+    );
+    lease.ensure().await?;
+    let report = state
+        .deliverer
+        .push_to(payload, reason, &plan.target_ids)
+        .await;
+    record_target_report(state, plan, &report, "aborted", lease).await?;
+    if !report.fully_delivered() {
+        return Ok(false);
+    }
+    let terminal = state
+        .store
+        .transition_deployment_plan(
+            &plan.id,
+            "aborting",
+            "failed",
+            plan.last_error
+                .as_deref()
+                .or(Some("pre-commit deployment aborted")),
+            lease.coordinator_id(),
+        )
+        .await?;
+    cleanup_aborted_secret_candidate(state, env, &terminal).await;
+    Ok(true)
+}
+
+async fn cleanup_aborted_secret_candidate(
+    state: &CatalogState,
+    env: &Environment,
+    plan: &DeploymentPlan,
+) {
+    let Some(change) = plan.policy.get("secretChange") else {
+        return;
+    };
+    let (Some(name), Some(revision)) = (
+        change.get("name").and_then(serde_json::Value::as_str),
+        change
+            .get("replacementRevision")
+            .and_then(serde_json::Value::as_str),
+    ) else {
+        return;
+    };
+    match state
+        .store
+        .discard_secret_revision_if_unreferenced(&env.id, name, revision)
+        .await
+    {
+        Ok(true) => info!(
+            deployment_plan = %plan.id,
+            secret = %name,
+            revision = %revision,
+            "Removed staged secret ciphertext after every pre-commit compensation was confirmed"
+        ),
+        Ok(false) => {}
+        Err(error) => warn!(
+            deployment_plan = %plan.id,
+            secret = %name,
+            revision = %revision,
+            error = %error,
+            "Could not remove terminal staged secret ciphertext; retention reconciliation must retry"
+        ),
     }
 }
 
@@ -1049,7 +1619,7 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
 
 fn response(
     env: &Environment,
-    deployment: Deployment,
+    deployment: Option<Deployment>,
     version: &Version,
     delivery: Option<DeliveryReport>,
     plan: Option<DeploymentPlan>,
@@ -1084,14 +1654,245 @@ async fn resolve_version(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Harness, call, harness, harness_with_failed_runtime, json};
+    use super::super::tests::{
+        Harness, call, harness, harness_with_failed_runtime, harness_with_queue, json,
+    };
+    use super::{deployment_plan_location, reconcile_plan};
     use crate::api::catalog::MAX_BUNDLE_BYTES;
+    use crate::catalog::DeploymentPlanSpec;
     use crate::catalog::bundle::tests::{bundle_with_manifest, sample_bundle};
 
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Request, StatusCode, header::LOCATION};
+    use deis_wire::CanonicalId;
     use serde_json::Value;
     use tower::ServiceExt;
+
+    #[test]
+    fn mutation_location_identifies_the_durable_plan_status_resource() {
+        let headers =
+            deployment_plan_location("demo", "production", "018f2518-7e38-7f80-8000-000000000001");
+        assert_eq!(
+            headers.get(LOCATION).unwrap(),
+            "/api/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_owner_excludes_the_local_background_reconciler_until_release() {
+        let h = harness(true).await;
+        h.state.store.create_app("lease-app").await.unwrap();
+        let env = h
+            .state
+            .store
+            .create_environment("lease-app", "production")
+            .await
+            .unwrap();
+        let (version, _) = h
+            .state
+            .store
+            .create_version(
+                "lease-app",
+                "sha-lease",
+                "/unused/lease.zip",
+                r#"{"schema":1,"app":"lease-app","entry":"worker/index.js"}"#,
+            )
+            .await
+            .unwrap();
+        let request_owner = CanonicalId::new_v7();
+        let plan = h
+            .state
+            .store
+            .create_deployment_plan(
+                &env,
+                &version,
+                DeploymentPlanSpec {
+                    snapshot: None,
+                    expected_secret_heads: Default::default(),
+                    compare_secret_heads: true,
+                    target_ids: Vec::new(),
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: None,
+                },
+                request_owner,
+                super::DEPLOYMENT_COORDINATOR_LEASE_SECONDS,
+            )
+            .await
+            .unwrap();
+
+        reconcile_plan(&h.state, plan.clone()).await.unwrap();
+        let unchanged = h.state.store.deployment_plan(&plan.id).await.unwrap();
+        assert_eq!(unchanged.state, "preparing");
+        assert_eq!(unchanged.coordinator_id, Some(request_owner));
+
+        h.state
+            .store
+            .release_deployment_plan_lease(&plan.id, request_owner)
+            .await
+            .unwrap();
+        reconcile_plan(&h.state, plan).await.unwrap();
+        let terminal = h.state.store.deployment_plan(&unchanged.id).await.unwrap();
+        assert_eq!(terminal.state, "failed");
+        assert_eq!(terminal.coordinator_id, None);
+        assert_eq!(terminal.lease_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn queue_leases_drain_before_the_production_pointer_is_committed() {
+        use deis_queue::proto::queue::{
+            AckRequest, MessageHandle, PullRequest, SendRequest, queue_client::QueueClient,
+        };
+
+        let h = harness_with_queue(true).await;
+        let tenant = "demo.production";
+        let mut queue = QueueClient::connect(h.queue_endpoint.clone().unwrap())
+            .await
+            .unwrap();
+        for body in ["old lease", "next generation"] {
+            let mut request = tonic::Request::new(SendRequest {
+                queue_name: "jobs".to_string(),
+                message_body: body.as_bytes().to_vec(),
+            });
+            request.metadata_mut().insert(
+                deis_wire::conventions::TENANT_HEADER,
+                tenant.parse().unwrap(),
+            );
+            queue.send(request).await.unwrap();
+        }
+        let mut request = tonic::Request::new(PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 1,
+            lease_seconds: 60,
+        });
+        request.metadata_mut().insert(
+            deis_wire::conventions::TENANT_HEADER,
+            tenant.parse().unwrap(),
+        );
+        let old = queue.pull(request).await.unwrap().into_inner().messages;
+        assert_eq!(old.len(), 1);
+
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let bundle = bundle_with_manifest(
+            r#"{"schema":1,"app":"demo","entry":"worker/index.js","queues":[{"name":"jobs"}]}"#,
+            true,
+        );
+        let (_, uploaded) = call(
+            &h.router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(bundle),
+            "application/zip",
+        )
+        .await;
+        let version_id = uploaded["version"]["id"].as_str().unwrap();
+        json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+        let (status, accepted) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({"version_id": version_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        assert!(accepted.get("deployment").is_none(), "{accepted}");
+        assert_eq!(accepted["plan"]["state"], "prepared");
+        assert!(
+            accepted["plan"].get("coordinator_id").is_none(),
+            "the accepted response must reflect the request owner's explicit release: {accepted}"
+        );
+        let plan_id = accepted["plan"]["id"].as_str().unwrap();
+        assert!(
+            h.state
+                .store
+                .current_deployment(accepted["plan"]["env_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let queue_observation = h
+            .state
+            .store
+            .deployment_queue_observation(plan_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue_observation.observed_state, "draining");
+        assert_eq!(queue_observation.outstanding_leases, 1);
+        assert_eq!(queue_observation.active_deployment_id, "");
+        assert_eq!(
+            queue_observation.pending_deployment_id.as_deref(),
+            Some(plan_id)
+        );
+
+        let leased = &old[0];
+        let mut ack = tonic::Request::new(AckRequest {
+            queue_name: "jobs".to_string(),
+            messages: vec![MessageHandle {
+                id: leased.id.clone(),
+                lease_token: leased.lease_token.clone(),
+            }],
+        });
+        ack.metadata_mut().insert(
+            deis_wire::conventions::TENANT_HEADER,
+            tenant.parse().unwrap(),
+        );
+        queue.ack(ack).await.unwrap();
+
+        let plan = h.state.store.deployment_plan(plan_id).await.unwrap();
+        reconcile_plan(&h.state, plan).await.unwrap();
+        let plan = h.state.store.deployment_plan(plan_id).await.unwrap();
+        assert_eq!(plan.state, "activating");
+        reconcile_plan(&h.state, plan).await.unwrap();
+        let plan = h.state.store.deployment_plan(plan_id).await.unwrap();
+        assert_eq!(plan.state, "active");
+        let deployment = h
+            .state
+            .store
+            .current_deployment(&plan.env_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deployment.id, plan.id);
+        let queue_observation = h
+            .state
+            .store
+            .deployment_queue_observation(plan_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue_observation.observed_state, "active");
+        assert_eq!(
+            queue_observation.active_generation,
+            plan.routing_generation.to_string()
+        );
+        assert_eq!(queue_observation.active_deployment_id, plan.id);
+        assert!(queue_observation.pending_deployment_id.is_none());
+        let (status, plan_status) = json(
+            &h.router,
+            "GET",
+            &format!("/api/apps/demo/environments/production/deployment-plans/{plan_id}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{plan_status}");
+        assert_eq!(plan_status["queue"]["active_deployment_id"], plan_id);
+        assert!(plan_status["queue"].get("pending_deployment_id").is_none());
+    }
 
     #[tokio::test]
     async fn active_waits_for_the_frozen_proxy_to_report_the_applied_table() {
@@ -1420,9 +2221,13 @@ mod tests {
 
     #[tokio::test]
     async fn standard_deploy_and_secret_rotation_append_atomic_snapshot_pointers() {
-        let h = harness(true).await;
+        use deis_queue::proto::queue::{
+            AckRequest, MessageHandle, PullRequest, SendRequest, queue_client::QueueClient,
+        };
+
+        let h = harness_with_queue(true).await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
             vec![
                 deis_wire::EnvironmentDeclaration {
                     name: "LABEL".to_string(),
@@ -1450,6 +2255,7 @@ mod tests {
             "app": "demo",
             "entry": "worker/index.js",
             "environment": declarations,
+            "queues": [{"name": "jobs"}],
         })
         .to_string();
         let (status, uploaded) = call(
@@ -1493,6 +2299,38 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        let first_deployment = deployed["deployment"]["id"].as_str().unwrap().to_string();
+        let first_generation = deployed["deployment"]["canonical_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut queue = QueueClient::connect(h.queue_endpoint.clone().unwrap())
+            .await
+            .unwrap();
+        let mut send = tonic::Request::new(SendRequest {
+            queue_name: "jobs".to_string(),
+            message_body: b"finish under the old secret".to_vec(),
+        });
+        send.metadata_mut().insert(
+            deis_wire::conventions::TENANT_HEADER,
+            "demo.production".parse().unwrap(),
+        );
+        queue.send(send).await.unwrap();
+        let mut pull = tonic::Request::new(PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 1,
+            lease_seconds: 60,
+        });
+        pull.metadata_mut().insert(
+            deis_wire::conventions::TENANT_HEADER,
+            "demo.production".parse().unwrap(),
+        );
+        pull.metadata_mut().insert(
+            deis_wire::conventions::DEPLOYMENT_GENERATION_HEADER,
+            first_generation.parse().unwrap(),
+        );
+        let old_lease = queue.pull(pull).await.unwrap().into_inner().messages;
+        assert_eq!(old_lease.len(), 1);
 
         let (status, rotated) = json(
             &h.router,
@@ -1501,8 +2339,58 @@ mod tests {
             serde_json::json!({"value": "second-value"}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{rotated}");
+        assert_eq!(status, StatusCode::ACCEPTED, "{rotated}");
         assert_eq!(rotated["delivery"]["version_id"], version_id);
+        let rotation_plan = rotated["plan"]["id"].as_str().unwrap();
+        let staged_revision = rotated["secret"]["revision"].as_str().unwrap();
+        assert_eq!(rotated["plan"]["state"], "prepared");
+        assert_eq!(
+            h.state
+                .store
+                .current_deployment(rotated["plan"]["env_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            first_deployment,
+            "a staged secret must not move the pointer before its queue barrier drains"
+        );
+        assert_ne!(
+            h.state
+                .store
+                .current_secret_revision(rotated["plan"]["env_id"].as_str().unwrap(), "TOKEN")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(staged_revision),
+            "202 exposes candidate metadata but the current secret head stays unchanged"
+        );
+        let leased = &old_lease[0];
+        let mut ack = tonic::Request::new(AckRequest {
+            queue_name: "jobs".to_string(),
+            messages: vec![MessageHandle {
+                id: leased.id.clone(),
+                lease_token: leased.lease_token.clone(),
+            }],
+        });
+        ack.metadata_mut().insert(
+            deis_wire::conventions::TENANT_HEADER,
+            "demo.production".parse().unwrap(),
+        );
+        queue.ack(ack).await.unwrap();
+        let plan = h.state.store.deployment_plan(rotation_plan).await.unwrap();
+        reconcile_plan(&h.state, plan).await.unwrap();
+        let plan = h.state.store.deployment_plan(rotation_plan).await.unwrap();
+        reconcile_plan(&h.state, plan).await.unwrap();
+        assert_eq!(
+            h.state
+                .store
+                .current_secret_revision(rotated["plan"]["env_id"].as_str().unwrap(), "TOKEN")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(staged_revision)
+        );
         let (_, current) = json(
             &h.router,
             "GET",
@@ -1580,7 +2468,7 @@ mod tests {
     async fn historical_rollback_reactivates_its_snapshot_after_secret_heads_move() {
         let h = harness(true).await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
             vec![deis_wire::EnvironmentDeclaration {
                 name: "TOKEN".to_string(),
                 kind: deis_wire::EnvironmentKind::Secret,

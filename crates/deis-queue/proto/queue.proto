@@ -48,13 +48,22 @@ service Queue {
   // calling pins nothing on the server.
   rpc Pull(PullRequest) returns (PullResponse);
 
-  // Move one tenant's asynchronous consumers to an immutable deployment
-  // generation. The first call closes admission for the previous generation;
-  // subsequent idempotent calls report activated only after its outstanding
-  // leases have finished or expired. Pull then admits only the new
-  // generation. Ack and Nack remain valid while the barrier is draining.
+  // Close consumer admission for a tenant and wait for every lease of the
+  // currently active generation to settle. This is the pre-commit half of a
+  // deployment barrier: it never admits the candidate generation.
+  rpc PrepareConsumerGeneration(PrepareConsumerGenerationRequest)
+      returns (PrepareConsumerGenerationResponse);
+
+  // Admit a generation whose PrepareConsumerGeneration barrier is complete.
+  // The deployment coordinator calls this only after its production pointer
+  // commit and routing convergence are durable.
   rpc ActivateConsumerGeneration(ActivateConsumerGenerationRequest)
       returns (ActivateConsumerGenerationResponse);
+
+  // Cancel an uncommitted prepared barrier and reopen admission for the
+  // previous generation. An already active candidate cannot be aborted.
+  rpc AbortConsumerGeneration(AbortConsumerGenerationRequest)
+      returns (AbortConsumerGenerationResponse);
 
   // Report messages as handled. They are deleted and never delivered again.
   rpc Ack(AckRequest) returns (AckResponse);
@@ -129,12 +138,33 @@ message PullRequest {
   int32 lease_seconds = 3;
 }
 
-message ActivateConsumerGenerationRequest {
+message PrepareConsumerGenerationRequest {
   string deployment_id = 1;
   string generation = 2;
   // Empty for the first generation. A non-empty value is a compare-and-swap
   // precondition and prevents two coordinators from crossing deployments.
   string expected_previous_generation = 3;
+  // The deployment that owns expected_previous_generation. Presence is part
+  // of the compare-and-swap contract. Historical control-plane deployments
+  // may be UUIDv4; current ones are UUIDv7. An explicitly present empty value
+  // is reserved for adopting a generation written by a queue version that
+  // did not persist deployment ownership; absence means no predecessor.
+  optional string expected_previous_deployment_id = 4;
+}
+
+message PrepareConsumerGenerationResponse {
+  bool prepared = 1;
+  string active_generation = 2;
+  string pending_generation = 3;
+  int64 outstanding_leases = 4;
+  // Empty only when the corresponding generation has no recorded owner.
+  string active_deployment_id = 5;
+  string pending_deployment_id = 6;
+}
+
+message ActivateConsumerGenerationRequest {
+  string deployment_id = 1;
+  string generation = 2;
 }
 
 message ActivateConsumerGenerationResponse {
@@ -142,6 +172,21 @@ message ActivateConsumerGenerationResponse {
   string active_generation = 2;
   string pending_generation = 3;
   int64 outstanding_leases = 4;
+  // Empty only when the corresponding generation has no recorded owner.
+  string active_deployment_id = 5;
+  string pending_deployment_id = 6;
+}
+
+message AbortConsumerGenerationRequest {
+  string deployment_id = 1;
+  string generation = 2;
+}
+
+message AbortConsumerGenerationResponse {
+  bool aborted = 1;
+  string active_generation = 2;
+  // Empty only when the active generation has no recorded owner.
+  string active_deployment_id = 3;
 }
 
 message QueueMessage {

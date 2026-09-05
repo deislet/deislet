@@ -111,6 +111,12 @@ pub struct DeploymentPlan {
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Short-lived owner of the next coordinator action. This is mutable
+    /// execution state and is deliberately outside `plan_sha256`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinator_id: Option<CanonicalId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -133,6 +139,22 @@ pub struct DeploymentProxyObservation {
     pub observed_state: String,
     pub routing_table_version: String,
     pub routing_generation: String,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentQueueObservation {
+    pub plan_id: String,
+    pub observed_state: String,
+    pub active_generation: String,
+    pub active_deployment_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_deployment_id: Option<String>,
+    pub outstanding_leases: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     pub observed_at: i64,
 }
 

@@ -219,9 +219,13 @@ pub(crate) mod tests {
 
     pub(crate) struct Harness {
         pub router: Router,
+        pub state: CatalogState,
         pub sessions: Arc<SessionManager>,
+        pub queue_endpoint: Option<String>,
         pub _bundle_dir: tempfile::TempDir,
         pub _runtime_shutdown: tokio::sync::oneshot::Sender<()>,
+        pub _queue_dir: Option<tempfile::TempDir>,
+        pub _queue_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
     struct PreparedRuntime;
@@ -340,6 +344,44 @@ pub(crate) mod tests {
 
     pub(crate) async fn harness_with(secrets_ready: bool, node_keys: Vec<String>) -> Harness {
         harness_with_storage(secrets_ready, node_keys, storage_wiring(None)).await
+    }
+
+    pub(crate) async fn harness_with_queue(secrets_ready: bool) -> Harness {
+        let queue_dir = tempfile::tempdir().unwrap();
+        let queue = deis_queue::queue::QueueService::open(
+            queue_dir.path(),
+            4,
+            deis_queue::queue::QueueLimits::default(),
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(deis_queue::proto::queue::queue_server::QueueServer::new(
+                    queue,
+                ))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        let storage = crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
+            queue_endpoint: Some(endpoint.clone()),
+            ..Default::default()
+        });
+        let mut harness =
+            harness_with_storage(secrets_ready, vec![TEST_NODE_KEY.to_string()], storage).await;
+        harness.queue_endpoint = Some(endpoint);
+        harness._queue_dir = Some(queue_dir);
+        harness._queue_shutdown = Some(shutdown);
+        harness
     }
 
     /// The storage secret the harness mints tokens from when it is asked to
@@ -461,9 +503,13 @@ pub(crate) mod tests {
             // or a handler that names its caller would fail to extract one.
             router: router(state.clone())
                 .layer(axum::middleware::from_fn(supply_test_principal))
-                .merge(node_router(state)),
+                .merge(node_router(state.clone())),
+            state: state.clone(),
             _bundle_dir: bundle_dir,
             _runtime_shutdown: runtime_shutdown,
+            _queue_dir: None,
+            _queue_shutdown: None,
+            queue_endpoint: None,
             sessions,
         }
     }

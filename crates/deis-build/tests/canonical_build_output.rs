@@ -58,7 +58,7 @@ async fn canonical_identity_is_portable_complete_and_secret_free() {
     let first_root = Path::new(&first.output_path);
     let verified = canonical_artifact::validate(
         first_root,
-        Some("edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13"),
+        Some("edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654"),
         &[b"EC_RUNTIME_VALUE_MUST_NOT_ENTER_ARTIFACT".to_vec()],
     )
     .expect("completed output validates and contains no runtime value");
@@ -120,7 +120,7 @@ async fn canonical_identity_is_portable_complete_and_secret_free() {
         .expect("routing document");
     let routing = deis_build::canonical_routing::parse(
         &routing_bytes,
-        "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+        "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
     )
     .expect("standard routing document");
     assert_eq!(routing.functions.len(), 1);

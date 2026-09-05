@@ -621,7 +621,7 @@ mod tests {
                 .collect(),
             secrets: vec!["API_KEY".to_string()],
             environment: Some(deis_wire::EnvironmentDeclarations::new(
-                "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+                "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
                 Vec::new(),
             )),
             routes: vec![Route {

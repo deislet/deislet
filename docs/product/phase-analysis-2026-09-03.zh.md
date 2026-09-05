@@ -1697,12 +1697,12 @@ Application/framework source + versioned build plan
   新增用例覆盖 legacy migration、
   mixed-version trigger、deployment/head CAS、竞争 staging cleanup、历史 rollback、标准 typed/frozen/fresh
   runtime、同版本轮换收敛、schema-2 disk recovery fail closed、CLI argv 禁止和 pin/lock 防漂移。
-- 这仍没有完成 ADR-009 的 cluster `prepare -> verify -> activate -> observed active`：Control 目前只保证
-  metadata snapshot/pointer 原子，随后才 push 节点；部分 delivery 仍会形成 desired 已变、observed 未齐的
-  状态。也尚未实现 config 独立 update API、revision retention/GC 与销毁审计、per-tenant envelope key、
-  强制加密的 node transport、可表达多行值的 `deis dev` secret document，以及 Cloudflare/EdgeOne 的真实
-  account create/rotate/delete/rollback evidence。因此本实现关闭上一节点名的 Deislet EC-ENV 数据模型与
-  materialization 缺陷，但不提升任何 provider 的 compliant/supported 状态，`P0-SPEC-002` 保持 active。
+- 本切片当时仍没有完成 ADR-009 的 cluster `prepare -> verify -> activate -> observed active`，也没有完成
+  revision retention/GC 与销毁审计；这些发布屏障与 secret orphan 回收随后在第 59 节继续推进。config 独立
+  update API、可配置 snapshot/revision retention、per-tenant envelope key、强制加密的 node transport、可表达
+  多行值的 `deis dev` secret document，以及 Cloudflare/EdgeOne 的真实 account
+  create/rotate/delete/rollback evidence 仍未完成。因此本实现不提升任何 provider 的
+  compliant/supported 状态，`P0-SPEC-002` 保持 active。
 
 ## 58. 发布、预览与回滚进入统一标准
 
@@ -1727,22 +1727,34 @@ Application/framework source + versioned build plan
   per-case 时间戳并按 key 排序后的 SHA-256 都是
   `c015df30699bbd639667d093f142ef74044547da89d6212ec6f25a3e5e4b90a9`。该证据仅证明 reference
   portability，不是任一 provider 的认证证据。
-- Edge Canon 最终登记提交 `c926687f7539453ab31776cd16f8341133d82a13` 同步修正 registry：EC-DEPLOY
-  已是等待真实 provider integration 的本地 Draft，未执行能力族由 8 个减为 7 个。Node 24.20.0 下全仓
-  120/120 与 217 条 Draft clause 治理通过。Deislet 标准锁固定该提交、两份 schema SHA-256、requirements、
-  harness、三平台 evidence 与新 registry 摘要；这不表示 ADR-009 已实现。当前 Control 仍先写 desired
-  deployment pointer 再逐节点 push，Runtime 仍在一次 ApplyDeployment 内立即 stage+activate，Proxy 不携带
-  routing generation，也没有 target/proxy observed ack。下一实现必须同时增加 durable plan/status journal、
-  prepare-only staged pool、generation-addressed trusted routing、proxy/target observation 与 drain；只把同一
-  RPC 拆成两次调用无法消除 activate 途中断连造成的新旧随机混合。
-+
+- Edge Canon 后续登记提交 `a41a4caadeaf8e5751ebe57ef5be673d18384654` 将 EC-DEPLOY 扩为 43 条
+  Draft clause 与 T001–T014：previous owner 固定为 deployment/generation 二元组；HTTP、queue、cron 使用统一
+  trigger observation；严格顺序固定为 runtime prepare、queue/cron admission close 与 drain、selector 和
+  binding head 原子 CAS、冻结 proxy 全部 observation，最后激活 queue/cron/runtime；过期 lease settle 必须
+  stale，崩溃恢复按完整 owner CAS。Node 24.20.0 下全仓 127/127 与 223 条 Draft clause 治理通过。旧的
+  Linux/macOS/Windows EC-DEPLOY evidence 继续精确绑定 `4f926427…`、T001–T012 和不可变历史 reference
+  snapshot；T013/T014 尚只有当前本地 reference harness 结果，不能伪称新三平台或 provider evidence。
+  Deislet 标准锁固定 `a41a4ca…`、两份新 schema SHA-256、requirements、harness 与 registry 摘要。
 
 ## 59. Deislet 严格发布协调器第一批可执行实现
 
-- Control 在任何 runtime I/O 前持久化 immutable deployment plan：计划 ID 与 routing generation 为独立 lowercase UUIDv7，冻结 application/environment/version/snapshot、上一 deployment/generation、secret-head CAS、runtime/proxy 目标集、policy 与 note，并以 RFC 8785 JCS 的 SHA-256 标识。SQLite trigger 禁止修改计划事实，显式状态图、单环境 single-flight 唯一索引、append-only event journal、target/proxy observation 和 environment-scoped 查询使重启后的未知结果可继续核对，而不是凭一次 RPC 返回猜测。\`degraded\` 仍属于 single-flight/reconcile 状态，不能放行同环境的第二个计划。
-- Management wire 新增 \`PREPARE / ACTIVATE / ABORT / DRAIN\`，每次响应必须回显同一 plan/generation 和精确 observed state。Runtime 的 generation slot 在 PREPARE 后可按受信路由 generation 精确寻址，但不会移动 current selector、启动 cron 或 queue consumer；ACTIVATE 只切换已准备 generation，ABORT 只清理未激活候选。plan 与 generation 永久绑定，冲突重用拒绝；四个动作都支持丢失响应后的幂等重试。assignment list 同时携带阶段，重启/新节点在未完成计划上只 prepare，不会因 authoritative reconciliation 提前激活。
+- Control 在任何 runtime I/O 前以同一事务持久化 immutable deployment plan 与候选 environment snapshot：计划 ID 与 routing generation 为独立 lowercase UUIDv7，冻结 application/environment/version/snapshot、上一 deployment/generation、secret-head CAS、runtime/proxy 目标集、policy 与 note，并以 RFC 8785 JCS 的 SHA-256 标识。SQLite trigger 禁止修改计划事实，显式状态图、单环境 single-flight 唯一索引、append-only event journal、target/proxy/queue observation 和 environment-scoped 查询使重启后的未知结果可继续核对，而不是凭一次 RPC 返回猜测。`aborting`、`degraded` 都属于 single-flight/reconcile 状态，不能放行同环境的第二个计划；预提交补偿只有在持久进入 `aborting` 后才能执行。
+- Management wire 新增 `PREPARE / ACTIVATE / ABORT / DRAIN`，每次响应必须回显同一 plan/generation 和精确 observed state。Runtime 的 generation slot 在 PREPARE 后可按受信路由 generation 精确寻址，但不会移动 current selector、启动 cron 或 queue consumer；ACTIVATE 只切换已准备 generation，ABORT 只清理未激活候选。plan 与 generation 永久绑定，冲突重用拒绝；四个动作都支持丢失响应后的幂等重试。assignment list 同时携带阶段，重启/新节点在未完成计划上只 prepare，不会因 authoritative reconciliation 提前激活。
 - Proxy routing table 现携带精确 deployment generation，generation 参与 table digest；Proxy 在转发前删除客户端提供的全部平台头，再写入 app/environment/generation。Control 只接受 frozen set 内、持有 live Active proxy session 的下一轮 applied-table ACK；伪造或已离场 proxy 不能把计划推进为 active。Runtime 对缺失 generation 不会替换为另一个候选，对未知/正在 drain 的精确 generation 返回失败，避免旧新版本随机降级。
-- Queue 增加 tenant-scoped consumer generation fence。第一次 activation 在与 lease 相同的 SQLite 写事务里关闭旧 consumer 的 Pull admission；旧 ACK/NACK 继续有效，只有全部未过期 lease 结束后才原子开放新 generation。之后 legacy/旧 generation Pull 均以 FailedPrecondition 拒绝。active/pending generation 同时绑定 deployment intent，compare-and-swap predecessor 防止两个协调器交叉推进；旧数据库增加 lease generation 与 active deployment attribution，第一次精确升级重试在事务内认领。producer 不能自行选择 consumer generation。
+- 严格发布顺序现固定为 `runtime PREPARE → queue PREPARE/drain → pointer/head CAS → proxy ACK → queue ACTIVATE → runtime ACTIVATE`。Queue 协议拆为三个精确、幂等动作：PREPARE 在与 Pull 相同的 SQLite 写事务里登记 pending generation、关闭该租户的新 Pull，并等待仍有效的旧 lease 结清，但绝不开放候选；ACTIVATE 只在 pointer/head 已提交且全部冻结 Proxy ACK 后把该 pending 原子提升为 active；ABORT 只清除未提交候选并恢复旧 generation admission，已经 active 的候选不能被中止。三个响应都回显 observed generation 与 deployment owner 二元组，Control 同时严格核验两部分。ABORT 另保存最近一次完整 candidate 二元组的持久 tombstone：首次补偿产生一次副作用并返回 `aborted=true`，精确丢响应重试返回 `aborted=false`，任一 identity 分量不同均 CAS conflict，不能把错误候选当作幂等成功。Control 持久记录 `draining/prepared/active/aborted/error`、active/pending owner 与 outstanding lease 数，predecessor owner CAS 防止两个协调器交叉推进。producer 不能自行选择 consumer generation。
+- Queue drain 尚未完成时，部署、回滚与 secret mutation 接口返回 `202 Accepted`，响应中的 `deployment` 为空，并以同一应用/环境 scope 下的 `Location: /api/apps/:app/environments/:env/deployment-plans/:id` 指向可查询状态；调用者通过 plan status、event 和 observation 继续核对，此时 production pointer 与 secret head 均未改变。CLI 不再把该响应按必填 deployment 解析失败或把 PREPARE 误报为已上线：它验证 `Location` 必须是同 scope、同 plan 的相对路径，轮询至精确 plan `active`，再复核 current pointer 的 deployment ID；失败终态与 300 秒内仍未收敛都以 plan identity 和可继续查询路径明确报错。pre-commit runtime/CAS 失败则先持久进入 `aborting`，Queue ABORT 恢复旧 admission 后才 Runtime ABORT；两侧补偿未确认前不能进入失败终态。候选 snapshot 已随 plan 持久化，所以进程在 pointer commit 前重启仍能按同一 secret revision 重建 payload。
+- Queue 同时修复过期 lease 的确认边界：Ack/Nack 除 token 外还检查 `visible_at > now`。即使消息尚未再次投递，只要租约已到期，旧 Ack/Nack 也按 stale 处理，不能在 generation barrier 已报告旧 lease 排空后又删除、死信或释放该消息。旧数据库继续增加 lease generation 与 active deployment attribution，第一次精确升级重试在事务内认领。
 - 旧 HTTP generation 默认保留 300 秒，持久 drain 记录使用上一计划冻结的 runtime 目标集，而不是可能已经扩缩容的新集合。到期后协调器停止该 generation 的新请求/连接，等待普通响应 body、stream 与 WebSocket 持有的引用归零，再卸载 isolate；成功/失败 observation 和重试状态保留。静态资产响应同样持有 drain 引用。历史 rollback 继续使用该版本最近一次已激活的 immutable environment snapshot，即使 secret heads 此后移动也不重新按名称绑定。
-- 当前定向证据覆盖：partial PREPARE 时 production pointer 不创建、JCS digest/immutability/single-flight/非法状态迁移、pointer 与 plan 使用同一 generation、首次与替换中 cron 只观察 active 计划、proxy ACK 后才 active、prepare/activate/abort/drain 幂等、generation/plan 冲突拒绝、旧 lease drain 后 queue wire cutover、历史 snapshot rollback，以及 runtime request/stream/WebSocket drain 的底层引用模型。DeliveryReport 新增真实 \`phase\`，等待 proxy 时返回的 PREPARE 结果不再伪装成 ACTIVATE。
-- 本批仍不是 ADR-009 完成。当前 queue fence 的调用顺序仍在 routing pointer 提交和 proxy applied observation 之后，尚未证明 HTTP、queue 与 cron 的统一切换边界；多 Control 实例尚无 deployment coordinator owner lease；proxy/runtime 数据面仍依赖内网边界与共享节点密钥，未达到 per-node mTLS；300 秒 retention 与 30 秒 drain timeout 尚不可配置，也没有 emergency termination/audit。渐进双版本权重、稳定签名 affinity、短期 override、smoke/health gate、pause/resume/progress/abort、service-binding cohort 传播、deployment/version telemetry、provider driver 映射与 Cloudflare/EdgeOne/Deislet live evidence 均未实现。因此 P3-ROLL-001 保持 queued，P2-DATA-001 与 P0-SPEC-002 保持 active，不能将本地 reference/单元证据登记为 provider conformance。
+- 每个 API 调用、后台 reconcile 与到期 generation drain 现在使用独立 UUIDv7 coordinator owner；30 秒持久租约和 10 秒 heartbeat 在每次 runtime/queue 外部动作前同步续期。状态迁移、target/queue/drain observation、snapshot/secret/pointer commit 都在事务内复核 owner 与未过期 lease；终态和 drain 完成原子清除 owner，普通 pass 显式释放，过期后新 Control 可接管，旧 owner 的 observation、transition、pointer 或 drain 写入均被拒绝。回归覆盖 API 与本进程 reconciler 互斥、双 claim 单赢家、过期接管、stale owner 拒绝和终态清理。
+- 失败计划在 Queue/Runtime 补偿全部确认后立即删除未被 head/deployment/非终态 plan snapshot 引用的 staged secret ciphertext。后台每 300 秒扫描一次、以 24 小时保留窗和每批 1000 条上限清理 orphan revision；销毁前把 revision/application/environment/name/reason/time 写入不可更新、不可删除且不含 ciphertext 的 ledger。终态失败 plan 不再永久保活 staged revision；真实部署和可恢复非终态 plan 仍保守保留。
+- 当前定向证据覆盖：partial PREPARE 时 production pointer 不创建、queue lease 排空前返回 202/Location 且 deployment 为空、CLI 等待精确 plan/current pointer 并拒绝缺失 Location、候选 snapshot 可供 pre-commit reconcile、JCS digest/immutability/single-flight/非法状态迁移、pointer 与 plan 使用同一 generation、首次与替换中 cron 只观察 active 计划、proxy ACK 后才 queue/runtime ACTIVATE、queue PREPARE/ACTIVATE/ABORT 及 runtime prepare/activate/abort/drain 幂等、generation/plan 冲突拒绝、Queue owner 二元组回显与 Control 严格核验、exact abort tombstone 重试及错误 candidate 拒绝、过期 Ack/Nack stale、历史 snapshot rollback、owner lease 竞争/接管，以及 runtime request/stream/WebSocket drain 的底层引用模型。DeliveryReport 新增真实 `phase`，等待 queue/proxy 时返回的 PREPARE 结果不再伪装成 ACTIVATE。
+- 本批仍不是 ADR-009 完成。必须继续增加 runtime PREPARE、queue PREPARE、pointer/head CAS、proxy ACK、queue ACTIVATE、runtime ACTIVATE 每个持久化边界的进程崩溃/丢响应注入；当前 owner 竞争与本地回归不能替代多进程 HA 故障证据。snapshot retention/GC、secret retention 配置和销毁查询面仍未闭环。proxy/runtime 数据面仍依赖内网边界与共享节点密钥，未达到 per-node mTLS；300 秒 generation retention 与 30 秒 drain timeout 尚不可配置，也没有 emergency termination/audit。渐进双版本权重、稳定签名 affinity、短期 override、smoke/health gate、pause/resume/progress/abort、service-binding cohort 传播、deployment/version telemetry、provider driver 映射与 Cloudflare/EdgeOne/Deislet live evidence 均未实现。因此 P3-ROLL-001 保持 queued，P2-DATA-001 与 P0-SPEC-002 保持 active，不能将本地 reference/单元证据登记为 provider conformance。
+
+## 60. 机器身份与内部能力安全复核
+
+- 再次沿真实调用链检查 ADR-013 后确认，当前最危险的问题不是共享 PSK 的随机性，而是身份与权限被同一个 fleet bearer 联结。internet-facing Proxy 或任一 Runtime 一旦取得其中一个有效 PSK，即可在 machine router 上声称任意 node ID、读取全量 assignments 和 bundle、取得所有环境的明文 secret/materialized storage token、建立 proxy session 后提交 routing ACK，并调用所有 Runtime 的部署/触发/检查管理面。HTTP middleware 只产生 PSK fingerprint，不产生受密码学证明的 node principal；assignment 的 path node ID 只用于日志，内部仍先读取全量；Control TLS 当前不要求 client certificate。默认允许 HTTP 时，同网段被动窃取还会把单机事故扩大为全 fleet 管理权限。
+- 现有 `nodes`/SessionManager 与 HTTP RuntimeNodeManager 是两套 registry；不能把相同自由文本 node name 当成统一身份。正式 [ADR-025](../adr/025-machine-identity-and-capabilities.md) 因此固定统一 `MachinePrincipal`：每个 Control、Runtime、Proxy、Store、Queue、Telemetry 和 driver 实例一个不可复用主体，以 SPIFFE URI SAN 和 mTLS 证明；role、installation、placement 与授权由 Control 持久事实决定，请求 path/header/protobuf 自报值只能交叉校验。Human API、machine API 与 data plane 使用独立 listener/auth boundary，production 缺少 client trust、server identity、撤销状态或严格配置时 fail closed。
+- M1 持久化 principal、单次 enrollment、certificate/SPKI lineage、registration lease、assignment、revocation 与 security event；enroll 只在 server-auth TLS 下消费短期 token，renew 必须由当前 mTLS principal 对新 CSR 做持有证明。registration/assignment/bundle/routing/ACK/Runtime management 全部按 principal role 和 placement 限定；Proxy 只能读取/观察获配 routing，不能读取 assignment 或调用 Runtime，Runtime A 不能声称 Runtime B。部署冻结 target 与 observation 使用 principal ID，不再依赖可复用地址或 header。
+- M2 以短期 EdDSA JOSE capability 表达精确 audience、subject、tenant/binding、deployment/version/generation、operation/action、expiry、auth epoch 与 `cnf` key thumbprint。Store/Queue/Telemetry 同时验证 mTLS role、JWT signature/kid/time/audience/cnf 和 method→action/resource mapping；Control→Runtime 及 migration/restore 也使用 operation-scoped capability。当前 tenant-wide HMAC、fleet PSK 和静态 backend admin bearer 只能在 `dual` 迁移窗存在，不能算 production-secure。
+- 滚动顺序固定为 inventory/audit → 独立 machine listener 与 dual trust → routing/bundle/assignment read path → management actions → data capability → strict。每个 endpoint 只有在新路径正负测试通过、旧用量静默超过规定窗口后才不可逆关闭 legacy；不能先关 PSK 再滚节点，也不能在同一 human listener 上突然强制 client cert。strict readiness 要求 legacy usage 为零且配置/代码路径拒绝 PSK/shared HMAC/static bearer。
+- 验收必须使用真实 TLS listener，覆盖错误 CA/trust-domain/EKU/role/name、过期/未来/撤销证书、enrollment 并发单用、CSR SAN 注入、轮换 overlap、克隆实例 lease 竞争、跨 node/tenant/binding/action/audience/generation、偷取 JWT 但无 `cnf` 私钥、旧 auth epoch、长连接换证、dual 互操作、strict 无降级和日志/snapshot 无 secret。M1、M2、strict fleet 迁移与生产演练全部通过前，ADR-025 只能是已接受契约，不能登记为已实现。

@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "generatedFrom": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "c926687f7539453ab31776cd16f8341133d82a13",
+    "sourceCommit": "a41a4caadeaf8e5751ebe57ef5be673d18384654",
     "registryPath": "conformance/registry.json",
     "registrySnapshotPath": "standards/edge-canon.conformance-registry.json",
     "registrySha256": "172a12917926a1f74a8d582bfd6b1b5ff220c8001f0705b2f1cd5b33eab40622",

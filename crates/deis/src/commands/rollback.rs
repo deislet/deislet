@@ -93,6 +93,7 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
             },
             "deployment": after.deployment,
             "delivery": after.delivery,
+            "plan": after.plan,
         }))?;
     } else {
         println!(

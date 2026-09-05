@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-05T15:06:30+08:00",
+  "resolvedAt": "2026-09-05T18:55:33+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "c926687f7539453ab31776cd16f8341133d82a13",
+    "sourceCommit": "a41a4caadeaf8e5751ebe57ef5be673d18384654",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "webFetchEventsFixturePath": "conformance/harness/web-fetch-events/fixture.mjs",
     "webFetchEventsFixtureSha256": "1d58a3a6320952f70d476198ff95cd109c93c2c02925620a7d725918ca290523",
@@ -52,9 +52,9 @@
     "environmentPlatformEvidencePath": "conformance/evidence/environment-secrets-platforms-2026-09-05.json",
     "deploymentRequirementsPath": "standard/requirements/deployment-preview-rollback.zh.md",
     "deploymentPlanSchemaPath": "schemas/deployment-plan.schema.json",
-    "deploymentPlanSchemaSha256": "b76d519fdbed717676b5b0ee5f7a9f444e2ab42bc1e54c7c1af4eeffcc5f4615",
+    "deploymentPlanSchemaSha256": "d3666d95fcad76377cc3c53e936a6ac79347f53148c1b66840ae6cbcbb6c5ed7",
     "deploymentStatusSchemaPath": "schemas/deployment-status.schema.json",
-    "deploymentStatusSchemaSha256": "dd5b2a2ee8c57dc0f00cfb54b6a69204dda8a8681dd074cab1d5db0c47a47aa0",
+    "deploymentStatusSchemaSha256": "9e6805ff55a76e78c904b8a26eb708af6e6a4d5be3ca97929fb3071901c54fa6",
     "deploymentHarnessPath": "conformance/harness/deployment-preview-rollback/harness.json",
     "deploymentPlatformEvidencePath": "conformance/evidence/deployment-preview-rollback-platforms-2026-09-05.json",
     "conformanceKitPath": "conformance/kit.json",
@@ -82,7 +82,7 @@
     "upstreamCommand": "python3 scripts/check-governance.py",
     "upstreamResult": "passed",
     "expectedCapabilityFamilies": 15,
-    "expectedDraftClauses": 217,
+    "expectedDraftClauses": 223,
     "expectedConformanceSuites": 15,
     "expectedBackends": 4
   }

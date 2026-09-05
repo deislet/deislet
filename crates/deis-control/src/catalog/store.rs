@@ -28,9 +28,10 @@ use super::domains::{DomainGrant, EVERY_ENVIRONMENT, GrantPattern, HostClaim, gr
 use super::model::{
     App, Assignment, DeletedApp, DeployedVersion, Deployment, DeploymentDrainObservation,
     DeploymentGenerationDrain, DeploymentPlan, DeploymentProxyObservation,
-    DeploymentTargetObservation, Environment, MAX_ROUTES_PER_APP, MAX_ROUTES_PER_ENVIRONMENT,
-    RetiredAppName, Route, SecretMeta, Version, now_secs, validate_app_id,
-    validate_environment_name, validate_path_prefix, validate_route_priority, validate_secret_name,
+    DeploymentQueueObservation, DeploymentTargetObservation, Environment, MAX_ROUTES_PER_APP,
+    MAX_ROUTES_PER_ENVIRONMENT, RetiredAppName, Route, SecretMeta, Version, now_secs,
+    validate_app_id, validate_environment_name, validate_path_prefix, validate_route_priority,
+    validate_secret_name,
 };
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
@@ -45,6 +46,11 @@ const ROUTE_COLUMNS: &str = "id, app_id, env_id, host, path_prefix, priority";
 const RETIRED_NAME_COLUMNS: &str = "app_id, retired_at, environments, released_at";
 const DOMAIN_GRANT_COLUMNS: &str = "pattern, app_id, environment, created_at, note";
 const DEFAULT_GENERATION_RETENTION_SECONDS: i64 = 300;
+const DEPLOYMENT_PLAN_COLUMNS: &str = "id, routing_generation, app_id, env_id, version_id, snapshot_id, previous_deployment_id, previous_generation, expected_secret_heads, compare_secret_heads, target_ids, proxy_ids, policy, plan_sha256, state, note, last_error, coordinator_id, lease_expires_at, created_at, updated_at";
+const NONTERMINAL_DEPLOYMENT_PLAN_STATES: &str =
+    "'preparing','prepared','aborting','activating','reconciling','degraded'";
+const UNREFERENCED_SECRET_RETENTION_SECONDS: i64 = 24 * 60 * 60;
+const UNREFERENCED_SECRET_GC_BATCH_SIZE: i64 = 1_000;
 
 /// One compare-and-swap update to a secret head, committed with the new
 /// deployment snapshot that references it.
@@ -60,7 +66,7 @@ pub struct SecretHeadChange<'a> {
 /// run of booleans and vectors while the plan contract evolves.
 #[derive(Debug, Clone)]
 pub struct DeploymentPlanSpec {
-    pub snapshot_id: Option<String>,
+    pub snapshot: Option<EnvironmentBindingSnapshot>,
     pub expected_secret_heads: std::collections::BTreeMap<String, Option<String>>,
     pub compare_secret_heads: bool,
     pub target_ids: Vec<String>,
@@ -80,6 +86,7 @@ struct DeploymentActivation<'a> {
     note: Option<String>,
     secret_change: Option<(String, Option<String>, Option<String>)>,
     deployment_identity: Option<(String, CanonicalId)>,
+    coordinator_id: Option<CanonicalId>,
     advance_plan: bool,
 }
 
@@ -834,7 +841,10 @@ impl CatalogStore {
         env: &Environment,
         version: &Version,
         mut spec: DeploymentPlanSpec,
+        coordinator_id: CanonicalId,
+        lease_seconds: u64,
     ) -> CatalogResult<DeploymentPlan> {
+        let lease_seconds = deployment_lease_seconds(lease_seconds)?;
         if !matches!(
             spec.operation_kind.as_str(),
             "deployment" | "rollback" | "secret_change"
@@ -847,7 +857,34 @@ impl CatalogStore {
         spec.target_ids.dedup();
         spec.proxy_ids.sort();
         spec.proxy_ids.dedup();
-        let current = self.current_deployment(&env.id).await?;
+        let snapshot_record = spec
+            .snapshot
+            .take()
+            .map(|snapshot| {
+                if snapshot.deployment_version_id != version.id
+                    || snapshot.environment_id != env.canonical_id.to_string()
+                {
+                    return Err(CatalogError::invalid(
+                        "EC_ENV_SNAPSHOT_INVALID: snapshot is not bound to this version and environment",
+                    ));
+                }
+                let snapshot_id = snapshot
+                    .identity()
+                    .map_err(|error| CatalogError::invalid(error.to_string()))?;
+                let document = String::from_utf8(
+                    snapshot
+                        .canonical_json()
+                        .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                )
+                .map_err(|_| {
+                    CatalogError::invalid("EC_ENV_SNAPSHOT_INVALID: snapshot is not UTF-8")
+                })?;
+                Ok((snapshot_id, snapshot.declarations_sha256, document))
+            })
+            .transpose()?;
+        let snapshot_id = snapshot_record
+            .as_ref()
+            .map(|(snapshot_id, _, _)| snapshot_id.clone());
         let id = CanonicalId::new_v7().to_string();
         let routing_generation = CanonicalId::new_v7();
         let policy = serde_json::json!({
@@ -862,66 +899,22 @@ impl CatalogStore {
             "operation": spec.operation_kind,
             "secretChange": spec.secret_change,
         });
-        let expected_secret_heads_json = serde_json::to_string(&spec.expected_secret_heads)
-            .map_err(|error| CatalogError::invalid(error.to_string()))?;
-        let target_ids_json = serde_json::to_string(&spec.target_ids)
-            .map_err(|error| CatalogError::invalid(error.to_string()))?;
-        let policy_json = serde_json::to_string(&policy)
-            .map_err(|error| CatalogError::invalid(error.to_string()))?;
-        let immutable_document = serde_json::json!({
-            "id": id,
-            "routingGeneration": routing_generation.to_string(),
-            "applicationId": env.app_id,
-            "environmentId": env.id,
-            "versionId": version.id,
-            "snapshotId": spec.snapshot_id,
-            "previousDeploymentId": current.as_ref().map(|row| row.id.as_str()),
-            "previousGeneration": current.as_ref().map(|row| row.canonical_id.to_string()),
-            "expectedSecretHeads": spec.expected_secret_heads,
-            "compareSecretHeads": spec.compare_secret_heads,
-            "targetIds": spec.target_ids,
-            "proxyIds": spec.proxy_ids,
-            "policy": policy,
-            "note": spec.note,
-        });
-        let canonical = serde_jcs::to_vec(&immutable_document).map_err(|error| {
-            CatalogError::invalid(format!(
-                "deployment plan is not RFC 8785 canonical JSON: {error}"
-            ))
-        })?;
-        let plan_sha256 = hex::encode(Sha256::digest(canonical));
+        let app_id = env.app_id.clone();
+        let env_id = env.id.clone();
+        let version_id = version.id.clone();
         let now = now_secs();
-        let plan = DeploymentPlan {
-            id: id.clone(),
-            routing_generation,
-            app_id: env.app_id.clone(),
-            env_id: env.id.clone(),
-            version_id: version.id.clone(),
-            snapshot_id: spec.snapshot_id,
-            previous_deployment_id: current.as_ref().map(|row| row.id.clone()),
-            previous_generation: current.map(|row| row.canonical_id.to_string()),
-            expected_secret_heads: spec.expected_secret_heads,
-            compare_secret_heads: spec.compare_secret_heads,
-            target_ids: spec.target_ids,
-            proxy_ids: spec.proxy_ids,
-            policy,
-            plan_sha256,
-            state: "preparing".to_string(),
-            note: spec.note,
-            last_error: None,
-            created_at: now,
-            updated_at: now,
-        };
-        let inserted = plan.clone();
+        let lease_expires_at = now
+            .checked_add(lease_seconds)
+            .ok_or_else(|| CatalogError::invalid("deployment lease timestamp overflow"))?;
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let in_flight: Option<String> = tx
                 .query_row(
                     "SELECT id FROM deployment_plans
                       WHERE env_id = ?1
-                        AND state IN ('preparing','prepared','activating','reconciling','degraded')
+                        AND state IN ('preparing','prepared','aborting','activating','reconciling','degraded')
                       LIMIT 1",
-                    [&inserted.env_id],
+                    [&env_id],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -930,42 +923,126 @@ impl CatalogStore {
                     "deployment plan {existing} is already in progress for this environment"
                 )));
             }
+            // The baseline belongs to the same write transaction as the
+            // single-flight check and immutable plan insert. A second
+            // control process therefore cannot create a plan whose CAS
+            // baseline predates an intervening pointer commit.
+            let current = current_deployment(&tx, &env_id)?;
+            let previous_deployment_id = current.as_ref().map(|row| row.id.clone());
+            let previous_generation = current
+                .as_ref()
+                .map(|row| row.canonical_id.to_string());
+            let immutable_document = serde_json::json!({
+                "id": id,
+                "routingGeneration": routing_generation.to_string(),
+                "applicationId": app_id,
+                "environmentId": env_id,
+                "versionId": version_id,
+                "snapshotId": snapshot_id,
+                "previousDeploymentId": previous_deployment_id,
+                "previousGeneration": previous_generation,
+                "expectedSecretHeads": spec.expected_secret_heads,
+                "compareSecretHeads": spec.compare_secret_heads,
+                "targetIds": spec.target_ids,
+                "proxyIds": spec.proxy_ids,
+                "policy": policy,
+                "note": spec.note,
+            });
+            let canonical = serde_jcs::to_vec(&immutable_document).map_err(|error| {
+                CatalogError::invalid(format!(
+                    "deployment plan is not RFC 8785 canonical JSON: {error}"
+                ))
+            })?;
+            let plan = DeploymentPlan {
+                id,
+                routing_generation,
+                app_id,
+                env_id,
+                version_id,
+                snapshot_id,
+                previous_deployment_id,
+                previous_generation,
+                expected_secret_heads: spec.expected_secret_heads,
+                compare_secret_heads: spec.compare_secret_heads,
+                target_ids: spec.target_ids,
+                proxy_ids: spec.proxy_ids,
+                policy,
+                plan_sha256: hex::encode(Sha256::digest(canonical)),
+                state: "preparing".to_string(),
+                note: spec.note,
+                last_error: None,
+                coordinator_id: Some(coordinator_id),
+                lease_expires_at: Some(lease_expires_at),
+                created_at: now,
+                updated_at: now,
+            };
+            if let Some((snapshot_id, declarations_sha256, document)) = &snapshot_record {
+                tx.execute(
+                    "INSERT OR IGNORE INTO environment_binding_snapshots
+                         (snapshot_id, app_id, env_id, version_id, declarations_sha256, document, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        snapshot_id,
+                        plan.app_id,
+                        plan.env_id,
+                        plan.version_id,
+                        declarations_sha256,
+                        document,
+                        plan.created_at,
+                    ],
+                )?;
+                let existing: String = tx.query_row(
+                    "SELECT document FROM environment_binding_snapshots WHERE snapshot_id = ?1",
+                    [snapshot_id],
+                    |row| row.get(0),
+                )?;
+                if existing != *document {
+                    return Err(CatalogError::conflict(
+                        "EC_ENV_SNAPSHOT_IDENTITY_COLLISION: snapshot identity names different content",
+                    ));
+                }
+            }
             tx.execute(
                 "INSERT INTO deployment_plans
                    (id, routing_generation, app_id, env_id, version_id, snapshot_id,
                     previous_deployment_id, previous_generation, expected_secret_heads,
                     compare_secret_heads, target_ids, proxy_ids, policy, plan_sha256, state, note, last_error,
-                    created_at, updated_at)
+                    coordinator_id, lease_expires_at, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                         ?14, ?15, ?16, NULL, ?17, ?17)",
+                         ?14, ?15, ?16, NULL, ?17, ?18, ?19, ?19)",
                 params![
-                    inserted.id,
-                    inserted.routing_generation.to_string(),
-                    inserted.app_id,
-                    inserted.env_id,
-                    inserted.version_id,
-                    inserted.snapshot_id,
-                    inserted.previous_deployment_id,
-                    inserted.previous_generation,
-                    expected_secret_heads_json,
-                    inserted.compare_secret_heads,
-                    target_ids_json,
-                    serde_json::to_string(&inserted.proxy_ids)
+                    plan.id,
+                    plan.routing_generation.to_string(),
+                    plan.app_id,
+                    plan.env_id,
+                    plan.version_id,
+                    plan.snapshot_id,
+                    plan.previous_deployment_id,
+                    plan.previous_generation,
+                    serde_json::to_string(&plan.expected_secret_heads)
                         .map_err(|error| CatalogError::invalid(error.to_string()))?,
-                    policy_json,
-                    inserted.plan_sha256,
-                    inserted.state,
-                    inserted.note,
-                    inserted.created_at,
+                    plan.compare_secret_heads,
+                    serde_json::to_string(&plan.target_ids)
+                        .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                    serde_json::to_string(&plan.proxy_ids)
+                        .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                    serde_json::to_string(&plan.policy)
+                        .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                    plan.plan_sha256,
+                    plan.state,
+                    plan.note,
+                    plan.coordinator_id.map(|id| id.to_string()),
+                    plan.lease_expires_at,
+                    plan.created_at,
                 ],
             )?;
             tx.execute(
                 "INSERT INTO deployment_events
                    (plan_id, from_state, to_state, detail, created_at)
                  VALUES (?1, NULL, 'preparing', 'plan persisted before prepare', ?2)",
-                params![inserted.id, inserted.created_at],
+                params![plan.id, plan.created_at],
             )?;
-            if let Some(generation) = inserted.previous_generation.as_deref() {
+            if let Some(generation) = plan.previous_generation.as_deref() {
                 // The old generation lives on the previous plan's frozen
                 // runtime set, not necessarily on this plan's set. A scale
                 // change between the two deployments must not strand an old
@@ -973,7 +1050,7 @@ impl CatalogStore {
                 // deployment rows have no plan to consult, so the current
                 // serving set is the only truthful fallback available.
                 let previous_targets_json: Option<String> =
-                    if let Some(previous_id) = inserted.previous_deployment_id.as_deref() {
+                    if let Some(previous_id) = plan.previous_deployment_id.as_deref() {
                         tx.query_row(
                             "SELECT target_ids FROM deployment_plans WHERE id = ?1",
                             [previous_id],
@@ -992,37 +1069,32 @@ impl CatalogStore {
                         })
                     })
                     .transpose()?
-                    .unwrap_or_else(|| inserted.target_ids.clone());
+                    .unwrap_or_else(|| plan.target_ids.clone());
                 tx.execute(
                     "INSERT INTO deployment_generation_drains
                        (plan_id, generation, target_ids, not_before, state, last_error, updated_at)
                      VALUES (?1, ?2, ?3, ?4, 'retained', NULL, ?5)",
                     params![
-                        inserted.id,
+                        plan.id,
                         generation,
                         serde_json::to_string(&drain_target_ids)
                             .map_err(|error| CatalogError::invalid(error.to_string()))?,
-                        inserted.created_at.saturating_add(DEFAULT_GENERATION_RETENTION_SECONDS),
-                        inserted.created_at,
+                        plan.created_at.saturating_add(DEFAULT_GENERATION_RETENTION_SECONDS),
+                        plan.created_at,
                     ],
                 )?;
             }
             tx.commit()?;
-            Ok(())
+            Ok(plan)
         })
-        .await?;
-        Ok(plan)
+        .await
     }
 
     pub async fn deployment_plan(&self, id: &str) -> CatalogResult<DeploymentPlan> {
         let id = id.to_string();
         self.with_conn(move |conn| {
             conn.query_row(
-                "SELECT id, routing_generation, app_id, env_id, version_id, snapshot_id,
-                        previous_deployment_id, previous_generation, expected_secret_heads,
-                        compare_secret_heads, target_ids, proxy_ids, policy,
-                        plan_sha256, state, note, last_error, created_at, updated_at
-                   FROM deployment_plans WHERE id = ?1",
+                &format!("SELECT {DEPLOYMENT_PLAN_COLUMNS} FROM deployment_plans WHERE id = ?1"),
                 [&id],
                 map_deployment_plan,
             )
@@ -1039,11 +1111,9 @@ impl CatalogStore {
         let generation = generation.to_string();
         self.with_conn(move |conn| {
             conn.query_row(
-                "SELECT id, routing_generation, app_id, env_id, version_id, snapshot_id,
-                        previous_deployment_id, previous_generation, expected_secret_heads,
-                        compare_secret_heads, target_ids, proxy_ids, policy, plan_sha256, state, note, last_error,
-                        created_at, updated_at
-                   FROM deployment_plans WHERE routing_generation = ?1",
+                &format!(
+                    "SELECT {DEPLOYMENT_PLAN_COLUMNS} FROM deployment_plans WHERE routing_generation = ?1"
+                ),
                 [&generation],
                 map_deployment_plan,
             )
@@ -1055,19 +1125,207 @@ impl CatalogStore {
 
     pub async fn nonterminal_deployment_plans(&self) -> CatalogResult<Vec<DeploymentPlan>> {
         self.with_conn(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT id, routing_generation, app_id, env_id, version_id, snapshot_id,
-                        previous_deployment_id, previous_generation, expected_secret_heads,
-                        compare_secret_heads, target_ids, proxy_ids, policy, plan_sha256, state,
-                        note, last_error, created_at, updated_at
-                   FROM deployment_plans
-                  WHERE state IN ('preparing','prepared','activating','reconciling','degraded')
-                  ORDER BY created_at, id",
-            )?;
+            let mut statement = conn.prepare(&format!(
+                "SELECT {DEPLOYMENT_PLAN_COLUMNS} FROM deployment_plans
+                  WHERE state IN ({NONTERMINAL_DEPLOYMENT_PLAN_STATES})
+                  ORDER BY created_at, id"
+            ))?;
             statement
                 .query_map([], map_deployment_plan)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    /// Claim one non-terminal deployment plan for a single coordination
+    /// attempt. A different owner may take it only after the prior lease has
+    /// expired; API and background attempts use distinct owner identities so
+    /// they cannot run the same plan concurrently even inside one process.
+    pub async fn claim_deployment_plan(
+        &self,
+        id: &str,
+        coordinator_id: CanonicalId,
+        lease_seconds: u64,
+    ) -> CatalogResult<DeploymentPlan> {
+        let lease_seconds = deployment_lease_seconds(lease_seconds)?;
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = now_secs();
+            let expires_at = now
+                .checked_add(lease_seconds)
+                .ok_or_else(|| CatalogError::invalid("deployment lease timestamp overflow"))?;
+            let changed = conn.execute(
+                &format!(
+                    "UPDATE deployment_plans
+                        SET coordinator_id = ?2, lease_expires_at = ?3
+                      WHERE id = ?1
+                        AND state IN ({NONTERMINAL_DEPLOYMENT_PLAN_STATES})
+                        AND (coordinator_id IS NULL OR lease_expires_at <= ?4)"
+                ),
+                params![id, coordinator_id.to_string(), expires_at, now],
+            )?;
+            if changed != 1 {
+                let holder: Option<(String, Option<String>, Option<i64>)> = conn
+                    .query_row(
+                        "SELECT state, coordinator_id, lease_expires_at
+                           FROM deployment_plans WHERE id = ?1",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                return match holder {
+                    None => Err(CatalogError::not_found(format!("deployment plan {id}"))),
+                    Some((state, owner, expires_at)) => {
+                        let expires_at = expires_at
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "no expiry".to_string());
+                        Err(CatalogError::conflict(format!(
+                            "deployment plan {id} in state {state} is leased by {} until {expires_at}",
+                            owner.as_deref().unwrap_or("nobody"),
+                        )))
+                    }
+                };
+            }
+            conn.query_row(
+                &format!("SELECT {DEPLOYMENT_PLAN_COLUMNS} FROM deployment_plans WHERE id = ?1"),
+                [&id],
+                map_deployment_plan,
+            )
+            .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    /// Claim the retained-generation cleanup that follows an otherwise
+    /// terminal active deployment. Activation clears its coordinator lease;
+    /// the later drain pass obtains a fresh owner so runtime DRAIN cannot race
+    /// across Control replicas either.
+    pub async fn claim_deployment_generation_drain(
+        &self,
+        id: &str,
+        coordinator_id: CanonicalId,
+        lease_seconds: u64,
+    ) -> CatalogResult<DeploymentPlan> {
+        let lease_seconds = deployment_lease_seconds(lease_seconds)?;
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = now_secs();
+            let expires_at = now
+                .checked_add(lease_seconds)
+                .ok_or_else(|| CatalogError::invalid("deployment lease timestamp overflow"))?;
+            let changed = conn.execute(
+                "UPDATE deployment_plans
+                    SET coordinator_id = ?2, lease_expires_at = ?3
+                  WHERE id = ?1 AND state = 'active'
+                    AND (coordinator_id IS NULL OR lease_expires_at <= ?4)
+                    AND EXISTS (
+                        SELECT 1 FROM deployment_generation_drains drain
+                         WHERE drain.plan_id = deployment_plans.id
+                           AND drain.state IN ('retained','draining')
+                    )",
+                params![id, coordinator_id.to_string(), expires_at, now],
+            )?;
+            if changed != 1 {
+                return Err(CatalogError::conflict(format!(
+                    "deployment generation drain {id} is terminal or already leased"
+                )));
+            }
+            conn.query_row(
+                &format!("SELECT {DEPLOYMENT_PLAN_COLUMNS} FROM deployment_plans WHERE id = ?1"),
+                [&id],
+                map_deployment_plan,
+            )
+            .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    /// Extend a live lease. An owner that let its lease expire cannot revive
+    /// it with renew: it must claim again, after which it receives a fresh
+    /// owner identity at the API/reconciler boundary.
+    pub async fn renew_deployment_plan_lease(
+        &self,
+        id: &str,
+        coordinator_id: CanonicalId,
+        lease_seconds: u64,
+    ) -> CatalogResult<()> {
+        let lease_seconds = deployment_lease_seconds(lease_seconds)?;
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = now_secs();
+            let expires_at = now
+                .checked_add(lease_seconds)
+                .ok_or_else(|| CatalogError::invalid("deployment lease timestamp overflow"))?;
+            let changed = conn.execute(
+                &format!(
+                    "UPDATE deployment_plans SET lease_expires_at = ?3
+                      WHERE id = ?1 AND coordinator_id = ?2
+                        AND lease_expires_at > ?4
+                        AND (state IN ({NONTERMINAL_DEPLOYMENT_PLAN_STATES})
+                             OR (state = 'active' AND EXISTS (
+                                 SELECT 1 FROM deployment_generation_drains drain
+                                  WHERE drain.plan_id = deployment_plans.id
+                                    AND drain.state IN ('retained','draining')
+                             )))"
+                ),
+                params![id, coordinator_id.to_string(), expires_at, now],
+            )?;
+            if changed != 1 {
+                return Err(CatalogError::conflict(format!(
+                    "deployment plan {id} is no longer leased by coordinator {coordinator_id}"
+                )));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Release a plan at the end of one bounded pass. Deployment terminal
+    /// transitions and retained-generation drain completion already clear the
+    /// lease in their own transaction, so a repeated release is also success.
+    pub async fn release_deployment_plan_lease(
+        &self,
+        id: &str,
+        coordinator_id: CanonicalId,
+    ) -> CatalogResult<()> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let changed = conn.execute(
+                "UPDATE deployment_plans
+                    SET coordinator_id = NULL, lease_expires_at = NULL
+                  WHERE id = ?1 AND coordinator_id = ?2",
+                params![id, coordinator_id.to_string()],
+            )?;
+            if changed == 1 {
+                return Ok(());
+            }
+            let owner: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT coordinator_id FROM deployment_plans WHERE id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match owner {
+                None => Err(CatalogError::not_found(format!("deployment plan {id}"))),
+                Some(None) => Ok(()),
+                Some(Some(owner)) => Err(CatalogError::conflict(format!(
+                    "deployment plan {id} is leased by coordinator {owner}, not {coordinator_id}"
+                ))),
+            }
+        })
+        .await
+    }
+
+    pub async fn assert_deployment_plan_lease(
+        &self,
+        id: &str,
+        coordinator_id: CanonicalId,
+    ) -> CatalogResult<()> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            require_deployment_plan_lease(conn, &id, coordinator_id, now_secs())
         })
         .await
     }
@@ -1078,11 +1336,13 @@ impl CatalogStore {
         expected_state: &str,
         next_state: &str,
         detail: Option<&str>,
+        coordinator_id: CanonicalId,
     ) -> CatalogResult<DeploymentPlan> {
         let allowed = matches!(
             (expected_state, next_state),
-            ("preparing", "prepared" | "failed" | "aborted")
-                | ("prepared", "failed" | "aborted")
+            ("preparing", "prepared" | "aborting")
+                | ("prepared", "aborting")
+                | ("aborting", "failed" | "aborted")
                 | ("activating", "active" | "reconciling" | "degraded")
                 | ("reconciling", "active" | "degraded")
                 | ("degraded", "active" | "reconciling")
@@ -1098,11 +1358,25 @@ impl CatalogStore {
         let detail = detail.map(str::to_string);
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
+            let now = now_secs();
+            require_deployment_plan_lease(&tx, &id, coordinator_id, now)?;
+            let terminal = matches!(next_state.as_str(), "active" | "failed" | "aborted");
             let changed = tx.execute(
                 "UPDATE deployment_plans
-                    SET state = ?1, last_error = ?2, updated_at = ?3
-                  WHERE id = ?4 AND state = ?5",
-                params![next_state, detail, now_secs(), id, expected_state],
+                    SET state = ?1, last_error = ?2, updated_at = ?3,
+                        coordinator_id = CASE WHEN ?6 THEN NULL ELSE coordinator_id END,
+                        lease_expires_at = CASE WHEN ?6 THEN NULL ELSE lease_expires_at END
+                  WHERE id = ?4 AND state = ?5 AND coordinator_id = ?7
+                    AND lease_expires_at > ?3",
+                params![
+                    next_state,
+                    detail,
+                    now,
+                    id,
+                    expected_state,
+                    terminal,
+                    coordinator_id.to_string()
+                ],
             )?;
             if changed != 1 {
                 let actual: Option<String> = tx
@@ -1121,15 +1395,11 @@ impl CatalogStore {
                 "INSERT INTO deployment_events
                    (plan_id, from_state, to_state, detail, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, expected_state, next_state, detail, now_secs()],
+                params![id, expected_state, next_state, detail, now],
             )?;
             tx.commit()?;
             conn.query_row(
-                "SELECT id, routing_generation, app_id, env_id, version_id, snapshot_id,
-                        previous_deployment_id, previous_generation, expected_secret_heads,
-                        compare_secret_heads, target_ids, proxy_ids, policy,
-                        plan_sha256, state, note, last_error, created_at, updated_at
-                   FROM deployment_plans WHERE id = ?1",
+                &format!("SELECT {DEPLOYMENT_PLAN_COLUMNS} FROM deployment_plans WHERE id = ?1"),
                 [&id],
                 map_deployment_plan,
             )
@@ -1141,9 +1411,17 @@ impl CatalogStore {
     pub async fn record_deployment_target_observation(
         &self,
         observation: DeploymentTargetObservation,
+        coordinator_id: CanonicalId,
     ) -> CatalogResult<()> {
         self.with_conn(move |conn| {
-            conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            require_deployment_plan_lease(
+                &tx,
+                &observation.plan_id,
+                coordinator_id,
+                now_secs(),
+            )?;
+            tx.execute(
                 "INSERT INTO deployment_target_observations
                    (plan_id, node_id, observed_state, version_id, routing_generation, message, observed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1163,6 +1441,7 @@ impl CatalogStore {
                     observation.observed_at,
                 ],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -1250,6 +1529,79 @@ impl CatalogStore {
                 })?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    pub async fn record_deployment_queue_observation(
+        &self,
+        observation: DeploymentQueueObservation,
+        coordinator_id: CanonicalId,
+    ) -> CatalogResult<()> {
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            require_deployment_plan_lease(&tx, &observation.plan_id, coordinator_id, now_secs())?;
+            tx.execute(
+                "INSERT INTO deployment_queue_observations
+                   (plan_id, observed_state, active_generation, active_deployment_id,
+                    pending_generation, pending_deployment_id, outstanding_leases, message,
+                    observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(plan_id) DO UPDATE SET
+                   observed_state = excluded.observed_state,
+                   active_generation = excluded.active_generation,
+                   active_deployment_id = excluded.active_deployment_id,
+                   pending_generation = excluded.pending_generation,
+                   pending_deployment_id = excluded.pending_deployment_id,
+                   outstanding_leases = excluded.outstanding_leases,
+                   message = excluded.message,
+                   observed_at = excluded.observed_at",
+                params![
+                    observation.plan_id,
+                    observation.observed_state,
+                    observation.active_generation,
+                    observation.active_deployment_id,
+                    observation.pending_generation,
+                    observation.pending_deployment_id,
+                    observation.outstanding_leases,
+                    observation.message,
+                    observation.observed_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn deployment_queue_observation(
+        &self,
+        plan_id: &str,
+    ) -> CatalogResult<Option<DeploymentQueueObservation>> {
+        let plan_id = plan_id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT plan_id, observed_state, active_generation, active_deployment_id,
+                        pending_generation, pending_deployment_id, outstanding_leases, message,
+                        observed_at
+                   FROM deployment_queue_observations WHERE plan_id = ?1",
+                [plan_id],
+                |row| {
+                    Ok(DeploymentQueueObservation {
+                        plan_id: row.get(0)?,
+                        observed_state: row.get(1)?,
+                        active_generation: row.get(2)?,
+                        active_deployment_id: row.get(3)?,
+                        pending_generation: row.get(4)?,
+                        pending_deployment_id: row.get(5)?,
+                        outstanding_leases: row.get(6)?,
+                        message: row.get(7)?,
+                        observed_at: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(CatalogError::from)
         })
         .await
     }
@@ -1386,9 +1738,12 @@ impl CatalogStore {
     pub async fn record_deployment_drain_observation(
         &self,
         observation: DeploymentDrainObservation,
+        coordinator_id: CanonicalId,
     ) -> CatalogResult<()> {
         self.with_conn(move |conn| {
-            conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            require_deployment_plan_lease(&tx, &observation.plan_id, coordinator_id, now_secs())?;
+            tx.execute(
                 "INSERT INTO deployment_drain_observations
                    (plan_id, node_id, generation, observed_state, message, observed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1406,6 +1761,7 @@ impl CatalogStore {
                     observation.observed_at,
                 ],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -1443,6 +1799,7 @@ impl CatalogStore {
         plan_id: &str,
         state: &str,
         last_error: Option<&str>,
+        coordinator_id: CanonicalId,
     ) -> CatalogResult<()> {
         if !matches!(state, "draining" | "drained") {
             return Err(CatalogError::invalid("unknown deployment drain state"));
@@ -1452,6 +1809,17 @@ impl CatalogStore {
         let last_error = last_error.map(str::to_string);
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
+            let actual: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM deployment_generation_drains WHERE plan_id = ?1",
+                    [&plan_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual.as_deref() == Some("drained") && state == "drained" {
+                return Ok(());
+            }
+            require_deployment_plan_lease(&tx, &plan_id, coordinator_id, now_secs())?;
             let changed = tx.execute(
                 "UPDATE deployment_generation_drains
                     SET state = ?1, last_error = ?2, updated_at = ?3
@@ -1459,22 +1827,23 @@ impl CatalogStore {
                 params![state, last_error, now_secs(), plan_id],
             )?;
             if changed == 0 {
-                let actual: Option<String> = tx
-                    .query_row(
-                        "SELECT state FROM deployment_generation_drains WHERE plan_id = ?1",
-                        [&plan_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if actual.as_deref() == Some("drained") && state == "drained" {
-                    return Ok(());
-                }
                 return Err(CatalogError::conflict(format!(
                     "deployment generation drain {plan_id} is {}",
                     actual.as_deref().unwrap_or("missing")
                 )));
             }
             if state == "drained" {
+                let released = tx.execute(
+                    "UPDATE deployment_plans
+                        SET coordinator_id = NULL, lease_expires_at = NULL
+                      WHERE id = ?1 AND state = 'active' AND coordinator_id = ?2",
+                    params![plan_id, coordinator_id.to_string()],
+                )?;
+                if released != 1 {
+                    return Err(CatalogError::conflict(format!(
+                        "deployment generation drain {plan_id} lost its coordinator lease"
+                    )));
+                }
                 tx.execute(
                     "INSERT INTO deployment_events
                        (plan_id, from_state, to_state, detail, created_at)
@@ -1496,6 +1865,7 @@ impl CatalogStore {
         plan: &DeploymentPlan,
         env: &Environment,
         snapshot: Option<&EnvironmentBindingSnapshot>,
+        coordinator_id: CanonicalId,
     ) -> CatalogResult<Deployment> {
         if plan.state != "prepared"
             || plan.app_id != env.app_id
@@ -1509,6 +1879,21 @@ impl CatalogStore {
         {
             return Err(CatalogError::conflict(
                 "deployment plan is not a prepared plan for this exact environment snapshot",
+            ));
+        }
+        self.assert_deployment_plan_lease(&plan.id, coordinator_id)
+            .await?;
+        if let Some(existing) = self.deployment_by_id(&plan.id).await? {
+            if existing.canonical_id == plan.routing_generation
+                && existing.app_id == plan.app_id
+                && existing.env_id == plan.env_id
+                && existing.version_id == plan.version_id
+                && existing.snapshot_id == plan.snapshot_id
+            {
+                return Ok(existing);
+            }
+            return Err(CatalogError::conflict(
+                "deployment plan identity is already bound to another pointer",
             ));
         }
         if let Some(snapshot) = snapshot {
@@ -1576,6 +1961,7 @@ impl CatalogStore {
                     note: plan.note.clone(),
                     secret_change,
                     deployment_identity: Some((plan.id.clone(), plan.routing_generation)),
+                    coordinator_id: Some(coordinator_id),
                     advance_plan: true,
                 })
                 .await;
@@ -1598,7 +1984,29 @@ impl CatalogStore {
         let inserted = deployment.clone();
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
+            let now = now_secs();
+            require_deployment_plan_lease(&tx, &inserted.id, coordinator_id, now)?;
             load_version(&tx, &inserted.app_id, &inserted.version_id)?;
+            if let Some(existing) = tx
+                .query_row(
+                    &format!("SELECT {DEPLOYMENT_COLUMNS} FROM deployments WHERE id = ?1"),
+                    [&inserted.id],
+                    map_deployment,
+                )
+                .optional()?
+            {
+                if existing.canonical_id == inserted.canonical_id
+                    && existing.app_id == inserted.app_id
+                    && existing.env_id == inserted.env_id
+                    && existing.version_id == inserted.version_id
+                    && existing.snapshot_id == inserted.snapshot_id
+                {
+                    return Ok(());
+                }
+                return Err(CatalogError::conflict(
+                    "deployment plan identity is already bound to another pointer",
+                ));
+            }
             let current = current_deployment(&tx, &inserted.env_id)?;
             if current.as_ref().map(|row| row.id.as_str()) != expected.as_deref() {
                 return Err(CatalogError::conflict(
@@ -1622,8 +2030,9 @@ impl CatalogStore {
             let advanced = tx.execute(
                 "UPDATE deployment_plans
                     SET state = 'activating', last_error = NULL, updated_at = ?1
-                  WHERE id = ?2 AND state = 'prepared'",
-                params![now_secs(), inserted.id],
+                  WHERE id = ?2 AND state = 'prepared' AND coordinator_id = ?3
+                    AND lease_expires_at > ?1",
+                params![now, inserted.id, coordinator_id.to_string()],
             )?;
             if advanced != 1 {
                 return Err(CatalogError::conflict(
@@ -1722,6 +2131,7 @@ impl CatalogStore {
             note,
             secret_change: None,
             deployment_identity: None,
+            coordinator_id: None,
             advance_plan: false,
         })
         .await
@@ -1747,6 +2157,7 @@ impl CatalogStore {
             note,
             secret_change: None,
             deployment_identity: None,
+            coordinator_id: None,
             advance_plan: false,
         })
         .await
@@ -1783,6 +2194,7 @@ impl CatalogStore {
                 change.expected_revision.map(str::to_string),
             )),
             deployment_identity: None,
+            coordinator_id: None,
             advance_plan: false,
         })
         .await
@@ -1801,6 +2213,7 @@ impl CatalogStore {
             note,
             secret_change,
             deployment_identity,
+            coordinator_id,
             advance_plan,
         } = activation;
         if snapshot.deployment_version_id != version_id
@@ -1829,7 +2242,36 @@ impl CatalogStore {
         let deployment = self
             .with_conn(move |conn| {
                 let tx = conn.unchecked_transaction()?;
+                let now = now_secs();
+                if let (Some((plan_id, _)), Some(coordinator_id)) =
+                    (deployment_identity.as_ref(), coordinator_id)
+                {
+                    require_deployment_plan_lease(&tx, plan_id, coordinator_id, now)?;
+                }
                 let version = load_version(&tx, &app_id, &version_id)?;
+                if let Some((planned_id, planned_generation)) = deployment_identity.as_ref()
+                    && let Some(existing) = tx
+                        .query_row(
+                            &format!(
+                                "SELECT {DEPLOYMENT_COLUMNS} FROM deployments WHERE id = ?1"
+                            ),
+                            [planned_id],
+                            map_deployment,
+                        )
+                        .optional()?
+                {
+                    if existing.canonical_id == *planned_generation
+                        && existing.app_id == app_id
+                        && existing.env_id == env_id
+                        && existing.version_id == version.id
+                        && existing.snapshot_id.as_deref() == Some(snapshot_id.as_str())
+                    {
+                        return Ok(existing);
+                    }
+                    return Err(CatalogError::conflict(
+                        "deployment plan identity is already bound to another pointer",
+                    ));
+                }
                 let current = current_deployment(&tx, &env_id)?;
                 if current.as_ref().map(|row| row.id.as_str()) != expected.as_deref() {
                     return Err(CatalogError::conflict(
@@ -1952,11 +2394,17 @@ impl CatalogStore {
                     ],
                 )?;
                 if advance_plan {
+                    let coordinator_id = coordinator_id.ok_or_else(|| {
+                        CatalogError::invalid(
+                            "deployment plan activation requires a coordinator lease",
+                        )
+                    })?;
                     let advanced = tx.execute(
                         "UPDATE deployment_plans
                             SET state = 'activating', last_error = NULL, updated_at = ?1
-                          WHERE id = ?2 AND state = 'prepared'",
-                        params![now_secs(), deployment.id],
+                          WHERE id = ?2 AND state = 'prepared' AND coordinator_id = ?3
+                            AND lease_expires_at > ?1",
+                        params![now, deployment.id, coordinator_id.to_string()],
                     )?;
                     if advanced != 1 {
                         return Err(CatalogError::conflict(
@@ -2052,6 +2500,23 @@ impl CatalogStore {
         let env_id = env_id.to_string();
         self.with_conn(move |conn| current_deployment(conn, &env_id))
             .await
+    }
+
+    /// Find the immutable pointer created by a strict plan. Used to resolve a
+    /// commit response whose outcome was unknown without issuing an abort
+    /// against work that may already be live.
+    pub async fn deployment_by_id(&self, id: &str) -> CatalogResult<Option<Deployment>> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                &format!("SELECT {DEPLOYMENT_COLUMNS} FROM deployments WHERE id = ?1"),
+                [id],
+                map_deployment,
+            )
+            .optional()
+            .map_err(CatalogError::from)
+        })
+        .await
     }
 
     /// Deployment history, newest first.
@@ -2608,36 +3073,18 @@ impl CatalogStore {
         let revision = revision.to_string();
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
-            let head_refs: i64 = tx.query_row(
-                "SELECT count(*) FROM secret_heads WHERE revision_id = ?1",
-                params![revision],
-                |row| row.get(0),
-            )?;
-            if head_refs != 0 {
+            if secret_revision_is_live(&tx, &revision)? {
                 return Ok(false);
             }
-            let mut statement = tx.prepare("SELECT document FROM environment_binding_snapshots")?;
-            let documents = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(statement);
-            for document in documents {
-                let snapshot: EnvironmentBindingSnapshot = serde_json::from_str(&document)
-                    .map_err(|_| {
-                        CatalogError::BundleStorage(
-                            "stored environment snapshot is no longer valid JSON".to_string(),
-                        )
-                    })?;
-                if snapshot.bindings.iter().any(|binding| {
-                    matches!(
-                        binding,
-                        deis_wire::EnvironmentBinding::Secret(secret)
-                            if secret.revision == revision
-                    )
-                }) {
-                    return Ok(false);
-                }
-            }
+            tx.execute(
+                "INSERT OR IGNORE INTO secret_revision_destructions
+                     (revision_id, app_id, env_id, name, reason, destroyed_at)
+                 SELECT revision_id, app_id, env_id, name,
+                        'unreferenced-staging-cleanup', ?4
+                   FROM secret_revisions
+                  WHERE revision_id = ?1 AND env_id = ?2 AND name = ?3",
+                params![revision, env_id, name, now_secs()],
+            )?;
             let removed = tx.execute(
                 "DELETE FROM secret_revisions
                   WHERE revision_id = ?1 AND env_id = ?2 AND name = ?3",
@@ -2645,6 +3092,64 @@ impl CatalogStore {
             )?;
             tx.commit()?;
             Ok(removed == 1)
+        })
+        .await
+    }
+
+    /// Retain an orphan long enough for the request that staged it to create
+    /// its plan, then destroy ciphertext that is neither a current head nor
+    /// reachable from a deployed or restartable snapshot. The destruction
+    /// ledger contains identity and reason only, never ciphertext.
+    pub async fn reap_unreferenced_secret_revisions(&self, now: i64) -> CatalogResult<Vec<String>> {
+        let cutoff = now.saturating_sub(UNREFERENCED_SECRET_RETENTION_SECONDS);
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let candidates = {
+                let mut statement = tx.prepare(
+                    "SELECT revision_id, env_id, name
+                       FROM secret_revisions revision
+                      WHERE revision.created_at <= ?1
+                        AND NOT EXISTS (
+                            SELECT 1 FROM secret_heads head
+                             WHERE head.revision_id = revision.revision_id
+                        )
+                      ORDER BY revision.created_at, revision.revision_id
+                      LIMIT ?2",
+                )?;
+                statement
+                    .query_map(params![cutoff, UNREFERENCED_SECRET_GC_BATCH_SIZE], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut removed = Vec::new();
+            for (revision, env_id, name) in candidates {
+                if secret_revision_is_live(&tx, &revision)? {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO secret_revision_destructions
+                         (revision_id, app_id, env_id, name, reason, destroyed_at)
+                     SELECT revision_id, app_id, env_id, name,
+                            'unreferenced-retention-expired', ?2
+                       FROM secret_revisions WHERE revision_id = ?1",
+                    params![revision, now],
+                )?;
+                if tx.execute(
+                    "DELETE FROM secret_revisions
+                      WHERE revision_id = ?1 AND env_id = ?2 AND name = ?3",
+                    params![revision, env_id, name],
+                )? == 1
+                {
+                    removed.push(revision);
+                }
+            }
+            tx.commit()?;
+            Ok(removed)
         })
         .await
     }
@@ -3359,6 +3864,44 @@ fn current_deployment(conn: &Connection, env_id: &str) -> CatalogResult<Option<D
     Ok(deployment)
 }
 
+fn deployment_lease_seconds(lease_seconds: u64) -> CatalogResult<i64> {
+    if !(5..=300).contains(&lease_seconds) {
+        return Err(CatalogError::invalid(
+            "deployment coordinator lease must be 5..=300 seconds",
+        ));
+    }
+    i64::try_from(lease_seconds)
+        .map_err(|_| CatalogError::invalid("deployment lease exceeds SQLite range"))
+}
+
+fn require_deployment_plan_lease(
+    conn: &Connection,
+    id: &str,
+    coordinator_id: CanonicalId,
+    now: i64,
+) -> CatalogResult<()> {
+    let held: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM deployment_plans
+              WHERE id = ?1 AND coordinator_id = ?2 AND lease_expires_at > ?3
+                AND (state IN ({NONTERMINAL_DEPLOYMENT_PLAN_STATES})
+                     OR (state = 'active' AND EXISTS (
+                         SELECT 1 FROM deployment_generation_drains drain
+                          WHERE drain.plan_id = deployment_plans.id
+                            AND drain.state IN ('retained','draining')
+                     )))"
+        ),
+        params![id, coordinator_id.to_string(), now],
+        |row| row.get(0),
+    )?;
+    if held != 1 {
+        return Err(CatalogError::conflict(format!(
+            "deployment plan {id} is no longer leased by coordinator {coordinator_id}"
+        )));
+    }
+    Ok(())
+}
+
 fn map_deployment_plan(row: &Row<'_>) -> rusqlite::Result<DeploymentPlan> {
     let routing_generation: String = row.get(1)?;
     let expected_secret_heads_json: String = row.get(8)?;
@@ -3376,6 +3919,18 @@ fn map_deployment_plan(row: &Row<'_>) -> rusqlite::Result<DeploymentPlan> {
         .map_err(|error| parse_failure(11, rusqlite::types::Type::Text, error))?;
     let policy = serde_json::from_str(&policy_json)
         .map_err(|error| parse_failure(12, rusqlite::types::Type::Text, error))?;
+    let coordinator_id = row
+        .get::<_, Option<String>>(17)?
+        .map(|value| {
+            value.parse().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    17,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
     Ok(DeploymentPlan {
         id: row.get(0)?,
         routing_generation: routing_generation.parse().map_err(|error| {
@@ -3400,9 +3955,62 @@ fn map_deployment_plan(row: &Row<'_>) -> rusqlite::Result<DeploymentPlan> {
         state: row.get(14)?,
         note: row.get(15)?,
         last_error: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        coordinator_id,
+        lease_expires_at: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
+}
+
+/// Whether deleting one encrypted revision would break current execution,
+/// rollback, or crash recovery. Terminal plan snapshots remain as immutable
+/// audit records but deliberately do not keep ciphertext alive.
+fn secret_revision_is_live(conn: &Connection, revision: &str) -> CatalogResult<bool> {
+    let head_refs: i64 = conn.query_row(
+        "SELECT count(*) FROM secret_heads WHERE revision_id = ?1",
+        [revision],
+        |row| row.get(0),
+    )?;
+    if head_refs != 0 {
+        return Ok(true);
+    }
+    let documents = {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT snapshot.document
+               FROM environment_binding_snapshots snapshot
+              WHERE EXISTS (
+                        SELECT 1 FROM deployments deployment
+                         WHERE deployment.snapshot_id = snapshot.snapshot_id
+                    )
+                 OR EXISTS (
+                        SELECT 1 FROM deployment_plans plan
+                         WHERE plan.snapshot_id = snapshot.snapshot_id
+                           AND plan.state IN
+                               ('preparing','prepared','aborting','activating','reconciling','degraded')
+                    )",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for document in documents {
+        let snapshot: EnvironmentBindingSnapshot =
+            serde_json::from_str(&document).map_err(|_| {
+                CatalogError::BundleStorage(
+                    "stored environment snapshot is no longer valid JSON".to_string(),
+                )
+            })?;
+        if snapshot.bindings.iter().any(|binding| {
+            matches!(
+                binding,
+                deis_wire::EnvironmentBinding::Secret(secret)
+                    if secret.revision == revision
+            )
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -3693,12 +4301,23 @@ mod tests {
         let store = store().await;
         let env = app_with_env(&store, "demo", "production").await;
         let first_version = version(&store, "demo", "sha-plan").await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            Vec::new(),
+        );
+        let candidate_snapshot = snapshot(
+            &first_version.id,
+            &env.canonical_id.to_string(),
+            &declarations,
+            None,
+        );
+        let owner = CanonicalId::new_v7();
         let plan = store
             .create_deployment_plan(
                 &env,
                 &first_version,
                 DeploymentPlanSpec {
-                    snapshot_id: None,
+                    snapshot: Some(candidate_snapshot.clone()),
                     expected_secret_heads: std::collections::BTreeMap::new(),
                     compare_secret_heads: true,
                     target_ids: vec!["node-a".to_string()],
@@ -3708,11 +4327,24 @@ mod tests {
                     secret_change: None,
                     note: Some("release".to_string()),
                 },
+                owner,
+                30,
             )
             .await
             .unwrap();
         assert_eq!(plan.state, "preparing");
         assert_eq!(plan.plan_sha256.len(), 64);
+        assert!(store.current_deployment(&env.id).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get_environment_snapshot(plan.snapshot_id.as_deref().unwrap())
+                .await
+                .unwrap()
+                .identity()
+                .unwrap(),
+            candidate_snapshot.identity().unwrap(),
+            "the candidate snapshot must survive a control-plane restart before pointer commit"
+        );
         let immutable_document = serde_json::json!({
             "id": plan.id,
             "routingGeneration": plan.routing_generation.to_string(),
@@ -3742,7 +4374,7 @@ mod tests {
                 &env,
                 &first_version,
                 DeploymentPlanSpec {
-                    snapshot_id: None,
+                    snapshot: None,
                     expected_secret_heads: std::collections::BTreeMap::new(),
                     compare_secret_heads: true,
                     target_ids: vec!["node-b".to_string()],
@@ -3752,6 +4384,8 @@ mod tests {
                     secret_change: None,
                     note: None,
                 },
+                CanonicalId::new_v7(),
+                30,
             )
             .await
             .unwrap_err();
@@ -3770,19 +4404,34 @@ mod tests {
         assert!(immutable.is_err());
         assert!(
             store
-                .transition_deployment_plan(&plan.id, "preparing", "active", None)
+                .transition_deployment_plan(&plan.id, "preparing", "active", None, owner)
                 .await
                 .is_err()
         );
+        assert!(
+            store
+                .transition_deployment_plan(&plan.id, "preparing", "failed", None, owner)
+                .await
+                .is_err(),
+            "a terminal failure must pass through the durable aborting compensation state"
+        );
 
         let prepared = store
-            .transition_deployment_plan(&plan.id, "preparing", "prepared", Some("ready"))
+            .transition_deployment_plan(&plan.id, "preparing", "prepared", Some("ready"), owner)
             .await
             .unwrap();
         let deployment = store
-            .commit_deployment_plan(&prepared, &env, None)
+            .commit_deployment_plan(&prepared, &env, Some(&candidate_snapshot), owner)
             .await
             .unwrap();
+        assert_eq!(
+            store
+                .commit_deployment_plan(&prepared, &env, Some(&candidate_snapshot), owner)
+                .await
+                .expect("a lost pointer-commit response is resolved by immutable identity")
+                .id,
+            deployment.id
+        );
         assert_eq!(deployment.id, plan.id);
         assert_eq!(deployment.canonical_id, plan.routing_generation);
         assert_eq!(
@@ -3803,7 +4452,7 @@ mod tests {
         );
 
         store
-            .transition_deployment_plan(&plan.id, "activating", "active", Some("applied"))
+            .transition_deployment_plan(&plan.id, "activating", "active", Some("applied"), owner)
             .await
             .unwrap();
         assert_eq!(
@@ -3811,12 +4460,13 @@ mod tests {
             first_version.id
         );
         let next_version = version(&store, "demo", "sha-plan-next").await;
+        let next_owner = CanonicalId::new_v7();
         let next = store
             .create_deployment_plan(
                 &env,
                 &next_version,
                 DeploymentPlanSpec {
-                    snapshot_id: None,
+                    snapshot: None,
                     expected_secret_heads: std::collections::BTreeMap::new(),
                     compare_secret_heads: true,
                     target_ids: vec!["node-b".to_string()],
@@ -3826,6 +4476,8 @@ mod tests {
                     secret_change: None,
                     note: None,
                 },
+                next_owner,
+                30,
             )
             .await
             .unwrap();
@@ -3850,11 +4502,11 @@ mod tests {
         );
 
         let next = store
-            .transition_deployment_plan(&next.id, "preparing", "prepared", None)
+            .transition_deployment_plan(&next.id, "preparing", "prepared", None, next_owner)
             .await
             .unwrap();
         store
-            .commit_deployment_plan(&next, &env, None)
+            .commit_deployment_plan(&next, &env, None, next_owner)
             .await
             .unwrap();
         assert_eq!(
@@ -3863,7 +4515,7 @@ mod tests {
             "cron keeps the prior active version while a replacement is only activating"
         );
         store
-            .transition_deployment_plan(&next.id, "activating", "active", None)
+            .transition_deployment_plan(&next.id, "activating", "active", None, next_owner)
             .await
             .unwrap();
         assert_eq!(
@@ -3878,23 +4530,60 @@ mod tests {
                 .len(),
             1
         );
+        let drain_owner = CanonicalId::new_v7();
         store
-            .record_deployment_drain_observation(DeploymentDrainObservation {
-                plan_id: next.id.clone(),
-                node_id: "node-a".to_string(),
-                generation: retained.generation,
-                observed_state: "drained".to_string(),
-                message: None,
-                observed_at: now_secs(),
+            .claim_deployment_generation_drain(&next.id, drain_owner, 30)
+            .await
+            .unwrap();
+        let takeover_owner = CanonicalId::new_v7();
+        assert!(
+            store
+                .claim_deployment_generation_drain(&next.id, takeover_owner, 30)
+                .await
+                .is_err()
+        );
+        let plan_id = next.id.clone();
+        store
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE deployment_plans SET lease_expires_at = ?2 WHERE id = ?1",
+                    params![plan_id, now_secs() - 1],
+                )?;
+                Ok(())
             })
             .await
             .unwrap();
         store
-            .set_deployment_generation_drain_state(&next.id, "drained", None)
+            .claim_deployment_generation_drain(&next.id, takeover_owner, 30)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .set_deployment_generation_drain_state(&next.id, "draining", None, drain_owner,)
+                .await
+                .is_err()
+        );
+        let drain_owner = takeover_owner;
+        store
+            .record_deployment_drain_observation(
+                DeploymentDrainObservation {
+                    plan_id: next.id.clone(),
+                    node_id: "node-a".to_string(),
+                    generation: retained.generation,
+                    observed_state: "drained".to_string(),
+                    message: None,
+                    observed_at: now_secs(),
+                },
+                drain_owner,
+            )
             .await
             .unwrap();
         store
-            .set_deployment_generation_drain_state(&next.id, "drained", None)
+            .set_deployment_generation_drain_state(&next.id, "drained", None, drain_owner)
+            .await
+            .unwrap();
+        store
+            .set_deployment_generation_drain_state(&next.id, "drained", None, drain_owner)
             .await
             .unwrap();
         assert_eq!(
@@ -3904,6 +4593,215 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_coordinator_lease_excludes_stale_writers_and_allows_expired_takeover() {
+        let store = store().await;
+        let env = app_with_env(&store, "lease-app", "production").await;
+        let version = version(&store, "lease-app", "sha-lease").await;
+        let first_owner = CanonicalId::new_v7();
+        let second_owner = CanonicalId::new_v7();
+        let third_owner = CanonicalId::new_v7();
+        let plan = store
+            .create_deployment_plan(
+                &env,
+                &version,
+                DeploymentPlanSpec {
+                    snapshot: None,
+                    expected_secret_heads: Default::default(),
+                    compare_secret_heads: true,
+                    target_ids: vec!["node-a".to_string()],
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: None,
+                },
+                first_owner,
+                30,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.coordinator_id, Some(first_owner));
+        assert!(
+            plan.lease_expires_at
+                .is_some_and(|expiry| expiry > now_secs())
+        );
+
+        assert!(matches!(
+            store
+                .claim_deployment_plan(&plan.id, second_owner, 30)
+                .await,
+            Err(CatalogError::Conflict(_))
+        ));
+        store
+            .renew_deployment_plan_lease(&plan.id, first_owner, 30)
+            .await
+            .unwrap();
+
+        let plan_id = plan.id.clone();
+        store
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE deployment_plans SET lease_expires_at = ?2 WHERE id = ?1",
+                    params![plan_id, now_secs() - 1],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_deployment_plan(&plan.id, second_owner, 30)
+            .await
+            .unwrap();
+        assert_eq!(claimed.coordinator_id, Some(second_owner));
+        assert!(
+            store
+                .renew_deployment_plan_lease(&plan.id, first_owner, 30)
+                .await
+                .is_err(),
+            "an expired owner must claim anew rather than reviving its old lease"
+        );
+        assert!(
+            store
+                .transition_deployment_plan(&plan.id, "preparing", "prepared", None, first_owner,)
+                .await
+                .is_err(),
+            "a stale owner cannot advance durable state after takeover"
+        );
+        assert!(
+            store
+                .record_deployment_target_observation(
+                    DeploymentTargetObservation {
+                        plan_id: plan.id.clone(),
+                        node_id: "node-a".to_string(),
+                        observed_state: "prepared".to_string(),
+                        version_id: Some(version.id.clone()),
+                        routing_generation: Some(plan.routing_generation.to_string()),
+                        message: None,
+                        observed_at: now_secs(),
+                    },
+                    first_owner,
+                )
+                .await
+                .is_err(),
+            "a stale owner cannot persist observations from an uncertain RPC"
+        );
+        assert!(
+            store
+                .record_deployment_queue_observation(
+                    DeploymentQueueObservation {
+                        plan_id: plan.id.clone(),
+                        observed_state: "prepared".to_string(),
+                        active_generation: String::new(),
+                        active_deployment_id: String::new(),
+                        pending_generation: Some(plan.routing_generation.to_string()),
+                        pending_deployment_id: Some(plan.id.clone()),
+                        outstanding_leases: 0,
+                        message: None,
+                        observed_at: now_secs(),
+                    },
+                    first_owner,
+                )
+                .await
+                .is_err(),
+            "a stale owner cannot persist a queue observation after takeover"
+        );
+
+        store
+            .release_deployment_plan_lease(&plan.id, second_owner)
+            .await
+            .unwrap();
+        let released = store.deployment_plan(&plan.id).await.unwrap();
+        assert_eq!(released.coordinator_id, None);
+        assert_eq!(released.lease_expires_at, None);
+        store
+            .claim_deployment_plan(&plan.id, third_owner, 30)
+            .await
+            .unwrap();
+        let prepared = store
+            .transition_deployment_plan(&plan.id, "preparing", "prepared", None, third_owner)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .commit_deployment_plan(&prepared, &env, None, second_owner)
+                .await
+                .is_err(),
+            "a released owner cannot commit the production pointer"
+        );
+        assert!(store.current_deployment(&env.id).await.unwrap().is_none());
+        store
+            .commit_deployment_plan(&prepared, &env, None, third_owner)
+            .await
+            .unwrap();
+        let terminal = store
+            .transition_deployment_plan(&plan.id, "activating", "active", None, third_owner)
+            .await
+            .unwrap();
+        assert_eq!(terminal.coordinator_id, None);
+        assert_eq!(terminal.lease_expires_at, None);
+        store
+            .release_deployment_plan_lease(&plan.id, third_owner)
+            .await
+            .expect("release remains idempotent after a terminal transition clears the lease");
+    }
+
+    #[tokio::test]
+    async fn concurrent_deployment_claims_have_exactly_one_owner() {
+        let store = store().await;
+        let env = app_with_env(&store, "claim-app", "production").await;
+        let version = version(&store, "claim-app", "sha-claim").await;
+        let initial_owner = CanonicalId::new_v7();
+        let plan = store
+            .create_deployment_plan(
+                &env,
+                &version,
+                DeploymentPlanSpec {
+                    snapshot: None,
+                    expected_secret_heads: Default::default(),
+                    compare_secret_heads: true,
+                    target_ids: vec!["node-a".to_string()],
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: None,
+                },
+                initial_owner,
+                30,
+            )
+            .await
+            .unwrap();
+        store
+            .release_deployment_plan_lease(&plan.id, initial_owner)
+            .await
+            .unwrap();
+
+        let first_owner = CanonicalId::new_v7();
+        let second_owner = CanonicalId::new_v7();
+        let (first, second) = tokio::join!(
+            store.claim_deployment_plan(&plan.id, first_owner, 30),
+            store.claim_deployment_plan(&plan.id, second_owner, 30),
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let winner = first
+            .ok()
+            .or_else(|| second.ok())
+            .expect("one concurrent claim must win");
+        assert!(matches!(
+            winner.coordinator_id,
+            Some(owner) if owner == first_owner || owner == second_owner
+        ));
+        assert_eq!(
+            store
+                .deployment_plan(&plan.id)
+                .await
+                .unwrap()
+                .coordinator_id,
+            winner.coordinator_id
         );
     }
 
@@ -4501,7 +5399,7 @@ mod tests {
         let env = app_with_env(&store, "demo", "production").await;
         let version = version(&store, "demo", "sha-1").await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
             Vec::new(),
         );
         let snapshot = snapshot(
@@ -4548,7 +5446,7 @@ mod tests {
         let env = app_with_env(&store, "demo", "production").await;
         let version = version(&store, "demo", "sha-1").await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
             vec![deis_wire::EnvironmentDeclaration {
                 name: "TOKEN".to_string(),
                 kind: deis_wire::EnvironmentKind::Secret,
@@ -4595,7 +5493,7 @@ mod tests {
         let env = app_with_env(&store, "demo", "production").await;
         let version = version(&store, "demo", "sha-1").await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
             vec![deis_wire::EnvironmentDeclaration {
                 name: "TOKEN".to_string(),
                 kind: deis_wire::EnvironmentKind::Secret,
@@ -4685,13 +5583,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_nonterminal_plan_snapshots_retain_staged_secret_ciphertext() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        let version = version(&store, "demo", "sha-plan-staging").await;
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "TOKEN".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        );
+        let staged = CanonicalId::new_v7().to_string();
+        store
+            .stage_secret_revision(&env, "TOKEN", &staged, b"candidate".to_vec())
+            .await
+            .unwrap();
+        let candidate = snapshot(
+            &version.id,
+            &env.canonical_id.to_string(),
+            &declarations,
+            Some(&staged),
+        );
+        let owner = CanonicalId::new_v7();
+        let plan = store
+            .create_deployment_plan(
+                &env,
+                &version,
+                DeploymentPlanSpec {
+                    snapshot: Some(candidate),
+                    expected_secret_heads: Default::default(),
+                    compare_secret_heads: false,
+                    target_ids: vec!["node-a".to_string()],
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "secret_change".to_string(),
+                    secret_change: Some(serde_json::json!({
+                        "name": "TOKEN",
+                        "replacementRevision": staged,
+                        "expectedRevision": null,
+                    })),
+                    note: None,
+                },
+                owner,
+                30,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !store
+                .discard_secret_revision_if_unreferenced(&env.id, "TOKEN", &staged)
+                .await
+                .unwrap(),
+            "restartable candidate state must retain its ciphertext"
+        );
+        store
+            .transition_deployment_plan(
+                &plan.id,
+                "preparing",
+                "aborting",
+                Some("test abort"),
+                owner,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_deployment_plan(&plan.id, "aborting", "failed", Some("test abort"), owner)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .discard_secret_revision_if_unreferenced(&env.id, "TOKEN", &staged)
+                .await
+                .unwrap(),
+            "a terminal audit-only plan must not retain staged ciphertext"
+        );
+        assert!(
+            store
+                .secret_revision_ciphertext(&env.id, "TOKEN", &staged)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_secret_retention_gc_destroys_ciphertext_and_keeps_evidence() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        let orphan = CanonicalId::new_v7().to_string();
+        let active = CanonicalId::new_v7().to_string();
+        store
+            .stage_secret_revision(&env, "ORPHAN", &orphan, b"orphan-value".to_vec())
+            .await
+            .unwrap();
+        store
+            .put_secret_revision(&env, "ACTIVE", &active, b"active-value".to_vec())
+            .await
+            .unwrap();
+
+        let removed = store
+            .reap_unreferenced_secret_revisions(
+                now_secs().saturating_add(UNREFERENCED_SECRET_RETENTION_SECONDS + 1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed, vec![orphan.clone()]);
+        assert!(
+            store
+                .secret_revision_ciphertext(&env.id, "ORPHAN", &orphan)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .secret_revision_ciphertext(&env.id, "ACTIVE", &active)
+                .await
+                .unwrap()
+                .ciphertext,
+            b"active-value"
+        );
+        let evidence: (String, String, String) = store
+            .db
+            .with_connection(move |conn| {
+                conn.query_row(
+                    "SELECT revision_id, reason, name
+                       FROM secret_revision_destructions WHERE revision_id = ?1",
+                    [orphan],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(CatalogError::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(evidence.0, removed[0]);
+        assert_eq!(evidence.1, "unreferenced-retention-expired");
+        assert_eq!(evidence.2, "ORPHAN");
+    }
+
+    #[tokio::test]
     async fn rollback_lookup_returns_the_exact_historical_snapshot() {
         let store = store().await;
         let env = app_with_env(&store, "demo", "production").await;
         let v1 = version(&store, "demo", "sha-1").await;
         let v2 = version(&store, "demo", "sha-2").await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
             vec![deis_wire::EnvironmentDeclaration {
                 name: "TOKEN".to_string(),
                 kind: deis_wire::EnvironmentKind::Secret,

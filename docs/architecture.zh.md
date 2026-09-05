@@ -239,6 +239,8 @@ sequenceDiagram
     participant CLI as deis
     participant R as deis-control
     participant X as deis-runtime ×N
+    participant Q as deis-queue
+    participant P as deis-proxy ×N
 
     Dev->>CLI: deis deploy
     CLI->>CLI: 编译打包（函数 + 路由表 + 静态资产 → bundle.zip）
@@ -252,8 +254,14 @@ sequenceDiagram
         X->>X: 校验包 → 建 staged isolate；不切 current/triggers
         X-->>R: prepared(plan, generation)
     end
-    R->>R: 全部 prepared 后 CAS 写 snapshot + desired pointer
-    R->>R: 等待冻结 Proxy applied-table observation 与 queue lease fence
+    R->>Q: PrepareConsumerGeneration(plan, generation)
+    Q->>Q: 关闭 Pull admission，等待有效旧 lease 结清
+    Q-->>R: draining / prepared observation
+    R->>R: Runtime 与 Queue prepared 后 CAS 写 desired pointer + secret head
+    P->>R: 拉取精确 generation routing table
+    P-->>R: frozen proxy applied-table ACK
+    R->>Q: ActivateConsumerGeneration(plan, generation)
+    Q-->>R: active generation observation
     R->>X: ApplyDeployment(ACTIVATE, plan, generation)
     X-->>R: active(plan, generation)
     Dev->>CLI: deis secret set NAME（值从 stdin 进）
@@ -279,11 +287,22 @@ sequenceDiagram
 - **包从不进 gRPC 消息**。控制面只发指针，节点自己 HTTP 取。早前的 `DeployApp`
   把整个 zip 塞进一次调用，撞 tonic 的消息上限，已删除。
 - **去重**：`bundle_sha` 相同不新建版本。
-- **严格发布第一批已改为先 PREPARE、后写 desired pointer**：任一冻结 runtime target 没有按同一
-  plan/generation 回报 prepared，候选会 ABORT，pointer 不变。写 pointer 后仍要等冻结 Proxy 的
-  applied-table observation、queue lease fence 和 runtime ACTIVATE 才标 `active`；未知结果由持久计划重试。
-  当前 queue fence 顺序尚未与 HTTP/cron 构成同一个可证明切换边界，多 Control owner lease、渐进发布、
-  gate/affinity/override 和 provider evidence 也仍是 ADR-009 阻断项。
+- **严格发布已有统一的有序切换屏障**：固定顺序是 `runtime PREPARE → queue PREPARE/drain →
+  pointer/head CAS → proxy ACK → queue ACTIVATE → runtime ACTIVATE`。Queue PREPARE 只关闭租约入口并等待
+  有效旧 lease，不会提前开放候选；尚未排空时部署/回滚/secret mutation 返回 `202 Accepted`、plan
+  `Location`，`deployment` 为空，production
+  pointer 与 secret head 均不变。任一 pre-commit 失败先持久进入 `aborting`，Queue ABORT 恢复旧 generation
+  admission 后才 Runtime ABORT。plan status 同时公开 target、proxy、queue observations，未知结果由相同
+  plan/generation 幂等重试。CLI 验证 scoped `Location`，等待精确 plan active 后再读取并核对 current pointer；
+  它不会把 PREPARE 报告打印成已经上线。
+- **协调器持久互斥**：API、后台 reconcile 和到期 generation drain 使用不同 UUIDv7 owner；30 秒持久 lease
+  与 10 秒 heartbeat 保护每个 runtime/queue 动作、observation、pointer/head commit 和 drain。过期后新
+  Control 可以接管，旧 owner 的任何推进都被事务 CAS 拒绝。终态失败的无引用 staged secret 立即销毁，
+  orphan revision 再由有界后台 GC 回收并写不可变、无值的销毁 ledger。
+- **完成边界仍受约束**：上述顺序已消除 Queue 在 HTTP routing 之前开放候选的窗口，并让 Cron 只在
+  runtime ACTIVATE 后启动，也已有协调器单赢家/接管回归；但仍没有逐持久化边界的进程崩溃/丢响应注入和
+  真实多 Control 故障演练。渐进发布、gate/affinity/override、可配置生命周期与 provider evidence 仍是
+  ADR-009 阻断项。
 - **不做百分比灰度**。全量复制下灰度需要 deis-runtime 同时驻留两个版本的 Isolate，
   本轮不做，但模型留了口子。
 - **换版先装好再切**：`RuntimePool::stage_app` 在另一条线程上把新版本建好、预热完，PREPARE 后按
@@ -491,7 +510,17 @@ sequenceDiagram
   就意味着应用见过它。
 - **租约令牌**：每条被领走的消息带一个 `lease_token`，租约每次续期都换新的。Ack 与
   Nack 必须原样带回来，所以租约过期、消息被别人领走之后，先前那个消费者的 Ack 不再
-  作数——否则它会把别人正在处理的那条销掉。
+  作数——否则它会把别人正在处理的那条销掉。判断同时比较 token 与 `visible_at`：即使消息还没被
+  再次领走，只要原租约已经到期，旧 Ack/Nack 也按 stale 处理，不能在 generation barrier 已报告
+  “旧 lease 排空”后再删除或释放该消息。
+- **发布 generation 屏障**：Control 在 pointer commit 前调用 Queue PREPARE。deis-queue 在与 Pull 相同的
+  SQLite 写事务里登记 pending generation 并关闭该租户全部新 Pull；仍有效的旧 lease 可以正常 Ack/Nack，
+  全部结清或到期后只回报 prepared，不会自动开放新 consumer。pointer/head CAS 与全部 Proxy applied ACK
+  完成后，Queue ACTIVATE 才把 pending 原子提升为 active；pre-commit 失败则以 Queue ABORT 清除精确
+  deployment/generation 的 pending 并恢复旧 admission。Queue 的三个响应均回显 active/pending owner；
+  ABORT 用持久 exact tombstone 区分首次副作用、精确丢响应重试与错误 candidate。Control 将
+  draining/prepared/active/aborted/error、active/pending owner 与 outstanding lease 数写成持久 observation，
+  并同时核验 deployment 与 generation；重启后按同一身份继续核对。
 - **死信**：重试超过阈值进死信表，不再投递。`ListDeadLetters` 与 `ReplayDeadLetters`
   两个 RPC 让人能看见它们、并把它们放回队列，不必直接读库；命令行这一头是 `deis queue
   dead-letters` 和 `deis queue replay`。每条死信还记着是哪一种失败把它送进来的：消费者

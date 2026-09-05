@@ -228,20 +228,19 @@ impl StorageWiring {
         Ok(!manifest.queues.is_empty())
     }
 
-    /// Ask deis-queue to drain the previous generation and atomically admit
-    /// the new one. `activated = false` is progress, not failure: outstanding
-    /// leases are still allowed to Ack/Nack and the durable reconciler calls
-    /// this again after they finish or expire.
-    pub async fn activate_consumer_generation(
+    /// Close queue Pull admission and wait for the previous generation's
+    /// leases without admitting the candidate before pointer commit.
+    pub async fn prepare_consumer_generation(
         &self,
         app_id: &str,
         environment: &str,
         deployment_id: &str,
         generation: &str,
         expected_previous_generation: Option<&str>,
-    ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
+        expected_previous_deployment_id: Option<&str>,
+    ) -> anyhow::Result<deis_queue::proto::queue::PrepareConsumerGenerationResponse> {
         use deis_queue::proto::queue::{
-            ActivateConsumerGenerationRequest, queue_client::QueueClient,
+            PrepareConsumerGenerationRequest, queue_client::QueueClient,
         };
         use tonic::transport::Endpoint;
 
@@ -254,12 +253,13 @@ impl StorageWiring {
             .timeout(std::time::Duration::from_secs(10))
             .connect_lazy();
         let tenant = deis_wire::conventions::tenant_id(app_id, environment);
-        let mut request = tonic::Request::new(ActivateConsumerGenerationRequest {
+        let mut request = tonic::Request::new(PrepareConsumerGenerationRequest {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
             expected_previous_generation: expected_previous_generation
                 .unwrap_or_default()
                 .to_string(),
+            expected_previous_deployment_id: expected_previous_deployment_id.map(str::to_string),
         });
         request.metadata_mut().insert(
             deis_wire::conventions::TENANT_HEADER,
@@ -276,9 +276,97 @@ impl StorageWiring {
             );
         }
         Ok(QueueClient::new(channel)
+            .prepare_consumer_generation(request)
+            .await?
+            .into_inner())
+    }
+
+    /// Admit a queue generation whose pre-commit barrier completed.
+    pub async fn activate_consumer_generation(
+        &self,
+        app_id: &str,
+        environment: &str,
+        deployment_id: &str,
+        generation: &str,
+    ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
+        use deis_queue::proto::queue::{
+            ActivateConsumerGenerationRequest, queue_client::QueueClient,
+        };
+        let (channel, tenant) = self.queue_channel_and_tenant(app_id, environment)?;
+        let mut request = tonic::Request::new(ActivateConsumerGenerationRequest {
+            deployment_id: deployment_id.to_string(),
+            generation: generation.to_string(),
+        });
+        self.authorize_queue_request(&mut request, app_id, environment, &tenant)?;
+        Ok(QueueClient::new(channel)
             .activate_consumer_generation(request)
             .await?
             .into_inner())
+    }
+
+    /// Cancel an uncommitted queue barrier and restore old Pull admission.
+    pub async fn abort_consumer_generation(
+        &self,
+        app_id: &str,
+        environment: &str,
+        deployment_id: &str,
+        generation: &str,
+    ) -> anyhow::Result<deis_queue::proto::queue::AbortConsumerGenerationResponse> {
+        use deis_queue::proto::queue::{AbortConsumerGenerationRequest, queue_client::QueueClient};
+        let (channel, tenant) = self.queue_channel_and_tenant(app_id, environment)?;
+        let mut request = tonic::Request::new(AbortConsumerGenerationRequest {
+            deployment_id: deployment_id.to_string(),
+            generation: generation.to_string(),
+        });
+        self.authorize_queue_request(&mut request, app_id, environment, &tenant)?;
+        Ok(QueueClient::new(channel)
+            .abort_consumer_generation(request)
+            .await?
+            .into_inner())
+    }
+
+    fn queue_channel_and_tenant(
+        &self,
+        app_id: &str,
+        environment: &str,
+    ) -> anyhow::Result<(tonic::transport::Channel, String)> {
+        use tonic::transport::Endpoint;
+        let endpoint = self
+            .queue
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("queue endpoint is not configured"))?;
+        let channel = Endpoint::from_shared(endpoint.to_string())?
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_lazy();
+        Ok((
+            channel,
+            deis_wire::conventions::tenant_id(app_id, environment),
+        ))
+    }
+
+    fn authorize_queue_request<T>(
+        &self,
+        request: &mut tonic::Request<T>,
+        app_id: &str,
+        environment: &str,
+        tenant: &str,
+    ) -> anyhow::Result<()> {
+        request.metadata_mut().insert(
+            deis_wire::conventions::TENANT_HEADER,
+            tenant.parse().map_err(|error| {
+                anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
+            })?,
+        );
+        if let Some(token) = self.token_for(app_id, environment) {
+            request.metadata_mut().insert(
+                deis_wire::conventions::STORAGE_TOKEN_HEADER,
+                token.parse().map_err(|error| {
+                    anyhow::anyhow!("queue capability is not valid gRPC metadata: {error}")
+                })?,
+            );
+        }
+        Ok(())
     }
 
     /// True when this control plane mints capability tokens at all.
@@ -781,20 +869,77 @@ impl DeploymentDeliverer {
         self.storage.requires_consumer_fence(version)
     }
 
-    pub async fn activate_consumer_generation(
+    pub async fn prepare_consumer_generation(
         &self,
         environment: &Environment,
         plan: &crate::catalog::DeploymentPlan,
-    ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
-        self.storage
-            .activate_consumer_generation(
+    ) -> anyhow::Result<deis_queue::proto::queue::PrepareConsumerGenerationResponse> {
+        let progress = self
+            .storage
+            .prepare_consumer_generation(
                 &environment.app_id,
                 &environment.name,
                 &plan.id,
                 &plan.routing_generation.to_string(),
                 plan.previous_generation.as_deref(),
+                plan.previous_deployment_id.as_deref(),
             )
-            .await
+            .await?;
+        validate_prepare_consumer_generation_response(
+            &progress,
+            &plan.id,
+            &plan.routing_generation.to_string(),
+            plan.previous_generation.as_deref(),
+            plan.previous_deployment_id.as_deref(),
+        )?;
+        Ok(progress)
+    }
+
+    pub async fn activate_consumer_generation(
+        &self,
+        environment: &Environment,
+        plan: &crate::catalog::DeploymentPlan,
+    ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
+        let progress = self
+            .storage
+            .activate_consumer_generation(
+                &environment.app_id,
+                &environment.name,
+                &plan.id,
+                &plan.routing_generation.to_string(),
+            )
+            .await?;
+        validate_activate_consumer_generation_response(
+            &progress,
+            &plan.id,
+            &plan.routing_generation.to_string(),
+            plan.previous_generation.as_deref(),
+            plan.previous_deployment_id.as_deref(),
+        )?;
+        Ok(progress)
+    }
+
+    pub async fn abort_consumer_generation(
+        &self,
+        environment: &Environment,
+        plan: &crate::catalog::DeploymentPlan,
+    ) -> anyhow::Result<deis_queue::proto::queue::AbortConsumerGenerationResponse> {
+        let progress = self
+            .storage
+            .abort_consumer_generation(
+                &environment.app_id,
+                &environment.name,
+                &plan.id,
+                &plan.routing_generation.to_string(),
+            )
+            .await?;
+        validate_abort_consumer_generation_response(
+            &progress,
+            &plan.id,
+            plan.previous_generation.as_deref(),
+            plan.previous_deployment_id.as_deref(),
+        )?;
+        Ok(progress)
     }
 
     /// Freeze the runtime serving set for a deployment plan. Lost nodes stay
@@ -1243,7 +1388,7 @@ impl DeploymentDeliverer {
                 // states here keeps a restored/hand-repaired catalog safe:
                 // an uncertain generation may be made addressable, never
                 // allowed to start triggers early.
-                Some("preparing" | "prepared" | "activating" | "reconciling") => {
+                Some("preparing" | "prepared" | "activating" | "reconciling" | "degraded") => {
                     proto::DeploymentAction::Prepare
                 }
                 Some("active") | None => proto::DeploymentAction::LegacyApply,
@@ -1765,6 +1910,71 @@ impl DeploymentDeliverer {
     }
 }
 
+fn validate_prepare_consumer_generation_response(
+    progress: &deis_queue::proto::queue::PrepareConsumerGenerationResponse,
+    plan_id: &str,
+    generation: &str,
+    previous_generation: Option<&str>,
+    previous_deployment_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if progress.active_generation != previous_generation.unwrap_or_default()
+        || progress.active_deployment_id != previous_deployment_id.unwrap_or_default()
+        || progress.pending_generation != generation
+        || progress.pending_deployment_id != plan_id
+        || progress.outstanding_leases < 0
+        || progress.prepared != (progress.outstanding_leases == 0)
+    {
+        anyhow::bail!(
+            "queue PREPARE returned an observation that does not match plan {plan_id} generation {generation}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_activate_consumer_generation_response(
+    progress: &deis_queue::proto::queue::ActivateConsumerGenerationResponse,
+    plan_id: &str,
+    generation: &str,
+    previous_generation: Option<&str>,
+    previous_deployment_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let valid = if progress.activated {
+        progress.active_generation == generation
+            && progress.active_deployment_id == plan_id
+            && progress.pending_generation.is_empty()
+            && progress.pending_deployment_id.is_empty()
+            && progress.outstanding_leases == 0
+    } else {
+        progress.active_generation == previous_generation.unwrap_or_default()
+            && progress.active_deployment_id == previous_deployment_id.unwrap_or_default()
+            && progress.pending_generation == generation
+            && progress.pending_deployment_id == plan_id
+            && progress.outstanding_leases > 0
+    };
+    if !valid {
+        anyhow::bail!(
+            "queue ACTIVATE returned an observation that does not match plan {plan_id} generation {generation}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_abort_consumer_generation_response(
+    progress: &deis_queue::proto::queue::AbortConsumerGenerationResponse,
+    plan_id: &str,
+    previous_generation: Option<&str>,
+    previous_deployment_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if progress.active_generation != previous_generation.unwrap_or_default()
+        || progress.active_deployment_id != previous_deployment_id.unwrap_or_default()
+    {
+        anyhow::bail!(
+            "queue ABORT returned an observation that does not match plan {plan_id} baseline"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1776,6 +1986,111 @@ mod tests {
     const MANIFEST: &str = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
         "env":{"LOG_LEVEL":"info","API_KEY":"placeholder-from-manifest"},
         "secrets":["API_KEY","MISSING_ONE"]}"#;
+
+    #[test]
+    fn queue_barrier_observations_are_bound_to_both_generation_and_deployment_owner() {
+        const PREVIOUS_PLAN: &str = "018f2518-7e38-7f80-8000-000000000001";
+        const PREVIOUS_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000002";
+        const PLAN: &str = "018f2518-7e38-7f80-8000-000000000003";
+        const GENERATION: &str = "018f2518-7e38-7f80-8000-000000000004";
+
+        let mut prepared = deis_queue::proto::queue::PrepareConsumerGenerationResponse {
+            prepared: true,
+            active_generation: PREVIOUS_GENERATION.to_string(),
+            pending_generation: GENERATION.to_string(),
+            outstanding_leases: 0,
+            active_deployment_id: PREVIOUS_PLAN.to_string(),
+            pending_deployment_id: PLAN.to_string(),
+        };
+        assert!(
+            validate_prepare_consumer_generation_response(
+                &prepared,
+                PLAN,
+                GENERATION,
+                Some(PREVIOUS_GENERATION),
+                Some(PREVIOUS_PLAN),
+            )
+            .is_ok()
+        );
+        prepared.pending_deployment_id = PREVIOUS_PLAN.to_string();
+        assert!(
+            validate_prepare_consumer_generation_response(
+                &prepared,
+                PLAN,
+                GENERATION,
+                Some(PREVIOUS_GENERATION),
+                Some(PREVIOUS_PLAN),
+            )
+            .is_err(),
+            "a matching generation reported under the wrong deployment must fail closed"
+        );
+
+        let mut active = deis_queue::proto::queue::ActivateConsumerGenerationResponse {
+            activated: true,
+            active_generation: GENERATION.to_string(),
+            pending_generation: String::new(),
+            outstanding_leases: 0,
+            active_deployment_id: PLAN.to_string(),
+            pending_deployment_id: String::new(),
+        };
+        assert!(
+            validate_activate_consumer_generation_response(
+                &active,
+                PLAN,
+                GENERATION,
+                Some(PREVIOUS_GENERATION),
+                Some(PREVIOUS_PLAN),
+            )
+            .is_ok()
+        );
+        active.active_deployment_id = PREVIOUS_PLAN.to_string();
+        assert!(
+            validate_activate_consumer_generation_response(
+                &active,
+                PLAN,
+                GENERATION,
+                Some(PREVIOUS_GENERATION),
+                Some(PREVIOUS_PLAN),
+            )
+            .is_err()
+        );
+
+        let mut aborted = deis_queue::proto::queue::AbortConsumerGenerationResponse {
+            aborted: true,
+            active_generation: PREVIOUS_GENERATION.to_string(),
+            active_deployment_id: PREVIOUS_PLAN.to_string(),
+        };
+        assert!(
+            validate_abort_consumer_generation_response(
+                &aborted,
+                PLAN,
+                Some(PREVIOUS_GENERATION),
+                Some(PREVIOUS_PLAN),
+            )
+            .is_ok()
+        );
+        aborted.aborted = false;
+        assert!(
+            validate_abort_consumer_generation_response(
+                &aborted,
+                PLAN,
+                Some(PREVIOUS_GENERATION),
+                Some(PREVIOUS_PLAN),
+            )
+            .is_ok(),
+            "an exact tombstone retry is converged even though it has no new side effect"
+        );
+        aborted.active_deployment_id = PLAN.to_string();
+        assert!(
+            validate_abort_consumer_generation_response(
+                &aborted,
+                PLAN,
+                Some(PREVIOUS_GENERATION),
+                Some(PREVIOUS_PLAN),
+            )
+            .is_err()
+        );
+    }
 
     /// A version row as the catalog would have written it. Never inserted
     /// here: these tests exercise what is built from one, not the store.
@@ -1913,7 +2228,7 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
             vec![
                 deis_wire::EnvironmentDeclaration {
                     name: "LABEL".to_string(),
@@ -2001,7 +2316,7 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
             vec![deis_wire::EnvironmentDeclaration {
                 name: "REQUIRED".to_string(),
                 kind: deis_wire::EnvironmentKind::Config,

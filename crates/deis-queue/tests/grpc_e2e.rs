@@ -24,9 +24,10 @@ use deis_backend_migration::proto::{
 };
 use deis_queue::config::Config;
 use deis_queue::proto::queue::{
-    AckRequest, ActivateConsumerGenerationRequest, ListDeadLettersRequest, MessageHandle,
-    NackRequest, PullRequest, QueueMessage, ReplayDeadLettersRequest, SendBatchRequest,
-    SendRequest, queue_client::QueueClient,
+    AbortConsumerGenerationRequest, AckRequest, ActivateConsumerGenerationRequest,
+    ListDeadLettersRequest, MessageHandle, NackRequest, PrepareConsumerGenerationRequest,
+    PullRequest, QueueMessage, ReplayDeadLettersRequest, SendBatchRequest, SendRequest,
+    queue_client::QueueClient,
 };
 use deis_queue::tenant::TENANT_HEADER;
 use deis_queue::{MAX_GRPC_MESSAGE_BYTES, server};
@@ -844,19 +845,22 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     assert_eq!(old.len(), 1);
 
     let first = client
-        .activate_consumer_generation(as_tenant(
+        .prepare_consumer_generation(as_tenant(
             tenant,
-            ActivateConsumerGenerationRequest {
+            PrepareConsumerGenerationRequest {
                 deployment_id: PLAN.to_string(),
                 generation: GENERATION.to_string(),
                 expected_previous_generation: String::new(),
+                expected_previous_deployment_id: None,
             },
         ))
         .await
         .unwrap()
         .into_inner();
-    assert!(!first.activated);
+    assert!(!first.prepared);
     assert_eq!(first.outstanding_leases, 1);
+    assert_eq!(first.active_deployment_id, "");
+    assert_eq!(first.pending_deployment_id, PLAN);
 
     let mut early = as_tenant(
         tenant,
@@ -879,13 +883,46 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
         ack(&mut client, tenant, "jobs", handles(&old)).await,
         (1, 0)
     );
+    let prepared = client
+        .prepare_consumer_generation(as_tenant(
+            tenant,
+            PrepareConsumerGenerationRequest {
+                deployment_id: PLAN.to_string(),
+                generation: GENERATION.to_string(),
+                expected_previous_generation: String::new(),
+                expected_previous_deployment_id: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(prepared.prepared);
+    assert_eq!(prepared.active_deployment_id, "");
+    assert_eq!(prepared.pending_deployment_id, PLAN);
+
+    let mut still_paused = as_tenant(
+        tenant,
+        PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 1,
+            lease_seconds: 30,
+        },
+    );
+    still_paused
+        .metadata_mut()
+        .insert(DEPLOYMENT_GENERATION_HEADER, GENERATION.parse().unwrap());
+    assert_eq!(
+        client.pull(still_paused).await.unwrap_err().code(),
+        Code::FailedPrecondition,
+        "PREPARED is still pre-commit and must not admit the new generation"
+    );
+
     let active = client
         .activate_consumer_generation(as_tenant(
             tenant,
             ActivateConsumerGenerationRequest {
                 deployment_id: PLAN.to_string(),
                 generation: GENERATION.to_string(),
-                expected_previous_generation: String::new(),
             },
         ))
         .await
@@ -893,6 +930,8 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
         .into_inner();
     assert!(active.activated);
     assert_eq!(active.active_generation, GENERATION);
+    assert_eq!(active.active_deployment_id, PLAN);
+    assert!(active.pending_deployment_id.is_empty());
 
     let legacy = as_tenant(
         tenant,
@@ -922,6 +961,149 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     let leased = client.pull(current).await.unwrap().into_inner().messages;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].body, b"next generation");
+}
+
+#[tokio::test]
+async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire() {
+    const PLAN_ONE: &str = "018f2518-7e38-7f80-8000-000000000021";
+    const GENERATION_ONE: &str = "018f2518-7e38-7f80-8000-000000000022";
+    const PLAN_TWO: &str = "018f2518-7e38-7f80-8000-000000000023";
+    const GENERATION_TWO: &str = "018f2518-7e38-7f80-8000-000000000024";
+    let harness = Harness::start().await;
+    let mut client = harness.client().await;
+    let tenant = "app-one.production";
+
+    let prepared = client
+        .prepare_consumer_generation(as_tenant(
+            tenant,
+            PrepareConsumerGenerationRequest {
+                deployment_id: PLAN_ONE.to_string(),
+                generation: GENERATION_ONE.to_string(),
+                expected_previous_generation: String::new(),
+                expected_previous_deployment_id: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(prepared.prepared);
+    let first_active = client
+        .activate_consumer_generation(as_tenant(
+            tenant,
+            ActivateConsumerGenerationRequest {
+                deployment_id: PLAN_ONE.to_string(),
+                generation: GENERATION_ONE.to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first_active.activated);
+    assert_eq!(first_active.active_deployment_id, PLAN_ONE);
+    assert!(first_active.pending_deployment_id.is_empty());
+    send(&mut client, tenant, "jobs", "still for the old generation").await;
+
+    let wrong_owner = client
+        .prepare_consumer_generation(as_tenant(
+            tenant,
+            PrepareConsumerGenerationRequest {
+                deployment_id: PLAN_TWO.to_string(),
+                generation: GENERATION_TWO.to_string(),
+                expected_previous_generation: GENERATION_ONE.to_string(),
+                expected_previous_deployment_id: Some(PLAN_TWO.to_string()),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_owner.code(), Code::FailedPrecondition);
+
+    let second_prepared = client
+        .prepare_consumer_generation(as_tenant(
+            tenant,
+            PrepareConsumerGenerationRequest {
+                deployment_id: PLAN_TWO.to_string(),
+                generation: GENERATION_TWO.to_string(),
+                expected_previous_generation: GENERATION_ONE.to_string(),
+                expected_previous_deployment_id: Some(PLAN_ONE.to_string()),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(second_prepared.prepared);
+    assert_eq!(second_prepared.active_deployment_id, PLAN_ONE);
+    assert_eq!(second_prepared.pending_deployment_id, PLAN_TWO);
+    let aborted = client
+        .abort_consumer_generation(as_tenant(
+            tenant,
+            AbortConsumerGenerationRequest {
+                deployment_id: PLAN_TWO.to_string(),
+                generation: GENERATION_TWO.to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(aborted.aborted);
+    assert_eq!(aborted.active_generation, GENERATION_ONE);
+    assert_eq!(aborted.active_deployment_id, PLAN_ONE);
+    let retried = client
+        .abort_consumer_generation(as_tenant(
+            tenant,
+            AbortConsumerGenerationRequest {
+                deployment_id: PLAN_TWO.to_string(),
+                generation: GENERATION_TWO.to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!retried.aborted, "an exact retry has no new side effect");
+    assert_eq!(retried.active_deployment_id, PLAN_ONE);
+    let wrong_candidate = client
+        .abort_consumer_generation(as_tenant(
+            tenant,
+            AbortConsumerGenerationRequest {
+                deployment_id: PLAN_ONE.to_string(),
+                generation: GENERATION_TWO.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_candidate.code(), Code::FailedPrecondition);
+
+    let mut previous = as_tenant(
+        tenant,
+        PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 1,
+            lease_seconds: 30,
+        },
+    );
+    previous.metadata_mut().insert(
+        DEPLOYMENT_GENERATION_HEADER,
+        GENERATION_ONE.parse().unwrap(),
+    );
+    let messages = client.pull(previous).await.unwrap().into_inner().messages;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body, b"still for the old generation");
+
+    let mut aborted_candidate = as_tenant(
+        tenant,
+        PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 1,
+            lease_seconds: 30,
+        },
+    );
+    aborted_candidate.metadata_mut().insert(
+        DEPLOYMENT_GENERATION_HEADER,
+        GENERATION_TWO.parse().unwrap(),
+    );
+    assert_eq!(
+        client.pull(aborted_candidate).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
 }
 
 #[tokio::test]

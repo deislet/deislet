@@ -1010,7 +1010,7 @@ impl Drop for StagingDirectory {
 mod tests {
     use super::*;
 
-    const STANDARD: &str = "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13";
+    const STANDARD: &str = "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654";
 
     fn digest(label: &str) -> String {
         sha256(label.as_bytes())
@@ -1042,7 +1042,7 @@ mod tests {
             (
                 "documents/environment-secrets.json",
                 "application/json",
-                br#"{"access":{"extraProviderBindings":"excluded","surface":"context.env"},"declarations":[],"format":"edge-canon.environment-secrets/v1","limits":{"bindingCount":64,"measurement":"utf-8","valueBytes":5120},"schemaVersion":1,"standardVersion":"edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13"}\n"#.as_slice(),
+                br#"{"access":{"extraProviderBindings":"excluded","surface":"context.env"},"declarations":[],"format":"edge-canon.environment-secrets/v1","limits":{"bindingCount":64,"measurement":"utf-8","valueBytes":5120},"schemaVersion":1,"standardVersion":"edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654"}\n"#.as_slice(),
             ),
             (
                 "functions/main.js",
