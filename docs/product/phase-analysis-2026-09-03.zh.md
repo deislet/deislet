@@ -2089,3 +2089,23 @@ Application/framework source + versioned build plan
   s69 的失败 archive 临时副本后，Windows driver 38/38（含三个真实 Job Object/stdin 测试）通过，证明修复方向。
 - 临时副本不是可登记证据。必须提交修复，从新 commit 重新生成一个 archive，并在 Linux/macOS/Windows 全部复跑
   相同门禁；只有新 archive 三端通过后才能新增 portability evidence。
+
+## 74. Registry/dispatcher 修复提交的三平台精确证据
+
+- 修复提交 `b185984da354e59a199fe600726e454a9c4f3ef9`（tree
+  `142c06446304007ccd496f646ab1dbd93304c49b`，15,093,760-byte `git archive --format=tar` SHA-256
+  `d2f3d6d24e0228ac4fde7ffac9f1b3b5c718e6d547bafd6d815b869a5dc8d685`）的同一 archive 已在 s17 Linux、
+  s67 macOS 和 s69 Windows 验证为相同摘要。三个主机都使用 Rust 1.96.0，并以
+  `CARGO_INCREMENTAL=0`、`CARGO_PROFILE_TEST_DEBUG=0` 运行。
+- Linux/macOS 的 provider driver 均为 47/47，Windows 为 38/38；Windows 结果包含 compile-time `Send`
+  断言、公开 stdin 和两项 Job Object 边界测试。三端的 Control provider-driver 专项均为 16/16、legacy active
+  target fail-closed migration 均为 1/1，`deis-provider-driver/deis-control/deis-queue/deis-store/deis-telemetry`
+  五个 crate 的严格 all-target Clippy 全部通过。因此上一提交暴露的 Windows async `Send` 缺陷在新的精确提交上关闭。
+- 新的 `provider-driver-dispatcher-portability` Schema 和受治理 evidence 固定 source/tree/archive、四条命令、三种操作
+  系统顺序、逐项计数、Windows 回归断言和总结果；同时保留 `f4dc7d3` 在 s69 的编译失败并把它明确关联到修复提交，
+  不能用最终绿灯反向改写历史。共享契约在 s17 通过 11 份 Schema/29 组 fixture；s67/s69 因环境缺少 Python
+  `jsonschema` 未运行该脚本，这一环境观察不被写成失败，也不冒充三端契约证据。
+- 当前精确 archive 仍不包含生成的 Control Web `dist`，既有 dashboard 404 警告不属于这条 Rust 控制路径证据。
+  release/process fixture 仍为合成分发物；真实 Wrangler/Deislet materialized release、签名/信任根轮换/撤销/透明记录、
+  Windows service-account DACL、后台 dispatcher loop、公共 API/CLI/Web、三个完整 driver 和真实账户生命周期均未完成。
+  因此 `P1-DEPLOY-001` 继续保持 active，任何 backend 的 support/conformance 状态均不提升。

@@ -267,10 +267,15 @@ Control 现把 release/host 的验证结果写入不可改写、不可删除的�
 `edge-canon-provider-driver-v1` 进程协议传入 request/outcome；owner/epoch 绑定的短租约 credential 只进入清空后的短期
 process environment。公开 schema 禁止 vendor-specific envelope，进程超时或结果不明时仍按副作用规则 reconcile。
 
+精确提交 `b185984da354e59a199fe600726e454a9c4f3ef9` 的同一 archive 已在 Linux、macOS、Windows 通过
+registry/dispatcher 平台适用测试、legacy migration 和五个部署控制 crate 的严格 Clippy，并登记受 Schema 与治理脚本
+约束的 evidence；它还保留前一提交在 Windows 暴露的 async `Send` 编译失败及其修复关系。该结果只证明受验证安装树到
+进程边界的三平台可移植性，并不证明任何真实 provider deployment 或 conformance。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成 Wrangler 的真实完整安装树，也没有 release
 签名/透明日志与 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
-完整 backend driver 和真实账户 evidence 也未完成。在这些完成并形成精确提交三平台证据前，不能把当前 dispatcher
-称作已部署的 provider 服务，更不能升级 backend 支持状态。
+完整 backend driver 和真实账户 evidence 也未完成。在这些完成并获得真实账户证据前，不能把当前 dispatcher 称作已部署
+的 provider 服务，更不能升级 backend 支持状态。
 
 ## 后果
 

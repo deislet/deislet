@@ -46,6 +46,9 @@ PROVIDER_DEPLOYMENT_PORTABILITY_EVIDENCE_GLOB = "provider-deployment-portability
 PROVIDER_DRIVER_RELEASE_PORTABILITY_EVIDENCE_GLOB = (
     "provider-driver-release-portability-*.json"
 )
+PROVIDER_DRIVER_DISPATCHER_PORTABILITY_EVIDENCE_GLOB = (
+    "provider-driver-dispatcher-portability-*.json"
+)
 
 
 class ValidationError(RuntimeError):
@@ -685,6 +688,127 @@ def validate_provider_driver_release_portability_evidence(evidence_path: str) ->
     )
 
 
+def validate_provider_driver_dispatcher_portability_evidence(
+    evidence_path: str,
+) -> None:
+    schema = load_json(
+        "docs/product/evidence/provider-driver-dispatcher-portability.schema.json"
+    )
+    evidence = load_json(evidence_path)
+    validator = jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.FormatChecker()
+    )
+    errors = sorted(validator.iter_errors(evidence), key=lambda error: list(error.path))
+    if errors:
+        error = errors[0]
+        location = "/" + "/".join(str(part) for part in error.path)
+        raise ValidationError(f"{evidence_path} {location}: {error.message}")
+
+    source = evidence["source"]
+    observations = evidence["observations"]
+    command_ids = [command["id"] for command in evidence["commands"]]
+    require(
+        len(command_ids) == len(set(command_ids)),
+        f"{evidence_path}: duplicate command id",
+    )
+    ids = [observation["id"] for observation in observations]
+    aliases = [observation["hostAlias"] for observation in observations]
+    operating_systems = [
+        observation["operatingSystem"] for observation in observations
+    ]
+    require(len(ids) == len(set(ids)), f"{evidence_path}: duplicate observation id")
+    require(
+        len(aliases) == len(set(aliases)),
+        f"{evidence_path}: duplicate host alias",
+    )
+    require(
+        operating_systems == evidence["requiredOperatingSystems"],
+        f"{evidence_path}: operating system observation set or order drifted",
+    )
+
+    passing_systems: set[str] = set()
+    exact_archive_verified = True
+    for observation in observations:
+        require(
+            observation["commit"] == source["commit"],
+            f"{evidence_path}: {observation['id']} commit drifted",
+        )
+        exact_archive_verified &= (
+            observation["archiveSha256"] == source["archive"]["sha256"]
+        )
+        checks = observation["checks"]
+        require(
+            [check["id"] for check in checks] == command_ids,
+            f"{evidence_path}: {observation['id']} check set or order drifted",
+        )
+        for check in checks:
+            if check["id"] != "strict-clippy":
+                require(
+                    all(field in check for field in ("passed", "failed", "ignored")),
+                    f"{evidence_path}: {observation['id']} {check['id']} lacks test counts",
+                )
+            if check["outcome"] == "passed" and "failed" in check:
+                require(
+                    check["failed"] == 0,
+                    f"{evidence_path}: {observation['id']} {check['id']} passed with failures",
+                )
+        if all(check["outcome"] == "passed" for check in checks):
+            passing_systems.add(observation["operatingSystem"])
+
+    require(
+        evidence["assertions"]["exactArchiveVerifiedOnEveryHost"]
+        == exact_archive_verified,
+        f"{evidence_path}: exact archive assertion does not match observations",
+    )
+    required_systems = set(evidence["requiredOperatingSystems"])
+    all_required_passed = required_systems <= passing_systems
+    require(
+        evidence["assertions"]["allRequiredOperatingSystemsPassed"]
+        == all_required_passed,
+        f"{evidence_path}: required OS assertion does not match observations",
+    )
+    require(
+        evidence["assertions"]["windowsAsyncSendRegressionClosed"]
+        == ("windows" in passing_systems),
+        f"{evidence_path}: Windows async Send assertion does not match observations",
+    )
+
+    prior_commits: set[str] = set()
+    for prior in evidence["priorFailedAttempts"]:
+        prior_source = prior["source"]
+        require(
+            prior_source["commit"] not in prior_commits,
+            f"{evidence_path}: duplicate prior failure commit",
+        )
+        prior_commits.add(prior_source["commit"])
+        require(
+            prior_source["commit"] != source["commit"]
+            and prior["fixedBy"] == source["commit"],
+            f"{evidence_path}: prior failure is not linked to the passing source",
+        )
+        require(
+            [check["id"] for check in prior["checks"]] == command_ids,
+            f"{evidence_path}: prior failure check set or order drifted",
+        )
+        require(
+            any(check["outcome"] == "failed" for check in prior["checks"]),
+            f"{evidence_path}: prior attempt has no failed check",
+        )
+
+    any_failed = any(
+        check["outcome"] == "failed"
+        for observation in observations
+        for check in observation["checks"]
+    )
+    expected_outcome = (
+        "failed" if any_failed else "passed" if all_required_passed else "partial"
+    )
+    require(
+        evidence["outcome"] == expected_outcome,
+        f"{evidence_path}: outcome must be {expected_outcome}",
+    )
+
+
 def validate_integration() -> None:
     control_manifest = tomllib.loads(read_text("crates/deis-control/Cargo.toml"))
     control_dependencies = set(control_manifest.get("dependencies", {}))
@@ -995,6 +1119,19 @@ def main() -> int:
         )
         for evidence_path in release_portability_paths:
             validate_provider_driver_release_portability_evidence(evidence_path)
+        dispatcher_portability_paths = sorted(
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "docs/product/evidence").glob(
+                PROVIDER_DRIVER_DISPATCHER_PORTABILITY_EVIDENCE_GLOB
+            )
+            if path.name != "provider-driver-dispatcher-portability.schema.json"
+        )
+        require(
+            dispatcher_portability_paths,
+            "no provider driver dispatcher portability evidence is registered",
+        )
+        for evidence_path in dispatcher_portability_paths:
+            validate_provider_driver_dispatcher_portability_evidence(evidence_path)
         validate_integration()
     except (KeyError, TypeError, ValidationError) as error:
         print(f"product governance validation failed: {error}", file=sys.stderr)

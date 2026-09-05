@@ -1,0 +1,131 @@
+{
+  "$schema": "./provider-driver-dispatcher-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-driver-dispatcher-portability-b185984-2026-09-06",
+  "collectedAt": "2026-09-06T02:52:27+08:00",
+  "outcome": "passed",
+  "scope": "The exact source archive passes the platform-applicable verified driver process suite, Control installed-release registry and durable provider-operation suite, legacy target fail-closed migration, and strict all-target lint for the deployment-control crates on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "b185984da354e59a199fe600726e454a9c4f3ef9",
+    "tree": "142c06446304007ccd496f646ab1dbd93304c49b",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "d2f3d6d24e0228ac4fde7ffac9f1b3b5c718e6d547bafd6d815b869a5dc8d685",
+      "sizeBytes": 15093760
+    }
+  },
+  "buildEnvironment": {"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_TEST_DEBUG": "0"},
+  "commands": [
+    {"id": "provider-driver-tests", "command": "cargo +1.96.0 test -p deis-provider-driver"},
+    {"id": "provider-driver-control-tests", "command": "cargo +1.96.0 test -p deis-control provider_driver -- --nocapture"},
+    {"id": "legacy-target-migration-test", "command": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"},
+    {"id": "strict-clippy", "command": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"}
+  ],
+  "sharedContractCheck": {
+    "hostAlias": "s17",
+    "command": "python3 scripts/check-shared-contracts.py",
+    "outcome": "passed",
+    "exitCode": 0,
+    "schemas": 11,
+    "fixtures": 29
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "b185984da354e59a199fe600726e454a9c4f3ef9",
+      "archiveSha256": "d2f3d6d24e0228ac4fde7ffac9f1b3b5c718e6d547bafd6d815b869a5dc8d685",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 47, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 16, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "b185984da354e59a199fe600726e454a9c4f3ef9",
+      "archiveSha256": "d2f3d6d24e0228ac4fde7ffac9f1b3b5c718e6d547bafd6d815b869a5dc8d685",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 47, "failed": 0, "ignored": 0, "note": "Unix full-tree installation checks, process groups, and the real shell release/credential process test are enabled."},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 16, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "Serv69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "b185984da354e59a199fe600726e454a9c4f3ef9",
+      "archiveSha256": "d2f3d6d24e0228ac4fde7ffac9f1b3b5c718e6d547bafd6d815b869a5dc8d685",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 38, "failed": 0, "ignored": 0, "note": "Windows compiles the ProcessGroup Send assertion and executes public stdin plus two Job Object boundary tests; Unix-only tests are not compiled."},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 16, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    }
+  ],
+  "priorFailedAttempts": [
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "f4dc7d3ef7b89d0381f5931d02cf9f478cb3fd0e",
+        "tree": "8a0b71df8bb49c16856eed1f8a9124a7789f3a1d",
+        "archive": {"format": "git-archive-tar", "sha256": "552ecb9b5c0974353789d29ea9b3fd2517d0de19f083fb4962a14818ac0baba3", "sizeBytes": 15083520}
+      },
+      "hostAlias": "s69",
+      "operatingSystem": "windows",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "failed", "exitCode": 101, "note": "Compilation failed before tests because a raw Windows HANDLE held across await made the executable driver future non-Send."},
+        {"id": "provider-driver-control-tests", "outcome": "not-run", "exitCode": null},
+        {"id": "legacy-target-migration-test", "outcome": "not-run", "exitCode": null},
+        {"id": "strict-clippy", "outcome": "not-run", "exitCode": null}
+      ],
+      "cause": "Windows Job Object ProcessGroup stored HANDLE as a raw pointer across async suspension. The async ProviderDriver trait requires a Send future, while Unix PID storage did not expose the target-specific error.",
+      "fixedBy": "b185984da354e59a199fe600726e454a9c4f3ef9"
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "exactArchiveVerifiedOnEveryHost": true,
+    "windowsAsyncSendRegressionClosed": true,
+    "sharedProcessProtocolValidated": true,
+    "noLiveProviderClaim": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "The release and process fixtures are synthetic; this evidence does not execute a real Wrangler, EdgeOne, Deislet, or other provider release or account.",
+    "Release signing, trust-root rotation, revocation, transparency, and Windows service-account DACL validation are not implemented.",
+    "The registry and dispatcher have no public API/CLI/Web management surface or background execution loop in this evidence.",
+    "The exact archive does not contain generated Control dashboard assets, so the existing build warning and dashboard 404 remain outside this Rust control-path record.",
+    "Passing contract, unit, migration, and lint checks does not certify any backend against Edge Canon."
+  ]
+}
