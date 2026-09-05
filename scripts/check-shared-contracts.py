@@ -32,6 +32,7 @@ EXPECTED_DOCUMENTS = {
     "provider-driver",
     "provider-driver-release",
     "provider-driver-trust-root",
+    "provider-driver-trust-root-envelope",
     "provider-driver-release-authorization",
     "provider-driver-release-envelope",
     "provider-driver-process",
@@ -394,9 +395,16 @@ def validate_cross_document_invariants(registry: dict) -> None:
                 )
 
     trust_root = load_json("contracts/v1/fixtures/valid/provider-driver-trust-root.json")
+    root_role = trust_root["root"]
     signing_role = trust_root["providerDriverRelease"]
     key_ids = signing_role["keyIds"]
     keys = trust_root["keys"]
+    require(
+        root_role["keyIds"] == sorted(root_role["keyIds"])
+        and len(root_role["keyIds"]) == len(set(root_role["keyIds"]))
+        and root_role["threshold"] <= len(root_role["keyIds"]),
+        "provider driver root signing role is not canonical",
+    )
     require(
         key_ids == sorted(key_ids) and len(key_ids) == len(set(key_ids)),
         "provider driver release signing role key IDs are not canonical",
@@ -410,6 +418,10 @@ def validate_cross_document_invariants(registry: dict) -> None:
         signing_role["threshold"] <= len(key_ids)
         and set(key_ids) <= {key["keyId"] for key in keys},
         "provider driver release signing role threshold or keys are invalid",
+    )
+    require(
+        set(root_role["keyIds"]) <= {key["keyId"] for key in keys},
+        "provider driver root signing role references an unknown key",
     )
     for key in keys:
         public_key = base64.b64decode(key["publicKey"], validate=True)
@@ -457,6 +469,33 @@ def validate_cross_document_invariants(registry: dict) -> None:
         and set(envelope_signers) <= set(key_ids)
         and len(envelope_signers) >= signing_role["threshold"],
         "provider driver release DSSE signers do not satisfy the trusted role",
+    )
+
+    next_root = load_json("contracts/v1/fixtures/valid/provider-driver-trust-root-v2.json")
+    next_root_canonical = json.dumps(
+        next_root, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    root_envelope = load_json(
+        "contracts/v1/fixtures/valid/provider-driver-trust-root-envelope.json"
+    )
+    require(
+        next_root["rootVersion"] == trust_root["rootVersion"] + 1
+        and base64.b64decode(root_envelope["payload"], validate=True)
+        == next_root_canonical,
+        "provider driver trust root envelope does not carry exactly the next canonical root",
+    )
+    root_envelope_signers = [
+        signature["keyid"] for signature in root_envelope["signatures"]
+    ]
+    next_root_role = next_root["root"]
+    require(
+        root_envelope_signers == sorted(root_envelope_signers)
+        and len(root_envelope_signers) == len(set(root_envelope_signers))
+        and len(set(root_envelope_signers) & set(root_role["keyIds"]))
+        >= root_role["threshold"]
+        and len(set(root_envelope_signers) & set(next_root_role["keyIds"]))
+        >= next_root_role["threshold"],
+        "provider driver trust root envelope lacks old-root or new-root threshold",
     )
 
     operation = load_json("contracts/v1/fixtures/valid/operation.json")

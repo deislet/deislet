@@ -297,8 +297,23 @@ DSSE fixture 的真实 Ed25519 阈值签名也由 Rust verifier 验证。证据�
 Windows reparse/share-write 文件边界。macOS 未安装 Python `jsonschema`，因此共享 14 份 Schema/37 组 fixture 只在
 Linux 执行；该环境缺项不冒充三端契约运行。
 
+信任根演化采用 TUF root update 的核心不变量，而不是由当前根单方面替换自身。根文档新增独立 `root` 角色；轮换
+sidecar 的 payload 是恰好 N+1 的 RFC 8785 canonical 新根，DSSE PAE 必须分别达到旧根 `root` 角色和新根 `root`
+角色阈值。验证轮换时不以旧根文档过期为恢复阻断，但参与签名的旧/新 key 在观察时刻都必须 active 且处于自身有效期，
+最终新根必须未过期。首次带外引导不能携带无从验证的轮换 envelope；数据库已有同一 canonical 最高版本时可直接重启，
+只有前进到下一版本才要求 envelope。版本回退、跳号、同版本异内容、已撤销 key 重新激活，以及已经退出 key/root/release
+角色的历史 key 被重新引入都失败关闭。
+
+Control 通过与根文件相同的安全文件读取边界加载可选 rotation envelope；根与轮换在同一 SQLite 事务中持久化。
+`provider_driver_trust_root_rotations` 保存前后版本、canonical envelope 摘要和双方实际签名者，记录不可修改、不可删除。
+为避免上一已发布切片的 pre-root-role v1 在升级时失效，兼容解析只对既有历史保留其原 canonical identity，并把旧
+release role 阈值作为旧 root role；它不能用于全新 bootstrap，下一次双阈值轮换写入显式 root role 后即退出兼容路径。
+共享契约新增 rotation envelope schema、canonical N+1 正例与 payload type/signature/role 阈值反例；Rust fixture 测试会
+执行真实 Ed25519 双阈值验证，而不把 Python 结构检查冒充密码学证据。该设计遵循 TUF 对连续 intermediate root、旧/新
+root threshold 及只在更新结束检查最终 trusted root expiry 的要求。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
-Sigstore/Rekor 或等价透明证明、旧根与新根双阈值验证的自动 root rotation，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
+Sigstore/Rekor 或等价透明证明，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
 完整 backend driver 和真实账户 evidence 也未完成。在这些完成并获得真实账户证据前，不能把当前 dispatcher 称作已部署
 的 provider 服务，更不能升级 backend 支持状态。
 

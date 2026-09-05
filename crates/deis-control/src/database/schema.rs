@@ -3228,6 +3228,37 @@ fn ensure_provider_driver_release_schema(conn: &Connection) -> Result<()> {
             SELECT RAISE(ABORT, 'provider driver trust root history cannot be deleted');
         END;
 
+        CREATE TABLE IF NOT EXISTS provider_driver_trust_root_rotations (
+            from_root_version            INTEGER NOT NULL CHECK(from_root_version >= 1),
+            to_root_version              INTEGER NOT NULL UNIQUE CHECK(to_root_version >= 2),
+            envelope_sha256              TEXT NOT NULL UNIQUE,
+            envelope_json                TEXT NOT NULL CHECK(json_valid(envelope_json)),
+            previous_signer_key_ids_json TEXT NOT NULL CHECK(json_valid(previous_signer_key_ids_json)),
+            next_signer_key_ids_json     TEXT NOT NULL CHECK(json_valid(next_signer_key_ids_json)),
+            observed_at                  INTEGER NOT NULL,
+            PRIMARY KEY(from_root_version, to_root_version),
+            FOREIGN KEY(from_root_version)
+                REFERENCES provider_driver_trust_roots(root_version),
+            FOREIGN KEY(to_root_version)
+                REFERENCES provider_driver_trust_roots(root_version),
+            CHECK(to_root_version = from_root_version + 1),
+            CHECK(length(envelope_sha256) = 64
+              AND lower(envelope_sha256) = envelope_sha256
+              AND envelope_sha256 NOT GLOB '*[^0-9a-f]*')
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_trust_root_rotations_immutable_v1
+        BEFORE UPDATE ON provider_driver_trust_root_rotations
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver trust root rotation is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_trust_root_rotations_no_delete_v1
+        BEFORE DELETE ON provider_driver_trust_root_rotations
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver trust root rotation cannot be deleted');
+        END;
+
         CREATE TABLE IF NOT EXISTS provider_driver_release_authorizations (
             release_sha256          TEXT NOT NULL,
             host_operating_system   TEXT NOT NULL,

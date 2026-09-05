@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/provider-driver-trust-root-envelope.schema.json",
+  "title": "DSSE envelope for a provider driver trust-root rotation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payloadType", "payload", "signatures"],
+  "properties": {
+    "payloadType": {
+      "const": "application/vnd.deislet.provider-driver-trust-root.v1+json"
+    },
+    "payload": {
+      "type": "string",
+      "minLength": 4,
+      "pattern": "^[A-Za-z0-9+/]+={0,2}$"
+    },
+    "signatures": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["keyid", "sig"],
+        "properties": {
+          "keyid": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "sig": {"type": "string", "pattern": "^[A-Za-z0-9+/]{86}==$"}
+        }
+      }
+    }
+  }
+}

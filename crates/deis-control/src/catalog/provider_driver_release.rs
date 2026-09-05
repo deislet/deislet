@@ -11,8 +11,9 @@ use deis_provider_driver::{
     DriverInstallationError, DriverReleaseInstaller, ExecutableProviderDriver,
     ExecutableProviderDriverConfig, HostOperatingSystem, InstalledDriverRelease,
     ProviderCredentialBroker, Sha256Digest, ValidatedDriverReleaseAuthorization,
-    ValidatedDriverReleaseTrustRoot, ValidatedProviderDriverManifest,
-    ValidatedProviderDriverRelease, VerifiedDriverReleaseAuthorization,
+    ValidatedDriverReleaseTrustRoot, ValidatedDriverTrustRootRotation,
+    ValidatedProviderDriverManifest, ValidatedProviderDriverRelease,
+    VerifiedDriverReleaseAuthorization, VerifiedDriverTrustRootRotation,
 };
 use deis_wire::CanonicalId;
 use rusqlite::{OptionalExtension, params};
@@ -80,10 +81,17 @@ impl ProviderDriverReleaseRegistry {
         store: CatalogStore,
         installation_root: impl AsRef<Path>,
         trust_root: ValidatedDriverReleaseTrustRoot,
+        trust_root_rotation: Option<ValidatedDriverTrustRootRotation>,
     ) -> CatalogResult<Self> {
-        if trust_root.get().expires_at <= Utc::now() {
+        let now = Utc::now();
+        if trust_root.get().expires_at <= now {
             return Err(CatalogError::invalid(
                 "provider driver release trust root has expired",
+            ));
+        }
+        if !trust_root.root_role_satisfies_threshold_at(now) {
+            return Err(CatalogError::invalid(
+                "provider driver release trust root has no currently usable root-role threshold",
             ));
         }
         let host = HostOperatingSystem::current().ok_or_else(|| {
@@ -102,7 +110,7 @@ impl ProviderDriverReleaseRegistry {
             host,
             trust_root: Arc::new(trust_root),
         };
-        registry.record_trust_root().await?;
+        registry.record_trust_root(trust_root_rotation).await?;
         Ok(registry)
     }
 
@@ -126,68 +134,87 @@ impl ProviderDriverReleaseRegistry {
         Arc::ptr_eq(&self.store.database(), &store.database())
     }
 
-    async fn record_trust_root(&self) -> CatalogResult<()> {
-        let root = self.trust_root.get();
-        let root_version = i64::try_from(root.root_version).map_err(|_| {
+    async fn record_trust_root(
+        &self,
+        trust_root_rotation: Option<ValidatedDriverTrustRootRotation>,
+    ) -> CatalogResult<()> {
+        let trust_root = self.trust_root.as_ref().clone();
+        let root_version = i64::try_from(trust_root.get().root_version).map_err(|_| {
             CatalogError::invalid("provider driver trust root version exceeds SQLite range")
         })?;
-        let root_digest = self.trust_root.canonical_sha256().to_string();
-        let root_json = String::from_utf8(self.trust_root.canonical_json().map_err(|error| {
+        let root_digest = trust_root.canonical_sha256().to_string();
+        let root_json = String::from_utf8(trust_root.canonical_json().map_err(|error| {
             CatalogError::invalid(format!(
                 "cannot canonicalize provider driver trust root: {error}"
             ))
         })?)
         .expect("JCS JSON is UTF-8");
-        let active_key_ids = root
-            .keys
-            .iter()
-            .filter(|key| key.status == deis_provider_driver::DriverReleaseSigningKeyStatus::Active)
-            .map(|key| key.key_id.clone())
-            .collect::<BTreeSet<_>>();
-        let expires_at = root.expires_at.timestamp();
+        let expires_at = trust_root.get().expires_at.timestamp();
         let database = self.store.database();
         database
             .with_connection(move |connection| {
                 let transaction = connection.unchecked_transaction()?;
-                let highest_version: Option<i64> = transaction.query_row(
-                    "SELECT max(root_version) FROM provider_driver_trust_roots",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if highest_version.is_some_and(|highest| root_version < highest) {
-                    return Err(CatalogError::conflict(
-                        "provider driver trust root version would roll durable trust state backward",
-                    ));
-                }
-                let existing = transaction
+                let highest = transaction
                     .query_row(
-                        "SELECT root_sha256, root_json, expires_at
-                           FROM provider_driver_trust_roots WHERE root_version = ?1",
-                        [root_version],
+                        "SELECT root_version, root_sha256, root_json, expires_at
+                           FROM provider_driver_trust_roots
+                          ORDER BY root_version DESC LIMIT 1",
+                        [],
                         |row| {
                             Ok((
-                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(0)?,
                                 row.get::<_, String>(1)?,
-                                row.get::<_, i64>(2)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
                             ))
                         },
                     )
                     .optional()?;
                 let now = now_secs();
-                if let Some(existing) = existing {
-                    if existing != (root_digest.clone(), root_json.clone(), expires_at) {
+                match highest {
+                    None => {
+                        if trust_root_rotation.is_some() {
+                            return Err(CatalogError::conflict(
+                                "provider driver trust root bootstrap cannot use an unverifiable rotation envelope",
+                            ));
+                        }
+                        if trust_root.uses_legacy_implicit_root_role() {
+                            return Err(CatalogError::conflict(
+                                "provider driver trust root bootstrap requires an explicit root role",
+                            ));
+                        }
+                        insert_trust_root(
+                            &transaction,
+                            root_version,
+                            &root_digest,
+                            &root_json,
+                            expires_at,
+                            now,
+                        )?;
+                    }
+                    Some((highest_version, highest_digest, highest_json, highest_expires_at))
+                        if root_version == highest_version =>
+                    {
+                        if (highest_digest, highest_json, highest_expires_at)
+                            != (root_digest.clone(), root_json.clone(), expires_at)
+                        {
+                            return Err(CatalogError::conflict(
+                                "provider driver trust root version has conflicting canonical content",
+                            ));
+                        }
+                        transaction.execute(
+                            "UPDATE provider_driver_trust_roots SET last_seen_at = MAX(last_seen_at, ?2)
+                              WHERE root_version = ?1",
+                            params![root_version, now],
+                        )?;
+                    }
+                    Some((highest_version, _, _, _)) if root_version < highest_version => {
                         return Err(CatalogError::conflict(
-                            "provider driver trust root version has conflicting canonical content",
+                            "provider driver trust root version would roll durable trust state backward",
                         ));
                     }
-                    transaction.execute(
-                        "UPDATE provider_driver_trust_roots SET last_seen_at = MAX(last_seen_at, ?2)
-                          WHERE root_version = ?1",
-                        params![root_version, now],
-                    )?;
-                } else {
-                    if let Some(highest) = highest_version {
-                        let expected = highest.checked_add(1).ok_or_else(|| {
+                    Some((highest_version, _, highest_json, _)) => {
+                        let expected = highest_version.checked_add(1).ok_or_else(|| {
                             CatalogError::invalid(
                                 "provider driver trust root version exceeds SQLite range",
                             )
@@ -197,53 +224,61 @@ impl ProviderDriverReleaseRegistry {
                                 "provider driver trust root versions must advance exactly once",
                             ));
                         }
-                    }
-                    let historical_root_json = {
-                        let mut statement = transaction.prepare(
-                            "SELECT root_json FROM provider_driver_trust_roots
-                              ORDER BY root_version",
-                        )?;
-                        statement
-                            .query_map([], |row| row.get::<_, String>(0))?
-                            .collect::<Result<Vec<_>, _>>()?
-                    };
-                    let mut permanently_revoked_key_ids = BTreeSet::new();
-                    for historical_root_json in historical_root_json {
-                        let historical_root = ValidatedDriverReleaseTrustRoot::parse_json(
-                            historical_root_json.as_bytes(),
+                        let previous_root = ValidatedDriverReleaseTrustRoot::parse_json_compatible(
+                            highest_json.as_bytes(),
                         )
                         .map_err(|error| {
                             CatalogError::invalid(format!(
                                 "invalid durable provider driver trust root: {error}"
                             ))
                         })?;
-                        permanently_revoked_key_ids.extend(
-                            historical_root
-                                .get()
-                                .keys
-                                .iter()
-                                .filter(|key| {
-                                    key.status
-                                        == deis_provider_driver::DriverReleaseSigningKeyStatus::Revoked
-                                })
-                                .map(|key| key.key_id.clone()),
-                        );
+                        let rotation = trust_root_rotation.as_ref().ok_or_else(|| {
+                            CatalogError::conflict(
+                                "provider driver trust root update requires an old-root/new-root rotation envelope",
+                            )
+                        })?;
+                        if rotation.next_root().canonical_sha256()
+                            != trust_root.canonical_sha256()
+                        {
+                            return Err(CatalogError::conflict(
+                                "provider driver trust root rotation does not carry the configured next root",
+                            ));
+                        }
+                        let observed_at = DateTime::from_timestamp(now, 0).ok_or_else(|| {
+                            CatalogError::invalid("provider driver trust root observation time is invalid")
+                        })?;
+                        let verified_rotation = rotation
+                            .verify(&previous_root, observed_at)
+                            .map_err(trust_root_rotation_error)?;
+                        let historical_root_json = {
+                            let mut statement = transaction.prepare(
+                                "SELECT root_json FROM provider_driver_trust_roots
+                                  ORDER BY root_version",
+                            )?;
+                            statement
+                                .query_map([], |row| row.get::<_, String>(0))?
+                                .collect::<Result<Vec<_>, _>>()?
+                        };
+                        validate_trust_root_transition(
+                            &historical_root_json,
+                            &previous_root,
+                            &trust_root,
+                        )?;
+                        insert_trust_root(
+                            &transaction,
+                            root_version,
+                            &root_digest,
+                            &root_json,
+                            expires_at,
+                            now,
+                        )?;
+                        persist_trust_root_rotation(
+                            &transaction,
+                            rotation,
+                            &verified_rotation,
+                            now,
+                        )?;
                     }
-                    if active_key_ids
-                        .iter()
-                        .any(|key_id| permanently_revoked_key_ids.contains(key_id))
-                    {
-                        return Err(CatalogError::conflict(
-                            "provider driver trust root cannot reactivate a historically revoked key",
-                        ));
-                    }
-                    transaction.execute(
-                        "INSERT INTO provider_driver_trust_roots
-                           (root_version, root_sha256, root_json, expires_at,
-                            first_seen_at, last_seen_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                        params![root_version, root_digest, root_json, expires_at, now],
-                    )?;
                 }
                 transaction.commit()?;
                 Ok(())
@@ -533,6 +568,160 @@ impl ProviderDriverReleaseRegistry {
         };
         persist_verified_release(&self.store, facts).await
     }
+}
+
+fn insert_trust_root(
+    connection: &rusqlite::Connection,
+    root_version: i64,
+    root_digest: &str,
+    root_json: &str,
+    expires_at: i64,
+    observed_at: i64,
+) -> CatalogResult<()> {
+    connection.execute(
+        "INSERT INTO provider_driver_trust_roots
+           (root_version, root_sha256, root_json, expires_at, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        params![
+            root_version,
+            root_digest,
+            root_json,
+            expires_at,
+            observed_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn persist_trust_root_rotation(
+    connection: &rusqlite::Connection,
+    rotation: &ValidatedDriverTrustRootRotation,
+    verified: &VerifiedDriverTrustRootRotation,
+    observed_at: i64,
+) -> CatalogResult<()> {
+    let envelope_json = String::from_utf8(rotation.canonical_json().map_err(|error| {
+        CatalogError::invalid(format!(
+            "cannot canonicalize provider driver trust root rotation: {error}"
+        ))
+    })?)
+    .expect("JCS JSON is UTF-8");
+    let previous_signers_json = serde_json::to_string(&verified.previous_root_signer_key_ids)
+        .map_err(|error| {
+            CatalogError::invalid(format!(
+                "cannot encode previous provider driver root signer IDs: {error}"
+            ))
+        })?;
+    let next_signers_json =
+        serde_json::to_string(&verified.next_root_signer_key_ids).map_err(|error| {
+            CatalogError::invalid(format!(
+                "cannot encode next provider driver root signer IDs: {error}"
+            ))
+        })?;
+    connection.execute(
+        "INSERT INTO provider_driver_trust_root_rotations
+           (from_root_version, to_root_version, envelope_sha256, envelope_json,
+            previous_signer_key_ids_json, next_signer_key_ids_json, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            i64::try_from(verified.previous_root_version).map_err(|_| {
+                CatalogError::invalid("previous provider driver root version exceeds SQLite range")
+            })?,
+            i64::try_from(verified.next_root_version).map_err(|_| {
+                CatalogError::invalid("next provider driver root version exceeds SQLite range")
+            })?,
+            verified.envelope_sha256.as_str(),
+            envelope_json,
+            previous_signers_json,
+            next_signers_json,
+            observed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_trust_root_transition(
+    historical_root_json: &[String],
+    previous_root: &ValidatedDriverReleaseTrustRoot,
+    next_root: &ValidatedDriverReleaseTrustRoot,
+) -> CatalogResult<()> {
+    let previous = previous_root.get();
+    let next = next_root.get();
+    let previous_key_ids = previous
+        .keys
+        .iter()
+        .map(|key| key.key_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let previous_root_role_ids = previous
+        .root
+        .key_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let previous_release_role_ids = previous
+        .provider_driver_release
+        .key_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut historical_key_ids = BTreeSet::new();
+    let mut historical_root_role_ids = BTreeSet::new();
+    let mut historical_release_role_ids = BTreeSet::new();
+    let mut permanently_revoked_key_ids = BTreeSet::new();
+
+    for root_json in historical_root_json {
+        let root = ValidatedDriverReleaseTrustRoot::parse_json_compatible(root_json.as_bytes())
+            .map_err(|error| {
+                CatalogError::invalid(format!(
+                    "invalid durable provider driver trust root: {error}"
+                ))
+            })?;
+        historical_key_ids.extend(root.get().keys.iter().map(|key| key.key_id.clone()));
+        historical_root_role_ids.extend(root.get().root.key_ids.iter().cloned());
+        historical_release_role_ids
+            .extend(root.get().provider_driver_release.key_ids.iter().cloned());
+        permanently_revoked_key_ids.extend(
+            root.get()
+                .keys
+                .iter()
+                .filter(|key| {
+                    key.status == deis_provider_driver::DriverReleaseSigningKeyStatus::Revoked
+                })
+                .map(|key| key.key_id.clone()),
+        );
+    }
+
+    if next.keys.iter().any(|key| {
+        key.status == deis_provider_driver::DriverReleaseSigningKeyStatus::Active
+            && permanently_revoked_key_ids.contains(&key.key_id)
+    }) {
+        return Err(CatalogError::conflict(
+            "provider driver trust root cannot reactivate a historically revoked key",
+        ));
+    }
+    if next.keys.iter().any(|key| {
+        historical_key_ids.contains(&key.key_id) && !previous_key_ids.contains(key.key_id.as_str())
+    }) {
+        return Err(CatalogError::conflict(
+            "provider driver trust root cannot reintroduce a retired key",
+        ));
+    }
+    if next.root.key_ids.iter().any(|key_id| {
+        historical_root_role_ids.contains(key_id)
+            && !previous_root_role_ids.contains(key_id.as_str())
+    }) {
+        return Err(CatalogError::conflict(
+            "provider driver trust root cannot restore a key to the root role after retirement",
+        ));
+    }
+    if next.provider_driver_release.key_ids.iter().any(|key_id| {
+        historical_release_role_ids.contains(key_id)
+            && !previous_release_role_ids.contains(key_id.as_str())
+    }) {
+        return Err(CatalogError::conflict(
+            "provider driver trust root cannot restore a key to the release role after retirement",
+        ));
+    }
+    Ok(())
 }
 
 impl ProviderDriverDispatcher {
@@ -1187,6 +1376,14 @@ fn authorization_error(
     ))
 }
 
+fn trust_root_rotation_error(
+    error: deis_provider_driver::DriverReleaseAuthorizationError,
+) -> CatalogError {
+    CatalogError::invalid(format!(
+        "provider driver trust root rotation verification failed: {error}"
+    ))
+}
+
 fn parse_digest(value: &str, label: &str) -> CatalogResult<Sha256Digest> {
     value
         .parse()
@@ -1259,10 +1456,11 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use chrono::TimeDelta;
     use deis_provider_driver::{
-        CredentialMaterial, DSSE_ENVELOPE_PAYLOAD_TYPE, DriverReleaseAuthorization,
-        DriverReleaseAuthorizationSubject, DriverReleaseComponent, DriverReleaseDsseEnvelope,
-        DriverReleaseDsseSignature, DriverReleaseFile, DriverReleaseSigningKey,
-        DriverReleaseSigningKeyStatus, DriverReleaseSigningRole, DriverReleaseTrustRoot,
+        CredentialMaterial, DSSE_ENVELOPE_PAYLOAD_TYPE, DSSE_TRUST_ROOT_PAYLOAD_TYPE,
+        DriverReleaseAuthorization, DriverReleaseAuthorizationSubject, DriverReleaseComponent,
+        DriverReleaseDsseEnvelope, DriverReleaseDsseSignature, DriverReleaseFile,
+        DriverReleaseRootRole, DriverReleaseSigningKey, DriverReleaseSigningKeyStatus,
+        DriverReleaseSigningRole, DriverReleaseTrustRoot, DriverTrustRootDsseEnvelope,
         ProviderDriver, ProviderDriverManifest, ProviderDriverRelease, ToolDigest,
     };
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -1377,26 +1575,45 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[29; 32]);
         let public_key = signing_key.verifying_key().to_bytes();
         let key_id = hex::encode(Sha256::digest(public_key));
+        let root_signing_key = SigningKey::from_bytes(&[23; 32]);
+        let root_public_key = root_signing_key.verifying_key().to_bytes();
+        let root_key_id = hex::encode(Sha256::digest(root_public_key));
         let trust_root = ValidatedDriverReleaseTrustRoot::new(DriverReleaseTrustRoot {
             schema: Some("provider-driver-trust-root.schema.json".to_owned()),
             schema_version: 1,
             root_version: 1,
             expires_at: now + TimeDelta::days(30),
+            root: DriverReleaseRootRole {
+                key_ids: vec![root_key_id.clone()],
+                threshold: 1,
+            },
             provider_driver_release: DriverReleaseSigningRole {
                 key_ids: vec![key_id.clone()],
                 threshold: 1,
                 max_authorization_lifetime_seconds: 7 * 24 * 60 * 60,
             },
-            keys: vec![DriverReleaseSigningKey {
-                key_id: key_id.clone(),
-                key_type: "ed25519".to_owned(),
-                scheme: "ed25519".to_owned(),
-                public_key: STANDARD.encode(public_key),
-                status: DriverReleaseSigningKeyStatus::Active,
-                valid_from: now - TimeDelta::days(1),
-                valid_until: now + TimeDelta::days(90),
-                revoked_at: None,
-            }],
+            keys: vec![
+                DriverReleaseSigningKey {
+                    key_id: key_id.clone(),
+                    key_type: "ed25519".to_owned(),
+                    scheme: "ed25519".to_owned(),
+                    public_key: STANDARD.encode(public_key),
+                    status: DriverReleaseSigningKeyStatus::Active,
+                    valid_from: now - TimeDelta::days(1),
+                    valid_until: now + TimeDelta::days(90),
+                    revoked_at: None,
+                },
+                DriverReleaseSigningKey {
+                    key_id: root_key_id,
+                    key_type: "ed25519".to_owned(),
+                    scheme: "ed25519".to_owned(),
+                    public_key: STANDARD.encode(root_public_key),
+                    status: DriverReleaseSigningKeyStatus::Active,
+                    valid_from: now - TimeDelta::days(1),
+                    valid_until: now + TimeDelta::days(90),
+                    revoked_at: None,
+                },
+            ],
         })
         .unwrap();
         let authorization = DriverReleaseAuthorization {
@@ -1439,6 +1656,42 @@ mod tests {
         (trust_root, authorization)
     }
 
+    fn signed_root_rotation(next_root: DriverReleaseTrustRoot) -> ValidatedDriverTrustRootRotation {
+        signed_root_rotation_with_seeds(next_root, &[23])
+    }
+
+    fn signed_root_rotation_with_seeds(
+        next_root: DriverReleaseTrustRoot,
+        seeds: &[u8],
+    ) -> ValidatedDriverTrustRootRotation {
+        let payload = serde_jcs::to_vec(&next_root).unwrap();
+        let mut pae = format!(
+            "DSSEv1 {} {} {} ",
+            DSSE_TRUST_ROOT_PAYLOAD_TYPE.len(),
+            DSSE_TRUST_ROOT_PAYLOAD_TYPE,
+            payload.len()
+        )
+        .into_bytes();
+        pae.extend_from_slice(&payload);
+        let mut signatures = seeds
+            .iter()
+            .map(|seed| {
+                let signing_key = SigningKey::from_bytes(&[*seed; 32]);
+                DriverReleaseDsseSignature {
+                    keyid: hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes())),
+                    sig: STANDARD.encode(signing_key.sign(&pae).to_bytes()),
+                }
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by(|left, right| left.keyid.cmp(&right.keyid));
+        ValidatedDriverTrustRootRotation::new(DriverTrustRootDsseEnvelope {
+            payload_type: DSSE_TRUST_ROOT_PAYLOAD_TYPE.to_owned(),
+            payload: STANDARD.encode(payload),
+            signatures,
+        })
+        .unwrap()
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             make_writable_for_cleanup(self.temporary.path());
@@ -1458,6 +1711,7 @@ mod tests {
             store,
             &fixture.install_root,
             fixture.trust_root.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -1595,6 +1849,7 @@ mod tests {
             store,
             &fixture.install_root,
             fixture.trust_root.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -1615,6 +1870,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_root_history_can_restart_and_rotate_but_cannot_bootstrap() {
+        let fixture = Fixture::new();
+        let mut legacy_value = serde_json::to_value(fixture.trust_root.get()).unwrap();
+        legacy_value.as_object_mut().unwrap().remove("root");
+        let legacy_json = serde_jcs::to_vec(&legacy_value).unwrap();
+        let legacy_root =
+            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&legacy_json).unwrap();
+        assert!(legacy_root.uses_legacy_implicit_root_role());
+
+        let bootstrap_database = Arc::new(
+            Database::init(fixture.temporary.path().join("legacy-bootstrap.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let bootstrap_error = ProviderDriverReleaseRegistry::new(
+            CatalogStore::new(bootstrap_database),
+            &fixture.install_root,
+            legacy_root.clone(),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(bootstrap_error.to_string().contains("explicit root role"));
+
+        let database = Arc::new(
+            Database::init(fixture.temporary.path().join("legacy-upgrade.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let root_version = i64::try_from(legacy_root.get().root_version).unwrap();
+        let root_digest = legacy_root.canonical_sha256().to_string();
+        let root_json = String::from_utf8(legacy_root.canonical_json().unwrap()).unwrap();
+        let expires_at = legacy_root.get().expires_at.timestamp();
+        database
+            .with_connection(move |connection| {
+                connection.execute(
+                    "INSERT INTO provider_driver_trust_roots
+                       (root_version, root_sha256, root_json, expires_at,
+                        first_seen_at, last_seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![root_version, root_digest, root_json, expires_at, now_secs()],
+                )?;
+                Ok::<(), crate::database::DatabaseError>(())
+            })
+            .await
+            .unwrap();
+        let store = CatalogStore::new(Arc::clone(&database));
+        ProviderDriverReleaseRegistry::new(store.clone(), &fixture.install_root, legacy_root, None)
+            .await
+            .unwrap();
+
+        let mut next_root = fixture.trust_root.get().clone();
+        next_root.root_version = 2;
+        next_root.expires_at += TimeDelta::days(30);
+        let rotation = signed_root_rotation_with_seeds(next_root.clone(), &[29, 23]);
+        ProviderDriverReleaseRegistry::new(
+            store,
+            &fixture.install_root,
+            ValidatedDriverReleaseTrustRoot::new(next_root).unwrap(),
+            Some(rotation),
+        )
+        .await
+        .unwrap();
+        let versions: (i64, i64) = database
+            .with_connection(|connection| {
+                Ok::<(i64, i64), crate::database::DatabaseError>((
+                    connection.query_row(
+                        "SELECT count(*) FROM provider_driver_trust_roots",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT count(*) FROM provider_driver_trust_root_rotations",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(versions, (2, 1));
+    }
+
+    #[tokio::test]
     async fn every_driver_selection_rechecks_current_key_revocation() {
         let fixture = Fixture::new();
         let database = Arc::new(
@@ -1627,6 +1967,7 @@ mod tests {
             store.clone(),
             &fixture.install_root,
             fixture.trust_root.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -1702,6 +2043,7 @@ mod tests {
             store.clone(),
             &fixture.install_root,
             ValidatedDriverReleaseTrustRoot::new(equivocated_root).unwrap(),
+            None,
         )
         .await
         .err()
@@ -1716,10 +2058,26 @@ mod tests {
         revoked_root.root_version += 1;
         revoked_root.keys[0].status = DriverReleaseSigningKeyStatus::Revoked;
         revoked_root.keys[0].revoked_at = Some(Utc::now());
+        let missing_rotation_error = ProviderDriverReleaseRegistry::new(
+            store.clone(),
+            &fixture.install_root,
+            ValidatedDriverReleaseTrustRoot::new(revoked_root.clone()).unwrap(),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            missing_rotation_error
+                .to_string()
+                .contains("requires an old-root/new-root rotation envelope")
+        );
+        let revoked_rotation = signed_root_rotation(revoked_root.clone());
         let revoked_registry = ProviderDriverReleaseRegistry::new(
             store,
             &fixture.install_root,
             ValidatedDriverReleaseTrustRoot::new(revoked_root).unwrap(),
+            Some(revoked_rotation),
         )
         .await
         .unwrap();
@@ -1743,6 +2101,7 @@ mod tests {
             revoked_registry.store.clone(),
             &fixture.install_root,
             ValidatedDriverReleaseTrustRoot::new(skipped_root).unwrap(),
+            None,
         )
         .await
         .err()
@@ -1750,10 +2109,12 @@ mod tests {
         assert!(skipped_error.to_string().contains("advance exactly once"));
         let mut reactivated_root = fixture.trust_root.get().clone();
         reactivated_root.root_version = 3;
+        let reactivation_rotation = signed_root_rotation(reactivated_root.clone());
         let reactivation_error = ProviderDriverReleaseRegistry::new(
             revoked_registry.store.clone(),
             &fixture.install_root,
             ValidatedDriverReleaseTrustRoot::new(reactivated_root).unwrap(),
+            Some(reactivation_rotation),
         )
         .await
         .err()
@@ -1767,6 +2128,7 @@ mod tests {
             revoked_registry.store.clone(),
             &fixture.install_root,
             fixture.trust_root.clone(),
+            None,
         )
         .await
         .err()
@@ -1775,6 +2137,39 @@ mod tests {
             rollback_error
                 .to_string()
                 .contains("roll durable trust state backward")
+        );
+
+        let rotation_count: i64 = database
+            .with_connection(|connection| {
+                Ok::<i64, crate::database::DatabaseError>(connection.query_row(
+                    "SELECT count(*) FROM provider_driver_trust_root_rotations",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(rotation_count, 1);
+        assert!(
+            database
+                .with_connection(|connection| {
+                    connection.execute(
+                        "UPDATE provider_driver_trust_root_rotations SET observed_at = observed_at + 1",
+                        [],
+                    )?;
+                    Ok::<(), crate::database::DatabaseError>(())
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .with_connection(|connection| {
+                    connection.execute("DELETE FROM provider_driver_trust_root_rotations", [])?;
+                    Ok::<(), crate::database::DatabaseError>(())
+                })
+                .await
+                .is_err()
         );
     }
 
@@ -1791,6 +2186,7 @@ mod tests {
             store.clone(),
             &fixture.install_root,
             fixture.trust_root.clone(),
+            None,
         )
         .await
         .unwrap();

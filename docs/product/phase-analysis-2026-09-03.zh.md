@@ -2156,3 +2156,35 @@ Application/framework source + versioned build plan
   仍缺真实 Wrangler/Deislet materialized release 与离线签署流程、Sigstore/Rekor 或等价透明 inclusion/checkpoint、旧根/
   新根双阈值自动 rotation、Windows service-account DACL、公共 API/CLI/Web 与后台 dispatcher loop，更不构成任何 backend
   的 live lifecycle 或 Edge Canon conformance。
+
+## 77. Provider release 信任根的连续双阈值轮换
+
+- 继续深审发现，已有 durable root history 只能拒绝 rollback、跳号、同版本异内容和历史撤销 key 复活，却没有证明
+  `N+1` 根获得 `N` 根授权。能够替换配置文件的主体只需写入一个自签的新版本就能接管 release authorization；版本
+  单调性不能替代信任连续性。该缺口现按 TUF root update 的行业语义关闭：根文档新增独立 `root` 角色；rotation 是
+  标准 DSSE v1 envelope，payload 必须是 RFC 8785 canonical 的恰好 `N+1` 根，并分别达到旧根和新根 `root` 角色阈值。
+- 更新恢复遵循 TUF 的 expiry 边界：旧根文档过期不阻断尝试轮换，否则过期本身会造成无法恢复；参与旧/新阈值的每个
+  Ed25519 key 在观察时刻仍须 active 且处于自身有效期，最终新根必须未过期。首次 out-of-band bootstrap 拒绝无从验证的
+  rotation；已持久化同一 canonical 最高版本的正常重启不要求重复携带 envelope，只有从当前版本前进时才要求它。
+  版本回退、跳号、同版本异内容、历史 revoked key 激活、已从 key set 或 root/release 角色退休后重新引入均失败关闭。
+- `provider_driver_trust_root_rotation` 使用与根文件相同的绝对路径、regular non-symlink、1 MiB 上限、Unix owner/mode/
+  `O_NOFOLLOW` 和 Windows reparse/share-write 防护。Control 在一个 SQLite 事务内写入新根及
+  `provider_driver_trust_root_rotations`；后者固定前后版本、canonical envelope SHA-256 和双方实际 signer，update/delete
+  trigger 保证不可修改、不可删除。缺 envelope、错误 payload、新根不匹配、任一侧阈值不足或数据库写入失败都不能留下
+  半个新根。
+- 回归审查同时发现升级兼容风险：上一已推送切片的 v1 root 尚无独立 `root` 字段，若把新 schema 直接套到 durable
+  history，会使同版本 canonical identity 改变并在重启时关闭外部执行。兼容解析现在只为既有 pre-root-role v1 保留原始
+  canonical bytes/digest，并以其 release role 阈值派生旧 root role；严格 parser 与全新 bootstrap 都拒绝该旧形态，
+  下一次由旧 release threshold 和新 root threshold 共同签署的轮换会写入显式角色并永久退出兼容路径。专项测试覆盖旧根
+  重启、全新引导拒绝和成功迁移，不能以“升级”名义静默重置信任。
+- 共享 registry 现为 15 份 Schema/42 组正反 fixture；新增 root role、v2 root、rotation envelope 和 payload type/
+  signature width/role threshold 负例。Python 治理验证结构、canonical payload、连续版本及双方 signer 集合；Rust
+  authorization 专项 7/7 进一步执行真实 Ed25519 PAE 验证，并覆盖旧根过期可恢复、过期 root key 不计阈值、双方阈值、
+  跳号和历史格式 identity。Control release 专项 5/5 覆盖缺 envelope 拒绝、成功轮换、release key 撤销即时阻断、历史
+  复活拒绝、旧数据库迁移以及轮换审计 update/delete 失败；本机完整 provider-driver 54/54、Control lib 459/459、Control
+  API integration 14/14 和五个部署控制 crate 严格 all-target Clippy 均通过。提交后的 Linux/macOS/Windows exact-archive
+  复跑尚未登记，不能用本机结果冒充三平台证据。
+- 该切片仍不是完整供应链发布：fixture 使用确定性合成 key 与合成 release，尚无真实 Wrangler/Deislet materialized
+  release、离线签署 ceremony、Sigstore/Rekor 或等价 transparency inclusion/checkpoint、Windows service-account DACL、
+  公共 API/CLI/Web 或后台 dispatcher loop。`P1-DEPLOY-001` 保持 active，所有 backend 的 live/support/conformance
+  状态保持不变。

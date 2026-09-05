@@ -328,6 +328,10 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # Out-of-band public trust root for DSSE release authorizations. Configure it
 # together with the installation root; either one alone keeps execution off.
 # provider_driver_trust_root = "/etc/deis-control/provider-driver-trust-root.json"
+# Set this only while advancing to the configured trust root. It is a DSSE
+# envelope over that exact next root, signed independently by the thresholds of
+# both the previously durable root role and the new root role.
+# provider_driver_trust_root_rotation = "/etc/deis-control/provider-driver-trust-root-rotation.json"
 
 # Seconds between cron scheduler ticks (1..=60). A tick rebuilds the task
 # list from the catalog and fires whatever came due, so the default means a

@@ -13,6 +13,7 @@
     {"id": "provider-driver", "schema": "contracts/v1/provider-driver.schema.json"},
     {"id": "provider-driver-release", "schema": "contracts/v1/provider-driver-release.schema.json"},
     {"id": "provider-driver-trust-root", "schema": "contracts/v1/provider-driver-trust-root.schema.json"},
+    {"id": "provider-driver-trust-root-envelope", "schema": "contracts/v1/provider-driver-trust-root-envelope.schema.json"},
     {"id": "provider-driver-release-authorization", "schema": "contracts/v1/provider-driver-release-authorization.schema.json"},
     {"id": "provider-driver-release-envelope", "schema": "contracts/v1/provider-driver-release-envelope.schema.json"},
     {"id": "provider-driver-process", "schema": "contracts/v1/provider-driver-process.schema.json"},

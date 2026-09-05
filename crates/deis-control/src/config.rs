@@ -210,6 +210,12 @@ pub struct ControlConfig {
     /// are both configured and valid. The file carries no private key.
     #[serde(default)]
     pub provider_driver_trust_root: Option<PathBuf>,
+    /// Optional absolute path to a DSSE envelope that authorizes the configured
+    /// trust root as the exact successor of Control's durable current root.
+    /// Required only while advancing the root; both the old and new root-role
+    /// thresholds must sign it. The file carries no private key.
+    #[serde(default)]
+    pub provider_driver_trust_root_rotation: Option<PathBuf>,
     /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).
     ///
     /// A tick does two things: it rebuilds the task list from the catalog,
@@ -308,6 +314,7 @@ impl Default for ControlConfig {
             backend_restore_driver_timeout_secs: default_backend_restore_driver_timeout_secs(),
             provider_driver_installation_root: None,
             provider_driver_trust_root: None,
+            provider_driver_trust_root_rotation: None,
             cron_tick_seconds: default_cron_tick_seconds(),
             node_registration_ttl_secs: default_node_registration_ttl(),
         }
@@ -388,6 +395,10 @@ impl std::fmt::Debug for ControlConfig {
             .field(
                 "provider_driver_trust_root",
                 &self.provider_driver_trust_root,
+            )
+            .field(
+                "provider_driver_trust_root_rotation",
+                &self.provider_driver_trust_root_rotation,
             )
             .field("cron_tick_seconds", &self.cron_tick_seconds)
             .field(

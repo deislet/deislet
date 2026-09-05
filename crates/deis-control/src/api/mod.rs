@@ -484,60 +484,73 @@ async fn build_catalog_state(
     let provider_driver_dispatcher = match (
         config.provider_driver_installation_root.as_ref(),
         config.provider_driver_trust_root.as_ref(),
+        config.provider_driver_trust_root_rotation.as_ref(),
     ) {
-        (Some(root), Some(trust_root_path)) => {
-            match deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file(trust_root_path)
-            {
-                Ok(trust_root) => match crate::catalog::ProviderDriverReleaseRegistry::new(
-                    store.as_ref().clone(),
-                    root,
-                    trust_root,
+        (Some(root), Some(trust_root_path), trust_root_rotation_path) => {
+            let trust_metadata =
+                deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file_compatible(
+                    trust_root_path,
                 )
-                .await
-                {
-                    Ok(registry) => {
-                        info!(
-                            installation_root = %registry.installation_root().display(),
-                            host = %registry.host(),
-                            trust_root_version = registry.trust_root().get().root_version,
-                            trust_root_sha256 = %registry.trust_root().canonical_sha256(),
-                            "Signed provider driver release registry is enabled"
-                        );
-                        match crate::catalog::ProviderDriverDispatcher::new(
-                            registry,
-                            Arc::clone(&provider_credentials),
-                            deis_provider_driver::ExecutableProviderDriverConfig::default(),
-                        ) {
-                            Ok(dispatcher) => Some(Arc::new(dispatcher)),
-                            Err(error) => {
-                                error!(
-                                    error = %error,
-                                    "Provider driver dispatcher is unusable; external provider execution is disabled"
-                                );
-                                None
+                .and_then(|trust_root| {
+                    trust_root_rotation_path
+                        .map(deis_provider_driver::ValidatedDriverTrustRootRotation::load_file)
+                        .transpose()
+                        .map(|rotation| (trust_root, rotation))
+                });
+            match trust_metadata {
+                Ok((trust_root, trust_root_rotation)) => {
+                    match crate::catalog::ProviderDriverReleaseRegistry::new(
+                        store.as_ref().clone(),
+                        root,
+                        trust_root,
+                        trust_root_rotation,
+                    )
+                    .await
+                    {
+                        Ok(registry) => {
+                            info!(
+                                installation_root = %registry.installation_root().display(),
+                                host = %registry.host(),
+                                trust_root_version = registry.trust_root().get().root_version,
+                                trust_root_sha256 = %registry.trust_root().canonical_sha256(),
+                                "Signed provider driver release registry is enabled"
+                            );
+                            match crate::catalog::ProviderDriverDispatcher::new(
+                                registry,
+                                Arc::clone(&provider_credentials),
+                                deis_provider_driver::ExecutableProviderDriverConfig::default(),
+                            ) {
+                                Ok(dispatcher) => Some(Arc::new(dispatcher)),
+                                Err(error) => {
+                                    error!(
+                                        error = %error,
+                                        "Provider driver dispatcher is unusable; external provider execution is disabled"
+                                    );
+                                    None
+                                }
                             }
                         }
+                        Err(error) => {
+                            error!(
+                                configured = %root.display(),
+                                error = %error,
+                                "Provider driver release registry is unusable; external provider execution is disabled"
+                            );
+                            None
+                        }
                     }
-                    Err(error) => {
-                        error!(
-                            configured = %root.display(),
-                            error = %error,
-                            "Provider driver installation root is unusable; external provider execution is disabled"
-                        );
-                        None
-                    }
-                },
+                }
                 Err(error) => {
                     error!(
                         configured = %trust_root_path.display(),
                         error = %error,
-                        "Provider driver trust root is unusable; external provider execution is disabled"
+                        "Provider driver trust metadata is unusable; external provider execution is disabled"
                     );
                     None
                 }
             }
         }
-        (None, None) => {
+        (None, None, None) => {
             warn!(
                 "provider_driver_installation_root and provider_driver_trust_root are not configured; external provider execution is disabled"
             );
@@ -545,7 +558,7 @@ async fn build_catalog_state(
         }
         _ => {
             error!(
-                "provider_driver_installation_root and provider_driver_trust_root must be configured together; external provider execution is disabled"
+                "provider_driver_installation_root and provider_driver_trust_root must be configured together, and provider_driver_trust_root_rotation requires both; external provider execution is disabled"
             );
             None
         }

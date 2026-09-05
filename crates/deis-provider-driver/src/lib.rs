@@ -62,9 +62,11 @@ pub use release::{
     HostOperatingSystem, ProviderDriverRelease, ValidatedProviderDriverRelease,
 };
 pub use release_authorization::{
-    DSSE_ENVELOPE_PAYLOAD_TYPE, DriverReleaseAuthorization, DriverReleaseAuthorizationError,
-    DriverReleaseAuthorizationSubject, DriverReleaseDsseEnvelope, DriverReleaseDsseSignature,
-    DriverReleaseSigningKey, DriverReleaseSigningKeyStatus, DriverReleaseSigningRole,
-    DriverReleaseTrustRoot, ValidatedDriverReleaseAuthorization, ValidatedDriverReleaseTrustRoot,
-    VerifiedDriverReleaseAuthorization,
+    DSSE_ENVELOPE_PAYLOAD_TYPE, DSSE_TRUST_ROOT_PAYLOAD_TYPE, DriverReleaseAuthorization,
+    DriverReleaseAuthorizationError, DriverReleaseAuthorizationSubject, DriverReleaseDsseEnvelope,
+    DriverReleaseDsseSignature, DriverReleaseRootRole, DriverReleaseSigningKey,
+    DriverReleaseSigningKeyStatus, DriverReleaseSigningRole, DriverReleaseTrustRoot,
+    DriverTrustRootDsseEnvelope, ValidatedDriverReleaseAuthorization,
+    ValidatedDriverReleaseTrustRoot, ValidatedDriverTrustRootRotation,
+    VerifiedDriverReleaseAuthorization, VerifiedDriverTrustRootRotation,
 };

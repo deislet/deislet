@@ -1,0 +1,51 @@
+{
+  "$schema": "provider-driver-trust-root.schema.json",
+  "schemaVersion": 1,
+  "rootVersion": 2,
+  "expiresAt": "2028-09-01T00:00:00Z",
+  "root": {
+    "keyIds": [
+      "dbc298251c51321b7266e78d1c151c2b62aff8cb95b293096d3463018544face",
+      "fdf72a088f18f7399e8c52bce448441501f759a595a86980e5d9a422a01e5d55"
+    ],
+    "threshold": 2
+  },
+  "providerDriverRelease": {
+    "keyIds": [
+      "dbc298251c51321b7266e78d1c151c2b62aff8cb95b293096d3463018544face",
+      "fdf72a088f18f7399e8c52bce448441501f759a595a86980e5d9a422a01e5d55"
+    ],
+    "threshold": 2,
+    "maxAuthorizationLifetimeSeconds": 604800
+  },
+  "keys": [
+    {
+      "keyId": "dbc298251c51321b7266e78d1c151c2b62aff8cb95b293096d3463018544face",
+      "keyType": "ed25519",
+      "scheme": "ed25519",
+      "publicKey": "/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=",
+      "status": "active",
+      "validFrom": "2026-09-01T00:00:00Z",
+      "validUntil": "2029-09-01T00:00:00Z"
+    },
+    {
+      "keyId": "fdf72a088f18f7399e8c52bce448441501f759a595a86980e5d9a422a01e5d55",
+      "keyType": "ed25519",
+      "scheme": "ed25519",
+      "publicKey": "Zr5+Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo=",
+      "status": "active",
+      "validFrom": "2026-09-01T00:00:00Z",
+      "validUntil": "2029-09-01T00:00:00Z"
+    },
+    {
+      "keyId": "fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889",
+      "keyType": "ed25519",
+      "scheme": "ed25519",
+      "publicKey": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+      "status": "revoked",
+      "validFrom": "2026-09-01T00:00:00Z",
+      "validUntil": "2029-09-01T00:00:00Z",
+      "revokedAt": "2026-09-06T00:00:00Z"
+    }
+  ]
+}

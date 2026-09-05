@@ -24,6 +24,8 @@ use crate::{
 
 pub const DSSE_ENVELOPE_PAYLOAD_TYPE: &str =
     "application/vnd.deislet.provider-driver-release-authorization.v1+json";
+pub const DSSE_TRUST_ROOT_PAYLOAD_TYPE: &str =
+    "application/vnd.deislet.provider-driver-trust-root.v1+json";
 
 const MAX_SIGNING_KEYS: usize = 32;
 const MAX_SIGNATURES: usize = 32;
@@ -63,21 +65,45 @@ pub struct DriverReleaseSigningRole {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct DriverReleaseRootRole {
+    pub key_ids: Vec<String>,
+    pub threshold: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct DriverReleaseTrustRoot {
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
     pub schema_version: u32,
     pub root_version: u64,
     pub expires_at: DateTime<Utc>,
+    pub root: DriverReleaseRootRole,
     pub provider_driver_release: DriverReleaseSigningRole,
     pub keys: Vec<DriverReleaseSigningKey>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct LegacyDriverReleaseTrustRoot {
+    #[serde(rename = "$schema")]
+    schema: Option<String>,
+    schema_version: u32,
+    root_version: u64,
+    expires_at: DateTime<Utc>,
+    provider_driver_release: DriverReleaseSigningRole,
+    keys: Vec<DriverReleaseSigningKey>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ValidatedDriverReleaseTrustRoot {
     root: DriverReleaseTrustRoot,
     verifying_keys: BTreeMap<String, VerifyingKey>,
+    canonical_json: Vec<u8>,
     canonical_sha256: Sha256Digest,
+    legacy_implicit_root_role: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -119,10 +145,26 @@ pub struct DriverReleaseDsseEnvelope {
     pub signatures: Vec<DriverReleaseDsseSignature>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DriverTrustRootDsseEnvelope {
+    pub payload_type: String,
+    pub payload: String,
+    pub signatures: Vec<DriverReleaseDsseSignature>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ValidatedDriverReleaseAuthorization {
     envelope: DriverReleaseDsseEnvelope,
     authorization: DriverReleaseAuthorization,
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ValidatedDriverTrustRootRotation {
+    envelope: DriverTrustRootDsseEnvelope,
+    next_root: ValidatedDriverReleaseTrustRoot,
     payload: Vec<u8>,
 }
 
@@ -134,6 +176,17 @@ pub struct VerifiedDriverReleaseAuthorization {
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub signer_key_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedDriverTrustRootRotation {
+    pub previous_root_version: u64,
+    pub next_root_version: u64,
+    pub previous_root_sha256: Sha256Digest,
+    pub next_root_sha256: Sha256Digest,
+    pub envelope_sha256: Sha256Digest,
+    pub previous_root_signer_key_ids: Vec<String>,
+    pub next_root_signer_key_ids: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -148,11 +201,11 @@ impl fmt::Display for DriverReleaseAuthorizationError {
         match self {
             Self::Io(error) => write!(
                 formatter,
-                "cannot read provider driver release trust root: {error}"
+                "cannot read provider driver release trust metadata: {error}"
             ),
             Self::Json(error) => write!(
                 formatter,
-                "invalid driver release authorization JSON: {error}"
+                "invalid provider driver release trust metadata JSON: {error}"
             ),
             Self::Invalid(message) => formatter.write_str(message),
         }
@@ -163,70 +216,7 @@ impl std::error::Error for DriverReleaseAuthorizationError {}
 
 impl ValidatedDriverReleaseTrustRoot {
     pub fn load_file(path: impl AsRef<Path>) -> Result<Self, DriverReleaseAuthorizationError> {
-        let path = path.as_ref();
-        if !path.is_absolute() {
-            return Err(DriverReleaseAuthorizationError::Invalid(
-                "provider driver release trust root path must be absolute",
-            ));
-        }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        #[cfg(windows)]
-        options
-            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
-            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-        let mut file = options
-            .open(path)
-            .map_err(DriverReleaseAuthorizationError::Io)?;
-        let metadata = file
-            .metadata()
-            .map_err(DriverReleaseAuthorizationError::Io)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(DriverReleaseAuthorizationError::Invalid(
-                "provider driver release trust root must be a regular non-symlink file",
-            ));
-        }
-        #[cfg(windows)]
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err(DriverReleaseAuthorizationError::Invalid(
-                "provider driver release trust root cannot be a Windows reparse point",
-            ));
-        }
-        if metadata.len() > MAX_TRUST_ROOT_BYTES {
-            return Err(DriverReleaseAuthorizationError::Invalid(
-                "provider driver release trust root exceeds one MiB",
-            ));
-        }
-        #[cfg(unix)]
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
-            return Err(DriverReleaseAuthorizationError::Invalid(
-                "provider driver release trust root must be owned by the service identity and not group/other writable",
-            ));
-        }
-        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-        file.read_to_end(&mut bytes)
-            .map_err(DriverReleaseAuthorizationError::Io)?;
-        let final_metadata = file
-            .metadata()
-            .map_err(DriverReleaseAuthorizationError::Io)?;
-        #[cfg(unix)]
-        let metadata_changed = metadata.dev() != final_metadata.dev()
-            || metadata.ino() != final_metadata.ino()
-            || metadata.len() != final_metadata.len()
-            || metadata.mtime() != final_metadata.mtime()
-            || metadata.mtime_nsec() != final_metadata.mtime_nsec();
-        #[cfg(not(unix))]
-        let metadata_changed = metadata.len() != final_metadata.len();
-        if metadata_changed || u64::try_from(bytes.len()).ok() != Some(final_metadata.len()) {
-            return Err(DriverReleaseAuthorizationError::Invalid(
-                "provider driver release trust root changed while it was read",
-            ));
-        }
+        let bytes = read_secure_trust_metadata_file(path.as_ref())?;
         Self::parse_json(&bytes)
     }
 
@@ -235,7 +225,53 @@ impl ValidatedDriverReleaseTrustRoot {
         Self::new(root)
     }
 
+    /// Reads the pre-root-role v1 shape only for an already deployed trust
+    /// history. New bootstrap and every rotation payload remain strict.
+    pub fn load_file_compatible(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, DriverReleaseAuthorizationError> {
+        let bytes = read_secure_trust_metadata_file(path.as_ref())?;
+        Self::parse_json_compatible(&bytes)
+    }
+
+    pub fn parse_json_compatible(bytes: &[u8]) -> Result<Self, DriverReleaseAuthorizationError> {
+        if let Ok(root) = serde_json::from_slice::<DriverReleaseTrustRoot>(bytes) {
+            return Self::new(root);
+        }
+        let legacy: LegacyDriverReleaseTrustRoot =
+            serde_json::from_slice(bytes).map_err(DriverReleaseAuthorizationError::Json)?;
+        let canonical_json =
+            serde_jcs::to_vec(&legacy).map_err(DriverReleaseAuthorizationError::Json)?;
+        let root_role = DriverReleaseRootRole {
+            key_ids: legacy.provider_driver_release.key_ids.clone(),
+            threshold: legacy.provider_driver_release.threshold,
+        };
+        Self::from_root_and_canonical(
+            DriverReleaseTrustRoot {
+                schema: legacy.schema,
+                schema_version: legacy.schema_version,
+                root_version: legacy.root_version,
+                expires_at: legacy.expires_at,
+                root: root_role,
+                provider_driver_release: legacy.provider_driver_release,
+                keys: legacy.keys,
+            },
+            canonical_json,
+            true,
+        )
+    }
+
     pub fn new(root: DriverReleaseTrustRoot) -> Result<Self, DriverReleaseAuthorizationError> {
+        let canonical_json =
+            serde_jcs::to_vec(&root).map_err(DriverReleaseAuthorizationError::Json)?;
+        Self::from_root_and_canonical(root, canonical_json, false)
+    }
+
+    fn from_root_and_canonical(
+        root: DriverReleaseTrustRoot,
+        canonical_json: Vec<u8>,
+        legacy_implicit_root_role: bool,
+    ) -> Result<Self, DriverReleaseAuthorizationError> {
         validate_trust_root(&root)?;
         let mut verifying_keys = BTreeMap::new();
         for key in &root.keys {
@@ -252,11 +288,12 @@ impl ValidatedDriverReleaseTrustRoot {
             })?;
             verifying_keys.insert(key.key_id.clone(), verifying_key);
         }
-        let canonical = serde_jcs::to_vec(&root).map_err(DriverReleaseAuthorizationError::Json)?;
         Ok(Self {
             root,
             verifying_keys,
-            canonical_sha256: sha256(&canonical),
+            canonical_sha256: sha256(&canonical_json),
+            canonical_json,
+            legacy_implicit_root_role,
         })
     }
 
@@ -271,7 +308,159 @@ impl ValidatedDriverReleaseTrustRoot {
     }
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, DriverReleaseAuthorizationError> {
-        serde_jcs::to_vec(&self.root).map_err(DriverReleaseAuthorizationError::Json)
+        Ok(self.canonical_json.clone())
+    }
+
+    #[must_use]
+    pub const fn uses_legacy_implicit_root_role(&self) -> bool {
+        self.legacy_implicit_root_role
+    }
+
+    #[must_use]
+    pub fn root_role_satisfies_threshold_at(&self, at: DateTime<Utc>) -> bool {
+        self.root
+            .root
+            .key_ids
+            .iter()
+            .filter(|key_id| root_key_is_active(self, key_id, at))
+            .count()
+            >= usize::try_from(self.root.root.threshold).unwrap_or(usize::MAX)
+    }
+}
+
+impl ValidatedDriverTrustRootRotation {
+    pub fn load_file(path: impl AsRef<Path>) -> Result<Self, DriverReleaseAuthorizationError> {
+        let bytes = read_secure_trust_metadata_file(path.as_ref())?;
+        Self::parse_json(&bytes)
+    }
+
+    pub fn parse_json(bytes: &[u8]) -> Result<Self, DriverReleaseAuthorizationError> {
+        let envelope =
+            serde_json::from_slice(bytes).map_err(DriverReleaseAuthorizationError::Json)?;
+        Self::new(envelope)
+    }
+
+    pub fn new(
+        envelope: DriverTrustRootDsseEnvelope,
+    ) -> Result<Self, DriverReleaseAuthorizationError> {
+        if envelope.payload_type != DSSE_TRUST_ROOT_PAYLOAD_TYPE {
+            return Err(DriverReleaseAuthorizationError::Invalid(
+                "driver trust root rotation uses an unsupported DSSE payload type",
+            ));
+        }
+        validate_dsse_signatures(&envelope.signatures)?;
+        let payload = decode_canonical_base64(&envelope.payload)?;
+        let next_root = ValidatedDriverReleaseTrustRoot::parse_json(&payload)?;
+        if payload != next_root.canonical_json()? {
+            return Err(DriverReleaseAuthorizationError::Invalid(
+                "driver trust root rotation payload must be RFC 8785 canonical JSON",
+            ));
+        }
+        Ok(Self {
+            envelope,
+            next_root,
+            payload,
+        })
+    }
+
+    #[must_use]
+    pub fn get(&self) -> &DriverTrustRootDsseEnvelope {
+        &self.envelope
+    }
+
+    #[must_use]
+    pub fn next_root(&self) -> &ValidatedDriverReleaseTrustRoot {
+        &self.next_root
+    }
+
+    pub fn canonical_json(&self) -> Result<Vec<u8>, DriverReleaseAuthorizationError> {
+        serde_jcs::to_vec(&self.envelope).map_err(DriverReleaseAuthorizationError::Json)
+    }
+
+    pub fn verify(
+        &self,
+        previous_root: &ValidatedDriverReleaseTrustRoot,
+        now: DateTime<Utc>,
+    ) -> Result<VerifiedDriverTrustRootRotation, DriverReleaseAuthorizationError> {
+        if self.next_root.root.root_version
+            != previous_root.root.root_version.checked_add(1).ok_or(
+                DriverReleaseAuthorizationError::Invalid(
+                    "provider driver trust root version cannot advance",
+                ),
+            )?
+        {
+            return Err(DriverReleaseAuthorizationError::Invalid(
+                "provider driver trust root rotation must advance exactly one version",
+            ));
+        }
+        if self.next_root.root.expires_at <= now {
+            return Err(DriverReleaseAuthorizationError::Invalid(
+                "new provider driver trust root is expired",
+            ));
+        }
+
+        let pae = dsse_pae(&self.envelope.payload_type, &self.payload);
+        let previous_role = &previous_root.root.root;
+        let next_role = &self.next_root.root.root;
+        let mut previous_signers = Vec::new();
+        let mut next_signers = Vec::new();
+        for dsse_signature in &self.envelope.signatures {
+            let belongs_to_previous = previous_role
+                .key_ids
+                .iter()
+                .any(|key_id| key_id == &dsse_signature.keyid);
+            let belongs_to_next = next_role
+                .key_ids
+                .iter()
+                .any(|key_id| key_id == &dsse_signature.keyid);
+            if !belongs_to_previous && !belongs_to_next {
+                return Err(DriverReleaseAuthorizationError::Invalid(
+                    "driver trust root rotation contains a signer outside both root roles",
+                ));
+            }
+            let signature_bytes = decode_canonical_base64(&dsse_signature.sig)?;
+            let signature = Signature::from_slice(&signature_bytes).map_err(|_| {
+                DriverReleaseAuthorizationError::Invalid(
+                    "driver trust root rotation Ed25519 signature is invalid",
+                )
+            })?;
+            let verifying_key = previous_root
+                .verifying_keys
+                .get(&dsse_signature.keyid)
+                .or_else(|| self.next_root.verifying_keys.get(&dsse_signature.keyid))
+                .ok_or(DriverReleaseAuthorizationError::Invalid(
+                    "driver trust root rotation signer key is absent",
+                ))?;
+            verifying_key.verify(&pae, &signature).map_err(|_| {
+                DriverReleaseAuthorizationError::Invalid(
+                    "driver trust root rotation signature verification failed",
+                )
+            })?;
+            if belongs_to_previous && root_key_is_active(previous_root, &dsse_signature.keyid, now)
+            {
+                previous_signers.push(dsse_signature.keyid.clone());
+            }
+            if belongs_to_next && root_key_is_active(&self.next_root, &dsse_signature.keyid, now) {
+                next_signers.push(dsse_signature.keyid.clone());
+            }
+        }
+        if previous_signers.len() < usize::try_from(previous_role.threshold).unwrap_or(usize::MAX)
+            || next_signers.len() < usize::try_from(next_role.threshold).unwrap_or(usize::MAX)
+        {
+            return Err(DriverReleaseAuthorizationError::Invalid(
+                "driver trust root rotation does not satisfy both root signature thresholds",
+            ));
+        }
+        let envelope_json = self.canonical_json()?;
+        Ok(VerifiedDriverTrustRootRotation {
+            previous_root_version: previous_root.root.root_version,
+            next_root_version: self.next_root.root.root_version,
+            previous_root_sha256: previous_root.canonical_sha256.clone(),
+            next_root_sha256: self.next_root.canonical_sha256.clone(),
+            envelope_sha256: sha256(&envelope_json),
+            previous_root_signer_key_ids: previous_signers,
+            next_root_signer_key_ids: next_signers,
+        })
     }
 }
 
@@ -290,11 +479,7 @@ impl ValidatedDriverReleaseAuthorization {
                 "driver release authorization uses an unsupported DSSE payload type",
             ));
         }
-        if envelope.signatures.is_empty() || envelope.signatures.len() > MAX_SIGNATURES {
-            return Err(DriverReleaseAuthorizationError::Invalid(
-                "driver release authorization must contain one to 32 signatures",
-            ));
-        }
+        validate_dsse_signatures(&envelope.signatures)?;
         let payload = decode_canonical_base64(&envelope.payload)?;
         let authorization: DriverReleaseAuthorization =
             serde_json::from_slice(&payload).map_err(DriverReleaseAuthorizationError::Json)?;
@@ -305,22 +490,6 @@ impl ValidatedDriverReleaseAuthorization {
             return Err(DriverReleaseAuthorizationError::Invalid(
                 "driver release authorization payload must be RFC 8785 canonical JSON",
             ));
-        }
-        let mut previous_key_id: Option<&str> = None;
-        for signature in &envelope.signatures {
-            if !is_sha256_hex(&signature.keyid)
-                || previous_key_id.is_some_and(|previous| previous >= signature.keyid.as_str())
-            {
-                return Err(DriverReleaseAuthorizationError::Invalid(
-                    "driver release authorization signatures must have unique canonical key IDs in order",
-                ));
-            }
-            previous_key_id = Some(&signature.keyid);
-            if decode_canonical_base64(&signature.sig)?.len() != 64 {
-                return Err(DriverReleaseAuthorizationError::Invalid(
-                    "driver release authorization Ed25519 signature must be 64 bytes",
-                ));
-            }
         }
         Ok(Self {
             envelope,
@@ -459,6 +628,22 @@ fn validate_trust_root(
         !root.keys.is_empty() && root.keys.len() <= MAX_SIGNING_KEYS,
         "provider driver release trust root must contain one to 32 keys",
     )?;
+    let root_role = &root.root;
+    require(
+        !root_role.key_ids.is_empty()
+            && usize::try_from(root_role.threshold)
+                .is_ok_and(|threshold| threshold >= 1 && threshold <= root_role.key_ids.len()),
+        "provider driver root signing role threshold is invalid",
+    )?;
+    let mut previous_root_role_key: Option<&str> = None;
+    for key_id in &root_role.key_ids {
+        require(
+            is_sha256_hex(key_id)
+                && previous_root_role_key.is_none_or(|previous| previous < key_id.as_str()),
+            "provider driver root signing role key IDs must be unique and ordered",
+        )?;
+        previous_root_role_key = Some(key_id);
+    }
     let role = &root.provider_driver_release;
     require(
         !role.key_ids.is_empty()
@@ -508,6 +693,26 @@ fn validate_trust_root(
             )?,
         }
     }
+    require(
+        root_role
+            .key_ids
+            .iter()
+            .all(|key_id| root.keys.iter().any(|key| &key.key_id == key_id)),
+        "provider driver root signing role references an unknown key",
+    )?;
+    require(
+        root_role
+            .key_ids
+            .iter()
+            .filter(|key_id| {
+                root.keys.iter().any(|key| {
+                    &key.key_id == *key_id && key.status == DriverReleaseSigningKeyStatus::Active
+                })
+            })
+            .count()
+            >= usize::try_from(root_role.threshold).unwrap_or(usize::MAX),
+        "provider driver root signing role lacks enough active keys",
+    )?;
     require(
         role.key_ids
             .iter()
@@ -574,6 +779,115 @@ fn verify_subject(
             && subject.driver_version == release_identity.version,
         "driver release authorization subject differs from the exact release and manifest",
     )
+}
+
+fn validate_dsse_signatures(
+    signatures: &[DriverReleaseDsseSignature],
+) -> Result<(), DriverReleaseAuthorizationError> {
+    if signatures.is_empty() || signatures.len() > MAX_SIGNATURES {
+        return Err(DriverReleaseAuthorizationError::Invalid(
+            "provider driver trust DSSE envelope must contain one to 32 signatures",
+        ));
+    }
+    let mut previous_key_id: Option<&str> = None;
+    for signature in signatures {
+        if !is_sha256_hex(&signature.keyid)
+            || previous_key_id.is_some_and(|previous| previous >= signature.keyid.as_str())
+        {
+            return Err(DriverReleaseAuthorizationError::Invalid(
+                "provider driver trust DSSE signatures must have unique canonical key IDs in order",
+            ));
+        }
+        previous_key_id = Some(&signature.keyid);
+        if decode_canonical_base64(&signature.sig)?.len() != 64 {
+            return Err(DriverReleaseAuthorizationError::Invalid(
+                "provider driver trust DSSE Ed25519 signature must be 64 bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn root_key_is_active(
+    root: &ValidatedDriverReleaseTrustRoot,
+    key_id: &str,
+    at: DateTime<Utc>,
+) -> bool {
+    root.root.keys.iter().any(|key| {
+        key.key_id == key_id
+            && key.status == DriverReleaseSigningKeyStatus::Active
+            && key.valid_from <= at
+            && at < key.valid_until
+    })
+}
+
+fn read_secure_trust_metadata_file(
+    path: &Path,
+) -> Result<Vec<u8>, DriverReleaseAuthorizationError> {
+    if !path.is_absolute() {
+        return Err(DriverReleaseAuthorizationError::Invalid(
+            "provider driver release trust metadata path must be absolute",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options
+        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut file = options
+        .open(path)
+        .map_err(DriverReleaseAuthorizationError::Io)?;
+    let metadata = file
+        .metadata()
+        .map_err(DriverReleaseAuthorizationError::Io)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(DriverReleaseAuthorizationError::Invalid(
+            "provider driver release trust metadata must be a regular non-symlink file",
+        ));
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        return Err(DriverReleaseAuthorizationError::Invalid(
+            "provider driver release trust metadata cannot be a Windows reparse point",
+        ));
+    }
+    if metadata.len() > MAX_TRUST_ROOT_BYTES {
+        return Err(DriverReleaseAuthorizationError::Invalid(
+            "provider driver release trust metadata exceeds one MiB",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(DriverReleaseAuthorizationError::Invalid(
+            "provider driver release trust metadata must be owned by the service identity and not group/other writable",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .map_err(DriverReleaseAuthorizationError::Io)?;
+    let final_metadata = file
+        .metadata()
+        .map_err(DriverReleaseAuthorizationError::Io)?;
+    #[cfg(unix)]
+    let metadata_changed = metadata.dev() != final_metadata.dev()
+        || metadata.ino() != final_metadata.ino()
+        || metadata.len() != final_metadata.len()
+        || metadata.mtime() != final_metadata.mtime()
+        || metadata.mtime_nsec() != final_metadata.mtime_nsec();
+    #[cfg(not(unix))]
+    let metadata_changed = metadata.len() != final_metadata.len();
+    if metadata_changed || u64::try_from(bytes.len()).ok() != Some(final_metadata.len()) {
+        return Err(DriverReleaseAuthorizationError::Invalid(
+            "provider driver release trust metadata changed while it was read",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn decode_canonical_base64(value: &str) -> Result<Vec<u8>, DriverReleaseAuthorizationError> {
@@ -699,6 +1013,12 @@ mod tests {
             schema_version: 1,
             root_version: 1,
             expires_at: now + TimeDelta::days(30),
+            root: DriverReleaseRootRole {
+                key_ids: vec![hex::encode(Sha256::digest(
+                    signing_keys[0].verifying_key().to_bytes(),
+                ))],
+                threshold: 1,
+            },
             provider_driver_release: DriverReleaseSigningRole {
                 key_ids: keys.iter().map(|key| key.key_id.clone()).collect(),
                 threshold: 2,
@@ -756,6 +1076,81 @@ mod tests {
         (root, envelope, release, manifest)
     }
 
+    fn signed_root_rotation(
+        previous_root: &ValidatedDriverReleaseTrustRoot,
+        now: DateTime<Utc>,
+    ) -> ValidatedDriverTrustRootRotation {
+        let signing_keys = [
+            SigningKey::from_bytes(&[7; 32]),
+            SigningKey::from_bytes(&[9; 32]),
+            SigningKey::from_bytes(&[11; 32]),
+        ];
+        let key_by_id = signing_keys
+            .iter()
+            .map(|key| {
+                (
+                    hex::encode(Sha256::digest(key.verifying_key().to_bytes())),
+                    key,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut next = previous_root.get().clone();
+        next.root_version += 1;
+        next.expires_at = now + TimeDelta::days(60);
+        let retired_key_id =
+            hex::encode(Sha256::digest(signing_keys[0].verifying_key().to_bytes()));
+        next.keys
+            .iter_mut()
+            .find(|key| key.key_id == retired_key_id)
+            .unwrap()
+            .status = DriverReleaseSigningKeyStatus::Revoked;
+        next.keys
+            .iter_mut()
+            .find(|key| key.key_id == retired_key_id)
+            .unwrap()
+            .revoked_at = Some(now);
+        let new_public = signing_keys[2].verifying_key().to_bytes();
+        let new_key_id = hex::encode(Sha256::digest(new_public));
+        next.keys.push(DriverReleaseSigningKey {
+            key_id: new_key_id.clone(),
+            key_type: "ed25519".to_owned(),
+            scheme: "ed25519".to_owned(),
+            public_key: STANDARD.encode(new_public),
+            status: DriverReleaseSigningKeyStatus::Active,
+            valid_from: now - TimeDelta::days(1),
+            valid_until: now + TimeDelta::days(90),
+            revoked_at: None,
+        });
+        next.keys
+            .sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        let retained_key_id =
+            hex::encode(Sha256::digest(signing_keys[1].verifying_key().to_bytes()));
+        let mut next_role_key_ids = vec![retained_key_id, new_key_id];
+        next_role_key_ids.sort();
+        next.root = DriverReleaseRootRole {
+            key_ids: next_role_key_ids.clone(),
+            threshold: 2,
+        };
+        next.provider_driver_release.key_ids = next_role_key_ids;
+        next.provider_driver_release.threshold = 2;
+        let next = ValidatedDriverReleaseTrustRoot::new(next).unwrap();
+        let payload = next.canonical_json().unwrap();
+        let pae = dsse_pae(DSSE_TRUST_ROOT_PAYLOAD_TYPE, &payload);
+        let signatures = key_by_id
+            .iter()
+            .map(|(key_id, key)| DriverReleaseDsseSignature {
+                keyid: key_id.clone(),
+                sig: STANDARD.encode(key.sign(&pae).to_bytes()),
+            })
+            .collect();
+        ValidatedDriverTrustRootRotation::new(DriverTrustRootDsseEnvelope {
+            payload_type: DSSE_TRUST_ROOT_PAYLOAD_TYPE.to_owned(),
+            payload: STANDARD.encode(payload),
+            signatures,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn threshold_dsse_authorizes_only_the_exact_release_and_manifest() {
         let now = Utc::now();
@@ -788,8 +1183,13 @@ mod tests {
         );
 
         let mut revoked = root.get().clone();
-        revoked.keys[0].status = DriverReleaseSigningKeyStatus::Revoked;
-        revoked.keys[0].revoked_at = Some(now);
+        let revoked_key = revoked
+            .keys
+            .iter_mut()
+            .find(|key| !revoked.root.key_ids.contains(&key.key_id))
+            .unwrap();
+        revoked_key.status = DriverReleaseSigningKeyStatus::Revoked;
+        revoked_key.revoked_at = Some(now);
         let revoked = ValidatedDriverReleaseTrustRoot::new(revoked).unwrap();
         assert!(envelope.verify(&release, &manifest, &revoked, now).is_err());
 
@@ -802,6 +1202,118 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("threshold")
+        );
+    }
+
+    #[test]
+    fn root_rotation_requires_old_and_new_thresholds_and_exactly_next_version() {
+        let now = Utc::now();
+        let (previous, _authorization, _release, _manifest) = signed_fixture(now);
+        let rotation = signed_root_rotation(&previous, now);
+        let verified = rotation.verify(&previous, now).unwrap();
+        assert_eq!(verified.previous_root_version, 1);
+        assert_eq!(verified.next_root_version, 2);
+        assert_eq!(verified.previous_root_signer_key_ids.len(), 1);
+        assert_eq!(verified.next_root_signer_key_ids.len(), 2);
+
+        let mut expired_previous = previous.get().clone();
+        expired_previous.expires_at = now - TimeDelta::seconds(1);
+        let expired_previous = ValidatedDriverReleaseTrustRoot::new(expired_previous).unwrap();
+        rotation.verify(&expired_previous, now).unwrap();
+
+        let mut expired_previous_key = previous.get().clone();
+        let root_key_id = expired_previous_key.root.key_ids[0].clone();
+        expired_previous_key
+            .keys
+            .iter_mut()
+            .find(|key| key.key_id == root_key_id)
+            .unwrap()
+            .valid_until = now - TimeDelta::seconds(1);
+        let expired_previous_key =
+            ValidatedDriverReleaseTrustRoot::new(expired_previous_key).unwrap();
+        assert!(
+            rotation
+                .verify(&expired_previous_key, now)
+                .unwrap_err()
+                .to_string()
+                .contains("both root signature thresholds")
+        );
+
+        let previous_only_key = previous
+            .get()
+            .root
+            .key_ids
+            .iter()
+            .find(|key_id| !rotation.next_root().get().root.key_ids.contains(key_id))
+            .unwrap()
+            .clone();
+        let mut without_previous_threshold = rotation.get().clone();
+        without_previous_threshold
+            .signatures
+            .retain(|signature| signature.keyid != previous_only_key);
+        let without_previous_threshold =
+            ValidatedDriverTrustRootRotation::new(without_previous_threshold).unwrap();
+        assert!(
+            without_previous_threshold
+                .verify(&previous, now)
+                .unwrap_err()
+                .to_string()
+                .contains("both root signature thresholds")
+        );
+
+        let next_only_key = rotation
+            .next_root()
+            .get()
+            .root
+            .key_ids
+            .iter()
+            .find(|key_id| !previous.get().root.key_ids.contains(key_id))
+            .unwrap()
+            .clone();
+        let mut without_next_threshold = rotation.get().clone();
+        without_next_threshold
+            .signatures
+            .retain(|signature| signature.keyid != next_only_key);
+        let without_next_threshold =
+            ValidatedDriverTrustRootRotation::new(without_next_threshold).unwrap();
+        assert!(without_next_threshold.verify(&previous, now).is_err());
+
+        let mut skipped = rotation.next_root().get().clone();
+        skipped.root_version += 1;
+        let skipped = ValidatedDriverReleaseTrustRoot::new(skipped).unwrap();
+        let skipped_payload = skipped.canonical_json().unwrap();
+        let mut skipped_envelope = rotation.get().clone();
+        skipped_envelope.payload = STANDARD.encode(skipped_payload);
+        let skipped = ValidatedDriverTrustRootRotation::new(skipped_envelope).unwrap();
+        assert!(
+            skipped
+                .verify(&previous, now)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one version")
+        );
+    }
+
+    #[test]
+    fn legacy_root_shape_preserves_its_identity_only_in_compatible_mode() {
+        let now = Utc::now();
+        let (root, _authorization, _release, _manifest) = signed_fixture(now);
+        let mut legacy: serde_json::Value = serde_json::to_value(root.get()).unwrap();
+        legacy.as_object_mut().unwrap().remove("root");
+        let canonical_legacy = serde_jcs::to_vec(&legacy).unwrap();
+
+        assert!(ValidatedDriverReleaseTrustRoot::parse_json(&canonical_legacy).is_err());
+        let compatible =
+            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&canonical_legacy).unwrap();
+        assert!(compatible.uses_legacy_implicit_root_role());
+        assert_eq!(compatible.canonical_json().unwrap(), canonical_legacy);
+        assert_eq!(
+            compatible.get().root.key_ids,
+            compatible.get().provider_driver_release.key_ids
+        );
+        assert_eq!(
+            compatible.get().root.threshold,
+            compatible.get().provider_driver_release.threshold
         );
     }
 
@@ -849,6 +1361,18 @@ mod tests {
             .unwrap();
         assert_eq!(verified.trust_root_version, 1);
         assert_eq!(verified.signer_key_ids.len(), 2);
+
+        let rotation = fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/v1/fixtures/valid/provider-driver-trust-root-envelope.json"
+        ))
+        .unwrap();
+        let rotation = ValidatedDriverTrustRootRotation::parse_json(&rotation).unwrap();
+        let verified_rotation = rotation.verify(&root, observed_at).unwrap();
+        assert_eq!(verified_rotation.previous_root_version, 1);
+        assert_eq!(verified_rotation.next_root_version, 2);
+        assert_eq!(verified_rotation.previous_root_signer_key_ids.len(), 1);
+        assert_eq!(verified_rotation.next_root_signer_key_ids.len(), 2);
     }
 
     #[test]
