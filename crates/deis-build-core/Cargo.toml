@@ -14,6 +14,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "1.0"
+dunce = "1.0.5"
 # The bundler, from its own repository at a pinned tag rather than from a
 # checkout beside this one. Until 2026-08-31 these two were `path =
 # "/ext/deislet/resource/rolldown/..."`, an absolute path outside the

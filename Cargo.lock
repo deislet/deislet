@@ -2125,6 +2125,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deis-node-contract",
+ "dunce",
  "rolldown",
  "rolldown_common",
  "rolldown_error",

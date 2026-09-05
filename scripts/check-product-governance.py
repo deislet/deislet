@@ -39,7 +39,7 @@ EXPECTED_TEST_SHARDS = {
 EXPECTED_TEST_PREREQUISITES = {
     "runtime-tests": "cargo build -p deis-proxy",
 }
-COMPILER_IDENTITY_EVIDENCE = "docs/product/evidence/compiler-identity-ffb1591.json"
+COMPILER_IDENTITY_EVIDENCE_GLOB = "compiler-identity-*.json"
 
 
 class ValidationError(RuntimeError):
@@ -346,9 +346,9 @@ def validate_roadmap(locked_standard_commit: str) -> None:
         raise ValidationError(f"target-status.json {location}: {error.message}") from error
 
 
-def validate_compiler_identity_evidence() -> None:
+def validate_compiler_identity_evidence(evidence_path: str) -> None:
     schema = load_json("docs/product/evidence/compiler-identity.schema.json")
-    evidence = load_json(COMPILER_IDENTITY_EVIDENCE)
+    evidence = load_json(evidence_path)
     try:
         jsonschema.validate(
             instance=evidence,
@@ -358,60 +358,60 @@ def validate_compiler_identity_evidence() -> None:
     except jsonschema.ValidationError as error:
         location = "/".join(str(part) for part in error.absolute_path) or "<root>"
         raise ValidationError(
-            f"{COMPILER_IDENTITY_EVIDENCE} {location}: {error.message}"
+            f"{evidence_path} {location}: {error.message}"
         ) from error
 
     source = evidence["source"]
     require(
         source["repository"] == "deislet/deislet",
-        f"{COMPILER_IDENTITY_EVIDENCE}: unexpected source repository",
+        f"{evidence_path}: unexpected source repository",
     )
     expected_commit = source["commit"]
     expected_archive = source["archive"]["sha256"]
     fixture_root = (ROOT / evidence["fixture"]["path"]).resolve()
     require(
         fixture_root.is_relative_to(ROOT.resolve()) and fixture_root.is_dir(),
-        f"{COMPILER_IDENTITY_EVIDENCE}: fixture path escapes or is missing",
+        f"{evidence_path}: fixture path escapes or is missing",
     )
     for relative, expected_digest in evidence["fixture"]["files"].items():
         fixture_file = (fixture_root / relative).resolve()
         require(
             fixture_file.is_relative_to(fixture_root) and fixture_file.is_file(),
-            f"{COMPILER_IDENTITY_EVIDENCE}: fixture file escapes or is missing: {relative}",
+            f"{evidence_path}: fixture file escapes or is missing: {relative}",
         )
         require(
             hashlib.sha256(fixture_file.read_bytes()).hexdigest() == expected_digest,
-            f"{COMPILER_IDENTITY_EVIDENCE}: fixture digest drifted: {relative}",
+            f"{evidence_path}: fixture digest drifted: {relative}",
         )
 
     observations = evidence["observations"]
     ids = [item["id"] for item in observations]
     aliases = [item["hostAlias"] for item in observations]
-    require(len(ids) == len(set(ids)), f"{COMPILER_IDENTITY_EVIDENCE}: duplicate observation id")
+    require(len(ids) == len(set(ids)), f"{evidence_path}: duplicate observation id")
     require(
         len(aliases) == len(set(aliases)),
-        f"{COMPILER_IDENTITY_EVIDENCE}: duplicate host alias",
+        f"{evidence_path}: duplicate host alias",
     )
     expected_identities = evidence["expectedIdentities"]
     for observation in observations:
         require(
             observation["commit"] == expected_commit,
-            f"{COMPILER_IDENTITY_EVIDENCE}: {observation['id']} commit drifted",
+            f"{evidence_path}: {observation['id']} commit drifted",
         )
         require(
             observation["archiveSha256"] == expected_archive,
-            f"{COMPILER_IDENTITY_EVIDENCE}: {observation['id']} archive drifted",
+            f"{evidence_path}: {observation['id']} archive drifted",
         )
         if observation["result"] == "passed":
             require(
                 observation["identities"] == expected_identities,
-                f"{COMPILER_IDENTITY_EVIDENCE}: {observation['id']} identity mismatch",
+                f"{evidence_path}: {observation['id']} identity mismatch",
             )
 
     required_systems = evidence["requiredOperatingSystems"]
     require(
         required_systems == ["linux", "macos", "windows"],
-        f"{COMPILER_IDENTITY_EVIDENCE}: required OS set or order drifted",
+        f"{evidence_path}: required OS set or order drifted",
     )
     passing_systems = {
         item["operatingSystem"] for item in observations if item["result"] == "passed"
@@ -419,7 +419,7 @@ def validate_compiler_identity_evidence() -> None:
     missing = [system for system in required_systems if system not in passing_systems]
     require(
         evidence["assertions"]["missingPassingOperatingSystems"] == missing,
-        f"{COMPILER_IDENTITY_EVIDENCE}: missing OS assertion does not match observations",
+        f"{evidence_path}: missing OS assertion does not match observations",
     )
     expected_outcome = (
         "failed"
@@ -428,7 +428,7 @@ def validate_compiler_identity_evidence() -> None:
     )
     require(
         evidence["outcome"] == expected_outcome,
-        f"{COMPILER_IDENTITY_EVIDENCE}: outcome must be {expected_outcome}",
+        f"{evidence_path}: outcome must be {expected_outcome}",
     )
 
 
@@ -635,7 +635,16 @@ def main() -> int:
         validate_adrs()
         commit = validate_standard_lock()
         validate_roadmap(commit)
-        validate_compiler_identity_evidence()
+        evidence_paths = sorted(
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "docs/product/evidence").glob(
+                COMPILER_IDENTITY_EVIDENCE_GLOB
+            )
+            if path.name != "compiler-identity.schema.json"
+        )
+        require(evidence_paths, "no real compiler identity evidence is registered")
+        for evidence_path in evidence_paths:
+            validate_compiler_identity_evidence(evidence_path)
         validate_integration()
     except (KeyError, TypeError, ValidationError) as error:
         print(f"product governance validation failed: {error}", file=sys.stderr)

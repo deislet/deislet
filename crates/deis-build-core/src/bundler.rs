@@ -177,7 +177,12 @@ impl BuildBundler {
         // and Linux.  Keep the original path only when the caller supplied a
         // path which does not exist yet; rolldown will report that condition
         // through its ordinary build error.
-        self.options.cwd = Some(cwd.canonicalize().unwrap_or(cwd));
+        // `std::fs::canonicalize` adds the verbatim `\\?\` prefix on
+        // Windows, while rolldown reports resolved modules with ordinary
+        // drive-letter paths.  `dunce` preserves the filesystem resolution
+        // but removes that incompatible spelling there; on Unix it is the
+        // standard canonicalization operation.
+        self.options.cwd = Some(dunce::canonicalize(&cwd).unwrap_or(cwd));
         self
     }
 
@@ -435,6 +440,26 @@ mod tests {
             "a canonicalized module path and an aliased cwd must not expose the alias boundary"
         );
         assert!(!through_alias.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_cwd_uses_the_same_non_verbatim_spelling_as_the_resolver() {
+        let root = tempfile::tempdir().expect("temp root");
+        let entry = root.path().join("entry.mjs");
+        fs::write(&entry, "export default 1;\n").expect("entry module");
+        let bundler = BuildBundler::new(
+            entry.to_str().expect("UTF-8 entry"),
+            TargetPlatform::Canonical,
+        )
+        .with_cwd(root.path().to_path_buf());
+        let cwd = bundler.options.cwd.expect("cwd");
+
+        assert!(!cwd.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(
+            cwd,
+            dunce::canonicalize(root.path()).expect("canonical cwd")
+        );
     }
 
     #[tokio::test]

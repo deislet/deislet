@@ -1,0 +1,114 @@
+{
+  "$schema": "./compiler-identity.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-compiler-identity-94fb8fb-2026-09-05",
+  "collectedAt": "2026-09-05T12:01:00+08:00",
+  "outcome": "failed",
+  "scope": "The real deis-build compiler produces the same canonical and provider payload identities from one byte-identical source archive and fixture on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "94fb8fbb12597c3803745fc793064113b9d9ed0a",
+    "archive": {
+      "fileName": "deislet-94fb8fb.tar.gz",
+      "sha256": "d150079d81a5a20ac1e1f7ff1acbc08adf3ab015b32cc0b23c4a6ecc1cf984b9"
+    }
+  },
+  "fixture": {
+    "path": "scripts/demo-assets/portable-app",
+    "files": {
+      ".config.json": "4e57dc50f08496349ae3b9819ccc873e27159305d6167763b837a3a9db432cdf",
+      "functions/api/where.ts": "34af2ed3e5c34b014f7a41a78f8ef283741483f02f3425196979ee090b2ef3fe"
+    }
+  },
+  "expectedIdentities": {
+    "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+    "providers": {
+      "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+      "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+      "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+      "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+    }
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s68-linux-x86_64",
+      "hostAlias": "s68",
+      "hostName": "Serv68",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-117-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "94fb8fbb12597c3803745fc793064113b9d9ed0a",
+      "archiveSha256": "d150079d81a5a20ac1e1f7ff1acbc08adf3ab015b32cc0b23c4a6ecc1cf984b9",
+      "identities": {
+        "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "94fb8fbb12597c3803745fc793064113b9d9ed0a",
+      "archiveSha256": "d150079d81a5a20ac1e1f7ff1acbc08adf3ab015b32cc0b23c4a6ecc1cf984b9",
+      "identities": {
+        "canonical": "33ca63d5cb47bf65f326b9b7159aa998fe8915171e19097ffa9b9f02a1bf522a",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "failed",
+      "commit": "94fb8fbb12597c3803745fc793064113b9d9ed0a",
+      "archiveSha256": "d150079d81a5a20ac1e1f7ff1acbc08adf3ab015b32cc0b23c4a6ecc1cf984b9",
+      "identities": {
+        "canonical": "473c53aef7f06e3dee55aa3987c95abe98fb14a54fc7712950035a665abc551a",
+        "providers": {
+          "cloudflare": "f85cfafd9c9811b8ddcc53282bee65ec9849b0fb036d89ba922f36cfc771ebeb",
+          "deno": "2cc5740996236c2a81e1f9690988eee3ebed0fd47ff4201c0358e9e977fc0a03",
+          "tencent": "1de0fd464cb40313e0ed360bce29e4dfc15b1afa02f23e53825b9d52ae954ea2",
+          "deislet": "06adf9e22eb897110db44224070302130952828b33d9297f498e87699fd0f0a2"
+        }
+      },
+      "reason": "The macOS alias fix used std::fs::canonicalize directly. On Windows that added a verbatim path prefix to cwd while rolldown retained ordinary drive-letter module paths, so absolute temporary paths entered the inline source map and changed every identity."
+    }
+  ],
+  "assertions": {
+    "allPassingObservationsMatchExpected": true,
+    "missingPassingOperatingSystems": ["windows"]
+  },
+  "limitations": [
+    "This evidence covers compiler output identity, not provider-account deployment, runtime conformance, or backend certification.",
+    "Provider CLI presence or absence affects verification warnings only and does not change emitted bytes.",
+    "The native compiler executables are platform-specific and are not themselves compared byte-for-byte."
+  ]
+}
