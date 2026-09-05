@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn no_build_resolves_the_verified_content_addressed_bundle() {
-        const STANDARD: &str = "edge-canon.next@f8eabb6619a50aab02fd44647c3bc7d64d817d24";
+        const STANDARD: &str = "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66";
 
         let project = tempfile::tempdir().expect("project");
         std::fs::write(
