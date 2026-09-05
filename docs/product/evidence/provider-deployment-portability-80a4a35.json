@@ -1,0 +1,123 @@
+{
+  "$schema": "./provider-deployment-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-deployment-portability-80a4a35-2026-09-06",
+  "collectedAt": "2026-09-06T00:25:32+08:00",
+  "outcome": "passed",
+  "scope": "The exact source commit passes the complete platform-applicable deis-provider-driver suite, the provider credential and durable deployment-operation Control suites, and strict all-target lint for the five deployment-control crates on Linux, macOS, and Windows with the repository-pinned Rust toolchain.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "80a4a35ae85abe484d0e899d16fd4eb2927b563c",
+    "tree": "e8f9aad35d012b1dc5d6caeeb5e9c919a8304cf7",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "551714dd910186bea96c73453ccdd9d6c1230ecb8ba5b3539a740eea5763bd6c"
+    }
+  },
+  "buildEnvironment": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "commands": [
+    {
+      "id": "provider-driver-tests",
+      "command": "cargo +1.96.0 test -p deis-provider-driver"
+    },
+    {
+      "id": "provider-credential-tests",
+      "command": "cargo +1.96.0 test -p deis-control provider_credential -- --nocapture"
+    },
+    {
+      "id": "provider-operation-tests",
+      "command": "cargo +1.96.0 test -p deis-control provider_driver_operation -- --nocapture"
+    },
+    {
+      "id": "strict-clippy",
+      "command": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"
+    }
+  ],
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "80a4a35ae85abe484d0e899d16fd4eb2927b563c",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 27, "failed": 0, "ignored": 0},
+        {"id": "provider-credential-tests", "outcome": "passed", "exitCode": 0, "passed": 7, "failed": 0, "ignored": 0},
+        {"id": "provider-operation-tests", "outcome": "passed", "exitCode": 0, "passed": 14, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "80a4a35ae85abe484d0e899d16fd4eb2927b563c",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 27, "failed": 0, "ignored": 0},
+        {"id": "provider-credential-tests", "outcome": "passed", "exitCode": 0, "passed": 7, "failed": 0, "ignored": 0},
+        {"id": "provider-operation-tests", "outcome": "passed", "exitCode": 0, "passed": 14, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "80a4a35ae85abe484d0e899d16fd4eb2927b563c",
+      "checks": [
+        {
+          "id": "provider-driver-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 21,
+          "failed": 0,
+          "ignored": 0,
+          "note": "Windows-specific Job Object tests are enabled; Unix-only process-group and environment tests are not compiled."
+        },
+        {"id": "provider-credential-tests", "outcome": "passed", "exitCode": 0, "passed": 7, "failed": 0, "ignored": 0},
+        {"id": "provider-operation-tests", "outcome": "passed", "exitCode": 0, "passed": 14, "failed": 0, "ignored": 0},
+        {
+          "id": "strict-clippy",
+          "outcome": "passed",
+          "exitCode": 0,
+          "note": "The lint set compiles deis-control together with deis-queue, deis-store, and deis-telemetry on Windows, closing the unconditional tokio::signal::unix import regression observed at 6003b12."
+        }
+      ]
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "windowsSignalPortabilityRegressionClosed": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "This evidence covers the shared driver, credential authorization, durable deployment coordination, and compilation/lint portability of the named crates; it is not a complete deis-control test run on every host.",
+    "It does not execute a live Cloudflare, Tencent EdgeOne, Deislet, or other provider account and does not certify a backend against Edge Canon.",
+    "The exact git archive does not contain a generated Control dashboard dist directory, so the Control build warning and dashboard HTTP 404 behavior remain outside this API-focused record.",
+    "Trusted driver installation, complete provider implementations, public API/CLI/Web management surfaces, and account-level lifecycle evidence remain outside this record."
+  ]
+}

@@ -1965,3 +1965,21 @@ Application/framework source + versioned build plan
   伪造 SIGTERM。Queue 本地 103 项单测与 22 项 gRPC 集成全过，相关 crate 严格 Clippy 通过。
 - 该修复只有在新提交的 exact archive 上完成 Windows/macOS/Linux 复跑后才能形成通过证据；当前阶段记录明确
   保留 `6003b12` 的 Windows 失败 observation，不以工作树或 Linux 结果覆盖历史失败。
+
+## 69. Credential/deployment 控制层精确提交三平台证据
+
+- 修复提交 `80a4a35ae85abe484d0e899d16fd4eb2927b563c`（tree
+  `e8f9aad35d012b1dc5d6caeeb5e9c919a8304cf7`，未压缩 `git archive --format=tar` SHA-256
+  `551714dd910186bea96c73453ccdd9d6c1230ecb8ba5b3539a740eea5763bd6c`）以同一 archive、固定 Rust
+  1.96.0 和关闭 incremental/test debug info 的构建环境在 s17 Linux、s67 macOS 与 s69 Windows 重跑。
+  三端均通过共享 driver 完整平台适用测试、Control credential 专项 7 项、durable provider operation/deployment
+  专项 14 项，以及 `deis-provider-driver/deis-control/deis-queue/deis-store/deis-telemetry` 五个 crate 的严格
+  all-target Clippy。共享 driver 在两个 Unix 主机为 27 项，Windows 为 21 项并包含两项真实 Job Object 测试。
+- Windows 严格检查真实编译了此前失败的 Queue、Store、Telemetry 和 Control 条件分支，因此 `6003b12` 暴露的
+  无条件 `tokio::signal::unix` import 回归在该提交上关闭。历史失败记录继续保留；新的通过记录不能反向改写旧提交。
+- 证据使用独立 `provider-deployment-portability` Schema，强制四条命令在三种操作系统逐条出现且全部成功，并检查
+  source commit 一致性、Windows 回归结论和总 outcome。它没有复用较窄的 driver-only Schema，也没有把编译/单元
+  测试提升为 provider live deployment 或 Edge Canon conformance。
+- exact archive 不含生成的 `crates/deis-control/web/dist`，因此构建明确警告 dashboard 路由返回 404；本证据只覆盖
+  API/Control Rust 边界，不把未构建 Web 资产计入通过。全量 Control 三平台 suite、受信 driver 安装、公共
+  vault/target/deployment API/CLI/Web、三个完整 provider driver 和真实账户生命周期仍是后续阻断项。
