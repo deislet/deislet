@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-05T12:05:00+08:00",
+  "updatedAt": "2026-09-05T12:15:00+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -218,9 +218,10 @@
             {"type": "local-path", "value": "crates/deis-build/tests/canonical_build_output.rs"},
             {"type": "local-path", "value": "crates/deis-build/tests/provider_resource_bindings.rs"},
             {"type": "local-path", "value": "docs/product/evidence/compiler-identity-ffb1591.json"},
-            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-94fb8fb.json"}
+            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-94fb8fb.json"},
+            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-3eb581e.json"}
           ],
-          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload 按文件集摘要原子发布和复用、current selector 只在全构建成功后切换、payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；protobuf 代码生成已固定并显式调用 vendored protoc 3.2.0，CI 不再安装系统 protoc；ffb1591 暴露 macOS /var 别名，94fb8fb 修复 macOS 后又暴露 Windows verbatim-prefix 路径，两次失败 observation 均有受治理机器 evidence；当前实现使用跨平台一致的解析路径 spelling，并有 Unix 符号链接及 Windows 前缀回归，下一精确提交的三平台复验尚待完成；全部 semantic document schema、签名、受信 build/control-plane record 和 framework/provider 集成继续阻断完成"
+          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload 按文件集摘要原子发布和复用、current selector 只在全构建成功后切换、payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；protobuf 代码生成已固定并显式调用 vendored protoc 3.2.0，CI 不再安装系统 protoc；ffb1591 暴露 macOS /var 别名，94fb8fb 暴露 Windows verbatim-prefix，两次失败 observation 和根因均保留；修复提交 3eb581e 的同一 archive/fixture 已在 Linux x86_64、macOS arm64、Windows AMD64 产生相同 canonical identity 786f483d 与四个 provider identity，机器 evidence 通过治理重算；全部 semantic document schema、签名、受信 build/control-plane record 和 framework/provider 集成继续阻断完成"
         },
         {
           "id": "P1-DEPLOY-001",
@@ -250,9 +251,10 @@
             {"type": "local-path", "value": "docs/product/evidence/compiler-identity.schema.json"},
             {"type": "local-path", "value": "docs/product/evidence/compiler-identity-ffb1591.json"},
             {"type": "local-path", "value": "docs/product/evidence/compiler-identity-94fb8fb.json"},
+            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-3eb581e.json"},
             {"type": "planned-path", "value": "Linux/macOS/Windows CI matrix"}
           ],
-          "verification": "ffb1591 的实机证据暴露 macOS /var 别名漂移；94fb8fb 的实机证据证明 macOS 修复后与 Linux 一致，同时暴露 Windows canonicalize 产生 verbatim prefix 的第二个漂移。两项根因均已修复并进入平台专属回归；修复提交的三平台实机复验及持续 CI matrix 未完成，故保持 active"
+          "verification": "ffb1591 与 94fb8fb 的受治理实机失败证据分别保留 macOS /var alias 和 Windows verbatim-prefix 根因；修复提交 3eb581e 已在 s68 Linux、s67 macOS ARM64、s69 Windows 11 AMD64 使用固定 Rust/Cargo 1.96.0 对同一 archive/fixture 得到相同 canonical 与四个 provider identity。真实 compiler determinism 已完成；持续 GitHub Actions 三平台 matrix 及完整 CLI/dev 发布验证仍未完成，故保持 active"
         }
       ]
     },

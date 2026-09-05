@@ -1,0 +1,113 @@
+{
+  "$schema": "./compiler-identity.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-compiler-identity-3eb581e-2026-09-05",
+  "collectedAt": "2026-09-05T12:12:00+08:00",
+  "outcome": "passed",
+  "scope": "The real deis-build compiler produces the same canonical and provider payload identities from one byte-identical source archive and fixture on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "3eb581e3672473e2d355cddfa08523a9dbbb347d",
+    "archive": {
+      "fileName": "deislet-3eb581e.tar.gz",
+      "sha256": "ed5555d23d69e4afde40312906bec201a5938edb4699b0209dd19739086b5c0e"
+    }
+  },
+  "fixture": {
+    "path": "scripts/demo-assets/portable-app",
+    "files": {
+      ".config.json": "4e57dc50f08496349ae3b9819ccc873e27159305d6167763b837a3a9db432cdf",
+      "functions/api/where.ts": "34af2ed3e5c34b014f7a41a78f8ef283741483f02f3425196979ee090b2ef3fe"
+    }
+  },
+  "expectedIdentities": {
+    "canonical": "786f483d66f1507af8875c7e1b968de40be0661bf10988a24517d5434c713d32",
+    "providers": {
+      "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+      "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+      "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+      "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+    }
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s68-linux-x86_64",
+      "hostAlias": "s68",
+      "hostName": "Serv68",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-117-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "3eb581e3672473e2d355cddfa08523a9dbbb347d",
+      "archiveSha256": "ed5555d23d69e4afde40312906bec201a5938edb4699b0209dd19739086b5c0e",
+      "identities": {
+        "canonical": "786f483d66f1507af8875c7e1b968de40be0661bf10988a24517d5434c713d32",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "3eb581e3672473e2d355cddfa08523a9dbbb347d",
+      "archiveSha256": "ed5555d23d69e4afde40312906bec201a5938edb4699b0209dd19739086b5c0e",
+      "identities": {
+        "canonical": "786f483d66f1507af8875c7e1b968de40be0661bf10988a24517d5434c713d32",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "result": "passed",
+      "commit": "3eb581e3672473e2d355cddfa08523a9dbbb347d",
+      "archiveSha256": "ed5555d23d69e4afde40312906bec201a5938edb4699b0209dd19739086b5c0e",
+      "identities": {
+        "canonical": "786f483d66f1507af8875c7e1b968de40be0661bf10988a24517d5434c713d32",
+        "providers": {
+          "cloudflare": "aa9603382b489bd21f370bbe79e0ae8d6d698d6678a54ebc799866f53a0c5c0f",
+          "deno": "94d1fee92ad266cda0fb88ec0c840de7fd00f76a97d470d35542282530607df3",
+          "tencent": "bac54511568a97dda41b6546ad291a79e7c6bed2a748f27a794daf4cc8a44cf7",
+          "deislet": "db7c6a528814896b0ba36efb83387328d117624814d77e0e6c04e1d0695207e6"
+        }
+      }
+    }
+  ],
+  "assertions": {
+    "allPassingObservationsMatchExpected": true,
+    "missingPassingOperatingSystems": []
+  },
+  "limitations": [
+    "This evidence covers compiler output identity, not provider-account deployment, runtime conformance, or backend certification.",
+    "Provider CLI presence or absence affects verification warnings only and does not change emitted bytes.",
+    "The native compiler executables are platform-specific and are not themselves compared byte-for-byte."
+  ]
+}
