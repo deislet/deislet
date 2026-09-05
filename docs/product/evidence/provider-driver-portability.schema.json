@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/docs/product/evidence/provider-driver-portability.schema.json",
+  "title": "Deislet provider driver portability evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "evidenceId",
+    "collectedAt",
+    "outcome",
+    "scope",
+    "source",
+    "commands",
+    "requiredOperatingSystems",
+    "observations",
+    "assertions",
+    "limitations"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": 1},
+    "evidenceId": {"type": "string", "minLength": 1},
+    "collectedAt": {"type": "string", "format": "date-time"},
+    "outcome": {"enum": ["passed", "partial", "failed"]},
+    "scope": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit", "tree", "archive"],
+      "properties": {
+        "repository": {"const": "deislet/deislet"},
+        "commit": {"$ref": "#/$defs/gitSha"},
+        "tree": {"$ref": "#/$defs/gitSha"},
+        "archive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["format", "sha256"],
+          "properties": {
+            "format": {"const": "git-archive-tar"},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["test", "clippy"],
+      "properties": {
+        "test": {"const": "cargo +1.96.0 test -p deis-provider-driver --all-targets"},
+        "clippy": {"const": "cargo +1.96.0 clippy -p deis-provider-driver --all-targets -- -D warnings"}
+      }
+    },
+    "requiredOperatingSystems": {
+      "type": "array",
+      "prefixItems": [
+        {"const": "linux"},
+        {"const": "macos"},
+        {"const": "windows"}
+      ],
+      "items": false
+    },
+    "observations": {
+      "type": "array",
+      "minItems": 3,
+      "items": {"$ref": "#/$defs/observation"}
+    },
+    "assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allRequiredOperatingSystemsPassed", "noProviderConformanceClaim"],
+      "properties": {
+        "allRequiredOperatingSystemsPassed": {"type": "boolean"},
+        "noProviderConformanceClaim": {"const": true}
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "operatingSystem": {"enum": ["linux", "macos", "windows"]},
+    "checkResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "exitCode"],
+      "properties": {
+        "outcome": {"enum": ["passed", "failed", "blocked"]},
+        "exitCode": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "ignored": {"type": "integer", "minimum": 0},
+        "note": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"outcome": {"const": "passed"}}},
+          "then": {"properties": {"exitCode": {"const": 0}}}
+        }
+      ]
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "hostAlias",
+        "hostName",
+        "operatingSystem",
+        "osRelease",
+        "architecture",
+        "rustc",
+        "cargo",
+        "clippy",
+        "commit",
+        "test",
+        "lint"
+      ],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "hostAlias": {"type": "string", "minLength": 1},
+        "hostName": {"type": "string", "minLength": 1},
+        "operatingSystem": {"$ref": "#/$defs/operatingSystem"},
+        "osRelease": {"type": "string", "minLength": 1},
+        "kernel": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "powershell": {"type": "string", "minLength": 1},
+        "rustc": {"type": "string", "minLength": 1},
+        "cargo": {"type": "string", "minLength": 1},
+        "clippy": {"type": "string", "minLength": 1},
+        "commit": {"$ref": "#/$defs/gitSha"},
+        "test": {"$ref": "#/$defs/checkResult"},
+        "lint": {"$ref": "#/$defs/checkResult"}
+      }
+    }
+  }
+}

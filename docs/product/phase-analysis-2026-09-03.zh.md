@@ -1877,3 +1877,21 @@ Application/framework source + versioned build plan
   Tokio paused clock 确定性推进 20、40、45 ms，并显式启用仅测试使用的 `test-util` feature。
 - 两个结果均按失败记录，不能算 `c0f788c` 三平台通过。修订提交必须重新在 Linux、macOS、Windows 跑完整
   provider-driver suite 与严格 Clippy；只有新提交全部通过后才能形成通过证据。
+
+## 65. Provider driver 精确提交三平台可移植性证据
+
+- 修订提交 `db10a9c0afdc80145a1b4509532724324420cc36`（tree
+  `59ee5d8cc1b247bc083e1ef043316b1928b505d4`，未压缩 `git archive --format=tar` SHA-256
+  `38cd621b7cd3f36101f919bccc291bfb3f8b45f90c1f9409cde628f2d7095248`）在固定 Rust 1.96.0
+  上完成重跑。s17 Ubuntu 24.04.4 x86_64 与 s67 macOS 26.6 arm64 各通过 25/25；s69 Windows 11
+  AMD64 通过其平台适用的 19/19，其中包含两项真实 Job Object 进程边界测试。三端均通过
+  `cargo clippy -p deis-provider-driver --all-targets -- -D warnings`。
+- 测试数不同不是跳过失败：Unix 编译 process-group 与环境继承边界用例，Windows 编译 Job Object 用例。
+  上一提交暴露的 500 ms process cleanup 与真实墙钟 heartbeat 假设均在新提交上通过确定性验证。
+- 证据已写入 `docs/product/evidence/provider-driver-portability-db10a9c.json`，由独立 JSON Schema 与产品治理
+  校验器检查 source commit、工具链、操作系统覆盖、测试/Clippy 结果和结论一致性。该记录只证明 driver
+  contract/orchestrator/process boundary 的平台可移植性；不证明 Cloudflare、EdgeOne、Deislet 的真实账户
+  部署，不提升任一 backend 的 conformance 或 supported 状态。
+- `P1-DEPLOY-001` 因而只关闭“精确提交三平台复跑”子项，仍保持 active。部署父流程、credential lease/use
+  audit、受信 driver installer、完整 CLI dependency-tree lock、三个 backend driver、API/CLI/Web 接线和真实
+  账户全生命周期证据继续阻断完成。

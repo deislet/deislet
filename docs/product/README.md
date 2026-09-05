@@ -25,6 +25,7 @@
 - [共享产品契约](../../contracts/v1/README.zh.md)及其[机器 registry](../../contracts/v1/registry.json)
 - [执行路线 JSON](roadmap.json)
 - [路线 JSON Schema](roadmap.schema.json)
+- [provider driver 三平台可移植性证据](evidence/provider-driver-portability-db10a9c.json)及其[Schema](evidence/provider-driver-portability.schema.json)
 - [仓库校验器](../../scripts/check-product-governance.py)
 
 ## 更新规则

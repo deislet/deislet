@@ -1,0 +1,93 @@
+{
+  "$schema": "./provider-driver-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-driver-portability-db10a9c-2026-09-05",
+  "collectedAt": "2026-09-05T23:07:07+08:00",
+  "outcome": "passed",
+  "scope": "The exact deis-provider-driver source commit passes its complete platform-applicable test suite and strict lint on Linux, macOS, and Windows with the repository-pinned Rust toolchain.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "db10a9c0afdc80145a1b4509532724324420cc36",
+    "tree": "59ee5d8cc1b247bc083e1ef043316b1928b505d4",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "38cd621b7cd3f36101f919bccc291bfb3f8b45f90c1f9409cde628f2d7095248"
+    }
+  },
+  "commands": {
+    "test": "cargo +1.96.0 test -p deis-provider-driver --all-targets",
+    "clippy": "cargo +1.96.0 clippy -p deis-provider-driver --all-targets -- -D warnings"
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "db10a9c0afdc80145a1b4509532724324420cc36",
+      "test": {"outcome": "passed", "exitCode": 0, "passed": 25, "failed": 0, "ignored": 0},
+      "lint": {"outcome": "passed", "exitCode": 0}
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "db10a9c0afdc80145a1b4509532724324420cc36",
+      "test": {
+        "outcome": "passed",
+        "exitCode": 0,
+        "passed": 25,
+        "failed": 0,
+        "ignored": 0,
+        "note": "Unix process-group tests are enabled."
+      },
+      "lint": {"outcome": "passed", "exitCode": 0}
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "db10a9c0afdc80145a1b4509532724324420cc36",
+      "test": {
+        "outcome": "passed",
+        "exitCode": 0,
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0,
+        "note": "Windows-specific Job Object tests are enabled; Unix-only process-group and environment tests are not compiled."
+      },
+      "lint": {"outcome": "passed", "exitCode": 0}
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "This evidence covers provider-driver contract, orchestration, process-boundary, and platform compilation behavior; it is not a live provider-account deployment run.",
+    "It does not certify Cloudflare, Tencent EdgeOne, Deislet, or any other backend against Edge Canon.",
+    "The platform test totals differ because Unix process-group tests and Windows Job Object tests are selected by target configuration.",
+    "Credential-vault leasing, trusted driver installation, complete provider implementations, and end-to-end deployment lifecycle evidence remain outside this record."
+  ]
+}

@@ -41,6 +41,7 @@ EXPECTED_TEST_PREREQUISITES = {
     "runtime-tests": "cargo build -p deis-proxy",
 }
 COMPILER_IDENTITY_EVIDENCE_GLOB = "compiler-identity-*.json"
+PROVIDER_DRIVER_PORTABILITY_EVIDENCE_GLOB = "provider-driver-portability-*.json"
 
 
 class ValidationError(RuntimeError):
@@ -464,6 +465,50 @@ def validate_compiler_identity_evidence(evidence_path: str) -> None:
     )
 
 
+def validate_provider_driver_portability_evidence(evidence_path: str) -> None:
+    schema = load_json("docs/product/evidence/provider-driver-portability.schema.json")
+    evidence = load_json(evidence_path)
+    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
+    errors = sorted(validator.iter_errors(evidence), key=lambda error: list(error.path))
+    if errors:
+        error = errors[0]
+        location = "/" + "/".join(str(part) for part in error.path)
+        raise ValidationError(f"{evidence_path} {location}: {error.message}")
+
+    source = evidence["source"]
+    observations = evidence["observations"]
+    ids = [observation["id"] for observation in observations]
+    aliases = [observation["hostAlias"] for observation in observations]
+    require(len(ids) == len(set(ids)), f"{evidence_path}: duplicate observation id")
+    require(len(aliases) == len(set(aliases)), f"{evidence_path}: duplicate host alias")
+    require(
+        all(observation["commit"] == source["commit"] for observation in observations),
+        f"{evidence_path}: observation commit drifted",
+    )
+    passing_systems = {
+        observation["operatingSystem"]
+        for observation in observations
+        if observation["test"]["outcome"] == "passed"
+        and observation["lint"]["outcome"] == "passed"
+    }
+    required_systems = set(evidence["requiredOperatingSystems"])
+    all_required_passed = required_systems <= passing_systems
+    require(
+        evidence["assertions"]["allRequiredOperatingSystemsPassed"] == all_required_passed,
+        f"{evidence_path}: required OS assertion does not match observations",
+    )
+    any_failed = any(
+        observation[check]["outcome"] == "failed"
+        for observation in observations
+        for check in ("test", "lint")
+    )
+    expected_outcome = "failed" if any_failed else "passed" if all_required_passed else "partial"
+    require(
+        evidence["outcome"] == expected_outcome,
+        f"{evidence_path}: outcome must be {expected_outcome}",
+    )
+
+
 def validate_integration() -> None:
     control_manifest = tomllib.loads(read_text("crates/deis-control/Cargo.toml"))
     control_dependencies = set(control_manifest.get("dependencies", {}))
@@ -738,6 +783,16 @@ def main() -> int:
         require(evidence_paths, "no real compiler identity evidence is registered")
         for evidence_path in evidence_paths:
             validate_compiler_identity_evidence(evidence_path)
+        portability_paths = sorted(
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "docs/product/evidence").glob(
+                PROVIDER_DRIVER_PORTABILITY_EVIDENCE_GLOB
+            )
+            if path.name != "provider-driver-portability.schema.json"
+        )
+        require(portability_paths, "no provider driver portability evidence is registered")
+        for evidence_path in portability_paths:
+            validate_provider_driver_portability_evidence(evidence_path)
         validate_integration()
     except (KeyError, TypeError, ValidationError) as error:
         print(f"product governance validation failed: {error}", file=sys.stderr)
