@@ -159,12 +159,6 @@ jobs:
           done
           npm run build
 
-      # deis-wire's build script compiles the protobuf definitions with
-      # `protoc`, which the runner image does not carry. The first run of
-      # this workflow failed here, before a line of Rust was checked.
-      - name: Install protoc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
-
       # Keep the written exceptions in .cargo/audit.toml under review while
       # rejecting every advisory that has not been explicitly judged there.
       - name: Audit Rust dependencies
@@ -208,9 +202,6 @@ jobs:
           key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-registry-
 
-      - name: Install protoc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
-
       # Two runtime integration cases start the real proxy binary. A package
       # test does not build binaries from another workspace package, and jobs
       # do not share the static workspace job's target directory.
@@ -244,9 +235,6 @@ jobs:
             ~/.cargo/git
           key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-registry-
-
-      - name: Install protoc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
       - name: Compiler, adapters and CLI tests
         run: cargo test -p deis-bundle -p deis-node-contract -p deis-build-core -p deis-build-adapter-cloudflare -p deis-build-adapter-deislet -p deis-build-adapter-deno -p deis-build-adapter-tencent -p deis-build -p deis --no-fail-fast
@@ -286,9 +274,6 @@ jobs:
         run: |
           npm ci
           npm run build
-
-      - name: Install protoc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
       - name: Control plane and service tests
         run: cargo test -p deis-wire -p deis-backend-migration -p deis-backend-topology -p deis-control -p deis-store -p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests --no-fail-fast
@@ -352,11 +337,6 @@ jobs:
           tar -xzf grpcurl.tar.gz grpcurl
           sudo install -m 0755 grpcurl /usr/local/bin/grpcurl
           grpcurl --version
-
-      # Same reason as in the workspace job: `demo.sh start` builds the
-      # binaries, and deis-wire's build script needs `protoc`.
-      - name: Install protoc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
       - name: Start the demo
         run: ./scripts/demo.sh start

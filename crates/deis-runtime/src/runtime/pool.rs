@@ -51,6 +51,25 @@ fn init_v8_platform() {
     });
 }
 
+// V8 11.6 and later require all isolate threads to share the parent thread
+// that initialized the platform. Production calls `RuntimePool::new` before it
+// starts any runtime thread. The Rust test harness, however, starts sibling
+// worker threads before the first test body runs. Initialize V8 on the common
+// pre-main thread and serialize the libtest bodies: a single body still starts
+// multiple runtime threads and exercises the production concurrency model,
+// while unrelated tests no longer create and destroy independent V8 pool
+// families concurrently (a topology the product never uses and V8 aborts on).
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn init_v8_platform_before_parallel_tests() {
+    // SAFETY: constructors run before the test harness starts any thread. No
+    // other thread can read or write the process environment at this point.
+    unsafe {
+        std::env::set_var("RUST_TEST_THREADS", "1");
+    }
+    init_v8_platform();
+}
+
 /// What a caught panic said, as text.
 ///
 /// A panic payload is `&str` for `panic!("literal")` and `String` once

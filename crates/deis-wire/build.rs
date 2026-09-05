@@ -2,8 +2,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&["proto/control.proto"], &["proto"])?;
+        .compile_protos_with_config(protobuf_config()?, &["proto/control.proto"], &["proto"])?;
 
     println!("cargo:rerun-if-changed=proto/control.proto");
     Ok(())
+}
+
+fn protobuf_config() -> Result<prost_build::Config, Box<dyn std::error::Error>> {
+    let mut config = prost_build::Config::new();
+    config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+    Ok(config)
 }

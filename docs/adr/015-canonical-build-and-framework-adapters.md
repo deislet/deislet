@@ -46,6 +46,9 @@ payload 本身也经隔离 staging、全量回读和原子 rename 发布到
 `deis deploy` 在读取/上传 bundle 前重新校验 parent、record 和 payload。路由、资产、事件和
 逻辑资源若当前 target 尚无标准语义映射，会在 provider 产物写出前以稳定错误拒绝，不再静默
 丢失或降级。Memory 模式同样经过临时 canonical parent，但不会把临时 identity 当成持久结果。
+所有 protobuf 代码生成入口显式使用 Cargo.lock 固定的 `protoc-bin-vendored` 3.2.0；构建脚本把
+对应平台的可执行文件直接交给 `prost-build`，不读取宿主 PATH 中的 `protoc`。CI 也不预装系统
+protobuf compiler，因而无法用 runner 的偶然状态掩盖未声明工具链输入。
 
 以下仍是完成本 ADR 的明确缺口：
 
@@ -55,7 +58,7 @@ payload 本身也经隔离 staging、全量回读和原子 rename 发布到
 - 没有通用 source checkout、framework build、monorepo root、远端 build cache 和官方 framework adapter；`deis build --watch` 仍明确未实现；
 - npm lock/install 已有严格路径，但 native dependency 的目标平台构建、完整多框架矩阵和 cache reuse 未完成；
 - provider 官方 CLI 检查可缺席并形成 warning；统一 driver API、固定工具版本、账户级 prepare/deploy/verify/activate/rollback 及 deployment identity 尚未实现；
-- Linux 上的 determinism 已有回归，但本实现尚未取得 Linux/macOS/Windows 对同一真实 compiler 产物的 identity 证据；
+- Linux 上的 determinism 已有回归；Windows 已与 Linux 对同一提交和 fixture 产生相同真实 compiler identity，但 macOS 仍受开发机可用构建空间阻断，因此三平台完整证据尚未取得；
 - 当前结果只是 artifact generation/integrity 证据，不是 provider compliance 或产品 support 结论；registry 状态不得据此提升。
 
 ## 分层架构

@@ -202,6 +202,12 @@ Invocation-local 值不得放在可被另一 invocation 覆写的 runtime single
 - Isolate eviction 后应用仍正确。
 - 多租户压力下公平性和内存上限。
 
+`deis-runtime` 的单个 `RuntimePool` 仍会启动多个 runtime thread，并在测试中执行上述真实并发。
+但 Rust libtest 默认会同时执行多个互不相关的测试体，从而在同一进程并行创建、销毁多组独立 V8
+平台线程族；这不是产品拓扑，并会触发 V8/libc++ 进程级断言。测试二进制因此在 libtest 启动前
+由共同父线程初始化 V8，并把独立测试体串行化。该限制不串行化一个 pool 内的 isolate/thread，
+也不改变生产 runtime 的并发模型；相关并发断言必须继续在单个测试体内显式制造。
+
 ## 后果
 
 - 当前 runtime dispatcher 和 one-isolate-per-thread/per-app 串行假设需要较大重构。

@@ -21,7 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(false)
         .build_client(true)
-        .compile_protos(
+        .compile_protos_with_config(
+            protobuf_config()?,
             &["../deis-telemetry/proto/telemetry.proto"],
             &["../deis-telemetry/proto"],
         )?;
@@ -29,7 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(false)
         .build_client(true)
-        .compile_protos(
+        .compile_protos_with_config(
+            protobuf_config()?,
             &["../deis-runtime/proto/management.proto"],
             &["../deis-runtime/proto"],
         )?;
@@ -37,7 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(false)
         .build_client(true)
-        .compile_protos(
+        .compile_protos_with_config(
+            protobuf_config()?,
             &[
                 "../deis-store/proto/storage.proto",
                 "../deis-store/proto/blob.proto",
@@ -48,7 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(false)
         .build_client(true)
-        .compile_protos(
+        .compile_protos_with_config(
+            protobuf_config()?,
             &["../deis-queue/proto/queue.proto"],
             &["../deis-queue/proto"],
         )?;
@@ -59,4 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../deis-store/proto/blob.proto");
     println!("cargo:rerun-if-changed=../deis-queue/proto/queue.proto");
     Ok(())
+}
+
+fn protobuf_config() -> Result<prost_build::Config, Box<dyn std::error::Error>> {
+    let mut config = prost_build::Config::new();
+    config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+    Ok(config)
 }
