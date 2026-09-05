@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "resolvedAt": "2026-09-05T12:30:00+08:00",
+  "resolvedAt": "2026-09-05T15:06:30+08:00",
   "source": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+    "sourceCommit": "c926687f7539453ab31776cd16f8341133d82a13",
     "proposalPath": "proposals/0001-unified-platform-contract/README.zh.md",
     "webFetchEventsFixturePath": "conformance/harness/web-fetch-events/fixture.mjs",
     "webFetchEventsFixtureSha256": "1d58a3a6320952f70d476198ff95cd109c93c2c02925620a7d725918ca290523",
@@ -50,12 +50,19 @@
     "environmentBindingSnapshotSchemaSha256": "957e01e859dcc07dc1def50bb1276905a9bfea126f53059197697514ee39cf9f",
     "environmentHarnessPath": "conformance/harness/environment-secrets/harness.json",
     "environmentPlatformEvidencePath": "conformance/evidence/environment-secrets-platforms-2026-09-05.json",
+    "deploymentRequirementsPath": "standard/requirements/deployment-preview-rollback.zh.md",
+    "deploymentPlanSchemaPath": "schemas/deployment-plan.schema.json",
+    "deploymentPlanSchemaSha256": "b76d519fdbed717676b5b0ee5f7a9f444e2ab42bc1e54c7c1af4eeffcc5f4615",
+    "deploymentStatusSchemaPath": "schemas/deployment-status.schema.json",
+    "deploymentStatusSchemaSha256": "dd5b2a2ee8c57dc0f00cfb54b6a69204dda8a8681dd074cab1d5db0c47a47aa0",
+    "deploymentHarnessPath": "conformance/harness/deployment-preview-rollback/harness.json",
+    "deploymentPlatformEvidencePath": "conformance/evidence/deployment-preview-rollback-platforms-2026-09-05.json",
     "conformanceKitPath": "conformance/kit.json",
     "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
     "registryPath": "conformance/registry.json",
     "registrySchemaPath": "schemas/conformance-registry.schema.json",
     "registrySnapshotPath": "standards/edge-canon.conformance-registry.json",
-    "registrySha256": "2fd62b88684c6a02925d4202279e43938d4bf79ec32276b77745680b265f16b3"
+    "registrySha256": "172a12917926a1f74a8d582bfd6b1b5ff220c8001f0705b2f1cd5b33eab40622"
   },
   "standard": {
     "contractId": "edge-canon.next",
@@ -75,7 +82,7 @@
     "upstreamCommand": "python3 scripts/check-governance.py",
     "upstreamResult": "passed",
     "expectedCapabilityFamilies": 15,
-    "expectedDraftClauses": 180,
+    "expectedDraftClauses": 217,
     "expectedConformanceSuites": 15,
     "expectedBackends": 4
   }

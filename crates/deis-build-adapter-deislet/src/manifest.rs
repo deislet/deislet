@@ -436,7 +436,7 @@ mod tests {
         }));
         let declarations = deis_build_core::resolve_environment_declarations(
             &project,
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
         )
         .unwrap();
         let manifest =

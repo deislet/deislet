@@ -748,7 +748,7 @@ mod tests {
             asset("_headers", b"/*\n  X-Frame-Options: DENY\n"),
         ];
         let document = build(
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
             &config(Some("single-page-app")),
             &[("/api/:id".into(), "../src/api/[id].ts".into())],
             &assets,
@@ -775,7 +775,7 @@ mod tests {
             )],
         ] {
             let error = build(
-                "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+                "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
                 &config(None),
                 &[],
                 &controls,

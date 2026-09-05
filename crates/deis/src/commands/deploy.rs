@@ -387,7 +387,7 @@ mod tests {
         let config = deis_build::load_project_config(&project.path().to_string_lossy()).unwrap();
         let declarations = deis_build::resolve_environment_declarations(
             &config,
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
         )
         .unwrap();
         let manifest = deis_bundle::Manifest::parse(
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn no_build_resolves_the_verified_content_addressed_bundle() {
-        const STANDARD: &str = "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66";
+        const STANDARD: &str = "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13";
 
         let project = tempfile::tempdir().expect("project");
         std::fs::write(

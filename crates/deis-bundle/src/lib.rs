@@ -653,7 +653,7 @@ mod tests {
         assert!(error.contains("requires an Edge Canon environment declaration"));
 
         let declaration = serde_json::to_value(deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
             vec![deis_wire::EnvironmentDeclaration {
                 name: "TOKEN".into(),
                 kind: deis_wire::EnvironmentKind::Secret,

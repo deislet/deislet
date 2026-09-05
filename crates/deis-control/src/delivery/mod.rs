@@ -1685,7 +1685,7 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
             vec![
                 deis_wire::EnvironmentDeclaration {
                     name: "LABEL".to_string(),
@@ -1773,7 +1773,7 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
             vec![deis_wire::EnvironmentDeclaration {
                 name: "REQUIRED".to_string(),
                 kind: deis_wire::EnvironmentKind::Config,

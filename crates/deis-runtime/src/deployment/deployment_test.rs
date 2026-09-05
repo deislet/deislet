@@ -464,7 +464,7 @@ export default function handler(context) {
 }
 "#;
     let declarations = deis_wire::EnvironmentDeclarations::new(
-        "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+        "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
         vec![
             deis_wire::EnvironmentDeclaration {
                 name: "LABEL".to_string(),

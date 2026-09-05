@@ -3333,7 +3333,7 @@ mod tests {
         let env = app_with_env(&store, "demo", "production").await;
         let version = version(&store, "demo", "sha-1").await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
             Vec::new(),
         );
         let snapshot = snapshot(
@@ -3380,7 +3380,7 @@ mod tests {
         let env = app_with_env(&store, "demo", "production").await;
         let version = version(&store, "demo", "sha-1").await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
             vec![deis_wire::EnvironmentDeclaration {
                 name: "TOKEN".to_string(),
                 kind: deis_wire::EnvironmentKind::Secret,
@@ -3427,7 +3427,7 @@ mod tests {
         let env = app_with_env(&store, "demo", "production").await;
         let version = version(&store, "demo", "sha-1").await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
             vec![deis_wire::EnvironmentDeclaration {
                 name: "TOKEN".to_string(),
                 kind: deis_wire::EnvironmentKind::Secret,
@@ -3523,7 +3523,7 @@ mod tests {
         let v1 = version(&store, "demo", "sha-1").await;
         let v2 = version(&store, "demo", "sha-2").await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
-            "edge-canon.next@60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+            "edge-canon.next@c926687f7539453ab31776cd16f8341133d82a13",
             vec![deis_wire::EnvironmentDeclaration {
                 name: "TOKEN".to_string(),
                 kind: deis_wire::EnvironmentKind::Secret,

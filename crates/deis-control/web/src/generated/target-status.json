@@ -3,11 +3,11 @@
   "schemaVersion": 1,
   "generatedFrom": {
     "repository": "https://github.com/deislet/edge-canon",
-    "sourceCommit": "60eacb13cda28ecc2ecb5508a2eff95ef56dff66",
+    "sourceCommit": "c926687f7539453ab31776cd16f8341133d82a13",
     "registryPath": "conformance/registry.json",
     "registrySnapshotPath": "standards/edge-canon.conformance-registry.json",
-    "registrySha256": "2fd62b88684c6a02925d4202279e43938d4bf79ec32276b77745680b265f16b3",
-    "registryUpdatedAt": "2026-09-05T11:30:00+08:00"
+    "registrySha256": "172a12917926a1f74a8d582bfd6b1b5ff220c8001f0705b2f1cd5b33eab40622",
+    "registryUpdatedAt": "2026-09-05T15:05:00+08:00"
   },
   "standard": {
     "id": "edge-canon.next",
@@ -46,7 +46,7 @@
         "validUntil": null,
         "blockers": [
           "edge-canon.next is not a released standard",
-          "mandatory conformance kit is incomplete; EC-WEB has no complete provider adapter, EC-ARTIFACT/EC-ROUTING/EC-STREAM/EC-WEBAPI/EC-NODE/EC-ENV are local Draft harnesses awaiting real provider integration, and the other 8 suites are not executable",
+          "mandatory conformance kit is incomplete; EC-WEB has no complete provider adapter, EC-ARTIFACT/EC-ROUTING/EC-STREAM/EC-WEBAPI/EC-NODE/EC-ENV/EC-DEPLOY are local Draft harnesses awaiting real provider integration, and the other 7 suites are not executable",
           "no signed complete-version conformance record"
         ]
       }
@@ -80,7 +80,7 @@
         "blockers": [
           "edge-canon.next is not a released standard",
           "no recorded deployment identity for an exact canonical artifact",
-          "mandatory conformance kit is incomplete; EC-WEB has no complete provider adapter, EC-ARTIFACT/EC-ROUTING/EC-STREAM/EC-WEBAPI/EC-NODE/EC-ENV are local Draft harnesses awaiting real provider integration, and the other 8 suites are not executable"
+          "mandatory conformance kit is incomplete; EC-WEB has no complete provider adapter, EC-ARTIFACT/EC-ROUTING/EC-STREAM/EC-WEBAPI/EC-NODE/EC-ENV/EC-DEPLOY are local Draft harnesses awaiting real provider integration, and the other 7 suites are not executable"
         ]
       }
     },
@@ -113,7 +113,7 @@
         "blockers": [
           "edge-canon.next is not a released standard",
           "no official syntax-verification record for the exact artifact",
-          "mandatory conformance kit is incomplete; EC-WEB has no complete provider adapter, EC-ARTIFACT/EC-ROUTING/EC-STREAM/EC-WEBAPI/EC-NODE/EC-ENV are local Draft harnesses awaiting real provider integration, and the other 8 suites are not executable"
+          "mandatory conformance kit is incomplete; EC-WEB has no complete provider adapter, EC-ARTIFACT/EC-ROUTING/EC-STREAM/EC-WEBAPI/EC-NODE/EC-ENV/EC-DEPLOY are local Draft harnesses awaiting real provider integration, and the other 7 suites are not executable"
         ]
       }
     },
@@ -146,7 +146,7 @@
         "blockers": [
           "experimental implementation",
           "edge-canon.next is not a released standard",
-          "mandatory conformance kit is incomplete; EC-WEB has no complete provider adapter, EC-ARTIFACT/EC-ROUTING/EC-STREAM/EC-WEBAPI/EC-NODE/EC-ENV are local Draft harnesses awaiting real provider integration, and the other 8 suites are not executable"
+          "mandatory conformance kit is incomplete; EC-WEB has no complete provider adapter, EC-ARTIFACT/EC-ROUTING/EC-STREAM/EC-WEBAPI/EC-NODE/EC-ENV/EC-DEPLOY are local Draft harnesses awaiting real provider integration, and the other 7 suites are not executable"
         ]
       }
     }

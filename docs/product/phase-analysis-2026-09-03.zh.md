@@ -1703,3 +1703,35 @@ Application/framework source + versioned build plan
   强制加密的 node transport、可表达多行值的 `deis dev` secret document，以及 Cloudflare/EdgeOne 的真实
   account create/rotate/delete/rollback evidence。因此本实现关闭上一节点名的 Deislet EC-ENV 数据模型与
   materialization 缺陷，但不提升任何 provider 的 compliant/supported 状态，`P0-SPEC-002` 保持 active。
+
+## 58. 发布、预览与回滚进入统一标准
+
+- Edge Canon `4f926427f78bb22673ce8138b113af401089a5f6` 将 `deployment-preview-rollback` 从
+  pending 推进为 Draft，新增 immutable `DeploymentPlan`、observed `DeploymentStatus` 两份 schema、37 条
+  条款及 EC-DEPLOY T001–T012 reference harness。语义明确 version upload 不改变 production；默认 atomic
+  必须准备全部 configured serving targets；candidate 先按 routing generation 可寻址，production selector
+  后提交，proxy/target observation 未齐只能处于 `activating/degraded/reconciling`，不能把数据库 pointer 当成
+  `active`。渐进发布限制为 baseline/candidate 两版本与整数 basis points，并固定 rollout-scoped stable
+  affinity、签名短期 override、gate evidence、drain、CAS、未知 provider 结果 reconcile 和精确 snapshot
+  rollback；应用数据不随代码回滚。
+- 行业基线只使用官方资料：Cloudflare Workers 的 version/deployment 分离、两版本渐进流量、affinity、
+  current-deployment override 与新 revision rollback，以及 Tencent EdgeOne Makers 的 immutable preview 与
+  最近三个成功 artifact retention。EdgeOne 没有公开等价的渐进/affinity primitive，因此统一标准要求其
+  driver 通过可信 front routing layer 补齐，不能降低成 provider profile。`prepare -> verify -> activate ->
+  observed active` 是为跨 provider 传播与 Deislet 多节点增加的 provider-neutral 可观察生命周期，不声称
+  vendor 内部使用同名步骤。
+- 同一 `4f926427f78bb22673ce8138b113af401089a5f6` archive（SHA-256
+  `37e1f5898d2237f374a72f418ca2bb678a11bced1b6d3ac35aa0123f081ac2dc`）在 s17 Linux x86_64
+  Node 24.20.0、s67 macOS arm64 Node 26.0.0 与 s69 Windows AMD64 Node 24.16.0 均通过 12/12；三端
+  artifact identity 都是 `44c5a6c1e73b16adf5be539518e793fd8771d99d62b1a2de239a13c2dbec59cf`，去除
+  per-case 时间戳并按 key 排序后的 SHA-256 都是
+  `c015df30699bbd639667d093f142ef74044547da89d6212ec6f25a3e5e4b90a9`。该证据仅证明 reference
+  portability，不是任一 provider 的认证证据。
+- Edge Canon 最终登记提交 `c926687f7539453ab31776cd16f8341133d82a13` 同步修正 registry：EC-DEPLOY
+  已是等待真实 provider integration 的本地 Draft，未执行能力族由 8 个减为 7 个。Node 24.20.0 下全仓
+  120/120 与 217 条 Draft clause 治理通过。Deislet 标准锁固定该提交、两份 schema SHA-256、requirements、
+  harness、三平台 evidence 与新 registry 摘要；这不表示 ADR-009 已实现。当前 Control 仍先写 desired
+  deployment pointer 再逐节点 push，Runtime 仍在一次 ApplyDeployment 内立即 stage+activate，Proxy 不携带
+  routing generation，也没有 target/proxy observed ack。下一实现必须同时增加 durable plan/status journal、
+  prepare-only staged pool、generation-addressed trusted routing、proxy/target observation 与 drain；只把同一
+  RPC 拆成两次调用无法消除 activate 途中断连造成的新旧随机混合。

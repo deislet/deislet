@@ -179,6 +179,11 @@ def validate_standard_lock() -> str:
         "environmentBindingSnapshotSchemaPath": "schemas/environment-binding-snapshot.schema.json",
         "environmentHarnessPath": "conformance/harness/environment-secrets/harness.json",
         "environmentPlatformEvidencePath": "conformance/evidence/environment-secrets-platforms-2026-09-05.json",
+        "deploymentRequirementsPath": "standard/requirements/deployment-preview-rollback.zh.md",
+        "deploymentPlanSchemaPath": "schemas/deployment-plan.schema.json",
+        "deploymentStatusSchemaPath": "schemas/deployment-status.schema.json",
+        "deploymentHarnessPath": "conformance/harness/deployment-preview-rollback/harness.json",
+        "deploymentPlatformEvidencePath": "conformance/evidence/deployment-preview-rollback-platforms-2026-09-05.json",
         "conformanceKitPath": "conformance/kit.json",
         "conformanceKitSchemaPath": "schemas/conformance-kit.schema.json",
         "registryPath": "conformance/registry.json",
@@ -238,10 +243,18 @@ def validate_standard_lock() -> str:
         bool(SHA256.fullmatch(source.get("environmentBindingSnapshotSchemaSha256", ""))),
         "standard lock environment snapshot schema digest is not SHA-256",
     )
+    require(
+        bool(SHA256.fullmatch(source.get("deploymentPlanSchemaSha256", ""))),
+        "standard lock deployment plan schema digest is not SHA-256",
+    )
+    require(
+        bool(SHA256.fullmatch(source.get("deploymentStatusSchemaSha256", ""))),
+        "standard lock deployment status schema digest is not SHA-256",
+    )
     verification = lock.get("verification", {})
     require(verification.get("upstreamResult") == "passed", "locked upstream governance check did not pass")
     require(verification.get("expectedCapabilityFamilies") == 15, "unexpected capability family count")
-    require(verification.get("expectedDraftClauses") == 180, "unexpected draft clause count")
+    require(verification.get("expectedDraftClauses") == 217, "unexpected draft clause count")
     require(verification.get("expectedConformanceSuites") == 15, "unexpected conformance suite count")
     require(verification.get("expectedBackends") == 4, "unexpected backend record count")
 
