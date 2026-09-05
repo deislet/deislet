@@ -3149,7 +3149,13 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn make_install_root_private(path: &Path) {
+        deis_provider_driver::test_support::set_windows_private_acl(path, true, false, true)
+            .unwrap();
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn make_install_root_private(_path: &Path) {}
 
     #[cfg(unix)]

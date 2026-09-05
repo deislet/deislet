@@ -18,6 +18,39 @@ mod process;
 mod release;
 mod release_authorization;
 mod release_transparency;
+#[cfg(windows)]
+mod windows_security;
+
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
+    use std::{io, path::Path};
+
+    /// Builds explicit Windows ACL fixtures for cross-crate security tests.
+    ///
+    /// This API exists only behind the `test-support` feature. Production code
+    /// must provision the service-owned directory and trust files outside the
+    /// running Control process, then let the normal constructors validate them.
+    pub fn set_windows_private_acl(
+        path: &Path,
+        directory: bool,
+        add_untrusted_writer: bool,
+        protected: bool,
+    ) -> io::Result<()> {
+        crate::windows_security::set_private_acl_for_test(
+            path,
+            directory,
+            add_untrusted_writer,
+            protected,
+        )
+        .map_err(|error| match error {
+            crate::windows_security::WindowsSecurityError::Io(error) => error,
+            crate::windows_security::WindowsSecurityError::Insecure(message) => {
+                io::Error::other(message)
+            }
+        })
+    }
+}
 
 pub use credential::{
     CredentialBrokerError, CredentialBrokerErrorKind, CredentialLeaseDisposition,

@@ -9,6 +9,9 @@ use std::{
 use sha2::{Digest as _, Sha256};
 use tempfile::Builder as TempDirBuilder;
 
+#[cfg(windows)]
+use std::sync::Arc;
+
 use crate::{
     DriverHostDistribution, DriverReleaseComponentRole, DriverReleaseError, HostOperatingSystem,
     PinnedExecutable, Sha256Digest, ValidatedProviderDriverManifest,
@@ -21,6 +24,8 @@ const STAGING_PREFIX: &str = ".driver-staging.";
 #[derive(Clone, Debug)]
 pub struct DriverReleaseInstaller {
     root: PathBuf,
+    #[cfg(windows)]
+    _root_guard: Arc<File>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,7 +56,16 @@ impl DriverReleaseInstaller {
         let root = fs::canonicalize(root).map_err(|error| {
             DriverInstallationError::io("canonicalize installation root", error)
         })?;
-        Ok(Self { root })
+        #[cfg(windows)]
+        let root_guard = Arc::new(
+            crate::windows_security::open_private_directory(&root)
+                .map_err(installation_security_error)?,
+        );
+        Ok(Self {
+            root,
+            #[cfg(windows)]
+            _root_guard: root_guard,
+        })
     }
 
     pub fn install(
@@ -425,12 +439,36 @@ fn validate_installation_root_permissions(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn validate_installation_root_permissions(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), DriverInstallationError> {
+    crate::windows_security::open_private_directory(path)
+        .map(drop)
+        .map_err(installation_security_error)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn validate_installation_root_permissions(
     _path: &Path,
     _metadata: &fs::Metadata,
 ) -> Result<(), DriverInstallationError> {
     Ok(())
+}
+
+#[cfg(windows)]
+fn installation_security_error(
+    error: crate::windows_security::WindowsSecurityError,
+) -> DriverInstallationError {
+    match error {
+        crate::windows_security::WindowsSecurityError::Io(error) => {
+            DriverInstallationError::io("validate Windows installation-root security", error)
+        }
+        crate::windows_security::WindowsSecurityError::Insecure(message) => {
+            DriverInstallationError::Invalid(message)
+        }
+    }
 }
 
 fn open_and_verify_archive(
@@ -1057,7 +1095,12 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn make_test_install_root_private(path: &Path) {
+        crate::windows_security::set_private_acl_for_test(path, true, false, true).unwrap();
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn make_test_install_root_private(_path: &Path) {}
 
     #[cfg(unix)]
@@ -1225,6 +1268,33 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refuses_unprotected_or_untrusted_windows_installation_roots_and_pins_the_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("windows-private-root");
+        fs::create_dir(&root).unwrap();
+
+        crate::windows_security::set_private_acl_for_test(&root, true, false, false).unwrap();
+        assert!(matches!(
+            DriverReleaseInstaller::new(&root),
+            Err(DriverInstallationError::Invalid(message)) if message.contains("protected")
+        ));
+
+        crate::windows_security::set_private_acl_for_test(&root, true, true, true).unwrap();
+        assert!(matches!(
+            DriverReleaseInstaller::new(&root),
+            Err(DriverInstallationError::Invalid(message)) if message.contains("untrusted")
+        ));
+
+        crate::windows_security::set_private_acl_for_test(&root, true, false, true).unwrap();
+        let installer = DriverReleaseInstaller::new(&root).unwrap();
+        let moved = temporary.path().join("moved-root");
+        assert!(fs::rename(&root, &moved).is_err());
+        drop(installer);
+        fs::rename(&root, &moved).unwrap();
     }
 
     #[test]

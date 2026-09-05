@@ -202,19 +202,23 @@ pub struct ControlConfig {
     /// releases. When unset or invalid, external provider execution is
     /// disabled; Control never falls back to PATH or an unregistered binary.
     /// On Unix it must be owned by the Control service identity and not be
-    /// writable by group or others.
+    /// writable by group or others. On Windows its DACL must be protected,
+    /// owned by the current service SID, and grant mutation rights only to
+    /// that SID, LocalSystem, or built-in Administrators.
     #[serde(default)]
     pub provider_driver_installation_root: Option<PathBuf>,
     /// Absolute path to the out-of-band provider release trust root, including
     /// release, transparency-log and witness policy. External provider
     /// execution is enabled only when this and the installation root are both
-    /// configured and valid. The file carries no private key.
+    /// configured and valid. The file carries no private key and is subject
+    /// to the same Unix ownership/mode or Windows service-DACL policy.
     #[serde(default)]
     pub provider_driver_trust_root: Option<PathBuf>,
     /// Optional absolute path to a DSSE envelope that authorizes the configured
     /// trust root as the exact successor of Control's durable current root.
     /// Required only while advancing the root; both the old and new root-role
-    /// thresholds must sign it. The file carries no private key.
+    /// thresholds must sign it. The file carries no private key and is subject
+    /// to the same Unix ownership/mode or Windows service-DACL policy.
     #[serde(default)]
     pub provider_driver_trust_root_rotation: Option<PathBuf>,
     /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).

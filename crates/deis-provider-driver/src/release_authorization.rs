@@ -907,6 +907,15 @@ fn read_secure_trust_metadata_file(
             "provider driver release trust metadata must be owned by the service identity and not group/other writable",
         ));
     }
+    #[cfg(windows)]
+    crate::windows_security::validate_private_file(&file).map_err(|error| match error {
+        crate::windows_security::WindowsSecurityError::Io(error) => {
+            DriverReleaseAuthorizationError::Io(error)
+        }
+        crate::windows_security::WindowsSecurityError::Insecure(message) => {
+            DriverReleaseAuthorizationError::Invalid(message)
+        }
+    })?;
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.read_to_end(&mut bytes)
         .map_err(DriverReleaseAuthorizationError::Io)?;
@@ -1475,6 +1484,8 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("trust-root.json");
         std::fs::write(&path, serde_jcs::to_vec(root.get()).unwrap()).unwrap();
+        #[cfg(windows)]
+        crate::windows_security::set_private_acl_for_test(&path, false, false, true).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1485,6 +1496,25 @@ mod tests {
         }
         let loaded = ValidatedDriverReleaseTrustRoot::load_file(&path).unwrap();
         assert_eq!(loaded.canonical_sha256(), root.canonical_sha256());
+
+        #[cfg(windows)]
+        {
+            crate::windows_security::set_private_acl_for_test(&path, false, false, false).unwrap();
+            assert!(
+                ValidatedDriverReleaseTrustRoot::load_file(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("protected")
+            );
+            crate::windows_security::set_private_acl_for_test(&path, false, true, true).unwrap();
+            assert!(
+                ValidatedDriverReleaseTrustRoot::load_file(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("untrusted")
+            );
+            crate::windows_security::set_private_acl_for_test(&path, false, false, true).unwrap();
+        }
 
         #[cfg(unix)]
         {
