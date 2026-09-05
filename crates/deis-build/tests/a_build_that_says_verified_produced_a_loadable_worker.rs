@@ -89,7 +89,7 @@ async fn a_handler_with_named_exports_and_no_default_stops_the_build_by_name() {
     // Nothing was packed. A bundle on disk beside a failed build is a bundle
     // somebody uploads.
     assert!(
-        !project.path().join("dist/deislet/bundle.zip").exists(),
+        !project.path().join("dist/providers/deislet").exists(),
         "a build that could not produce a loadable worker must not leave one behind"
     );
 }
@@ -148,8 +148,10 @@ async fn a_handler_with_a_default_export_still_builds_and_packs() {
            return new Response(\"r\");\n}\n",
     );
 
-    build(project.path())
+    let result = build(project.path())
         .await
         .expect("this project is correct");
-    assert!(project.path().join("dist/deislet/bundle.zip").exists());
+    assert!(Path::new(&result.builds["deislet"].output_path)
+        .join("bundle.zip")
+        .exists());
 }

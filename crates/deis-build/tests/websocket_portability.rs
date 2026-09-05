@@ -41,7 +41,7 @@ async fn build(project: &Path, vendor: &str) -> anyhow::Result<deis_build::Compi
 }
 
 fn deployable_entries(project: &Path, vendor: &str) -> Vec<std::path::PathBuf> {
-    let root = project.join("dist").join(vendor);
+    let root = project.join("dist/providers").join(vendor);
     match vendor {
         "cloudflare" => vec![root.join("index.js")],
         "tencent" => vec![
@@ -135,11 +135,11 @@ async fn every_generated_target_seals_reflective_provider_global_access() {
             vendor,
             "const names = ['Web' + 'Socket', ['WebSocket', 'Pair'].join(''), ['WebSocket', 'Server'].join('')];\nexport default function handler() { return Response.json(names.map(name => typeof globalThis[name])); }\n",
         );
-        build(project.path(), vendor)
+        let result = build(project.path(), vendor)
             .await
             .unwrap_or_else(|error| panic!("{vendor} reflective-isolation build: {error}"));
 
-        let root = project.path().join("dist").join(vendor);
+        let root = Path::new(&result.builds[vendor].output_path);
         let entry = match vendor {
             "cloudflare" => fs::read_to_string(root.join("index.js")).expect("Cloudflare entry"),
             "tencent" => {

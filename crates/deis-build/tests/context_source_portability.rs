@@ -59,7 +59,7 @@ async fn every_target_rejects_non_standard_context_fields_before_packaging() {
         assert!(error.contains("context.services"), "{vendor}: {error}");
         assert!(error.contains("context.bindings"), "{vendor}: {error}");
 
-        let target = project.path().join("dist").join(vendor);
+        let target = project.path().join("dist/providers").join(vendor);
         let deployable = match vendor {
             "cloudflare" => target.join("index.js"),
             "tencent" => target.join("edge-functions/index.js"),

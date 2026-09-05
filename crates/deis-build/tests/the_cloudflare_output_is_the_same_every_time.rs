@@ -121,6 +121,23 @@ fn build(project: &Path, bin: &Path) {
     assert!(status.success(), "the build has to succeed: {status}");
 }
 
+fn provider_payload_root(project: &Path) -> PathBuf {
+    let store = project.join("dist/providers/cloudflare");
+    let mut payloads = std::fs::read_dir(&store)
+        .expect("read the provider payload store")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir());
+    let root = payloads
+        .next()
+        .expect("one content-addressed payload")
+        .path();
+    assert!(
+        payloads.next().is_none(),
+        "unchanged source has one payload"
+    );
+    root
+}
+
 #[test]
 fn two_builds_of_one_source_produce_one_tree() {
     let project = tempfile::tempdir().expect("a temporary project");
@@ -130,9 +147,15 @@ fn two_builds_of_one_source_produce_one_tree() {
     stage(project.path());
 
     build(project.path(), &bin);
-    let first = tree(&project.path().join("dist/cloudflare"));
+    let first_root = provider_payload_root(project.path());
+    let first = tree(&first_root);
     build(project.path(), &bin);
-    let second = tree(&project.path().join("dist/cloudflare"));
+    let second_root = provider_payload_root(project.path());
+    let second = tree(&second_root);
+    assert_eq!(
+        first_root, second_root,
+        "the payload identity must be reused"
+    );
 
     // The stub really ran, twice. Without this the test would pass just as
     // happily on a build that had stopped verifying anything at all.

@@ -181,9 +181,10 @@ async fn every_target_builds_the_exact_context_and_deislet_enforces_its_lifecycl
 
     let mut env = HashMap::new();
     env.insert("TEST_VALUE".to_string(), "edge-canon-env".to_string());
+    let deislet_root = Path::new(&result.builds["deislet"].output_path);
     let mut runtime = AppRuntime::new(
         "edge-canon-context-lifecycle.production".to_string(),
-        worker_from_bundle(&project.path().join("dist/deislet/bundle.zip")),
+        worker_from_bundle(&deislet_root.join("bundle.zip")),
         None,
         IsolateSpec {
             env,

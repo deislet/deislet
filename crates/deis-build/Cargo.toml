@@ -54,6 +54,9 @@ swc_ecma_parser = "34.0"
 swc_ecma_transforms_base = "37.0"
 swc_ecma_visit = "20.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 deis-runtime = { path = "../deis-runtime" }
 tempfile = "3"

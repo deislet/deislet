@@ -60,7 +60,7 @@ export async function lazy() {
     .expect("config");
 }
 
-async fn build(project: &Path, vendor: &str) -> anyhow::Result<()> {
+async fn build(project: &Path, vendor: &str) -> anyhow::Result<deis_build::VendorBuild> {
     let compiler = Compiler::with_options(CompilerOptions {
         project_dir: project.to_string_lossy().to_string(),
         minify: false,
@@ -70,7 +70,7 @@ async fn build(project: &Path, vendor: &str) -> anyhow::Result<()> {
         .compile(project, vec![vendor.to_string()], false)
         .await?;
     assert!(result.success);
-    Ok(())
+    Ok(result.builds[vendor].clone())
 }
 
 fn assert_markers(code: &str, vendor: &str) {
@@ -89,29 +89,27 @@ async fn every_bundled_target_carries_helpers_outside_a_nested_function_root() {
     for vendor in ["cloudflare", "tencent"] {
         let project = tempfile::tempdir().expect("temporary project");
         stage(project.path(), vendor);
-        build(project.path(), vendor)
+        let build = build(project.path(), vendor)
             .await
             .unwrap_or_else(|error| panic!("{vendor} builds the local graph: {error}"));
+        let root = Path::new(&build.output_path);
         let entry = match vendor {
-            "cloudflare" => project.path().join("dist/cloudflare/index.js"),
-            "tencent" => project.path().join("dist/tencent/edge-functions/index.js"),
+            "cloudflare" => root.join("index.js"),
+            "tencent" => root.join("edge-functions/index.js"),
             _ => unreachable!(),
         };
         assert_markers(&fs::read_to_string(entry).expect("bundled entry"), vendor);
-        assert!(!project.path().join(format!("dist/{vendor}/src")).exists());
-        assert!(!project
-            .path()
-            .join(format!("dist/{vendor}/project"))
-            .exists());
+        assert!(!root.join("src").exists());
+        assert!(!root.join("project").exists());
     }
 
     let project = tempfile::tempdir().expect("temporary project");
     stage(project.path(), "deislet");
-    build(project.path(), "deislet")
+    let build = build(project.path(), "deislet")
         .await
         .expect("deislet builds the local graph");
-    let bundle =
-        fs::File::open(project.path().join("dist/deislet/bundle.zip")).expect("deislet bundle");
+    let root = Path::new(&build.output_path);
+    let bundle = fs::File::open(root.join("bundle.zip")).expect("deislet bundle");
     let mut archive = zip::ZipArchive::new(bundle).expect("bundle is zip");
     let mut worker = String::new();
     archive
@@ -120,18 +118,18 @@ async fn every_bundled_target_carries_helpers_outside_a_nested_function_root() {
         .read_to_string(&mut worker)
         .expect("worker source");
     assert_markers(&worker, "deislet");
-    assert!(!project.path().join("dist/deislet/src").exists());
-    assert!(!project.path().join("dist/deislet/project").exists());
+    assert!(!root.join("src").exists());
+    assert!(!root.join("project").exists());
 }
 
 #[tokio::test]
 async fn deno_ships_only_the_canonical_parent_graph() {
     let project = tempfile::tempdir().expect("temporary project");
     stage(project.path(), "deno");
-    build(project.path(), "deno")
+    let build = build(project.path(), "deno")
         .await
         .expect("deno builds the local graph");
-    let output = project.path().join("dist/deno");
+    let output = Path::new(&build.output_path);
     let proxy = fs::read_to_string(output.join("src/[[all]].js")).expect("route proxy");
     assert!(proxy.contains("../project/functions/[[all]].js"), "{proxy}");
     let canonical_module =

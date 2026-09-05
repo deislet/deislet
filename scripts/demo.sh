@@ -807,7 +807,7 @@ acme_ca_stats() {
 #
 # Nothing here is a shortcut. The same five steps a person takes:
 #
-#   1. `deis build --vendor deislet`  -> dist/deislet/bundle.zip
+#   1. `deis build --vendor deislet`  -> dist/providers/deislet/<digest>/bundle.zip
 #   2. POST /api/apps                 -> the application exists
 #   3. POST .../versions              -> the bundle becomes an immutable version
 #   4. POST .../environments          -> production exists
@@ -2261,7 +2261,7 @@ header_value() {
   local file=$1
   local name=$2
   [ -s "$file" ] || return 0
-  tr -d '\r' < "$file" | awk -v want="$(echo "$name" | tr 'A-Z' 'a-z')" '
+  tr -d '\r' < "$file" | awk -v want="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" '
     { split($0, kv, ":"); k = tolower(kv[1]);
       if (k == want) { sub(/^[^:]*:[ ]*/, ""); print; exit } }'
 }
@@ -2729,7 +2729,7 @@ check_assets_binding_is_not_shadowable() {
   if [ "$kind" = "object" ] && [ "$callable" = "true" ] && [ -z "$leaked" ] \
     && [ -n "$dropped" ]; then
     pass_check "$title" \
-      "the bundle's manifest declares an ordinary variable called ASSETS; the node dropped it before the map became context.env ($(echo "$dropped" | sed 's/.*keys=/keys=/')), and inside the isolate env.ASSETS is an ${kind} whose fetch() is a function, not the string the application shipped"
+      "the bundle's manifest declares an ordinary variable called ASSETS; the node dropped it before the map became context.env (keys=${dropped##*keys=}), and inside the isolate env.ASSETS is an ${kind} whose fetch() is a function, not the string the application shipped"
   else
     fail_check "$title" \
       "env.ASSETS is a ${kind:-<none>} (callable: ${callable}), the application's own value is $(if [ -n "$leaked" ]; then echo "visible as '${leaked}'"; else echo "not visible"; fi), and the node's log $(if [ -n "$dropped" ]; then echo "reports the key dropped"; else echo "never reports dropping a reserved key"; fi)"
@@ -5965,9 +5965,15 @@ check_an_undated_application_keeps_the_old_answer() {
 upload_altered_bundle() {
   local label=$1
   local mutation=$2
-  local source="${DEMO_DIR}/app-v1/dist/deislet/bundle.zip"
+  local source
+  source=$(jq -r '.bundle.path // empty' < "${LOG_DIR}/cli-deploy-v1.json" 2>/dev/null || true)
   local patched="${DEMO_DIR}/${label}.zip"
   local body="${LOG_DIR}/${label}-upload.json"
+
+  if [ ! -f "$source" ]; then
+    echo "the deployed bundle path is absent or no longer exists" >&2
+    return 1
+  fi
 
   python3 - "$source" "$patched" "$mutation" <<'ALTER' || return 1
 import json, sys, zipfile
@@ -7211,6 +7217,24 @@ portable_artifact_fault() {
   fi
 }
 
+# A provider payload is immutable and named by its complete file-set digest.
+# This demo builds each fresh fixture once, so exactly one child is expected.
+provider_payload_dir() {
+  local project=$1
+  local vendor=$2
+  local found=""
+  local candidate
+  for candidate in "${project}/dist/providers/${vendor}/"*; do
+    [ -d "$candidate" ] || continue
+    if [ -n "$found" ]; then
+      return 1
+    fi
+    found=$candidate
+  done
+  [ -n "$found" ] || return 1
+  echo "$found"
+}
+
 # What the build's own log says was verified against a vendor's tool and what
 # was not, one clause per vendor target, for the evidence line below.
 #
@@ -7280,23 +7304,32 @@ check_every_compiler_target_is_built() {
   # What each vendor has to have produced. The entry file is the application;
   # the second file is what makes the directory deployable to that host and to
   # no other.
+  local cloudflare deno tencent deislet
+  cloudflare=$(provider_payload_dir "$dir" cloudflare || true)
+  deno=$(provider_payload_dir "$dir" deno || true)
+  tencent=$(provider_payload_dir "$dir" tencent || true)
+  deislet=$(provider_payload_dir "$dir" deislet || true)
   local faults=""
-  faults="${faults}$(portable_artifact_fault "${dir}/dist/cloudflare/index.js" "Cloudflare's index.js") "
-  faults="${faults}$(portable_artifact_fault "${dir}/dist/deno/src/api/where.ts" "Deno's copy of the handler") "
-  faults="${faults}$(portable_artifact_fault "${dir}/dist/tencent/edge-functions/index.js" "EdgeOne's index.js") "
+  [ -n "$cloudflare" ] || faults="${faults}Cloudflare payload identity was not published "
+  [ -n "$deno" ] || faults="${faults}Deno payload identity was not published "
+  [ -n "$tencent" ] || faults="${faults}EdgeOne payload identity was not published "
+  [ -n "$deislet" ] || faults="${faults}Deislet payload identity was not published "
+  faults="${faults}$(portable_artifact_fault "${cloudflare}/index.js" "Cloudflare's index.js") "
+  faults="${faults}$(portable_artifact_fault "${deno}/project/functions/[[all]].js" "Deno's canonical module") "
+  faults="${faults}$(portable_artifact_fault "${tencent}/edge-functions/index.js" "EdgeOne's index.js") "
 
   local file
-  for file in "dist/cloudflare/wrangler.toml" "dist/cloudflare/package.json" \
-    "dist/deno/deno.json" "dist/deno/_deis_internal/router.ts" \
-    "dist/tencent/edgeone.json" "dist/deislet/bundle.zip"; do
-    [ -f "${dir}/${file}" ] || faults="${faults}${file} was not written "
+  for file in "${cloudflare}/wrangler.toml" "${cloudflare}/package.json" \
+    "${deno}/deno.json" "${deno}/_deis_internal/router.ts" \
+    "${tencent}/edgeone.json" "${deislet}/bundle.zip"; do
+    [ -f "$file" ] || faults="${faults}${file} was not written "
   done
 
   # The deislet bundle is a zip, so its entry is read out of the archive
   # rather than grepped through the compression.
   local bundled=""
-  if [ -f "${dir}/dist/deislet/bundle.zip" ]; then
-    bundled=$(python3 - "${dir}/dist/deislet/bundle.zip" "$PORTABLE_MARKER" <<'BUNDLE'
+  if [ -f "${deislet}/bundle.zip" ]; then
+    bundled=$(python3 - "${deislet}/bundle.zip" "$PORTABLE_MARKER" <<'BUNDLE'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as archive:
     names = archive.namelist()
@@ -7312,19 +7345,19 @@ BUNDLE
   # handler, so two vendors producing byte-identical output would mean one of
   # them was never really targeted.
   local cf_sum eo_sum
-  cf_sum=$(openssl dgst -sha256 "${dir}/dist/cloudflare/index.js" 2>/dev/null | awk '{print $NF}')
-  eo_sum=$(openssl dgst -sha256 "${dir}/dist/tencent/edge-functions/index.js" 2>/dev/null | awk '{print $NF}')
+  cf_sum=$(openssl dgst -sha256 "${cloudflare}/index.js" 2>/dev/null | awk '{print $NF}')
+  eo_sum=$(openssl dgst -sha256 "${tencent}/edge-functions/index.js" 2>/dev/null | awk '{print $NF}')
   if [ -n "$cf_sum" ] && [ "$cf_sum" = "$eo_sum" ]; then
     faults="${faults}Cloudflare's and EdgeOne's entry files are byte-identical, so one adapter emitted the other's output "
   fi
 
   # The vendor's own configuration has to be about this project.
-  grep -q '^name = "portable"' "${dir}/dist/cloudflare/wrangler.toml" 2>/dev/null \
+  grep -q '^name = "portable"' "${cloudflare}/wrangler.toml" 2>/dev/null \
     || faults="${faults}wrangler.toml does not name the project "
-  grep -q '"portable"' "${dir}/dist/tencent/edgeone.json" 2>/dev/null \
+  grep -q '"portable"' "${tencent}/edgeone.json" 2>/dev/null \
     || faults="${faults}edgeone.json does not name the project "
-  grep -q "/api/where" "${dir}/dist/deno/_deis_internal/router.ts" 2>/dev/null \
-    || faults="${faults}Deno's router does not carry the route the function tree defines "
+  grep -q '"/\*"' "${deno}/_deis_internal/router.ts" 2>/dev/null \
+    || faults="${faults}Deno's provider router does not invoke the canonical module through its catch-all "
 
   # Which vendor tools stood behind this run, from the build's own log.
   local verified
@@ -7342,7 +7375,7 @@ BUNDLE
   fi
 
   pass_check "$title" \
-    "one \`deis build -v all\` over ${PORTABLE_SRC_DIR} wrote four directories: dist/deislet/bundle.zip (a manifest and a worker carrying this handler), dist/cloudflare (index.js plus the wrangler.toml naming \"portable\" and a package.json), dist/deno (the handler, a generated router that knows /api/where, and deno.json) and dist/tencent (edge-functions/index.js and edgeone.json). Every entry carries the handler's own marker, and Cloudflare's and EdgeOne's differ from one another, so each adapter built the shape its host expects rather than copying one output four times. The files are this compiler's own work; what a vendor's tool said about them on this machine, from the build log: ${verified}. A target marked NOT verified was verified nowhere in this run"
+    "one \`deis build -v all\` over ${PORTABLE_SRC_DIR} published one canonical parent and four immutable payload directories under dist/providers/<vendor>/<digest>. Deislet carries bundle.zip, Cloudflare carries index.js plus the wrangler.toml naming \"portable\", Deno carries the reconstructed canonical module and its generated catch-all router, and EdgeOne carries edge-functions/index.js plus edgeone.json. Every entry carries the handler's own marker, and Cloudflare's and EdgeOne's differ from one another, so each packager built the shape its host expects from the same parent rather than copying one output four times. The files are this compiler's own work; what a vendor's tool said about them on this machine, from the build log: ${verified}. A target marked NOT verified was verified nowhere in this run"
 }
 
 check_cli_deploy() {
@@ -7700,7 +7733,8 @@ check_a_credential_cannot_wire_an_app_to_one_it_cannot_see() {
     return
   fi
 
-  local bundle="${DEMO_DIR}/app-v1/dist/deislet/bundle.zip"
+  local bundle
+  bundle=$(jq -r '.bundle.path // empty' < "${LOG_DIR}/cli-deploy-v1.json" 2>/dev/null || true)
   if [ ! -f "$bundle" ]; then
     fail_check "$title" "the example app's bundle is not at ${bundle}, so nothing could be uploaded"
     return
@@ -8342,7 +8376,7 @@ check_cli_trace() {
   if await_trace_row "$probe" "$out"; then
     close_trace_stream
     pass_check "$title" \
-      "GET /hello/${probe} was made after the stream opened, and deis trace printed: $(echo "$TRACE_ROW" | sed 's/[[:space:]][[:space:]]*/ /g')"
+      "GET /hello/${probe} was made after the stream opened, and deis trace printed: $(printf '%s' "$TRACE_ROW" | tr -s '[:space:]' ' ')"
   else
     close_trace_stream
     fail_check "$title" \
@@ -8489,7 +8523,7 @@ check_memory_cutoff() {
   fi
 
   pass_check "$title" \
-    "GET /api/heap allocated past the ${ceiling:-?}MB heap this version's manifest asks for and answered HTTP ${status} after ${seconds}s. deis trace calls invocation ${trace} - this request's own, and no other - memory-limit, which nothing but the near-heap-limit callback can produce - from the request path an out-of-heap kill and a handler that threw are the same terminated execution: $(echo "$TRACE_ROW" | sed 's/[[:space:]][[:space:]]*/ /g'). The same callback increments deis_runtime_memory_cutoffs_total, and deis-telemetry's scrape for this tenant went from ${before:-nothing} to ${after} while this check waited for it - that series carries no invocation dimension, so its rise says the counter is written at all, and the row above is what says this request is the one that was cut off"
+    "GET /api/heap allocated past the ${ceiling:-?}MB heap this version's manifest asks for and answered HTTP ${status} after ${seconds}s. deis trace calls invocation ${trace} - this request's own, and no other - memory-limit, which nothing but the near-heap-limit callback can produce - from the request path an out-of-heap kill and a handler that threw are the same terminated execution: $(printf '%s' "$TRACE_ROW" | tr -s '[:space:]' ' '). The same callback increments deis_runtime_memory_cutoffs_total, and deis-telemetry's scrape for this tenant went from ${before:-nothing} to ${after} while this check waited for it - that series carries no invocation dimension, so its rise says the counter is written at all, and the row above is what says this request is the one that was cut off"
 }
 
 check_cli_tail() {

@@ -149,7 +149,11 @@ async fn an_unimplemented_standard_rule_mapping_fails_instead_of_being_dropped()
         );
         assert!(error.contains("redirects"), "{vendor}: {error}");
         assert!(
-            !project.path().join("dist").join(vendor).exists(),
+            !project
+                .path()
+                .join("dist/providers")
+                .join(vendor)
+                .exists(),
             "{vendor} must not leave a partial provider artifact"
         );
     }

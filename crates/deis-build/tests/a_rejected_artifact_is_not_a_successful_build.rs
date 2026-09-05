@@ -108,6 +108,17 @@ async fn a_vendor_that_refuses_the_artifact_fails_the_build() {
         error.contains("must not be uploaded"),
         "and what not to do with what is on disk: {error}"
     );
+    assert!(
+        project.path().join("dist/providers/cloudflare").is_dir(),
+        "the immutable rejected payload remains available for inspection"
+    );
+    assert!(
+        !project
+            .path()
+            .join("dist/.deislet/current/cloudflare.json")
+            .exists(),
+        "a rejected provider payload must never become the current successful build"
+    );
 
     // Accepting. The same project, the same stub, one file removed - so a
     // failure here is the new refusal firing on a build that was always fine.
@@ -127,5 +138,13 @@ async fn a_vendor_that_refuses_the_artifact_fails_the_build() {
         build.warnings.is_empty(),
         "a verification that ran leaves no 'not verified' warning behind: {:?}",
         build.warnings
+    );
+    assert_eq!(
+        deis_build::provider_derivation::resolve_current(
+            &project.path().join("dist"),
+            "cloudflare"
+        )
+        .expect("the accepted payload becomes current"),
+        Path::new(&build.output_path)
     );
 }

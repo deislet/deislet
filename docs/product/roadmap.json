@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-05T08:51:45+08:00",
+  "updatedAt": "2026-09-05T09:24:00+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -217,7 +217,7 @@
             {"type": "local-path", "value": "crates/deis-build/tests/canonical_build_output.rs"},
             {"type": "local-path", "value": "crates/deis-build/tests/provider_resource_bindings.rs"}
           ],
-          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；仍需 Linux/macOS/Windows 的真实 compiler identity、全部 semantic document schema、不可变 provider payload、签名和 framework/provider 集成，故保持 active"
+          "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload 按文件集摘要原子发布和复用、current selector 只在全构建成功后切换、payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；仍需 Linux/macOS/Windows 的真实 compiler identity、全部 semantic document schema、签名、受信 build/control-plane record 和 framework/provider 集成，故保持 active"
         },
         {
           "id": "P1-DEPLOY-001",

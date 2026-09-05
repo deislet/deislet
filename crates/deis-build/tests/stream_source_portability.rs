@@ -40,7 +40,7 @@ async fn build(project: &Path, vendor: &str) -> anyhow::Result<deis_build::Compi
 }
 
 fn deployable_entries(project: &Path, vendor: &str) -> Vec<std::path::PathBuf> {
-    let root = project.join("dist").join(vendor);
+    let root = project.join("dist/providers").join(vendor);
     match vendor {
         "cloudflare" => vec![root.join("index.js")],
         "tencent" => vec![
@@ -165,11 +165,11 @@ async fn every_generated_target_installs_the_identity_byte_runtime_boundary() {
             vendor,
             "export default function handler() { const value = new TransformStream(); return new Response(String(value.readable.locked)); }\n",
         );
-        build(project.path(), vendor)
+        let result = build(project.path(), vendor)
             .await
             .unwrap_or_else(|error| panic!("{vendor} identity runtime build: {error}"));
 
-        let root = project.path().join("dist").join(vendor);
+        let root = Path::new(&result.builds[vendor].output_path);
         let entry = match vendor {
             "cloudflare" => fs::read_to_string(root.join("index.js")).expect("Cloudflare entry"),
             "tencent" => {

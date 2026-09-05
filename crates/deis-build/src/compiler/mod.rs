@@ -328,11 +328,12 @@ impl Compiler {
             }
 
             if self.options.output_mode != OutputMode::Memory && !verification_failed {
-                let record_store = output_dir
+                let record_store = Path::new(&canonical_for_derivation.output_path)
                     .parent()
+                    .and_then(Path::parent)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "EC_DERIVATION_PUBLISH_FAILED: provider output has no record store parent"
+                            "EC_DERIVATION_PUBLISH_FAILED: canonical output has no shared artifact store"
                         )
                     })?
                     .join(".deislet/derivations")
@@ -377,6 +378,46 @@ impl Compiler {
                 rejected.len(),
                 rejected.join("\n  ")
             ));
+        }
+
+        // Only a completely successful multi-target build may move the
+        // mutable "current" selectors. Immutable payloads and derivation
+        // records can safely remain as evidence when a sibling target fails,
+        // but `--no-build` must never pick half of a failed build request.
+        if self.options.output_mode != OutputMode::Memory {
+            let output_base = Path::new(&canonical_for_derivation.output_path)
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "EC_DERIVATION_PUBLISH_FAILED: canonical output has no shared artifact store"
+                    )
+                })?;
+            let standard_version = Self::locked_standard_version()?;
+            for (vendor, build) in &builds {
+                let derivation = build.derivation.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "EC_DERIVATION_SELECTION_INVALID: completed provider build has no derivation"
+                    )
+                })?;
+                crate::provider_derivation::publish_current(
+                    output_base,
+                    vendor,
+                    &standard_version,
+                    &derivation.parent_artifact_sha256,
+                    &derivation.parent_content_root_sha256,
+                    derivation.payload_root_sha256.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "EC_DERIVATION_SELECTION_INVALID: completed provider build has no payload identity"
+                        )
+                    })?,
+                    derivation.manifest_sha256.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "EC_DERIVATION_SELECTION_INVALID: completed provider build has no record identity"
+                        )
+                    })?,
+                )?;
+            }
         }
 
         Ok(CompilationResult {
@@ -1183,12 +1224,22 @@ impl Compiler {
                 .map(|build| build.out_dir.as_str())
                 .unwrap_or("./dist"),
         );
+        let provider_staging = if self.options.output_mode == OutputMode::Memory {
+            None
+        } else {
+            Some(ScratchDir::create(&format!("provider-payload-{vendor}"))?)
+        };
         let mut derived_config = plan.config.clone();
         derived_config.function_root = "./functions".into();
         derived_config.environment = deployment_config.environment.clone();
         derived_config.vendors = None;
         derived_config.build = Some(deis_build_core::BuildConfig {
-            out_dir: output_base.to_string_lossy().into_owned(),
+            out_dir: provider_staging
+                .as_ref()
+                .map(|staging| staging.path())
+                .unwrap_or(output_base.as_path())
+                .to_string_lossy()
+                .into_owned(),
             minify: plan.build.minify,
             sourcemap: plan.build.source_map,
         });
@@ -1295,6 +1346,26 @@ impl Compiler {
         let mut build = self
             .build_from_project(derived_source.path(), vendor, &derived_config, true)
             .await?;
+        if let Some(staging) = &provider_staging {
+            let staged_output = Path::new(&build.output_path);
+            if !staged_output.starts_with(staging.path()) {
+                return Err(anyhow::anyhow!(
+                    "EC_DERIVATION_PUBLISH_FAILED: provider builder escaped its isolated output root"
+                ));
+            }
+            let published = crate::provider_derivation::publish_payload(
+                &output_base.join("providers").join(vendor),
+                staged_output,
+            )?;
+            build.output_path = published.root.to_string_lossy().into_owned();
+            build.files = published
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect();
+            build.size = published.size;
+        }
+        drop(provider_staging);
         build.derivation = Some(ProviderDerivation {
             parent_artifact_sha256: canonical.artifact_sha256.clone(),
             parent_content_root_sha256: canonical.content_root_sha256.clone(),

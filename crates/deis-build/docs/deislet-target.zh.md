@@ -7,7 +7,7 @@
 ## 产物
 
 ```
-dist/deislet/bundle.zip
+dist/providers/deislet/<payload-digest>/bundle.zip
 ├── manifest.json       应用是什么，节点装它之前需要知道的一切
 ├── worker/index.js     打包后的入口模块，单文件 ESM
 └── assets/             静态文件，目录结构原样保留
@@ -29,7 +29,9 @@ edge-canon 规定「文件树就是路由表」。函数根目录下的路径决
 | `functions/users/[id]/index.ts` | `/users/:id` |
 | `functions/api/[[catch]].ts` | `/api/*` |
 
-模式写进 `manifest.json` 的 `routes[].pattern`，与 `management.proto` 的 `RouteRule.pattern` 是同一种写法。
+模式先写入 canonical parent 的 `documents/routing-static-assets.json`。Deislet
+派生包只用一条 `/*` 传输路由进入已经完成应用路由的 canonical module；纯静态应用没有
+传输路由，资产 miss 也不会启动 isolate。
 
 **这些文件每一个都得有 `export default` handler。** 生成的入口模块是拿 `import handlerN from "<文件>"` 去取它、再把 `handlerN` 放进一张模块顶层就构造好的表里的；文件里没有可绑的东西，这个自由标识符就留在那张表里，节点求值这个模块的时候直接抛 `ReferenceError`——**整个应用**起不来，所有路由一起没，而不只是那一个文件。只有具名导出不算数，构建会点名拒绝。不是 handler 的辅助模块请放到函数根目录外面。
 
@@ -38,8 +40,9 @@ handler 可以用普通的相对 ESM 路径导入这些辅助模块。构建会�
 暂存后打包；即使 `functionRoot` 位于多层目录，原来的相对路径仍指向同一个文件。解析到
 项目外、经过符号链接文件或找不到目标的本地导入会使构建失败，否则产物就会暗中依赖
 构建机上未记录的文件。路由目录里只生成指向这棵镜像树的薄代理，因此辅助模块不会被
-误注册成路由。单文件打包目标在生成入口后删除两棵暂存树；Deno 目标需要在部署/运行时
-解析 ESM，所以保留它们。动态计算目标的 `import(expression)` 或 `require(expression)`
+误注册成路由。source adapter 将完整模块图折叠进 canonical parent；包括 Deno 在内的
+provider packager 只拿到由 parent 重建的 canonical entry，不再看到 checkout 的原始模块树。
+动态计算目标的 `import(expression)` 或 `require(expression)`
 会被拒绝：构建无法枚举应该携带哪些文件，接受它只会把缺模块错误推迟到某条分支运行时。
 
 **文件名在路由表里只是数据，永远不是语法。** 占位符和通配在文件树里写成 `[name]` 和 `[[name]]`，所以名字里裸的 `:` 或 `*` 是字面量，会被转义成只能表示它自己：`functions/api/*.ts` 答的是 `/api/%2A`，不是通配的 `/api/*`；`functions/users/:id.ts` 答的是 `/users/%3Aid`，不会和 `[id].ts` 撞成一条路由。`%` 本身也一起转义，这样「一个文件名对一条路由」才是一一对应的。每转义一段构建都会点名说一句，因为这么写通常是把方括号那种写法写错了。

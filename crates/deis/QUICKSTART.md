@@ -127,7 +127,7 @@ deis deploy
 ```
 Deploying my-app to production
   control plane  http://127.0.0.1:8085
-  ✓ built dist/deislet/bundle.zip (2.7 KB, sha256 a9a8013decdf)
+  ✓ built dist/providers/deislet/<payload-digest>/bundle.zip (2.7 KB, sha256 a9a8013decdf)
   ✓ created application my-app
   ✓ created environment production
   ✓ uploaded 2.7 KB as version 1

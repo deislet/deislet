@@ -136,17 +136,16 @@ deis-build build
 
 Output:
 ```
-Building for cloudflare...
-  ⚡ Bundling for cloudflare...
-  ✓ Bundled to index.js
-  ✓ Build complete: dist/cloudflare
+  ✓ Canonical: <artifact-digest> (content <content-root>, 7 files)
+    dist/canonical/<artifact-digest>
 
-Building for deno...
-  ✓ Build complete: dist/deno
+[1/2] Cloudflare
+  ✓ Derived from canonical <artifact-digest>, record <record-digest>
+  ✓ Output: dist/providers/cloudflare/<payload-digest>
 
-Build Result:
-  ✓ cloudflare: 2 files, 15.2 KB
-  ✓ deno: 2 files, 8.3 KB
+[2/2] Deno
+  ✓ Derived from canonical <artifact-digest>, record <record-digest>
+  ✓ Output: dist/providers/deno/<payload-digest>
 ```
 
 #### Build for Specific Platform
@@ -168,27 +167,24 @@ tree dist/
 Output structure:
 ```
 dist/
-├── cloudflare/
-│   ├── index.js           # Bundled entry file
-│   └── wrangler.toml      # Cloudflare configuration
-└── deno/
-    ├── _deis_internal/
-    │   ├── router.ts      # Deno router
-    │   └── adapters/
-    │       ├── context-builder.ts
-    │       └── kv-adapter.ts
-    ├── src/               # Transformed source files
-    │   ├── index.ts
-    │   └── api/
-    │       └── hello.ts
-    └── deno.json          # Deno configuration
+├── canonical/<artifact-digest>/     # One provider-neutral parent
+├── providers/
+│   ├── cloudflare/<payload-digest>/
+│   │   ├── index.js
+│   │   └── wrangler.toml
+│   └── deno/<payload-digest>/
+│       ├── _deis_internal/router.ts
+│       ├── project/functions/[[all]].js
+│       └── deno.json
+└── .deislet/                       # Derivation records and current selectors
 ```
 
-Everything under `dist/<vendor>/` is what gets deployed and nothing else. The
+Everything under the exact `dist/providers/<vendor>/<payload-digest>/` path
+printed by the build is what gets deployed and nothing else. The
 build's own smoke test - `wrangler deploy --dry-run` for the Cloudflare target -
 writes into a scratch directory outside the tree and removes it, so building
 the same source twice produces the same bytes. It used to write its output into
-`dist/cloudflare/dist-check/`, which put wrangler's own build of the Worker and
+the old mutable `dist/cloudflare/dist-check/`, which put wrangler's own build of the Worker and
 a file with the wall-clock time into the deliverable, and made two builds of one
 source differ.
 
@@ -199,14 +195,14 @@ Build only handles building. Deployment requires platform-specific tools.
 ### Cloudflare Workers
 
 ```bash
-cd dist/cloudflare
+cd dist/providers/cloudflare/<payload-digest>  # use the path printed by build
 npx wrangler deploy
 ```
 
 ### Deno Deploy
 
 ```bash
-cd dist/deno
+cd dist/providers/deno/<payload-digest>        # use the path printed by build
 deployctl deploy --project=my-app _deis_internal/router.ts
 ```
 

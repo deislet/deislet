@@ -67,7 +67,8 @@ curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
 脚本没有任何后门，而且**不打控制面的 REST**：它敲的就是开发者自己会敲的命令。
 
 1. `deis deploy`（在项目目录里跑）一条命令做完五件事：把
-   `scripts/demo-assets/example-app/` 编成 `dist/deislet/bundle.zip`
+   `scripts/demo-assets/example-app/` 编成
+   `dist/providers/deislet/<payload-digest>/bundle.zip`
    （`manifest.json` + `worker/index.js` + `assets/`）、建应用、建 `production`
    环境、把 zip 传成一个不可变版本、把环境指针指到那一版
 2. `deis secret set DEMO_SECRET`（值从标准输入进去，不进 shell 历史、也不进别人的

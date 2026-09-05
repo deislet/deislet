@@ -12,7 +12,7 @@ Deploy project, an EdgeOne function. This one emits the platform's own.
 ## Output
 
 ```
-dist/deislet/bundle.zip
+dist/providers/deislet/<payload-digest>/bundle.zip
 ├── manifest.json       what the app is, and everything a node needs before it loads it
 ├── worker/index.js     the bundled entry module, one ESM file
 └── assets/             static files, directory structure preserved
@@ -41,8 +41,10 @@ function root decides which requests reach it:
 | `functions/users/[id]/index.ts` | `/users/:id` |
 | `functions/api/[[catch]].ts` | `/api/*` |
 
-Patterns go into `manifest.json` as `routes[].pattern`, spelled exactly the way
-`RouteRule.pattern` is spelled on the wire.
+Patterns first go into the canonical parent's
+`documents/routing-static-assets.json`. The Deislet payload invokes that
+already-routed module through one `/*` transport route; a static-only app has
+no transport route and never starts an isolate on an asset miss.
 
 **Every one of those files needs a `export default` handler.** The generated
 entry module reaches each one as `import handlerN from "<file>"` and puts
@@ -60,9 +62,10 @@ paths even when `functionRoot` is nested. A local import that resolves outside
 the project, crosses a symbolic-link file, or names no file fails the build;
 otherwise the deployable would depend on unrecorded state from the build
 machine. Route files are small generated proxies into that mirror, so helpers
-remain helpers and never acquire routes of their own. Bundled targets remove
-both staging trees after producing their one entry module; the Deno target
-carries them because Deno resolves the ESM tree at deployment/runtime. A
+remain helpers and never acquire routes of their own. The source adapter folds
+the complete graph into the canonical parent. Provider packagers, including
+Deno, receive only a reconstructed canonical entry and never the checkout's
+original module tree. A
 computed `import(expression)` or `require(expression)` is refused: the build
 cannot enumerate what it would need to carry, and accepting it would defer a
 missing-module failure until that branch happens to run.

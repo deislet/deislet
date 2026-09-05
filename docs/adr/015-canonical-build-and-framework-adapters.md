@@ -40,14 +40,16 @@ secret 均为 fail-closed。
 
 Cloudflare、Deno、Tencent 与 Deislet packager 只读取已验证 canonical parent。应用源码在
 parent 发布后被改写也不会改变派生产物；每个落盘 provider payload 另有 canonical JSON
-derivation record，绑定标准版本、parent artifact/content root 和 provider 完整文件集。
+derivation record，绑定标准版本、parent artifact/content root 和 provider 完整文件集。provider
+payload 本身也经隔离 staging、全量回读和原子 rename 发布到
+`dist/providers/<target>/<payload-root>`；相同字节只复用，不覆盖。
 `deis deploy` 在读取/上传 bundle 前重新校验 parent、record 和 payload。路由、资产、事件和
 逻辑资源若当前 target 尚无标准语义映射，会在 provider 产物写出前以稳定错误拒绝，不再静默
 丢失或降级。Memory 模式同样经过临时 canonical parent，但不会把临时 identity 当成持久结果。
 
 以下仍是完成本 ADR 的明确缺口：
 
-- provider payload 目前仍写入可变的 `dist/<target>`，虽有完整派生摘要和部署前复核，尚未按自身 identity 不可变发布；
+- current selector 只在整次构建成功后原子切换，并在读取时复核 payload/derivation；它仍是本地最近构建状态，不是跨机器 artifact catalog 或控制面部署 identity；
 - canonical semantic document 的 schema 覆盖尚未扩展到 logical resource、environment/secret、queue/cron、SSR/ISR、middleware 与 Stateful Object；未实现 target 目前只能 fail closed；
 - 缺少 artifact signature、受信 builder identity、透明/远端 build job、build log 生命周期和控制面 canonical artifact record 持久化；
 - 没有通用 source checkout、framework build、monorepo root、远端 build cache 和官方 framework adapter；`deis build --watch` 仍明确未实现；

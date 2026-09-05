@@ -61,13 +61,13 @@ async fn root_event_files_fail_closed_before_any_provider_entry_is_emitted() {
             assert!(
                 !project
                     .path()
-                    .join("dist")
+                    .join("dist/providers")
                     .join(vendor)
                     .join("index.js")
                     .exists()
                     && !project
                         .path()
-                        .join("dist")
+                        .join("dist/providers")
                         .join(vendor)
                         .join("edge-functions/index.js")
                         .exists(),

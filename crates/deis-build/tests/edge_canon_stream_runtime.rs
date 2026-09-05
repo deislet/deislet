@@ -174,25 +174,29 @@ async fn exact_provider_fixture_builds_for_every_target_and_runs_on_deislet() {
         .expect("compile the exact EC-STREAM fixture");
     assert_eq!(result.builds.len(), VENDORS.len());
 
-    let dist = project.path().join("dist");
+    let root = |vendor: &str| Path::new(&result.builds[vendor].output_path).to_path_buf();
+    let cloudflare = root("cloudflare");
+    let tencent = root("tencent");
+    let deno = root("deno");
+    let deislet = root("deislet");
     for path in [
-        dist.join("cloudflare/index.js"),
-        dist.join("tencent/edge-functions/index.js"),
-        dist.join("deno/_deis_internal/router.ts"),
+        cloudflare.join("index.js"),
+        tencent.join("edge-functions/index.js"),
+        deno.join("_deis_internal/router.ts"),
         // Deno receives the reconstructed canonical entry, not the original
         // provider fixture/source tree through a second build path.
-        dist.join("deno/project/functions/[[all]].js"),
-        dist.join("deislet/bundle.zip"),
+        deno.join("project/functions/[[all]].js"),
+        deislet.join("bundle.zip"),
     ] {
         assert!(path.is_file(), "missing deployable {}", path.display());
     }
-    let deno_import_map = std::fs::read_to_string(dist.join("deno/deno.json")).unwrap();
+    let deno_import_map = std::fs::read_to_string(deno.join("deno.json")).unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&deno_import_map).unwrap()["imports"],
         serde_json::json!({})
     );
 
-    let worker = worker_from_bundle(&dist.join("deislet/bundle.zip"));
+    let worker = worker_from_bundle(&deislet.join("bundle.zip"));
     assert!(worker.contains("EC-STREAM-T010"));
     assert!(worker.contains("EC_STREAM_RUNTIME_INCOMPATIBLE"));
     let mut runtime = AppRuntime::new(

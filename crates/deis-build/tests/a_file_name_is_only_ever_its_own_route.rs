@@ -121,7 +121,7 @@ async fn a_name_that_reads_as_a_pattern_is_escaped_and_reported() {
         "one route per file, and the placeholder is the one written [id]"
     );
     assert_eq!(
-        manifest_patterns(&project.path().join("dist/deislet/bundle.zip")),
+        manifest_patterns(&Path::new(&build.output_path).join("bundle.zip")),
         vec!["/*"],
         "the provider bundle exposes one transport entry; application routing stays inside the canonical module"
     );
@@ -173,5 +173,5 @@ async fn a_backslash_in_a_name_is_refused_and_says_which_file() {
     );
 
     // Refused before anything was written, not after a bundle was packed.
-    assert!(!project.path().join("dist/deislet/bundle.zip").exists());
+    assert!(!project.path().join("dist/providers/deislet").exists());
 }

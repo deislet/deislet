@@ -80,7 +80,8 @@ let result = compiler.build().await?;
 ```
 
 `result.canonical_artifact` 返回持久 canonical identity（Memory 模式除外）；每个落盘
-`VendorBuild` 的 `derivation` 指向 `dist/.deislet/derivations/<vendor>/` 下的完整性记录。
+`VendorBuild.output_path` 是不可变的 `dist/providers/<vendor>/<payload-digest>`；其
+`derivation` 指向 `dist/.deislet/derivations/<vendor>/` 下的完整性记录。
 构建或部署会重新校验这些 identity，未实现的标准语义映射会失败而不是被忽略。
 
 ## 📚 文档 | Documentation

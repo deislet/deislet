@@ -135,17 +135,16 @@ deis-build build
 
 输出：
 ```
-Building for cloudflare...
-  ⚡ Bundling for cloudflare...
-  ✓ Bundled to index.js
-  ✓ Build complete: dist/cloudflare
+  ✓ Canonical: <artifact-digest> (content <content-root>, 7 files)
+    dist/canonical/<artifact-digest>
 
-Building for deno...
-  ✓ Build complete: dist/deno
+[1/2] Cloudflare
+  ✓ Derived from canonical <artifact-digest>, record <record-digest>
+  ✓ Output: dist/providers/cloudflare/<payload-digest>
 
-Build Result:
-  ✓ cloudflare: 2 files, 15.2 KB
-  ✓ deno: 2 files, 8.3 KB
+[2/2] Deno
+  ✓ Derived from canonical <artifact-digest>, record <record-digest>
+  ✓ Output: dist/providers/deno/<payload-digest>
 ```
 
 #### 构建特定平台
@@ -167,25 +166,22 @@ tree dist/
 输出结构：
 ```
 dist/
-├── cloudflare/
-│   ├── index.js           # 打包后的入口文件
-│   └── wrangler.toml      # Cloudflare 配置
-└── deno/
-    ├── _deis_internal/
-    │   ├── router.ts      # Deno 路由器
-    │   └── adapters/
-    │       ├── context-builder.ts
-    │       └── kv-adapter.ts
-    ├── src/               # 转换后的源文件
-    │   ├── index.ts
-    │   └── api/
-    │       └── hello.ts
-    └── deno.json          # Deno 配置
+├── canonical/<artifact-digest>/     # 唯一 provider-neutral parent
+├── providers/
+│   ├── cloudflare/<payload-digest>/
+│   │   ├── index.js
+│   │   └── wrangler.toml
+│   └── deno/<payload-digest>/
+│       ├── _deis_internal/router.ts
+│       ├── project/functions/[[all]].js
+│       └── deno.json
+└── .deislet/                       # 派生记录与 current selector
 ```
 
-`dist/<vendor>/` 下面的东西就是要部署的全部，不多一件。构建自带的冒烟检查——
+构建输出中精确的 `dist/providers/<vendor>/<payload-digest>/` 路径下面就是要部署的全部，
+不多一件。构建自带的冒烟检查——
 Cloudflare 那边是 `wrangler deploy --dry-run`——写在这棵树外面的临时目录里、跑完就删，
-所以同一份源码构建两次得到的字节是一样的。以前它写在 `dist/cloudflare/dist-check/`，
+所以同一份源码构建两次复用同一 payload identity。以前它写在可变的 `dist/cloudflare/dist-check/`，
 于是 wrangler 自己那份 Worker 和一个带墙上时间的文件进了交付物，同一份源码构建两次
 结果还不一样。
 
@@ -196,14 +192,14 @@ Build 只负责构建，部署需要使用各平台的工具。
 ### Cloudflare Workers
 
 ```bash
-cd dist/cloudflare
+cd dist/providers/cloudflare/<payload-digest>  # 使用 build 打印的路径
 npx wrangler deploy
 ```
 
 ### Deno Deploy
 
 ```bash
-cd dist/deno
+cd dist/providers/deno/<payload-digest>        # 使用 build 打印的路径
 deployctl deploy --project=my-app _deis_internal/router.ts
 ```
 

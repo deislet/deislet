@@ -249,10 +249,15 @@ pub fn default_bundle_path(project_dir: &Path) -> Result<PathBuf> {
         .as_ref()
         .map(|b| b.out_dir.clone())
         .unwrap_or_else(|| "./dist".to_string());
-    Ok(project_dir
-        .join(out_dir)
-        .join(build::DEISLET_VENDOR)
-        .join(deis_build::adapter_deislet::BUNDLE_FILE_NAME))
+    let output_base = project_dir.join(out_dir);
+    let payload = deis_build::provider_derivation::resolve_current(
+        &output_base,
+        build::DEISLET_VENDOR,
+    )
+    .context(
+        "resolving the last fully verified deislet build; run `deis build --vendor deislet` first",
+    )?;
+    Ok(payload.join(deis_build::adapter_deislet::BUNDLE_FILE_NAME))
 }
 
 fn human_size(bytes: usize) -> String {
@@ -269,6 +274,7 @@ fn human_size(bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::platform::NodeFailure;
+    use sha2::{Digest, Sha256};
 
     fn report(
         delivered: &[&str],
@@ -323,5 +329,65 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KB");
         assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn no_build_resolves_the_verified_content_addressed_bundle() {
+        const STANDARD: &str = "edge-canon.next@f8eabb6619a50aab02fd44647c3bc7d64d817d24";
+
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join(".config.json"),
+            r#"{
+                "version":"1.0",
+                "name":"selector-test",
+                "runtime":"standard-v1",
+                "language":"javascript",
+                "build":{"outDir":"./artifacts","minify":true,"sourcemap":false}
+            }"#,
+        )
+        .expect("config");
+
+        let source = project.path().join("provider-source");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(
+            source.join(deis_build::adapter_deislet::BUNDLE_FILE_NAME),
+            b"immutable bundle bytes",
+        )
+        .expect("bundle");
+        let output_base = project.path().join("artifacts");
+        let payload = deis_build::provider_derivation::publish_payload(
+            &output_base.join("providers/deislet"),
+            &source,
+        )
+        .expect("payload");
+        let parent = hex::encode(Sha256::digest(b"parent"));
+        let content = hex::encode(Sha256::digest(b"content"));
+        let derivation = deis_build::provider_derivation::publish(
+            &output_base.join(".deislet/derivations/deislet"),
+            &payload.root,
+            build::DEISLET_VENDOR,
+            STANDARD,
+            &parent,
+            &content,
+        )
+        .expect("derivation");
+        deis_build::provider_derivation::publish_current(
+            &output_base,
+            build::DEISLET_VENDOR,
+            STANDARD,
+            &parent,
+            &content,
+            &derivation.payload_root_sha256,
+            &derivation.manifest_sha256,
+        )
+        .expect("current selector");
+
+        assert_eq!(
+            default_bundle_path(project.path()).expect("default bundle"),
+            payload
+                .root
+                .join(deis_build::adapter_deislet::BUNDLE_FILE_NAME)
+        );
     }
 }

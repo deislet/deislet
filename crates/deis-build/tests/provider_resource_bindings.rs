@@ -50,7 +50,11 @@ async fn external_targets_fail_before_dropping_a_logical_binding() {
         );
         assert!(error.contains("SESSIONS (kv)"), "{vendor}: {error}");
         assert!(
-            !project.path().join("dist").join(vendor).exists(),
+            !project
+                .path()
+                .join("dist/providers")
+                .join(vendor)
+                .exists(),
             "{vendor} left a misleading artifact"
         );
     }

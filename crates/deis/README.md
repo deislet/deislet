@@ -137,7 +137,8 @@ Check the project against the specification.
 ### `deis build [--vendor …]`
 
 Compile one content-addressed canonical artifact, then derive the selected
-provider payload. `--vendor deislet` produces `dist/deislet/bundle.zip`, the
+provider payload. `--vendor deislet` produces
+`dist/providers/deislet/<payload-digest>/bundle.zip`, the
 bundle a version is made of; the other vendors produce their own output for
 their own tooling. The command prints the canonical and derivation identities.
 Provider packaging fails before output when a declared standard feature has no

@@ -593,7 +593,7 @@ async fn a_handler_importing_a_module_nothing_carries_fails_the_build() {
         "the message says what would happen: {error}"
     );
     assert!(
-        !Path::new(&project.path().join("dist/deislet/bundle.zip")).exists(),
+        !Path::new(&project.path().join("dist/providers/deislet")).exists(),
         "no archive may be written for an application that cannot load"
     );
 }

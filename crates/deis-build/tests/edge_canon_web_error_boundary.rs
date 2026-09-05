@@ -127,23 +127,27 @@ async fn exact_web_fixture_builds_for_every_target_and_errors_are_canonical_on_d
         .expect("compile the exact EC-WEB fixture");
     assert_eq!(result.builds.len(), VENDORS.len());
 
-    let dist = project.path().join("dist");
+    let root = |vendor: &str| Path::new(&result.builds[vendor].output_path).to_path_buf();
+    let cloudflare = root("cloudflare");
+    let tencent = root("tencent");
+    let deno = root("deno");
+    let deislet = root("deislet");
     for path in [
-        dist.join("cloudflare/index.js"),
-        dist.join("tencent/edge-functions/index.js"),
-        dist.join("deno/_deis_internal/router.ts"),
-        dist.join("deno/_deis_internal/edge-canon-runtime.js"),
-        dist.join("deislet/bundle.zip"),
+        cloudflare.join("index.js"),
+        tencent.join("edge-functions/index.js"),
+        deno.join("_deis_internal/router.ts"),
+        deno.join("_deis_internal/edge-canon-runtime.js"),
+        deislet.join("bundle.zip"),
     ] {
         assert!(path.is_file(), "missing deployable {}", path.display());
     }
 
     for (entry, support) in [
-        (dist.join("cloudflare/index.js"), None),
-        (dist.join("tencent/edge-functions/index.js"), None),
+        (cloudflare.join("index.js"), None),
+        (tencent.join("edge-functions/index.js"), None),
         (
-            dist.join("deno/_deis_internal/router.ts"),
-            Some(dist.join("deno/_deis_internal/edge-canon-runtime.js")),
+            deno.join("_deis_internal/router.ts"),
+            Some(deno.join("_deis_internal/edge-canon-runtime.js")),
         ),
     ] {
         let mut code = std::fs::read_to_string(&entry).expect("provider entry is UTF-8");
@@ -159,7 +163,7 @@ async fn exact_web_fixture_builds_for_every_target_and_errors_are_canonical_on_d
         assert!(!code.contains("error.message"), "{}", entry.display());
     }
 
-    let worker = worker_from_bundle(&dist.join("deislet/bundle.zip"));
+    let worker = worker_from_bundle(&deislet.join("bundle.zip"));
     assert!(worker.contains("EC_WEB_SECRET_MUST_NOT_LEAK"));
     assert!(worker.contains("EC_HANDLER_THROWN"));
     assert!(worker.contains("EC_HANDLER_RESULT_INVALID"));

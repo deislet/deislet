@@ -50,7 +50,7 @@ async fn build(dir: &Path, vendor: &str) -> anyhow::Result<deis_build::Compilati
 }
 
 fn deployable_entries(project: &Path, vendor: &str) -> Vec<std::path::PathBuf> {
-    let root = project.join("dist").join(vendor);
+    let root = project.join("dist/providers").join(vendor);
     match vendor {
         "cloudflare" => vec![root.join("index.js")],
         "tencent" => vec![
@@ -99,12 +99,10 @@ async fn a_bare_specifier_stops_the_deno_build_the_way_it_stops_the_others() {
     // Nothing runnable was left behind. `deno.json` is what `deno task start`
     // reads and `_deis_internal/router.ts` is what it runs; neither may exist
     // for a build that stopped.
-    let output = project.path().join("dist/deno");
     assert!(
-        !output.join("deno.json").exists(),
-        "a build that could not produce a loadable program must not leave one behind"
+        !project.path().join("dist/providers/deno").exists(),
+        "a build that could not produce a loadable program must not publish a payload"
     );
-    assert!(!output.join("_deis_internal/router.ts").exists());
 }
 
 /// The claim the whole file exists for: the four targets now agree about the
@@ -143,7 +141,7 @@ async fn a_deno_npm_specifier_is_refused_by_the_unified_standard() {
     assert!(error.contains("EC_ARTIFACT_MODULE_EXTERNAL"), "{error}");
     assert!(error.contains("npm-scheme"), "{error}");
     assert!(error.contains("package.json"), "{error}");
-    assert!(!project.path().join("dist/deno/deno.json").exists());
+    assert!(!project.path().join("dist/providers/deno").exists());
 }
 
 #[tokio::test]
