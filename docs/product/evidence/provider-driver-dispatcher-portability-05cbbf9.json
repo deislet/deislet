@@ -1,0 +1,167 @@
+{
+  "$schema": "./provider-driver-dispatcher-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-driver-transparency-portability-05cbbf9-2026-09-06",
+  "collectedAt": "2026-09-06T07:13:57+08:00",
+  "outcome": "passed",
+  "scope": "The exact source archive passes the platform-applicable offline transparency proof, RFC 6962 inclusion, C2SP Ed25519 checkpoint and witness verification, threshold release authorization, trust-root recovery and rotation, verified process, Control release and operation, signed-but-unlogged target migration, and strict deployment-control lint checks on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "05cbbf98e719c084c8c6ea8085b2038396193dba",
+    "tree": "84ad81ea886c93d2b55e714c912b583f4408c143",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "e01bc19998de56cc90f1142d34ebd5c92c3278c269dcd7145c0e84ae490758fa",
+      "sizeBytes": 15431680
+    }
+  },
+  "buildEnvironment": {"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_TEST_DEBUG": "0"},
+  "commands": [
+    {"id": "provider-driver-tests", "command": "cargo +1.96.0 test -p deis-provider-driver"},
+    {"id": "provider-driver-control-tests", "command": "cargo +1.96.0 test -p deis-control provider_driver -- --nocapture"},
+    {"id": "provider-target-migration-tests", "command": "cargo +1.96.0 test -p deis-control provider_targets -- --nocapture"},
+    {"id": "strict-clippy", "command": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"}
+  ],
+  "sharedContractCheck": {
+    "hostAlias": "s17",
+    "command": "python3 scripts/check-shared-contracts.py",
+    "outcome": "passed",
+    "exitCode": 0,
+    "schemas": 16,
+    "fixtures": 48
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "05cbbf98e719c084c8c6ea8085b2038396193dba",
+      "archiveSha256": "e01bc19998de56cc90f1142d34ebd5c92c3278c269dcd7145c0e84ae490758fa",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 62, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 21, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "05cbbf98e719c084c8c6ea8085b2038396193dba",
+      "archiveSha256": "e01bc19998de56cc90f1142d34ebd5c92c3278c269dcd7145c0e84ae490758fa",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 62, "failed": 0, "ignored": 0, "note": "Unix process-group, installation-root ownership and mode, trust material, root rotation, transparency, transient spawn retry, and real shell release and credential process checks are enabled."},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 21, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100 build 26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "05cbbf98e719c084c8c6ea8085b2038396193dba",
+      "archiveSha256": "e01bc19998de56cc90f1142d34ebd5c92c3278c269dcd7145c0e84ae490758fa",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 52, "failed": 0, "ignored": 0, "note": "Windows compiles and runs DSSE/Ed25519 authorization, C2SP Ed25519 log and timestamped witness verification, RFC 6962 inclusion, root rotation and migration, non-share-write trust-root loading with reparse-point rejection, public stdin, and Job Object boundaries; Unix-only checks are not compiled."},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 21, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    }
+  ],
+  "priorFailedAttempts": [],
+  "collectionObservations": [
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "05cbbf98e719c084c8c6ea8085b2038396193dba",
+        "tree": "84ad81ea886c93d2b55e714c912b583f4408c143",
+        "archive": {"format": "git-archive-tar", "sha256": "e01bc19998de56cc90f1142d34ebd5c92c3278c269dcd7145c0e84ae490758fa", "sizeBytes": 15431680}
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "classification": "harness",
+      "outcome": "inconclusive",
+      "description": "The first SSH command used a locally double-quoted remote script, so the local Bash expanded remote variables before macOS received it and no product check ran.",
+      "resolution": "The passing collection sent the script through a quoted remote standard-input boundary, preserving every remote variable literally."
+    },
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "05cbbf98e719c084c8c6ea8085b2038396193dba",
+        "tree": "84ad81ea886c93d2b55e714c912b583f4408c143",
+        "archive": {"format": "git-archive-tar", "sha256": "e01bc19998de56cc90f1142d34ebd5c92c3278c269dcd7145c0e84ae490758fa", "sizeBytes": 15431680}
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "classification": "environment",
+      "outcome": "inconclusive",
+      "description": "The corrected non-login SSH shell did not place the installed Rust toolchain on PATH, so Cargo was not found and no Rust check ran.",
+      "resolution": "The passing collection explicitly loaded /Users/leo/.cargo/env before recording tool versions and running the checks."
+    },
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "05cbbf98e719c084c8c6ea8085b2038396193dba",
+        "tree": "84ad81ea886c93d2b55e714c912b583f4408c143",
+        "archive": {"format": "git-archive-tar", "sha256": "e01bc19998de56cc90f1142d34ebd5c92c3278c269dcd7145c0e84ae490758fa", "sizeBytes": 15431680}
+      },
+      "hostAlias": "s69",
+      "operatingSystem": "windows",
+      "classification": "harness",
+      "outcome": "inconclusive",
+      "description": "Two initial SSH command spellings allowed a local or remote POSIX shell to expand PowerShell variables, producing parser errors before any product check ran.",
+      "resolution": "The passing collection transported the PowerShell 5.1 program with UTF-16LE -EncodedCommand, used ErrorActionPreference=Continue, and treated LASTEXITCODE as the native command result."
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "exactArchiveVerifiedOnEveryHost": true,
+    "windowsAsyncSendRegressionClosed": true,
+    "sharedProcessProtocolValidated": true,
+    "signedReleaseAuthorizationValidated": true,
+    "trustRootLoaderCompiledOnWindows": true,
+    "rootRotationValidated": true,
+    "legacyTrustRootMigrationValidated": true,
+    "transientSpawnRetryBoundaryValidated": true,
+    "offlineTransparencyProofValidated": true,
+    "independentWitnessThresholdValidated": true,
+    "signedButUnloggedTargetMigrationValidated": true,
+    "noLiveProviderClaim": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "The release, keys, roots, rotation envelopes, log checkpoint, witness cosignature, and process fixtures are synthetic; this evidence does not execute a real signed Wrangler, EdgeOne, Deislet, or other provider release or account.",
+    "The verifier implements an offline C2SP-compatible Ed25519 checkpoint and timestamped witness subset, but this evidence does not submit to or monitor a real public transparency log or independently operated witness service.",
+    "The v1 contract fixes Ed25519 signature types 0x01 and 0x04 and does not implement the ML-DSA-44 branch added by the evolving C2SP specifications; adding that branch requires a versioned contract evolution.",
+    "Windows rejects reparse points and concurrent write or delete sharing while reading trust material, but service-account DACL ownership is not validated.",
+    "The registry and dispatcher have no public API, CLI, or Web management surface and no background execution loop in this evidence.",
+    "The exact archive does not contain generated Control dashboard assets, so the existing build warning and dashboard 404 remain outside this Rust control-path record.",
+    "macOS and Windows did not run the shared-contract Python script; the same exact archive passed all 16 schemas and 48 fixtures on Linux.",
+    "Passing contract, unit, migration, and lint checks does not certify any backend against Edge Canon."
+  ]
+}

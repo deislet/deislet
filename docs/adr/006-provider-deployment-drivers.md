@@ -355,8 +355,11 @@ inclusion、checkpoint、见证阈值及时间验证，并复核派生事实，�
 
 为兼容已部署的显式 root、但不静默降低新基线，旧 root 若缺 `providerDriverTransparency` 只能按原 canonical bytes
 作为既有最高版本重启，以便提交受旧/新 root 双阈值保护的下一版轮换；它不能用于全新 bootstrap，也不能启用 dispatcher。
-轮换到带透明策略的新根后立即退出恢复模式。当前契约 fixture 使用确定性合成日志/见证 key 和单叶树，密码学实现与
-迁移边界已有本机回归；提交后的三平台 exact-archive evidence 尚待登记，且这仍不等于接入真实公共日志或独立见证服务。
+轮换到带透明策略的新根后立即退出恢复模式。当前契约 fixture 使用确定性合成日志/见证 key 和单叶树。精确提交
+`05cbbf98e719c084c8c6ea8085b2038396193dba` 的同一 archive 已在 Linux/macOS/Windows 通过平台适用的 verifier、
+Control provider、两项 target migration 和严格 Clippy，并登记受治理 evidence；Linux 另通过 16 份 Schema/48 组
+fixture。该结果仍不等于接入真实公共日志或独立见证服务。当前 v1 只固定 C2SP Ed25519 `0x01`/`0x04` 分支；上游
+ML-DSA-44 能力必须通过后续版本化统一契约引入，不能静默改变 v1 语义。
 
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
 真实透明日志/独立 witness 的采集与可用性运营，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个

@@ -72,6 +72,9 @@ request、argv、持久状态或未脱敏输出。timeout/输出上限/进程树
 密钥与当前时间窗口内。Control 在安装前及每次选择 executable 时重新验证授权和 proof，把原始 proof 与派生事实同事务
 写入不可修改、不可删除的记录；只有签名但没有透明记录的旧 active target 在升级时 disabled 且不能重新激活。
 上一版没有透明策略的显式根只可按原 canonical identity 重启并执行受双阈值保护的轮换，不能用于新 bootstrap 或执行。
+精确提交 `05cbbf98e719c084c8c6ea8085b2038396193dba` 的同一 archive 已在 Linux/macOS/Windows 通过平台适用的
+密码学、Control registry、两项 target migration 与严格 Clippy；当前 v1 只定义 C2SP Ed25519 日志/见证签名，
+ML-DSA-44 等后续行业能力须以版本化契约演进。
 
 这些切片仍不代表八阶段 identity 迁移或统一部署完成。当前迁移、restore、单步 provider work 与 provider deployment parent 已满足 `operation.schema.json` 全字段与通用状态图，credential vault/broker、验证安装器、Control release registry、DSSE 阈值授权、透明 proof、旧根/新根双阈值轮换与进程 dispatcher 已存在；但真实官方工具 materialized release、真实公共日志/见证服务与发行 ceremony、Windows service DACL、Cloudflare/EdgeOne/Deislet 完整 driver、后台执行循环和 API/CLI/Web 仍未接线。Stateful Objects 与 provider resources 仍无 inventory/fence/restore；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
 

@@ -2271,3 +2271,27 @@ Application/framework source + versioned build plan
   尚无真实公共透明日志、独立 witness 采集/可用性运营、真实 materialized release 和离线签署 ceremony；Windows DACL、
   公共 API/CLI/Web、后台 dispatcher loop、三家完整 driver 与真实账户 lifecycle/conformance evidence 仍是明确阻断项。
   `P1-DEPLOY-001` 保持 active，所有 backend 支持状态不变。
+
+## 81. 发行透明证明的三平台精确归档证据
+
+- 精确提交 `05cbbf98e719c084c8c6ea8085b2038396193dba`（tree
+  `84ad81ea886c93d2b55e714c912b583f4408c143`）生成 15,431,680-byte `git archive --format=tar`，SHA-256 为
+  `e01bc19998de56cc90f1142d34ebd5c92c3278c269dcd7145c0e84ae490758fa`。s17 Linux、s67 macOS 与 s69 Windows
+  均先复核该摘要，再只从各自的新临时目录解包，使用 Rust/Cargo/Clippy 1.96.0、`CARGO_INCREMENTAL=0` 与
+  `CARGO_PROFILE_TEST_DEBUG=0` 执行相同门禁。
+- Linux/macOS 的 provider-driver 均为 62/62，Windows 为 52/52；三端 Control provider 专项均为 21/21，旧 target
+  与 signed-but-unlogged target 两项迁移均为 2/2，五个部署控制 crate 的严格 all-target Clippy 均通过。Windows
+  实际编译并运行 DSSE/Ed25519 授权、RFC 6962 inclusion、C2SP Ed25519 checkpoint/timestamped witness、root
+  rotation/兼容迁移、trust-root reparse/share-write、公开 stdin 与 Job Object 边界；Unix-only 权限和进程组用例不冒充
+  Windows 执行。Linux 同一 archive 另通过 16 份 Schema/48 组 fixture。
+- 正式记录为 `docs/product/evidence/provider-driver-dispatcher-portability-05cbbf9.json`。首次远端脚本曾因本地或远端
+  POSIX shell 提前展开 `$变量` 而在任何产品命令前失败；macOS 修正引用后又发现非登录 shell 没有 Cargo PATH。
+  最终 macOS 通过 quoted stdin 加载 `/Users/leo/.cargo/env`，Windows 使用 PowerShell UTF-16LE
+  `-EncodedCommand`、`ErrorActionPreference=Continue` 和 `LASTEXITCODE`。这些均登记为 inconclusive harness/environment
+  observation，不虚报成代码失败，也不因最终绿灯而删除。
+- 对照当前 C2SP 上游还确认一个版本边界：本项目 v1 明确固定 Ed25519 日志签名 `0x01` 与时间戳见证签名 `0x04`，
+  尚未实现演化中规范的 ML-DSA-44 分支。该分支必须通过新的版本化统一契约引入，不能在 v1 下静默改变 key/signature
+  语义。更重要的产品阻断仍是合成 release/key/checkpoint 尚未替换为真实 materialized driver release、离线发行签署、
+  公共透明日志和独立 witness 运营；Windows service DACL、后台 dispatcher loop、API/CLI/Web、三家完整 driver 与真实
+  账户 lifecycle/conformance evidence 也未完成。因此本证据只关闭该 verifier/registry 切片的三平台可移植性，
+  `P1-DEPLOY-001` 继续保持 active。
