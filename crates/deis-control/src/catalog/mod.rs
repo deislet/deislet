@@ -38,6 +38,7 @@ pub mod identity_migration;
 pub mod limits;
 pub mod model;
 pub mod operation;
+pub mod provider_driver_operation;
 pub mod secrets;
 pub mod store;
 
@@ -67,6 +68,10 @@ pub use model::{
     Environment, ProviderDerivation, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
+pub use provider_driver_operation::{
+    ProviderDriverOperationRecord, ProviderInstallation, ProviderInstallationSpec, ProviderTarget,
+    ProviderTargetSpec,
+};
 pub use secrets::{SecretCipher, SecretsBackend};
 pub use store::{
     BundlePathRepair, CatalogStore, DeploymentPlanSpec, ProviderDerivationSpec, SecretHeadChange,

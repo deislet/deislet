@@ -8,6 +8,8 @@ authors = ["kookyleo <kookyleo@gmail.com>"]
 [dependencies]
 deis-bundle = { path = "../deis-bundle" }
 deis-artifact = { path = "../deis-artifact" }
+deis-provider-driver = { path = "../deis-provider-driver" }
+async-trait = "0.1"
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"

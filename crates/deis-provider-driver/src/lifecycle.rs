@@ -20,6 +20,12 @@ pub trait ProviderDriver: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DriverContractError(&'static str);
 
+impl DriverContractError {
+    pub(crate) const fn new(message: &'static str) -> Self {
+        Self(message)
+    }
+}
+
 impl fmt::Display for DriverContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.0)

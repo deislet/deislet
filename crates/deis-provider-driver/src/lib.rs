@@ -11,6 +11,7 @@ mod executor;
 mod lifecycle;
 mod manifest;
 mod model;
+mod orchestrator;
 
 pub use digest::{Sha256Digest, Sha256DigestError};
 pub use executor::{
@@ -30,4 +31,9 @@ pub use model::{
     ALL_DRIVER_OPERATIONS, ArtifactVersionRef, DeploymentState, DriverError, DriverErrorCategory,
     DriverNextAction, DriverOperation, DriverReceipt, DriverRequest, DriverStepState,
     ProviderNeutralPlan, ProviderTargetRef, SideEffect,
+};
+pub use orchestrator::{
+    DriverOperationClaim, DriverOperationClaimOutcome, DriverOperationStore,
+    DriverOrchestrationOutcome, DriverOrchestrator, DriverOrchestratorConfig,
+    DriverOrchestratorConfigError, DriverOrchestratorError, ProviderDriverPin,
 };

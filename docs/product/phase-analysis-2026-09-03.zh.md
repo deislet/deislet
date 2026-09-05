@@ -1835,3 +1835,31 @@ Application/framework source + versioned build plan
   完整 driver、EdgeOne 安全 transport、CLI/API/Web 接线，以及三个真实账户的 preview→verify→activate→observe→
   rollback→delete/cleanup evidence 均未实现；因此 roadmap 只把本项从 queued 改为 active，不能生成完整 manifest
   或改变任何 backend 的 not-certified/not-supported 状态。
+
+## 63. Provider operation 持久化、租约接管与 exact driver pin
+
+- 在共享 driver crate 中新增统一 orchestrator。每次执行先从 durable store 取得 owner UUIDv7、单调 claim epoch、
+  lease 与 exact request；heartbeat 最长只能是 lease 的一半。活跃 owner 存在时第二个 worker 不得执行；heartbeat
+  写失败会丢弃 driver future，不能用已失效的 claim 保存结果。receipt/error 在持久化前继续复核 operation、
+  desired-state、side effect 与 next action。
+- target 现在用 JCS canonical manifest SHA-256 固定 driver ID、version、distribution digest 与完整 manifest digest；
+  orchestrator 在实际 provider 调用前逐项核对。只匹配 backend ID 已不再足够，错误二进制/版本/manifest 会作为
+  contract violation 失败关闭，不能借用同一 provider 名称绕过升级门禁。
+- Control 新增 `provider_installations`、`provider_targets`、`provider_driver_operations` 与
+  `provider_driver_attempts`。installation 只记录 opaque credential binding UUIDv7，不存在 plaintext/token/
+  ciphertext 字段；target 将标准版本、配置摘要和 driver pin 作为不可变事实，变更必须注册新 target。
+  driver request 使用 canonical JSON 持久化且绑定 application/environment/installation/target/desired state；
+  幂等键摘要绑定语义请求但排除服务端新生成的 operation ID，因此相同请求返回原 Operation，不同 desired state
+  冲突。
+- claim/renew/settle 与 ProductOperation 状态、provider summary 和逐 attempt journal 在同一 SQLite 事务内推进。
+  provider 网络或子进程调用不持有数据库连接。过期 running 与 unknown 结果接管时只能把 execution operation
+  改为 `reconcile`，其余 identity 和 desired state 保持不变；只有明确 `sideEffect=none`、retryable 且
+  `nextAction=retry` 的失败可重放原动作。旧 owner/epoch/lease 不能续租、不能保存成功、失败或合同违约结果。
+- 本机验证为 provider-driver 25/25、Control 439/439、Control API integration 14/14，两个 crate 严格 Clippy
+  通过。专项测试覆盖 success、live-owner exclusion、lease expiry takeover、unknown→reconcile、stale epoch、
+  retryable original-operation replay、terminal failure、contract violation、幂等冲突、target/manifest 防漂移和
+  provider schema 无凭证明文字段。该结果尚未绑定提交后的三平台 evidence。
+- `P1-DEPLOY-001` 仍为 active：deployment parent/step workflow、credential vault lease/use audit、受信 installer
+  与完整 materialized tool tree、Deislet/Cloudflare 完整 driver、EdgeOne 安全 API/SDK transport、API/CLI/Web
+  接线和真实账户 preview→verify→activate→observe→rollback→delete/cleanup 仍未完成；不得因 durable 单步层
+  已完成就宣称 provider deployment 或 conformance 完成。

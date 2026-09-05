@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, fmt};
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::{ALL_DRIVER_OPERATIONS, DriverOperation, Sha256Digest};
 
@@ -150,6 +151,19 @@ impl ValidatedProviderDriverManifest {
     #[must_use]
     pub fn get(&self) -> &ProviderDriverManifest {
         &self.0
+    }
+
+    /// Canonical bytes used to bind a target to this exact manifest.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, DriverManifestError> {
+        serde_jcs::to_vec(&self.0).map_err(DriverManifestError::Json)
+    }
+
+    /// SHA-256 of [`Self::canonical_json`].
+    pub fn canonical_sha256(&self) -> Result<Sha256Digest, DriverManifestError> {
+        let digest = hex::encode(Sha256::digest(self.canonical_json()?));
+        Ok(digest
+            .parse()
+            .expect("hex encoding a SHA-256 always produces a canonical digest"))
     }
 }
 
@@ -381,6 +395,14 @@ mod tests {
         let manifest = ValidatedProviderDriverManifest::parse_json(FIXTURE).unwrap();
         assert_eq!(manifest.get().operations, ALL_DRIVER_OPERATIONS);
         assert!(manifest.get().supported_standard_versions.is_empty());
+        assert_eq!(manifest.canonical_sha256().unwrap().as_str().len(), 64);
+        let reparsed =
+            ValidatedProviderDriverManifest::parse_json(&manifest.canonical_json().unwrap())
+                .unwrap();
+        assert_eq!(
+            reparsed.canonical_sha256().unwrap(),
+            manifest.canonical_sha256().unwrap()
+        );
     }
 
     #[test]

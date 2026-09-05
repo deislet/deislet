@@ -1081,6 +1081,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // before a data cutover can start.
     ensure_identity_migration_schema(conn)?;
     ensure_product_operation_schema(conn)?;
+    ensure_provider_driver_schema(conn)?;
 
     info!("Database tables created successfully");
     Ok(())
@@ -2298,6 +2299,319 @@ fn ensure_product_operation_schema(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+/// Install the provider-neutral deployment domain and the fenced operation
+/// journal used by every backend driver. Provider credentials are represented
+/// only by an opaque binding identity; plaintext and encrypted credential
+/// material deliberately have no column in these tables.
+fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS provider_installations (
+            installation_id      TEXT PRIMARY KEY,
+            organization_id      TEXT NOT NULL
+                                      REFERENCES product_organizations(organization_id),
+            backend_id           TEXT NOT NULL
+                                      CHECK(backend_id IN ('deislet',
+                                                           'cloudflare-workers-pages',
+                                                           'tencent-edgeone-makers', 'deno')),
+            account_reference    TEXT NOT NULL
+                                      CHECK(length(account_reference) BETWEEN 1 AND 512),
+            region               TEXT CHECK(region IS NULL OR length(region) BETWEEN 1 AND 128),
+            credential_binding_id TEXT NOT NULL,
+            status               TEXT NOT NULL CHECK(status IN ('active', 'disabled', 'revoked')),
+            revision             INTEGER NOT NULL CHECK(revision >= 1),
+            created_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL,
+            CHECK(length(installation_id) = 36
+              AND lower(installation_id) = installation_id
+              AND substr(installation_id, 9, 1) = '-'
+              AND substr(installation_id, 14, 1) = '-'
+              AND substr(installation_id, 15, 1) = '7'
+              AND substr(installation_id, 19, 1) = '-'
+              AND substr(installation_id, 20, 1) GLOB '[89ab]'
+              AND substr(installation_id, 24, 1) = '-'
+              AND length(replace(installation_id, '-', '')) = 32
+              AND replace(installation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(credential_binding_id) = 36
+              AND lower(credential_binding_id) = credential_binding_id
+              AND substr(credential_binding_id, 9, 1) = '-'
+              AND substr(credential_binding_id, 14, 1) = '-'
+              AND substr(credential_binding_id, 15, 1) = '7'
+              AND substr(credential_binding_id, 19, 1) = '-'
+              AND substr(credential_binding_id, 20, 1) GLOB '[89ab]'
+              AND substr(credential_binding_id, 24, 1) = '-'
+              AND length(replace(credential_binding_id, '-', '')) = 32
+              AND replace(credential_binding_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            UNIQUE(organization_id, backend_id, account_reference)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_installations_backend
+            ON provider_installations(organization_id, backend_id, status);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_installations_identity_immutable_v1
+        BEFORE UPDATE OF installation_id, organization_id, backend_id,
+                         account_reference, created_at
+        ON provider_installations
+        WHEN NEW.installation_id != OLD.installation_id
+          OR NEW.organization_id != OLD.organization_id
+          OR NEW.backend_id != OLD.backend_id
+          OR NEW.account_reference != OLD.account_reference
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider installation identity is immutable');
+        END;
+
+        CREATE TABLE IF NOT EXISTS provider_targets (
+            target_id                  TEXT PRIMARY KEY,
+            installation_id            TEXT NOT NULL
+                                               REFERENCES provider_installations(installation_id),
+            backend_id                 TEXT NOT NULL
+                                               CHECK(backend_id IN ('deislet',
+                                                                    'cloudflare-workers-pages',
+                                                                    'tencent-edgeone-makers', 'deno')),
+            name                       TEXT NOT NULL
+                                               CHECK(length(name) BETWEEN 1 AND 128),
+            standard_version           TEXT NOT NULL
+                                               CHECK(length(standard_version) BETWEEN 1 AND 128),
+            target_config_sha256       TEXT NOT NULL,
+            driver_id                  TEXT NOT NULL CHECK(length(driver_id) BETWEEN 3 AND 128),
+            driver_version             TEXT NOT NULL CHECK(length(driver_version) BETWEEN 1 AND 128),
+            driver_distribution_sha256 TEXT NOT NULL,
+            driver_manifest_sha256     TEXT NOT NULL,
+            driver_manifest_json       TEXT NOT NULL CHECK(json_valid(driver_manifest_json)),
+            status                     TEXT NOT NULL CHECK(status IN ('active', 'disabled')),
+            revision                   INTEGER NOT NULL CHECK(revision >= 1),
+            created_at                 INTEGER NOT NULL,
+            updated_at                 INTEGER NOT NULL,
+            CHECK(length(target_id) = 36
+              AND lower(target_id) = target_id
+              AND substr(target_id, 9, 1) = '-'
+              AND substr(target_id, 14, 1) = '-'
+              AND substr(target_id, 15, 1) = '7'
+              AND substr(target_id, 19, 1) = '-'
+              AND substr(target_id, 20, 1) GLOB '[89ab]'
+              AND substr(target_id, 24, 1) = '-'
+              AND length(replace(target_id, '-', '')) = 32
+              AND replace(target_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(target_config_sha256) = 64
+              AND lower(target_config_sha256) = target_config_sha256
+              AND target_config_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(driver_distribution_sha256) = 64
+              AND lower(driver_distribution_sha256) = driver_distribution_sha256
+              AND driver_distribution_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(driver_manifest_sha256) = 64
+              AND lower(driver_manifest_sha256) = driver_manifest_sha256
+              AND driver_manifest_sha256 NOT GLOB '*[^0-9a-f]*'),
+            UNIQUE(installation_id, name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_targets_backend
+            ON provider_targets(backend_id, status, target_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_installation_backend_v1
+        BEFORE INSERT ON provider_targets
+        WHEN NOT EXISTS (
+            SELECT 1 FROM provider_installations
+             WHERE installation_id = NEW.installation_id
+               AND backend_id = NEW.backend_id
+               AND status = 'active'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target installation/backend mismatch');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_facts_immutable_v1
+        BEFORE UPDATE OF target_id, installation_id, backend_id, name,
+                         standard_version, target_config_sha256, driver_id,
+                         driver_version, driver_distribution_sha256,
+                         driver_manifest_sha256, driver_manifest_json, created_at
+        ON provider_targets
+        WHEN NEW.target_id != OLD.target_id
+          OR NEW.installation_id != OLD.installation_id
+          OR NEW.backend_id != OLD.backend_id
+          OR NEW.name != OLD.name
+          OR NEW.standard_version != OLD.standard_version
+          OR NEW.target_config_sha256 != OLD.target_config_sha256
+          OR NEW.driver_id != OLD.driver_id
+          OR NEW.driver_version != OLD.driver_version
+          OR NEW.driver_distribution_sha256 != OLD.driver_distribution_sha256
+          OR NEW.driver_manifest_sha256 != OLD.driver_manifest_sha256
+          OR NEW.driver_manifest_json != OLD.driver_manifest_json
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target facts are immutable; register a new target');
+        END;
+
+        CREATE TABLE IF NOT EXISTS provider_driver_operations (
+            operation_id               TEXT PRIMARY KEY
+                                                REFERENCES product_operations(operation_id),
+            provider_target_id         TEXT NOT NULL REFERENCES provider_targets(target_id),
+            target_revision            INTEGER NOT NULL CHECK(target_revision >= 1),
+            original_operation         TEXT NOT NULL
+                                                CHECK(original_operation IN
+                                                  ('preflight', 'plan', 'prepare', 'upload',
+                                                   'verify', 'activate', 'observe', 'rollback',
+                                                   'inspect', 'reconcile', 'delete', 'cleanup')),
+            desired_state_sha256       TEXT NOT NULL,
+            driver_id                  TEXT NOT NULL,
+            driver_version             TEXT NOT NULL,
+            driver_distribution_sha256 TEXT NOT NULL,
+            driver_manifest_sha256     TEXT NOT NULL,
+            request_json               TEXT NOT NULL CHECK(json_valid(request_json)),
+            state                      TEXT NOT NULL
+                                                CHECK(state IN
+                                                  ('pending', 'running', 'succeeded',
+                                                   'failed', 'unknown')),
+            last_attempt_operation     TEXT
+                                                CHECK(last_attempt_operation IS NULL OR
+                                                  last_attempt_operation IN
+                                                    ('preflight', 'plan', 'prepare', 'upload',
+                                                     'verify', 'activate', 'observe', 'rollback',
+                                                     'inspect', 'reconcile', 'delete', 'cleanup')),
+            receipt_json               TEXT CHECK(receipt_json IS NULL OR json_valid(receipt_json)),
+            driver_error_json          TEXT CHECK(driver_error_json IS NULL OR
+                                                   json_valid(driver_error_json)),
+            contract_failure           TEXT CHECK(contract_failure IS NULL OR
+                                                   length(contract_failure) BETWEEN 1 AND 2048),
+            side_effect                TEXT CHECK(side_effect IS NULL OR
+                                                   side_effect IN ('none', 'possible', 'confirmed')),
+            next_action                TEXT CHECK(next_action IS NULL OR
+                                                   next_action IN ('none', 'retry', 'observe',
+                                                                   'reconcile', 'rollback',
+                                                                   'manual-intervention')),
+            native_operation_id        TEXT CHECK(native_operation_id IS NULL OR
+                                                   length(native_operation_id) BETWEEN 1 AND 1024),
+            attempt_count              INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+            owner_id                   TEXT,
+            claim_epoch                INTEGER NOT NULL DEFAULT 0 CHECK(claim_epoch >= 0),
+            lease_expires_at           INTEGER,
+            revision                   INTEGER NOT NULL CHECK(revision >= 1),
+            created_at                 INTEGER NOT NULL,
+            updated_at                 INTEGER NOT NULL,
+            CHECK(length(operation_id) = 36
+              AND lower(operation_id) = operation_id
+              AND substr(operation_id, 9, 1) = '-'
+              AND substr(operation_id, 14, 1) = '-'
+              AND substr(operation_id, 15, 1) = '7'
+              AND substr(operation_id, 19, 1) = '-'
+              AND substr(operation_id, 20, 1) GLOB '[89ab]'
+              AND substr(operation_id, 24, 1) = '-'
+              AND length(replace(operation_id, '-', '')) = 32
+              AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(desired_state_sha256) = 64
+              AND lower(desired_state_sha256) = desired_state_sha256
+              AND desired_state_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(driver_distribution_sha256) = 64
+              AND lower(driver_distribution_sha256) = driver_distribution_sha256
+              AND driver_distribution_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(driver_manifest_sha256) = 64
+              AND lower(driver_manifest_sha256) = driver_manifest_sha256
+              AND driver_manifest_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(owner_id IS NULL OR
+                 (length(owner_id) = 36
+                  AND lower(owner_id) = owner_id
+                  AND substr(owner_id, 9, 1) = '-'
+                  AND substr(owner_id, 14, 1) = '-'
+                  AND substr(owner_id, 15, 1) = '7'
+                  AND substr(owner_id, 19, 1) = '-'
+                  AND substr(owner_id, 20, 1) GLOB '[89ab]'
+                  AND substr(owner_id, 24, 1) = '-'
+                  AND length(replace(owner_id, '-', '')) = 32
+                  AND replace(owner_id, '-', '') NOT GLOB '*[^0-9a-f]*')),
+            CHECK((state = 'running' AND owner_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+               OR (state != 'running' AND owner_id IS NULL AND lease_expires_at IS NULL)),
+            CHECK((state = 'pending' AND last_attempt_operation IS NULL AND attempt_count = 0)
+               OR (state != 'pending' AND last_attempt_operation IS NOT NULL
+                   AND attempt_count >= 1)),
+            CHECK(contract_failure IS NULL OR state = 'failed'),
+            CHECK(receipt_json IS NULL OR state IN ('succeeded', 'failed', 'unknown')),
+            CHECK(driver_error_json IS NULL OR state IN ('failed', 'unknown'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_driver_operations_claim
+            ON provider_driver_operations(state, lease_expires_at, updated_at, operation_id);
+        CREATE INDEX IF NOT EXISTS idx_provider_driver_operations_target
+            ON provider_driver_operations(provider_target_id, created_at, operation_id);
+
+        CREATE TABLE IF NOT EXISTS provider_driver_attempts (
+            operation_id       TEXT NOT NULL
+                                    REFERENCES provider_driver_operations(operation_id),
+            claim_epoch        INTEGER NOT NULL CHECK(claim_epoch >= 1),
+            owner_id           TEXT NOT NULL,
+            execution_operation TEXT NOT NULL
+                                    CHECK(execution_operation IN
+                                      ('preflight', 'plan', 'prepare', 'upload', 'verify',
+                                       'activate', 'observe', 'rollback', 'inspect',
+                                       'reconcile', 'delete', 'cleanup')),
+            state              TEXT NOT NULL
+                                    CHECK(state IN ('running', 'succeeded', 'failed',
+                                                    'unknown', 'contract-failure',
+                                                    'lease-expired')),
+            result_json        TEXT CHECK(result_json IS NULL OR json_valid(result_json)),
+            error_json         TEXT CHECK(error_json IS NULL OR json_valid(error_json)),
+            contract_failure   TEXT CHECK(contract_failure IS NULL OR
+                                           length(contract_failure) BETWEEN 1 AND 2048),
+            started_at         INTEGER NOT NULL,
+            finished_at        INTEGER,
+            PRIMARY KEY(operation_id, claim_epoch),
+            CHECK(length(owner_id) = 36
+              AND lower(owner_id) = owner_id
+              AND substr(owner_id, 9, 1) = '-'
+              AND substr(owner_id, 14, 1) = '-'
+              AND substr(owner_id, 15, 1) = '7'
+              AND substr(owner_id, 19, 1) = '-'
+              AND substr(owner_id, 20, 1) GLOB '[89ab]'
+              AND substr(owner_id, 24, 1) = '-'
+              AND length(replace(owner_id, '-', '')) = 32
+              AND replace(owner_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK((state = 'running' AND finished_at IS NULL)
+               OR (state != 'running' AND finished_at IS NOT NULL)),
+            CHECK(result_json IS NULL OR state IN ('succeeded', 'failed', 'unknown')),
+            CHECK(error_json IS NULL OR state IN ('failed', 'unknown')),
+            CHECK(contract_failure IS NULL OR state = 'contract-failure')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_driver_attempts_state
+            ON provider_driver_attempts(state, started_at, operation_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_attempts_identity_immutable_v1
+        BEFORE UPDATE OF operation_id, claim_epoch, owner_id,
+                         execution_operation, started_at
+        ON provider_driver_attempts
+        WHEN NEW.operation_id != OLD.operation_id
+          OR NEW.claim_epoch != OLD.claim_epoch
+          OR NEW.owner_id != OLD.owner_id
+          OR NEW.execution_operation != OLD.execution_operation
+          OR NEW.started_at != OLD.started_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver attempt identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_driver_operations_request_immutable_v1
+        BEFORE UPDATE OF operation_id, provider_target_id, target_revision,
+                         original_operation, desired_state_sha256, driver_id,
+                         driver_version, driver_distribution_sha256,
+                         driver_manifest_sha256, request_json, created_at
+        ON provider_driver_operations
+        WHEN NEW.operation_id != OLD.operation_id
+          OR NEW.provider_target_id != OLD.provider_target_id
+          OR NEW.target_revision != OLD.target_revision
+          OR NEW.original_operation != OLD.original_operation
+          OR NEW.desired_state_sha256 != OLD.desired_state_sha256
+          OR NEW.driver_id != OLD.driver_id
+          OR NEW.driver_version != OLD.driver_version
+          OR NEW.driver_distribution_sha256 != OLD.driver_distribution_sha256
+          OR NEW.driver_manifest_sha256 != OLD.driver_manifest_sha256
+          OR NEW.request_json != OLD.request_json
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider driver operation request and pins are immutable');
+        END;
+        "#,
+    )?;
     Ok(())
 }
 

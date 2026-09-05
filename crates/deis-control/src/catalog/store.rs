@@ -161,6 +161,7 @@ pub struct UndescribableEnvironment {
     pub version_id: String,
 }
 
+#[derive(Clone)]
 pub struct CatalogStore {
     db: Arc<Database>,
 }
