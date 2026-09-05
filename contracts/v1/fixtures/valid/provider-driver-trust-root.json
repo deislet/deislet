@@ -17,12 +17,48 @@
     "threshold": 2,
     "maxAuthorizationLifetimeSeconds": 604800
   },
+  "providerDriverTransparency": {
+    "logOperatorThreshold": 1,
+    "witnessOperatorThreshold": 1,
+    "logs": [
+      {
+        "origin": "log.example.test/deislet",
+        "operator": "log-operator.example.test",
+        "keyId": "defe6330f78fcc11efd0fb28614f0d29d7b60d6e66c25c1c5b0f98fe505fc8bb"
+      }
+    ],
+    "witnesses": [
+      {
+        "name": "witness.example.test/deislet",
+        "operator": "witness-operator.example.test",
+        "keyId": "795ed5ffe9039bf56d224dc19d19c33e58f65632da8132af5da8063c8bd37665"
+      }
+    ]
+  },
   "keys": [
+    {
+      "keyId": "795ed5ffe9039bf56d224dc19d19c33e58f65632da8132af5da8063c8bd37665",
+      "keyType": "ed25519",
+      "scheme": "ed25519",
+      "publicKey": "2b8hSHSKhcidparY7gsPwtEF/TnUGkx5ZTY1TwrikAw=",
+      "status": "active",
+      "validFrom": "2026-09-01T00:00:00Z",
+      "validUntil": "2027-09-01T00:00:00Z"
+    },
     {
       "keyId": "dbc298251c51321b7266e78d1c151c2b62aff8cb95b293096d3463018544face",
       "keyType": "ed25519",
       "scheme": "ed25519",
       "publicKey": "/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=",
+      "status": "active",
+      "validFrom": "2026-09-01T00:00:00Z",
+      "validUntil": "2027-09-01T00:00:00Z"
+    },
+    {
+      "keyId": "defe6330f78fcc11efd0fb28614f0d29d7b60d6e66c25c1c5b0f98fe505fc8bb",
+      "keyType": "ed25519",
+      "scheme": "ed25519",
+      "publicKey": "kaKKC3Q4FZOk2UaVeSCJJq/IrYLIg5t2RDWbnrqaSzo=",
       "status": "active",
       "validFrom": "2026-09-01T00:00:00Z",
       "validUntil": "2027-09-01T00:00:00Z"

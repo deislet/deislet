@@ -508,25 +508,39 @@ async fn build_catalog_state(
                     .await
                     {
                         Ok(registry) => {
-                            info!(
-                                installation_root = %registry.installation_root().display(),
-                                host = %registry.host(),
-                                trust_root_version = registry.trust_root().get().root_version,
-                                trust_root_sha256 = %registry.trust_root().canonical_sha256(),
-                                "Signed provider driver release registry is enabled"
-                            );
-                            match crate::catalog::ProviderDriverDispatcher::new(
-                                registry,
-                                Arc::clone(&provider_credentials),
-                                deis_provider_driver::ExecutableProviderDriverConfig::default(),
-                            ) {
-                                Ok(dispatcher) => Some(Arc::new(dispatcher)),
-                                Err(error) => {
-                                    error!(
-                                        error = %error,
-                                        "Provider driver dispatcher is unusable; external provider execution is disabled"
-                                    );
-                                    None
+                            if registry
+                                .trust_root()
+                                .uses_legacy_missing_transparency_policy()
+                            {
+                                warn!(
+                                    installation_root = %registry.installation_root().display(),
+                                    host = %registry.host(),
+                                    trust_root_version = registry.trust_root().get().root_version,
+                                    trust_root_sha256 = %registry.trust_root().canonical_sha256(),
+                                    "Legacy provider driver trust root was loaded for recovery and rotation only; external provider execution remains disabled until a transparently governed root is active"
+                                );
+                                None
+                            } else {
+                                info!(
+                                    installation_root = %registry.installation_root().display(),
+                                    host = %registry.host(),
+                                    trust_root_version = registry.trust_root().get().root_version,
+                                    trust_root_sha256 = %registry.trust_root().canonical_sha256(),
+                                    "Signed and transparent provider driver release registry is enabled"
+                                );
+                                match crate::catalog::ProviderDriverDispatcher::new(
+                                    registry,
+                                    Arc::clone(&provider_credentials),
+                                    deis_provider_driver::ExecutableProviderDriverConfig::default(),
+                                ) {
+                                    Ok(dispatcher) => Some(Arc::new(dispatcher)),
+                                    Err(error) => {
+                                        error!(
+                                            error = %error,
+                                            "Provider driver dispatcher is unusable; external provider execution is disabled"
+                                        );
+                                        None
+                                    }
                                 }
                             }
                         }

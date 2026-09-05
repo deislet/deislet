@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    Sha256Digest, ToolDigest, ValidatedProviderDriverManifest, ValidatedProviderDriverRelease,
+    DriverReleaseTransparencyPolicy, Sha256Digest, ToolDigest, ValidatedProviderDriverManifest,
+    ValidatedProviderDriverRelease,
 };
 
 pub const DSSE_ENVELOPE_PAYLOAD_TYPE: &str =
@@ -81,6 +82,8 @@ pub struct DriverReleaseTrustRoot {
     pub expires_at: DateTime<Utc>,
     pub root: DriverReleaseRootRole,
     pub provider_driver_release: DriverReleaseSigningRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_driver_transparency: Option<DriverReleaseTransparencyPolicy>,
     pub keys: Vec<DriverReleaseSigningKey>,
 }
 
@@ -104,6 +107,7 @@ pub struct ValidatedDriverReleaseTrustRoot {
     canonical_json: Vec<u8>,
     canonical_sha256: Sha256Digest,
     legacy_implicit_root_role: bool,
+    legacy_missing_transparency_policy: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,7 +240,12 @@ impl ValidatedDriverReleaseTrustRoot {
 
     pub fn parse_json_compatible(bytes: &[u8]) -> Result<Self, DriverReleaseAuthorizationError> {
         if let Ok(root) = serde_json::from_slice::<DriverReleaseTrustRoot>(bytes) {
-            return Self::new(root);
+            let canonical_json =
+                serde_jcs::to_vec(&root).map_err(DriverReleaseAuthorizationError::Json)?;
+            if root.provider_driver_transparency.is_some() {
+                return Self::from_root_and_canonical(root, canonical_json, false, false);
+            }
+            return Self::from_root_and_canonical(root, canonical_json, false, true);
         }
         let legacy: LegacyDriverReleaseTrustRoot =
             serde_json::from_slice(bytes).map_err(DriverReleaseAuthorizationError::Json)?;
@@ -254,9 +263,11 @@ impl ValidatedDriverReleaseTrustRoot {
                 expires_at: legacy.expires_at,
                 root: root_role,
                 provider_driver_release: legacy.provider_driver_release,
+                provider_driver_transparency: None,
                 keys: legacy.keys,
             },
             canonical_json,
+            true,
             true,
         )
     }
@@ -264,15 +275,16 @@ impl ValidatedDriverReleaseTrustRoot {
     pub fn new(root: DriverReleaseTrustRoot) -> Result<Self, DriverReleaseAuthorizationError> {
         let canonical_json =
             serde_jcs::to_vec(&root).map_err(DriverReleaseAuthorizationError::Json)?;
-        Self::from_root_and_canonical(root, canonical_json, false)
+        Self::from_root_and_canonical(root, canonical_json, false, false)
     }
 
     fn from_root_and_canonical(
         root: DriverReleaseTrustRoot,
         canonical_json: Vec<u8>,
         legacy_implicit_root_role: bool,
+        legacy_missing_transparency_policy: bool,
     ) -> Result<Self, DriverReleaseAuthorizationError> {
-        validate_trust_root(&root)?;
+        validate_trust_root(&root, !legacy_missing_transparency_policy)?;
         let mut verifying_keys = BTreeMap::new();
         for key in &root.keys {
             let bytes = decode_canonical_base64(&key.public_key)?;
@@ -294,6 +306,7 @@ impl ValidatedDriverReleaseTrustRoot {
             canonical_sha256: sha256(&canonical_json),
             canonical_json,
             legacy_implicit_root_role,
+            legacy_missing_transparency_policy,
         })
     }
 
@@ -314,6 +327,11 @@ impl ValidatedDriverReleaseTrustRoot {
     #[must_use]
     pub const fn uses_legacy_implicit_root_role(&self) -> bool {
         self.legacy_implicit_root_role
+    }
+
+    #[must_use]
+    pub const fn uses_legacy_missing_transparency_policy(&self) -> bool {
+        self.legacy_missing_transparency_policy
     }
 
     #[must_use]
@@ -613,6 +631,7 @@ impl ValidatedDriverReleaseAuthorization {
 
 fn validate_trust_root(
     root: &DriverReleaseTrustRoot,
+    require_transparency_policy: bool,
 ) -> Result<(), DriverReleaseAuthorizationError> {
     require(
         root.schema
@@ -718,7 +737,27 @@ fn validate_trust_root(
             .iter()
             .all(|key_id| root.keys.iter().any(|key| &key.key_id == key_id)),
         "provider driver release signing role references an unknown key",
-    )
+    )?;
+    match &root.provider_driver_transparency {
+        Some(policy) => {
+            require(
+                policy
+                    .logs
+                    .iter()
+                    .map(|log| &log.key_id)
+                    .chain(policy.witnesses.iter().map(|witness| &witness.key_id))
+                    .all(|key_id| {
+                        !root_role.key_ids.contains(key_id) && !role.key_ids.contains(key_id)
+                    }),
+                "provider driver transparency keys must be distinct from root and release signing roles",
+            )?;
+            crate::release_transparency::validate_transparency_policy(policy, &root.keys)
+        }
+        None if !require_transparency_policy => Ok(()),
+        None => Err(DriverReleaseAuthorizationError::Invalid(
+            "provider driver release trust root requires a transparency policy",
+        )),
+    }
 }
 
 fn validate_authorization(
@@ -991,8 +1030,13 @@ mod tests {
             SigningKey::from_bytes(&[7; 32]),
             SigningKey::from_bytes(&[9; 32]),
         ];
+        let transparency_keys = [
+            SigningKey::from_bytes(&[13; 32]),
+            SigningKey::from_bytes(&[15; 32]),
+        ];
         let mut keys = signing_keys
             .iter()
+            .chain(transparency_keys.iter())
             .map(|key| {
                 let public = key.verifying_key().to_bytes();
                 DriverReleaseSigningKey {
@@ -1008,6 +1052,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        let mut release_role_key_ids = signing_keys
+            .iter()
+            .map(|key| hex::encode(Sha256::digest(key.verifying_key().to_bytes())))
+            .collect::<Vec<_>>();
+        release_role_key_ids.sort();
         let root = ValidatedDriverReleaseTrustRoot::new(DriverReleaseTrustRoot {
             schema: Some("provider-driver-trust-root.schema.json".to_owned()),
             schema_version: 1,
@@ -1020,10 +1069,28 @@ mod tests {
                 threshold: 1,
             },
             provider_driver_release: DriverReleaseSigningRole {
-                key_ids: keys.iter().map(|key| key.key_id.clone()).collect(),
+                key_ids: release_role_key_ids,
                 threshold: 2,
                 max_authorization_lifetime_seconds: 7 * 24 * 60 * 60,
             },
+            provider_driver_transparency: Some(DriverReleaseTransparencyPolicy {
+                log_operator_threshold: 1,
+                witness_operator_threshold: 1,
+                logs: vec![crate::DriverReleaseTransparencyLog {
+                    origin: "log.example.test/deislet".to_owned(),
+                    operator: "log-operator.example.test".to_owned(),
+                    key_id: hex::encode(Sha256::digest(
+                        transparency_keys[0].verifying_key().to_bytes(),
+                    )),
+                }],
+                witnesses: vec![crate::DriverReleaseTransparencyWitness {
+                    name: "witness.example.test/deislet".to_owned(),
+                    operator: "witness-operator.example.test".to_owned(),
+                    key_id: hex::encode(Sha256::digest(
+                        transparency_keys[1].verifying_key().to_bytes(),
+                    )),
+                }],
+            }),
             keys,
         })
         .unwrap();
@@ -1186,7 +1253,13 @@ mod tests {
         let revoked_key = revoked
             .keys
             .iter_mut()
-            .find(|key| !revoked.root.key_ids.contains(&key.key_id))
+            .find(|key| {
+                revoked
+                    .provider_driver_release
+                    .key_ids
+                    .contains(&key.key_id)
+                    && !revoked.root.key_ids.contains(&key.key_id)
+            })
             .unwrap();
         revoked_key.status = DriverReleaseSigningKeyStatus::Revoked;
         revoked_key.revoked_at = Some(now);
@@ -1300,6 +1373,10 @@ mod tests {
         let (root, _authorization, _release, _manifest) = signed_fixture(now);
         let mut legacy: serde_json::Value = serde_json::to_value(root.get()).unwrap();
         legacy.as_object_mut().unwrap().remove("root");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("providerDriverTransparency");
         let canonical_legacy = serde_jcs::to_vec(&legacy).unwrap();
 
         assert!(ValidatedDriverReleaseTrustRoot::parse_json(&canonical_legacy).is_err());
@@ -1361,6 +1438,20 @@ mod tests {
             .unwrap();
         assert_eq!(verified.trust_root_version, 1);
         assert_eq!(verified.signer_key_ids.len(), 2);
+
+        let transparency = fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/v1/fixtures/valid/provider-driver-transparency-proof.json"
+        ))
+        .unwrap();
+        let transparency =
+            crate::ValidatedDriverReleaseTransparencyProof::parse_json(&transparency).unwrap();
+        let verified_transparency = transparency.verify(&envelope, &root, observed_at).unwrap();
+        assert_eq!(
+            verified_transparency.log_origins,
+            vec!["log.example.test/deislet"]
+        );
+        assert_eq!(verified_transparency.witness_operators.len(), 1);
 
         let rotation = fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),

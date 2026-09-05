@@ -35,6 +35,7 @@ EXPECTED_DOCUMENTS = {
     "provider-driver-trust-root-envelope",
     "provider-driver-release-authorization",
     "provider-driver-release-envelope",
+    "provider-driver-transparency-proof",
     "provider-driver-process",
     "identity-migration",
     "backend-migration-evidence",
@@ -496,6 +497,90 @@ def validate_cross_document_invariants(registry: dict) -> None:
         and len(set(root_envelope_signers) & set(next_root_role["keyIds"]))
         >= next_root_role["threshold"],
         "provider driver trust root envelope lacks old-root or new-root threshold",
+    )
+
+    transparency_policy = trust_root["providerDriverTransparency"]
+    transparency_key_ids = [
+        identity["keyId"]
+        for identity in transparency_policy["logs"]
+        + transparency_policy["witnesses"]
+    ]
+    require(
+        len(transparency_key_ids) == len(set(transparency_key_ids))
+        and set(transparency_key_ids) <= {key["keyId"] for key in keys},
+        "provider driver transparency identities must use distinct trusted keys",
+    )
+    require(
+        set(transparency_key_ids).isdisjoint(root_role["keyIds"])
+        and set(transparency_key_ids).isdisjoint(
+            trust_root["providerDriverRelease"]["keyIds"]
+        ),
+        "provider driver transparency keys overlap root or release signing roles",
+    )
+    require(
+        [
+            (entry["operator"], entry["origin"], entry["keyId"])
+            for entry in transparency_policy["logs"]
+        ]
+        == sorted(
+            (entry["operator"], entry["origin"], entry["keyId"])
+            for entry in transparency_policy["logs"]
+        )
+        and [
+            (entry["operator"], entry["name"], entry["keyId"])
+            for entry in transparency_policy["witnesses"]
+        ]
+        == sorted(
+            (entry["operator"], entry["name"], entry["keyId"])
+            for entry in transparency_policy["witnesses"]
+        ),
+        "provider driver transparency identities are not canonically ordered",
+    )
+    require(
+        transparency_policy["logOperatorThreshold"]
+        <= len({entry["operator"] for entry in transparency_policy["logs"]})
+        and transparency_policy["witnessOperatorThreshold"]
+        <= len({entry["operator"] for entry in transparency_policy["witnesses"]}),
+        "provider driver transparency thresholds exceed distinct operators",
+    )
+    require(
+        {entry["operator"] for entry in transparency_policy["logs"]}.isdisjoint(
+            entry["operator"] for entry in transparency_policy["witnesses"]
+        ),
+        "provider driver transparency log and witness operators are not independent",
+    )
+    transparency = load_json(
+        "contracts/v1/fixtures/valid/provider-driver-transparency-proof.json"
+    )
+    envelope_canonical = json.dumps(
+        envelope, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    require(
+        transparency["authorizationSha256"]
+        == {
+            "algorithm": "sha256",
+            "value": hashlib.sha256(envelope_canonical).hexdigest(),
+        },
+        "provider driver transparency proof does not bind the canonical authorization envelope",
+    )
+    proof_origins = [entry["logOrigin"] for entry in transparency["entries"]]
+    require(
+        proof_origins == sorted(set(proof_origins)),
+        "provider driver transparency proof origins are not unique and ordered",
+    )
+    leaf_hash = hashlib.sha256(b"\x00" + envelope_canonical).digest()
+    fixture_entry = transparency["entries"][0]
+    checkpoint_lines = fixture_entry["checkpoint"].splitlines()
+    require(
+        fixture_entry["logIndex"] == 0
+        and fixture_entry["inclusionPath"] == []
+        and checkpoint_lines[:3]
+        == [
+            fixture_entry["logOrigin"],
+            "1",
+            base64.b64encode(leaf_hash).decode("ascii"),
+        ],
+        "provider driver transparency fixture does not use the expected RFC 6962 single-leaf proof",
     )
 
     operation = load_json("contracts/v1/fixtures/valid/operation.json")

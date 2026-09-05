@@ -205,9 +205,10 @@ pub struct ControlConfig {
     /// writable by group or others.
     #[serde(default)]
     pub provider_driver_installation_root: Option<PathBuf>,
-    /// Absolute path to the out-of-band provider release trust root. External
-    /// provider execution is enabled only when this and the installation root
-    /// are both configured and valid. The file carries no private key.
+    /// Absolute path to the out-of-band provider release trust root, including
+    /// release, transparency-log and witness policy. External provider
+    /// execution is enabled only when this and the installation root are both
+    /// configured and valid. The file carries no private key.
     #[serde(default)]
     pub provider_driver_trust_root: Option<PathBuf>,
     /// Optional absolute path to a DSSE envelope that authorizes the configured

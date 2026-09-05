@@ -48,8 +48,8 @@
         "command": {"const": "python3 scripts/check-shared-contracts.py"},
         "outcome": {"const": "passed"},
         "exitCode": {"const": 0},
-        "schemas": {"enum": [11, 14, 15]},
-        "fixtures": {"enum": [29, 37, 42]}
+        "schemas": {"enum": [11, 14, 15, 16]},
+        "fixtures": {"enum": [29, 37, 42, 48]}
       }
     },
     "requiredOperatingSystems": {
@@ -94,7 +94,10 @@
         "trustRootLoaderCompiledOnWindows": {"const": true},
         "rootRotationValidated": {"const": true},
         "legacyTrustRootMigrationValidated": {"const": true},
-        "transientSpawnRetryBoundaryValidated": {"const": true}
+        "transientSpawnRetryBoundaryValidated": {"const": true},
+        "offlineTransparencyProofValidated": {"const": true},
+        "independentWitnessThresholdValidated": {"const": true},
+        "signedButUnloggedTargetMigrationValidated": {"const": true}
       }
     },
     "limitations": {
@@ -147,7 +150,12 @@
     "migrationCommand": {
       "allOf": [
         {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "legacy-target-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"}}}
+        {
+          "oneOf": [
+            {"properties": {"id": {"const": "legacy-target-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"}}},
+            {"properties": {"id": {"const": "provider-target-migration-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control provider_targets -- --nocapture"}}}
+          ]
+        }
       ]
     },
     "clippyCommand": {
@@ -161,7 +169,7 @@
       "additionalProperties": false,
       "required": ["id", "outcome", "exitCode"],
       "properties": {
-        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "legacy-target-migration-test", "strict-clippy"]},
+        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "legacy-target-migration-test", "provider-target-migration-tests", "strict-clippy"]},
         "outcome": {"enum": ["passed", "failed", "not-run"]},
         "exitCode": {"type": ["integer", "null"], "minimum": 0},
         "passed": {"type": "integer", "minimum": 0},

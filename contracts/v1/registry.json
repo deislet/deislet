@@ -16,6 +16,7 @@
     {"id": "provider-driver-trust-root-envelope", "schema": "contracts/v1/provider-driver-trust-root-envelope.schema.json"},
     {"id": "provider-driver-release-authorization", "schema": "contracts/v1/provider-driver-release-authorization.schema.json"},
     {"id": "provider-driver-release-envelope", "schema": "contracts/v1/provider-driver-release-envelope.schema.json"},
+    {"id": "provider-driver-transparency-proof", "schema": "contracts/v1/provider-driver-transparency-proof.schema.json"},
     {"id": "provider-driver-process", "schema": "contracts/v1/provider-driver-process.schema.json"},
     {"id": "identity-migration", "schema": "contracts/v1/identity-migration.schema.json"},
     {"id": "backend-migration-evidence", "schema": "contracts/v1/backend-migration-evidence.schema.json"},

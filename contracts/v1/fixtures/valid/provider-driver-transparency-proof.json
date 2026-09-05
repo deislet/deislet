@@ -1,0 +1,17 @@
+{
+  "$schema": "provider-driver-transparency-proof.schema.json",
+  "schemaVersion": 1,
+  "mediaType": "application/vnd.deislet.provider-driver-transparency-proof.v1+json",
+  "authorizationSha256": {
+    "algorithm": "sha256",
+    "value": "32c4bfee53a7fc60ce912328ad7236ddd044c06d319c985962af2cf8032de146"
+  },
+  "entries": [
+    {
+      "logOrigin": "log.example.test/deislet",
+      "logIndex": 0,
+      "inclusionPath": [],
+      "checkpoint": "log.example.test/deislet\n1\nRJT89A3eFcMPaAs/XCUR9PJRaLRAIdkwDpPF1o8qIls=\n\n— log.example.test/deislet ghIEwiYt0Pd96KgF2b7KFz/VC+QycG2t4pZPOLd5FKeoEky+0raKw9b5BeUouzaIogkGnwe7TDpIdxej440RIgI2iwA=\n— witness.example.test/deislet JW4xaQAAAABqnf6Ak7ldvagmCztiSGNge6L7smlHwBdnOuRTwhvTyNmY/3u/uA4nJLSESFhSY5HcnSmsN1dpW5TanwYY/KyWpL5qCA==\n"
+    }
+  ]
+}

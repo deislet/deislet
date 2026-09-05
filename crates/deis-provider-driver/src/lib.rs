@@ -17,6 +17,7 @@ mod orchestrator;
 mod process;
 mod release;
 mod release_authorization;
+mod release_transparency;
 
 pub use credential::{
     CredentialBrokerError, CredentialBrokerErrorKind, CredentialLeaseDisposition,
@@ -69,4 +70,10 @@ pub use release_authorization::{
     DriverTrustRootDsseEnvelope, ValidatedDriverReleaseAuthorization,
     ValidatedDriverReleaseTrustRoot, ValidatedDriverTrustRootRotation,
     VerifiedDriverReleaseAuthorization, VerifiedDriverTrustRootRotation,
+};
+pub use release_transparency::{
+    DriverReleaseTransparencyEntry, DriverReleaseTransparencyLog, DriverReleaseTransparencyPolicy,
+    DriverReleaseTransparencyProof, DriverReleaseTransparencyWitness,
+    TRANSPARENCY_PROOF_MEDIA_TYPE, ValidatedDriverReleaseTransparencyProof,
+    VerifiedDriverReleaseTransparencyProof,
 };

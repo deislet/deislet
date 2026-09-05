@@ -4,16 +4,21 @@
 //! the durable bridge from that claim to one complete installation tree that
 //! the current Control host has actually verified.
 
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 use deis_provider_driver::{
     DriverInstallationError, DriverReleaseInstaller, ExecutableProviderDriver,
     ExecutableProviderDriverConfig, HostOperatingSystem, InstalledDriverRelease,
     ProviderCredentialBroker, Sha256Digest, ValidatedDriverReleaseAuthorization,
-    ValidatedDriverReleaseTrustRoot, ValidatedDriverTrustRootRotation,
-    ValidatedProviderDriverManifest, ValidatedProviderDriverRelease,
-    VerifiedDriverReleaseAuthorization, VerifiedDriverTrustRootRotation,
+    ValidatedDriverReleaseTransparencyProof, ValidatedDriverReleaseTrustRoot,
+    ValidatedDriverTrustRootRotation, ValidatedProviderDriverManifest,
+    ValidatedProviderDriverRelease, VerifiedDriverReleaseAuthorization,
+    VerifiedDriverReleaseTransparencyProof, VerifiedDriverTrustRootRotation,
 };
 use deis_wire::CanonicalId;
 use rusqlite::{OptionalExtension, params};
@@ -74,6 +79,13 @@ pub struct ResolvedProviderDriverRelease {
     pub manifest: ValidatedProviderDriverManifest,
     pub release: ValidatedProviderDriverRelease,
     pub installed: InstalledDriverRelease,
+}
+
+struct VerifiedReleaseTrustMaterial<'a> {
+    authorization: &'a ValidatedDriverReleaseAuthorization,
+    verified_authorization: &'a VerifiedDriverReleaseAuthorization,
+    transparency: &'a ValidatedDriverReleaseTransparencyProof,
+    verified_transparency: &'a VerifiedDriverReleaseTransparencyProof,
 }
 
 impl ProviderDriverReleaseRegistry {
@@ -178,9 +190,11 @@ impl ProviderDriverReleaseRegistry {
                                 "provider driver trust root bootstrap cannot use an unverifiable rotation envelope",
                             ));
                         }
-                        if trust_root.uses_legacy_implicit_root_role() {
+                        if trust_root.uses_legacy_implicit_root_role()
+                            || trust_root.uses_legacy_missing_transparency_policy()
+                        {
                             return Err(CatalogError::conflict(
-                                "provider driver trust root bootstrap requires an explicit root role",
+                                "provider driver trust root bootstrap requires an explicit root role and transparency policy",
                             ));
                         }
                         insert_trust_root(
@@ -360,11 +374,16 @@ impl ProviderDriverReleaseRegistry {
         release: ValidatedProviderDriverRelease,
         manifest: ValidatedProviderDriverManifest,
         authorization: ValidatedDriverReleaseAuthorization,
+        transparency: ValidatedDriverReleaseTransparencyProof,
         archive_path: impl AsRef<Path>,
     ) -> CatalogResult<ProviderDriverReleaseRecord> {
+        let now = Utc::now();
         let verified_authorization = authorization
-            .verify(&release, &manifest, &self.trust_root, Utc::now())
+            .verify(&release, &manifest, &self.trust_root, now)
             .map_err(authorization_error)?;
+        let verified_transparency = transparency
+            .verify(&authorization, &self.trust_root, now)
+            .map_err(transparency_error)?;
         let installer = self.installer.clone();
         let host = self.host;
         let archive_path = archive_path.as_ref().to_path_buf();
@@ -384,8 +403,12 @@ impl ProviderDriverReleaseRegistry {
         self.register_verified(
             &release,
             &manifest,
-            &authorization,
-            &verified_authorization,
+            VerifiedReleaseTrustMaterial {
+                authorization: &authorization,
+                verified_authorization: &verified_authorization,
+                transparency: &transparency,
+                verified_transparency: &verified_transparency,
+            },
             &installed,
         )
         .await
@@ -396,10 +419,15 @@ impl ProviderDriverReleaseRegistry {
         release: ValidatedProviderDriverRelease,
         manifest: ValidatedProviderDriverManifest,
         authorization: ValidatedDriverReleaseAuthorization,
+        transparency: ValidatedDriverReleaseTransparencyProof,
     ) -> CatalogResult<ProviderDriverReleaseRecord> {
+        let now = Utc::now();
         let verified_authorization = authorization
-            .verify(&release, &manifest, &self.trust_root, Utc::now())
+            .verify(&release, &manifest, &self.trust_root, now)
             .map_err(authorization_error)?;
+        let verified_transparency = transparency
+            .verify(&authorization, &self.trust_root, now)
+            .map_err(transparency_error)?;
         let installer = self.installer.clone();
         let host = self.host;
         let release_for_verify = release.clone();
@@ -413,8 +441,12 @@ impl ProviderDriverReleaseRegistry {
         self.register_verified(
             &release,
             &manifest,
-            &authorization,
-            &verified_authorization,
+            VerifiedReleaseTrustMaterial {
+                authorization: &authorization,
+                verified_authorization: &verified_authorization,
+                transparency: &transparency,
+                verified_transparency: &verified_transparency,
+            },
             &installed,
         )
         .await
@@ -433,14 +465,25 @@ impl ProviderDriverReleaseRegistry {
         now: DateTime<Utc>,
     ) -> CatalogResult<ResolvedProviderDriverRelease> {
         let stored = load_release_for_target(&self.store, target_id, self.host).await?;
-        let authorization_is_trusted = stored.authorizations.iter().any(|authorization| {
-            authorization
+        let authorization_is_trusted = stored.verification_materials.iter().any(|material| {
+            material
+                .authorization
                 .verify(&stored.release, &stored.manifest, &self.trust_root, now)
                 .is_ok()
+                && material
+                    .transparency
+                    .verify(&material.authorization, &self.trust_root, now)
+                    .is_ok_and(|verified| {
+                        verified.log_origins == material.log_origins
+                            && verified.log_operators == material.log_operators
+                            && verified.witness_operators == material.witness_operators
+                            && verified.earliest_witnessed_at == material.earliest_witnessed_at
+                            && verified.latest_witnessed_at == material.latest_witnessed_at
+                    })
         });
         if !authorization_is_trusted {
             return Err(CatalogError::conflict(
-                "registered provider driver release has no current authorization under the active trust root",
+                "registered provider driver release has no current transparent authorization under the active trust root",
             ));
         }
         let installer = self.installer.clone();
@@ -478,8 +521,7 @@ impl ProviderDriverReleaseRegistry {
         &self,
         release: &ValidatedProviderDriverRelease,
         manifest: &ValidatedProviderDriverManifest,
-        authorization: &ValidatedDriverReleaseAuthorization,
-        verified_authorization: &VerifiedDriverReleaseAuthorization,
+        trust: VerifiedReleaseTrustMaterial<'_>,
         installed: &InstalledDriverRelease,
     ) -> CatalogResult<ProviderDriverReleaseRecord> {
         let installed_for_verify = installed.clone();
@@ -522,12 +564,14 @@ impl ProviderDriverReleaseRegistry {
         })?)
         .expect("JCS JSON is UTF-8");
         let authorization_json =
-            String::from_utf8(authorization.canonical_json().map_err(|error| {
+            String::from_utf8(trust.authorization.canonical_json().map_err(|error| {
                 CatalogError::invalid(format!(
                     "cannot canonicalize driver release authorization: {error}"
                 ))
             })?)
             .expect("JCS JSON is UTF-8");
+        let transparency_json =
+            String::from_utf8(trust.transparency.canonical_json()).expect("JCS JSON is UTF-8");
         let distribution = installed.distribution();
         let expected_dir_name = format!("{}-{}", release_digest.as_str(), self.host);
         let actual_dir_name = installed
@@ -557,13 +601,23 @@ impl ProviderDriverReleaseRegistry {
             tree_digest: distribution.tree_digest.value.clone(),
             installation_dir_name: expected_dir_name,
             authorization: Some(ReleaseAuthorizationFacts {
-                envelope_digest: verified_authorization.envelope_sha256.clone(),
+                envelope_digest: trust.verified_authorization.envelope_sha256.clone(),
                 envelope_json: authorization_json,
-                issued_at: verified_authorization.issued_at,
-                expires_at: verified_authorization.expires_at,
-                signer_key_ids: verified_authorization.signer_key_ids.clone(),
-                trust_root_version: verified_authorization.trust_root_version,
-                trust_root_digest: verified_authorization.trust_root_sha256.clone(),
+                issued_at: trust.verified_authorization.issued_at,
+                expires_at: trust.verified_authorization.expires_at,
+                signer_key_ids: trust.verified_authorization.signer_key_ids.clone(),
+                trust_root_version: trust.verified_authorization.trust_root_version,
+                trust_root_digest: trust.verified_authorization.trust_root_sha256.clone(),
+            }),
+            transparency: Some(ReleaseTransparencyFacts {
+                proof_digest: trust.verified_transparency.proof_sha256.clone(),
+                proof_json: transparency_json,
+                authorization_digest: trust.verified_transparency.authorization_sha256.clone(),
+                log_origins: trust.verified_transparency.log_origins.clone(),
+                log_operators: trust.verified_transparency.log_operators.clone(),
+                witness_operators: trust.verified_transparency.witness_operators.clone(),
+                earliest_witnessed_at: trust.verified_transparency.earliest_witnessed_at,
+                latest_witnessed_at: trust.verified_transparency.latest_witnessed_at,
             }),
         };
         persist_verified_release(&self.store, facts).await
@@ -663,9 +717,50 @@ fn validate_trust_root_transition(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    let previous_log_role_ids = previous
+        .provider_driver_transparency
+        .iter()
+        .flat_map(|policy| policy.logs.iter().map(|log| log.key_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let previous_witness_role_ids = previous
+        .provider_driver_transparency
+        .iter()
+        .flat_map(|policy| {
+            policy
+                .witnesses
+                .iter()
+                .map(|witness| witness.key_id.as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    let previous_log_identities = previous
+        .provider_driver_transparency
+        .iter()
+        .flat_map(|policy| {
+            policy.logs.iter().map(|log| {
+                (
+                    log.key_id.as_str(),
+                    (log.origin.as_str(), log.operator.as_str()),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let previous_witness_identities = previous
+        .provider_driver_transparency
+        .iter()
+        .flat_map(|policy| {
+            policy.witnesses.iter().map(|witness| {
+                (
+                    witness.key_id.as_str(),
+                    (witness.name.as_str(), witness.operator.as_str()),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut historical_key_ids = BTreeSet::new();
     let mut historical_root_role_ids = BTreeSet::new();
     let mut historical_release_role_ids = BTreeSet::new();
+    let mut historical_log_role_ids = BTreeSet::new();
+    let mut historical_witness_role_ids = BTreeSet::new();
     let mut permanently_revoked_key_ids = BTreeSet::new();
 
     for root_json in historical_root_json {
@@ -679,6 +774,15 @@ fn validate_trust_root_transition(
         historical_root_role_ids.extend(root.get().root.key_ids.iter().cloned());
         historical_release_role_ids
             .extend(root.get().provider_driver_release.key_ids.iter().cloned());
+        if let Some(policy) = &root.get().provider_driver_transparency {
+            historical_log_role_ids.extend(policy.logs.iter().map(|log| log.key_id.clone()));
+            historical_witness_role_ids.extend(
+                policy
+                    .witnesses
+                    .iter()
+                    .map(|witness| witness.key_id.clone()),
+            );
+        }
         permanently_revoked_key_ids.extend(
             root.get()
                 .keys
@@ -720,6 +824,74 @@ fn validate_trust_root_transition(
         return Err(CatalogError::conflict(
             "provider driver trust root cannot restore a key to the release role after retirement",
         ));
+    }
+    if next.root.key_ids.iter().any(|key_id| {
+        !previous_root_role_ids.contains(key_id.as_str())
+            && (historical_release_role_ids.contains(key_id)
+                || historical_log_role_ids.contains(key_id)
+                || historical_witness_role_ids.contains(key_id))
+    }) || next.provider_driver_release.key_ids.iter().any(|key_id| {
+        !previous_release_role_ids.contains(key_id.as_str())
+            && (historical_root_role_ids.contains(key_id)
+                || historical_log_role_ids.contains(key_id)
+                || historical_witness_role_ids.contains(key_id))
+    }) {
+        return Err(CatalogError::conflict(
+            "provider driver trust root cannot move a historical key between trust roles",
+        ));
+    }
+    if let Some(policy) = &next.provider_driver_transparency {
+        if policy.logs.iter().any(|log| {
+            !previous_log_role_ids.contains(log.key_id.as_str())
+                && (historical_root_role_ids.contains(&log.key_id)
+                    || historical_release_role_ids.contains(&log.key_id)
+                    || historical_witness_role_ids.contains(&log.key_id))
+        }) || policy.witnesses.iter().any(|witness| {
+            !previous_witness_role_ids.contains(witness.key_id.as_str())
+                && (historical_root_role_ids.contains(&witness.key_id)
+                    || historical_release_role_ids.contains(&witness.key_id)
+                    || historical_log_role_ids.contains(&witness.key_id))
+        }) {
+            return Err(CatalogError::conflict(
+                "provider driver trust root cannot move a historical key between trust roles",
+            ));
+        }
+        if policy.logs.iter().any(|log| {
+            previous_log_identities
+                .get(log.key_id.as_str())
+                .is_some_and(|identity| *identity != (log.origin.as_str(), log.operator.as_str()))
+        }) {
+            return Err(CatalogError::conflict(
+                "provider driver trust root cannot rename or reassign a retained transparency log key",
+            ));
+        }
+        if policy.witnesses.iter().any(|witness| {
+            previous_witness_identities
+                .get(witness.key_id.as_str())
+                .is_some_and(|identity| {
+                    *identity != (witness.name.as_str(), witness.operator.as_str())
+                })
+        }) {
+            return Err(CatalogError::conflict(
+                "provider driver trust root cannot rename or reassign a retained transparency witness key",
+            ));
+        }
+        if policy.logs.iter().any(|log| {
+            historical_log_role_ids.contains(&log.key_id)
+                && !previous_log_role_ids.contains(log.key_id.as_str())
+        }) {
+            return Err(CatalogError::conflict(
+                "provider driver trust root cannot restore a key to the transparency log role after retirement",
+            ));
+        }
+        if policy.witnesses.iter().any(|witness| {
+            historical_witness_role_ids.contains(&witness.key_id)
+                && !previous_witness_role_ids.contains(witness.key_id.as_str())
+        }) {
+            return Err(CatalogError::conflict(
+                "provider driver trust root cannot restore a key to the transparency witness role after retirement",
+            ));
+        }
     }
     Ok(())
 }
@@ -799,6 +971,7 @@ struct ReleaseFacts {
     tree_digest: Sha256Digest,
     installation_dir_name: String,
     authorization: Option<ReleaseAuthorizationFacts>,
+    transparency: Option<ReleaseTransparencyFacts>,
 }
 
 #[derive(Clone)]
@@ -812,11 +985,33 @@ struct ReleaseAuthorizationFacts {
     trust_root_digest: Sha256Digest,
 }
 
+#[derive(Clone)]
+struct ReleaseTransparencyFacts {
+    proof_digest: Sha256Digest,
+    proof_json: String,
+    authorization_digest: Sha256Digest,
+    log_origins: Vec<String>,
+    log_operators: Vec<String>,
+    witness_operators: Vec<String>,
+    earliest_witnessed_at: DateTime<Utc>,
+    latest_witnessed_at: DateTime<Utc>,
+}
+
 struct StoredRelease {
     record: ProviderDriverReleaseRecord,
     manifest: ValidatedProviderDriverManifest,
     release: ValidatedProviderDriverRelease,
-    authorizations: Vec<ValidatedDriverReleaseAuthorization>,
+    verification_materials: Vec<StoredVerificationMaterial>,
+}
+
+struct StoredVerificationMaterial {
+    authorization: ValidatedDriverReleaseAuthorization,
+    transparency: ValidatedDriverReleaseTransparencyProof,
+    log_origins: Vec<String>,
+    log_operators: Vec<String>,
+    witness_operators: Vec<String>,
+    earliest_witnessed_at: DateTime<Utc>,
+    latest_witnessed_at: DateTime<Utc>,
 }
 
 async fn persist_verified_release(
@@ -886,11 +1081,32 @@ async fn persist_verified_release(
                     authorization,
                     now,
                 )?;
+                let transparency = facts.transparency.as_ref().ok_or_else(|| {
+                    CatalogError::invalid(
+                        "provider driver release registration requires a transparency proof",
+                    )
+                })?;
+                if transparency.authorization_digest != authorization.envelope_digest {
+                    return Err(CatalogError::invalid(
+                        "provider driver transparency proof and authorization identities differ",
+                    ));
+                }
+                persist_release_transparency(
+                    &transaction,
+                    &facts.release_digest,
+                    facts.host,
+                    transparency,
+                    now,
+                )?;
                 format!(
-                    "complete installation tree and DSSE authorization verified with trust root {} ({}) and signer keys {}",
+                    "complete installation tree, DSSE authorization {} ({} signer keys), RFC 6962 inclusion proof {}, signed checkpoint, and witness threshold verified with trust root {} ({}), {} log operators, and {} witness operators",
+                    authorization.envelope_digest,
+                    authorization.signer_key_ids.len(),
+                    transparency.proof_digest,
                     authorization.trust_root_version,
                     authorization.trust_root_digest,
-                    authorization.signer_key_ids.join(",")
+                    transparency.log_operators.len(),
+                    transparency.witness_operators.len()
                 )
             } else {
                 #[cfg(not(test))]
@@ -898,7 +1114,8 @@ async fn persist_verified_release(
                     "provider driver release registration requires a signed authorization",
                 ));
                 #[cfg(test)]
-                "test-only unsigned release seed; never available in production".to_owned()
+                "test-only unsigned and non-transparent release seed; never available in production"
+                    .to_owned()
             };
             insert_audit(
                 &transaction,
@@ -945,6 +1162,10 @@ async fn load_release_for_target(
                         AND i.status = 'active' AND r.status = 'active'
                         AND EXISTS (
                             SELECT 1 FROM provider_driver_release_authorizations a
+                            JOIN provider_driver_release_transparency p
+                              ON p.release_sha256 = a.release_sha256
+                             AND p.host_operating_system = a.host_operating_system
+                             AND p.authorization_sha256 = a.authorization_sha256
                              WHERE a.release_sha256 = r.release_sha256
                                AND a.host_operating_system = r.host_operating_system
                         )",
@@ -993,11 +1214,19 @@ async fn load_release_for_target(
                 |error| CatalogError::invalid(format!("invalid registered driver release: {error}")),
             )?;
             let mut statement = connection.prepare(
-                "SELECT authorization_sha256, authorization_json, issued_at,
-                        expires_at, signer_key_ids_json
-                   FROM provider_driver_release_authorizations
-                  WHERE release_sha256 = ?1 AND host_operating_system = ?2
-                  ORDER BY expires_at DESC, issued_at DESC, authorization_sha256",
+                "SELECT a.authorization_sha256, a.authorization_json, a.issued_at,
+                        a.expires_at, a.signer_key_ids_json,
+                        p.proof_sha256, p.proof_json, p.log_origins_json,
+                        p.log_operators_json, p.witness_operators_json,
+                        p.earliest_witnessed_at, p.latest_witnessed_at
+                   FROM provider_driver_release_authorizations a
+                   JOIN provider_driver_release_transparency p
+                     ON p.release_sha256 = a.release_sha256
+                    AND p.host_operating_system = a.host_operating_system
+                    AND p.authorization_sha256 = a.authorization_sha256
+                  WHERE a.release_sha256 = ?1 AND a.host_operating_system = ?2
+                  ORDER BY a.expires_at DESC, a.issued_at DESC,
+                           a.authorization_sha256, p.proof_sha256",
             )?;
             let authorization_rows = statement
                 .query_map(params![row.0, host.as_str()], |authorization_row| {
@@ -1007,10 +1236,17 @@ async fn load_release_for_target(
                         authorization_row.get::<_, i64>(2)?,
                         authorization_row.get::<_, i64>(3)?,
                         authorization_row.get::<_, String>(4)?,
+                        authorization_row.get::<_, String>(5)?,
+                        authorization_row.get::<_, String>(6)?,
+                        authorization_row.get::<_, String>(7)?,
+                        authorization_row.get::<_, String>(8)?,
+                        authorization_row.get::<_, String>(9)?,
+                        authorization_row.get::<_, i64>(10)?,
+                        authorization_row.get::<_, i64>(11)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            let authorizations = authorization_rows
+            let verification_materials = authorization_rows
                 .into_iter()
                 .map(|authorization_row| {
                     let authorization = ValidatedDriverReleaseAuthorization::parse_json(
@@ -1028,7 +1264,59 @@ async fn load_release_for_target(
                         authorization_row.3,
                         &authorization_row.4,
                     )?;
-                    Ok(authorization)
+                    let transparency = ValidatedDriverReleaseTransparencyProof::parse_json(
+                        authorization_row.6.as_bytes(),
+                    )
+                    .map_err(|error| {
+                        CatalogError::invalid(format!(
+                            "invalid registered driver release transparency proof: {error}"
+                        ))
+                    })?;
+                    let log_origins: Vec<String> =
+                        serde_json::from_str(&authorization_row.7).map_err(|error| {
+                            CatalogError::invalid(format!(
+                                "invalid registered transparency log origins: {error}"
+                            ))
+                        })?;
+                    let log_operators: Vec<String> =
+                        serde_json::from_str(&authorization_row.8).map_err(|error| {
+                            CatalogError::invalid(format!(
+                                "invalid registered transparency log operators: {error}"
+                            ))
+                        })?;
+                    let witness_operators: Vec<String> =
+                        serde_json::from_str(&authorization_row.9).map_err(|error| {
+                            CatalogError::invalid(format!(
+                                "invalid registered transparency witness operators: {error}"
+                            ))
+                        })?;
+                    let earliest_witnessed_at = timestamp(
+                        authorization_row.10,
+                        "driver transparency earliest witness time",
+                    )?;
+                    let latest_witnessed_at = timestamp(
+                        authorization_row.11,
+                        "driver transparency latest witness time",
+                    )?;
+                    validate_loaded_transparency(
+                        &authorization,
+                        &transparency,
+                        &authorization_row.5,
+                        &log_origins,
+                        &log_operators,
+                        &witness_operators,
+                        earliest_witnessed_at,
+                        latest_witnessed_at,
+                    )?;
+                    Ok(StoredVerificationMaterial {
+                        authorization,
+                        transparency,
+                        log_origins,
+                        log_operators,
+                        witness_operators,
+                        earliest_witnessed_at,
+                        latest_witnessed_at,
+                    })
                 })
                 .collect::<CatalogResult<Vec<_>>>()?;
             validate_loaded_documents(
@@ -1066,7 +1354,7 @@ async fn load_release_for_target(
                 },
                 manifest,
                 release,
-                authorizations,
+                verification_materials,
             })
         })
         .await
@@ -1105,6 +1393,52 @@ fn validate_loaded_authorization(
         ));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_loaded_transparency(
+    authorization: &ValidatedDriverReleaseAuthorization,
+    transparency: &ValidatedDriverReleaseTransparencyProof,
+    proof_digest: &str,
+    log_origins: &[String],
+    log_operators: &[String],
+    witness_operators: &[String],
+    earliest_witnessed_at: DateTime<Utc>,
+    latest_witnessed_at: DateTime<Utc>,
+) -> CatalogResult<()> {
+    let authorization_digest = hex::encode(Sha256::digest(
+        authorization.canonical_json().map_err(|error| {
+            CatalogError::invalid(format!(
+                "cannot identify registered driver authorization for transparency: {error}"
+            ))
+        })?,
+    ));
+    let proof_origins = transparency
+        .get()
+        .entries
+        .iter()
+        .map(|entry| entry.log_origin.clone())
+        .collect::<Vec<_>>();
+    if transparency.canonical_sha256().as_str() != proof_digest
+        || transparency.get().authorization_sha256.value.as_str() != authorization_digest
+        || proof_origins != log_origins
+        || log_operators.is_empty()
+        || witness_operators.is_empty()
+        || !strictly_ordered(log_operators)
+        || !strictly_ordered(witness_operators)
+        || earliest_witnessed_at > latest_witnessed_at
+    {
+        return Err(CatalogError::invalid(
+            "registered provider driver transparency facts differ from the canonical proof",
+        ));
+    }
+    Ok(())
+}
+
+fn strictly_ordered(values: &[String]) -> bool {
+    values
+        .windows(2)
+        .all(|pair| pair[0].as_str() < pair[1].as_str())
 }
 
 fn persist_release_authorization(
@@ -1169,6 +1503,96 @@ fn persist_release_authorization(
             issued_at,
             expires_at,
             signer_key_ids_json,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn persist_release_transparency(
+    connection: &rusqlite::Connection,
+    release_digest: &Sha256Digest,
+    host: HostOperatingSystem,
+    transparency: &ReleaseTransparencyFacts,
+    now: i64,
+) -> CatalogResult<()> {
+    let log_origins_json = serde_json::to_string(&transparency.log_origins).map_err(|error| {
+        CatalogError::invalid(format!("cannot encode transparency log origins: {error}"))
+    })?;
+    let log_operators_json =
+        serde_json::to_string(&transparency.log_operators).map_err(|error| {
+            CatalogError::invalid(format!("cannot encode transparency log operators: {error}"))
+        })?;
+    let witness_operators_json =
+        serde_json::to_string(&transparency.witness_operators).map_err(|error| {
+            CatalogError::invalid(format!(
+                "cannot encode transparency witness operators: {error}"
+            ))
+        })?;
+    let earliest = transparency.earliest_witnessed_at.timestamp();
+    let latest = transparency.latest_witnessed_at.timestamp();
+    let existing = connection
+        .query_row(
+            "SELECT proof_json, authorization_sha256, log_origins_json,
+                    log_operators_json, witness_operators_json,
+                    earliest_witnessed_at, latest_witnessed_at
+               FROM provider_driver_release_transparency
+              WHERE release_sha256 = ?1 AND host_operating_system = ?2
+                AND proof_sha256 = ?3",
+            params![
+                release_digest.as_str(),
+                host.as_str(),
+                transparency.proof_digest.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing
+            != (
+                transparency.proof_json.clone(),
+                transparency.authorization_digest.to_string(),
+                log_origins_json,
+                log_operators_json,
+                witness_operators_json,
+                earliest,
+                latest,
+            )
+        {
+            return Err(CatalogError::conflict(
+                "provider driver transparency proof conflicts with its immutable durable record",
+            ));
+        }
+        return Ok(());
+    }
+    connection.execute(
+        "INSERT INTO provider_driver_release_transparency
+           (release_sha256, host_operating_system, proof_sha256, proof_json,
+            authorization_sha256, log_origins_json, log_operators_json,
+            witness_operators_json, earliest_witnessed_at, latest_witnessed_at,
+            created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            release_digest.as_str(),
+            host.as_str(),
+            transparency.proof_digest.as_str(),
+            transparency.proof_json,
+            transparency.authorization_digest.as_str(),
+            log_origins_json,
+            log_operators_json,
+            witness_operators_json,
+            earliest,
+            latest,
             now,
         ],
     )?;
@@ -1384,6 +1808,14 @@ fn trust_root_rotation_error(
     ))
 }
 
+fn transparency_error(
+    error: deis_provider_driver::DriverReleaseAuthorizationError,
+) -> CatalogError {
+    CatalogError::invalid(format!(
+        "provider driver release transparency verification failed: {error}"
+    ))
+}
+
 fn parse_digest(value: &str, label: &str) -> CatalogResult<Sha256Digest> {
     value
         .parse()
@@ -1440,6 +1872,16 @@ pub(crate) async fn seed_test_provider_driver_release(
             trust_root_version: 1,
             trust_root_digest: "c".repeat(64).parse().unwrap(),
         }),
+        transparency: Some(ReleaseTransparencyFacts {
+            proof_digest: "d".repeat(64).parse().unwrap(),
+            proof_json: "{}".to_owned(),
+            authorization_digest: "a".repeat(64).parse().unwrap(),
+            log_origins: vec!["test-only.invalid/log".to_owned()],
+            log_operators: vec!["test-only.invalid".to_owned()],
+            witness_operators: vec!["test-only.invalid".to_owned()],
+            earliest_witnessed_at: Utc::now() - chrono::TimeDelta::minutes(1),
+            latest_witnessed_at: Utc::now(),
+        }),
     };
     persist_verified_release(store, facts).await.unwrap();
 }
@@ -1460,8 +1902,11 @@ mod tests {
         DriverReleaseAuthorization, DriverReleaseAuthorizationSubject, DriverReleaseComponent,
         DriverReleaseDsseEnvelope, DriverReleaseDsseSignature, DriverReleaseFile,
         DriverReleaseRootRole, DriverReleaseSigningKey, DriverReleaseSigningKeyStatus,
-        DriverReleaseSigningRole, DriverReleaseTrustRoot, DriverTrustRootDsseEnvelope,
-        ProviderDriver, ProviderDriverManifest, ProviderDriverRelease, ToolDigest,
+        DriverReleaseSigningRole, DriverReleaseTransparencyEntry, DriverReleaseTransparencyLog,
+        DriverReleaseTransparencyPolicy, DriverReleaseTransparencyProof,
+        DriverReleaseTransparencyWitness, DriverReleaseTrustRoot, DriverTrustRootDsseEnvelope,
+        ProviderDriver, ProviderDriverManifest, ProviderDriverRelease,
+        TRANSPARENCY_PROOF_MEDIA_TYPE, ToolDigest,
     };
     use ed25519_dalek::{Signer as _, SigningKey};
     use serde::Serialize;
@@ -1488,6 +1933,7 @@ mod tests {
         manifest: ValidatedProviderDriverManifest,
         trust_root: ValidatedDriverReleaseTrustRoot,
         authorization: ValidatedDriverReleaseAuthorization,
+        transparency: ValidatedDriverReleaseTransparencyProof,
         contents: BTreeMap<String, Vec<u8>>,
     }
 
@@ -1537,7 +1983,8 @@ mod tests {
             manifest.supported_host_operating_systems = vec![host.as_str().to_owned()];
             manifest.driver.distribution_digest.value = release.canonical_sha256().unwrap();
             let manifest = ValidatedProviderDriverManifest::new(manifest).unwrap();
-            let (trust_root, authorization) = signed_authorization(&release, &manifest);
+            let (trust_root, authorization, transparency) =
+                signed_authorization(&release, &manifest);
 
             Self {
                 temporary,
@@ -1547,6 +1994,7 @@ mod tests {
                 manifest,
                 trust_root,
                 authorization,
+                transparency,
                 contents,
             }
         }
@@ -1570,6 +2018,7 @@ mod tests {
     ) -> (
         ValidatedDriverReleaseTrustRoot,
         ValidatedDriverReleaseAuthorization,
+        ValidatedDriverReleaseTransparencyProof,
     ) {
         let now = Utc::now();
         let signing_key = SigningKey::from_bytes(&[29; 32]);
@@ -1578,6 +2027,57 @@ mod tests {
         let root_signing_key = SigningKey::from_bytes(&[23; 32]);
         let root_public_key = root_signing_key.verifying_key().to_bytes();
         let root_key_id = hex::encode(Sha256::digest(root_public_key));
+        let log_signing_key = SigningKey::from_bytes(&[31; 32]);
+        let log_public_key = log_signing_key.verifying_key().to_bytes();
+        let log_key_id = hex::encode(Sha256::digest(log_public_key));
+        let witness_signing_key = SigningKey::from_bytes(&[33; 32]);
+        let witness_public_key = witness_signing_key.verifying_key().to_bytes();
+        let witness_key_id = hex::encode(Sha256::digest(witness_public_key));
+        let log_origin = "log.example.test/deislet";
+        let witness_name = "witness.example.test/deislet";
+        let mut keys = vec![
+            DriverReleaseSigningKey {
+                key_id: key_id.clone(),
+                key_type: "ed25519".to_owned(),
+                scheme: "ed25519".to_owned(),
+                public_key: STANDARD.encode(public_key),
+                status: DriverReleaseSigningKeyStatus::Active,
+                valid_from: now - TimeDelta::days(1),
+                valid_until: now + TimeDelta::days(90),
+                revoked_at: None,
+            },
+            DriverReleaseSigningKey {
+                key_id: root_key_id.clone(),
+                key_type: "ed25519".to_owned(),
+                scheme: "ed25519".to_owned(),
+                public_key: STANDARD.encode(root_public_key),
+                status: DriverReleaseSigningKeyStatus::Active,
+                valid_from: now - TimeDelta::days(1),
+                valid_until: now + TimeDelta::days(90),
+                revoked_at: None,
+            },
+            DriverReleaseSigningKey {
+                key_id: log_key_id.clone(),
+                key_type: "ed25519".to_owned(),
+                scheme: "ed25519".to_owned(),
+                public_key: STANDARD.encode(log_public_key),
+                status: DriverReleaseSigningKeyStatus::Active,
+                valid_from: now - TimeDelta::days(1),
+                valid_until: now + TimeDelta::days(90),
+                revoked_at: None,
+            },
+            DriverReleaseSigningKey {
+                key_id: witness_key_id.clone(),
+                key_type: "ed25519".to_owned(),
+                scheme: "ed25519".to_owned(),
+                public_key: STANDARD.encode(witness_public_key),
+                status: DriverReleaseSigningKeyStatus::Active,
+                valid_from: now - TimeDelta::days(1),
+                valid_until: now + TimeDelta::days(90),
+                revoked_at: None,
+            },
+        ];
+        keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
         let trust_root = ValidatedDriverReleaseTrustRoot::new(DriverReleaseTrustRoot {
             schema: Some("provider-driver-trust-root.schema.json".to_owned()),
             schema_version: 1,
@@ -1592,28 +2092,21 @@ mod tests {
                 threshold: 1,
                 max_authorization_lifetime_seconds: 7 * 24 * 60 * 60,
             },
-            keys: vec![
-                DriverReleaseSigningKey {
-                    key_id: key_id.clone(),
-                    key_type: "ed25519".to_owned(),
-                    scheme: "ed25519".to_owned(),
-                    public_key: STANDARD.encode(public_key),
-                    status: DriverReleaseSigningKeyStatus::Active,
-                    valid_from: now - TimeDelta::days(1),
-                    valid_until: now + TimeDelta::days(90),
-                    revoked_at: None,
-                },
-                DriverReleaseSigningKey {
-                    key_id: root_key_id,
-                    key_type: "ed25519".to_owned(),
-                    scheme: "ed25519".to_owned(),
-                    public_key: STANDARD.encode(root_public_key),
-                    status: DriverReleaseSigningKeyStatus::Active,
-                    valid_from: now - TimeDelta::days(1),
-                    valid_until: now + TimeDelta::days(90),
-                    revoked_at: None,
-                },
-            ],
+            provider_driver_transparency: Some(DriverReleaseTransparencyPolicy {
+                log_operator_threshold: 1,
+                witness_operator_threshold: 1,
+                logs: vec![DriverReleaseTransparencyLog {
+                    origin: log_origin.to_owned(),
+                    operator: "log-operator.example.test".to_owned(),
+                    key_id: log_key_id,
+                }],
+                witnesses: vec![DriverReleaseTransparencyWitness {
+                    name: witness_name.to_owned(),
+                    operator: "witness-operator.example.test".to_owned(),
+                    key_id: witness_key_id,
+                }],
+            }),
+            keys,
         })
         .unwrap();
         let authorization = DriverReleaseAuthorization {
@@ -1653,7 +2146,58 @@ mod tests {
             }],
         })
         .unwrap();
-        (trust_root, authorization)
+        let authorization_json = authorization.canonical_json().unwrap();
+        let mut leaf_hasher = Sha256::new();
+        leaf_hasher.update([0]);
+        leaf_hasher.update(&authorization_json);
+        let leaf_hash: [u8; 32] = leaf_hasher.finalize().into();
+        let body = format!("{log_origin}\n1\n{}\n", STANDARD.encode(leaf_hash));
+        let mut log_id_hasher = Sha256::new();
+        log_id_hasher.update(log_origin.as_bytes());
+        log_id_hasher.update(b"\n");
+        log_id_hasher.update([0x01]);
+        log_id_hasher.update(log_public_key);
+        let mut log_signature = log_id_hasher.finalize()[..4].to_vec();
+        log_signature.extend_from_slice(&log_signing_key.sign(body.as_bytes()).to_bytes());
+        let witnessed_at = now.timestamp();
+        let witness_message = format!("cosignature/v1\ntime {witnessed_at}\n{body}");
+        let mut witness_id_hasher = Sha256::new();
+        witness_id_hasher.update(witness_name.as_bytes());
+        witness_id_hasher.update(b"\n");
+        witness_id_hasher.update([0x04]);
+        witness_id_hasher.update(witness_public_key);
+        let mut witness_signature = witness_id_hasher.finalize()[..4].to_vec();
+        witness_signature.extend_from_slice(&u64::try_from(witnessed_at).unwrap().to_be_bytes());
+        witness_signature.extend_from_slice(
+            &witness_signing_key
+                .sign(witness_message.as_bytes())
+                .to_bytes(),
+        );
+        let checkpoint = format!(
+            "{body}\n— {log_origin} {}\n— {witness_name} {}\n",
+            STANDARD.encode(log_signature),
+            STANDARD.encode(witness_signature)
+        );
+        let transparency =
+            ValidatedDriverReleaseTransparencyProof::new(DriverReleaseTransparencyProof {
+                schema: Some("provider-driver-transparency-proof.schema.json".to_owned()),
+                schema_version: 1,
+                media_type: TRANSPARENCY_PROOF_MEDIA_TYPE.to_owned(),
+                authorization_sha256: ToolDigest {
+                    algorithm: "sha256".to_owned(),
+                    value: hex::encode(Sha256::digest(&authorization_json))
+                        .parse()
+                        .unwrap(),
+                },
+                entries: vec![DriverReleaseTransparencyEntry {
+                    log_origin: log_origin.to_owned(),
+                    log_index: 0,
+                    inclusion_path: Vec::new(),
+                    checkpoint,
+                }],
+            })
+            .unwrap();
+        (trust_root, authorization, transparency)
     }
 
     fn signed_root_rotation(next_root: DriverReleaseTrustRoot) -> ValidatedDriverTrustRootRotation {
@@ -1722,6 +2266,7 @@ mod tests {
                     fixture.release.clone(),
                     fixture.manifest.clone(),
                     fixture.authorization.clone(),
+                    fixture.transparency.clone(),
                 )
                 .await
                 .unwrap_err()
@@ -1733,6 +2278,7 @@ mod tests {
                 fixture.release.clone(),
                 fixture.manifest.clone(),
                 fixture.authorization.clone(),
+                fixture.transparency.clone(),
                 &fixture.archive,
             )
             .await
@@ -1752,6 +2298,7 @@ mod tests {
                 fixture.release.clone(),
                 fixture.manifest.clone(),
                 fixture.authorization.clone(),
+                fixture.transparency.clone(),
             )
             .await
             .unwrap();
@@ -1767,12 +2314,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["registered", "verified"]
         );
-        let (_, renewed_authorization) = signed_authorization(&fixture.release, &fixture.manifest);
+        let (_, renewed_authorization, renewed_transparency) =
+            signed_authorization(&fixture.release, &fixture.manifest);
         let renewed = registry
             .register_existing(
                 fixture.release.clone(),
                 fixture.manifest.clone(),
                 renewed_authorization,
+                renewed_transparency,
             )
             .await
             .unwrap();
@@ -1790,6 +2339,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authorization_count, 2);
+        let release_digest = renewed.release_digest.to_string();
+        let transparency_count: i64 = database
+            .with_connection(move |connection| {
+                Ok::<i64, crate::database::DatabaseError>(connection.query_row(
+                    "SELECT count(*) FROM provider_driver_release_transparency
+                      WHERE release_sha256 = ?1",
+                    [release_digest],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(transparency_count, 2);
         assert!(
             registry
                 .audit_events(registered.release_digest.clone(), 0)
@@ -1807,6 +2369,28 @@ mod tests {
                           WHERE release_sha256 = ?1 AND host_operating_system = ?2",
                         params![release_digest, host],
                     )?;
+                    Ok::<(), crate::database::DatabaseError>(())
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .with_connection(|connection| {
+                    connection.execute(
+                        "UPDATE provider_driver_release_transparency
+                            SET witness_operators_json = '[]'",
+                        [],
+                    )?;
+                    Ok::<(), crate::database::DatabaseError>(())
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .with_connection(|connection| {
+                    connection.execute("DELETE FROM provider_driver_release_transparency", [])?;
                     Ok::<(), crate::database::DatabaseError>(())
                 })
                 .await
@@ -1861,11 +2445,32 @@ mod tests {
                 fixture.release.clone(),
                 fixture.manifest.clone(),
                 tampered,
+                fixture.transparency.clone(),
                 &fixture.archive,
             )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("signature verification failed"));
+        assert_eq!(fs::read_dir(&fixture.install_root).unwrap().count(), 0);
+
+        let mut wrong_subject = fixture.transparency.get().clone();
+        wrong_subject.authorization_sha256.value = "0".repeat(64).parse().unwrap();
+        let wrong_subject = ValidatedDriverReleaseTransparencyProof::new(wrong_subject).unwrap();
+        let error = registry
+            .install_and_register(
+                fixture.release.clone(),
+                fixture.manifest.clone(),
+                fixture.authorization.clone(),
+                wrong_subject,
+                &fixture.archive,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("canonical authorization envelope")
+        );
         assert_eq!(fs::read_dir(&fixture.install_root).unwrap().count(), 0);
     }
 
@@ -1874,6 +2479,10 @@ mod tests {
         let fixture = Fixture::new();
         let mut legacy_value = serde_json::to_value(fixture.trust_root.get()).unwrap();
         legacy_value.as_object_mut().unwrap().remove("root");
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("providerDriverTransparency");
         let legacy_json = serde_jcs::to_vec(&legacy_value).unwrap();
         let legacy_root =
             ValidatedDriverReleaseTrustRoot::parse_json_compatible(&legacy_json).unwrap();
@@ -1955,6 +2564,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_transparency_explicit_root_can_only_restart_and_rotate() {
+        let fixture = Fixture::new();
+        let mut legacy_value = serde_json::to_value(fixture.trust_root.get()).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("providerDriverTransparency");
+        let legacy_json = serde_jcs::to_vec(&legacy_value).unwrap();
+        assert!(ValidatedDriverReleaseTrustRoot::parse_json(&legacy_json).is_err());
+        let legacy_root =
+            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&legacy_json).unwrap();
+        assert!(!legacy_root.uses_legacy_implicit_root_role());
+        assert!(legacy_root.uses_legacy_missing_transparency_policy());
+        assert_eq!(legacy_root.canonical_json().unwrap(), legacy_json);
+
+        let bootstrap_database = Arc::new(
+            Database::init(
+                fixture
+                    .temporary
+                    .path()
+                    .join("pre-transparency-bootstrap.sqlite"),
+            )
+            .await
+            .unwrap(),
+        );
+        let bootstrap_error = ProviderDriverReleaseRegistry::new(
+            CatalogStore::new(bootstrap_database),
+            &fixture.install_root,
+            legacy_root.clone(),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(bootstrap_error.to_string().contains("transparency policy"));
+
+        let database = Arc::new(
+            Database::init(
+                fixture
+                    .temporary
+                    .path()
+                    .join("pre-transparency-upgrade.sqlite"),
+            )
+            .await
+            .unwrap(),
+        );
+        let root_version = i64::try_from(legacy_root.get().root_version).unwrap();
+        let root_digest = legacy_root.canonical_sha256().to_string();
+        let root_json = String::from_utf8(legacy_root.canonical_json().unwrap()).unwrap();
+        let expires_at = legacy_root.get().expires_at.timestamp();
+        database
+            .with_connection(move |connection| {
+                connection.execute(
+                    "INSERT INTO provider_driver_trust_roots
+                       (root_version, root_sha256, root_json, expires_at,
+                        first_seen_at, last_seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![root_version, root_digest, root_json, expires_at, now_secs()],
+                )?;
+                Ok::<(), crate::database::DatabaseError>(())
+            })
+            .await
+            .unwrap();
+        let store = CatalogStore::new(Arc::clone(&database));
+        ProviderDriverReleaseRegistry::new(store.clone(), &fixture.install_root, legacy_root, None)
+            .await
+            .unwrap();
+
+        let mut next_root = fixture.trust_root.get().clone();
+        next_root.root_version = 2;
+        next_root.expires_at += TimeDelta::days(30);
+        let rotation = signed_root_rotation(next_root.clone());
+        ProviderDriverReleaseRegistry::new(
+            store,
+            &fixture.install_root,
+            ValidatedDriverReleaseTrustRoot::new(next_root).unwrap(),
+            Some(rotation),
+        )
+        .await
+        .unwrap();
+        let counts: (i64, i64) = database
+            .with_connection(|connection| {
+                Ok::<(i64, i64), crate::database::DatabaseError>((
+                    connection.query_row(
+                        "SELECT count(*) FROM provider_driver_trust_roots",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT count(*) FROM provider_driver_trust_root_rotations",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (2, 1));
+    }
+
+    #[test]
+    fn retained_transparency_keys_cannot_change_operator_identity() {
+        let fixture = Fixture::new();
+        let previous = fixture.trust_root.clone();
+        let historical = vec![String::from_utf8(previous.canonical_json().unwrap()).unwrap()];
+
+        let mut renamed_log = previous.get().clone();
+        renamed_log.root_version += 1;
+        renamed_log
+            .provider_driver_transparency
+            .as_mut()
+            .unwrap()
+            .logs[0]
+            .operator = "different-log-operator.example.test".to_owned();
+        let renamed_log = ValidatedDriverReleaseTrustRoot::new(renamed_log).unwrap();
+        let error =
+            validate_trust_root_transition(&historical, &previous, &renamed_log).unwrap_err();
+        assert!(error.to_string().contains("retained transparency log key"));
+
+        let mut renamed_witness = previous.get().clone();
+        renamed_witness.root_version += 1;
+        renamed_witness
+            .provider_driver_transparency
+            .as_mut()
+            .unwrap()
+            .witnesses[0]
+            .name = "different-witness.example.test/deislet".to_owned();
+        let renamed_witness = ValidatedDriverReleaseTrustRoot::new(renamed_witness).unwrap();
+        let error =
+            validate_trust_root_transition(&historical, &previous, &renamed_witness).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("retained transparency witness key")
+        );
+
+        let mut reassigned_roles = previous.get().clone();
+        reassigned_roles.root_version += 1;
+        let release_key_id = reassigned_roles.provider_driver_release.key_ids[0].clone();
+        let log_key_id = reassigned_roles
+            .provider_driver_transparency
+            .as_ref()
+            .unwrap()
+            .logs[0]
+            .key_id
+            .clone();
+        reassigned_roles.provider_driver_release.key_ids = vec![log_key_id];
+        reassigned_roles
+            .provider_driver_transparency
+            .as_mut()
+            .unwrap()
+            .logs[0]
+            .key_id = release_key_id;
+        let reassigned_roles = ValidatedDriverReleaseTrustRoot::new(reassigned_roles).unwrap();
+        let error =
+            validate_trust_root_transition(&historical, &previous, &reassigned_roles).unwrap_err();
+        assert!(error.to_string().contains("between trust roles"));
+    }
+
+    #[tokio::test]
     async fn every_driver_selection_rechecks_current_key_revocation() {
         let fixture = Fixture::new();
         let database = Arc::new(
@@ -1976,6 +2745,7 @@ mod tests {
                 fixture.release.clone(),
                 fixture.manifest.clone(),
                 fixture.authorization.clone(),
+                fixture.transparency.clone(),
                 &fixture.archive,
             )
             .await
@@ -2024,7 +2794,7 @@ mod tests {
         assert!(
             expired_error
                 .to_string()
-                .contains("no current authorization")
+                .contains("no current transparent authorization")
         );
         assert_eq!(
             registry
@@ -2056,8 +2826,14 @@ mod tests {
 
         let mut revoked_root = fixture.trust_root.get().clone();
         revoked_root.root_version += 1;
-        revoked_root.keys[0].status = DriverReleaseSigningKeyStatus::Revoked;
-        revoked_root.keys[0].revoked_at = Some(Utc::now());
+        let revoked_release_key_id = revoked_root.provider_driver_release.key_ids[0].clone();
+        let revoked_release_key = revoked_root
+            .keys
+            .iter_mut()
+            .find(|key| key.key_id == revoked_release_key_id)
+            .unwrap();
+        revoked_release_key.status = DriverReleaseSigningKeyStatus::Revoked;
+        revoked_release_key.revoked_at = Some(Utc::now());
         let missing_rotation_error = ProviderDriverReleaseRegistry::new(
             store.clone(),
             &fixture.install_root,
@@ -2085,7 +2861,11 @@ mod tests {
             .resolve_for_target(target.target_id)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("no current authorization"));
+        assert!(
+            error
+                .to_string()
+                .contains("no current transparent authorization")
+        );
         assert_eq!(
             revoked_registry
                 .release(registered.release_digest)
@@ -2195,6 +2975,7 @@ mod tests {
                 fixture.release.clone(),
                 fixture.manifest.clone(),
                 fixture.authorization.clone(),
+                fixture.transparency.clone(),
                 &fixture.archive,
             )
             .await
@@ -2291,6 +3072,7 @@ mod tests {
                     fixture.release.clone(),
                     fixture.manifest.clone(),
                     fixture.authorization.clone(),
+                    fixture.transparency.clone(),
                 )
                 .await
                 .unwrap_err()

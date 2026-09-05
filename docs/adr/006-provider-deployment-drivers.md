@@ -320,8 +320,46 @@ provider driver 平台适用测试、Control provider 专项、legacy migration 
 重复 provider side effect。该证据同时覆盖显式 root role、旧/新根双阈值、过期旧根恢复、最终新根有效期、不可变轮换
 记录，以及 pre-root-role v1 历史根重启和一次性迁移。
 
+## 发行透明度与离线证明
+
+阈值 DSSE 只能证明受信 release signer 授权了某个发行，不能证明授权已进入可审计、可交叉见证的公共历史。统一契约
+因此新增 `provider-driver-transparency-proof` sidecar；它不复制任何单一 vendor 的 REST response，而是组合行业已有的
+可验证原语：RFC 6962 Merkle inclusion、C2SP signed note/checkpoint 和 timestamped witness cosignature。proof 绑定 exact
+canonical authorization envelope 的 SHA-256；日志 leaf 固定为 `SHA-256(0x00 || canonical envelope)`，内部节点固定为
+`SHA-256(0x01 || left || right)`。每个 entry 保存 log origin/index、inclusion path 和完整签名 checkpoint，因而运行时
+不需要信任在线日志返回的 `integratedTime`，也不需要联网查询才能复核历史证明。
+
+信任根的 transparency policy 固定日志与见证者的 note name/origin、operator、Ed25519 key ID，以及不同日志 operator
+和不同见证者 operator 的阈值。日志、见证者各自不得复用密钥，且这些密钥不得与 root/release signer 角色复用；日志
+operator 也不得自任见证者 operator。阈值只按不同 operator 计数，不能用同一运营主体的多次部署或多把 key 扩大票数。
+log operator 阈值不得超过 v1 proof 的 16-entry 上限，避免接受永远无法满足的信任根。每个 checkpoint 必须单独达到
+witness operator 阈值，整份 proof 还必须达到 log operator 阈值。log origin 与 witness name 在一个策略内分别唯一，
+不能用同一 note identity 表达多个运营主体。见证时间必须位于
+authorization 有效期、对应 witness key 有效期和当前时间之前；log key 至少在其中一个受信见证时间有效。保留同一日志
+或见证者 key 的根轮换不能改变其 origin/name 或 operator；需要变更运营身份时必须使用新 key，避免只改显示文本重算
+信任票数。已经出现在 root、release、log 或 witness 角色历史中的 key 也不能在后续轮换时改任另一角色；角色转换必须
+生成新 key，旧 key 只保留在不可变历史中。
+
+C2SP signed-note key ID 按 `SHA-256(name || "\n" || signature-type || raw-public-key)` 的前四字节计算；日志签名类型固定
+为 Ed25519 `0x01`，见证签名固定为 timestamped Ed25519 `0x04`。解析拒绝未知 checkpoint extension、非 canonical
+decimal/base64、控制字符、重复受信签名、错误宽度和过长输入；不认识的 note signature 可以保留以支持独立生态演化，
+但任何匹配已受信 name/key ID 的损坏签名都会失败关闭。当前 v1 wrapper 有意不宣称与 Sigstore bundle v0.3 字节兼容：
+Sigstore bundle 是可参考的交换格式，但其 DSSE message signature 约束与本产品已有的多签阈值 authorization 不相同；
+Deislet 的统一应用/部署标准不能因此退化为某一个供应商 envelope。
+
+Control 在 archive 解包前依次验证 DSSE 与透明 proof；两者和安装/registry 事实在同一事务中持久化。原始 proof、摘要、
+authorization 摘要、log origins/operators、witness operators 和最早/最晚见证时间均不可修改、不可删除。active target
+必须具有同一 host authorization 对应的 transparency row；升级时只有签名、没有 proof 的旧 active target 会自动
+disabled，后续 activation 仍被独立新触发器拒绝。每次 executable selection 都从持久 canonical JSON 重新执行签名、
+inclusion、checkpoint、见证阈值及时间验证，并复核派生事实，不能只相信注册时的布尔结果。
+
+为兼容已部署的显式 root、但不静默降低新基线，旧 root 若缺 `providerDriverTransparency` 只能按原 canonical bytes
+作为既有最高版本重启，以便提交受旧/新 root 双阈值保护的下一版轮换；它不能用于全新 bootstrap，也不能启用 dispatcher。
+轮换到带透明策略的新根后立即退出恢复模式。当前契约 fixture 使用确定性合成日志/见证 key 和单叶树，密码学实现与
+迁移边界已有本机回归；提交后的三平台 exact-archive evidence 尚待登记，且这仍不等于接入真实公共日志或独立见证服务。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
-Sigstore/Rekor 或等价透明证明，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
+真实透明日志/独立 witness 的采集与可用性运营，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
 完整 backend driver 和真实账户 evidence 也未完成。在这些完成并获得真实账户证据前，不能把当前 dispatcher 称作已部署
 的 provider 服务，更不能升级 backend 支持状态。
 
@@ -338,6 +376,12 @@ Sigstore/Rekor 或等价透明证明，以及 Windows service account DACL。公
 - `https://github.com/secure-systems-lab/dsse/blob/master/protocol.md`
 - `https://theupdateframework.github.io/specification/latest/`
 - `https://docs.sigstore.dev/about/bundle/`
+- `https://c2sp.org/tlog-proof`
+- `https://c2sp.org/tlog-checkpoint@v1.0.0`
+- `https://c2sp.org/signed-note@v1.0.0`
+- `https://c2sp.org/tlog-cosignature@v1.0.1`
+- `https://github.com/sigstore/protobuf-specs/blob/main/protos/sigstore_bundle.proto`
+- `https://github.com/sigstore/protobuf-specs/blob/main/protos/sigstore_trustroot.proto`
 - `https://developers.cloudflare.com/workers/wrangler/commands/`
 - `https://developers.cloudflare.com/workers/versions-and-deployments/`
 - `https://pages.edgeone.ai/document/edgeone-cli`

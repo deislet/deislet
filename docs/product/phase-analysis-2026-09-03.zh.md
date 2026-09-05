@@ -2232,3 +2232,42 @@ Application/framework source + versioned build plan
   完成度。fixture 仍为合成 release/key/root；Sigstore/Rekor 或等价 transparency inclusion/checkpoint、真实签署的
   materialized release、Windows service-account DACL、公共 API/CLI/Web、后台 dispatcher loop、三家完整 driver 和
   真实账户 lifecycle/conformance evidence 仍未完成。`P1-DEPLOY-001` 保持 active，所有 backend 的支持状态不变。
+
+## 80. Provider release 的离线透明证明与见证阈值
+
+- Root rotation 完成后继续审查供应链边界，发现 threshold DSSE 仍只能证明受信 publisher 授权了一组 bytes，不能证明
+  该授权进入可审计且由独立主体见证的历史。当前实现新增统一 `provider-driver-transparency-proof` sidecar，不复制任何
+  vendor REST response；它精确绑定 canonical authorization envelope 的 SHA-256，并用 RFC 6962
+  `SHA-256(0x00 || leaf)`、`SHA-256(0x01 || left || right)` 验证 log index/inclusion path 到 signed checkpoint root。
+  checkpoint 使用严格 C2SP signed-note 三行 body；日志 Ed25519 signature type 为 `0x01`，见证使用带 POSIX 秒数的
+  timestamped Ed25519 cosignature type `0x04`。解析拒绝 extension、控制字符、非 canonical decimal/base64、错误摘要
+  宽度、重复受信签名、超长 note/path 和多余或不完整 inclusion path。
+- 信任根新增日志与 witness 的 origin/name、operator、key ID 和两个 operator threshold。log/witness key 相互唯一，且
+  不得与 root/release signing role 复用；日志 operator 与 witness operator 不得重合，阈值只按不同 operator 计数，
+  同一运营方增加 deployment 或 key 不能扩票。log origin 与 witness name 各自唯一，log threshold 不能超过 v1 proof
+  的 16-entry 容量，避免合法 root 定义出永远无法满足的门槛。每个 checkpoint 必须独立满足 witness operator threshold，整份 proof
+  再满足 log operator threshold。witness time 必须同时落在 authorization window、witness key window、当前时间之前，
+  log key 也必须在至少一个受信见证时刻有效。根轮换若保留同一透明 key，不得更改其 origin/name/operator；更换运营
+  身份必须换 key，避免以文本重标绕过历史 role retirement。已经用于 root/release/log/witness 任一角色的历史 key
+  也不得在后续改任另一角色；角色转换必须生成新 key。
+- Control 在展开 archive 之前先验证 DSSE，再验证透明 proof；同一事务保存 immutable authorization、proof、proof/
+  authorization digest、log origins/operators、witness operators 和见证时间范围，update/delete trigger 禁止改写。
+  每次 executable selection 都从持久 canonical JSON 重跑 authorization、inclusion、checkpoint、witness threshold 与
+  时间校验，并核对派生事实。active target 的 release/authorization 必须能 join 到 transparency row；已有数据库中
+  只有签名而没有 proof 的 active target 在升级时自动 disabled，独立的新 insert/activation trigger 防止旧命名 trigger
+  因 `CREATE IF NOT EXISTS` 保留旧逻辑而绕过。迁移回归同时证明该 target 不能重新激活。
+- 上一版已有显式 root、但没有 `providerDriverTransparency` 的 durable history 保持原 canonical bytes/digest，仅允许
+  同版本恢复并完成受旧/新 root 双阈值保护的下一版轮换；严格 parser、新 bootstrap 和 dispatcher 启用都拒绝该形态。
+  API 启动日志现在明确标记 recovery-only，而不再错误宣称外部 provider execution 已启用。轮换进入带透明策略的新根
+  后退出兼容路径。
+- 共享契约现为 16 份 Schema/48 组正反 fixture；valid fixture 使用确定性合成 log/witness key、单叶 Merkle tree、真实
+  signed checkpoint 与 timestamped witness signature。Python 校验结构、角色隔离、operator 独立、threshold、canonical
+  authorization digest 和单叶 root；Rust 执行真实 Ed25519、RFC 6962 平衡/非平衡树、篡改、时间和角色隔离验证。本机
+  provider-driver 62/62、Control transparency/root 专项 7/7、signed-but-unlogged migration 1/1、Control lib 462/462、
+  API integration 14/14、五个部署控制 crate 的严格 all-target Clippy 与产品治理均已通过。提交后三平台 exact-archive
+  尚待完成，当前本机结果不能冒充跨平台 evidence。
+- 该 wrapper 参考 C2SP tlog proof/checkpoint/signed-note/cosignature 与 Sigstore trust-root/bundle 职责，但不宣称与
+  Sigstore bundle v0.3 字节兼容：其 DSSE message signature 约束不等同于本产品已有的多签阈值 authorization。当前也
+  尚无真实公共透明日志、独立 witness 采集/可用性运营、真实 materialized release 和离线签署 ceremony；Windows DACL、
+  公共 API/CLI/Web、后台 dispatcher loop、三家完整 driver 与真实账户 lifecycle/conformance evidence 仍是明确阻断项。
+  `P1-DEPLOY-001` 保持 active，所有 backend 支持状态不变。
