@@ -2230,6 +2230,24 @@ name = "deis-node-contract"
 version = "0.1.0"
 
 [[package]]
+name = "deis-provider-driver"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "deis-wire",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "deis-proxy"
 version = "0.1.0"
 dependencies = [

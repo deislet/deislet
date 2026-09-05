@@ -1794,3 +1794,44 @@ Application/framework source + versioned build plan
   带入控制面编译/链接边界。纯 canonical artifact 和 provider derivation 真源现已迁到独立
   `deis-artifact` crate；`deis-build` 保持同名 re-export 兼容，Control 只依赖轻量 crate。依赖树回归证明
   Control 不再包含 `deis-build`、`deis-build-core` 或任一 adapter，CI compiler shard 显式测试该 crate。
+
+## 62. Provider-neutral driver contract 与官方工具安全边界
+
+- 复核确认此前的 `provider-driver.schema.json` 只有机器 fixture，生产代码没有共同 driver API，也没有任何机制
+  强制 12 个生命周期操作、exact desired state、provider native identity、未知结果查询或凭证传输约束。构建
+  adapter 能生成 payload 但不能因此宣称 deployment support；现有 Deislet deploy 也仍是专用调用链，不是统一
+  backend driver。
+- 新增轻量 `deis-provider-driver` crate，固定
+  `preflight/plan/prepare/upload/verify/activate/observe/rollback/inspect/reconcile/delete/cleanup` 12 个操作，并以
+  共享 request/receipt/error 绑定 canonical operation、application、environment、installation、target、artifact
+  lineage 与 desired-state SHA-256。proposal manifest 的 `supportedStandardVersions` 继续为空；Rust manifest parser
+  与 JSON Schema 一样拒绝未知字段、不完整操作、非规范摘要、弱化 credential/execution/claim policy。成功 upload
+  必须返回 immutable provider version ID，成功 activate 必须返回 deployment ID；可能已经产生副作用的 unknown/
+  failed 结果只能 observe/reconcile/rollback 或人工介入，不能直接 retry。
+- 官方 CLI 的唯一共享执行边界要求绝对 executable 路径、regular non-symlink 文件与 exact executable SHA-256，
+  不查找 PATH、不拼 shell、清空继承环境、显式 cwd、非交互参数数组、有限 stdin/stdout/stderr 与 deadline。
+  credential 类型不实现 Serialize/Clone，owned allocation 在 drop 时清零；只允许短期环境或 stdin 注入，运行前
+  扫描并拒绝出现在 executable/cwd/argv/公开环境中的 credential，Debug、JSON、stdout/stderr 与错误诊断都按
+  实际 credential 脱敏。Unix 为子进程建立独立 process group，Windows 使用带
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object；超时、stdin/capture 边界失败会终止进程树。side-effecting
+  命令的 timeout、非零退出、输出超限或非结构化输出都返回 reconcile，而不是盲目重放。
+- `provider-drivers/official-tool-lock.json` 现固定 Wrangler 4.129.0 tarball SHA-256
+  `08912bc89315a123bd22c8c29813bde70838e0b0e7eaee4369b8e0ba02dac81c` 与 EdgeOne 1.6.33 SHA-256
+  `92be7b1cf7a64512f6a03913b594259dd835b003a9faa00df7e780418ba80478`，同时保存 npm SHA-512 SRI、精确 registry
+  URL 和官方文档。校验器离线检查 schema/语义，升级评审可重新下载并同时重算 SHA-256 与 SRI；本轮两份真实
+  tarball 重算均通过。该来源锁只证明下载 bytes，不证明命令行为、driver completeness 或 conformance。
+- Cloudflare 官方把 `CLOUDFLARE_API_TOKEN` 定义为 CI/automation 环境变量，因此 Wrangler 可作为候选内部工具；
+  每条采用的命令仍要验证固定版本机器输出、upload/activate 分离、status/reconcile 和 live account 行为。EdgeOne
+  官方 CI 部署则要求 `edgeone makers deploy ... -t/--token`；这会把管理凭证暴露在 argv，与统一契约
+  `argvAllowed: false` 直接冲突。服务端 EdgeOne CLI 路线已明确标为 blocked，只能采用安全官方 API/SDK、
+  已认证安全上下文，或等待/推动 CLI 提供 environment/stdin/keyring transport，不能为供应商特例降低标准。
+- 当前本机 Rust 1.96.0 为 18/18，Windows 10/Rust 1.96.0 的第一版 Job Object 切片为 10/10，macOS arm64/
+  Rust 1.97.0 上一切片为 17/17；本机 Windows MSVC/GNU cross-check 和严格 clippy 均通过。提交后仍须在精确 source
+  commit 上复跑三平台并形成不可变 evidence；macOS 的仓库固定 Rust 1.96.0 下载尚未完成，1.97.0 结果不能冒充
+  固定工具链证据。
+- 该切片仍不是 `P1-DEPLOY-001` 完成。缺少受信 installer 与完整 materialized CLI dependency-tree lock，单文件
+  executable hash 不能证明 npm 安装树，也仍需通过只读安装目录/ACL 或可验证封装关闭 hash-to-exec 替换窗口。
+  durable provider operation store、driver orchestrator、credential lease/audit、Deislet 内置 driver、Cloudflare
+  完整 driver、EdgeOne 安全 transport、CLI/API/Web 接线，以及三个真实账户的 preview→verify→activate→observe→
+  rollback→delete/cleanup evidence 均未实现；因此 roadmap 只把本项从 queued 改为 active，不能生成完整 manifest
+  或改变任何 backend 的 not-certified/not-supported 状态。

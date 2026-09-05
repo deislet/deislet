@@ -1,0 +1,32 @@
+[package]
+name = "deis-provider-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository = "https://github.com/deislet/deislet"
+description = "Provider-neutral deployment driver contract and secure official-tool boundary"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+deis-wire = { workspace = true }
+hex = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { workspace = true }
+zeroize = "1.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"

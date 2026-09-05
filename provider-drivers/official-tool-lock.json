@@ -1,0 +1,47 @@
+{
+  "$schema": "official-tool-lock.schema.json",
+  "schemaVersion": 1,
+  "observedAt": "2026-09-05T21:30:43+08:00",
+  "tools": [
+    {
+      "provider": "cloudflare-workers-pages",
+      "tool": "wrangler",
+      "package": "wrangler",
+      "version": "4.129.0",
+      "registry": "https://registry.npmjs.org",
+      "tarball": "https://registry.npmjs.org/wrangler/-/wrangler-4.129.0.tgz",
+      "npmIntegrity": "sha512-PGPvs9UPoFrwxT0VogpESSZGvZIctAuTK3wGsLLPHtHsSgS85kNdvtpa2d14UzG8gwLWD64XUGFPGG9tOXG9VQ==",
+      "distributionSha256": "08912bc89315a123bd22c8c29813bde70838e0b0e7eaee4369b8e0ba02dac81c",
+      "documentation": [
+        "https://developers.cloudflare.com/workers/wrangler/commands/",
+        "https://developers.cloudflare.com/workers/wrangler/system-environment-variables/"
+      ],
+      "serverAutomation": {
+        "status": "candidate",
+        "credentialTransport": ["short-lived-environment"],
+        "credentialInArgv": false,
+        "reason": "Wrangler documents CLOUDFLARE_API_TOKEN for CI and automation; each selected command still needs pinned structured-output contract tests before a driver manifest may claim it."
+      }
+    },
+    {
+      "provider": "tencent-edgeone-makers",
+      "tool": "edgeone",
+      "package": "edgeone",
+      "version": "1.6.33",
+      "registry": "https://registry.npmjs.org",
+      "tarball": "https://registry.npmjs.org/edgeone/-/edgeone-1.6.33.tgz",
+      "npmIntegrity": "sha512-ZqUod8xQJ5FrEFsh8+i7OuILrwxUil4udX3PMZWxFbsG7NOkogZsWeLO2ELtbsH4E5Q3AZSJCzBydjHyy2RNVg==",
+      "distributionSha256": "92be7b1cf7a64512f6a03913b594259dd835b003a9faa00df7e780418ba80478",
+      "documentation": [
+        "https://pages.edgeone.ai/document/edgeone-cli",
+        "https://pages.edgeone.ai/document/api-token"
+      ],
+      "serverAutomation": {
+        "status": "blocked",
+        "credentialTransport": [],
+        "credentialInArgv": true,
+        "reason": "The documented non-interactive deploy interface requires -t/--token, which exposes the management credential in argv and violates the unified driver contract. Control must use an official API/SDK or a future safe CLI credential transport."
+      }
+    }
+  ]
+}

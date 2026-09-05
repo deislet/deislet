@@ -60,6 +60,8 @@ jobs:
         run: python3 scripts/check-product-governance.py
       - name: Execute shared product contract fixtures
         run: python3 scripts/check-shared-contracts.py
+      - name: Validate official provider tool source pins
+        run: python3 scripts/check-provider-tool-lock.py
       - name: Reject target status drift from the locked registry
         run: python3 scripts/generate-target-status.py --check
 
@@ -276,7 +278,7 @@ jobs:
           npm run build
 
       - name: Control plane and service tests
-        run: cargo test -p deis-wire -p deis-backend-migration -p deis-backend-topology -p deis-control -p deis-store -p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests --no-fail-fast
+        run: cargo test -p deis-wire -p deis-provider-driver -p deis-backend-migration -p deis-backend-topology -p deis-control -p deis-store -p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests --no-fail-fast
 
   demo:
     name: the demo runs end to end

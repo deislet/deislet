@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-05T20:41:33+08:00",
+  "updatedAt": "2026-09-05T21:30:43+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -14,6 +14,7 @@
     "P0-SPEC-002",
     "P0-MODEL-001",
     "P1-BUILD-001",
+    "P1-DEPLOY-001",
     "P1-PLAT-001",
     "P2-DATA-001"
   ],
@@ -245,10 +246,21 @@
           "id": "P1-DEPLOY-001",
           "title": "实现统一 provider driver API 与 CLI 生命周期",
           "owner": "deislet",
-          "status": "queued",
+          "status": "active",
           "dependsOn": ["P1-BUILD-001"],
-          "outputs": [{"type": "planned-path", "value": "prepare/verify/activate/status/rollback driver API"}],
-          "verification": "官方 vendor CLI/API 版本固定，错误和 operation 状态统一"
+          "outputs": [
+            {"type": "local-path", "value": "crates/deis-provider-driver/src/lib.rs"},
+            {"type": "local-path", "value": "crates/deis-provider-driver/src/model.rs"},
+            {"type": "local-path", "value": "crates/deis-provider-driver/src/manifest.rs"},
+            {"type": "local-path", "value": "crates/deis-provider-driver/src/lifecycle.rs"},
+            {"type": "local-path", "value": "crates/deis-provider-driver/src/executor.rs"},
+            {"type": "local-path", "value": "provider-drivers/official-tool-lock.json"},
+            {"type": "local-path", "value": "provider-drivers/official-tool-lock.schema.json"},
+            {"type": "local-path", "value": "scripts/check-provider-tool-lock.py"},
+            {"type": "planned-path", "value": "durable provider operation store and orchestrator"},
+            {"type": "planned-path", "value": "Cloudflare, EdgeOne and Deislet complete driver manifests and live evidence"}
+          ],
+          "verification": "共享 crate 已执行 provider-driver schema 的 12 个固定操作，request/receipt/error exact identity、unknown result query-before-retry 和上传/激活 native identity 均 fail closed；官方工具只可由绝对路径、regular non-symlink executable digest、清空环境、非 shell 参数数组、非 argv 凭证、结构化输出、总 deadline、输出限额、脱敏及 Unix process group/Windows Job Object 边界执行。本机当前 18 项测试、Windows 10/Rust 1.96.0 第一版 Job Object 切片 10 项测试和 macOS arm64/Rust 1.97.0 上一切片 17 项测试通过；Wrangler 4.129.0 与 EdgeOne 1.6.33 npm tarball 已重算 SRI/SHA-256。Cloudflare 仍须逐命令 contract/live tests；EdgeOne CLI 因官方 CI token 必须进入 -t/--token 而禁止服务端使用，等待安全官方 API/SDK 或新 transport。受信 installer/完整安装树、持久 operation/orchestrator、三个完整 backend driver、账户级全生命周期与 live conformance 仍未完成，故保持 active"
         },
         {
           "id": "P1-PREVIEW-001",

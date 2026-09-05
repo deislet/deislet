@@ -30,7 +30,8 @@ EXPECTED_TEST_SHARDS = {
         "-p deis-build -p deis --no-fail-fast"
     ),
     "control-services-tests": (
-        "cargo test -p deis-wire -p deis-backend-migration -p deis-backend-topology "
+        "cargo test -p deis-wire -p deis-provider-driver -p deis-backend-migration "
+        "-p deis-backend-topology "
         "-p deis-control -p deis-store "
         "-p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests "
         "--no-fail-fast"
@@ -508,11 +509,38 @@ def validate_integration() -> None:
         "CI does not execute the shared product contract fixtures",
     )
     require(
+        "python3 scripts/check-provider-tool-lock.py" in workflow,
+        "CI does not validate official provider tool source pins",
+    )
+    require(
         "python3 scripts/generate-target-status.py --check" in workflow,
         "CI does not reject registry-derived target status drift",
     )
     require((ROOT / "contracts/v1/registry.json").is_file(), "shared product contract registry is missing")
     require((ROOT / "contracts/v1/README.zh.md").is_file(), "shared product contract documentation is missing")
+    provider_driver_manifest = tomllib.loads(
+        read_text("crates/deis-provider-driver/Cargo.toml")
+    )
+    provider_driver_dependencies = set(provider_driver_manifest.get("dependencies", {}))
+    require(
+        not provider_driver_dependencies.intersection(
+            {
+                "deis-build",
+                "deis-build-core",
+                "deis-build-adapter-cloudflare",
+                "deis-build-adapter-deislet",
+                "deis-build-adapter-deno",
+                "deis-build-adapter-tencent",
+                "deis-control",
+            }
+        ),
+        "provider-neutral driver contract must not depend on compiler, adapters, or Control",
+    )
+    require(
+        (ROOT / "provider-drivers/official-tool-lock.json").is_file()
+        and (ROOT / "provider-drivers/official-tool-lock.schema.json").is_file(),
+        "official provider tool source lock or schema is missing",
+    )
     require("cargo audit" in workflow, "CI dependency audit is missing")
     workspace_job = re.search(
         r"(?ms)^  workspace:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
