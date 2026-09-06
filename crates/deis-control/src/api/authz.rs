@@ -405,6 +405,114 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         )
         .about(restore_id),
 
+        // Provider credentials and account installations are platform
+        // authority, not an application-scoped deployment secret. Opaque
+        // IDs cannot narrow that authority, so every management route stays
+        // administrative even when it is read-only.
+        ["api", "providers", "credentials"] if !writing => Requirement::new(
+            "provider_credential.list",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "providers", "credentials"] => Requirement::new(
+            "provider_credential.provision",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state(),
+        ["api", "providers", "credentials", binding_id] if !writing => Requirement::new(
+            "provider_credential.get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(binding_id),
+        ["api", "providers", "credentials", binding_id] => Requirement::new(
+            "provider_credential.revoke",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(binding_id)
+        .changes_state(),
+        ["api", "providers", "credentials", binding_id, "rotate"] => Requirement::new(
+            "provider_credential.rotate",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(binding_id)
+        .changes_state(),
+        ["api", "providers", "credentials", binding_id, "audit"] => Requirement::new(
+            "provider_credential.audit",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(binding_id),
+        ["api", "providers", "installations"] if !writing => Requirement::new(
+            "provider_installation.list",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "providers", "installations"] => Requirement::new(
+            "provider_installation.register",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state(),
+        ["api", "providers", "installations", installation_id] => Requirement::new(
+            "provider_installation.get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(installation_id),
+        [
+            "api",
+            "providers",
+            "installations",
+            installation_id,
+            "targets",
+        ] if !writing => Requirement::new(
+            "provider_target.list_for_installation",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(installation_id),
+        [
+            "api",
+            "providers",
+            "installations",
+            installation_id,
+            "targets",
+        ] => Requirement::new(
+            "provider_target.register",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(installation_id)
+        .changes_state(),
+        ["api", "providers", "targets"] => Requirement::new(
+            "provider_target.list",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "providers", "targets", target_id] => Requirement::new(
+            "provider_target.get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(target_id),
+
         // Operation IDs are globally unique, but the path alone does not
         // reveal their application/environment scope to this pure route
         // classifier. Until authorization can load that scope before the
@@ -506,6 +614,52 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         ["api", "apps", app, "environments", env, "deployments"] => {
             Requirement::new("deploy", Verb::Deploy, named(app), named(env)).changes_state()
         }
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "provider-deployments",
+        ] if !writing => Requirement::new(
+            "provider_deployment.list",
+            Verb::Read,
+            named(app),
+            named(env),
+        ),
+        [
+            "api",
+            "apps",
+            _app,
+            "environments",
+            _env,
+            "provider-deployments",
+        ] => Requirement::new(
+            "provider_deployment.start",
+            // A target currently grants access to an installation-wide
+            // provider account; until target assignment is itself scoped to
+            // an environment, an ordinary deploy credential must not be able
+            // to spend or publish through any configured account.
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state(),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "provider-deployments",
+            operation_id,
+        ] => Requirement::new(
+            "provider_deployment.get",
+            Verb::Read,
+            named(app),
+            named(env),
+        )
+        .about(operation_id),
         [
             "api",
             "apps",
@@ -1521,6 +1675,24 @@ mod tests {
             ),
             (
                 "GET",
+                "/api/apps/demo/environments/production/provider-deployments",
+                "provider_deployment.list",
+                Verb::Read,
+            ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-deployments",
+                "provider_deployment.start",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/apps/demo/environments/production/provider-deployments/01990f44-1000-7000-8000-000000000040",
+                "provider_deployment.get",
+                Verb::Read,
+            ),
+            (
+                "GET",
                 "/api/apps/demo/environments/production/deployment-plans/plan-1",
                 "deployment.plan.get",
                 Verb::Read,
@@ -1668,6 +1840,84 @@ mod tests {
                 "domain_grant.delete",
                 Verb::Admin,
             ),
+            (
+                "GET",
+                "/api/providers/credentials",
+                "provider_credential.list",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/credentials",
+                "provider_credential.provision",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/credentials/01990f44-1000-7000-8000-000000000040",
+                "provider_credential.get",
+                Verb::Admin,
+            ),
+            (
+                "DELETE",
+                "/api/providers/credentials/01990f44-1000-7000-8000-000000000040",
+                "provider_credential.revoke",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/credentials/01990f44-1000-7000-8000-000000000040/rotate",
+                "provider_credential.rotate",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/credentials/01990f44-1000-7000-8000-000000000040/audit",
+                "provider_credential.audit",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/installations",
+                "provider_installation.list",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/installations",
+                "provider_installation.register",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040",
+                "provider_installation.get",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/targets",
+                "provider_target.list_for_installation",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/targets",
+                "provider_target.register",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/targets",
+                "provider_target.list",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/targets/01990f44-1000-7000-8000-000000000040",
+                "provider_target.get",
+                Verb::Admin,
+            ),
         ];
         for (method, path, action, verb) in routes {
             let requirement = requirement(method, path);
@@ -1758,6 +2008,11 @@ mod tests {
             ),
             (
                 "POST",
+                "/api/apps/demo/environments/production/provider-deployments",
+                AdministratorsAlready,
+            ),
+            (
+                "POST",
                 "/api/apps/demo/environments/production/rollback",
                 NothingTheUrlDoesNotAlreadyName,
             ),
@@ -1809,6 +2064,27 @@ mod tests {
             ),
             ("POST", "/api/domains", AdministratorsAlready),
             ("DELETE", "/api/domains/example.com", AdministratorsAlready),
+            ("POST", "/api/providers/credentials", AdministratorsAlready),
+            (
+                "POST",
+                "/api/providers/credentials/01990f44-1000-7000-8000-000000000040/rotate",
+                AdministratorsAlready,
+            ),
+            (
+                "DELETE",
+                "/api/providers/credentials/01990f44-1000-7000-8000-000000000040",
+                AdministratorsAlready,
+            ),
+            (
+                "POST",
+                "/api/providers/installations",
+                AdministratorsAlready,
+            ),
+            (
+                "POST",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/targets",
+                AdministratorsAlready,
+            ),
         ];
 
         for (method, path, reach) in routes {
@@ -2012,6 +2288,24 @@ mod tests {
             ("DELETE", "/api/tokens/abcd"),
             ("POST", "/api/apps/demo/environments/production/routes"),
             (
+                "POST",
+                "/api/apps/demo/environments/production/provider-deployments",
+            ),
+            ("POST", "/api/providers/credentials"),
+            (
+                "POST",
+                "/api/providers/credentials/01990f44-1000-7000-8000-000000000040/rotate",
+            ),
+            (
+                "DELETE",
+                "/api/providers/credentials/01990f44-1000-7000-8000-000000000040",
+            ),
+            ("POST", "/api/providers/installations"),
+            (
+                "POST",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/targets",
+            ),
+            (
                 "GET",
                 "/api/apps/demo/environments/production/storage-token",
             ),
@@ -2061,6 +2355,12 @@ mod tests {
         assert_eq!(
             requirement("PUT", "/api/apps/demo/environments/production/routes/r1").from_body,
             Some(BodyClaim::RouteAddress)
+        );
+        assert!(
+            requirement("POST", "/api/providers/credentials")
+                .from_body
+                .is_none(),
+            "the authorization gate must never read provider credential material"
         );
     }
 
@@ -2116,6 +2416,11 @@ mod tests {
             ("POST", "/api/accounts"),
             ("GET", "/api/routes"),
             ("POST", "/api/commands/execute/node-1"),
+            (
+                "POST",
+                "/api/apps/myapp/environments/preview/provider-deployments",
+            ),
+            ("GET", "/api/providers/credentials"),
             ("DELETE", "/api/apps/myapp"),
         ];
         for (method, path) in refused {

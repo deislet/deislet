@@ -15,6 +15,7 @@ use deis_provider_driver::{
 };
 use deis_wire::CanonicalId;
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::Serialize;
 
 use super::model::now_secs;
 use super::operation::{OperationRequestContext, actor_id, default_organization_id};
@@ -32,7 +33,25 @@ pub struct ProviderCredentialBindingSpec {
     pub name: String,
 }
 
+/// Identity attached to a provider-credential lifecycle audit event.
+/// Credential mutations are conditionally safe resource writes, not product
+/// operations, so they do not pretend to consume an operation idempotency
+/// key or request fingerprint.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCredentialMutationContext {
+    pub actor_subject: String,
+}
+
+impl From<OperationRequestContext> for ProviderCredentialMutationContext {
+    fn from(context: OperationRequestContext) -> Self {
+        Self {
+            actor_subject: context.actor_subject,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderCredentialBinding {
     pub binding_id: CanonicalId,
     pub organization_id: CanonicalId,
@@ -46,7 +65,8 @@ pub struct ProviderCredentialBinding {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderCredentialAuditEvent {
     pub event_id: CanonicalId,
     pub binding_id: CanonicalId,
@@ -90,8 +110,9 @@ impl CatalogProviderCredentialVault {
         &self,
         spec: ProviderCredentialBindingSpec,
         material: CredentialMaterial,
-        context: OperationRequestContext,
+        context: impl Into<ProviderCredentialMutationContext>,
     ) -> CatalogResult<ProviderCredentialBinding> {
+        let context = context.into();
         validate_backend(&spec.backend_id)?;
         validate_single_line("provider credential binding name", &spec.name, 1, 128)?;
         let binding_id = CanonicalId::new_v7();
@@ -177,13 +198,49 @@ impl CatalogProviderCredentialVault {
             .await
     }
 
+    pub async fn bindings(&self, limit: usize) -> CatalogResult<Vec<ProviderCredentialBinding>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CatalogError::invalid(
+                "provider credential binding limit must be between 1 and 1000",
+            ));
+        }
+        self.store
+            .database()
+            .with_connection(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT binding_id FROM provider_credential_bindings
+                      ORDER BY created_at, binding_id LIMIT ?1",
+                )?;
+                let ids = statement
+                    .query_map(
+                        [i64::try_from(limit).map_err(|_| {
+                            CatalogError::invalid(
+                                "provider credential binding limit exceeds SQLite range",
+                            )
+                        })?],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                ids.into_iter()
+                    .map(|id| {
+                        let id = parse_id(&id, "provider credential binding")?;
+                        load_binding(connection, id)?.ok_or_else(|| {
+                            CatalogError::not_found(format!("provider credential binding {id}"))
+                        })
+                    })
+                    .collect()
+            })
+            .await
+    }
+
     pub async fn rotate(
         &self,
         binding_id: CanonicalId,
         expected_row_revision: u64,
         material: CredentialMaterial,
-        context: OperationRequestContext,
+        context: impl Into<ProviderCredentialMutationContext>,
     ) -> CatalogResult<ProviderCredentialBinding> {
+        let context = context.into();
         let now = now_secs();
         let secrets = Arc::clone(&self.secrets);
         self.store
@@ -268,8 +325,9 @@ impl CatalogProviderCredentialVault {
         &self,
         binding_id: CanonicalId,
         expected_row_revision: u64,
-        context: OperationRequestContext,
+        context: impl Into<ProviderCredentialMutationContext>,
     ) -> CatalogResult<ProviderCredentialBinding> {
+        let context = context.into();
         let now = now_secs();
         self.store
             .database()
@@ -329,7 +387,13 @@ impl CatalogProviderCredentialVault {
     pub async fn audit_events(
         &self,
         binding_id: CanonicalId,
+        limit: usize,
     ) -> CatalogResult<Vec<ProviderCredentialAuditEvent>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CatalogError::invalid(
+                "provider credential audit limit must be between 1 and 1000",
+            ));
+        }
         self.store
             .database()
             .with_connection(move |connection| {
@@ -339,10 +403,20 @@ impl CatalogProviderCredentialVault {
                             event_type, disposition, occurred_at
                        FROM provider_credential_audit_events
                       WHERE binding_id = ?1
-                      ORDER BY occurred_at, event_id",
+                      ORDER BY occurred_at, event_id LIMIT ?2",
                 )?;
                 let rows = statement
-                    .query_map([binding_id.to_string()], audit_event_from_row)?
+                    .query_map(
+                        params![
+                            binding_id.to_string(),
+                            i64::try_from(limit).map_err(|_| {
+                                CatalogError::invalid(
+                                    "provider credential audit limit exceeds SQLite range",
+                                )
+                            })?,
+                        ],
+                        audit_event_from_row,
+                    )?
                     .collect::<Result<Vec<_>, _>>()?;
                 rows.into_iter().map(try_audit_event).collect()
             })
@@ -1008,8 +1082,8 @@ mod tests {
     use deis_provider_driver::{
         DeploymentState, DriverError, DriverNextAction, DriverOperation, DriverReceipt,
         DriverRequest, DriverStepState, ProviderDriver, ProviderDriverManifest,
-        ProviderNeutralPlan, ProviderTargetRef, Sha256Digest, SideEffect,
-        ValidatedProviderDriverManifest,
+        ProviderNeutralPlan, ProviderTargetRef, Sha256Digest, SideEffect, SupportedStandard,
+        ToolDigest, ValidatedProviderDriverManifest,
     };
     use tempfile::TempDir;
 
@@ -1075,7 +1149,7 @@ mod tests {
             .register_provider_target(ProviderTargetSpec {
                 installation_id: installation.installation_id,
                 name: "production".to_owned(),
-                standard_version: "edge-canon-proposal-0001".to_owned(),
+                standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
                 target_config_digest: digest('b'),
                 driver_manifest: manifest.clone(),
             })
@@ -1293,7 +1367,7 @@ mod tests {
         );
         let events = harness
             .vault
-            .audit_events(harness.binding.binding_id)
+            .audit_events(harness.binding.binding_id, 100)
             .await
             .unwrap();
         assert_eq!(
@@ -1336,7 +1410,7 @@ mod tests {
         assert!(driver.rotated.load(Ordering::SeqCst));
         let events = harness
             .vault
-            .audit_events(harness.binding.binding_id)
+            .audit_events(harness.binding.binding_id, 100)
             .await
             .unwrap();
         let event_types = events
@@ -1386,7 +1460,7 @@ mod tests {
         assert!(driver.denied.load(Ordering::SeqCst));
         let events = harness
             .vault
-            .audit_events(harness.binding.binding_id)
+            .audit_events(harness.binding.binding_id, 100)
             .await
             .unwrap();
         let denial = events
@@ -1476,10 +1550,24 @@ mod tests {
     }
 
     fn manifest() -> ValidatedProviderDriverManifest {
-        let value: ProviderDriverManifest = serde_json::from_slice(include_bytes!(
+        let mut value: ProviderDriverManifest = serde_json::from_slice(include_bytes!(
             "../../../../contracts/v1/fixtures/valid/provider-driver.json"
         ))
         .unwrap();
+        value.supported_standard_versions.push(SupportedStandard {
+            contract_id: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION
+                .split_once('@')
+                .unwrap()
+                .0
+                .to_owned(),
+            version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+            contract_digest: ToolDigest {
+                algorithm: "sha256".to_owned(),
+                value: deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256
+                    .parse()
+                    .unwrap(),
+            },
+        });
         ValidatedProviderDriverManifest::new(value).unwrap()
     }
 

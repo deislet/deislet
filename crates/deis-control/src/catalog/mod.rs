@@ -73,7 +73,7 @@ pub use model::{
 pub use operation::OperationRequestContext;
 pub use provider_credential::{
     CatalogProviderCredentialVault, ProviderCredentialAuditEvent, ProviderCredentialBinding,
-    ProviderCredentialBindingSpec,
+    ProviderCredentialBindingSpec, ProviderCredentialMutationContext,
 };
 pub use provider_deployment_reconciler::{
     ProviderDeploymentReconciler, ProviderDeploymentReconcilerConfig,

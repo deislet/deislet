@@ -1905,7 +1905,7 @@ mod tests {
         DriverReleaseSigningRole, DriverReleaseTransparencyEntry, DriverReleaseTransparencyLog,
         DriverReleaseTransparencyPolicy, DriverReleaseTransparencyProof,
         DriverReleaseTransparencyWitness, DriverReleaseTrustRoot, DriverTrustRootDsseEnvelope,
-        ProviderDriver, ProviderDriverManifest, ProviderDriverRelease,
+        ProviderDriver, ProviderDriverManifest, ProviderDriverRelease, SupportedStandard,
         TRANSPARENCY_PROOF_MEDIA_TYPE, ToolDigest,
     };
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -1982,6 +1982,22 @@ mod tests {
                 serde_json::from_slice(MANIFEST_FIXTURE).unwrap();
             manifest.supported_host_operating_systems = vec![host.as_str().to_owned()];
             manifest.driver.distribution_digest.value = release.canonical_sha256().unwrap();
+            manifest
+                .supported_standard_versions
+                .push(SupportedStandard {
+                    contract_id: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION
+                        .split_once('@')
+                        .unwrap()
+                        .0
+                        .to_owned(),
+                    version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                    contract_digest: ToolDigest {
+                        algorithm: "sha256".to_owned(),
+                        value: deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256
+                            .parse()
+                            .unwrap(),
+                    },
+                });
             let manifest = ValidatedProviderDriverManifest::new(manifest).unwrap();
             let (trust_root, authorization, transparency) =
                 signed_authorization(&release, &manifest);
@@ -2780,7 +2796,7 @@ mod tests {
             .register_provider_target(ProviderTargetSpec {
                 installation_id: installation.installation_id,
                 name: "revocation-target".to_owned(),
-                standard_version: "edge-canon-proposal-0001".to_owned(),
+                standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
                 target_config_digest: "d".repeat(64).parse().unwrap(),
                 driver_manifest: fixture.manifest.clone(),
             })
@@ -3010,7 +3026,7 @@ mod tests {
             .register_provider_target(ProviderTargetSpec {
                 installation_id: installation.installation_id,
                 name: "registry-target".to_owned(),
-                standard_version: "edge-canon-proposal-0001".to_owned(),
+                standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
                 target_config_digest: "b".repeat(64).parse().unwrap(),
                 driver_manifest: fixture.manifest.clone(),
             })

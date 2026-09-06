@@ -22,6 +22,7 @@ pub mod assignments;
 pub mod deployments;
 pub mod domains;
 pub mod environments;
+pub mod providers;
 pub mod routes;
 pub mod routing_table;
 pub mod secrets;
@@ -160,6 +161,14 @@ pub fn router(state: CatalogState) -> Router {
             post(deployments::rollback),
         )
         .route(
+            "/api/apps/:app_id/environments/:env/provider-deployments",
+            get(providers::list_provider_deployments).post(providers::begin_provider_deployment),
+        )
+        .route(
+            "/api/apps/:app_id/environments/:env/provider-deployments/:operation_id",
+            get(providers::get_provider_deployment),
+        )
+        .route(
             "/api/deployment-plans/:id",
             get(deployments::deployment_plan),
         )
@@ -196,6 +205,41 @@ pub fn router(state: CatalogState) -> Router {
             get(domains::list_grants).post(domains::create_grant),
         )
         .route("/api/domains/:pattern", delete(domains::delete_grant))
+        .route(
+            "/api/providers/credentials",
+            get(providers::list_credentials)
+                .post(providers::provision_credential)
+                .layer(DefaultBodyLimit::max(70 * 1024)),
+        )
+        .route(
+            "/api/providers/credentials/:binding_id",
+            get(providers::get_credential).delete(providers::revoke_credential),
+        )
+        .route(
+            "/api/providers/credentials/:binding_id/rotate",
+            post(providers::rotate_credential).layer(DefaultBodyLimit::max(70 * 1024)),
+        )
+        .route(
+            "/api/providers/credentials/:binding_id/audit",
+            get(providers::credential_audit),
+        )
+        .route(
+            "/api/providers/installations",
+            get(providers::list_installations).post(providers::register_installation),
+        )
+        .route(
+            "/api/providers/installations/:installation_id",
+            get(providers::get_installation),
+        )
+        .route(
+            "/api/providers/installations/:installation_id/targets",
+            get(providers::list_installation_targets).post(providers::register_target),
+        )
+        .route("/api/providers/targets", get(providers::list_targets))
+        .route(
+            "/api/providers/targets/:target_id",
+            get(providers::get_target),
+        )
         .with_state(state)
 }
 

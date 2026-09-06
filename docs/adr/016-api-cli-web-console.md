@@ -255,6 +255,16 @@ Web e2e 与 CLI integration 对同一 API fixture 验证一致 resource ID、ope
 
 ## 发布阶段
 
+Provider 管理面已经有第一段服务端实现：credential、installation、target 和 application/environment-scoped provider
+deployment 都通过同一 Control router、集中 authz/audit gate 与既有 domain service；secret response 禁止明文，轮换/吊销
+使用 ETag/`If-Match`，deployment 使用 `Idempotency-Key` 和 durable `ProductOperation`。target 还绑定 Control 标准 registry
+中的 exact version/contract digest，而不是把 driver 自报字符串当成标准事实。
+
+这段实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；列表没有 cursor，`total` 目前只代表本次返回数；
+provider release 安装、target grant 与 installation/target 生命周期尚无 HTTP 资源；credential provision 等资源创建尚未统一
+幂等 replay；CLI/Web 也没有生成 client 或交互入口。开始 provider deployment 因 target 尚是账户级 authority 而暂时只允许
+管理员；在 target assignment/grant 建立前不能把它误降为普通 environment deploy 权限。
+
 1. 建立 versioned API/error/operation/schema 基础与安全 Web session。
 2. 新建 organization/application/environment shell、scope switcher 与权限导航。
 3. 补 versions/previews/deployments/builds/domains，打通核心交付闭环。

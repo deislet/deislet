@@ -14,8 +14,9 @@ use deis_provider_driver::{
     DriverOperationClaimOutcome, DriverOperationStore, DriverOrchestrationOutcome,
     DriverOrchestrator, DriverOrchestratorConfig, DriverOrchestratorError, DriverReceipt,
     DriverRequest, DriverStepState, ProviderDriver, ProviderDriverPin, ProviderNeutralPlan,
-    ProviderTargetRef, Sha256Digest, SideEffect, ValidatedProviderDriverManifest,
-    validate_driver_error, validate_driver_request, validate_driver_response,
+    ProviderTargetRef, Sha256Digest, SideEffect, SupportedStandard,
+    ValidatedProviderDriverManifest, validate_driver_error, validate_driver_request,
+    validate_driver_response,
 };
 use deis_wire::{
     CanonicalId, OperationError, OperationKind, OperationState, ProductOperation,
@@ -44,7 +45,8 @@ pub struct ProviderInstallationSpec {
     pub credential_binding_id: CanonicalId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderInstallation {
     pub installation_id: CanonicalId,
     pub organization_id: CanonicalId,
@@ -67,13 +69,16 @@ pub struct ProviderTargetSpec {
     pub driver_manifest: ValidatedProviderDriverManifest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderTarget {
     pub target_id: CanonicalId,
     pub installation_id: CanonicalId,
     pub backend_id: String,
     pub name: String,
+    pub standard_contract_id: String,
     pub standard_version: String,
+    pub standard_contract_digest: Sha256Digest,
     pub target_config_digest: Sha256Digest,
     pub driver_id: String,
     pub driver_version: String,
@@ -130,14 +135,16 @@ pub struct ProviderDeploymentSpec {
     pub plan: ProviderNeutralPlan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderDeploymentStep {
     pub sequence: usize,
     pub operation: DriverOperation,
     pub child_operation_id: CanonicalId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderDeploymentWorkflow {
     pub operation: ProductOperation,
     pub provider_target_id: CanonicalId,
@@ -257,6 +264,52 @@ impl CatalogStore {
             .await
     }
 
+    pub async fn provider_installation(
+        &self,
+        installation_id: CanonicalId,
+    ) -> CatalogResult<Option<ProviderInstallation>> {
+        self.database()
+            .with_connection(move |connection| load_installation(connection, installation_id))
+            .await
+    }
+
+    pub async fn provider_installations(
+        &self,
+        limit: usize,
+    ) -> CatalogResult<Vec<ProviderInstallation>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CatalogError::invalid(
+                "provider installation limit must be between 1 and 1000",
+            ));
+        }
+        self.database()
+            .with_connection(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT installation_id FROM provider_installations
+                      ORDER BY created_at, installation_id LIMIT ?1",
+                )?;
+                let ids = statement
+                    .query_map(
+                        [i64::try_from(limit).map_err(|_| {
+                            CatalogError::invalid(
+                                "provider installation limit exceeds SQLite range",
+                            )
+                        })?],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                ids.into_iter()
+                    .map(|id| {
+                        let id = parse_id(&id, "provider installation")?;
+                        load_installation(connection, id)?.ok_or_else(|| {
+                            CatalogError::not_found(format!("provider installation {id}"))
+                        })
+                    })
+                    .collect()
+            })
+            .await
+    }
+
     pub async fn register_provider_target(
         &self,
         spec: ProviderTargetSpec,
@@ -272,6 +325,7 @@ impl CatalogStore {
             CatalogError::invalid(format!("invalid provider driver manifest: {error}"))
         })?;
         let manifest = spec.driver_manifest.get();
+        resolve_target_standard(manifest, &spec.standard_version)?;
         let backend_id = manifest.backend.id.clone();
         let driver_id = manifest.driver.id.clone();
         let driver_version = manifest.driver.version.clone();
@@ -347,6 +401,89 @@ impl CatalogStore {
                 load_target(connection, target_id)?
                     .map(|stored| stored.target)
                     .ok_or_else(|| CatalogError::not_found(format!("provider target {target_id}")))
+            })
+            .await
+    }
+
+    pub async fn provider_target(
+        &self,
+        target_id: CanonicalId,
+    ) -> CatalogResult<Option<ProviderTarget>> {
+        self.database()
+            .with_connection(move |connection| {
+                load_target(connection, target_id).map(|target| target.map(|stored| stored.target))
+            })
+            .await
+    }
+
+    pub async fn provider_targets(
+        &self,
+        installation_id: Option<CanonicalId>,
+        limit: usize,
+    ) -> CatalogResult<Vec<ProviderTarget>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CatalogError::invalid(
+                "provider target limit must be between 1 and 1000",
+            ));
+        }
+        self.database()
+            .with_connection(move |connection| {
+                let mut ids = Vec::new();
+                match installation_id {
+                    Some(installation_id) => {
+                        if load_installation(connection, installation_id)?.is_none() {
+                            return Err(CatalogError::not_found(format!(
+                                "provider installation {installation_id}"
+                            )));
+                        }
+                        let mut statement = connection.prepare(
+                            "SELECT target_id FROM provider_targets
+                              WHERE installation_id = ?1
+                              ORDER BY created_at, target_id LIMIT ?2",
+                        )?;
+                        ids.extend(
+                            statement
+                                .query_map(
+                                    params![
+                                        installation_id.to_string(),
+                                        i64::try_from(limit).map_err(|_| {
+                                            CatalogError::invalid(
+                                                "provider target limit exceeds SQLite range",
+                                            )
+                                        })?,
+                                    ],
+                                    |row| row.get::<_, String>(0),
+                                )?
+                                .collect::<Result<Vec<_>, _>>()?,
+                        );
+                    }
+                    None => {
+                        let mut statement = connection.prepare(
+                            "SELECT target_id FROM provider_targets
+                              ORDER BY created_at, target_id LIMIT ?1",
+                        )?;
+                        ids.extend(
+                            statement
+                                .query_map(
+                                    [i64::try_from(limit).map_err(|_| {
+                                        CatalogError::invalid(
+                                            "provider target limit exceeds SQLite range",
+                                        )
+                                    })?],
+                                    |row| row.get::<_, String>(0),
+                                )?
+                                .collect::<Result<Vec<_>, _>>()?,
+                        );
+                    }
+                }
+                ids.into_iter()
+                    .map(|id| {
+                        let id = parse_id(&id, "provider target")?;
+                        load_target(connection, id)?
+                            .map(|stored| stored.target)
+                            .ok_or_else(|| CatalogError::not_found(format!("provider target {id}")))
+                    })
+                    .collect()
             })
             .await
     }
@@ -538,6 +675,50 @@ impl CatalogStore {
         self.database()
             .with_connection(move |connection| {
                 load_provider_deployment_workflow(connection, operation_id)
+            })
+            .await
+    }
+
+    pub async fn provider_deployments_for_environment(
+        &self,
+        application_id: CanonicalId,
+        environment_id: CanonicalId,
+        limit: usize,
+    ) -> CatalogResult<Vec<ProviderDeploymentWorkflow>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CatalogError::invalid(
+                "provider deployment limit must be between 1 and 1000",
+            ));
+        }
+        self.database()
+            .with_connection(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT operation_id FROM provider_deployment_workflows
+                      WHERE application_id = ?1 AND environment_id = ?2
+                      ORDER BY created_at DESC, operation_id DESC LIMIT ?3",
+                )?;
+                let ids = statement
+                    .query_map(
+                        params![
+                            application_id.to_string(),
+                            environment_id.to_string(),
+                            i64::try_from(limit).map_err(|_| {
+                                CatalogError::invalid(
+                                    "provider deployment limit exceeds SQLite range",
+                                )
+                            })?,
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                ids.into_iter()
+                    .map(|id| {
+                        let id = parse_id(&id, "provider deployment operation")?;
+                        load_provider_deployment_workflow(connection, id)?.ok_or_else(|| {
+                            CatalogError::not_found(format!("provider deployment operation {id}"))
+                        })
+                    })
+                    .collect()
             })
             .await
     }
@@ -2865,6 +3046,7 @@ fn load_target(
                     CatalogError::invalid(format!("invalid persisted provider manifest: {error}"))
                 },
             )?;
+            let standard = resolve_target_standard(manifest.get(), &row.4)?;
             let computed = manifest.canonical_sha256().map_err(|error| {
                 CatalogError::invalid(format!("invalid persisted provider manifest: {error}"))
             })?;
@@ -2888,7 +3070,9 @@ fn load_target(
                     installation_id: parse_id(&row.1, "provider installation")?,
                     backend_id: row.2,
                     name: row.3,
+                    standard_contract_id: standard.contract_id,
                     standard_version: row.4,
+                    standard_contract_digest: standard.contract_digest.value,
                     target_config_digest: row.5.parse().map_err(|error| {
                         CatalogError::invalid(format!("invalid target config digest: {error}"))
                     })?,
@@ -2912,6 +3096,49 @@ fn load_target(
             })
         })
         .transpose()
+}
+
+fn resolve_target_standard(
+    manifest: &deis_provider_driver::ProviderDriverManifest,
+    standard_version: &str,
+) -> CatalogResult<SupportedStandard> {
+    let (contract_id, revision) = standard_version.rsplit_once('@').ok_or_else(|| {
+        CatalogError::invalid(
+            "provider target standard version must be an exact contractId@40-hex-commit pin",
+        )
+    })?;
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CatalogError::invalid(
+            "provider target standard version must be an exact contractId@40-hex-commit pin",
+        ));
+    }
+    if standard_version != deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION {
+        return Err(CatalogError::conflict(
+            "provider target standard version is not present in this Control standard registry",
+        ));
+    }
+    let standard = manifest
+        .supported_standard_versions
+        .iter()
+        .find(|standard| {
+            standard.contract_id == contract_id && standard.version == standard_version
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CatalogError::conflict(
+                "provider driver manifest does not declare the exact target standard version",
+            )
+        })?;
+    if standard.contract_digest.value.as_str() != deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256 {
+        return Err(CatalogError::conflict(
+            "provider driver standard declaration does not match the Control standard registry digest",
+        ));
+    }
+    Ok(standard)
 }
 
 fn load_driver_operation(
@@ -3197,7 +3424,7 @@ mod tests {
 
     use deis_provider_driver::{
         ArtifactVersionRef, CredentialMaterial, DeploymentState, DriverExecutionContext,
-        ProviderDriverManifest, ProviderNeutralPlan,
+        ProviderDriverManifest, ProviderNeutralPlan, SupportedStandard, ToolDigest,
     };
     use tempfile::TempDir;
 
@@ -3265,7 +3492,7 @@ mod tests {
             .register_provider_target(ProviderTargetSpec {
                 installation_id: installation.installation_id,
                 name: "production".to_owned(),
-                standard_version: "edge-canon-proposal-0001".to_owned(),
+                standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
                 target_config_digest: "b".repeat(64).parse().unwrap(),
                 driver_manifest,
             })
@@ -3282,11 +3509,83 @@ mod tests {
     }
 
     fn manifest() -> ValidatedProviderDriverManifest {
-        let manifest: ProviderDriverManifest = serde_json::from_slice(include_bytes!(
+        let mut manifest: ProviderDriverManifest = serde_json::from_slice(include_bytes!(
             "../../../../contracts/v1/fixtures/valid/provider-driver.json"
         ))
         .unwrap();
+        manifest
+            .supported_standard_versions
+            .push(SupportedStandard {
+                contract_id: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION
+                    .split_once('@')
+                    .unwrap()
+                    .0
+                    .to_owned(),
+                version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                contract_digest: ToolDigest {
+                    algorithm: "sha256".to_owned(),
+                    value: deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256
+                        .parse()
+                        .unwrap(),
+                },
+            });
         ValidatedProviderDriverManifest::new(manifest).unwrap()
+    }
+
+    #[test]
+    fn target_standard_pin_is_exact_and_manifest_backed() {
+        let declared = manifest();
+        let standard = resolve_target_standard(
+            declared.get(),
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        )
+        .unwrap();
+        assert_eq!(standard.contract_id, "edge-canon.next");
+        assert_eq!(
+            standard.contract_digest.value.as_str(),
+            deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256
+        );
+
+        let floating = resolve_target_standard(declared.get(), "edge-canon.next").unwrap_err();
+        assert!(
+            floating
+                .to_string()
+                .contains("exact contractId@40-hex-commit")
+        );
+
+        let undeclared: ProviderDriverManifest = serde_json::from_slice(include_bytes!(
+            "../../../../contracts/v1/fixtures/valid/provider-driver.json"
+        ))
+        .unwrap();
+        let undeclared = ValidatedProviderDriverManifest::new(undeclared).unwrap();
+        let error = resolve_target_standard(
+            undeclared.get(),
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not declare"));
+
+        let mut wrong_digest: ProviderDriverManifest = serde_json::from_slice(include_bytes!(
+            "../../../../contracts/v1/fixtures/valid/provider-driver.json"
+        ))
+        .unwrap();
+        wrong_digest
+            .supported_standard_versions
+            .push(SupportedStandard {
+                contract_id: "edge-canon.next".to_owned(),
+                version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                contract_digest: ToolDigest {
+                    algorithm: "sha256".to_owned(),
+                    value: "0".repeat(64).parse().unwrap(),
+                },
+            });
+        let wrong_digest = ValidatedProviderDriverManifest::new(wrong_digest).unwrap();
+        let error = resolve_target_standard(
+            wrong_digest.get(),
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("registry digest"));
     }
 
     fn request(harness: &Harness) -> DriverRequest {

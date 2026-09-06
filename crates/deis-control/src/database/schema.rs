@@ -2533,6 +2533,44 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             SELECT RAISE(ABORT, 'provider target installation/backend mismatch');
         END;
 
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_standard_pin_v1
+        BEFORE INSERT ON provider_targets
+        WHEN NEW.status = 'active' AND NOT EXISTS (
+            SELECT 1
+              FROM json_each(NEW.driver_manifest_json, '$.supportedStandardVersions') standard
+             WHERE json_extract(standard.value, '$.version') = NEW.standard_version
+               AND json_extract(standard.value, '$.contractId') =
+                   substr(NEW.standard_version, 1, instr(NEW.standard_version, '@') - 1)
+               AND json_extract(standard.value, '$.contractDigest.algorithm') = 'sha256'
+               AND length(json_extract(standard.value, '$.contractDigest.value')) = 64
+               AND lower(json_extract(standard.value, '$.contractDigest.value')) =
+                   json_extract(standard.value, '$.contractDigest.value')
+               AND json_extract(standard.value, '$.contractDigest.value')
+                   NOT GLOB '*[^0-9a-f]*'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target standard is not declared by driver manifest');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_standard_pin_activation_v1
+        BEFORE UPDATE OF status ON provider_targets
+        WHEN NEW.status = 'active' AND NOT EXISTS (
+            SELECT 1
+              FROM json_each(NEW.driver_manifest_json, '$.supportedStandardVersions') standard
+             WHERE json_extract(standard.value, '$.version') = NEW.standard_version
+               AND json_extract(standard.value, '$.contractId') =
+                   substr(NEW.standard_version, 1, instr(NEW.standard_version, '@') - 1)
+               AND json_extract(standard.value, '$.contractDigest.algorithm') = 'sha256'
+               AND length(json_extract(standard.value, '$.contractDigest.value')) = 64
+               AND lower(json_extract(standard.value, '$.contractDigest.value')) =
+                   json_extract(standard.value, '$.contractDigest.value')
+               AND json_extract(standard.value, '$.contractDigest.value')
+                   NOT GLOB '*[^0-9a-f]*'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target cannot activate without an exact declared standard');
+        END;
+
         CREATE TRIGGER IF NOT EXISTS trg_provider_targets_release_v1
         BEFORE INSERT ON provider_targets
         WHEN NEW.status = 'active' AND (
@@ -3206,7 +3244,20 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             SET status = 'disabled', revision = revision + 1,
                 updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER))
           WHERE status = 'active' AND (
-               driver_release_sha256 IS NULL
+               standard_version != ?1
+            OR NOT EXISTS (
+                   SELECT 1
+                     FROM json_each(provider_targets.driver_manifest_json,
+                                    '$.supportedStandardVersions') standard
+                    WHERE json_extract(standard.value, '$.version') =
+                          provider_targets.standard_version
+                      AND json_extract(standard.value, '$.contractId') =
+                          substr(provider_targets.standard_version, 1,
+                                 instr(provider_targets.standard_version, '@') - 1)
+                      AND json_extract(standard.value, '$.contractDigest.algorithm') = 'sha256'
+                      AND json_extract(standard.value, '$.contractDigest.value') = ?2
+               )
+            OR driver_release_sha256 IS NULL
             OR NOT EXISTS (
                 SELECT 1 FROM provider_driver_releases r
                 JOIN provider_driver_release_authorizations a
@@ -3224,12 +3275,15 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
                    AND r.status = 'active'
             )
           )",
-        [],
+        rusqlite::params![
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256,
+        ],
     )?;
     if disabled_targets > 0 {
         info!(
             disabled_targets,
-            "Disabled legacy provider targets that have no signed and transparently logged verified driver release"
+            "Disabled legacy provider targets that lack the current standard pin or a signed and transparently logged verified driver release"
         );
     }
     Ok(())
@@ -4183,6 +4237,18 @@ mod tests {
         let target_id = CanonicalId::new_v7().to_string();
         let release_sha256 = "a".repeat(64);
         let manifest_sha256 = "b".repeat(64);
+        let standard_version = deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION;
+        let manifest_json = serde_json::json!({
+            "supportedStandardVersions": [{
+                "contractId": standard_version.split_once('@').unwrap().0,
+                "version": standard_version,
+                "contractDigest": {
+                    "algorithm": "sha256",
+                    "value": deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256
+                }
+            }]
+        })
+        .to_string();
         conn.execute(
             "INSERT INTO provider_credential_bindings
                (binding_id, organization_id, backend_id, name, status,
@@ -4236,14 +4302,16 @@ mod tests {
                 driver_manifest_sha256, driver_manifest_json, status,
                 revision, created_at, updated_at)
              VALUES (?1, ?2, 'cloudflare-workers-pages', 'legacy-auth-only-target',
-                     'edge-canon-proposal-0001', ?3, 'deislet.driver.cloudflare',
-                     '1.0.0', ?4, ?4, ?5, '{}', 'active', 1, 1, 1)",
+                     ?3, ?4, 'deislet.driver.cloudflare',
+                     '1.0.0', ?5, ?5, ?6, ?7, 'active', 1, 1, 1)",
             rusqlite::params![
                 target_id,
                 installation_id,
+                standard_version,
                 "f".repeat(64),
                 release_sha256,
                 manifest_sha256,
+                manifest_json,
             ],
         )
         .unwrap();

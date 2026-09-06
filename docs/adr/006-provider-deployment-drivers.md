@@ -416,6 +416,31 @@ release/vault/target/deployment API、三个完整 backend driver 和真实账�
 但会在一个读事务内遍历全部非终态 workflow；大规模 catalog 仍需可索引 eligibility、负载证据和扫描时长指标。在这些完成并获得真实账户证据前，不能把当前 dispatcher
 称作已部署的 provider 服务，更不能升级 backend 支持状态。
 
+## 公共管理 API 的第一段边界
+
+Control 的 human API 现已公开 provider-neutral 的 credential、installation、target 与 deployment 资源：凭据可创建、
+列出、读取、轮换、吊销和读取不可变审计；installation/target 可注册和读取；application/environment 路径下可创建、
+列出和读取 durable provider deployment。deployment 创建要求 `Idempotency-Key`，返回同一 `ProductOperation`、
+`Location`、ETag、request ID 与 correlation ID；轮换和吊销要求强 `If-Match`。所有 provider 管理响应都带
+`Cache-Control: no-store`。
+
+凭据值只反序列化进 vault 写入路径；response model、operation、授权中间件和审计均没有明文字段。provider credential、
+installation 与 target 是账户级 authority，因此当前全部要求平台管理员。deployment status 可按 application/environment
+授权读取；但 target 尚未有 application/environment grant 模型，普通 deploy credential 不能选择任意账户发布，故开始
+provider deployment 暂时也保持管理员权限。后续必须先建立 target assignment/grant，再把开始操作收窄到 deploy scope，
+不能直接放宽路由权限。
+
+target 注册不再相信调用者给出的一个版本字符串：版本必须是 `contractId@40-hex-commit` exact pin，必须存在于 Control
+当前标准 registry，driver manifest 必须逐项声明相同 contract ID/version/digest，且 contract digest 必须与仓库锁一致。
+读取 target 时重新从持久 manifest 验证并返回 contract ID 与 digest；旧 active target 若缺当前标准声明，会在升级时
+disabled。SQLite insert/activation trigger 同时拒绝没有完整 SHA-256 声明的 active target。proposal 公共 fixture 继续保持
+空 `supportedStandardVersions`，测试只为合成、已验证 release 显式加入当前声明，不能反向把 fixture 伪装成合规 driver。
+
+这只是公共管理面的第一段，并不满足本 ADR 的完整验收。release/archive/authorization/transparency 安装 API 尚未公开；
+installation/target 还没有 disable/delete 生命周期；列表只有有界 limit、没有 cursor；credential provision 和非 operation
+资源创建还没有统一幂等 replay；CLI 与 Web 尚未接线。更关键的是尚无真实签署 release、真实透明日志/独立 witness、
+三个完整 backend driver 或真实账户 lifecycle/conformance evidence。因此所有 backend 的 supported/compliant 状态保持不变。
+
 ## 后果
 
 - 需要新增 provider-neutral deployment core 和 provider drivers，而不是继续把逻辑堆入 build adapter。

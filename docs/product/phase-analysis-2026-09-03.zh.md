@@ -2395,3 +2395,27 @@ Application/framework source + versioned build plan
   并新增六门禁、跨页公平、持久退避、增量迁移和竞态 fence 断言。本增量关闭第 83 节两个已知调度正确性缺陷，不关闭公共
   vault/release/target/deployment/operation API、CLI、Web，真实 materialized release、公共透明日志、独立 witness、真实
   Windows Service 安装、三个完整 backend driver 或账户级 lifecycle/conformance evidence。`P1-DEPLOY-001` 继续 active。
+
+## 85. Provider 公共管理 API 第一段与标准 pin 修复
+
+- Control 新增 provider-neutral human API：credential 的 create/list/get/rotate/revoke/audit，installation 的 register/list/get，
+  target 的 register/list/get，以及 application/environment 下 provider deployment 的 start/list/get。deployment 创建要求
+  `Idempotency-Key`，返回 durable `ProductOperation`、poll `Location`、ETag、request/correlation ID；credential 轮换与吊销
+  要求强 `If-Match`。所有 provider 管理响应均为 `Cache-Control: no-store`。
+- 凭据请求类型不实现 `Debug`，明文只移动到 `CredentialMaterial` 和 vault write path；response、operation、授权中间件与 audit
+  不含 secret。credential/installation/target 是 provider account 级 authority，统一要求 `admin:*/*`。deployment status 由
+  application/environment scope 授权读取；开始 deployment 暂时仍只允许管理员，因为 target 尚无 application/environment
+  assignment/grant，直接允许普通 deploy scope 会让其选择任意配置账户并产生费用或发布副作用。
+- 深审新 API 时发现 target 原实现只保存 `standard_version`，没有证明 driver manifest 声明该版本，更没有把声明摘要与 Control
+  的标准锁交叉验证。这违反“应用只建立在统一标准上”的已确认决策。现要求 `contractId@40-hex-commit` exact pin、Control 当前
+  registry 版本、manifest 中相同 contract ID/version，以及与 `standards/edge-canon.lock.json` 一致的 contract SHA-256；target
+  response 返回 contract ID/digest，读取持久行时重新验证。数据库 insert/activation trigger 拒绝无完整声明的 active target，
+  升级会 disabled 缺当前标准 pin 的旧 active target。正式 proposal fixture 仍保持空声明，只有合成测试 release 显式添加标准，
+  不把测试便利改写成产品合规声明。
+- 本机验证已通过 Control 474/474 lib tests、14/14 API integration、provider API 3/3、credential 5/5、release 7/7、schema
+  migration 17/17、target standard pin 专项和 `cargo clippy -p deis-control --all-targets -- -D warnings`；格式与 diff 检查通过。
+  这是未提交工作树的本机证据，提交后三平台 exact-archive 尚未登记，不能冒充跨平台或 live provider evidence。
+- 剩余缺口保持可见：release/archive/authorization/transparency 安装尚无安全 upload API；installation/target 缺 disable/delete；
+  target grant 未建；列表尚无 cursor 且 `total` 只是当前页计数；credential provision 等资源创建缺统一幂等 replay；API 尚无显式
+  major/schema client generation；CLI/Web 未接线。三个真实 backend driver、真实签署 release、透明日志/独立 witness、真实账户
+  lifecycle/conformance 也均未完成，因此 `P1-DEPLOY-001` 继续 active，所有 backend 支持/合规状态不变。
