@@ -97,7 +97,8 @@
         "transientSpawnRetryBoundaryValidated": {"const": true},
         "offlineTransparencyProofValidated": {"const": true},
         "independentWitnessThresholdValidated": {"const": true},
-        "signedButUnloggedTargetMigrationValidated": {"const": true}
+        "signedButUnloggedTargetMigrationValidated": {"const": true},
+        "windowsServiceIdentityDaclPolicyValidated": {"const": true}
       }
     },
     "limitations": {

@@ -2295,3 +2295,39 @@ Application/framework source + versioned build plan
   公共透明日志和独立 witness 运营；Windows service DACL、后台 dispatcher loop、API/CLI/Web、三家完整 driver 与真实
   账户 lifecycle/conformance evidence 也未完成。因此本证据只关闭该 verifier/registry 切片的三平台可移植性，
   `P1-DEPLOY-001` 继续保持 active。
+
+## 82. Windows provider trust material 的服务身份 DACL
+
+- 继续审查发现，Windows 既有边界只拒绝 reparse point，并在读取 trust material 时拒绝 share-write/share-delete；安装树
+  只读也依赖 `FILE_ATTRIBUTE_READONLY`。这些能缩小替换窗口，却不能证明谁拥有写、删除、改 DACL 或改 owner 权限。
+  read-only attribute 不是 Windows 授权边界，因此原先“Windows service-account DACL 尚未验证”的记录是实质安全缺口。
+- 新的 native Windows 校验从已经打开的 object handle 调用 `GetSecurityInfo`，要求 owner 等于当前进程令牌用户 SID、
+  DACL 非 null 且有效、`SE_DACL_PROTECTED` 已关闭父目录继承。危险权限集合包含 generic write/all、文件内容/属性写、
+  delete/delete-child、WRITE_DAC 与 WRITE_OWNER；标准 allow ACE 只接受当前 SID、LocalSystem 或 built-in Administrators。
+  带危险权限的 object、callback 或 compound allow ACE 因不能用简单 SID 等价安全解释而失败关闭。installation root 用
+  `FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS` 打开，并在 installer 生命周期保留不共享 delete 的 handle，
+  因而根目录不能在校验后被重命名或替换。trust root 与 rotation 文件在读内容前对同一已打开 handle 执行同一策略。
+- 第一次未提交工作树归档 SHA-256 `933076bf0a863932804675372fe8c51352e311081c70b628bf7e25c3913eb95b`
+  在 s69 得到 provider-driver 45/54：9 项安装/信任文件用例被 owner 校验拒绝。根因是提升的管理员进程新建对象可由
+  Administrators 组持有，而测试构造器只替换 DACL、没有把 owner 显式设为当前 token user；生产校验按设计失败关闭。
+  测试构造器随后同时设置 owner 和受保护 DACL；工作树归档
+  `6ebcbc298f5203c77066379236356322c361b96d8b6350e22bb4cc2bf232cbb5` 在 s69 为 54/54。构造器只通过
+  `test-support` feature 暴露给跨 crate 测试，正常 Control dependency 不启用它。
+- 同一未提交工作树还额外运行了非正式支持范围的完整 Windows Control lib：454/461 通过。7 个既有失败分别是两个
+  canonical artifact 目录同步 `Access is denied`、restore test coordinator 的 Unix executable path、backend migration
+  gRPC Cancelled、相对 bundle root 的 Windows 路径期望、stored bundle absolute-path 分类，以及 Unix 示例配置的绝对路径
+  断言；本次相关的 provider release 7/7、provider operation 与 credential 测试全部通过。既定 ADR 018 只承诺 Linux
+  生产服务端，故这 7 项不阻断当前 DACL 切片，但它们作为未来扩展 Windows server 支持前必须处理的已知观察保留。
+- 实现提交 `2f215a8777549a570a65328df3e365db22badec5`（tree
+  `ba75de4d4424962b704370b7579c5cc393a035b2`）生成 15,472,640-byte `git archive --format=tar`，SHA-256 为
+  `867f314fbb03493847536a9b13c5298fea6d91362de85f1c5ebf2e003c36e276`。s17 Linux、s67 macOS、s69 Windows
+  均复核同一摘要；Linux/macOS provider-driver 62/62、Windows 54/54，三端 Control provider 21/21、target migration
+  2/2 与五个部署控制 crate 严格 Clippy 全部通过，Linux 同一 archive 另通过 16 份 Schema/48 组 fixture。
+- 精确归档首次 s69 收集把过长 UTF-16LE payload 经过有输出上限的中间工具，截断提示进入 `-EncodedCommand`，任何产品
+  命令都未运行；最终在同一 shell 内编码并立即发送后通过。s67 首轮先通过 62 项 driver，随后链接 Control 时 data volume
+  空间耗尽；只删除本任务和上一精确归档产生的可重建临时目录后，从同一摘要新目录重跑全过。两项均在正式 evidence
+  `docs/product/evidence/provider-driver-dispatcher-portability-2f215a8.json` 保留为 inconclusive collection observation。
+- 此项关闭 Windows 当前服务身份的代码级 DACL 策略与三平台可移植性缺口，不冒充 Windows Service 部署完成：s69 使用
+  提升的交互式 token，尚未以虚拟、托管或域 service account 安装/启动 Control。真实 materialized release、离线签署、
+  公共透明日志与独立 witness、后台 dispatcher、公共 API/CLI/Web、三家 driver 和真实账户 lifecycle/conformance 仍是
+  `P1-DEPLOY-001` 的明确阻断项。

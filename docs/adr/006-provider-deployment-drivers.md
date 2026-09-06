@@ -260,6 +260,13 @@ archive handle 复核长度和摘要，在隔离 staging 中拒绝 link、非 re
 才按 release digest + host 原子发布只读目录，随后再次遍历完整树；已有目录必须逐文件一致，绝不原位修补。崩溃留下的
 专用 staging 只在持有同一安装锁时清理。
 
+Windows 的 read-only attribute 不属于权限边界。installation root、trust root 与 rotation envelope 必须由当前 Control
+进程令牌用户 SID 持有，DACL 必须以 `SE_DACL_PROTECTED` 关闭父目录继承；只有该 SID、LocalSystem 与 built-in
+Administrators 可以获得写入、删除、改 DACL 或改 owner 权限。标准 allow ACE 会核对 SID；带危险权限的 object、callback
+或 compound allow ACE 因有效语义更复杂而直接失败关闭。校验始终读取已打开对象 handle 的 owner/DACL，而不是先按路径
+查询再相信结果；installation root 还在 installer 生命周期内保留一个不共享 delete 的目录 handle，阻止重命名或替换根。
+测试 ACL 构造器只在显式 `test-support` feature 下导出，正常 Control 依赖不会获得修改 ACL 的生产 API。
+
 Control 现把 release/host 的验证结果写入不可改写、不可删除的持久 registry，并让 active target 精确绑定该 release。
 没有 pin 的旧 target 在升级时 disabled；全树校验失败会把 release 永久 quarantined 并追加审计。唯一公开执行入口只
 接受由 Control 创建的 dispatcher，不再接受调用方提供的任意内存 driver。dispatcher 从 target 的 host-specific 安装树
@@ -276,7 +283,7 @@ backend、driver ID/version 和有限有效期，再装入标准 DSSE v1 envelop
 
 Control 的 out-of-band trust root 固定 root version/expiry、key ID、公钥、有效期/撤销、角色 key set、阈值和授权最长
 寿命。key ID 是 32-byte raw public key 的 SHA-256。信任根文件必须为绝对路径、regular non-symlink、小于 1 MiB；
-Unix 还要求由服务身份持有且 group/other 不可写。Control 把每个见过的 canonical root/version 持久保存，拒绝版本
+Unix 还要求由服务身份持有且 group/other 不可写，Windows 执行上述 owner/protected-DACL 规则。Control 把每个见过的 canonical root/version 持久保存，拒绝版本
 回退、跳号、同版本不同内容，以及更高版本重新激活历史上已经撤销的 key；安装根与信任根必须同时配置，否则外部执行
 保持关闭。
 
@@ -361,8 +368,13 @@ Control provider、两项 target migration 和严格 Clippy，并登记受治理
 fixture。该结果仍不等于接入真实公共日志或独立见证服务。当前 v1 只固定 C2SP Ed25519 `0x01`/`0x04` 分支；上游
 ML-DSA-44 能力必须通过后续版本化统一契约引入，不能静默改变 v1 语义。
 
+精确提交 `2f215a8777549a570a65328df3e365db22badec5` 的同一 archive 已在 Linux、macOS 与 Windows 通过
+provider-driver、Control provider、两项 target migration 和五 crate 严格 Clippy；Windows 原生 54 项包括 owner、
+protected DACL、非可信 writer、trust file 与 root handle pinning。正式 evidence 明确保留测试使用提升的交互式 token，
+尚未把 Control 安装为使用虚拟、托管或域账户的 Windows Service，不能把 API 语义验证夸大成服务部署验收。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
-真实透明日志/独立 witness 的采集与可用性运营，以及 Windows service account DACL。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
+真实透明日志/独立 witness 的采集与可用性运营，以及真实 Windows Service 安装演练。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
 完整 backend driver 和真实账户 evidence 也未完成。在这些完成并获得真实账户证据前，不能把当前 dispatcher 称作已部署
 的 provider 服务，更不能升级 backend 支持状态。
 
