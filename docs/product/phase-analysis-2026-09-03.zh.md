@@ -2702,3 +2702,38 @@ Application/framework source + versioned build plan
   Linux 另通过 18 份 Schema/57 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。evidence Schema 相应放行 18/57 计数。
   正式记录为 `evidence/provider-driver-dispatcher-portability-5926363.json`；它证明这些控制路径的三平台代码可移植性，
   不证明真实 provider 部署或 Edge Canon 合规。
+
+## 94. Provider deployment cancel/rollback、服务端密钥幂等摘要、查询计划收尾与细粒度错误码
+
+- 幂等摘要改为服务端密钥：`SecretCipher` 保留主密钥并以 HKDF-SHA256 按用途串 `deislet-control-idempotency-digest-v1` 派生
+  子键，请求摘要改为 HMAC-SHA256；记录新增 `digest_scheme` 列（旧行读作 `sha256-v1`，新行写 `hmac-sha256-v1`，独立不可变
+  触发器），跨 scheme 的重放按 `idempotency-key-reused` 409 处理并说明原因，只影响升级前 24 小时窗口内首次使用的 key。未配置
+  主密钥时带 `Idempotency-Key` 的 provider mutation 在任何写入前以 409 `not-configured` 失败关闭并指名 `secret_key_file`。
+- 查询计划三项遗留全部收口：environment 内 grant 列表按过滤形态分别准备语句（status 等值可走既有索引，"all" 走新增的
+  `idx_provider_target_grants_environment_page_v1`），tokens 按 account、targets 按 installation 各自准备等值语句；结果、
+  排序与 keyset 谓词逐字不变，`pagination_plans.rs` 断言过滤形态命中预期索引，`known_shortfall` 现无记录但机制保留。
+- Cancel：`POST .../provider-deployments/:operation_id/cancel`（三个前缀），要求 If-Match（缺 428、陈旧 412），
+  `Idempotency-Key` 可选；按 `operation-transitions.json` 只允许 queued/running/waiting → cancelling，其它状态 409
+  `operation-not-cancellable`。协调器在同一 tick 内处理 cancelling：在途的 driver 调用照旧等待 receipt 或走 unknown-result
+  对账；已激活（或可能已激活）的步骤绝不回退；可逆副作用追加一条 `cleanup` 步骤经普通 lease 路径执行，成功后 cancelled、
+  失败后 failed 并带诊断。审查发现两处 major 并已修：第二次 prepare 会误取消排队中的 cleanup 并把 workflow 标 failed；
+  cancel 落在 prepare 与 claim 之间时 claim 缺少父状态围栏——现在 claim 事务内联查父 workflow 状态，cancelling 或终态一律
+  NotRunnable，lapsed 步骤仍可 reconcile。cancel 请求按 (actor, key 摘要, 请求指纹) 一次性记在 workflow 行上做重放。
+- Rollback：`POST .../provider-deployments/:operation_id/rollback`，要求 `Idempotency-Key`；源 operation 必须是本 environment
+  上已 succeeded 的 deploy，target/installation/grant 仍 active（复用 start 的校验路径）；创建 kind=`rollback` 的新
+  ProductOperation，workflow 为 `[rollback, observe]`，重申源部署的精确 desired state（同一 desiredStateDigest/artifact/plan/
+  target+grant pin，即 driver receipt 绑定的身份），并以 `rolledBackFromOperationId`/`rollbackOperationIds` 双向链接。workflow
+  表 CHECK 无法原地放宽，按文件既有重建技术一次性重建 journal。新 deploy/rollback operation 如实报告 `cancellable: true`。
+  审查的一项 minor 未修：rollback 请求未携带源激活 receipt 的 provider 原生身份，补上需要 `DriverRequest` 增量扩展
+  `rollbackTarget`（deis-provider-driver 契约与全部 driver），属 ADR-006 范畴的 driver 契约决定。
+- 细粒度错误码：`limit-out-of-range`（target query/limit）、`cursor-invalid`（含 keyset 位置畸形）、`idempotency-key-required`
+  （`ApiError::missing_header` 统一三处副本）、`already-exists`（app/environment/account/domain grant 创建冲突，含退役名
+  保留）已逐路由产出；app id、environment/account name、role、scopes[n] 的字段校验带 `violations`。`offset-out-of-range`
+  按兼容门禁规则保留为 reserved（删枚举值即破坏性变更）。旧前缀响应文本逐字节不变。32 条 OpenAPI 摘要不再拼写路径；
+  `download_bundle` 不是 OpenAPI operation，文案保持。
+- 门禁：fmt、严格 Clippy、Control 617/617（加 1 ignore）与集成 26、CLI 171/171、共享契约 18/57、治理、OpenAPI 兼容（113 个
+  operation、仅增量）、文档路径、`git diff --check`、web 构建全部通过；三视角审查 9 项修 8 项。
+- 未完成：rollback 原生身份的 driver 契约扩展；通用 `POST /operations/:id/cancel` 对 deploy/rollback 仍答 409 无控制器，
+  provider 专用路由为受支持路径；cancel/rollback 重放未用共享 `api_idempotency_records`（其 resource_kind CHECK 需重建表）；
+  `scripts/demo.sh` 仍走旧前缀；旧库两代索引清退；`download_bundle` 文案；ADR-006 所列真实签署 release、透明日志、三家
+  完整 driver 与真实账户 evidence。本节为本机工作节点，尚无提交后精确归档或三平台 evidence。

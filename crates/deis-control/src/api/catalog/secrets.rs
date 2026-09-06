@@ -62,7 +62,7 @@ pub struct SecretDeletedResponse {
     pub plan: Option<DeploymentPlan>,
 }
 
-/// PUT /api/apps/:app_id/environments/:env/secrets/:name
+/// Store one of an environment's secrets.
 #[utoipa::path(
     put,
     path = "/api/v1/apps/{app_id}/environments/{env_name}/secrets/{name}",
@@ -220,7 +220,7 @@ async fn discard_staged_revision(
     }
 }
 
-/// GET /api/apps/:app_id/environments/:env/secrets
+/// List an environment's secret names.
 ///
 /// Names and timestamps only. There is deliberately no endpoint that
 /// returns a secret value.
@@ -274,7 +274,7 @@ pub async fn list_secrets(
     Ok(Json(response))
 }
 
-/// DELETE /api/apps/:app_id/environments/:env/secrets/:name
+/// Remove a secret.
 #[utoipa::path(
     delete,
     path = "/api/v1/apps/{app_id}/environments/{env_name}/secrets/{name}",

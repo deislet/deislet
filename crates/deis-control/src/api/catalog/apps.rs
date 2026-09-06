@@ -65,7 +65,7 @@ pub struct ReleaseRetiredAppResponse {
     pub accepted: String,
 }
 
-/// POST /api/apps
+/// Create an application.
 #[utoipa::path(
     post,
     path = "/api/v1/apps",
@@ -84,11 +84,23 @@ pub async fn create_app(
     State(state): State<CatalogState>,
     Json(request): Json<CreateAppRequest>,
 ) -> ApiResult<(StatusCode, Json<App>)> {
-    let app = state.store.create_app(request.id.trim()).await?;
+    // The two things this create can be refused for are both about the
+    // one field the body has: the id is not a name (400, `id`), or the
+    // name is taken - by a live application or by a deleted one whose data
+    // still holds it (409 `already-exists`, and the message says which).
+    let app = state
+        .store
+        .create_app(request.id.trim())
+        .await
+        .map_err(|error| {
+            ApiError::from(error)
+                .creating("application")
+                .invalid_field("id")
+        })?;
     Ok((StatusCode::CREATED, Json(app)))
 }
 
-/// GET /api/apps
+/// List the applications, by id.
 #[utoipa::path(
     get,
     path = "/api/v1/apps",
@@ -129,7 +141,7 @@ pub async fn list_apps(
     Ok(Json(response))
 }
 
-/// GET /api/apps/:app_id
+/// Read one application.
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}",
@@ -150,7 +162,7 @@ pub async fn get_app(
     Ok(Json(state.store.get_app(&app_id).await?))
 }
 
-/// DELETE /api/apps/:app_id
+/// Delete an application and stop every node serving it.
 ///
 /// Removes the app together with its versions, environments, deployment
 /// history, routes and secrets, drops the bundle files those versions
@@ -280,7 +292,7 @@ pub async fn delete_app(
     }))
 }
 
-/// GET /api/retired-apps
+/// List the names deleted applications still hold.
 ///
 /// The names of deleted applications and the tenants whose data is the reason
 /// they are held. This is the only record of what became of a deleted
@@ -329,7 +341,7 @@ pub async fn list_retired_apps(
     Ok(Json(response))
 }
 
-/// DELETE /api/retired-apps/:app_id
+/// Release a retired name so it can be created again.
 ///
 /// Free the name again. Deliberately a second call, made by an administrator,
 /// rather than something the delete could have done on its own: releasing it
@@ -407,6 +419,62 @@ mod tests {
 
     use axum::http::StatusCode;
     use serde_json::{Value, json as body};
+
+    /// One JSON request through the whole router, on whichever surface the
+    /// path names - the mounts `api::tests` builds, which is where the
+    /// structured envelope is rendered.
+    async fn post(router: &axum::Router, uri: &str, request: Value) -> (StatusCode, Value) {
+        use axum::body::{Body, to_bytes};
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut http = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(request.to_string()))
+            .unwrap();
+        http.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let response = router.clone().oneshot(http).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Creating an application twice, and creating one under a name that is
+    /// not one: a v1 client reads the class off `code` and the member off
+    /// `violations`, and the flat tree still answers its one string.
+    #[tokio::test]
+    async fn a_v1_create_says_already_exists_and_names_the_field_it_refused() {
+        let (router, _dir) = crate::api::tests::full_router().await;
+        let (status, created) = post(&router, "/api/v1/apps", body!({ "id": "shop" })).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+
+        let (status, refused) = post(&router, "/api/v1/apps", body!({ "id": "shop" })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["error"]["code"], "already-exists");
+        assert_eq!(refused["error"]["target"]["resource"], "application");
+        assert!(refused["error"]["target"].get("field").is_none());
+        assert_eq!(refused["error"]["message"], "app shop already exists");
+        assert_eq!(refused["error"]["retryable"], false);
+
+        let (status, refused) = post(&router, "/api/v1/apps", body!({ "id": "Not A Name" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["error"]["code"], "invalid-argument");
+        let violation = &refused["error"]["violations"][0];
+        assert_eq!(violation["field"], "id");
+        assert_eq!(violation["code"], "invalid");
+        assert_eq!(violation["message"], refused["error"]["message"]);
+
+        // The legacy tree is one string, as it has always been.
+        let (status, refused) = post(&router, "/api/apps", body!({ "id": "Not A Name" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(refused["error"].is_string(), "{refused}");
+        assert_eq!(refused.as_object().unwrap().len(), 1, "{refused}");
+    }
 
     async fn platform() -> Harness {
         harness_with_storage(

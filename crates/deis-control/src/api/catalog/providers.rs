@@ -32,6 +32,7 @@ use utoipa::IntoParams;
 use utoipa::ToSchema;
 
 use super::{CatalogState, actor_subject};
+use crate::api::headers::{optional_header, required_header, single_header};
 use crate::api::openapi;
 use crate::{
     api::{
@@ -40,17 +41,18 @@ use crate::{
         paths::ApiPaths,
     },
     catalog::{
-        IdempotencyOutcome, IdempotencyScope, IdempotencyStore, IdempotentRequest,
-        IdempotentResource, OperationRequestContext, PagePosition, PendingIdempotencyRecord,
-        ProviderCredentialAuditEvent, ProviderCredentialBinding, ProviderCredentialBindingSpec,
-        ProviderCredentialMutationContext, ProviderDeploymentSpec, ProviderDeploymentWorkflow,
+        CatalogError, IdempotencyDigestKey, IdempotencyOutcome, IdempotencyScope, IdempotencyStore,
+        IdempotentRequest, IdempotentResource, OperationRequestContext, PagePosition,
+        PendingIdempotencyRecord, ProviderCredentialAuditEvent, ProviderCredentialBinding,
+        ProviderCredentialBindingSpec, ProviderCredentialMutationContext,
+        ProviderDeploymentCancellation, ProviderDeploymentSpec, ProviderDeploymentWorkflow,
         ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
         ProviderDriverReleaseRegistry, ProviderInstallation, ProviderInstallationSpec,
         ProviderLifecycleAuditEvent, ProviderLifecycleMutationContext,
-        ProviderLifecycleResourceKind, ProviderTarget, ProviderTargetGrant,
+        ProviderLifecycleResourceKind, ProviderRollbackSpec, ProviderTarget, ProviderTargetGrant,
         ProviderTargetGrantAuditEvent, ProviderTargetGrantHistoryFilter,
         ProviderTargetGrantMutationContext, ProviderTargetGrantSpec,
-        ProviderTargetGrantStatusFilter, ProviderTargetSpec,
+        ProviderTargetGrantStatusFilter, ProviderTargetSpec, SecretsBackend,
     },
     identity::Principal,
 };
@@ -559,6 +561,7 @@ pub async fn provision_credential(
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderCredentialBinding>)> {
     let idempotency_key = required_header(&headers, IDEMPOTENCY_KEY)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_CREDENTIAL_PROVISION,
         Some(idempotency_key),
         json!({
@@ -696,6 +699,7 @@ pub async fn rotate_credential(
     let binding_id = parse_id(&binding_id, "provider credential binding")?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_CREDENTIAL_ROTATE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({
@@ -750,6 +754,7 @@ pub async fn revoke_credential(
     let binding_id = parse_id(&binding_id, "provider credential binding")?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_CREDENTIAL_REVOKE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({"bindingId": binding_id, "ifMatch": expected_revision}),
@@ -859,6 +864,7 @@ pub async fn register_installation(
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderInstallation>)> {
     let idempotency_key = required_header(&headers, IDEMPOTENCY_KEY)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_INSTALLATION_REGISTER,
         Some(idempotency_key),
         json!({
@@ -999,6 +1005,7 @@ pub async fn register_target(
     let idempotency_key = required_header(&headers, IDEMPOTENCY_KEY)?;
     let installation_id = parse_id(&installation_id, "provider installation")?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_TARGET_REGISTER,
         Some(idempotency_key),
         json!({
@@ -1188,6 +1195,7 @@ pub async fn disable_installation(
     let installation_id = parse_id(&installation_id, "provider installation")?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_INSTALLATION_DISABLE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({"installationId": installation_id, "ifMatch": expected_revision}),
@@ -1236,6 +1244,7 @@ pub async fn enable_installation(
     let installation_id = parse_id(&installation_id, "provider installation")?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_INSTALLATION_ENABLE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({"installationId": installation_id, "ifMatch": expected_revision}),
@@ -1288,6 +1297,7 @@ pub async fn delete_installation(
     let expected_revision = required_if_match(&headers)?;
     let cascade = query.cascade.unwrap_or(false);
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_INSTALLATION_DELETE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({
@@ -1373,6 +1383,7 @@ pub async fn disable_target(
     let target_id = parse_id(&target_id, "provider target")?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_TARGET_DISABLE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({"targetId": target_id, "ifMatch": expected_revision}),
@@ -1421,6 +1432,7 @@ pub async fn enable_target(
     let target_id = parse_id(&target_id, "provider target")?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_TARGET_ENABLE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({"targetId": target_id, "ifMatch": expected_revision}),
@@ -1472,6 +1484,7 @@ pub async fn delete_target(
     let target_id = parse_id(&target_id, "provider target")?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_TARGET_DELETE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({"targetId": target_id, "ifMatch": expected_revision}),
@@ -1740,6 +1753,7 @@ pub async fn grant_provider_target(
     // Canonical ids, not names: a name deleted and recreated must not let an
     // old key replay a grant onto the new application.
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_TARGET_GRANT_CREATE,
         Some(idempotency_key),
         json!({
@@ -1890,6 +1904,7 @@ pub async fn revoke_provider_target_grant(
     provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
+        &state.secrets,
         ROUTE_TARGET_GRANT_REVOKE,
         optional_header(&headers, IDEMPOTENCY_KEY)?,
         json!({"grantId": grant_id, "ifMatch": expected_revision}),
@@ -2024,7 +2039,11 @@ pub async fn begin_provider_deployment(
         .store
         .get_environment(&app_name, &environment_name)
         .await?;
-    let context = operation_context(&headers, &principal, &app_name, &environment_name)?;
+    let context = operation_context(
+        &headers,
+        &principal,
+        &format!("/api/apps/{app_name}/environments/{environment_name}/provider-deployments"),
+    )?;
     let operation = state
         .store
         .begin_provider_deployment(
@@ -2145,6 +2164,111 @@ pub async fn get_provider_deployment(
     Ok((headers, Json(workflow)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/cancel",
+    operation_id = "cancelProviderDeployment",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The deployment or rollback operation's UUIDv7."), ("Idempotency-Key" = Option<String>, Header, description = "Optional. A replay of the same key by the same principal returns the same operation."), ("If-Match" = String, Header, description = "The operation revision the caller expects.")),
+    responses(
+        (status = 202, description = "Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
+pub async fn cancel_provider_deployment(
+    State(state): State<CatalogState>,
+    Path((app_name, environment_name, operation_id)): Path<(String, String, String)>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    paths: ApiPaths,
+) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
+    let app = state.store.get_app(&app_name).await?;
+    let environment = state
+        .store
+        .get_environment(&app_name, &environment_name)
+        .await?;
+    let operation_id = parse_id(&operation_id, "provider deployment operation")?;
+    let expected_revision = required_if_match(&headers)?;
+    let route = format!(
+        "/api/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/cancel"
+    );
+    let replay = optional_header(&headers, IDEMPOTENCY_KEY)?
+        .map(|key| keyed_operation_context(&headers, &principal, &route, key))
+        .transpose()?;
+    let operation = state
+        .store
+        .request_provider_deployment_cancellation(ProviderDeploymentCancellation {
+            application_id: app.canonical_id,
+            environment_id: environment.canonical_id,
+            operation_id,
+            expected_revision,
+            actor_subject: actor_subject(&principal),
+            replay,
+        })
+        .await?;
+    let headers = operation_headers(paths, &operation, &app_name, &environment_name)?;
+    Ok((StatusCode::ACCEPTED, headers, Json(operation)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/rollback",
+    operation_id = "rollbackProviderDeployment",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The succeeded deployment operation to roll back to."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation.")),
+    responses(
+        (status = 202, description = "A new `rollback` operation was recorded and will be driven; poll `Location`. Its workflow names the deployment in `rolledBackFromOperationId`, runs the driver's `rollback` against that deployment's exact desired state and then `observe`s the result.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the new operation."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 403, response = openapi::Forbidden),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+    )
+)]
+pub async fn rollback_provider_deployment(
+    State(state): State<CatalogState>,
+    Path((app_name, environment_name, operation_id)): Path<(String, String, String)>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    paths: ApiPaths,
+) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
+    let app = state.store.get_app(&app_name).await?;
+    let environment = state
+        .store
+        .get_environment(&app_name, &environment_name)
+        .await?;
+    let operation_id = parse_id(&operation_id, "provider deployment operation")?;
+    let context = operation_context(
+        &headers,
+        &principal,
+        &format!(
+            "/api/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/rollback"
+        ),
+    )?;
+    let operation = state
+        .store
+        .begin_provider_rollback(
+            ProviderRollbackSpec {
+                application_id: app.canonical_id,
+                environment_id: environment.canonical_id,
+                rolled_back_from_operation_id: operation_id,
+            },
+            context,
+        )
+        .await?;
+    let headers = operation_headers(paths, &operation, &app_name, &environment_name)?;
+    Ok((StatusCode::ACCEPTED, headers, Json(operation)))
+}
+
 fn provider_registry(state: &CatalogState) -> ApiResult<ProviderDriverReleaseRegistry> {
     state
         .provider_driver_dispatcher
@@ -2255,19 +2379,34 @@ fn parse_digest(value: &str, label: &str) -> ApiResult<Sha256Digest> {
 /// the record every provider-management mutation shares. `None` means the
 /// route treats the key as optional and the caller sent none, so the
 /// mutation runs without a replay record.
+///
+/// The request digest is keyed by a subkey of the secrets master key, so a
+/// key that arrives while no master key is usable is refused as
+/// `not-configured` naming `secret_key_file`: the mutation must not run
+/// unrecorded, and a weaker digest is not an option (see
+/// [`crate::catalog::idempotency`]).
 fn idempotent_request(
+    secrets: &SecretsBackend,
     route_id: &'static str,
     idempotency_key: Option<&str>,
     canonical_request: serde_json::Value,
 ) -> ApiResult<Option<IdempotentRequest>> {
     idempotency_key
         .map(|idempotency_key| {
+            let digest_key =
+                IdempotencyDigestKey::derive(secrets).map_err(|error| match error {
+                    CatalogError::SecretsUnavailable(reason) => ApiError::NotConfigured(format!(
+                        "{route_id} cannot record its Idempotency-Key: {reason}"
+                    )),
+                    other => other.into(),
+                })?;
             let canonical = serde_jcs::to_vec(&canonical_request).map_err(|error| {
                 ApiError::InternalError(format!(
                     "cannot canonicalize {route_id} request for its idempotency record: {error}"
                 ))
             })?;
-            IdempotentRequest::new(route_id, idempotency_key, &canonical).map_err(Into::into)
+            IdempotentRequest::new(route_id, idempotency_key, &canonical, &digest_key)
+                .map_err(Into::into)
         })
         .transpose()
 }
@@ -2395,21 +2534,31 @@ fn lifecycle_mutation_context(
     }
 }
 
+/// The durable replay context of a product operation request. `route` is
+/// the canonical (`/api`) path of the mutation, which the fingerprint binds
+/// with the method and contract version so one key cannot replay another
+/// route; the surface the caller used does not change the operation.
 fn operation_context(
     headers: &HeaderMap,
     principal: &Principal,
-    app_name: &str,
-    environment_name: &str,
+    route: &str,
 ) -> ApiResult<OperationRequestContext> {
     let idempotency_key = required_header(headers, IDEMPOTENCY_KEY)?;
+    keyed_operation_context(headers, principal, route, idempotency_key)
+}
+
+fn keyed_operation_context(
+    headers: &HeaderMap,
+    principal: &Principal,
+    route: &str,
+    idempotency_key: &str,
+) -> ApiResult<OperationRequestContext> {
     let request_id =
         optional_canonical_header(headers, REQUEST_ID)?.unwrap_or_else(CanonicalId::new_v7);
     let correlation_id = optional_canonical_header(headers, CORRELATION_ID)?.unwrap_or(request_id);
     OperationRequestContext::new(
         idempotency_key,
-        &format!(
-            "POST\n/api/apps/{app_name}/environments/{environment_name}/provider-deployments\nv1"
-        ),
+        &format!("POST\n{route}\nv1"),
         actor_subject(principal),
         request_id,
         correlation_id,
@@ -2476,23 +2625,6 @@ fn parse_id(value: &str, label: &str) -> ApiResult<CanonicalId> {
         .map_err(|error| ApiError::BadRequest(format!("invalid {label} identity: {error}")))
 }
 
-fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<&'a str> {
-    single_header(headers, name)?
-        .ok_or_else(|| ApiError::BadRequest(format!("{name} header is required")))?
-        .to_str()
-        .map_err(|_| ApiError::BadRequest(format!("{name} header is not valid visible ASCII")))
-}
-
-fn optional_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<Option<&'a str>> {
-    single_header(headers, name)?
-        .map(|value| {
-            value.to_str().map_err(|_| {
-                ApiError::BadRequest(format!("{name} header is not valid visible ASCII"))
-            })
-        })
-        .transpose()
-}
-
 fn optional_canonical_header(headers: &HeaderMap, name: &str) -> ApiResult<Option<CanonicalId>> {
     single_header(headers, name)?
         .map(|value| {
@@ -2502,18 +2634,6 @@ fn optional_canonical_header(headers: &HeaderMap, name: &str) -> ApiResult<Optio
             parse_id(value, name)
         })
         .transpose()
-}
-
-fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<Option<&'a HeaderValue>> {
-    let all = headers.get_all(name);
-    let mut values = all.iter();
-    let first = values.next();
-    if values.next().is_some() {
-        return Err(ApiError::BadRequest(format!(
-            "{name} header must appear exactly once"
-        )));
-    }
-    Ok(first)
 }
 
 fn required_if_match(headers: &HeaderMap) -> ApiResult<u64> {
@@ -2863,6 +2983,50 @@ mod tests {
                 .unwrap()
                 .contains("release management is disabled")
         );
+    }
+
+    /// The request digest is keyed by the secrets master key, so a keyed
+    /// create without one is refused before any mutation runs, as a 409
+    /// `not-configured` that names the setting to fix.
+    #[tokio::test]
+    async fn keyed_mutations_are_refused_as_not_configured_without_a_master_key() {
+        let harness = harness(false).await;
+        let response = harness
+            .router
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/providers/installations",
+                json!({
+                    "backendId": "deislet",
+                    "accountReference": "account",
+                    "credentialBindingId": CanonicalId::new_v7().to_string(),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // The legacy `/api` body carries only the message; the structured
+        // code travels in the extension the versioned surfaces render.
+        let detail = response
+            .extensions()
+            .get::<crate::api::error::ErrorDetail>()
+            .cloned()
+            .unwrap();
+        assert_eq!(detail.code, crate::api::error::codes::NOT_CONFIGURED);
+        assert!(
+            detail.message.contains("secret_key_file"),
+            "{}",
+            detail.message
+        );
+        assert!(
+            detail.message.contains("Idempotency-Key"),
+            "{}",
+            detail.message
+        );
+        let body = response_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("secret_key_file"));
+        assert_eq!(idempotency_record_count(&harness.state).await, 0);
     }
 
     #[tokio::test]
@@ -3588,6 +3752,51 @@ mod tests {
             let binding_id = created["bindingId"].as_str().unwrap();
             assert_eq!(location, format!("{expected_prefix}{binding_id}"), "{uri}");
         }
+    }
+
+    /// The missing key as a v1 client reads it: its own code and the header
+    /// it has to send, while the flat tree keeps the sentence it always
+    /// answered. Asserted through the whole router, because the envelope is
+    /// rendered by the surface mount rather than by the handler.
+    #[tokio::test]
+    async fn a_mutation_without_a_key_says_idempotency_key_required_on_v1() {
+        use axum::extract::ConnectInfo;
+
+        let (router, _dir) = crate::api::tests::full_router().await;
+        let body = json!({
+            "backendId": "cloudflare-workers-pages",
+            "name": "production",
+            "credential": "test-only-token"
+        });
+        let refuse = |uri: &'static str| {
+            let router = router.clone();
+            let body = body.clone();
+            async move {
+                let mut request = json_request_without_key(Method::POST, uri, body);
+                request.extensions_mut().insert(ConnectInfo(
+                    "127.0.0.1:40000".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                (status, response_json(response).await)
+            }
+        };
+
+        let (status, refused) = refuse("/api/v1/providers/credentials").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["error"]["code"], "idempotency-key-required");
+        assert_eq!(
+            refused["error"]["message"],
+            "idempotency-key header is required"
+        );
+        assert_eq!(refused["error"]["target"]["resource"], "request");
+        assert_eq!(refused["error"]["target"]["field"], "Idempotency-Key");
+        assert_eq!(refused["error"]["retryable"], false);
+
+        let (status, refused) = refuse("/api/providers/credentials").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["error"], "idempotency-key header is required");
+        assert_eq!(refused.as_object().unwrap().len(), 1, "{refused}");
     }
 
     #[tokio::test]
@@ -5095,5 +5304,409 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A driver that answers every step with a successful receipt, pinned
+    /// to the fixture's manifest so the target's durable pin accepts it.
+    struct HttpTestDriver {
+        manifest: ValidatedProviderDriverManifest,
+        calls: std::sync::Mutex<Vec<deis_provider_driver::DriverOperation>>,
+    }
+
+    #[async_trait::async_trait]
+    impl deis_provider_driver::ProviderDriver for HttpTestDriver {
+        fn manifest(&self) -> &ValidatedProviderDriverManifest {
+            &self.manifest
+        }
+
+        async fn execute(
+            &self,
+            context: &deis_provider_driver::DriverExecutionContext<'_>,
+        ) -> Result<deis_provider_driver::DriverReceipt, deis_provider_driver::DriverError>
+        {
+            use deis_provider_driver::{
+                DriverNextAction, DriverOperation, DriverStepState, SideEffect,
+            };
+            let request = context.request();
+            self.calls.lock().unwrap().push(request.operation);
+            let side_effecting = matches!(
+                request.operation,
+                DriverOperation::Upload
+                    | DriverOperation::Activate
+                    | DriverOperation::Rollback
+                    | DriverOperation::Cleanup
+            );
+            Ok(deis_provider_driver::DriverReceipt {
+                schema_version: 1,
+                operation_id: request.operation_id,
+                operation: request.operation,
+                desired_state_digest: request.desired_state_digest.clone(),
+                state: DriverStepState::Succeeded,
+                deployment_state: None,
+                side_effect: if side_effecting {
+                    SideEffect::Confirmed
+                } else {
+                    SideEffect::None
+                },
+                provider_request_id: Some(format!("request-{}", request.operation.as_str())),
+                provider_version_id: (request.operation == DriverOperation::Upload)
+                    .then(|| "provider-version-1".to_owned()),
+                provider_deployment_id: matches!(
+                    request.operation,
+                    DriverOperation::Activate
+                        | DriverOperation::Observe
+                        | DriverOperation::Rollback
+                )
+                .then(|| "provider-deployment-1".to_owned()),
+                provider_resource_ids: Default::default(),
+                observed_at: chrono::Utc::now(),
+                next_action: DriverNextAction::None,
+                diagnostic: None,
+            })
+        }
+    }
+
+    async fn drive_once(seeded: &ProviderFixture, driver: &HttpTestDriver, operation_id: &str) {
+        seeded
+            .harness
+            .state
+            .store
+            .drive_provider_deployment_once_for_test(
+                operation_id.parse().unwrap(),
+                CanonicalId::new_v7(),
+                driver,
+                deis_provider_driver::DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn error_code(response: &axum::response::Response) -> &'static str {
+        response
+            .extensions()
+            .get::<crate::api::error::ErrorDetail>()
+            .cloned()
+            .unwrap()
+            .code
+    }
+
+    #[tokio::test]
+    async fn provider_deployment_cancel_is_revision_fenced_replayable_and_settled_by_the_dispatcher()
+     {
+        let fixture = ReleaseFixture::new();
+        let seeded = provider_fixture(&fixture).await;
+        let router = &seeded.router;
+        let artifact = attach_artifact(&seeded.harness).await;
+        let (status, operation) =
+            begin_deployment(router, &seeded.target_id, &artifact, "deploy-to-cancel").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+        assert_eq!(operation["cancellable"], true);
+        let operation_id = operation["operationId"].as_str().unwrap().to_owned();
+        // Recording the first step already moved the operation past its
+        // initial revision; the ETag the caller saw is what If-Match names.
+        let revision = operation["revision"].as_u64().unwrap();
+        let etag = |revision: u64| format!("\"{revision}\"");
+        let deployment_uri =
+            format!("/api/apps/demo/environments/production/provider-deployments/{operation_id}");
+        let cancel_uri = format!("{deployment_uri}/cancel");
+
+        // If-Match is mandatory, exactly as for the generic operation cancel.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&cancel_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+        let (status, _, stale) = mutate(
+            router,
+            Method::POST,
+            &cancel_uri,
+            "cancel-001",
+            &etag(revision + 5),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{stale}");
+        // Another environment never sees the operation.
+        let (status, _, elsewhere) = mutate(
+            router,
+            Method::POST,
+            &format!(
+                "/api/apps/demo/environments/preview/provider-deployments/{operation_id}/cancel"
+            ),
+            "cancel-elsewhere",
+            &etag(revision),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{elsewhere}");
+
+        let (status, headers, cancelling) = mutate(
+            router,
+            Method::POST,
+            &cancel_uri,
+            "cancel-001",
+            &etag(revision),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{cancelling}");
+        assert_eq!(headers[header::LOCATION], deployment_uri);
+        assert_eq!(headers[header::ETAG], etag(revision + 1));
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(cancelling["operationId"], operation_id);
+        assert_eq!(cancelling["state"], "cancelling");
+        assert_eq!(cancelling["cancellable"], false);
+
+        // The same key replays the same operation, stale If-Match and all;
+        // a different key finds nothing cancellable.
+        let (status, headers, replayed) = mutate(
+            router,
+            Method::POST,
+            &cancel_uri,
+            "cancel-001",
+            &etag(revision),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replayed}");
+        assert_eq!(headers[header::ETAG], etag(revision + 1));
+        assert_eq!(replayed, cancelling);
+        let response = router
+            .clone()
+            .oneshot(keyed_request(
+                Method::POST,
+                &cancel_uri,
+                "cancel-002",
+                &etag(revision + 1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error_code(&response),
+            crate::api::error::codes::OPERATION_NOT_CANCELLABLE
+        );
+
+        // The dispatcher settles it: nothing ran, nothing to clean up.
+        assert_eq!(
+            ready_for_dispatch(&seeded.harness).await,
+            std::slice::from_ref(&operation_id)
+        );
+        let driver = HttpTestDriver {
+            manifest: fixture.manifest.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        drive_once(&seeded, &driver, &operation_id).await;
+        assert!(driver.calls.lock().unwrap().is_empty());
+        assert!(ready_for_dispatch(&seeded.harness).await.is_empty());
+        let (status, workflow) = get(router, &deployment_uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(workflow["kind"], "deploy");
+        assert_eq!(workflow["operation"]["state"], "cancelled");
+        assert_eq!(workflow["operation"]["cancellable"], false);
+        assert!(workflow["cancelRequestedAt"].is_string());
+        assert!(workflow["rolledBackFromOperationId"].is_null());
+        assert_eq!(workflow["steps"].as_array().unwrap().len(), 1);
+        // A terminal operation refuses a fresh cancel with the stable code.
+        let response = router
+            .clone()
+            .oneshot(keyed_request(
+                Method::POST,
+                &cancel_uri,
+                "cancel-003",
+                &etag(workflow["operation"]["revision"].as_u64().unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error_code(&response),
+            crate::api::error::codes::OPERATION_NOT_CANCELLABLE
+        );
+        // And the replay still answers the original cancel.
+        let (status, _, replayed) = mutate(
+            router,
+            Method::POST,
+            &cancel_uri,
+            "cancel-001",
+            &etag(revision),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replayed}");
+        assert_eq!(replayed["state"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn provider_deployment_rollback_creates_a_linked_operation_that_runs_the_driver_rollback()
+    {
+        let fixture = ReleaseFixture::new();
+        let seeded = provider_fixture(&fixture).await;
+        let router = &seeded.router;
+        let artifact = attach_artifact(&seeded.harness).await;
+        let (status, operation) =
+            begin_deployment(router, &seeded.target_id, &artifact, "deploy-to-roll-back").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+        let deployment_id = operation["operationId"].as_str().unwrap().to_owned();
+        let deployment_uri =
+            format!("/api/apps/demo/environments/production/provider-deployments/{deployment_id}");
+        let rollback_uri = format!("{deployment_uri}/rollback");
+        let driver = HttpTestDriver {
+            manifest: fixture.manifest.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        // Only a succeeded deployment can be rolled back to.
+        let response = router
+            .clone()
+            .oneshot(keyed_request(
+                Method::POST,
+                &rollback_uri,
+                "rollback-early",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error_code(&response),
+            crate::api::error::codes::OPERATION_NOT_ROLLBACKABLE
+        );
+        for _ in 0..crate::catalog::PROVIDER_DEPLOYMENT_STEPS.len() {
+            drive_once(&seeded, &driver, &deployment_id).await;
+        }
+        let (status, succeeded) = get(router, &deployment_uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(succeeded["operation"]["state"], "succeeded");
+        assert_eq!(succeeded["rollbackOperationIds"], json!([]));
+
+        // The key is required: a rollback creates work.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&rollback_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Another environment never sees the deployment.
+        let (status, _, elsewhere) = mutate(
+            router,
+            Method::POST,
+            &format!(
+                "/api/apps/demo/environments/preview/provider-deployments/{deployment_id}/rollback"
+            ),
+            "rollback-elsewhere",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{elsewhere}");
+
+        let (status, headers, rollback) =
+            mutate(router, Method::POST, &rollback_uri, "rollback-001", "").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{rollback}");
+        let rollback_id = rollback["operationId"].as_str().unwrap().to_owned();
+        assert_ne!(rollback_id, deployment_id);
+        assert_eq!(rollback["kind"], "rollback");
+        assert_eq!(rollback["state"], "queued");
+        assert_eq!(rollback["phase"], "rollback");
+        let rollback_resource =
+            format!("/api/apps/demo/environments/production/provider-deployments/{rollback_id}");
+        assert_eq!(headers[header::LOCATION], rollback_resource);
+        assert_eq!(
+            headers[header::ETAG],
+            format!("\"{}\"", rollback["revision"].as_u64().unwrap())
+        );
+        // Replays answer the same operation; the link is visible both ways
+        // and in the list.
+        let (status, _, replayed) =
+            mutate(router, Method::POST, &rollback_uri, "rollback-001", "").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replayed}");
+        assert_eq!(replayed["operationId"], rollback_id);
+        let (status, workflow) = get(router, &rollback_resource).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(workflow["kind"], "rollback");
+        assert_eq!(workflow["rolledBackFromOperationId"], deployment_id);
+        assert_eq!(
+            workflow["desiredStateDigest"],
+            succeeded["desiredStateDigest"]
+        );
+        assert_eq!(workflow["artifact"], succeeded["artifact"]);
+        assert_eq!(workflow["steps"][0]["operation"], "rollback");
+        let (_, source) = get(router, &deployment_uri).await;
+        assert_eq!(source["rollbackOperationIds"], json!([rollback_id]));
+        let (status, listed) = get(
+            router,
+            "/api/apps/demo/environments/production/provider-deployments",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["page"]["total"], 2);
+        assert_eq!(listed["items"][0]["operation"]["operationId"], rollback_id);
+        assert_eq!(
+            listed["items"][1]["operation"]["operationId"],
+            deployment_id
+        );
+        // A rollback is not itself a deployment to roll back to.
+        let response = router
+            .clone()
+            .oneshot(keyed_request(
+                Method::POST,
+                &format!("{rollback_resource}/rollback"),
+                "rollback-nested",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error_code(&response),
+            crate::api::error::codes::OPERATION_NOT_ROLLBACKABLE
+        );
+
+        // The dispatcher runs the driver's rollback against the deployment's
+        // desired state, then observes.
+        for _ in 0..crate::catalog::PROVIDER_ROLLBACK_STEPS.len() {
+            drive_once(&seeded, &driver, &rollback_id).await;
+        }
+        let calls = driver.calls.lock().unwrap().clone();
+        assert_eq!(
+            &calls[crate::catalog::PROVIDER_DEPLOYMENT_STEPS.len()..],
+            [
+                deis_provider_driver::DriverOperation::Rollback,
+                deis_provider_driver::DriverOperation::Observe,
+            ]
+        );
+        let (_, done) = get(router, &rollback_resource).await;
+        assert_eq!(done["operation"]["state"], "succeeded");
+        assert_eq!(done["operation"]["progress"], 10000);
+        assert_eq!(done["nextStepIndex"], 2);
+        let rollback_child: CanonicalId = done["steps"][0]["childOperationId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let record = seeded
+            .harness
+            .state
+            .store
+            .provider_driver_operation(rollback_child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.desired_state_digest.as_str(),
+            succeeded["desiredStateDigest"].as_str().unwrap()
+        );
+        assert_eq!(
+            record.receipt.unwrap().provider_deployment_id.as_deref(),
+            Some("provider-deployment-1")
+        );
     }
 }

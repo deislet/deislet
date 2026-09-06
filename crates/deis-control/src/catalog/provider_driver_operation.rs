@@ -24,6 +24,7 @@ use deis_wire::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
@@ -150,6 +151,66 @@ pub const PROVIDER_DEPLOYMENT_STEPS: [DriverOperation; 7] = [
     DriverOperation::Observe,
 ];
 
+/// The rollback path: ask the driver to restore the provider deployment a
+/// succeeded workflow activated, then observe the result exactly as a
+/// deployment's activation is observed.
+pub const PROVIDER_ROLLBACK_STEPS: [DriverOperation; 2] =
+    [DriverOperation::Rollback, DriverOperation::Observe];
+
+/// Structured code for a cancel of an operation that is terminal or already
+/// cancelling. Spelled as a `<code>: ` message prefix, which the API lifts
+/// into the error envelope.
+pub const OPERATION_NOT_CANCELLABLE: &str = "operation-not-cancellable";
+/// Structured code for a rollback whose source is not a succeeded provider
+/// deployment on the named environment.
+pub const OPERATION_NOT_ROLLBACKABLE: &str = "operation-not-rollbackable";
+
+/// Which step list a workflow journal runs.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderWorkflowKind {
+    Deploy,
+    Rollback,
+}
+
+impl ProviderWorkflowKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deploy => "deploy",
+            Self::Rollback => "rollback",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "deploy" => Some(Self::Deploy),
+            "rollback" => Some(Self::Rollback),
+            _ => None,
+        }
+    }
+
+    /// The product operation kind a journal of this kind belongs to.
+    #[must_use]
+    pub const fn operation_kind(self) -> OperationKind {
+        match self {
+            Self::Deploy => OperationKind::Deploy,
+            Self::Rollback => OperationKind::Rollback,
+        }
+    }
+
+    /// The success-path steps, in order. A `cleanup` step appended by a
+    /// cancel is never part of this list.
+    #[must_use]
+    pub const fn steps(self) -> &'static [DriverOperation] {
+        match self {
+            Self::Deploy => &PROVIDER_DEPLOYMENT_STEPS,
+            Self::Rollback => &PROVIDER_ROLLBACK_STEPS,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDeploymentSpec {
@@ -158,6 +219,33 @@ pub struct ProviderDeploymentSpec {
     pub provider_target_id: CanonicalId,
     pub artifact: ArtifactVersionRef,
     pub plan: ProviderNeutralPlan,
+}
+
+/// A rollback of one succeeded provider deployment on its own environment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRollbackSpec {
+    pub application_id: CanonicalId,
+    pub environment_id: CanonicalId,
+    /// The succeeded `deploy` workflow whose provider deployment is restored.
+    pub rolled_back_from_operation_id: CanonicalId,
+}
+
+/// A request to cancel one provider workflow.
+///
+/// `replay`, when the caller sent an `Idempotency-Key`, carries the key and
+/// request fingerprint digests the workflow row records once; a later
+/// request under the same key from the same actor answers the same
+/// operation whatever state it has reached since.
+#[derive(Clone, Debug)]
+pub struct ProviderDeploymentCancellation {
+    pub application_id: CanonicalId,
+    pub environment_id: CanonicalId,
+    pub operation_id: CanonicalId,
+    /// The operation revision the caller saw (`If-Match`).
+    pub expected_revision: u64,
+    pub actor_subject: String,
+    pub replay: Option<OperationRequestContext>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
@@ -175,6 +263,19 @@ pub struct ProviderDeploymentStep {
 pub struct ProviderDeploymentWorkflow {
     #[schema(value_type = crate::api::openapi::ProductOperationDocument)]
     pub operation: ProductOperation,
+    /// `deploy` runs the seven standard steps; `rollback` runs `rollback`
+    /// then `observe` against the desired state of the deployment it names.
+    pub kind: ProviderWorkflowKind,
+    /// For a `rollback` workflow, the succeeded deployment it restores.
+    #[schema(value_type = Option<String>, format = Uuid)]
+    pub rolled_back_from_operation_id: Option<CanonicalId>,
+    /// Every rollback workflow that names this workflow as its source,
+    /// oldest first, whatever state each has reached.
+    #[schema(value_type = Vec<String>)]
+    pub rollback_operation_ids: Vec<CanonicalId>,
+    /// When a cancel was accepted. Set once; the operation's state says how
+    /// far the cancel has progressed.
+    pub cancel_requested_at: Option<DateTime<Utc>>,
     #[schema(value_type = String, format = Uuid)]
     pub provider_target_id: CanonicalId,
     pub target_revision: u64,
@@ -209,6 +310,9 @@ pub enum ProviderDeploymentDriveOutcome {
     Waiting(ProviderDeploymentWorkflow),
     Succeeded(ProviderDeploymentWorkflow),
     Failed(ProviderDeploymentWorkflow),
+    /// A cancel request ran to completion: no further step was dispatched
+    /// and any reversible provider side effect was cleaned up.
+    Cancelled(ProviderDeploymentWorkflow),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -518,29 +622,60 @@ impl CatalogStore {
                         "provider installation {installation_id}"
                     )));
                 }
-                let installation_id = installation_id.map(|id| id.to_string());
-                let total = transaction.query_row(
-                    "SELECT COUNT(*) FROM provider_targets
-                      WHERE ?1 IS NULL OR installation_id = ?1",
-                    [installation_id.as_deref()],
-                    |row| row.get::<_, i64>(0),
-                )?;
                 let (after_created_at, after_id) = cursor
                     .map(|cursor| (Some(cursor.sort_value), cursor.identity))
                     .unwrap_or((None, String::new()));
-                let mut statement = transaction.prepare(
-                    "SELECT target_id FROM provider_targets
-                      WHERE (?1 IS NULL OR installation_id = ?1)
-                        AND (?2 IS NULL OR created_at > ?2
-                             OR (created_at = ?2 AND target_id > ?3))
-                      ORDER BY created_at, target_id LIMIT ?4",
-                )?;
-                let ids = statement
-                    .query_map(
-                        params![installation_id, after_created_at, after_id, fetch_limit,],
-                        |row| row.get::<_, String>(0),
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?;
+                // One statement per installation filter. Written as `(?1 IS
+                // NULL OR installation_id = ?1)` the installation is not an
+                // equality the planner can seek, so a per-installation page
+                // would read every target on the platform in sort order; as
+                // a plain equality it seeks
+                // `idx_provider_targets_installation_page_v1`, while the
+                // whole collection walks `idx_provider_targets_page_v1`.
+                // `pagination_plans` explains both statements.
+                let (ids, total) = match installation_id.map(|id| id.to_string()) {
+                    Some(installation_id) => {
+                        let total = transaction.query_row(
+                            "SELECT COUNT(*) FROM provider_targets
+                              WHERE installation_id = ?1",
+                            [&installation_id],
+                            |row| row.get::<_, i64>(0),
+                        )?;
+                        let mut statement = transaction.prepare(
+                            "SELECT target_id FROM provider_targets
+                              WHERE installation_id = ?1
+                                AND (?2 IS NULL OR created_at > ?2
+                                     OR (created_at = ?2 AND target_id > ?3))
+                              ORDER BY created_at, target_id LIMIT ?4",
+                        )?;
+                        let ids = statement
+                            .query_map(
+                                params![installation_id, after_created_at, after_id, fetch_limit],
+                                |row| row.get::<_, String>(0),
+                            )?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        (ids, total)
+                    }
+                    None => {
+                        let total = transaction.query_row(
+                            "SELECT COUNT(*) FROM provider_targets",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?;
+                        let mut statement = transaction.prepare(
+                            "SELECT target_id FROM provider_targets
+                              WHERE ?1 IS NULL OR created_at > ?1
+                                 OR (created_at = ?1 AND target_id > ?2)
+                              ORDER BY created_at, target_id LIMIT ?3",
+                        )?;
+                        let ids = statement
+                            .query_map(params![after_created_at, after_id, fetch_limit], |row| {
+                                row.get::<_, String>(0)
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        (ids, total)
+                    }
+                };
                 let targets = ids
                     .into_iter()
                     .map(|id| {
@@ -550,7 +685,6 @@ impl CatalogStore {
                             .ok_or_else(|| CatalogError::not_found(format!("provider target {id}")))
                     })
                     .collect::<CatalogResult<Vec<_>>>()?;
-                drop(statement);
                 transaction.commit()?;
                 finish_page(targets, limit, total, "provider target")
             })
@@ -661,98 +795,272 @@ impl CatalogStore {
                     .parse()
                     .expect("SHA-256 formatter is canonical");
                 let plan_json = canonical_json(&spec.plan, "provider deployment plan")?;
-                if let Some(active_id) = transaction
-                    .query_row(
-                        "SELECT operation_id FROM provider_deployment_workflows
-                          WHERE application_id = ?1 AND environment_id = ?2
-                            AND provider_target_id = ?3
-                            AND state NOT IN ('succeeded', 'failed')",
-                        params![
-                            spec.application_id.to_string(),
-                            spec.environment_id.to_string(),
-                            spec.provider_target_id.to_string(),
-                        ],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-                {
-                    return Err(CatalogError::conflict(format!(
-                        "provider target already has active deployment operation {active_id} for this environment"
-                    )));
-                }
-                let now = now_secs();
-                let actor = actor_id(&transaction, &context.actor_subject, now)?;
-                transaction.execute(
-                    "INSERT INTO product_operations
-                       (operation_id, kind, organization_id, application_id, environment_id,
-                        target_kind, target_id, expected_revision, state, phase, revision,
-                        idempotency_key_sha256, request_fingerprint_sha256, actor_id,
-                        request_id, correlation_id, progress, cancellable, retryable,
-                        child_operation_ids, provider_operations, error_json,
-                        created_at, started_at, updated_at, finished_at)
-                     VALUES (?1, 'deploy', ?2, ?3, ?4, 'provider-target', ?5, ?6,
-                             'queued', 'preflight', 1, ?7, ?8, ?9, ?10, ?11,
-                             0, 0, 1, '[]', '[]', NULL, ?12, NULL, ?12, NULL)",
-                    params![
-                        operation_id.to_string(),
-                        target.organization_id.to_string(),
-                        spec.application_id.to_string(),
-                        spec.environment_id.to_string(),
-                        spec.provider_target_id.to_string(),
-                        i64::try_from(target.target.revision).map_err(|_| {
-                            CatalogError::invalid("provider target revision exceeds SQLite range")
-                        })?,
-                        context.idempotency_key_sha256,
-                        context.request_fingerprint_sha256,
-                        actor.to_string(),
-                        context.request_id.to_string(),
-                        context.correlation_id.to_string(),
-                        now,
-                    ],
-                )?;
-                transaction.execute(
-                    "INSERT INTO provider_deployment_workflows
-                       (operation_id, application_id, environment_id, provider_target_id,
-                        target_revision, provider_target_grant_id, target_grant_revision,
-                        artifact_version_id, canonical_artifact_sha256,
-                        provider_payload_sha256, desired_state_sha256, desired_state_json,
-                        plan_json, state, next_step_index, revision, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                             ?12, ?13, 'queued', 0, 1, ?14, ?14)",
-                    params![
-                        operation_id.to_string(),
-                        spec.application_id.to_string(),
-                        spec.environment_id.to_string(),
-                        spec.provider_target_id.to_string(),
-                        i64::try_from(target.target.revision).map_err(|_| {
-                            CatalogError::invalid("provider target revision exceeds SQLite range")
-                        })?,
-                        grant.grant_id.to_string(),
-                        i64::try_from(grant.revision).map_err(|_| {
-                            CatalogError::invalid(
-                                "provider target grant revision exceeds SQLite range",
-                            )
-                        })?,
-                        spec.artifact.artifact_version_id.to_string(),
-                        spec.artifact.canonical_artifact_sha256.as_str(),
-                        spec.artifact.provider_payload_sha256.as_str(),
-                        desired_state_digest.as_str(),
-                        desired_state_json,
-                        plan_json,
-                        now,
-                    ],
-                )?;
-                create_provider_deployment_step_tx(
+                let operation = insert_provider_workflow_tx(
                     &transaction,
-                    operation_id,
-                    0,
-                    &desired,
-                    &desired_state_digest,
+                    &ProviderWorkflowInsert {
+                        operation_id,
+                        kind: ProviderWorkflowKind::Deploy,
+                        rolled_back_from_operation_id: None,
+                        organization_id: target.organization_id,
+                        desired: &desired,
+                        desired_state_json: &desired_state_json,
+                        desired_state_digest: &desired_state_digest,
+                        plan_json: &plan_json,
+                    },
                     &context,
                 )?;
+                transaction.commit()?;
+                Ok(operation)
+            })
+            .await
+    }
+
+    /// Start a rollback to the succeeded provider deployment `spec` names.
+    ///
+    /// The new `rollback` operation re-asserts that deployment's exact
+    /// desired state, target pin and grant pin: the driver receives the
+    /// same `desiredStateDigest`, artifact and plan its receipts were bound
+    /// to, which is how it identifies the provider deployment to restore.
+    /// The target, its installation and the pinned grant must all still be
+    /// active, exactly as for a new deployment; a grant that has since been
+    /// revoked and re-issued cannot re-sign a desired state that embeds the
+    /// old pin. Replays under the same actor, key and request facts return
+    /// the operation the first request created.
+    pub async fn begin_provider_rollback(
+        &self,
+        spec: ProviderRollbackSpec,
+        context: OperationRequestContext,
+    ) -> CatalogResult<ProductOperation> {
+        let request_json = canonical_json(&spec, "provider rollback request")?;
+        let request_digest = sha256_hex(request_json.as_bytes());
+        let context = context
+            .for_request_fact("provider-rollback-request-sha256", &request_digest)
+            .for_target("provider-deployment", spec.rolled_back_from_operation_id);
+        let operation_id = CanonicalId::new_v7();
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                if let Some(existing_id) =
+                    find_operation_request_tx(&transaction, OperationKind::Rollback, &context)?
+                {
+                    let existing = load_provider_deployment_workflow(&transaction, existing_id)?
+                        .ok_or_else(|| {
+                            CatalogError::conflict(format!(
+                                "rollback operation {existing_id} is missing its provider workflow"
+                            ))
+                        })?;
+                    transaction.commit()?;
+                    return Ok(existing.operation);
+                }
+                let source_id = spec.rolled_back_from_operation_id;
+                let source = load_provider_deployment_workflow(&transaction, source_id)?
+                    .filter(|source| {
+                        source.operation.scope.application_id == Some(spec.application_id)
+                            && source.operation.scope.environment_id == Some(spec.environment_id)
+                    })
+                    .ok_or_else(|| {
+                        CatalogError::not_found(format!(
+                            "provider deployment operation {source_id} not found on this environment"
+                        ))
+                    })?;
+                if source.kind != ProviderWorkflowKind::Deploy
+                    || source.operation.state != OperationState::Succeeded
+                {
+                    return Err(CatalogError::conflict(format!(
+                        "{OPERATION_NOT_ROLLBACKABLE}: operation {source_id} is a {} {} workflow; only a succeeded deployment can be rolled back to",
+                        source.operation.state.as_str(),
+                        source.kind.as_str(),
+                    )));
+                }
+                let grant = active_provider_target_grant_tx(
+                    &transaction,
+                    spec.application_id,
+                    spec.environment_id,
+                    source.provider_target_id,
+                )?
+                .ok_or_else(|| {
+                    CatalogError::forbidden(
+                        "provider target is not granted to this application/environment",
+                    )
+                })?;
+                if Some(grant.grant_id) != source.provider_target_grant_id
+                    || Some(grant.revision) != source.target_grant_revision
+                {
+                    return Err(CatalogError::conflict(format!(
+                        "{OPERATION_NOT_ROLLBACKABLE}: deployment {source_id} was authorized under a target grant that is no longer the active one; grant the target again and deploy instead of rolling back",
+                    )));
+                }
+                let target = load_target(&transaction, source.provider_target_id)?.ok_or_else(
+                    || {
+                        CatalogError::not_found(format!(
+                            "provider target {}",
+                            source.provider_target_id
+                        ))
+                    },
+                )?;
+                let validation_request = DriverRequest {
+                    schema_version: 1,
+                    operation_id: CanonicalId::new_v7(),
+                    operation: DriverOperation::Rollback,
+                    desired_state_digest: source.desired_state_digest.clone(),
+                    application_id: spec.application_id,
+                    environment_id: spec.environment_id,
+                    target: provider_target_ref(&target),
+                    artifact: Some(source.artifact.clone()),
+                    plan: source.plan.clone(),
+                };
+                validate_operation_target(&target, &validation_request)?;
+                resolve_application_environment(&transaction, &validation_request)?;
+                validate_artifact_lineage(&transaction, &target, &validation_request)?;
+                let (desired_state_json, plan_json): (String, String) = transaction.query_row(
+                    "SELECT desired_state_json, plan_json FROM provider_deployment_workflows
+                      WHERE operation_id = ?1",
+                    [source_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let desired: ProviderDeploymentDesiredState =
+                    parse_json(&desired_state_json, "provider deployment desired state")?;
+                let operation = insert_provider_workflow_tx(
+                    &transaction,
+                    &ProviderWorkflowInsert {
+                        operation_id,
+                        kind: ProviderWorkflowKind::Rollback,
+                        rolled_back_from_operation_id: Some(source_id),
+                        organization_id: target.organization_id,
+                        desired: &desired,
+                        desired_state_json: &desired_state_json,
+                        desired_state_digest: &source.desired_state_digest,
+                        plan_json: &plan_json,
+                    },
+                    &context,
+                )?;
+                info!(
+                    %operation_id,
+                    rolled_back_from_operation_id = %source_id,
+                    provider_target_id = %source.provider_target_id,
+                    "Provider rollback recorded; the dispatcher will drive it"
+                );
+                transaction.commit()?;
+                Ok(operation)
+            })
+            .await
+    }
+
+    /// Ask for one provider workflow to stop.
+    ///
+    /// Only `queued`, `running` and `waiting` operations accept the request
+    /// (`operation-transitions.json`); anything else is refused with
+    /// [`OPERATION_NOT_CANCELLABLE`]. The request itself only records the
+    /// intent and moves the operation to `cancelling`: the dispatcher tick
+    /// stops dispatching further steps, waits for any driver call in flight
+    /// to settle exactly as it would otherwise, cleans up reversible provider
+    /// side effects, and only then reaches `cancelled` (or `failed`, with
+    /// the cleanup diagnostic). A step that already activated is never
+    /// undone by a cancel; that is what a rollback is for.
+    pub async fn request_provider_deployment_cancellation(
+        &self,
+        request: ProviderDeploymentCancellation,
+    ) -> CatalogResult<ProductOperation> {
+        let operation_id = request.operation_id;
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let workflow = load_provider_deployment_workflow(&transaction, operation_id)?
+                    .filter(|workflow| {
+                        workflow.operation.scope.application_id == Some(request.application_id)
+                            && workflow.operation.scope.environment_id
+                                == Some(request.environment_id)
+                    })
+                    .ok_or_else(|| {
+                        CatalogError::not_found(format!(
+                            "provider deployment operation {operation_id} not found on this environment"
+                        ))
+                    })?;
+                let now = now_secs();
+                let actor = actor_id(&transaction, &request.actor_subject, now)?;
+                if let Some(replay) = request.replay.as_ref() {
+                    let recorded: Option<(Option<String>, Option<String>, Option<String>)> =
+                        transaction
+                            .query_row(
+                                "SELECT cancel_actor_id, cancel_idempotency_key_sha256,
+                                        cancel_request_fingerprint_sha256
+                                   FROM provider_deployment_workflows
+                                  WHERE operation_id = ?1",
+                                [operation_id.to_string()],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .optional()?;
+                    if let Some((Some(cancel_actor), Some(key), Some(fingerprint))) = recorded
+                        && cancel_actor == actor.to_string()
+                        && key == replay.idempotency_key_sha256
+                    {
+                        if fingerprint != replay.request_fingerprint_sha256 {
+                            return Err(CatalogError::conflict(format!(
+                                "the Idempotency-Key already belongs to a cancellation of operation {operation_id} with a different request"
+                            )));
+                        }
+                        transaction.commit()?;
+                        return Ok(workflow.operation);
+                    }
+                }
+                let state = workflow.operation.state;
+                if deis_wire::transition_operation(state, deis_wire::OperationEvent::CancelRequested)
+                    .is_none()
+                {
+                    return Err(CatalogError::conflict(format!(
+                        "{OPERATION_NOT_CANCELLABLE}: operation {operation_id} is {} and cannot be cancelled",
+                        state.as_str()
+                    )));
+                }
+                let phase = workflow.operation.phase.clone();
+                transition_operation_tx(
+                    &transaction,
+                    operation_id,
+                    Some(request.expected_revision),
+                    deis_wire::OperationEvent::CancelRequested,
+                    &phase,
+                    None,
+                )?;
+                transaction.execute(
+                    "UPDATE product_operations SET cancellable = 0 WHERE operation_id = ?1",
+                    [operation_id.to_string()],
+                )?;
+                let (key, fingerprint) = request
+                    .replay
+                    .as_ref()
+                    .map(|replay| {
+                        (
+                            Some(replay.idempotency_key_sha256.clone()),
+                            Some(replay.request_fingerprint_sha256.clone()),
+                        )
+                    })
+                    .unwrap_or((None, None));
+                let changed = transaction.execute(
+                    "UPDATE provider_deployment_workflows
+                        SET state = 'cancelling', cancel_requested_at = ?2,
+                            cancel_actor_id = ?3, cancel_idempotency_key_sha256 = ?4,
+                            cancel_request_fingerprint_sha256 = ?5,
+                            revision = revision + 1, updated_at = ?2
+                      WHERE operation_id = ?1
+                        AND state IN ('queued', 'running', 'waiting')",
+                    params![
+                        operation_id.to_string(),
+                        now,
+                        actor.to_string(),
+                        key,
+                        fingerprint,
+                    ],
+                )?;
+                ensure_parent_change(changed, operation_id, "record the cancel request")?;
                 let operation = load_operation_tx(&transaction, operation_id)?.ok_or_else(|| {
                     CatalogError::not_found(format!("operation {operation_id}"))
                 })?;
+                info!(
+                    %operation_id,
+                    previous_state = state.as_str(),
+                    phase = %phase,
+                    "Provider workflow cancel accepted; the dispatcher will settle in-flight work and clean up"
+                );
                 transaction.commit()?;
                 Ok(operation)
             })
@@ -852,7 +1160,7 @@ impl CatalogStore {
             .with_connection(move |connection| {
                 let mut statement = connection.prepare(
                     "SELECT operation_id FROM provider_deployment_workflows
-                      WHERE state NOT IN ('succeeded', 'failed')
+                      WHERE state NOT IN ('succeeded', 'failed', 'cancelled')
                       ORDER BY updated_at, operation_id LIMIT ?1",
                 )?;
                 let ids = statement
@@ -934,7 +1242,7 @@ impl CatalogStore {
                                JOIN provider_targets t ON t.target_id = w.provider_target_id
                                JOIN provider_installations i
                                  ON i.installation_id = t.installation_id
-                              WHERE w.state NOT IN ('succeeded', 'failed')
+                              WHERE w.state NOT IN ('succeeded', 'failed', 'cancelled')
                                 AND t.status = 'active' AND i.status = 'active'
                                 AND (w.updated_at > ?1
                                      OR (w.updated_at = ?1 AND w.operation_id > ?2))
@@ -953,7 +1261,7 @@ impl CatalogStore {
                                JOIN provider_targets t ON t.target_id = w.provider_target_id
                                JOIN provider_installations i
                                  ON i.installation_id = t.installation_id
-                              WHERE w.state NOT IN ('succeeded', 'failed')
+                              WHERE w.state NOT IN ('succeeded', 'failed', 'cancelled')
                                 AND t.status = 'active' AND i.status = 'active'
                               ORDER BY w.updated_at, w.operation_id
                               LIMIT ?1",
@@ -1000,8 +1308,16 @@ impl CatalogStore {
                             CatalogError::not_found(format!("provider operation {child_id}"))
                         })?;
                         let execution = claim_execution_operation(&child, now)?;
+                        let cancelling = workflow.operation.state == OperationState::Cancelling;
                         let due = match (child.state, execution) {
                             (ProviderOperationState::Running, None) => false,
+                            // A cancel does not retry a failed step; it settles the
+                            // child at once instead of waiting out the retry delay.
+                            (ProviderOperationState::Failed, Some(operation))
+                                if cancelling && operation != DriverOperation::Reconcile =>
+                            {
+                                true
+                            }
                             (
                                 ProviderOperationState::Failed | ProviderOperationState::Unknown,
                                 Some(_),
@@ -1130,18 +1446,13 @@ impl CatalogStore {
                     transaction.commit()?;
                     return Ok(());
                 }
-                let step = usize::try_from(next_step_index)
-                    .ok()
-                    .and_then(|index| PROVIDER_DEPLOYMENT_STEPS.get(index))
-                    .ok_or_else(|| {
-                        CatalogError::invalid("provider deployment dispatch step is invalid")
-                    })?;
-                let current_child: String = transaction
+                let (current_child, step): (String, String) = transaction
                     .query_row(
-                        "SELECT child_operation_id FROM provider_deployment_steps
+                        "SELECT child_operation_id, driver_operation
+                           FROM provider_deployment_steps
                           WHERE parent_operation_id = ?1 AND sequence = ?2",
                         params![operation_id.to_string(), next_step_index],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?
                     .ok_or_else(|| {
@@ -1149,6 +1460,7 @@ impl CatalogStore {
                             "provider deployment {operation_id} current child"
                         ))
                     })?;
+                let step = parse_driver_operation(&step)?;
                 if current_child != child_operation_id.to_string() {
                     transaction.commit()?;
                     return Ok(());
@@ -1175,17 +1487,23 @@ impl CatalogStore {
                     CatalogError::invalid("provider dispatch retry delay exceeds timestamp range")
                 })?);
                 let next_failures = i64::try_from(failures.saturating_add(1)).unwrap_or(i64::MAX);
-                ensure_parent_waiting_tx(&transaction, operation_id, step.as_str())?;
+                // A cancelling workflow keeps its state: the backoff only delays
+                // the settlement or cleanup the cancel still owes.
+                if state != OperationState::Cancelling {
+                    ensure_parent_waiting_tx(&transaction, operation_id, step.as_str())?;
+                }
                 let changed = transaction.execute(
                     "UPDATE provider_deployment_workflows
-                        SET state = 'waiting', dispatch_not_before = ?2,
+                        SET state = CASE WHEN state = 'cancelling' THEN 'cancelling'
+                                         ELSE 'waiting' END,
+                            dispatch_not_before = ?2,
                             dispatch_failure_count = ?3,
                             dispatch_failure_child_operation_id = ?4,
                             last_dispatch_error_code = ?5,
                             last_dispatch_error_message = ?6,
                             revision = revision + 1, updated_at = ?7
                       WHERE operation_id = ?1
-                        AND state IN ('running', 'waiting')",
+                        AND state IN ('running', 'waiting', 'cancelling')",
                     params![
                         operation_id.to_string(),
                         not_before,
@@ -1220,7 +1538,7 @@ impl CatalogStore {
     }
 
     #[cfg(test)]
-    async fn drive_provider_deployment_once_for_test(
+    pub(crate) async fn drive_provider_deployment_once_for_test(
         &self,
         operation_id: CanonicalId,
         owner_id: CanonicalId,
@@ -1240,11 +1558,8 @@ impl CatalogStore {
         config: DriverOrchestratorConfig,
     ) -> CatalogResult<ProviderDeploymentDriveOutcome> {
         let operation_id = workflow.operation.operation_id;
-        if workflow.operation.state == OperationState::Succeeded {
-            return Ok(ProviderDeploymentDriveOutcome::Succeeded(workflow));
-        }
-        if workflow.operation.state == OperationState::Failed {
-            return Ok(ProviderDeploymentDriveOutcome::Failed(workflow));
+        if workflow.operation.state.terminal() {
+            return Ok(classify_provider_deployment(workflow));
         }
         let child = workflow
             .steps
@@ -1255,6 +1570,23 @@ impl CatalogStore {
                 ))
             })?
             .child_operation_id;
+        if workflow.operation.state == OperationState::Cancelling {
+            // The prepare pass already settled a child that had nothing in
+            // flight. What is left to run is a driver call already under
+            // way (awaited, never killed), an inspection the provider owes,
+            // or the cleanup step; a terminal child means none of those.
+            let child_state = self
+                .product_operation(child)
+                .await?
+                .ok_or_else(|| {
+                    CatalogError::not_found(format!("provider child operation {child}"))
+                })?
+                .state;
+            if child_state.terminal() {
+                let workflow = self.refresh_provider_deployment(operation_id).await?;
+                return Ok(classify_provider_deployment(workflow));
+            }
+        }
         let orchestrator = DriverOrchestrator::new(self.clone(), config).map_err(|error| {
             CatalogError::invalid(format!("invalid provider orchestrator config: {error}"))
         })?;
@@ -1434,19 +1766,141 @@ fn provider_target_ref(target: &StoredTarget) -> ProviderTargetRef {
     }
 }
 
+/// The facts one workflow row and its parent product operation are written
+/// from. A deploy and a rollback differ only in `kind`, the step list that
+/// implies, and the source a rollback names.
+struct ProviderWorkflowInsert<'a> {
+    operation_id: CanonicalId,
+    kind: ProviderWorkflowKind,
+    rolled_back_from_operation_id: Option<CanonicalId>,
+    organization_id: CanonicalId,
+    desired: &'a ProviderDeploymentDesiredState,
+    desired_state_json: &'a str,
+    desired_state_digest: &'a Sha256Digest,
+    plan_json: &'a str,
+}
+
+/// Write the parent operation, the workflow row and its first step in the
+/// caller's transaction, after refusing a second active workflow on the
+/// same target and environment.
+fn insert_provider_workflow_tx(
+    transaction: &Connection,
+    insert: &ProviderWorkflowInsert<'_>,
+    context: &OperationRequestContext,
+) -> CatalogResult<ProductOperation> {
+    let desired = insert.desired;
+    if let Some(active_id) = transaction
+        .query_row(
+            "SELECT operation_id FROM provider_deployment_workflows
+              WHERE application_id = ?1 AND environment_id = ?2
+                AND provider_target_id = ?3
+                AND state NOT IN ('succeeded', 'failed', 'cancelled')",
+            params![
+                desired.application_id.to_string(),
+                desired.environment_id.to_string(),
+                desired.target.provider_target_id.to_string(),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Err(CatalogError::conflict(format!(
+            "provider target already has active deployment operation {active_id} for this environment"
+        )));
+    }
+    let operation_id = insert.operation_id;
+    let first_step = insert.kind.steps()[0];
+    let now = now_secs();
+    let actor = actor_id(transaction, &context.actor_subject, now)?;
+    let target_revision = i64::try_from(desired.target_revision)
+        .map_err(|_| CatalogError::invalid("provider target revision exceeds SQLite range"))?;
+    transaction.execute(
+        "INSERT INTO product_operations
+           (operation_id, kind, organization_id, application_id, environment_id,
+            target_kind, target_id, expected_revision, state, phase, revision,
+            idempotency_key_sha256, request_fingerprint_sha256, actor_id,
+            request_id, correlation_id, progress, cancellable, retryable,
+            child_operation_ids, provider_operations, error_json,
+            created_at, started_at, updated_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'provider-target', ?6, ?7,
+                 'queued', ?8, 1, ?9, ?10, ?11, ?12, ?13,
+                 0, 1, 1, '[]', '[]', NULL, ?14, NULL, ?14, NULL)",
+        params![
+            operation_id.to_string(),
+            insert.kind.operation_kind().as_str(),
+            insert.organization_id.to_string(),
+            desired.application_id.to_string(),
+            desired.environment_id.to_string(),
+            desired.target.provider_target_id.to_string(),
+            target_revision,
+            first_step.as_str(),
+            context.idempotency_key_sha256,
+            context.request_fingerprint_sha256,
+            actor.to_string(),
+            context.request_id.to_string(),
+            context.correlation_id.to_string(),
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO provider_deployment_workflows
+           (operation_id, kind, application_id, environment_id, provider_target_id,
+            target_revision, provider_target_grant_id, target_grant_revision,
+            artifact_version_id, canonical_artifact_sha256,
+            provider_payload_sha256, desired_state_sha256, desired_state_json,
+            plan_json, rolled_back_from_operation_id, state, next_step_index,
+            revision, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, 'queued', 0, 1, ?16, ?16)",
+        params![
+            operation_id.to_string(),
+            insert.kind.as_str(),
+            desired.application_id.to_string(),
+            desired.environment_id.to_string(),
+            desired.target.provider_target_id.to_string(),
+            target_revision,
+            desired.provider_target_grant_id.map(|id| id.to_string()),
+            desired
+                .target_grant_revision
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    CatalogError::invalid("provider target grant revision exceeds SQLite range")
+                })?,
+            desired.artifact.artifact_version_id.to_string(),
+            desired.artifact.canonical_artifact_sha256.as_str(),
+            desired.artifact.provider_payload_sha256.as_str(),
+            insert.desired_state_digest.as_str(),
+            insert.desired_state_json,
+            insert.plan_json,
+            insert
+                .rolled_back_from_operation_id
+                .map(|id| id.to_string()),
+            now,
+        ],
+    )?;
+    create_provider_deployment_step_tx(
+        transaction,
+        operation_id,
+        0,
+        first_step,
+        desired,
+        insert.desired_state_digest,
+        context,
+    )?;
+    load_operation_tx(transaction, operation_id)?
+        .ok_or_else(|| CatalogError::not_found(format!("operation {operation_id}")))
+}
+
 fn create_provider_deployment_step_tx(
     connection: &Connection,
     parent_operation_id: CanonicalId,
     sequence: usize,
+    operation: DriverOperation,
     desired: &ProviderDeploymentDesiredState,
     desired_state_digest: &Sha256Digest,
     parent_context: &OperationRequestContext,
 ) -> CatalogResult<CanonicalId> {
-    let operation = *PROVIDER_DEPLOYMENT_STEPS.get(sequence).ok_or_else(|| {
-        CatalogError::invalid(format!(
-            "provider deployment step index {sequence} is outside the standard lifecycle"
-        ))
-    })?;
     let child_operation_id = CanonicalId::new_v7();
     let request = DriverRequest {
         schema_version: 1,
@@ -1532,7 +1986,7 @@ fn sync_parent_provider_details_tx(
         "UPDATE product_operations
             SET child_operation_ids = ?2, provider_operations = ?3,
                 revision = revision + 1, updated_at = ?4
-          WHERE operation_id = ?1 AND kind = 'deploy'",
+          WHERE operation_id = ?1 AND kind IN ('deploy', 'rollback')",
         params![
             parent_operation_id.to_string(),
             child_json,
@@ -1556,7 +2010,8 @@ fn load_provider_deployment_workflow(
                     desired_state_json, plan_json, state, next_step_index,
                     dispatch_not_before, dispatch_failure_count,
                     dispatch_failure_child_operation_id,
-                    last_dispatch_error_code, last_dispatch_error_message
+                    last_dispatch_error_code, last_dispatch_error_message,
+                    kind, rolled_back_from_operation_id, cancel_requested_at
                FROM provider_deployment_workflows WHERE operation_id = ?1",
             [operation_id.to_string()],
             |row| {
@@ -1580,6 +2035,9 @@ fn load_provider_deployment_workflow(
                     row.get::<_, Option<String>>(16)?,
                     row.get::<_, Option<String>>(17)?,
                     row.get::<_, Option<String>>(18)?,
+                    row.get::<_, String>(19)?,
+                    row.get::<_, Option<String>>(20)?,
+                    row.get::<_, Option<i64>>(21)?,
                 ))
             },
         )
@@ -1587,6 +2045,23 @@ fn load_provider_deployment_workflow(
     let Some(row) = row else {
         return Ok(None);
     };
+    let kind = ProviderWorkflowKind::parse(&row.19).ok_or_else(|| {
+        CatalogError::invalid(format!("unknown provider workflow kind {:?}", row.19))
+    })?;
+    let rolled_back_from_operation_id = row
+        .20
+        .as_deref()
+        .map(|value| parse_id(value, "provider rollback source"))
+        .transpose()?;
+    if (kind == ProviderWorkflowKind::Rollback) != rolled_back_from_operation_id.is_some() {
+        return Err(CatalogError::invalid(
+            "provider workflow kind and rollback source disagree",
+        ));
+    }
+    let cancel_requested_at = row
+        .21
+        .map(|value| timestamp(value, "provider workflow cancel request"))
+        .transpose()?;
     let application_id = parse_id(&row.0, "provider deployment application")?;
     let environment_id = parse_id(&row.1, "provider deployment environment")?;
     let provider_target_id = parse_id(&row.2, "provider deployment target")?;
@@ -1668,7 +2143,7 @@ fn load_provider_deployment_workflow(
     }
     let operation = load_operation_tx(connection, operation_id)?
         .ok_or_else(|| CatalogError::not_found(format!("operation {operation_id}")))?;
-    if operation.kind != OperationKind::Deploy
+    if operation.kind != kind.operation_kind()
         || operation.state != workflow_state
         || operation.scope.application_id != Some(application_id)
         || operation.scope.environment_id != Some(environment_id)
@@ -1702,14 +2177,25 @@ fn load_provider_deployment_workflow(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut steps = Vec::with_capacity(raw_steps.len());
+    let standard_steps = kind.steps();
+    let step_count = raw_steps.len();
+    let mut steps = Vec::with_capacity(step_count);
     for (expected_sequence, row) in raw_steps.into_iter().enumerate() {
         let sequence = usize::try_from(row.0).map_err(|_| {
             CatalogError::invalid("provider deployment has a negative step sequence")
         })?;
         let operation = parse_driver_operation(&row.1)?;
+        // A cleanup step is only ever the last step of a cancelled journal,
+        // appended after the step the cancel interrupted; every other step
+        // is exactly the kind's step at that position.
+        let expected_operation = if operation == DriverOperation::Cleanup {
+            (cancel_requested_at.is_some() && sequence >= 1 && sequence + 1 == step_count)
+                .then_some(DriverOperation::Cleanup)
+        } else {
+            standard_steps.get(sequence).copied()
+        };
         if sequence != expected_sequence
-            || PROVIDER_DEPLOYMENT_STEPS.get(sequence) != Some(&operation)
+            || expected_operation != Some(operation)
             || row.1 != row.3
             || parse_id(&row.4, "provider child target")? != provider_target_id
             || row.5 != desired_state_digest.as_str()
@@ -1736,11 +2222,22 @@ fn load_provider_deployment_workflow(
             "terminal provider deployment retained a dispatch backoff",
         ));
     }
-    if (workflow_state == OperationState::Succeeded
-        && (next_step_index != PROVIDER_DEPLOYMENT_STEPS.len()
-            || steps.len() != PROVIDER_DEPLOYMENT_STEPS.len()))
+    let has_cleanup = steps
+        .last()
+        .is_some_and(|step| step.operation == DriverOperation::Cleanup);
+    let cancelled_journal = matches!(
+        workflow_state,
+        OperationState::Cancelling | OperationState::Cancelled
+    );
+    if (cancelled_journal && cancel_requested_at.is_none())
+        || (has_cleanup && !cancelled_journal && workflow_state != OperationState::Failed)
+        || (workflow_state == OperationState::Succeeded
+            && (next_step_index != standard_steps.len()
+                || steps.len() != standard_steps.len()
+                || cancel_requested_at.is_some()))
         || (workflow_state != OperationState::Succeeded
-            && (next_step_index >= PROVIDER_DEPLOYMENT_STEPS.len()
+            && (next_step_index > standard_steps.len()
+                || (next_step_index == standard_steps.len() && !has_cleanup)
                 || steps.len() != next_step_index + 1))
         || operation.child_operation_ids
             != steps
@@ -1752,8 +2249,24 @@ fn load_provider_deployment_workflow(
             "provider deployment parent and step journal disagree",
         ));
     }
+    let mut rollback_statement = connection.prepare(
+        "SELECT operation_id FROM provider_deployment_workflows
+          WHERE rolled_back_from_operation_id = ?1
+          ORDER BY created_at, operation_id",
+    )?;
+    let rollback_operation_ids = rollback_statement
+        .query_map([operation_id.to_string()], |row| row.get::<_, String>(0))?
+        .map(|id| {
+            id.map_err(CatalogError::from)
+                .and_then(|id| parse_id(&id, "provider rollback operation"))
+        })
+        .collect::<CatalogResult<Vec<_>>>()?;
     Ok(Some(ProviderDeploymentWorkflow {
         operation,
+        kind,
+        rolled_back_from_operation_id,
+        rollback_operation_ids,
+        cancel_requested_at,
         provider_target_id,
         target_revision,
         provider_target_grant_id,
@@ -1794,6 +2307,13 @@ fn advance_provider_deployment_tx(
         ))
     })?;
     sync_parent_provider_details_tx(connection, operation_id)?;
+    if workflow.operation.state == OperationState::Cancelling {
+        settle_cancelling_workflow_tx(connection, &workflow, step, &child)?;
+        return load_provider_deployment_workflow(connection, operation_id)?.ok_or_else(|| {
+            CatalogError::not_found(format!("provider deployment operation {operation_id}"))
+        });
+    }
+    let standard_steps = workflow.kind.steps();
     match child.state {
         OperationState::Succeeded => {
             clear_provider_deployment_dispatch_backoff_tx(
@@ -1806,7 +2326,7 @@ fn advance_provider_deployment_tx(
                 connection,
                 operation_id,
                 step.operation.as_str(),
-                progress_for_step(next_index),
+                progress_for_step(next_index, standard_steps.len()),
             )?;
             update_provider_deployment_state_tx(
                 connection,
@@ -1814,7 +2334,7 @@ fn advance_provider_deployment_tx(
                 OperationState::Running,
                 workflow.next_step_index,
             )?;
-            if next_index == PROVIDER_DEPLOYMENT_STEPS.len() {
+            if next_index == standard_steps.len() {
                 transition_operation_tx(
                     connection,
                     operation_id,
@@ -1835,45 +2355,18 @@ fn advance_provider_deployment_tx(
                     next_index,
                 )?;
             } else {
-                let desired: ProviderDeploymentDesiredState = connection
-                    .query_row(
-                        "SELECT desired_state_json FROM provider_deployment_workflows
-                      WHERE operation_id = ?1",
-                        [operation_id.to_string()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map_err(CatalogError::from)
-                    .and_then(|json| parse_json(&json, "provider deployment desired state"))?;
-                let actor_subject: String = connection.query_row(
-                    "SELECT actor.subject
-                       FROM product_operations operation
-                       JOIN operation_actors actor ON actor.actor_id = operation.actor_id
-                      WHERE operation.operation_id = ?1",
-                    [operation_id.to_string()],
-                    |row| row.get(0),
-                )?;
-                let parent_context = OperationRequestContext {
-                    idempotency_key_sha256: workflow.operation.idempotency_key_digest.value.clone(),
-                    request_fingerprint_sha256: sha256_hex(
-                        format!("provider-deployment:{operation_id}").as_bytes(),
-                    ),
-                    actor_subject,
-                    request_id: workflow.operation.request_id,
-                    correlation_id: workflow.operation.correlation_id,
-                };
-                create_provider_deployment_step_tx(
+                let next_operation = standard_steps[next_index];
+                append_provider_deployment_step_tx(
                     connection,
-                    operation_id,
+                    &workflow,
                     next_index,
-                    &desired,
-                    &workflow.desired_state_digest,
-                    &parent_context,
+                    next_operation,
                 )?;
                 update_parent_phase_tx(
                     connection,
                     operation_id,
-                    PROVIDER_DEPLOYMENT_STEPS[next_index].as_str(),
-                    progress_for_step(next_index),
+                    next_operation.as_str(),
+                    progress_for_step(next_index, standard_steps.len()),
                     true,
                 )?;
                 update_provider_deployment_state_tx(
@@ -1933,7 +2426,7 @@ fn advance_provider_deployment_tx(
                 connection,
                 operation_id,
                 step.operation.as_str(),
-                progress_for_step(workflow.next_step_index),
+                progress_for_step(workflow.next_step_index, standard_steps.len()),
             )?;
             update_provider_deployment_state_tx(
                 connection,
@@ -1952,6 +2445,316 @@ fn advance_provider_deployment_tx(
         CatalogError::not_found(format!("provider deployment operation {operation_id}"))
     })?;
     Ok(workflow)
+}
+
+/// Move a `cancelling` workflow as far as its current child allows.
+///
+/// A child with a driver call in flight, or one the provider still owes an
+/// inspection for, is left alone: its receipt is awaited exactly as it
+/// would be without the cancel. A child that never ran, or that only
+/// waits for a retry or an operator, is cancelled here without any
+/// provider call. Once the current child is settled the journal either
+/// appends one `cleanup` step for the reversible side effects earlier steps
+/// left behind, or ends in `cancelled`. The `cleanup` step is the cancel's
+/// own work and is never cancelled by a later pass; once it is settled it
+/// ends the workflow in `cancelled` or, if the cleanup failed, in `failed`
+/// with its diagnostic. Nothing that was applied is erased: every step row
+/// and receipt stays, and an activation that already happened is recorded
+/// as applied rather than undone.
+fn settle_cancelling_workflow_tx(
+    connection: &Connection,
+    workflow: &ProviderDeploymentWorkflow,
+    step: &ProviderDeploymentStep,
+    child: &ProductOperation,
+) -> CatalogResult<()> {
+    let operation_id = workflow.operation.operation_id;
+    if step.operation == DriverOperation::Cleanup {
+        return settle_cleanup_step_tx(connection, workflow, step, child);
+    }
+    let settled = match child.state {
+        OperationState::Queued => {
+            cancel_untouched_child_tx(connection, child, step.operation)?;
+            true
+        }
+        OperationState::Waiting => {
+            let row = load_claim_row(connection, step.child_operation_id)?.ok_or_else(|| {
+                CatalogError::not_found(format!("provider operation {}", step.child_operation_id))
+            })?;
+            if claim_execution_operation(&row, now_secs())? == Some(DriverOperation::Reconcile) {
+                false
+            } else {
+                cancel_untouched_child_tx(connection, child, step.operation)?;
+                true
+            }
+        }
+        OperationState::Running => false,
+        OperationState::Succeeded | OperationState::Failed | OperationState::Cancelled => true,
+        OperationState::Cancelling => {
+            return Err(CatalogError::invalid(
+                "provider child operation entered unsupported cancellation state",
+            ));
+        }
+    };
+    if !settled {
+        return Ok(());
+    }
+    clear_provider_deployment_dispatch_backoff_tx(
+        connection,
+        operation_id,
+        step.child_operation_id,
+    )?;
+    if cleanup_required_tx(connection, workflow)? {
+        let cleanup_index = workflow.next_step_index + 1;
+        append_provider_deployment_step_tx(
+            connection,
+            workflow,
+            cleanup_index,
+            DriverOperation::Cleanup,
+        )?;
+        update_parent_phase_tx(
+            connection,
+            operation_id,
+            DriverOperation::Cleanup.as_str(),
+            workflow.operation.progress.unwrap_or(0),
+            false,
+        )?;
+        update_provider_deployment_state_tx(
+            connection,
+            operation_id,
+            OperationState::Cancelling,
+            cleanup_index,
+        )?;
+        info!(
+            %operation_id,
+            interrupted_step = step.operation.as_str(),
+            "Cancelled provider workflow left reversible provider side effects; a cleanup step was appended"
+        );
+        return Ok(());
+    }
+    finish_cancelled_workflow_tx(connection, workflow)
+}
+
+/// Settle the `cleanup` step a cancel appended.
+///
+/// The cleanup is what the cancel still owes the provider, so no pass
+/// cancels it: the step is appended and committed before a driver is
+/// selected, and the pass that runs it may be a later tick of the same
+/// coordinator, another coordinator, or a restarted process. A cleanup
+/// that has not been claimed, waits for a retry or an inspection it can
+/// still get, or has a driver call in flight is left for the driver. Only
+/// a cleanup with nothing left to run ends the workflow: `cancelled` when
+/// it succeeded, `failed` with its diagnostic otherwise.
+fn settle_cleanup_step_tx(
+    connection: &Connection,
+    workflow: &ProviderDeploymentWorkflow,
+    step: &ProviderDeploymentStep,
+    child: &ProductOperation,
+) -> CatalogResult<()> {
+    let operation_id = workflow.operation.operation_id;
+    let runnable = match child.state {
+        OperationState::Queued | OperationState::Running => true,
+        OperationState::Waiting => {
+            let row = load_claim_row(connection, step.child_operation_id)?.ok_or_else(|| {
+                CatalogError::not_found(format!("provider operation {}", step.child_operation_id))
+            })?;
+            claim_execution_operation(&row, now_secs())?.is_some()
+        }
+        OperationState::Succeeded | OperationState::Failed | OperationState::Cancelled => false,
+        OperationState::Cancelling => {
+            return Err(CatalogError::invalid(
+                "provider child operation entered unsupported cancellation state",
+            ));
+        }
+    };
+    if runnable {
+        return Ok(());
+    }
+    clear_provider_deployment_dispatch_backoff_tx(
+        connection,
+        operation_id,
+        step.child_operation_id,
+    )?;
+    if child.state == OperationState::Succeeded {
+        return finish_cancelled_workflow_tx(connection, workflow);
+    }
+    // A cleanup that waits for nothing runnable has no product error yet;
+    // its driver record still holds the refusal the diagnostic should carry.
+    let recorded_error = match child.error.clone() {
+        Some(error) => Some(error),
+        None => load_driver_operation(connection, step.child_operation_id)?
+            .and_then(|record| record.driver_error)
+            .as_ref()
+            .map(operation_error),
+    };
+    let error = recorded_error.unwrap_or_else(|| OperationError {
+        code: "PROVIDER_CLEANUP_FAILED".to_owned(),
+        message: "provider cleanup after cancellation ended without a reusable result".to_owned(),
+        retryable: false,
+        retry_after_seconds: None,
+        remediation: Some(
+            "inspect the provider for resources the cancelled deployment left behind".to_owned(),
+        ),
+    });
+    warn!(
+        %operation_id,
+        cleanup_operation_id = %step.child_operation_id,
+        cleanup_state = child.state.as_str(),
+        error_code = %error.code,
+        "Provider cleanup after cancellation failed; the workflow ends failed with the diagnostic"
+    );
+    transition_operation_tx(
+        connection,
+        operation_id,
+        None,
+        deis_wire::OperationEvent::Failed,
+        DriverOperation::Cleanup.as_str(),
+        Some(&error),
+    )?;
+    connection.execute(
+        "UPDATE product_operations SET retryable = 0 WHERE operation_id = ?1",
+        [operation_id.to_string()],
+    )?;
+    update_provider_deployment_state_tx(
+        connection,
+        operation_id,
+        OperationState::Failed,
+        workflow.next_step_index,
+    )
+}
+
+/// Cancel a child that has no provider call in flight and nothing the
+/// provider still owes it. Its driver record keeps whatever it recorded.
+fn cancel_untouched_child_tx(
+    connection: &Connection,
+    child: &ProductOperation,
+    operation: DriverOperation,
+) -> CatalogResult<()> {
+    transition_operation_tx(
+        connection,
+        child.operation_id,
+        None,
+        deis_wire::OperationEvent::CancelRequested,
+        operation.as_str(),
+        None,
+    )?;
+    transition_operation_tx(
+        connection,
+        child.operation_id,
+        None,
+        deis_wire::OperationEvent::Cancelled,
+        operation.as_str(),
+        None,
+    )
+}
+
+/// Whether the settled steps left provider side effects a `cleanup` can
+/// reverse. Anything before activation that the driver reported as a
+/// possible or confirmed side effect qualifies. Once an activation has
+/// happened, or may have happened, nothing is cleaned up: the uploaded
+/// version is (or may be) live, and undoing that is a rollback, not a
+/// cancel.
+fn cleanup_required_tx(
+    connection: &Connection,
+    workflow: &ProviderDeploymentWorkflow,
+) -> CatalogResult<bool> {
+    let mut reversible = false;
+    for step in &workflow.steps {
+        let record =
+            load_driver_operation(connection, step.child_operation_id)?.ok_or_else(|| {
+                CatalogError::not_found(format!("provider operation {}", step.child_operation_id))
+            })?;
+        let side_effect = matches!(
+            record.side_effect,
+            Some(SideEffect::Possible | SideEffect::Confirmed)
+        );
+        match step.operation {
+            DriverOperation::Activate | DriverOperation::Rollback => {
+                if record.state == ProviderOperationState::Succeeded || side_effect {
+                    return Ok(false);
+                }
+            }
+            DriverOperation::Observe | DriverOperation::Cleanup => {}
+            _ => reversible |= side_effect,
+        }
+    }
+    Ok(reversible)
+}
+
+fn finish_cancelled_workflow_tx(
+    connection: &Connection,
+    workflow: &ProviderDeploymentWorkflow,
+) -> CatalogResult<()> {
+    let operation_id = workflow.operation.operation_id;
+    transition_operation_tx(
+        connection,
+        operation_id,
+        None,
+        deis_wire::OperationEvent::Cancelled,
+        "cancelled",
+        None,
+    )?;
+    connection.execute(
+        "UPDATE product_operations SET retryable = 0 WHERE operation_id = ?1",
+        [operation_id.to_string()],
+    )?;
+    update_provider_deployment_state_tx(
+        connection,
+        operation_id,
+        OperationState::Cancelled,
+        workflow.next_step_index,
+    )?;
+    info!(
+        %operation_id,
+        applied_steps = workflow.next_step_index,
+        "Provider workflow cancelled; applied steps remain recorded"
+    );
+    Ok(())
+}
+
+/// Append the durable child for step `sequence` of `workflow`, under the
+/// parent's own actor and correlation identity.
+fn append_provider_deployment_step_tx(
+    connection: &Connection,
+    workflow: &ProviderDeploymentWorkflow,
+    sequence: usize,
+    operation: DriverOperation,
+) -> CatalogResult<CanonicalId> {
+    let operation_id = workflow.operation.operation_id;
+    let desired: ProviderDeploymentDesiredState = connection
+        .query_row(
+            "SELECT desired_state_json FROM provider_deployment_workflows
+              WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(CatalogError::from)
+        .and_then(|json| parse_json(&json, "provider deployment desired state"))?;
+    let actor_subject: String = connection.query_row(
+        "SELECT actor.subject
+           FROM product_operations operation
+           JOIN operation_actors actor ON actor.actor_id = operation.actor_id
+          WHERE operation.operation_id = ?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let parent_context = OperationRequestContext {
+        idempotency_key_sha256: workflow.operation.idempotency_key_digest.value.clone(),
+        request_fingerprint_sha256: sha256_hex(
+            format!("provider-deployment:{operation_id}").as_bytes(),
+        ),
+        actor_subject,
+        request_id: workflow.operation.request_id,
+        correlation_id: workflow.operation.correlation_id,
+    };
+    create_provider_deployment_step_tx(
+        connection,
+        operation_id,
+        sequence,
+        operation,
+        &desired,
+        &workflow.desired_state_digest,
+        &parent_context,
+    )
 }
 
 fn ensure_parent_running_tx(
@@ -2037,7 +2840,8 @@ fn update_parent_phase_tx(
         "UPDATE product_operations
             SET phase = ?2, progress = ?3, retryable = ?4,
                 revision = revision + 1, updated_at = ?5
-          WHERE operation_id = ?1 AND state IN ('queued', 'running', 'waiting')",
+          WHERE operation_id = ?1
+            AND state IN ('queued', 'running', 'waiting', 'cancelling')",
         params![
             operation_id.to_string(),
             phase,
@@ -2063,7 +2867,7 @@ fn clear_provider_deployment_dispatch_backoff_tx(
                 revision = revision + 1, updated_at = ?2
           WHERE operation_id = ?1 AND dispatch_failure_count > 0
             AND dispatch_failure_child_operation_id = ?3
-            AND state NOT IN ('succeeded', 'failed')",
+            AND state NOT IN ('succeeded', 'failed', 'cancelled')",
         params![
             operation_id.to_string(),
             now_secs(),
@@ -2124,24 +2928,15 @@ fn ensure_parent_change(
     }
 }
 
-fn progress_for_step(completed_steps: usize) -> u16 {
-    u16::try_from(completed_steps.saturating_mul(10_000) / PROVIDER_DEPLOYMENT_STEPS.len())
+fn progress_for_step(completed_steps: usize, total_steps: usize) -> u16 {
+    u16::try_from(completed_steps.saturating_mul(10_000) / total_steps.max(1))
         .expect("provider deployment progress is bounded")
 }
 
 fn parse_deployment_operation_state(value: &str) -> CatalogResult<OperationState> {
-    match OperationState::parse(value) {
-        Some(
-            state @ (OperationState::Queued
-            | OperationState::Running
-            | OperationState::Waiting
-            | OperationState::Succeeded
-            | OperationState::Failed),
-        ) => Ok(state),
-        _ => Err(CatalogError::invalid(format!(
-            "unknown provider deployment state {value:?}"
-        ))),
-    }
+    OperationState::parse(value).ok_or_else(|| {
+        CatalogError::invalid(format!("unknown provider deployment state {value:?}"))
+    })
 }
 
 fn classify_provider_deployment(
@@ -2149,9 +2944,8 @@ fn classify_provider_deployment(
 ) -> ProviderDeploymentDriveOutcome {
     match workflow.operation.state {
         OperationState::Succeeded => ProviderDeploymentDriveOutcome::Succeeded(workflow),
-        OperationState::Failed | OperationState::Cancelled => {
-            ProviderDeploymentDriveOutcome::Failed(workflow)
-        }
+        OperationState::Failed => ProviderDeploymentDriveOutcome::Failed(workflow),
+        OperationState::Cancelled => ProviderDeploymentDriveOutcome::Cancelled(workflow),
         OperationState::Waiting => ProviderDeploymentDriveOutcome::Waiting(workflow),
         OperationState::Queued | OperationState::Running | OperationState::Cancelling => {
             ProviderDeploymentDriveOutcome::Advanced(workflow)
@@ -2187,6 +2981,11 @@ impl DriverOperationStore for CatalogStore {
                         DriverOperationClaimOutcome::NotRunnable
                     });
                 };
+                if starts_provider_work(execution_operation)
+                    && parent_workflow_refuses_dispatch_tx(&transaction, operation_id)?
+                {
+                    return Ok(DriverOperationClaimOutcome::NotRunnable);
+                }
                 let request = claim_request(&row, operation_id, execution_operation)?;
                 if row.state == ProviderOperationState::Running {
                     transaction.execute(
@@ -2472,6 +3271,60 @@ fn load_claim_row(
             })
         })
         .transpose()
+}
+
+/// Whether an execution would start work the provider has not been asked
+/// for yet. A `reconcile` only inspects what an earlier call may have done,
+/// and a `cleanup` is the work a cancel owes; neither is new work.
+fn starts_provider_work(execution_operation: DriverOperation) -> bool {
+    !matches!(
+        execution_operation,
+        DriverOperation::Reconcile | DriverOperation::Cleanup
+    )
+}
+
+/// Whether the workflow that owns this step no longer wants it dispatched.
+///
+/// A cancel is recorded on the parent from the request task while a
+/// coordinator may already be between its prepare pass and this claim,
+/// holding a snapshot that predates the cancel. The claim is the last
+/// durable point before the driver is invoked, so the parent's state is
+/// read again here, inside the claim transaction: once `cancelling` or a
+/// terminal state is recorded, a step that has not started is refused and
+/// the next pass settles it without a provider call. A child that belongs
+/// to no workflow has no parent and is never refused.
+fn parent_workflow_refuses_dispatch_tx(
+    connection: &Connection,
+    child_operation_id: CanonicalId,
+) -> CatalogResult<bool> {
+    let parent: Option<(String, String)> = connection
+        .query_row(
+            "SELECT w.operation_id, w.state
+               FROM provider_deployment_steps s
+               JOIN provider_deployment_workflows w ON w.operation_id = s.parent_operation_id
+              WHERE s.child_operation_id = ?1",
+            [child_operation_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((parent_operation_id, state_text)) = parent else {
+        return Ok(false);
+    };
+    let state = OperationState::parse(&state_text).ok_or_else(|| {
+        CatalogError::invalid(format!(
+            "unknown provider deployment workflow state {state_text:?}"
+        ))
+    })?;
+    let refused = state == OperationState::Cancelling || state.terminal();
+    if refused {
+        info!(
+            operation_id = %parent_operation_id,
+            child_operation_id = %child_operation_id,
+            workflow_state = state.as_str(),
+            "Provider step claim refused: the workflow was cancelled after the step was prepared"
+        );
+    }
+    Ok(refused)
 }
 
 fn claim_execution_operation(row: &ClaimRow, now: i64) -> CatalogResult<Option<DriverOperation>> {
@@ -3940,7 +4793,10 @@ mod tests {
     fn success_driver_receipt(request: &DriverRequest) -> DriverReceipt {
         let confirmed = matches!(
             request.operation,
-            DriverOperation::Upload | DriverOperation::Activate
+            DriverOperation::Upload
+                | DriverOperation::Activate
+                | DriverOperation::Rollback
+                | DriverOperation::Cleanup
         );
         DriverReceipt {
             schema_version: 1,
@@ -3948,15 +4804,21 @@ mod tests {
             operation: request.operation,
             desired_state_digest: request.desired_state_digest.clone(),
             state: DriverStepState::Succeeded,
-            deployment_state: Some(match request.operation {
-                DriverOperation::Preflight | DriverOperation::Plan => DeploymentState::Planned,
-                DriverOperation::Prepare => DeploymentState::Preparing,
-                DriverOperation::Upload => DeploymentState::Uploaded,
-                DriverOperation::Verify => DeploymentState::Ready,
-                DriverOperation::Activate => DeploymentState::Activating,
-                DriverOperation::Observe | DriverOperation::Reconcile => DeploymentState::Active,
-                _ => unreachable!("deployment workflow uses only its seven standard steps"),
-            }),
+            deployment_state: match request.operation {
+                DriverOperation::Preflight | DriverOperation::Plan => {
+                    Some(DeploymentState::Planned)
+                }
+                DriverOperation::Prepare => Some(DeploymentState::Preparing),
+                DriverOperation::Upload => Some(DeploymentState::Uploaded),
+                DriverOperation::Verify => Some(DeploymentState::Ready),
+                DriverOperation::Activate => Some(DeploymentState::Activating),
+                DriverOperation::Observe | DriverOperation::Reconcile => {
+                    Some(DeploymentState::Active)
+                }
+                DriverOperation::Rollback => Some(DeploymentState::RolledBack),
+                DriverOperation::Cleanup => None,
+                _ => unreachable!("workflows use only the deploy, rollback and cleanup steps"),
+            },
             side_effect: if confirmed {
                 SideEffect::Confirmed
             } else {
@@ -3967,7 +4829,10 @@ mod tests {
                 .then(|| "provider-version-1".to_owned()),
             provider_deployment_id: matches!(
                 request.operation,
-                DriverOperation::Activate | DriverOperation::Observe | DriverOperation::Reconcile
+                DriverOperation::Activate
+                    | DriverOperation::Observe
+                    | DriverOperation::Reconcile
+                    | DriverOperation::Rollback
             )
             .then(|| "provider-deployment-1".to_owned()),
             provider_resource_ids: Default::default(),
@@ -5456,5 +6321,1018 @@ mod tests {
                 && !column.contains("secret_value")
                 && !column.contains("ciphertext")
         }));
+    }
+
+    fn cancellation(
+        harness: &Harness,
+        operation_id: CanonicalId,
+        expected_revision: u64,
+        replay: Option<OperationRequestContext>,
+    ) -> ProviderDeploymentCancellation {
+        ProviderDeploymentCancellation {
+            application_id: harness.application_id,
+            environment_id: harness.environment_id,
+            operation_id,
+            expected_revision,
+            actor_subject: "account:provider-test".to_owned(),
+            replay,
+        }
+    }
+
+    async fn begin_test_deployment(
+        harness: &Harness,
+        artifact: &ArtifactVersionRef,
+        key: &str,
+    ) -> ProductOperation {
+        harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: artifact.clone(),
+                    plan: ProviderNeutralPlan::default(),
+                },
+                context(key),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn drive(
+        harness: &Harness,
+        operation_id: CanonicalId,
+        driver: &dyn ProviderDriver,
+    ) -> ProviderDeploymentDriveOutcome {
+        harness
+            .store
+            .drive_provider_deployment_once_for_test(
+                operation_id,
+                CanonicalId::new_v7(),
+                driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn ready_ids(harness: &Harness) -> Vec<CanonicalId> {
+        harness
+            .store
+            .provider_deployments_ready_for_dispatch(Utc::now(), Duration::from_secs(30), 10)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_from_queued_ends_cancelled_without_a_driver_call() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent = begin_test_deployment(&harness, &artifact, "provider-cancel-queued").await;
+        assert!(parent.cancellable);
+        let cancelling = harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                parent.revision,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cancelling.state, OperationState::Cancelling);
+        assert!(!cancelling.cancellable);
+        assert_eq!(cancelling.phase, "preflight");
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(workflow.cancel_requested_at.is_some());
+        assert_eq!(ready_ids(&harness).await, [parent.operation_id]);
+
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let outcome = drive(&harness, parent.operation_id, &driver).await;
+        let cancelled = match outcome {
+            ProviderDeploymentDriveOutcome::Cancelled(workflow) => workflow,
+            other => panic!("queued cancel did not end cancelled: {other:?}"),
+        };
+        assert!(driver.calls.lock().unwrap().is_empty());
+        assert_eq!(cancelled.operation.state, OperationState::Cancelled);
+        assert_eq!(cancelled.operation.phase, "cancelled");
+        assert!(cancelled.operation.finished_at.is_some());
+        assert_eq!(cancelled.steps.len(), 1);
+        assert_eq!(cancelled.next_step_index, 0);
+        let child = harness
+            .store
+            .product_operation(cancelled.steps[0].child_operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.state, OperationState::Cancelled);
+        assert!(ready_ids(&harness).await.is_empty());
+        assert!(
+            harness
+                .store
+                .nonterminal_provider_deployments(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Driving a cancelled workflow again is a no-op that reports it.
+        assert!(matches!(
+            drive(&harness, parent.operation_id, &driver).await,
+            ProviderDeploymentDriveOutcome::Cancelled(_)
+        ));
+        assert!(driver.calls.lock().unwrap().is_empty());
+        // The target is free for new work again.
+        let next = begin_test_deployment(&harness, &artifact, "provider-cancel-queued-next").await;
+        assert_ne!(next.operation_id, parent.operation_id);
+    }
+
+    #[tokio::test]
+    async fn cancel_while_a_step_is_in_flight_awaits_its_receipt_then_cleans_up() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent = begin_test_deployment(&harness, &artifact, "provider-cancel-in-flight").await;
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        // preflight, plan, prepare, upload settle; verify is the current step.
+        for _ in 0..4 {
+            assert!(matches!(
+                drive(&harness, parent.operation_id, &driver).await,
+                ProviderDeploymentDriveOutcome::Advanced(_)
+            ));
+        }
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workflow.next_step_index, 4);
+        let verify_child = workflow.steps[4].child_operation_id;
+        let claim = harness
+            .store
+            .claim(verify_child, CanonicalId::new_v7(), Duration::from_secs(60))
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+
+        let cancelling = harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                workflow.operation.revision,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cancelling.state, OperationState::Cancelling);
+        assert_eq!(cancelling.phase, "verify");
+        // The in-flight step is neither killed nor bypassed.
+        assert!(ready_ids(&harness).await.is_empty());
+        assert!(matches!(
+            drive(&harness, parent.operation_id, &driver).await,
+            ProviderDeploymentDriveOutcome::Busy(_)
+        ));
+        assert_eq!(driver.calls.lock().unwrap().len(), 4);
+
+        harness
+            .store
+            .record_receipt(&claim, &success_driver_receipt(&claim.request))
+            .await
+            .unwrap();
+        assert_eq!(ready_ids(&harness).await, [parent.operation_id]);
+        let outcome = drive(&harness, parent.operation_id, &driver).await;
+        let cancelled = match outcome {
+            ProviderDeploymentDriveOutcome::Cancelled(workflow) => workflow,
+            other => panic!("cancel did not settle after the receipt: {other:?}"),
+        };
+        // The uploaded version was a confirmed, pre-activation side effect,
+        // so exactly one cleanup ran; activate and observe never did.
+        assert_eq!(
+            *driver.calls.lock().unwrap(),
+            [
+                DriverOperation::Preflight,
+                DriverOperation::Plan,
+                DriverOperation::Prepare,
+                DriverOperation::Upload,
+                DriverOperation::Cleanup,
+            ]
+        );
+        assert_eq!(cancelled.next_step_index, 5);
+        assert_eq!(cancelled.steps.len(), 6);
+        assert_eq!(cancelled.steps[5].operation, DriverOperation::Cleanup);
+        assert_eq!(cancelled.operation.child_operation_ids.len(), 6);
+        assert_eq!(cancelled.operation.provider_operations.len(), 6);
+        let verify = harness
+            .store
+            .product_operation(verify_child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verify.state, OperationState::Succeeded);
+        let cleanup = harness
+            .store
+            .provider_driver_operation(cancelled.steps[5].child_operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleanup.original_operation, DriverOperation::Cleanup);
+        assert_eq!(cleanup.state, ProviderOperationState::Succeeded);
+        assert_eq!(cleanup.desired_state_digest, cancelled.desired_state_digest);
+    }
+
+    /// The prepare pass commits the appended cleanup before a driver is
+    /// selected. Driver selection may fail, the process may restart or
+    /// another coordinator may tick before it is executed: every later
+    /// pass must leave the queued cleanup for the driver, not cancel it.
+    #[tokio::test]
+    async fn an_appended_cleanup_survives_later_prepare_passes_and_runs_once() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent =
+            begin_test_deployment(&harness, &artifact, "provider-cancel-cleanup-reprepare").await;
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        for _ in 0..4 {
+            assert!(matches!(
+                drive(&harness, parent.operation_id, &driver).await,
+                ProviderDeploymentDriveOutcome::Advanced(_)
+            ));
+        }
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let verify_child = workflow.steps[4].child_operation_id;
+        let claim = harness
+            .store
+            .claim(verify_child, CanonicalId::new_v7(), Duration::from_secs(60))
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                workflow.operation.revision,
+                None,
+            ))
+            .await
+            .unwrap();
+        harness
+            .store
+            .record_receipt(&claim, &success_driver_receipt(&claim.request))
+            .await
+            .unwrap();
+
+        // The first prepare pass settles verify and appends the cleanup.
+        let first = harness
+            .store
+            .prepare_provider_deployment(parent.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(first.operation.state, OperationState::Cancelling);
+        assert_eq!(first.steps.len(), 6);
+        assert_eq!(first.steps[5].operation, DriverOperation::Cleanup);
+        assert_eq!(first.next_step_index, 5);
+        let cleanup_child = first.steps[5].child_operation_id;
+
+        // Two more passes before anything executes the cleanup: it stays
+        // queued, the workflow stays cancelling, and nothing is appended.
+        for _ in 0..2 {
+            let again = harness
+                .store
+                .prepare_provider_deployment(parent.operation_id)
+                .await
+                .unwrap();
+            assert_eq!(again.operation.state, OperationState::Cancelling);
+            assert_eq!(again.steps.len(), 6);
+            assert_eq!(again.next_step_index, 5);
+            let cleanup = harness
+                .store
+                .product_operation(cleanup_child)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cleanup.state, OperationState::Queued);
+        }
+        assert_eq!(driver.calls.lock().unwrap().len(), 4);
+        assert_eq!(ready_ids(&harness).await, [parent.operation_id]);
+
+        // The cleanup then runs exactly once and the workflow ends cancelled.
+        let cancelled = match drive(&harness, parent.operation_id, &driver).await {
+            ProviderDeploymentDriveOutcome::Cancelled(workflow) => workflow,
+            other => panic!("re-prepared cleanup did not end cancelled: {other:?}"),
+        };
+        assert_eq!(
+            *driver.calls.lock().unwrap(),
+            [
+                DriverOperation::Preflight,
+                DriverOperation::Plan,
+                DriverOperation::Prepare,
+                DriverOperation::Upload,
+                DriverOperation::Cleanup,
+            ]
+        );
+        assert_eq!(cancelled.operation.state, OperationState::Cancelled);
+        assert_eq!(cancelled.steps.len(), 6);
+        let cleanup = harness
+            .store
+            .provider_driver_operation(cleanup_child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleanup.state, ProviderOperationState::Succeeded);
+        assert!(matches!(
+            drive(&harness, parent.operation_id, &driver).await,
+            ProviderDeploymentDriveOutcome::Cancelled(_)
+        ));
+        assert_eq!(driver.calls.lock().unwrap().len(), 5);
+    }
+
+    /// A cleanup the driver asks to retry is retried, not cancelled.
+    #[tokio::test]
+    async fn a_retryable_cleanup_failure_is_retried_until_it_succeeds() {
+        struct CleanupRetriesOnceDriver {
+            manifest: ValidatedProviderDriverManifest,
+            cleanup_calls: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl ProviderDriver for CleanupRetriesOnceDriver {
+            fn manifest(&self) -> &ValidatedProviderDriverManifest {
+                &self.manifest
+            }
+
+            async fn execute(
+                &self,
+                context: &DriverExecutionContext<'_>,
+            ) -> Result<DriverReceipt, DriverError> {
+                let request = context.request();
+                if request.operation == DriverOperation::Cleanup {
+                    let mut calls = self.cleanup_calls.lock().unwrap();
+                    *calls += 1;
+                    if *calls == 1 {
+                        return Ok(DriverReceipt {
+                            state: DriverStepState::Failed,
+                            side_effect: SideEffect::None,
+                            next_action: DriverNextAction::Retry,
+                            diagnostic: Some("provider throttled the delete".to_owned()),
+                            ..success_driver_receipt(request)
+                        });
+                    }
+                }
+                Ok(success_driver_receipt(request))
+            }
+        }
+
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent =
+            begin_test_deployment(&harness, &artifact, "provider-cancel-cleanup-retry").await;
+        let driver = CleanupRetriesOnceDriver {
+            manifest: manifest(),
+            cleanup_calls: Mutex::new(0),
+        };
+        for _ in 0..4 {
+            drive(&harness, parent.operation_id, &driver).await;
+        }
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                workflow.operation.revision,
+                None,
+            ))
+            .await
+            .unwrap();
+        // First pass: verify is cancelled, the cleanup is appended and run,
+        // and the driver asks for a retry. The workflow is still cancelling.
+        let outcome = drive(&harness, parent.operation_id, &driver).await;
+        let waiting = match outcome {
+            ProviderDeploymentDriveOutcome::Advanced(workflow) => workflow,
+            other => panic!("retryable cleanup failure did not keep cancelling: {other:?}"),
+        };
+        assert_eq!(waiting.operation.state, OperationState::Cancelling);
+        assert_eq!(*driver.cleanup_calls.lock().unwrap(), 1);
+        let cleanup_child = waiting.steps[5].child_operation_id;
+        let cleanup = harness
+            .store
+            .product_operation(cleanup_child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleanup.state, OperationState::Waiting);
+        // Second pass: the same cleanup child is run again and succeeds.
+        let cancelled = match drive(&harness, parent.operation_id, &driver).await {
+            ProviderDeploymentDriveOutcome::Cancelled(workflow) => workflow,
+            other => panic!("retried cleanup did not end cancelled: {other:?}"),
+        };
+        assert_eq!(*driver.cleanup_calls.lock().unwrap(), 2);
+        assert_eq!(cancelled.steps.len(), 6);
+        assert_eq!(cancelled.steps[5].child_operation_id, cleanup_child);
+        let cleanup = harness
+            .store
+            .provider_driver_operation(cleanup_child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleanup.state, ProviderOperationState::Succeeded);
+        assert_eq!(cleanup.attempt_count, 2);
+    }
+
+    /// A cancel that lands after a coordinator's prepare pass and before its
+    /// claim is honoured by the claim itself: the step is refused, and the
+    /// coordinator's stale snapshot ends the workflow without a driver call.
+    #[tokio::test]
+    async fn cancel_recorded_between_prepare_and_claim_refuses_the_dispatch() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent =
+            begin_test_deployment(&harness, &artifact, "provider-cancel-before-claim").await;
+        let prepared = harness
+            .store
+            .prepare_provider_deployment(parent.operation_id)
+            .await
+            .unwrap();
+        assert_ne!(prepared.operation.state, OperationState::Cancelling);
+        let child = prepared.steps[0].child_operation_id;
+        harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                prepared.operation.revision,
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            harness
+                .store
+                .claim(child, CanonicalId::new_v7(), Duration::from_secs(60))
+                .await
+                .unwrap(),
+            DriverOperationClaimOutcome::NotRunnable
+        ));
+        let untouched = harness
+            .store
+            .product_operation(child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.state, OperationState::Queued);
+        let record = harness
+            .store
+            .provider_driver_operation(child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ProviderOperationState::Pending);
+        assert_eq!(record.attempt_count, 0);
+
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let outcome = harness
+            .store
+            .drive_prepared_provider_deployment_once(
+                prepared,
+                CanonicalId::new_v7(),
+                &driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ProviderDeploymentDriveOutcome::Cancelled(_)),
+            "{outcome:?}"
+        );
+        assert!(driver.calls.lock().unwrap().is_empty());
+        let cancelled = harness
+            .store
+            .product_operation(child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, OperationState::Cancelled);
+    }
+
+    /// The fence refuses new work only. A call already made whose lease
+    /// lapsed still gets its reconcile after the cancel, because the
+    /// provider may have done the work and the workflow needs to know.
+    #[tokio::test]
+    async fn cancel_still_lets_a_lapsed_step_reconcile() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent =
+            begin_test_deployment(&harness, &artifact, "provider-cancel-lapsed-reconcile").await;
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        for _ in 0..3 {
+            drive(&harness, parent.operation_id, &driver).await;
+        }
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let upload_child = workflow.steps[3].child_operation_id;
+        let first = harness
+            .store
+            .claim(upload_child, CanonicalId::new_v7(), Duration::from_secs(60))
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                workflow.operation.revision,
+                None,
+            ))
+            .await
+            .unwrap();
+        // The owner went away: its lease is recorded as already over.
+        harness
+            .database
+            .with_connection(move |connection| {
+                connection.execute(
+                    "UPDATE provider_driver_operations SET lease_expires_at = ?2
+                      WHERE operation_id = ?1",
+                    params![upload_child.to_string(), now_secs() - 1],
+                )?;
+                Ok::<(), crate::database::DatabaseError>(())
+            })
+            .await
+            .unwrap();
+        let reconcile = harness
+            .store
+            .claim(upload_child, CanonicalId::new_v7(), Duration::from_secs(60))
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        assert_eq!(reconcile.request.operation, DriverOperation::Reconcile);
+        assert_eq!(reconcile.original_operation, DriverOperation::Upload);
+        assert_eq!(reconcile.claim_epoch, first.claim_epoch + 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_activation_records_the_applied_steps_and_skips_cleanup() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent = begin_test_deployment(&harness, &artifact, "provider-cancel-activated").await;
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        for _ in 0..6 {
+            assert!(matches!(
+                drive(&harness, parent.operation_id, &driver).await,
+                ProviderDeploymentDriveOutcome::Advanced(_)
+            ));
+        }
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workflow.operation.phase, "observe");
+        harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                workflow.operation.revision,
+                None,
+            ))
+            .await
+            .unwrap();
+        let cancelled = match drive(&harness, parent.operation_id, &driver).await {
+            ProviderDeploymentDriveOutcome::Cancelled(workflow) => workflow,
+            other => panic!("post-activation cancel did not end cancelled: {other:?}"),
+        };
+        // Nothing after activation ran, and nothing was torn down: the live
+        // deployment is recorded as applied. Undoing it is a rollback.
+        assert_eq!(driver.calls.lock().unwrap().len(), 6);
+        assert_eq!(driver.calls.lock().unwrap()[5], DriverOperation::Activate);
+        assert_eq!(cancelled.steps.len(), 7);
+        assert_eq!(cancelled.next_step_index, 6);
+        assert_eq!(cancelled.operation.progress, Some(progress_for_step(6, 7)));
+        let observe = harness
+            .store
+            .product_operation(cancelled.steps[6].child_operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observe.state, OperationState::Cancelled);
+        let activate = harness
+            .store
+            .provider_driver_operation(cancelled.steps[5].child_operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(activate.state, ProviderOperationState::Succeeded);
+        assert_eq!(activate.side_effect, Some(SideEffect::Confirmed));
+    }
+
+    #[tokio::test]
+    async fn cancel_is_refused_once_terminal_and_replays_under_its_key() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent = begin_test_deployment(&harness, &artifact, "provider-cancel-terminal").await;
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        for _ in 0..PROVIDER_DEPLOYMENT_STEPS.len() {
+            drive(&harness, parent.operation_id, &driver).await;
+        }
+        let succeeded = harness
+            .store
+            .product_operation(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(succeeded.state, OperationState::Succeeded);
+        let refused = harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                succeeded.revision,
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, CatalogError::Conflict(_)), "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .starts_with(&format!("{OPERATION_NOT_CANCELLABLE}: ")),
+            "{refused}"
+        );
+
+        let next = begin_test_deployment(&harness, &artifact, "provider-cancel-replay").await;
+        let stale = harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                next.operation_id,
+                next.revision + 1,
+                Some(context("provider-cancel-replay-key")),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(stale, CatalogError::RevisionConflict(_)),
+            "{stale}"
+        );
+        let cancelling = harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                next.operation_id,
+                next.revision,
+                Some(context("provider-cancel-replay-key")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cancelling.state, OperationState::Cancelling);
+        // The same key replays the same operation even with the stale
+        // revision; a different key finds nothing left to cancel.
+        let replayed = harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                next.operation_id,
+                next.revision,
+                Some(context("provider-cancel-replay-key")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replayed.operation_id, cancelling.operation_id);
+        assert_eq!(replayed.revision, cancelling.revision);
+        let again = harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                next.operation_id,
+                cancelling.revision,
+                Some(context("provider-cancel-other-key")),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            again
+                .to_string()
+                .starts_with(&format!("{OPERATION_NOT_CANCELLABLE}: ")),
+            "{again}"
+        );
+        // Another environment never sees the operation.
+        let elsewhere = harness
+            .store
+            .request_provider_deployment_cancellation(ProviderDeploymentCancellation {
+                environment_id: CanonicalId::new_v7(),
+                ..cancellation(&harness, next.operation_id, cancelling.revision, None)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(elsewhere, CatalogError::NotFound(_)),
+            "{elsewhere}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_runs_the_driver_rollback_against_the_deployments_desired_state() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let deployment =
+            begin_test_deployment(&harness, &artifact, "provider-rollback-source").await;
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let spec = ProviderRollbackSpec {
+            application_id: harness.application_id,
+            environment_id: harness.environment_id,
+            rolled_back_from_operation_id: deployment.operation_id,
+        };
+        // Only a succeeded deployment can be rolled back to.
+        let premature = harness
+            .store
+            .begin_provider_rollback(spec.clone(), context("provider-rollback-early"))
+            .await
+            .unwrap_err();
+        assert!(
+            premature
+                .to_string()
+                .starts_with(&format!("{OPERATION_NOT_ROLLBACKABLE}: ")),
+            "{premature}"
+        );
+        for _ in 0..PROVIDER_DEPLOYMENT_STEPS.len() {
+            drive(&harness, deployment.operation_id, &driver).await;
+        }
+        let source = harness
+            .store
+            .provider_deployment_workflow(deployment.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.operation.state, OperationState::Succeeded);
+        assert!(source.rollback_operation_ids.is_empty());
+
+        let elsewhere = harness
+            .store
+            .begin_provider_rollback(
+                ProviderRollbackSpec {
+                    environment_id: CanonicalId::new_v7(),
+                    ..spec.clone()
+                },
+                context("provider-rollback-elsewhere"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(elsewhere, CatalogError::NotFound(_)),
+            "{elsewhere}"
+        );
+
+        let rollback = harness
+            .store
+            .begin_provider_rollback(spec.clone(), context("provider-rollback-1"))
+            .await
+            .unwrap();
+        assert_eq!(rollback.kind, OperationKind::Rollback);
+        assert_eq!(rollback.state, OperationState::Queued);
+        assert_eq!(rollback.phase, "rollback");
+        assert!(rollback.cancellable);
+        assert_eq!(rollback.target.id, harness.target.target_id);
+        let replay = harness
+            .store
+            .begin_provider_rollback(spec.clone(), context("provider-rollback-1"))
+            .await
+            .unwrap();
+        assert_eq!(replay.operation_id, rollback.operation_id);
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(rollback.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workflow.kind, ProviderWorkflowKind::Rollback);
+        assert_eq!(
+            workflow.rolled_back_from_operation_id,
+            Some(deployment.operation_id)
+        );
+        assert_eq!(workflow.desired_state_digest, source.desired_state_digest);
+        assert_eq!(workflow.artifact, source.artifact);
+        assert_eq!(
+            workflow.provider_target_grant_id,
+            source.provider_target_grant_id
+        );
+        assert_eq!(workflow.steps.len(), 1);
+        assert_eq!(workflow.steps[0].operation, DriverOperation::Rollback);
+        let linked = harness
+            .store
+            .provider_deployment_workflow(deployment.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(linked.rollback_operation_ids, [rollback.operation_id]);
+        // The rollback holds the target while it runs, and cannot itself be
+        // rolled back to.
+        let competing = harness
+            .store
+            .begin_provider_rollback(spec.clone(), context("provider-rollback-2"))
+            .await
+            .unwrap_err();
+        assert!(
+            competing
+                .to_string()
+                .contains("active deployment operation"),
+            "{competing}"
+        );
+        let nested = harness
+            .store
+            .begin_provider_rollback(
+                ProviderRollbackSpec {
+                    rolled_back_from_operation_id: rollback.operation_id,
+                    ..spec.clone()
+                },
+                context("provider-rollback-nested"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            nested
+                .to_string()
+                .starts_with(&format!("{OPERATION_NOT_ROLLBACKABLE}: ")),
+            "{nested}"
+        );
+
+        assert!(matches!(
+            drive(&harness, rollback.operation_id, &driver).await,
+            ProviderDeploymentDriveOutcome::Advanced(_)
+        ));
+        let done = match drive(&harness, rollback.operation_id, &driver).await {
+            ProviderDeploymentDriveOutcome::Succeeded(workflow) => workflow,
+            other => panic!("rollback did not succeed: {other:?}"),
+        };
+        assert_eq!(done.next_step_index, PROVIDER_ROLLBACK_STEPS.len());
+        assert_eq!(done.operation.progress, Some(10_000));
+        let calls = driver.calls.lock().unwrap().clone();
+        assert_eq!(
+            &calls[PROVIDER_DEPLOYMENT_STEPS.len()..],
+            [DriverOperation::Rollback, DriverOperation::Observe]
+        );
+        let rollback_child = harness
+            .store
+            .provider_driver_operation(done.steps[0].child_operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollback_child.original_operation, DriverOperation::Rollback);
+        assert_eq!(
+            rollback_child.desired_state_digest,
+            source.desired_state_digest
+        );
+        assert_eq!(
+            rollback_child
+                .receipt
+                .unwrap()
+                .provider_deployment_id
+                .as_deref(),
+            Some("provider-deployment-1")
+        );
+        // Once finished the same deployment can be rolled back to again.
+        let again = harness
+            .store
+            .begin_provider_rollback(spec, context("provider-rollback-3"))
+            .await
+            .unwrap();
+        assert_ne!(again.operation_id, rollback.operation_id);
+        let linked = harness
+            .store
+            .provider_deployment_workflow(deployment.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            linked.rollback_operation_ids,
+            [rollback.operation_id, again.operation_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_cleanup_ends_the_cancelled_workflow_failed_with_its_diagnostic() {
+        struct FailsCleanupDriver {
+            manifest: ValidatedProviderDriverManifest,
+        }
+
+        #[async_trait]
+        impl ProviderDriver for FailsCleanupDriver {
+            fn manifest(&self) -> &ValidatedProviderDriverManifest {
+                &self.manifest
+            }
+
+            async fn execute(
+                &self,
+                context: &DriverExecutionContext<'_>,
+            ) -> Result<DriverReceipt, DriverError> {
+                let request = context.request();
+                if request.operation == DriverOperation::Cleanup {
+                    return Ok(DriverReceipt {
+                        state: DriverStepState::Failed,
+                        side_effect: SideEffect::None,
+                        next_action: DriverNextAction::None,
+                        diagnostic: Some(
+                            "provider refused to delete the staged version".to_owned(),
+                        ),
+                        ..success_driver_receipt(request)
+                    });
+                }
+                Ok(success_driver_receipt(request))
+            }
+        }
+
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent =
+            begin_test_deployment(&harness, &artifact, "provider-cancel-cleanup-fails").await;
+        let driver = FailsCleanupDriver {
+            manifest: manifest(),
+        };
+        for _ in 0..4 {
+            drive(&harness, parent.operation_id, &driver).await;
+        }
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        harness
+            .store
+            .request_provider_deployment_cancellation(cancellation(
+                &harness,
+                parent.operation_id,
+                workflow.operation.revision,
+                None,
+            ))
+            .await
+            .unwrap();
+        let failed = match drive(&harness, parent.operation_id, &driver).await {
+            ProviderDeploymentDriveOutcome::Failed(workflow) => workflow,
+            other => panic!("failed cleanup did not fail the workflow: {other:?}"),
+        };
+        assert_eq!(failed.operation.state, OperationState::Failed);
+        assert_eq!(failed.operation.phase, "cleanup");
+        assert!(failed.cancel_requested_at.is_some());
+        let error = failed.operation.error.unwrap();
+        assert!(
+            error.message.contains("staged version"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            failed.steps.last().unwrap().operation,
+            DriverOperation::Cleanup
+        );
     }
 }

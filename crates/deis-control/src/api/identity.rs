@@ -56,7 +56,7 @@ pub struct CreateAccountRequest {
     pub role: String,
 }
 
-/// GET /api/accounts
+/// List the accounts, oldest first.
 ///
 /// The unified list envelope, oldest account first. There is one scope
 /// (the whole installation) and no filter, so the cursor binding only has
@@ -101,7 +101,7 @@ pub async fn list_accounts(
     Ok(Json(response))
 }
 
-/// POST /api/accounts
+/// Create an account.
 #[utoipa::path(
     post,
     path = "/api/v1/accounts",
@@ -121,11 +121,21 @@ pub async fn create_account(
     Json(request): Json<CreateAccountRequest>,
 ) -> ApiResult<Json<Account>> {
     let role = parse_role(&request.role)?;
-    let account = state.identity.create_account(&request.name, role).await?;
+    // `name` is the only member the store validates here, and the only
+    // clash it can report is an account of that name.
+    let account = state
+        .identity
+        .create_account(&request.name, role)
+        .await
+        .map_err(|error| {
+            ApiError::from(error)
+                .creating("account")
+                .invalid_field("name")
+        })?;
     Ok(Json(account))
 }
 
-/// GET /api/accounts/:name
+/// Read one account.
 #[utoipa::path(
     get,
     path = "/api/v1/accounts/{name}",
@@ -157,7 +167,7 @@ pub struct UpdateAccountRequest {
     pub disabled: Option<bool>,
 }
 
-/// PATCH /api/accounts/:name
+/// Change an account's role, or disable it.
 #[utoipa::path(
     patch,
     path = "/api/v1/accounts/{name}",
@@ -219,7 +229,7 @@ pub struct MintResponse {
     pub shown_once: &'static str,
 }
 
-/// POST /api/accounts/:name/tokens
+/// Mint a token for an account.
 #[utoipa::path(
     post,
     path = "/api/v1/accounts/{account}/tokens",
@@ -253,12 +263,19 @@ pub async fn create_token(
             let account = state.identity.get_account(&account).await?;
             Authority::Scoped(account.role.default_scopes())
         }
+        // Which scope was rejected, not just that one was: the list is
+        // the caller's own and a token request often carries several.
         (false, Some(scopes)) => Authority::Scoped(
             scopes
                 .iter()
-                .map(|text| Scope::parse(text))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+                .enumerate()
+                .map(|(index, text)| {
+                    Scope::parse(text).map_err(|e| {
+                        ApiError::BadRequest(e.to_string())
+                            .invalid_field(&format!("scopes[{index}]"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         ),
     };
 
@@ -323,7 +340,7 @@ impl TokenListQuery {
     }
 }
 
-/// GET /api/tokens
+/// List the credentials, oldest first.
 ///
 /// The unified list envelope, oldest credential first. Every filter is part
 /// of the cursor binding - by the account's id, never its name - so a
@@ -395,7 +412,7 @@ pub async fn list_tokens(
     Ok(Json(response))
 }
 
-/// DELETE /api/tokens/:id
+/// Revoke a token.
 #[utoipa::path(
     delete,
     path = "/api/v1/tokens/{id}",
@@ -416,12 +433,15 @@ pub async fn revoke_token(
     Ok(Json(state.identity.revoke_token(&id).await?))
 }
 
+/// The `role` member of a create or a change, which is a body field of
+/// that name in both.
 fn parse_role(text: &str) -> ApiResult<Role> {
     Role::parse(text).ok_or_else(|| {
         ApiError::BadRequest(format!(
             "{text:?} is not a role; the roles are {}",
             Role::names()
         ))
+        .invalid_field("role")
     })
 }
 
@@ -485,6 +505,57 @@ mod tests {
             .iter()
             .map(|item| item["id"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// The two refusals a `POST /accounts` can carry, over the whole
+    /// router so the envelope is the one a client reads: a name that is
+    /// taken answers `already-exists` about the account, and a role that is
+    /// not a role names the member it came from.
+    #[tokio::test]
+    async fn creating_an_account_names_the_clash_and_the_field_on_v1() {
+        use axum::body::{Body, to_bytes};
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (router, _dir) = crate::api::tests::full_router().await;
+        let post = |body: Value| {
+            let router = router.clone();
+            async move {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/accounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                request.extensions_mut().insert(ConnectInfo(
+                    "127.0.0.1:40000".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+
+        let (status, created) = post(serde_json::json!({ "name": "alice", "role": "owner" })).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+
+        let (status, refused) = post(serde_json::json!({ "name": "alice", "role": "owner" })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["error"]["code"], "already-exists");
+        assert_eq!(refused["error"]["target"]["resource"], "account");
+        assert_eq!(
+            refused["error"]["message"],
+            "an account named alice already exists"
+        );
+
+        let (status, refused) =
+            post(serde_json::json!({ "name": "bob", "role": "sysadmin" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["error"]["code"], "invalid-argument");
+        assert_eq!(refused["error"]["violations"][0]["field"], "role");
+        assert_eq!(refused["error"]["violations"][0]["code"], "invalid");
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ use deis_wire::CanonicalId;
 use rusqlite::{Connection, params};
 
 use super::pagination::{PageCursorStore, PagePosition};
-use super::provider_target_grant::history_page_sql;
+use super::provider_target_grant::{environment_page_sql, history_page_sql};
 use super::{
     CatalogProviderCredentialVault, CatalogStore, OperationRequestContext,
     ProviderCredentialBindingSpec, ProviderDeploymentSpec, ProviderInstallationSpec,
@@ -62,11 +62,6 @@ struct KeysetQuery {
     indexes: &'static [&'static str],
     /// What ties `sql` to the statement the store really prepares.
     provenance: Provenance,
-    /// A plan step this query is known to still take and should not. The
-    /// index assertion holds; the sort assertion is inverted so the marker
-    /// is removed the moment the query is fixed, instead of quietly
-    /// outliving the problem.
-    known_shortfall: Option<&'static str>,
 }
 
 /// Where the SQL under test came from.
@@ -159,19 +154,11 @@ fn assert_keyset_plan(query: &KeysetQuery, plan: &[String]) {
         query.name,
         query.indexes
     );
-    match query.known_shortfall {
-        None => assert!(
-            !text.contains("TEMP B-TREE"),
-            "{}: plan sorts with a temporary b-tree instead of walking the index:\n{text}",
-            query.name
-        ),
-        Some(shortfall) => assert!(
-            text.contains(shortfall),
-            "{}: the recorded shortfall {shortfall:?} is no longer in the plan; the query \
-             was fixed, so drop `known_shortfall` from this case:\n{text}",
-            query.name
-        ),
-    }
+    assert!(
+        !text.contains("TEMP B-TREE"),
+        "{}: plan sorts with a temporary b-tree instead of walking the index:\n{text}",
+        query.name
+    );
     for line in plan {
         let bare_scan = line
             .strip_prefix("SCAN ")
@@ -199,7 +186,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                 source: STORE_SOURCE,
                 fragment: "FROM apps WHERE (?1 IS NULL OR id > ?1) ORDER BY id ASC LIMIT ?2",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "list_retired_names_page",
@@ -214,7 +200,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                 fragment: "FROM retired_app_names WHERE (?1 IS NULL OR app_id > ?1) \
                               ORDER BY app_id ASC LIMIT ?2",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "list_canonical_artifacts_page",
@@ -233,7 +218,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                               created_at < ?2 OR (created_at = ?2 AND id < ?3)) ORDER BY \
                               created_at DESC, id DESC LIMIT ?4",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "list_versions_page",
@@ -255,7 +239,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                               OR (number = ?2 AND id < ?3)) ORDER BY number DESC, id DESC \
                               LIMIT ?4",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "list_environments_page",
@@ -271,7 +254,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                 fragment: "FROM environments WHERE app_id = ?1 AND (?2 IS NULL OR name > ?2) \
                               ORDER BY name ASC LIMIT ?3",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "list_deployments_page",
@@ -290,7 +272,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                               < ?2 OR (created_at = ?2 AND canonical_id < ?3)) ORDER BY \
                               created_at DESC, canonical_id DESC LIMIT ?4",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "list_routes_page",
@@ -310,7 +291,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                               path_prefix = ?3 AND id > ?4)) ORDER BY priority DESC, \
                               path_prefix ASC, id ASC LIMIT ?5",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "list_domain_grants_page",
@@ -326,7 +306,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                               environment) > (?1, ?2, ?3)) ORDER BY pattern ASC, app_id ASC, \
                               environment ASC LIMIT ?4",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "list_secrets_page",
@@ -341,7 +320,6 @@ fn catalog_queries() -> Vec<KeysetQuery> {
                 fragment: "FROM secret_heads WHERE env_id = ?1 AND (?2 IS NULL OR name > ?2) \
                               ORDER BY name ASC LIMIT ?3",
             },
-            known_shortfall: None,
         },
     ]
 }
@@ -363,31 +341,52 @@ fn identity_queries() -> Vec<KeysetQuery> {
                 fragment: "FROM accounts WHERE (?1 IS NULL OR created_at > ?1 OR (created_at \
                               = ?1 AND name > ?2)) ORDER BY created_at ASC, name ASC LIMIT ?3",
             },
-            known_shortfall: None,
         },
+        // The token list prepares one statement per account filter so the
+        // account is an equality the planner can seek.
         KeysetQuery {
-            name: "list_tokens_page",
+            name: "list_tokens_page unfiltered",
             table: "t",
             sql: "SELECT t.id, t.account_id, t.name, t.origin, t.scopes, t.unscoped, \
                   t.created_at, t.last_used_at, t.revoked_at, a.name FROM api_tokens t
                    JOIN accounts a ON a.id = t.account_id
-                  WHERE (?1 IS NULL OR t.account_id = ?1)
+                  WHERE (?1 = 1 OR t.revoked_at IS NULL)
+                    AND (?2 = 0 OR t.unscoped = 1)
+                    AND (?3 IS NULL OR t.created_at > ?3
+                         OR (t.created_at = ?3 AND t.id > ?4))
+                  ORDER BY t.created_at ASC, t.id ASC LIMIT ?5"
+                .to_string(),
+            indexes: &["idx_api_tokens_page_v1"],
+            provenance: Provenance::Copied {
+                source: IDENTITY_SOURCE,
+                fragment: "FROM api_tokens t JOIN accounts a ON a.id = t.account_id WHERE (?1 \
+                              = 1 OR t.revoked_at IS NULL) AND (?2 = 0 OR t.unscoped = 1) AND \
+                              (?3 IS NULL OR t.created_at > ?3 OR (t.created_at = ?3 AND t.id \
+                              > ?4)) ORDER BY t.created_at ASC, t.id ASC LIMIT ?5",
+            },
+        },
+        KeysetQuery {
+            name: "list_tokens_page by account",
+            table: "t",
+            sql: "SELECT t.id, t.account_id, t.name, t.origin, t.scopes, t.unscoped, \
+                  t.created_at, t.last_used_at, t.revoked_at, a.name FROM api_tokens t
+                   JOIN accounts a ON a.id = t.account_id
+                  WHERE t.account_id = ?1
                     AND (?2 = 1 OR t.revoked_at IS NULL)
                     AND (?3 = 0 OR t.unscoped = 1)
                     AND (?4 IS NULL OR t.created_at > ?4
                          OR (t.created_at = ?4 AND t.id > ?5))
                   ORDER BY t.created_at ASC, t.id ASC LIMIT ?6"
                 .to_string(),
-            indexes: &["idx_api_tokens_page_v1", "idx_api_tokens_account_page_v1"],
+            indexes: &["idx_api_tokens_account_page_v1"],
             provenance: Provenance::Copied {
                 source: IDENTITY_SOURCE,
-                fragment: "FROM api_tokens t JOIN accounts a ON a.id = t.account_id WHERE (?1 \
-                              IS NULL OR t.account_id = ?1) AND (?2 = 1 OR t.revoked_at IS \
-                              NULL) AND (?3 = 0 OR t.unscoped = 1) AND (?4 IS NULL OR \
-                              t.created_at > ?4 OR (t.created_at = ?4 AND t.id > ?5)) ORDER BY \
-                              t.created_at ASC, t.id ASC LIMIT ?6",
+                fragment: "FROM api_tokens t JOIN accounts a ON a.id = t.account_id WHERE \
+                              t.account_id = ?1 AND (?2 = 1 OR t.revoked_at IS NULL) AND (?3 = \
+                              0 OR t.unscoped = 1) AND (?4 IS NULL OR t.created_at > ?4 OR \
+                              (t.created_at = ?4 AND t.id > ?5)) ORDER BY t.created_at ASC, \
+                              t.id ASC LIMIT ?6",
             },
-            known_shortfall: None,
         },
     ]
 }
@@ -435,7 +434,6 @@ fn audit_queries() -> Vec<KeysetQuery> {
                 template: CURSOR_TEMPLATE,
                 rendered,
             },
-            known_shortfall: None,
         }
     };
     vec![
@@ -498,28 +496,41 @@ fn provider_queries() -> Vec<KeysetQuery> {
                               (created_at = ?1 AND installation_id > ?2) ORDER BY created_at, \
                               installation_id LIMIT ?3",
             },
-            known_shortfall: None,
         },
+        // The target list prepares one statement per installation filter so
+        // the installation is an equality the planner can seek.
         KeysetQuery {
-            name: "provider_targets_page",
+            name: "provider_targets_page unfiltered",
             table: "provider_targets",
             sql: "SELECT target_id FROM provider_targets
-                      WHERE (?1 IS NULL OR installation_id = ?1)
+                      WHERE ?1 IS NULL OR created_at > ?1
+                         OR (created_at = ?1 AND target_id > ?2)
+                      ORDER BY created_at, target_id LIMIT ?3"
+                .to_string(),
+            indexes: &["idx_provider_targets_page_v1"],
+            provenance: Provenance::Copied {
+                source: PROVIDER_OPERATION_SOURCE,
+                fragment: "FROM provider_targets WHERE ?1 IS NULL OR created_at > ?1 OR \
+                              (created_at = ?1 AND target_id > ?2) ORDER BY created_at, \
+                              target_id LIMIT ?3",
+            },
+        },
+        KeysetQuery {
+            name: "provider_targets_page by installation",
+            table: "provider_targets",
+            sql: "SELECT target_id FROM provider_targets
+                      WHERE installation_id = ?1
                         AND (?2 IS NULL OR created_at > ?2
                              OR (created_at = ?2 AND target_id > ?3))
                       ORDER BY created_at, target_id LIMIT ?4"
                 .to_string(),
-            indexes: &[
-                "idx_provider_targets_page_v1",
-                "idx_provider_targets_installation_page_v1",
-            ],
+            indexes: &["idx_provider_targets_installation_page_v1"],
             provenance: Provenance::Copied {
                 source: PROVIDER_OPERATION_SOURCE,
-                fragment: "FROM provider_targets WHERE (?1 IS NULL OR installation_id = ?1) \
-                              AND (?2 IS NULL OR created_at > ?2 OR (created_at = ?2 AND \
-                              target_id > ?3)) ORDER BY created_at, target_id LIMIT ?4",
+                fragment: "FROM provider_targets WHERE installation_id = ?1 AND (?2 IS NULL OR \
+                              created_at > ?2 OR (created_at = ?2 AND target_id > ?3)) ORDER \
+                              BY created_at, target_id LIMIT ?4",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider_deployments_for_environment_page",
@@ -538,35 +549,25 @@ fn provider_queries() -> Vec<KeysetQuery> {
                               (created_at = ?3 AND operation_id < ?4)) ORDER BY created_at \
                               DESC, operation_id DESC LIMIT ?5",
             },
-            known_shortfall: None,
+        },
+        // The per-environment list prepares one statement per status filter
+        // so a given status is an equality the planner can seek through the
+        // status column of `idx_provider_target_grants_environment_v1`, and
+        // the unfiltered list walks an index without that column; these are
+        // the store's own constants.
+        KeysetQuery {
+            name: "provider_target_grants_for_environment_page all",
+            table: "provider_target_grants",
+            sql: environment_page_sql::ALL.to_string(),
+            indexes: &["idx_provider_target_grants_environment_page_v1"],
+            provenance: Provenance::Store,
         },
         KeysetQuery {
-            name: "provider_target_grants_for_environment_page",
+            name: "provider_target_grants_for_environment_page by status",
             table: "provider_target_grants",
-            sql: "SELECT grant_id FROM provider_target_grants
-                      WHERE application_id = ?1 AND environment_id = ?2
-                        AND (?3 IS NULL OR status = ?3)
-                        AND (?4 IS NULL OR created_at < ?4
-                             OR (created_at = ?4 AND grant_id < ?5))
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?6"
-                .to_string(),
+            sql: environment_page_sql::BY_STATUS.to_string(),
             indexes: &["idx_provider_target_grants_environment_v1"],
-            provenance: Provenance::Copied {
-                source: PROVIDER_GRANT_SOURCE,
-                fragment: "FROM provider_target_grants WHERE application_id = ?1 AND \
-                              environment_id = ?2 AND (?3 IS NULL OR status = ?3) AND (?4 IS \
-                              NULL OR created_at < ?4 OR (created_at = ?4 AND grant_id < ?5)) \
-                              ORDER BY created_at DESC, grant_id DESC LIMIT ?6",
-            },
-            // The index is `(application_id, environment_id, status,
-            // created_at DESC, grant_id DESC)`, but the status filter is
-            // `(?3 IS NULL OR status = ?3)`, which is not an equality the
-            // planner can seek on, so the index stops at the environment and
-            // every page sorts that environment's grants. Fixing it means
-            // either a statement per status filter (equality when a status
-            // is given) or an index without the status column for the
-            // unfiltered list; both live outside this module.
-            known_shortfall: Some("USE TEMP B-TREE FOR ORDER BY"),
+            provenance: Provenance::Store,
         },
         // The global history prepares one statement per filter shape so
         // each filter is an equality the planner can seek; these are the
@@ -577,7 +578,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
             sql: history_page_sql::UNFILTERED.to_string(),
             indexes: &["idx_provider_target_grants_history_v1"],
             provenance: Provenance::Store,
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider_target_grant_history_page by status",
@@ -585,7 +585,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
             sql: history_page_sql::BY_STATUS.to_string(),
             indexes: &["idx_provider_target_grants_status_history_v1"],
             provenance: Provenance::Store,
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider_target_grant_history_page by target",
@@ -593,7 +592,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
             sql: history_page_sql::BY_TARGET.to_string(),
             indexes: &["idx_provider_target_grants_target_page_v1"],
             provenance: Provenance::Store,
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider_target_grant_history_page by target and status",
@@ -601,7 +599,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
             sql: history_page_sql::BY_TARGET_AND_STATUS.to_string(),
             indexes: &["idx_provider_target_grants_target_history_v1"],
             provenance: Provenance::Store,
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider_target_grant_audit_events_page",
@@ -622,7 +619,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
                               IS NULL OR grant_revision > ?2 OR (grant_revision = ?2 AND \
                               event_id > ?3)) ORDER BY grant_revision, event_id LIMIT ?4",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider credential bindings_page",
@@ -639,7 +635,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
                               ?1 OR (created_at = ?1 AND binding_id > ?2) ORDER BY created_at, \
                               binding_id LIMIT ?3",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider credential audit_events_page",
@@ -660,7 +655,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
                               IS NULL OR occurred_at > ?2 OR (occurred_at = ?2 AND event_id > \
                               ?3)) ORDER BY occurred_at, event_id LIMIT ?4",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider driver releases_page",
@@ -679,7 +673,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
                               release_sha256 < ?3)) ORDER BY created_at DESC, release_sha256 \
                               DESC LIMIT ?4",
             },
-            known_shortfall: None,
         },
         KeysetQuery {
             name: "provider driver release audit_events_page",
@@ -699,7 +692,6 @@ fn provider_queries() -> Vec<KeysetQuery> {
                               (observed_at = ?3 AND event_id > ?4)) ORDER BY observed_at, \
                               event_id LIMIT ?5",
             },
-            known_shortfall: None,
         },
     ]
 }

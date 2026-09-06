@@ -9,7 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use deis_wire::CanonicalId;
-use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, params, params_from_iter};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -134,36 +134,136 @@ pub(crate) mod history_page_sql {
                       ORDER BY created_at DESC, grant_id DESC LIMIT ?5";
 }
 
-/// One filter shape of the global history: its count and page statements
-/// and the filter bindings in the order the statements name them.
-struct HistoryShape {
+/// The per-environment grant list's keyset statements, one per status
+/// filter.
+///
+/// The same reasoning as `history_page_sql`: a status written as `(?n IS
+/// NULL OR status = ?n)` stops the planner at the environment columns of
+/// `idx_provider_target_grants_environment_v1` and every page sorts the
+/// whole environment. With a plain equality the filtered form seeks that
+/// index through the status; the unfiltered form walks
+/// `idx_provider_target_grants_environment_page_v1`, which carries no status
+/// column. The bindings are the application and environment ids, the status
+/// when filtered, then the cursor (`created_at`, `grant_id`) and the limit.
+/// `pagination_plans` explains both against the real schema.
+pub(crate) mod environment_page_sql {
+    pub(crate) const ALL: &str = "SELECT grant_id FROM provider_target_grants
+                      WHERE application_id = ?1 AND environment_id = ?2
+                        AND (?3 IS NULL OR created_at < ?3
+                             OR (created_at = ?3 AND grant_id < ?4))
+                      ORDER BY created_at DESC, grant_id DESC LIMIT ?5";
+    pub(crate) const BY_STATUS: &str = "SELECT grant_id FROM provider_target_grants
+                      WHERE application_id = ?1 AND environment_id = ?2 AND status = ?3
+                        AND (?4 IS NULL OR created_at < ?4
+                             OR (created_at = ?4 AND grant_id < ?5))
+                      ORDER BY created_at DESC, grant_id DESC LIMIT ?6";
+}
+
+/// One filter shape of a grant list: its count and page statements and the
+/// filter bindings in the order the statements name them.
+struct GrantPageShape {
     count_sql: &'static str,
     page_sql: &'static str,
     bindings: Vec<String>,
 }
 
+impl GrantPageShape {
+    /// The rows of one page and the total of the scope, both read inside
+    /// `transaction`. The cursor and the limit are appended to the shape's
+    /// own bindings in the order every page statement names them.
+    fn page(
+        &self,
+        transaction: &Transaction<'_>,
+        cursor: Option<PagePosition>,
+        limit: usize,
+        fetch_limit: i64,
+    ) -> CatalogResult<CatalogPage<ProviderTargetGrant>> {
+        let total = transaction.query_row(
+            self.count_sql,
+            params_from_iter(self.bindings.iter()),
+            |row| row.get::<_, i64>(0),
+        )?;
+        let (before_created_at, before_id) = cursor
+            .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+            .unwrap_or((None, String::new()));
+        let mut bindings: Vec<Box<dyn ToSql>> = self
+            .bindings
+            .iter()
+            .map(|value| Box::new(value.clone()) as Box<dyn ToSql>)
+            .collect();
+        bindings.push(Box::new(before_created_at));
+        bindings.push(Box::new(before_id));
+        bindings.push(Box::new(fetch_limit));
+        let mut statement = transaction.prepare(self.page_sql)?;
+        let ids = statement
+            .query_map(params_from_iter(bindings.iter()), |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let grants = ids
+            .into_iter()
+            .map(|id| {
+                let id = parse_id(&id, "provider target grant")?;
+                load_grant(transaction, id)?
+                    .ok_or_else(|| CatalogError::not_found(format!("provider target grant {id}")))
+            })
+            .collect::<CatalogResult<Vec<_>>>()?;
+        drop(statement);
+        finish_page(grants, limit, total, "provider target grant")
+    }
+}
+
+impl ProviderTargetGrantStatusFilter {
+    /// The per-environment list shape for this filter.
+    fn environment_shape(
+        self,
+        application_id: CanonicalId,
+        environment_id: CanonicalId,
+    ) -> GrantPageShape {
+        let scope = vec![application_id.to_string(), environment_id.to_string()];
+        match self.sql_status() {
+            None => GrantPageShape {
+                count_sql: "SELECT COUNT(*) FROM provider_target_grants
+                             WHERE application_id = ?1 AND environment_id = ?2",
+                page_sql: environment_page_sql::ALL,
+                bindings: scope,
+            },
+            Some(status) => GrantPageShape {
+                count_sql: "SELECT COUNT(*) FROM provider_target_grants
+                             WHERE application_id = ?1 AND environment_id = ?2
+                               AND status = ?3",
+                page_sql: environment_page_sql::BY_STATUS,
+                bindings: scope
+                    .into_iter()
+                    .chain(std::iter::once(status.to_owned()))
+                    .collect(),
+            },
+        }
+    }
+}
+
 impl ProviderTargetGrantHistoryFilter {
-    fn shape(&self) -> HistoryShape {
+    fn shape(&self) -> GrantPageShape {
         let status = self.status.sql_status().map(str::to_owned);
         let target = self.provider_target_id.map(|id| id.to_string());
         match (target, status) {
-            (None, None) => HistoryShape {
+            (None, None) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants",
                 page_sql: history_page_sql::UNFILTERED,
                 bindings: Vec::new(),
             },
-            (None, Some(status)) => HistoryShape {
+            (None, Some(status)) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants WHERE status = ?1",
                 page_sql: history_page_sql::BY_STATUS,
                 bindings: vec![status],
             },
-            (Some(target), None) => HistoryShape {
+            (Some(target), None) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants
                              WHERE provider_target_id = ?1",
                 page_sql: history_page_sql::BY_TARGET,
                 bindings: vec![target],
             },
-            (Some(target), Some(status)) => HistoryShape {
+            (Some(target), Some(status)) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants
                              WHERE provider_target_id = ?1 AND status = ?2",
                 page_sql: history_page_sql::BY_TARGET_AND_STATUS,
@@ -341,58 +441,14 @@ impl CatalogStore {
         cursor: Option<PagePosition>,
     ) -> CatalogResult<CatalogPage<ProviderTargetGrant>> {
         let fetch_limit = sqlite_fetch_limit(limit, "provider target grant")?;
+        let shape = status.environment_shape(application_id, environment_id);
         self.database()
             .with_connection(move |connection| {
                 let transaction = connection.unchecked_transaction()?;
                 ensure_application_environment(&transaction, application_id, environment_id)?;
-                let status = status.sql_status();
-                let total = transaction.query_row(
-                    "SELECT COUNT(*) FROM provider_target_grants
-                      WHERE application_id = ?1 AND environment_id = ?2
-                        AND (?3 IS NULL OR status = ?3)",
-                    params![
-                        application_id.to_string(),
-                        environment_id.to_string(),
-                        status,
-                    ],
-                    |row| row.get::<_, i64>(0),
-                )?;
-                let (before_created_at, before_id) = cursor
-                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-                    .unwrap_or((None, String::new()));
-                let mut statement = transaction.prepare(
-                    "SELECT grant_id FROM provider_target_grants
-                      WHERE application_id = ?1 AND environment_id = ?2
-                        AND (?3 IS NULL OR status = ?3)
-                        AND (?4 IS NULL OR created_at < ?4
-                             OR (created_at = ?4 AND grant_id < ?5))
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?6",
-                )?;
-                let ids = statement
-                    .query_map(
-                        params![
-                            application_id.to_string(),
-                            environment_id.to_string(),
-                            status,
-                            before_created_at,
-                            before_id,
-                            fetch_limit,
-                        ],
-                        |row| row.get::<_, String>(0),
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let grants = ids
-                    .into_iter()
-                    .map(|id| {
-                        let id = parse_id(&id, "provider target grant")?;
-                        load_grant(&transaction, id)?.ok_or_else(|| {
-                            CatalogError::not_found(format!("provider target grant {id}"))
-                        })
-                    })
-                    .collect::<CatalogResult<Vec<_>>>()?;
-                drop(statement);
+                let page = shape.page(&transaction, cursor, limit, fetch_limit)?;
                 transaction.commit()?;
-                finish_page(grants, limit, total, "provider target grant")
+                Ok(page)
             })
             .await
     }
@@ -460,40 +516,9 @@ impl CatalogStore {
         self.database()
             .with_connection(move |connection| {
                 let transaction = connection.unchecked_transaction()?;
-                let total = transaction.query_row(
-                    shape.count_sql,
-                    params_from_iter(shape.bindings.iter()),
-                    |row| row.get::<_, i64>(0),
-                )?;
-                let (before_created_at, before_id) = cursor
-                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-                    .unwrap_or((None, String::new()));
-                let mut bindings: Vec<Box<dyn ToSql>> = shape
-                    .bindings
-                    .iter()
-                    .map(|value| Box::new(value.clone()) as Box<dyn ToSql>)
-                    .collect();
-                bindings.push(Box::new(before_created_at));
-                bindings.push(Box::new(before_id));
-                bindings.push(Box::new(fetch_limit));
-                let mut statement = transaction.prepare(shape.page_sql)?;
-                let ids = statement
-                    .query_map(params_from_iter(bindings.iter()), |row| {
-                        row.get::<_, String>(0)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let grants = ids
-                    .into_iter()
-                    .map(|id| {
-                        let id = parse_id(&id, "provider target grant")?;
-                        load_grant(&transaction, id)?.ok_or_else(|| {
-                            CatalogError::not_found(format!("provider target grant {id}"))
-                        })
-                    })
-                    .collect::<CatalogResult<Vec<_>>>()?;
-                drop(statement);
+                let page = shape.page(&transaction, cursor, limit, fetch_limit)?;
                 transaction.commit()?;
-                finish_page(grants, limit, total, "provider target grant")
+                Ok(page)
             })
             .await
     }

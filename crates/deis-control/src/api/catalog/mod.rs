@@ -188,6 +188,14 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
             get(providers::get_provider_deployment),
         )
         .route(
+            &at("/apps/:app_id/environments/:env/provider-deployments/:operation_id/cancel"),
+            post(providers::cancel_provider_deployment),
+        )
+        .route(
+            &at("/apps/:app_id/environments/:env/provider-deployments/:operation_id/rollback"),
+            post(providers::rollback_provider_deployment),
+        )
+        .route(
             &at("/deployment-plans/:id"),
             get(deployments::deployment_plan),
         )

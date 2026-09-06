@@ -4,17 +4,33 @@
 //! the operation table. The remaining provider-management mutations write a
 //! resource row directly, so they share this table instead: one record per
 //! (organization, actor, route, `Idempotency-Key`), holding the SHA-256 of
-//! the key, the SHA-256 of the canonical request, and after success a
+//! the key, a keyed digest of the canonical request, and after success a
 //! canonical reference to the resource that was produced.
 //!
 //! Nothing here can carry a secret. The raw key and the request body are
-//! reduced to digests before they reach the database, the request digest is
-//! salted with the raw key (which is itself never stored), and a replay
-//! rebuilds its response from the resource store rather than from a stored
-//! body. The request digest does cover every request fact, a credential
-//! value included, so that a key reused with a different secret is refused
-//! instead of silently replaying the first one; the key is the only salt,
-//! and the server does not enforce its entropy.
+//! reduced to digests before they reach the database, and a replay rebuilds
+//! its response from the resource store rather than from a stored body. The
+//! request digest does cover every request fact, a credential value
+//! included, so that a key reused with a different secret is refused
+//! instead of silently replaying the first one. That is why it is not a
+//! plain hash: a reader of the database who guessed the (client-chosen,
+//! entropy-unenforced) key could otherwise confirm a credential value
+//! offline by hashing candidates. The digest is HMAC-SHA256 under a key
+//! derived from the control plane's secrets master key for exactly this
+//! purpose ([`DIGEST_KEY_PURPOSE`]), so without the master key a stored
+//! digest confirms nothing. The key is required for every record, secret
+//! material or not: one rule, no route-by-route judgement, and the master
+//! key is already mandatory for the credential routes this table exists
+//! for. Without it, a request that carries an `Idempotency-Key` fails
+//! closed (`SecretsUnavailable`, surfaced by the API as `not-configured`
+//! naming `secret_key_file`) rather than falling back to a weaker digest.
+//!
+//! Every record names the scheme its digest was computed under
+//! (`digest_scheme`, currently [`DIGEST_SCHEME`]). A replay that finds a
+//! record written under another scheme cannot compare digests, so it is
+//! refused as `idempotency-key-reused`, exactly like a changed request:
+//! the client sends a new key. Records expire within a day, so this only
+//! touches keys first used just before an upgrade that changed the scheme.
 //!
 //! Life cycle of a record:
 //!
@@ -43,7 +59,10 @@
 
 use std::sync::Arc;
 
+use std::fmt;
+
 use deis_wire::CanonicalId;
+use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -54,6 +73,7 @@ use super::operation::{actor_id, default_organization_id};
 use super::provider_credential::ProviderCredentialBinding;
 use super::provider_driver_operation::{ProviderInstallation, ProviderTarget};
 use super::provider_target_grant::ProviderTargetGrant;
+use super::secrets::{DerivedKey, SecretsBackend};
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
@@ -73,8 +93,63 @@ pub const IDEMPOTENCY_KEY_REUSED: &str = "idempotency-key-reused";
 /// not finished yet.
 pub const IDEMPOTENCY_REQUEST_IN_PROGRESS: &str = "idempotency-request-in-progress";
 
+/// Purpose string under which the request-digest key is derived from the
+/// secrets master key. Changing it rotates the digest key; bump
+/// [`DIGEST_SCHEME`] with it so old records are refused instead of never
+/// matching silently.
+pub const DIGEST_KEY_PURPOSE: &str = "deislet-control-idempotency-digest-v1";
+/// The scheme tag new records are written with. `sha256-v1` (an unkeyed
+/// SHA-256 salted only with the client key) was the scheme before the
+/// keyed digest and is only ever read, never written.
+pub const DIGEST_SCHEME: &str = "hmac-sha256-v1";
+
 const DIGEST_DOMAIN: &str = "deislet-api-idempotency-v1";
 const MAX_ROUTE_ID_BYTES: usize = 128;
+
+/// The server-side key every request digest is computed under.
+///
+/// Derived once per request from the secrets backend (cheap: one HKDF
+/// expansion) so the handler holds no long-lived key material of its own.
+pub struct IdempotencyDigestKey {
+    key: DerivedKey,
+}
+
+impl fmt::Debug for IdempotencyDigestKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("IdempotencyDigestKey(<material redacted>)")
+    }
+}
+
+impl IdempotencyDigestKey {
+    /// Derive the digest key, or fail closed when no usable master key is
+    /// configured. The error names `secret_key_file` because that is the
+    /// setting the operator has to fix; nothing weaker is substituted.
+    pub fn derive(secrets: &SecretsBackend) -> CatalogResult<Self> {
+        match secrets.derive_key(DIGEST_KEY_PURPOSE) {
+            Ok(key) => Ok(Self { key }),
+            Err(CatalogError::SecretsUnavailable(reason)) => {
+                warn!(
+                    reason,
+                    "Refusing an Idempotency-Key request: request digests need the secret_key_file master key and none is usable"
+                );
+                Err(CatalogError::SecretsUnavailable(format!(
+                    "secret_key_file must hold a usable master key before Idempotency-Key requests can be recorded ({reason})"
+                )))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(master_key_byte: u8) -> Self {
+        use super::secrets::{MASTER_KEY_LEN, SecretCipher};
+
+        let cipher = SecretCipher::from_key_bytes(&[master_key_byte; MASTER_KEY_LEN]).unwrap();
+        Self {
+            key: cipher.derive_key(DIGEST_KEY_PURPOSE),
+        }
+    }
+}
 
 /// A resource whose representation may be rebuilt for an idempotent replay.
 ///
@@ -156,7 +231,10 @@ pub struct IdempotencyScope {
 pub struct IdempotentRequest {
     route_id: &'static str,
     idempotency_key_sha256: String,
-    request_sha256: String,
+    /// HMAC-SHA256 under [`IdempotencyDigestKey`] of the route, the raw
+    /// key and the canonical request, hex encoded; stored in the
+    /// `request_sha256` column beside [`DIGEST_SCHEME`].
+    request_digest: String,
 }
 
 impl IdempotentRequest {
@@ -164,10 +242,13 @@ impl IdempotentRequest {
     /// `provider_credential.provision`); `canonical_request` is the JCS
     /// encoding of every request fact that must match on replay, including
     /// path parameters and the `If-Match` revision where one applies.
+    /// `digest_key` is the server key the request digest is computed
+    /// under; the same request under another key is a different digest.
     pub fn new(
         route_id: &'static str,
         idempotency_key: &str,
         canonical_request: &[u8],
+        digest_key: &IdempotencyDigestKey,
     ) -> CatalogResult<Self> {
         validate_idempotency_key(idempotency_key)?;
         if route_id.is_empty()
@@ -180,7 +261,8 @@ impl IdempotentRequest {
                 "idempotency route id {route_id:?} is not a lowercase dotted identifier"
             )));
         }
-        let mut request_digest = Sha256::new();
+        let mut request_digest = Hmac::<Sha256>::new_from_slice(digest_key.key.as_bytes())
+            .expect("HMAC-SHA256 accepts a key of any length");
         request_digest.update(DIGEST_DOMAIN.as_bytes());
         request_digest.update(b"\n");
         request_digest.update(route_id.as_bytes());
@@ -191,7 +273,7 @@ impl IdempotentRequest {
         Ok(Self {
             route_id,
             idempotency_key_sha256: hex::encode(Sha256::digest(idempotency_key.as_bytes())),
-            request_sha256: hex::encode(request_digest.finalize()),
+            request_digest: hex::encode(request_digest.finalize().into_bytes()),
         })
     }
 
@@ -362,7 +444,8 @@ pub enum IdempotencyOutcome {
 #[derive(Debug)]
 struct ExistingRecord {
     record_id: String,
-    request_sha256: String,
+    digest_scheme: String,
+    request_digest: String,
     state: String,
     response_status: Option<i64>,
     resource_kind: Option<String>,
@@ -392,7 +475,7 @@ impl IdempotencyStore {
     ) -> CatalogResult<IdempotencyOutcome> {
         let route_id = request.route_id;
         let key_sha256 = request.idempotency_key_sha256.clone();
-        let request_sha256 = request.request_sha256.clone();
+        let request_digest = request.request_digest.clone();
         let record_id = CanonicalId::new_v7();
         let now = now_secs();
         self.db
@@ -409,8 +492,9 @@ impl IdempotencyStore {
                 let actor = actor_id(&transaction, &scope.actor_subject, now)?;
                 let existing = transaction
                     .query_row(
-                        "SELECT record_id, request_sha256, state, response_status,
-                                resource_kind, resource_id, resource_revision
+                        "SELECT record_id, digest_scheme, request_sha256, state,
+                                response_status, resource_kind, resource_id,
+                                resource_revision
                            FROM api_idempotency_records
                           WHERE organization_id = ?1 AND actor_id = ?2
                             AND route_id = ?3 AND idempotency_key_sha256 = ?4",
@@ -423,34 +507,36 @@ impl IdempotencyStore {
                         |row| {
                             Ok(ExistingRecord {
                                 record_id: row.get(0)?,
-                                request_sha256: row.get(1)?,
-                                state: row.get(2)?,
-                                response_status: row.get(3)?,
-                                resource_kind: row.get(4)?,
-                                resource_id: row.get(5)?,
-                                resource_revision: row.get(6)?,
+                                digest_scheme: row.get(1)?,
+                                request_digest: row.get(2)?,
+                                state: row.get(3)?,
+                                response_status: row.get(4)?,
+                                resource_kind: row.get(5)?,
+                                resource_id: row.get(6)?,
+                                resource_revision: row.get(7)?,
                             })
                         },
                     )
                     .optional()?;
                 if let Some(existing) = existing {
-                    let outcome = resolve_existing(existing, &request_sha256, route_id, actor);
+                    let outcome = resolve_existing(existing, &request_digest, route_id, actor);
                     transaction.commit()?;
                     return outcome;
                 }
                 transaction.execute(
                     "INSERT INTO api_idempotency_records
                        (record_id, organization_id, actor_id, route_id,
-                        idempotency_key_sha256, request_sha256, state,
-                        created_at, expires_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+                        idempotency_key_sha256, digest_scheme, request_sha256,
+                        state, created_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9)",
                     params![
                         record_id.to_string(),
                         organization_id.to_string(),
                         actor.to_string(),
                         route_id,
                         key_sha256,
-                        request_sha256,
+                        DIGEST_SCHEME,
+                        request_digest,
                         now,
                         now.saturating_add(PENDING_RECORD_TTL_SECONDS),
                     ],
@@ -500,7 +586,7 @@ impl IdempotencyStore {
 
 fn resolve_existing(
     existing: ExistingRecord,
-    request_sha256: &str,
+    request_digest: &str,
     route_id: &str,
     actor: CanonicalId,
 ) -> CatalogResult<IdempotencyOutcome> {
@@ -510,14 +596,30 @@ fn resolve_existing(
             existing.record_id
         ))
     })?;
-    if existing.request_sha256 != request_sha256 {
-        let original = match existing.resource_id.as_deref() {
-            Some(resource_id) => format!(
-                "{} {resource_id}",
-                existing.resource_kind.as_deref().unwrap_or("resource")
-            ),
-            None => "a request that is still in progress".to_string(),
-        };
+    let original = match existing.resource_id.as_deref() {
+        Some(resource_id) => format!(
+            "{} {resource_id}",
+            existing.resource_kind.as_deref().unwrap_or("resource")
+        ),
+        None => "a request that is still in progress".to_string(),
+    };
+    if existing.digest_scheme != DIGEST_SCHEME {
+        // Digests under different schemes are incomparable, so the record
+        // cannot vouch for a replay; refusing it is the only answer that
+        // never replays a response for a request that may differ.
+        warn!(
+            route_id,
+            %record_id,
+            actor_id = %actor,
+            stored_scheme = existing.digest_scheme,
+            current_scheme = DIGEST_SCHEME,
+            "Idempotency-Key matches a record written under another digest scheme; refusing rather than guessing"
+        );
+        return Err(CatalogError::conflict(format!(
+            "{IDEMPOTENCY_KEY_REUSED}: the Idempotency-Key was already used on {route_id} for {original} before the request digest scheme changed and cannot be compared; send a new key"
+        )));
+    }
+    if existing.request_digest != request_digest {
         warn!(
             route_id,
             %record_id,
@@ -597,6 +699,20 @@ mod tests {
         }
     }
 
+    /// The request every test builds under one fixed server key.
+    fn keyed_request(
+        route_id: &'static str,
+        idempotency_key: &str,
+        canonical_request: &[u8],
+    ) -> CatalogResult<IdempotentRequest> {
+        IdempotentRequest::new(
+            route_id,
+            idempotency_key,
+            canonical_request,
+            &IdempotencyDigestKey::for_tests(42),
+        )
+    }
+
     fn sample_resource(revision: u64) -> ProviderInstallation {
         ProviderInstallation {
             installation_id: CanonicalId::new_v7(),
@@ -670,35 +786,172 @@ mod tests {
 
     #[test]
     fn request_digests_bind_route_key_and_canonical_body() {
-        let base =
-            IdempotentRequest::new("provider_target.register", "key-0001", b"{\"a\":1}").unwrap();
-        let same =
-            IdempotentRequest::new("provider_target.register", "key-0001", b"{\"a\":1}").unwrap();
+        let base = keyed_request("provider_target.register", "key-0001", b"{\"a\":1}").unwrap();
+        let same = keyed_request("provider_target.register", "key-0001", b"{\"a\":1}").unwrap();
         let other_body =
-            IdempotentRequest::new("provider_target.register", "key-0001", b"{\"a\":2}").unwrap();
+            keyed_request("provider_target.register", "key-0001", b"{\"a\":2}").unwrap();
         let other_key =
-            IdempotentRequest::new("provider_target.register", "key-0002", b"{\"a\":1}").unwrap();
+            keyed_request("provider_target.register", "key-0002", b"{\"a\":1}").unwrap();
         let other_route =
-            IdempotentRequest::new("provider_installation.register", "key-0001", b"{\"a\":1}")
-                .unwrap();
+            keyed_request("provider_installation.register", "key-0001", b"{\"a\":1}").unwrap();
         assert_eq!(base, same);
-        assert_ne!(base.request_sha256, other_body.request_sha256);
-        assert_ne!(base.request_sha256, other_key.request_sha256);
-        assert_ne!(base.request_sha256, other_route.request_sha256);
+        assert_ne!(base.request_digest, other_body.request_digest);
+        assert_ne!(base.request_digest, other_key.request_digest);
+        assert_ne!(base.request_digest, other_route.request_digest);
         assert_eq!(
             base.idempotency_key_sha256,
             other_body.idempotency_key_sha256
         );
-        assert!(IdempotentRequest::new("provider_target.register", "short", b"{}").is_err());
-        assert!(IdempotentRequest::new("Provider.Target", "key-0001", b"{}").is_err());
+        assert_eq!(base.request_digest.len(), 64);
+        assert!(keyed_request("provider_target.register", "short", b"{}").is_err());
+        assert!(keyed_request("Provider.Target", "key-0001", b"{}").is_err());
+    }
+
+    /// The digest is keyed: the same request under another server key is
+    /// another digest, and the unkeyed hash of the same material never
+    /// matches, so a database reader who guesses the client key still
+    /// cannot confirm a request body offline.
+    #[test]
+    fn request_digests_are_keyed_by_the_server_key() {
+        let under_a = IdempotentRequest::new(
+            "provider_credential.provision",
+            "key-0001",
+            b"{\"credential\":\"s3cr3t\"}",
+            &IdempotencyDigestKey::for_tests(1),
+        )
+        .unwrap();
+        let under_a_again = IdempotentRequest::new(
+            "provider_credential.provision",
+            "key-0001",
+            b"{\"credential\":\"s3cr3t\"}",
+            &IdempotencyDigestKey::for_tests(1),
+        )
+        .unwrap();
+        let under_b = IdempotentRequest::new(
+            "provider_credential.provision",
+            "key-0001",
+            b"{\"credential\":\"s3cr3t\"}",
+            &IdempotencyDigestKey::for_tests(2),
+        )
+        .unwrap();
+        assert_eq!(under_a, under_a_again);
+        assert_ne!(under_a.request_digest, under_b.request_digest);
+        // The key lookup column does not depend on the server key.
+        assert_eq!(
+            under_a.idempotency_key_sha256,
+            under_b.idempotency_key_sha256
+        );
+
+        let unkeyed = hex::encode(Sha256::digest(
+            b"deislet-api-idempotency-v1\nprovider_credential.provision\nkey-0001\n{\"credential\":\"s3cr3t\"}",
+        ));
+        assert_ne!(under_a.request_digest, unkeyed);
+        assert!(!format!("{:?}", IdempotencyDigestKey::for_tests(1)).contains("01"));
+    }
+
+    #[test]
+    fn a_missing_master_key_fails_closed_naming_the_setting() {
+        let unavailable =
+            SecretsBackend::Unavailable("secret_key_file is not set in the test".to_string());
+        let error = IdempotencyDigestKey::derive(&unavailable).unwrap_err();
+        assert!(matches!(error, CatalogError::SecretsUnavailable(_)));
+        assert!(error.to_string().contains("secret_key_file"));
+
+        let ready = SecretsBackend::Ready(Box::new(
+            super::super::secrets::SecretCipher::from_key_bytes(
+                &[42u8; super::super::secrets::MASTER_KEY_LEN],
+            )
+            .unwrap(),
+        ));
+        let derived = IdempotencyDigestKey::derive(&ready).unwrap();
+        assert_eq!(
+            derived.key.as_bytes(),
+            IdempotencyDigestKey::for_tests(42).key.as_bytes()
+        );
+        assert_eq!(derived.key.purpose(), DIGEST_KEY_PURPOSE);
+    }
+
+    /// A record written before the keyed digest existed (`sha256-v1`)
+    /// cannot be compared with a keyed digest, so the key is refused as
+    /// reused instead of being replayed or silently re-run.
+    #[tokio::test]
+    async fn a_record_under_another_digest_scheme_is_refused_as_reused() {
+        let store = store().await;
+        let request =
+            keyed_request("provider_installation.register", "key-0001", b"{\"a\":1}").unwrap();
+        let guard = expect_fresh(&store, "account:alice", &request).await;
+        let resource = sample_resource(1);
+        complete_in_transaction(&store, &guard, 201, &resource, true).await;
+        // Rows are immutable, so the legacy scheme is put in place by
+        // rewriting the row with the same identity under the old tag.
+        let record_id = guard.record_id();
+        store
+            .db
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                transaction.execute_batch(
+                    "CREATE TEMP TABLE legacy AS SELECT * FROM api_idempotency_records;
+                     DELETE FROM api_idempotency_records;
+                     INSERT INTO api_idempotency_records
+                        (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
+                         digest_scheme, request_sha256, state, response_status, resource_kind,
+                         resource_id, resource_revision, created_at, completed_at, expires_at)
+                     SELECT record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
+                            'sha256-v1', request_sha256, state, response_status, resource_kind,
+                            resource_id, resource_revision, created_at, completed_at, expires_at
+                       FROM legacy;
+                     DROP TABLE legacy;",
+                )?;
+                let scheme: String = transaction.query_row(
+                    "SELECT digest_scheme FROM api_idempotency_records WHERE record_id = ?1",
+                    [record_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(scheme, "sha256-v1");
+                transaction.commit()?;
+                Ok::<_, CatalogError>(())
+            })
+            .await
+            .unwrap();
+
+        let error = store
+            .begin(scope("account:alice"), &request)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CatalogError::Conflict(_)));
+        assert!(error.to_string().starts_with(IDEMPOTENCY_KEY_REUSED));
+        assert!(error.to_string().contains("digest scheme"));
+        assert!(
+            error
+                .to_string()
+                .contains(&resource.installation_id.to_string())
+        );
+        // A new key is the way forward, and it records the current scheme.
+        let fresh =
+            keyed_request("provider_installation.register", "key-0002", b"{\"a\":1}").unwrap();
+        let guard = expect_fresh(&store, "account:alice", &fresh).await;
+        let record_id = guard.record_id();
+        let scheme = store
+            .db
+            .with_connection(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT digest_scheme FROM api_idempotency_records WHERE record_id = ?1",
+                        [record_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(CatalogError::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(scheme, DIGEST_SCHEME);
     }
 
     #[tokio::test]
     async fn a_completed_record_replays_and_a_changed_request_is_refused() {
         let store = store().await;
         let request =
-            IdempotentRequest::new("provider_installation.register", "key-0001", b"{\"a\":1}")
-                .unwrap();
+            keyed_request("provider_installation.register", "key-0001", b"{\"a\":1}").unwrap();
         let guard = expect_fresh(&store, "account:alice", &request).await;
         let resource = sample_resource(1);
         complete_in_transaction(&store, &guard, 201, &resource, true).await;
@@ -714,8 +967,7 @@ mod tests {
         }
 
         let changed =
-            IdempotentRequest::new("provider_installation.register", "key-0001", b"{\"a\":2}")
-                .unwrap();
+            keyed_request("provider_installation.register", "key-0001", b"{\"a\":2}").unwrap();
         let error = store
             .begin(scope("account:alice"), &changed)
             .await
@@ -731,15 +983,14 @@ mod tests {
         // Another principal and another route both start from scratch.
         let _other_actor = expect_fresh(&store, "account:bob", &request).await;
         let other_route =
-            IdempotentRequest::new("provider_target.register", "key-0001", b"{\"a\":1}").unwrap();
+            keyed_request("provider_target.register", "key-0001", b"{\"a\":1}").unwrap();
         let _other_route = expect_fresh(&store, "account:alice", &other_route).await;
     }
 
     #[tokio::test]
     async fn a_pending_record_blocks_duplicates_until_completed_or_abandoned() {
         let store = store().await;
-        let request =
-            IdempotentRequest::new("provider_credential.provision", "key-0001", b"{}").unwrap();
+        let request = keyed_request("provider_credential.provision", "key-0001", b"{}").unwrap();
         let guard = expect_fresh(&store, "account:alice", &request).await;
         let error = store
             .begin(scope("account:alice"), &request)
@@ -768,8 +1019,7 @@ mod tests {
     #[tokio::test]
     async fn completion_lives_and_dies_with_the_mutation_transaction() {
         let store = store().await;
-        let request =
-            IdempotentRequest::new("provider_target_grant.create", "key-0001", b"{}").unwrap();
+        let request = keyed_request("provider_target_grant.create", "key-0001", b"{}").unwrap();
         let guard = expect_fresh(&store, "account:alice", &request).await;
         let resource = sample_resource(1);
 
@@ -831,8 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn expired_records_are_reaped_on_the_next_begin() {
         let store = store().await;
-        let request =
-            IdempotentRequest::new("provider_installation.register", "key-0001", b"{}").unwrap();
+        let request = keyed_request("provider_installation.register", "key-0001", b"{}").unwrap();
         let guard = expect_fresh(&store, "account:alice", &request).await;
         let record_id = guard.record_id();
         complete_in_transaction(&store, &guard, 201, &sample_resource(1), true).await;
@@ -847,11 +1096,11 @@ mod tests {
                      DELETE FROM api_idempotency_records;
                      INSERT INTO api_idempotency_records
                         (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
-                         request_sha256, state, response_status, resource_kind, resource_id,
-                         resource_revision, created_at, completed_at, expires_at)
+                         digest_scheme, request_sha256, state, response_status, resource_kind,
+                         resource_id, resource_revision, created_at, completed_at, expires_at)
                      SELECT record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
-                            request_sha256, state, response_status, resource_kind, resource_id,
-                            resource_revision, 1, 1, 2
+                            digest_scheme, request_sha256, state, response_status, resource_kind,
+                            resource_id, resource_revision, 1, 1, 2
                        FROM aged;
                      DROP TABLE aged;",
                 )?;

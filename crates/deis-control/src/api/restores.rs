@@ -21,6 +21,7 @@ use utoipa::ToSchema;
 
 use super::openapi;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::headers::{required_header, single_header};
 use crate::api::paths::ApiPaths;
 use crate::catalog::{
     BackendRestoreCoordinator, BackendRestorePlan, CatalogStore, OperationRequestContext,
@@ -321,13 +322,6 @@ fn parse_id(value: &str, label: &str) -> ApiResult<CanonicalId> {
     })
 }
 
-fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<&'a str> {
-    single_header(headers, name)?
-        .ok_or_else(|| ApiError::BadRequest(format!("{name} header is required")))?
-        .to_str()
-        .map_err(|_| ApiError::BadRequest(format!("{name} header is not valid visible ASCII")))
-}
-
 fn optional_canonical_header(headers: &HeaderMap, name: &str) -> ApiResult<Option<CanonicalId>> {
     single_header(headers, name)?
         .map(|value| {
@@ -337,17 +331,6 @@ fn optional_canonical_header(headers: &HeaderMap, name: &str) -> ApiResult<Optio
             parse_id(value, name)
         })
         .transpose()
-}
-
-fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<Option<&'a HeaderValue>> {
-    let mut values = headers.get_all(name).iter();
-    let first = values.next();
-    if values.next().is_some() {
-        return Err(ApiError::BadRequest(format!(
-            "{name} header must appear exactly once"
-        )));
-    }
-    Ok(first)
 }
 
 #[cfg(test)]

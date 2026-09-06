@@ -73,7 +73,7 @@ pub struct StorageTokenResponse {
     pub token: String,
 }
 
-/// GET /api/apps/:app_id/environments/:env/storage-token
+/// Mint a storage credential for an environment.
 ///
 /// Answers 404 when the application or the environment is unknown - the same
 /// resolution every other endpoint under this prefix does - and 409 when this

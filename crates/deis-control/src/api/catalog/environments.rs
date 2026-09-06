@@ -11,7 +11,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use super::CatalogState;
-use crate::api::error::ApiResult;
+use crate::api::error::{ApiError, ApiResult};
 use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, id_scope, list_page};
 use crate::catalog::Environment;
@@ -22,7 +22,7 @@ pub struct CreateEnvironmentRequest {
     pub name: String,
 }
 
-/// POST /api/apps/:app_id/environments
+/// Create an environment of an application.
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/environments",
@@ -44,14 +44,23 @@ pub async fn create_environment(
     Path(app_id): Path<String>,
     Json(request): Json<CreateEnvironmentRequest>,
 ) -> ApiResult<(StatusCode, Json<Environment>)> {
+    // `name` is the only member of the body and the only thing validated
+    // here (an application that is not there is a 404 of its own), so a
+    // 400 names that field and a 409 says the environment is already
+    // there.
     let env = state
         .store
         .create_environment(&app_id, request.name.trim())
-        .await?;
+        .await
+        .map_err(|error| {
+            ApiError::from(error)
+                .creating("environment")
+                .invalid_field("name")
+        })?;
     Ok((StatusCode::CREATED, Json(env)))
 }
 
-/// GET /api/apps/:app_id/environments
+/// List an application's environments, by name.
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/environments",
@@ -101,7 +110,7 @@ pub async fn list_environments(
     Ok(Json(response))
 }
 
-/// GET /api/apps/:app_id/environments/:env
+/// Read one environment.
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/environments/{env_name}",

@@ -413,7 +413,7 @@ Windows 失败—修复关系及 macOS 非登录 SSH 缺 Cargo PATH 的环境观
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
 真实透明日志/独立 witness 的采集与可用性运营，以及真实 Windows Service 安装演练。公共
 provider 生命周期中 installation/target 已有 disable/enable/软删除、级联撤销 grant 与 lifecycle audit，创建类 mutation 已接入
-共享幂等记录，但 deployment cancel/rollback 仍缺；CLI/Web、三个完整 backend driver 和真实账户 evidence 也未完成。当前跨页扫描虽然正确，
+共享幂等记录（HKDF 派生子键的 HMAC 摘要），provider deployment 已有 cancel（cancelling 经 cleanup 收敛、在途步骤等待 receipt、已激活步骤不回退）与 rollback（重申源部署 desired state 的新 operation）；rollback 尚未携带 driver 原生身份，需 `DriverRequest` 增量扩展；CLI/Web、三个完整 backend driver 和真实账户 evidence 也未完成。当前跨页扫描虽然正确，
 但会在一个读事务内遍历全部非终态 workflow；大规模 catalog 仍需可索引 eligibility 与扫描时长指标，分页路径已有查询计划与
 50,000 行负载证据。在这些完成并获得真实账户证据前，不能把当前 dispatcher
 称作已部署的 provider 服务，更不能升级 backend 支持状态。

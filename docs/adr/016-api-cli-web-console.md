@@ -331,8 +331,9 @@ CLI/Web 改用新前缀并解析 envelope。精确提交 `592636306ed9c5c8092494
 Linux、macOS、Windows 通过 provider 61/61、pagination 20/20、authz 38/38、grant、协调器、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
 `../product/evidence/provider-driver-dispatcher-portability-5926363.json`。
 
-这些实现仍明确低于本 ADR 的公共 API 完成门槛：细粒度错误码尚未逐路由采用；generated client 仍以示例反序列化校验替代；
-provider deployment cancel/rollback 未完成；Web 尚无 organization/application/environment 主线。
+随后 limit-out-of-range、cursor-invalid、idempotency-key-required、already-exists 与字段级 violations 逐路由产出（offset-out-of-range 按兼容门禁保留为 reserved），provider deployment 获得 cancel（If-Match，`operation-not-cancellable`）与 rollback（`operation-not-rollbackable`）两条 operation 路由，幂等摘要改为服务端密钥 HMAC。
+
+这些实现仍明确低于本 ADR 的公共 API 完成门槛：generated client 仍以示例反序列化校验替代；cancel/rollback 尚无 CLI 入口；Web 尚无 organization/application/environment 主线；旧前缀尚在弃用窗口内。
 
 1. 建立 versioned API/error/operation/schema 基础与安全 Web session。
 2. 新建 organization/application/environment shell、scope switcher 与权限导航。

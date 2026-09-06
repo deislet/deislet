@@ -788,7 +788,7 @@ fn nonterminal_workflows_tx(
             "SELECT w.operation_id
                FROM provider_deployment_workflows w
                JOIN provider_targets t ON t.target_id = w.provider_target_id
-              WHERE w.state NOT IN ('succeeded', 'failed') AND {filter_sql}
+              WHERE w.state NOT IN ('succeeded', 'failed', 'cancelled') AND {filter_sql}
               ORDER BY w.created_at, w.operation_id"
         ))?
         .query_map([filter_value], |row| row.get::<_, String>(0))?

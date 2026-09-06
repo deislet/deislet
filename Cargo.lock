@@ -2195,6 +2195,8 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "hkdf",
+ "hmac",
  "mime_guess",
  "prost 0.13.5",
  "prost-build",

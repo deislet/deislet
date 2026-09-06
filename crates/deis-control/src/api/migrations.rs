@@ -20,6 +20,7 @@ use utoipa::ToSchema;
 
 use super::openapi;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::headers::{required_header, single_header};
 use crate::api::paths::ApiPaths;
 use crate::api::versioning::{
     CORRELATION_ID_HEADER as CORRELATION_ID, REQUEST_ID_HEADER as REQUEST_ID,
@@ -561,13 +562,6 @@ fn operation_context(
     .map_err(Into::into)
 }
 
-fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<&'a str> {
-    single_header(headers, name)?
-        .ok_or_else(|| ApiError::BadRequest(format!("{name} header is required")))?
-        .to_str()
-        .map_err(|_| ApiError::BadRequest(format!("{name} header is not valid visible ASCII")))
-}
-
 fn optional_canonical_header(headers: &HeaderMap, name: &str) -> ApiResult<Option<CanonicalId>> {
     single_header(headers, name)?
         .map(|value| {
@@ -579,18 +573,6 @@ fn optional_canonical_header(headers: &HeaderMap, name: &str) -> ApiResult<Optio
             })
         })
         .transpose()
-}
-
-fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<Option<&'a HeaderValue>> {
-    let all = headers.get_all(name);
-    let mut values = all.iter();
-    let first = values.next();
-    if values.next().is_some() {
-        return Err(ApiError::BadRequest(format!(
-            "{name} header must appear exactly once"
-        )));
-    }
-    Ok(first)
 }
 
 fn required_if_match(headers: &HeaderMap) -> ApiResult<u64> {

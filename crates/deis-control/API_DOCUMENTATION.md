@@ -399,15 +399,16 @@ path for this purpose.
 | Code | HTTP | Retryable | When |
 |---|---|---|---|
 | `invalid-argument` | 400 | no | Malformed body, query or path value; validation failed. |
-| `limit-out-of-range` | 400 | no | Reserved for a `limit` outside `1..=1000`; answered as `invalid-argument` today. |
-| `offset-out-of-range` | 400 | no | Reserved. No route takes an offset any more. |
-| `cursor-invalid` | 400 | no | Reserved for a cursor from another collection or filter; answered as `invalid-argument` today. |
+| `limit-out-of-range` | 400 | no | A `limit` outside `1..=1000` on any list route. `target` is `{resource: "query", field: "limit"}`. |
+| `offset-out-of-range` | 400 | no | Reserved, and emitted by nothing: offset paging was retired before any route shipped it. Kept in the closed enum because a published code is never withdrawn. |
+| `cursor-invalid` | 400 | no | A cursor that was not issued for this collection and these filters, or has expired. `target` is `{resource: "query", field: "cursor"}`. |
+| `idempotency-key-required` | 400 | no | A mutation that replays under a key was sent without one. `target` is `{resource: "request", field: "Idempotency-Key"}`. |
 | `unauthenticated` | 401 | no | Nothing usable was presented. From the gate, see above. |
 | `insufficient-scope` | 403 | no | Authenticated, but the scope does not cover this call. From the gate, see above. |
 | `forbidden` | 403 | no | The call is refused for a reason other than scope. |
 | `not-found` | 404 | no | No such application, environment, version, record. |
 | `route-not-found` | 404 | no | No such endpoint. From the route fallback, see above. |
-| `already-exists` | 409 | no | Reserved for name clashes; answered as `conflict` today. |
+| `already-exists` | 409 | no | A create refused because the name is taken: an application (including one whose deleted namesake still holds data), an environment, a hostname grant, an account. `target.resource` is the kind. |
 | `conflict` | 409 | no | The request contradicts the current state. |
 | `not-configured` | 409 | no | A dependency this call needs is not configured (no master key, no store endpoint). The message names the setting. |
 | `idempotency-key-reused` | 409 | no | The key belongs to an earlier request with different parameters. |
@@ -416,10 +417,11 @@ path for this purpose.
 | `provider-installation-in-use` | 409 | no | The installation still backs an active grant or deployment. |
 | `provider-target-in-use` | 409 | no | The target still backs an active grant. |
 | `provider-resource-deleted` | 409 | no | The provider record was soft-deleted. |
+| `operation-not-cancellable` | 409 | no | The operation is terminal or already cancelling. |
+| `operation-not-rollbackable` | 409 | no | The operation is not a succeeded deployment on this environment, or its target grant is no longer the active one. |
 | `revision-conflict` | 412 | no | The `If-Match` revision is not the current one, or another writer moved it first. |
 | `payload-too-large` | 413 | no | The body is larger than the route reads. |
 | `precondition-required` | 428 | no | The mutation needs an `If-Match` and none was sent. |
-| `idempotency-key-required` | 428 | no | Reserved for a mutation that needs an `Idempotency-Key`; answered as `precondition-required` today. |
 | `internal` | 500 | no | This process failed on its own side. |
 | `database-unavailable` | 500 | **yes** | Its database did. |
 | `backend-unavailable` | 502 or 503 | **yes** | A node, provider driver or storage backend it had to reach did. |
@@ -432,9 +434,19 @@ four codes marked above, on every answer that carries one of them, and
 client picks its own backoff. Everything not retryable is a defect in the
 request: retrying it unchanged produces the same answer.
 
-The five codes marked *reserved* are in the closed enum, and a client should
-already handle them, but no route emits them yet - the routes that will are
-the ones that answer `invalid-argument` or `precondition-required` today.
+One code is marked *reserved*: `offset-out-of-range`. Nothing emits it and
+nothing will - every list is keyset-paged behind an opaque cursor and no
+route takes an offset - but it stays in the closed enum, because a code that
+has been published is never withdrawn from it and a client that already
+branches on it must keep compiling.
+
+A refusal that decomposes into named members carries them in `violations`,
+each `{field, code, message}` with the field in dotted path form
+(`scopes[0]`, `config.zoneId`). Where the route can attribute a validation
+failure to exactly one member of the body it does - `id` on an application
+create, `name` on an environment or account create, `role` and `scopes[n]`
+on the identity routes - and where a single sentence covers several members
+it stays a `target`-less `invalid-argument` rather than guessing.
 
 ---
 
@@ -1941,6 +1953,29 @@ with one of the `provider-*` conflict codes instead.
 - **Path** `operation_id` (string, required) - The deployment operation's UUIDv7.
 - **200** `ProviderDeploymentWorkflow` with `ETag` - The workflow and its operation.
 - **Refusals** `400`, `401`, `403`, `404` - see [Errors](#errors).
+
+#### `POST /api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/cancel`
+
+`operationId: cancelProviderDeployment`. Legacy spelling `POST /api/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/cancel`, deprecated.
+
+- **Path** `app_name` (string, required) - The application's id.
+- **Path** `environment_name` (string, required) - The environment's name.
+- **Path** `operation_id` (string, required) - The deployment or rollback operation's UUIDv7.
+- **Header** `Idempotency-Key` (string, optional) - A replay of the same key by the same principal returns the same operation.
+- **Header** `If-Match` (string, required) - The operation revision the caller expects.
+- **202** `ProductOperation` with `Location` - Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback.
+- **Refusals** `400`, `401`, `403`, `404`, `409`, `412`, `428`, `503` - see [Errors](#errors). A terminal or already-cancelling operation answers `409` `operation-not-cancellable`.
+
+#### `POST /api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/rollback`
+
+`operationId: rollbackProviderDeployment`. Legacy spelling `POST /api/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/rollback`, deprecated.
+
+- **Path** `app_name` (string, required) - The application's id.
+- **Path** `environment_name` (string, required) - The environment's name.
+- **Path** `operation_id` (string, required) - The succeeded deployment operation to roll back to.
+- **Header** `Idempotency-Key` (string, required) - Replays of the same key return the same operation.
+- **202** `ProductOperation` with `Location` - A new `rollback` operation was recorded and will be driven; poll `Location`. Its workflow names the deployment in `rolledBackFromOperationId`, runs the driver's `rollback` against that deployment's exact desired state and then `observe`s the result.
+- **Refusals** `400`, `401`, `403`, `404`, `409`, `428`, `503` - see [Errors](#errors). A source that is not a succeeded deployment on this environment, or whose target grant is no longer the active one, answers `409` `operation-not-rollbackable`.
 
 #### `GET /api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants`
 

@@ -126,6 +126,8 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         crate::api::catalog::providers::list_provider_deployments,
         crate::api::catalog::providers::begin_provider_deployment,
         crate::api::catalog::providers::get_provider_deployment,
+        crate::api::catalog::providers::cancel_provider_deployment,
+        crate::api::catalog::providers::rollback_provider_deployment,
         crate::api::catalog::routes::list_routes,
         crate::api::catalog::routes::create_route,
         crate::api::catalog::routes::update_route,
@@ -486,7 +488,9 @@ pub struct ErrorViolation {
 }
 
 /// The closed set of error codes. Rendered from `codes::ALL` so the document
-/// cannot list a code the server does not produce, or miss one it does.
+/// cannot miss a code the server produces, and lists exactly one it does
+/// not: `offset-out-of-range`, kept because a published code is never
+/// withdrawn from a closed enum.
 #[derive(Debug, Serialize)]
 pub struct ErrorCode(pub &'static str);
 
@@ -498,7 +502,10 @@ impl PartialSchema for ErrorCode {
                 "Stable machine-readable error class; `contracts/v1/control-error.schema.json` \
                  is the authority. `service-unavailable`, `backend-unavailable`, \
                  `database-unavailable` and `idempotency-request-in-progress` are the \
-                 retryable ones; `retryable` in the envelope is `true` for exactly those.",
+                 retryable ones; `retryable` in the envelope is `true` for exactly those. \
+                 `offset-out-of-range` is reserved and emitted by nothing: no route takes \
+                 an offset, and the token stays in the enum for clients that already \
+                 branch on it.",
             ))
             .enum_values(Some(codes::ALL.iter().copied()))
             .into()

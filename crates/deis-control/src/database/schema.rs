@@ -3370,200 +3370,9 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             SELECT RAISE(ABORT, 'provider driver operation request and pins are immutable');
         END;
 
-        CREATE TABLE IF NOT EXISTS provider_deployment_workflows (
-            operation_id               TEXT PRIMARY KEY
-                                                REFERENCES product_operations(operation_id),
-            application_id             TEXT NOT NULL,
-            environment_id             TEXT NOT NULL,
-            provider_target_id         TEXT NOT NULL REFERENCES provider_targets(target_id),
-            target_revision            INTEGER NOT NULL CHECK(target_revision >= 1),
-            provider_target_grant_id   TEXT NOT NULL
-                                                REFERENCES provider_target_grants(grant_id),
-            target_grant_revision      INTEGER NOT NULL CHECK(target_grant_revision >= 1),
-            artifact_version_id        TEXT NOT NULL,
-            canonical_artifact_sha256  TEXT NOT NULL,
-            provider_payload_sha256    TEXT NOT NULL,
-            desired_state_sha256       TEXT NOT NULL,
-            desired_state_json         TEXT NOT NULL CHECK(json_valid(desired_state_json)),
-            plan_json                  TEXT NOT NULL CHECK(json_valid(plan_json)),
-            state                      TEXT NOT NULL
-                                                CHECK(state IN ('queued', 'running', 'waiting',
-                                                                'succeeded', 'failed')),
-            next_step_index            INTEGER NOT NULL CHECK(next_step_index BETWEEN 0 AND 7),
-            dispatch_not_before        INTEGER,
-            dispatch_failure_count     INTEGER NOT NULL DEFAULT 0
-                                                CHECK(dispatch_failure_count >= 0),
-            dispatch_failure_child_operation_id TEXT
-                                                CHECK(
-                                                  dispatch_failure_child_operation_id IS NULL OR
-                                                  (length(dispatch_failure_child_operation_id) = 36
-                                                   AND lower(dispatch_failure_child_operation_id) =
-                                                     dispatch_failure_child_operation_id
-                                                   AND substr(dispatch_failure_child_operation_id,
-                                                              15, 1) = '7'
-                                                   AND substr(dispatch_failure_child_operation_id,
-                                                              20, 1) GLOB '[89ab]'
-                                                   AND length(replace(
-                                                     dispatch_failure_child_operation_id,
-                                                     '-', '')) = 32
-                                                   AND replace(
-                                                     dispatch_failure_child_operation_id,
-                                                     '-', '') NOT GLOB '*[^0-9a-f]*')),
-            last_dispatch_error_code   TEXT
-                                                CHECK(last_dispatch_error_code IS NULL OR
-                                                  length(last_dispatch_error_code)
-                                                    BETWEEN 2 AND 64),
-            last_dispatch_error_message TEXT
-                                                CHECK(last_dispatch_error_message IS NULL OR
-                                                  length(last_dispatch_error_message)
-                                                    BETWEEN 1 AND 2048),
-            revision                   INTEGER NOT NULL CHECK(revision >= 1),
-            created_at                 INTEGER NOT NULL,
-            updated_at                 INTEGER NOT NULL,
-            CHECK(length(operation_id) = 36
-              AND lower(operation_id) = operation_id
-              AND substr(operation_id, 9, 1) = '-'
-              AND substr(operation_id, 14, 1) = '-'
-              AND substr(operation_id, 15, 1) = '7'
-              AND substr(operation_id, 19, 1) = '-'
-              AND substr(operation_id, 20, 1) GLOB '[89ab]'
-              AND substr(operation_id, 24, 1) = '-'
-              AND length(replace(operation_id, '-', '')) = 32
-              AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(application_id) = 36
-              AND lower(application_id) = application_id
-              AND substr(application_id, 9, 1) = '-'
-              AND substr(application_id, 14, 1) = '-'
-              AND substr(application_id, 15, 1) = '7'
-              AND substr(application_id, 19, 1) = '-'
-              AND substr(application_id, 20, 1) GLOB '[89ab]'
-              AND substr(application_id, 24, 1) = '-'
-              AND length(replace(application_id, '-', '')) = 32
-              AND replace(application_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(environment_id) = 36
-              AND lower(environment_id) = environment_id
-              AND substr(environment_id, 9, 1) = '-'
-              AND substr(environment_id, 14, 1) = '-'
-              AND substr(environment_id, 15, 1) = '7'
-              AND substr(environment_id, 19, 1) = '-'
-              AND substr(environment_id, 20, 1) GLOB '[89ab]'
-              AND substr(environment_id, 24, 1) = '-'
-              AND length(replace(environment_id, '-', '')) = 32
-              AND replace(environment_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(artifact_version_id) = 36
-              AND lower(artifact_version_id) = artifact_version_id
-              AND substr(artifact_version_id, 9, 1) = '-'
-              AND substr(artifact_version_id, 14, 1) = '-'
-              AND substr(artifact_version_id, 15, 1) = '7'
-              AND substr(artifact_version_id, 19, 1) = '-'
-              AND substr(artifact_version_id, 20, 1) GLOB '[89ab]'
-              AND substr(artifact_version_id, 24, 1) = '-'
-              AND length(replace(artifact_version_id, '-', '')) = 32
-              AND replace(artifact_version_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(canonical_artifact_sha256) = 64
-              AND lower(canonical_artifact_sha256) = canonical_artifact_sha256
-              AND canonical_artifact_sha256 NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(provider_payload_sha256) = 64
-              AND lower(provider_payload_sha256) = provider_payload_sha256
-              AND provider_payload_sha256 NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(desired_state_sha256) = 64
-              AND lower(desired_state_sha256) = desired_state_sha256
-              AND desired_state_sha256 NOT GLOB '*[^0-9a-f]*'),
-            CHECK((state = 'succeeded' AND next_step_index = 7)
-               OR state != 'succeeded'),
-            CHECK((dispatch_failure_count = 0
-                    AND dispatch_not_before IS NULL
-                    AND dispatch_failure_child_operation_id IS NULL
-                    AND last_dispatch_error_code IS NULL
-                    AND last_dispatch_error_message IS NULL)
-               OR (dispatch_failure_count >= 1
-                    AND dispatch_not_before IS NOT NULL
-                    AND dispatch_failure_child_operation_id IS NOT NULL
-                    AND last_dispatch_error_code IS NOT NULL
-                    AND last_dispatch_error_message IS NOT NULL))
-        );
-
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_deployment_one_active_target
-            ON provider_deployment_workflows(application_id, environment_id, provider_target_id)
-            WHERE state NOT IN ('succeeded', 'failed');
-
-        CREATE INDEX IF NOT EXISTS idx_provider_deployment_reconcile
-            ON provider_deployment_workflows(state, updated_at, operation_id);
-
-        CREATE INDEX IF NOT EXISTS idx_provider_deployment_environment_page_v1
-            ON provider_deployment_workflows(application_id, environment_id,
-                                             created_at DESC, operation_id DESC);
-
-        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_workflow_facts_immutable_v1
-        BEFORE UPDATE OF operation_id, application_id, environment_id,
-                         provider_target_id, target_revision, artifact_version_id,
-                         canonical_artifact_sha256, provider_payload_sha256,
-                         desired_state_sha256, desired_state_json, plan_json, created_at
-        ON provider_deployment_workflows
-        WHEN NEW.operation_id != OLD.operation_id
-          OR NEW.application_id != OLD.application_id
-          OR NEW.environment_id != OLD.environment_id
-          OR NEW.provider_target_id != OLD.provider_target_id
-          OR NEW.target_revision != OLD.target_revision
-          OR NEW.artifact_version_id != OLD.artifact_version_id
-          OR NEW.canonical_artifact_sha256 != OLD.canonical_artifact_sha256
-          OR NEW.provider_payload_sha256 != OLD.provider_payload_sha256
-          OR NEW.desired_state_sha256 != OLD.desired_state_sha256
-          OR NEW.desired_state_json != OLD.desired_state_json
-          OR NEW.plan_json != OLD.plan_json
-          OR NEW.created_at != OLD.created_at
-        BEGIN
-            SELECT RAISE(ABORT, 'provider deployment desired state is immutable');
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_workflow_transition_v1
-        BEFORE UPDATE OF state, next_step_index, revision, updated_at
-        ON provider_deployment_workflows
-        WHEN NEW.revision != OLD.revision + 1
-          OR NEW.updated_at < OLD.updated_at
-          OR NEW.next_step_index < OLD.next_step_index
-          OR NEW.next_step_index > OLD.next_step_index + 1
-          OR (NEW.state != OLD.state AND NOT (
-               (OLD.state = 'queued' AND NEW.state IN ('running', 'failed'))
-            OR (OLD.state = 'running' AND NEW.state IN ('waiting', 'succeeded', 'failed'))
-            OR (OLD.state = 'waiting' AND NEW.state IN ('running', 'failed'))
-          ))
-          OR (OLD.state IN ('succeeded', 'failed')
-              AND (NEW.state != OLD.state OR NEW.next_step_index != OLD.next_step_index))
-        BEGIN
-            SELECT RAISE(ABORT, 'invalid provider deployment workflow transition');
-        END;
-
-        CREATE TABLE IF NOT EXISTS provider_deployment_steps (
-            parent_operation_id TEXT NOT NULL
-                                     REFERENCES provider_deployment_workflows(operation_id),
-            sequence            INTEGER NOT NULL CHECK(sequence BETWEEN 0 AND 6),
-            driver_operation    TEXT NOT NULL
-                                     CHECK(driver_operation IN
-                                       ('preflight', 'plan', 'prepare', 'upload',
-                                        'verify', 'activate', 'observe')),
-            child_operation_id  TEXT NOT NULL UNIQUE
-                                     REFERENCES provider_driver_operations(operation_id),
-            created_at          INTEGER NOT NULL,
-            PRIMARY KEY(parent_operation_id, sequence),
-            CHECK((sequence = 0 AND driver_operation = 'preflight')
-               OR (sequence = 1 AND driver_operation = 'plan')
-               OR (sequence = 2 AND driver_operation = 'prepare')
-               OR (sequence = 3 AND driver_operation = 'upload')
-               OR (sequence = 4 AND driver_operation = 'verify')
-               OR (sequence = 5 AND driver_operation = 'activate')
-               OR (sequence = 6 AND driver_operation = 'observe'))
-        );
-
-        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_steps_immutable_v1
-        BEFORE UPDATE ON provider_deployment_steps
-        BEGIN
-            SELECT RAISE(ABORT, 'provider deployment steps are immutable');
-        END;
         "#,
     )?;
-    ensure_provider_deployment_dispatch_columns(conn)?;
-    ensure_provider_deployment_target_grant_columns(conn)?;
+    ensure_provider_deployment_journal_schema(conn)?;
     let quarantined = conn.execute(
         "UPDATE provider_installations
             SET status = 'revoked', revision = revision + 1,
@@ -3780,14 +3589,19 @@ fn ensure_provider_lifecycle_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_provider_target_grants_target_page_v1
             ON provider_target_grants(provider_target_id, created_at DESC, grant_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_target_grants_environment_page_v1
+            ON provider_target_grants(application_id, environment_id,
+                                      created_at DESC, grant_id DESC);
         "#,
     )?;
     converge_retired_application_provider_target_grants(conn)
 }
 
-/// Add one nullable column when the table lacks it. Every column added this
-/// way defaults to NULL, which is the only default SQLite accepts for a
-/// column that references another table.
+/// Add one column when the table lacks it. A column that references another
+/// table must default to NULL (the only default SQLite accepts there); a
+/// plain column may carry `NOT NULL DEFAULT ...` and a `CHECK`, which SQLite
+/// applies to every existing row through the default.
 fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
     let present = conn
         .prepare(&format!("PRAGMA table_info({table})"))?
@@ -3938,6 +3752,8 @@ fn ensure_api_idempotency_schema(conn: &Connection) -> Result<()> {
                                           AND lower(route_id) = route_id
                                           AND route_id NOT GLOB '*[^a-z0-9._-]*'),
             idempotency_key_sha256 TEXT NOT NULL,
+            digest_scheme          TEXT NOT NULL DEFAULT 'sha256-v1'
+                                        CHECK(digest_scheme IN ('sha256-v1', 'hmac-sha256-v1')),
             request_sha256         TEXT NOT NULL,
             state                  TEXT NOT NULL CHECK(state IN ('pending', 'completed')),
             response_status        INTEGER CHECK(response_status IS NULL
@@ -3992,7 +3808,450 @@ fn ensure_api_idempotency_schema(conn: &Connection) -> Result<()> {
             SELECT RAISE(ABORT, 'API idempotency record identity is immutable and completes once');
         END;
         "#,
+    )?;
+
+    // Which digest scheme `request_sha256` was computed under. Added after
+    // the table shipped, so existing rows default to the unkeyed scheme
+    // and are refused on replay by the store (their digests cannot be
+    // compared with a keyed one); new rows are written as
+    // `hmac-sha256-v1`. The tag is part of the record's identity, hence
+    // its own immutability trigger, which has to follow the column.
+    ensure_column(
+        conn,
+        "api_idempotency_records",
+        "digest_scheme",
+        "TEXT NOT NULL DEFAULT 'sha256-v1' CHECK(digest_scheme IN ('sha256-v1', 'hmac-sha256-v1'))",
+    )?;
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS trg_api_idempotency_records_digest_scheme_immutable_v1
+        BEFORE UPDATE OF digest_scheme ON api_idempotency_records
+        WHEN NEW.digest_scheme != OLD.digest_scheme
+        BEGIN
+            SELECT RAISE(ABORT, 'API idempotency record digest scheme is immutable');
+        END;
+        "#,
     )
+}
+
+/// Column list shared by the live `provider_deployment_workflows` table and
+/// the copy [`rebuild_provider_deployment_journal_for_cancellation`] makes,
+/// so the two definitions cannot drift apart.
+///
+/// `state` mirrors the parent product operation, including the
+/// `cancelling`/`cancelled` pair a cancel request moves through. `kind`
+/// separates the standard deploy journal from a rollback journal, which
+/// re-asserts the exact desired state of the succeeded deployment named by
+/// `rolled_back_from_operation_id`. The `cancel_*` columns are written once
+/// by the cancel request and never change: they are the durable record of
+/// who asked, when, and under which idempotency key, so a replay of the same
+/// request answers the same operation. The target grant pin is nullable at
+/// the column level because workflows recorded before grants existed carry
+/// none; every new row still needs the exact active grant, which the insert
+/// trigger enforces.
+const PROVIDER_DEPLOYMENT_WORKFLOWS_COLUMNS: &str = r#"
+            operation_id               TEXT PRIMARY KEY
+                                                REFERENCES product_operations(operation_id),
+            kind                       TEXT NOT NULL DEFAULT 'deploy'
+                                                CHECK(kind IN ('deploy', 'rollback')),
+            application_id             TEXT NOT NULL,
+            environment_id             TEXT NOT NULL,
+            provider_target_id         TEXT NOT NULL REFERENCES provider_targets(target_id),
+            target_revision            INTEGER NOT NULL CHECK(target_revision >= 1),
+            provider_target_grant_id   TEXT REFERENCES provider_target_grants(grant_id),
+            target_grant_revision      INTEGER
+                                                CHECK(target_grant_revision IS NULL
+                                                      OR target_grant_revision >= 1),
+            artifact_version_id        TEXT NOT NULL,
+            canonical_artifact_sha256  TEXT NOT NULL,
+            provider_payload_sha256    TEXT NOT NULL,
+            desired_state_sha256       TEXT NOT NULL,
+            desired_state_json         TEXT NOT NULL CHECK(json_valid(desired_state_json)),
+            plan_json                  TEXT NOT NULL CHECK(json_valid(plan_json)),
+            rolled_back_from_operation_id TEXT
+                                                CHECK(rolled_back_from_operation_id IS NULL OR
+                                                  (length(rolled_back_from_operation_id) = 36
+                                                   AND lower(rolled_back_from_operation_id) =
+                                                     rolled_back_from_operation_id
+                                                   AND substr(rolled_back_from_operation_id,
+                                                              15, 1) = '7'
+                                                   AND substr(rolled_back_from_operation_id,
+                                                              20, 1) GLOB '[89ab]'
+                                                   AND length(replace(
+                                                     rolled_back_from_operation_id,
+                                                     '-', '')) = 32
+                                                   AND replace(
+                                                     rolled_back_from_operation_id,
+                                                     '-', '') NOT GLOB '*[^0-9a-f]*')),
+            state                      TEXT NOT NULL
+                                                CHECK(state IN ('queued', 'running', 'waiting',
+                                                                'cancelling', 'succeeded',
+                                                                'failed', 'cancelled')),
+            next_step_index            INTEGER NOT NULL CHECK(next_step_index BETWEEN 0 AND 7),
+            cancel_requested_at        INTEGER,
+            cancel_actor_id            TEXT REFERENCES operation_actors(actor_id),
+            cancel_idempotency_key_sha256 TEXT
+                                                CHECK(cancel_idempotency_key_sha256 IS NULL OR
+                                                  (length(cancel_idempotency_key_sha256) = 64
+                                                   AND lower(cancel_idempotency_key_sha256) =
+                                                     cancel_idempotency_key_sha256
+                                                   AND cancel_idempotency_key_sha256
+                                                     NOT GLOB '*[^0-9a-f]*')),
+            cancel_request_fingerprint_sha256 TEXT
+                                                CHECK(cancel_request_fingerprint_sha256 IS NULL OR
+                                                  (length(cancel_request_fingerprint_sha256) = 64
+                                                   AND lower(cancel_request_fingerprint_sha256) =
+                                                     cancel_request_fingerprint_sha256
+                                                   AND cancel_request_fingerprint_sha256
+                                                     NOT GLOB '*[^0-9a-f]*')),
+            dispatch_not_before        INTEGER,
+            dispatch_failure_count     INTEGER NOT NULL DEFAULT 0
+                                                CHECK(dispatch_failure_count >= 0),
+            dispatch_failure_child_operation_id TEXT
+                                                CHECK(
+                                                  dispatch_failure_child_operation_id IS NULL OR
+                                                  (length(dispatch_failure_child_operation_id) = 36
+                                                   AND lower(dispatch_failure_child_operation_id) =
+                                                     dispatch_failure_child_operation_id
+                                                   AND substr(dispatch_failure_child_operation_id,
+                                                              15, 1) = '7'
+                                                   AND substr(dispatch_failure_child_operation_id,
+                                                              20, 1) GLOB '[89ab]'
+                                                   AND length(replace(
+                                                     dispatch_failure_child_operation_id,
+                                                     '-', '')) = 32
+                                                   AND replace(
+                                                     dispatch_failure_child_operation_id,
+                                                     '-', '') NOT GLOB '*[^0-9a-f]*')),
+            last_dispatch_error_code   TEXT
+                                                CHECK(last_dispatch_error_code IS NULL OR
+                                                  length(last_dispatch_error_code)
+                                                    BETWEEN 2 AND 64),
+            last_dispatch_error_message TEXT
+                                                CHECK(last_dispatch_error_message IS NULL OR
+                                                  length(last_dispatch_error_message)
+                                                    BETWEEN 1 AND 2048),
+            revision                   INTEGER NOT NULL CHECK(revision >= 1),
+            created_at                 INTEGER NOT NULL,
+            updated_at                 INTEGER NOT NULL,
+            CHECK(length(operation_id) = 36
+              AND lower(operation_id) = operation_id
+              AND substr(operation_id, 9, 1) = '-'
+              AND substr(operation_id, 14, 1) = '-'
+              AND substr(operation_id, 15, 1) = '7'
+              AND substr(operation_id, 19, 1) = '-'
+              AND substr(operation_id, 20, 1) GLOB '[89ab]'
+              AND substr(operation_id, 24, 1) = '-'
+              AND length(replace(operation_id, '-', '')) = 32
+              AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(application_id) = 36
+              AND lower(application_id) = application_id
+              AND substr(application_id, 9, 1) = '-'
+              AND substr(application_id, 14, 1) = '-'
+              AND substr(application_id, 15, 1) = '7'
+              AND substr(application_id, 19, 1) = '-'
+              AND substr(application_id, 20, 1) GLOB '[89ab]'
+              AND substr(application_id, 24, 1) = '-'
+              AND length(replace(application_id, '-', '')) = 32
+              AND replace(application_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(environment_id) = 36
+              AND lower(environment_id) = environment_id
+              AND substr(environment_id, 9, 1) = '-'
+              AND substr(environment_id, 14, 1) = '-'
+              AND substr(environment_id, 15, 1) = '7'
+              AND substr(environment_id, 19, 1) = '-'
+              AND substr(environment_id, 20, 1) GLOB '[89ab]'
+              AND substr(environment_id, 24, 1) = '-'
+              AND length(replace(environment_id, '-', '')) = 32
+              AND replace(environment_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(artifact_version_id) = 36
+              AND lower(artifact_version_id) = artifact_version_id
+              AND substr(artifact_version_id, 9, 1) = '-'
+              AND substr(artifact_version_id, 14, 1) = '-'
+              AND substr(artifact_version_id, 15, 1) = '7'
+              AND substr(artifact_version_id, 19, 1) = '-'
+              AND substr(artifact_version_id, 20, 1) GLOB '[89ab]'
+              AND substr(artifact_version_id, 24, 1) = '-'
+              AND length(replace(artifact_version_id, '-', '')) = 32
+              AND replace(artifact_version_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(canonical_artifact_sha256) = 64
+              AND lower(canonical_artifact_sha256) = canonical_artifact_sha256
+              AND canonical_artifact_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(provider_payload_sha256) = 64
+              AND lower(provider_payload_sha256) = provider_payload_sha256
+              AND provider_payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(desired_state_sha256) = 64
+              AND lower(desired_state_sha256) = desired_state_sha256
+              AND desired_state_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK((kind = 'rollback') = (rolled_back_from_operation_id IS NOT NULL)),
+            CHECK((state = 'succeeded'
+                    AND ((kind = 'deploy' AND next_step_index = 7)
+                      OR (kind = 'rollback' AND next_step_index = 2)))
+               OR state != 'succeeded'),
+            CHECK((cancel_requested_at IS NULL) = (cancel_actor_id IS NULL)),
+            CHECK((cancel_idempotency_key_sha256 IS NULL)
+                  = (cancel_request_fingerprint_sha256 IS NULL)),
+            CHECK(cancel_idempotency_key_sha256 IS NULL OR cancel_requested_at IS NOT NULL),
+            CHECK(state NOT IN ('cancelling', 'cancelled') OR cancel_requested_at IS NOT NULL),
+            CHECK((dispatch_failure_count = 0
+                    AND dispatch_not_before IS NULL
+                    AND dispatch_failure_child_operation_id IS NULL
+                    AND last_dispatch_error_code IS NULL
+                    AND last_dispatch_error_message IS NULL)
+               OR (dispatch_failure_count >= 1
+                    AND dispatch_not_before IS NOT NULL
+                    AND dispatch_failure_child_operation_id IS NOT NULL
+                    AND last_dispatch_error_code IS NOT NULL
+                    AND last_dispatch_error_message IS NOT NULL))
+"#;
+
+/// Column list of the step journal, shared with the rebuild for the same
+/// reason. Sequence 0..=6 is the standard deploy path, a rollback journal
+/// runs `rollback` then `observe`, and `cleanup` may only follow the step a
+/// cancel interrupted, so it can never be sequence 0.
+const PROVIDER_DEPLOYMENT_STEPS_COLUMNS: &str = r#"
+            parent_operation_id TEXT NOT NULL
+                                     REFERENCES provider_deployment_workflows(operation_id),
+            sequence            INTEGER NOT NULL CHECK(sequence BETWEEN 0 AND 7),
+            driver_operation    TEXT NOT NULL
+                                     CHECK(driver_operation IN
+                                       ('preflight', 'plan', 'prepare', 'upload',
+                                        'verify', 'activate', 'observe',
+                                        'rollback', 'cleanup')),
+            child_operation_id  TEXT NOT NULL UNIQUE
+                                     REFERENCES provider_driver_operations(operation_id),
+            created_at          INTEGER NOT NULL,
+            PRIMARY KEY(parent_operation_id, sequence),
+            CHECK((driver_operation = 'cleanup' AND sequence >= 1)
+               OR (sequence = 0 AND driver_operation IN ('preflight', 'rollback'))
+               OR (sequence = 1 AND driver_operation IN ('plan', 'observe'))
+               OR (sequence = 2 AND driver_operation = 'prepare')
+               OR (sequence = 3 AND driver_operation = 'upload')
+               OR (sequence = 4 AND driver_operation = 'verify')
+               OR (sequence = 5 AND driver_operation = 'activate')
+               OR (sequence = 6 AND driver_operation = 'observe'))
+"#;
+
+/// Indexes and triggers of the two journal tables. They go with the tables
+/// when those are rebuilt, so they live apart from the `CREATE TABLE`s and
+/// are re-established after a rebuild.
+///
+/// The transition trigger is the executable form of
+/// `contracts/v1/operation-transitions.json` for the journal: every
+/// non-terminal state may enter `cancelling`, `cancelling` ends in
+/// `cancelled` or `failed`, and a terminal row never moves again.
+const PROVIDER_DEPLOYMENT_JOURNAL_OBJECTS_SQL: &str = r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_deployment_one_active_target_v2
+            ON provider_deployment_workflows(application_id, environment_id, provider_target_id)
+            WHERE state NOT IN ('succeeded', 'failed', 'cancelled');
+
+        CREATE INDEX IF NOT EXISTS idx_provider_deployment_reconcile
+            ON provider_deployment_workflows(state, updated_at, operation_id);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_deployment_environment_page_v1
+            ON provider_deployment_workflows(application_id, environment_id,
+                                             created_at DESC, operation_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_deployment_rollback_source_v1
+            ON provider_deployment_workflows(rolled_back_from_operation_id,
+                                             created_at, operation_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_workflow_facts_immutable_v2
+        BEFORE UPDATE OF operation_id, kind, application_id, environment_id,
+                         provider_target_id, target_revision, artifact_version_id,
+                         canonical_artifact_sha256, provider_payload_sha256,
+                         desired_state_sha256, desired_state_json, plan_json,
+                         rolled_back_from_operation_id, created_at
+        ON provider_deployment_workflows
+        WHEN NEW.operation_id != OLD.operation_id
+          OR NEW.kind != OLD.kind
+          OR NEW.application_id != OLD.application_id
+          OR NEW.environment_id != OLD.environment_id
+          OR NEW.provider_target_id != OLD.provider_target_id
+          OR NEW.target_revision != OLD.target_revision
+          OR NEW.artifact_version_id != OLD.artifact_version_id
+          OR NEW.canonical_artifact_sha256 != OLD.canonical_artifact_sha256
+          OR NEW.provider_payload_sha256 != OLD.provider_payload_sha256
+          OR NEW.desired_state_sha256 != OLD.desired_state_sha256
+          OR NEW.desired_state_json != OLD.desired_state_json
+          OR NEW.plan_json != OLD.plan_json
+          OR NEW.rolled_back_from_operation_id IS NOT OLD.rolled_back_from_operation_id
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider deployment desired state is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_workflow_cancel_immutable_v1
+        BEFORE UPDATE OF cancel_requested_at, cancel_actor_id,
+                         cancel_idempotency_key_sha256, cancel_request_fingerprint_sha256
+        ON provider_deployment_workflows
+        WHEN OLD.cancel_requested_at IS NOT NULL
+          AND (NEW.cancel_requested_at IS NOT OLD.cancel_requested_at
+            OR NEW.cancel_actor_id IS NOT OLD.cancel_actor_id
+            OR NEW.cancel_idempotency_key_sha256 IS NOT OLD.cancel_idempotency_key_sha256
+            OR NEW.cancel_request_fingerprint_sha256
+                 IS NOT OLD.cancel_request_fingerprint_sha256)
+        BEGIN
+            SELECT RAISE(ABORT, 'provider deployment cancel request is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_workflow_transition_v2
+        BEFORE UPDATE OF state, next_step_index, revision, updated_at
+        ON provider_deployment_workflows
+        WHEN NEW.revision != OLD.revision + 1
+          OR NEW.updated_at < OLD.updated_at
+          OR NEW.next_step_index < OLD.next_step_index
+          OR NEW.next_step_index > OLD.next_step_index + 1
+          OR (NEW.state != OLD.state AND NOT (
+               (OLD.state = 'queued' AND NEW.state IN ('running', 'cancelling', 'failed'))
+            OR (OLD.state = 'running'
+                AND NEW.state IN ('waiting', 'cancelling', 'succeeded', 'failed'))
+            OR (OLD.state = 'waiting' AND NEW.state IN ('running', 'cancelling', 'failed'))
+            OR (OLD.state = 'cancelling' AND NEW.state IN ('cancelled', 'failed'))
+          ))
+          OR (OLD.state IN ('succeeded', 'failed', 'cancelled')
+              AND (NEW.state != OLD.state OR NEW.next_step_index != OLD.next_step_index))
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid provider deployment workflow transition');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_steps_immutable_v1
+        BEFORE UPDATE ON provider_deployment_steps
+        BEGIN
+            SELECT RAISE(ABORT, 'provider deployment steps are immutable');
+        END;
+"#;
+
+/// The durable provider deployment journal: the workflow table, its step
+/// table, the additive columns older databases lack, and every index and
+/// trigger of both.
+fn ensure_provider_deployment_journal_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS provider_deployment_workflows (\
+            {PROVIDER_DEPLOYMENT_WORKFLOWS_COLUMNS});
+         CREATE TABLE IF NOT EXISTS provider_deployment_steps (\
+            {PROVIDER_DEPLOYMENT_STEPS_COLUMNS});"
+    ))?;
+    rebuild_provider_deployment_journal_for_cancellation(conn)?;
+    ensure_provider_deployment_dispatch_columns(conn)?;
+    ensure_provider_deployment_target_grant_columns(conn)?;
+    conn.execute_batch(PROVIDER_DEPLOYMENT_JOURNAL_OBJECTS_SQL)?;
+    Ok(())
+}
+
+/// Give a journal recorded before cancellation and rollback existed the
+/// current table definitions.
+///
+/// The old `provider_deployment_workflows` table pinned `state` to five
+/// values by `CHECK`, tied `succeeded` to step index 7 and let the step
+/// table name only the seven deploy operations. SQLite cannot change a
+/// `CHECK` in place, so this is the documented table rebuild (the same
+/// technique as [`drop_power_reserve`]): copy every row into a table with
+/// the current definition, drop the old one and rename. Rows are copied
+/// column by column over the columns the old table has, so a database that
+/// predates the additive dispatch or grant columns is rebuilt too and gets
+/// them right after. Existing rows are all `kind = 'deploy'` with no cancel
+/// request, which is exactly what they were.
+///
+/// Foreign key enforcement is switched off for the copy, as the SQLite
+/// documentation prescribes for a rebuild, and switched back on afterwards;
+/// `foreign_key_check` then proves no reference was left dangling. The
+/// pragma is a no-op inside a transaction, so this runs on the bare
+/// connection and wraps only the copy in one.
+fn rebuild_provider_deployment_journal_for_cancellation(conn: &Connection) -> Result<()> {
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+              WHERE type = 'table' AND name = 'provider_deployment_workflows'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if current.contains("'cancelling'") {
+        return Ok(());
+    }
+    let copied_workflow_columns = shared_columns(
+        conn,
+        "provider_deployment_workflows",
+        PROVIDER_DEPLOYMENT_WORKFLOWS_COLUMNS,
+    )?;
+    let copied_step_columns = shared_columns(
+        conn,
+        "provider_deployment_steps",
+        PROVIDER_DEPLOYMENT_STEPS_COLUMNS,
+    )?;
+    info!(
+        "Rebuilding the provider deployment journal so a workflow can be cancelled or rolled back"
+    );
+    conn.execute("PRAGMA foreign_keys = OFF", [])?;
+    let rebuild = conn.execute_batch(&format!(
+        "BEGIN;
+         CREATE TABLE provider_deployment_workflows_rebuilt (\
+            {PROVIDER_DEPLOYMENT_WORKFLOWS_COLUMNS});
+         INSERT INTO provider_deployment_workflows_rebuilt ({copied_workflow_columns})
+            SELECT {copied_workflow_columns} FROM provider_deployment_workflows;
+         CREATE TABLE provider_deployment_steps_rebuilt (\
+            {PROVIDER_DEPLOYMENT_STEPS_COLUMNS});
+         INSERT INTO provider_deployment_steps_rebuilt ({copied_step_columns})
+            SELECT {copied_step_columns} FROM provider_deployment_steps;
+         DROP TABLE provider_deployment_steps;
+         DROP TABLE provider_deployment_workflows;
+         ALTER TABLE provider_deployment_workflows_rebuilt
+            RENAME TO provider_deployment_workflows;
+         ALTER TABLE provider_deployment_steps_rebuilt
+            RENAME TO provider_deployment_steps;
+         COMMIT;"
+    ));
+    let restored = conn.execute("PRAGMA foreign_keys = ON", []);
+    rebuild?;
+    restored?;
+    let dangling: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM pragma_foreign_key_check('provider_deployment_steps'))
+              + (SELECT COUNT(*) FROM pragma_foreign_key_check('provider_deployment_workflows'))",
+        [],
+        |row| row.get(0),
+    )?;
+    if dangling != 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some(format!(
+                "provider deployment journal rebuild left {dangling} dangling foreign key reference(s)"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// The comma-separated columns of `table` that also appear in the column
+/// definition text `definition`, in definition order, for a copy that
+/// tolerates columns the old table never had.
+fn shared_columns(conn: &Connection, table: &str, definition: &str) -> Result<String> {
+    let present = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?;
+    let defined = definition
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|token| !matches!(*token, "CHECK" | "CHECK(" | "PRIMARY" | "REFERENCES"))
+        .filter(|token| {
+            token
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        })
+        .filter(|token| present.iter().any(|name| name == token))
+        .fold(Vec::new(), |mut columns, token| {
+            // A column name can also open a continuation line of its own
+            // CHECK; the copy names each column once.
+            if !columns.contains(&token) {
+                columns.push(token);
+            }
+            columns
+        });
+    Ok(defined.join(", "))
 }
 
 fn ensure_provider_deployment_dispatch_columns(conn: &Connection) -> Result<()> {
@@ -6358,6 +6617,138 @@ mod tests {
         .unwrap();
     }
 
+    /// A database from before the keyed request digest gets the
+    /// `digest_scheme` column on the next start: rows written before it
+    /// read as `sha256-v1`, new rows name their scheme, the tag is as
+    /// immutable as the rest of the record and only known schemes are
+    /// accepted.
+    #[test]
+    fn api_idempotency_digest_scheme_column_upgrades_additively_and_is_immutable() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE api_idempotency_records;
+             CREATE TABLE api_idempotency_records (
+                record_id              TEXT PRIMARY KEY,
+                organization_id        TEXT NOT NULL
+                                            REFERENCES product_organizations(organization_id),
+                actor_id               TEXT NOT NULL REFERENCES operation_actors(actor_id),
+                route_id               TEXT NOT NULL,
+                idempotency_key_sha256 TEXT NOT NULL,
+                request_sha256         TEXT NOT NULL,
+                state                  TEXT NOT NULL CHECK(state IN ('pending', 'completed')),
+                response_status        INTEGER,
+                resource_kind          TEXT,
+                resource_id            TEXT,
+                resource_revision      INTEGER,
+                created_at             INTEGER NOT NULL,
+                completed_at           INTEGER,
+                expires_at             INTEGER NOT NULL,
+                UNIQUE(organization_id, actor_id, route_id, idempotency_key_sha256)
+             );",
+        )
+        .unwrap();
+        let organization_id: String = conn
+            .query_row(
+                "SELECT organization_id FROM product_organizations WHERE slug = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let actor_id = "01990f44-1000-7000-8000-000000000011";
+        conn.execute(
+            "INSERT INTO operation_actors (actor_id, subject, created_at)
+             VALUES (?1, 'account:legacy', 1)",
+            [actor_id],
+        )
+        .unwrap();
+        let legacy_record_id = "01990f44-1000-7000-8000-000000000012";
+        conn.execute(
+            "INSERT INTO api_idempotency_records
+                (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
+                 request_sha256, state, created_at, expires_at)
+             VALUES (?1, ?2, ?3, 'provider_installation.register', ?4, ?5, 'pending', 1, 2)",
+            rusqlite::params![
+                legacy_record_id,
+                organization_id,
+                actor_id,
+                "a".repeat(64),
+                "b".repeat(64)
+            ],
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+        create_tables(&conn).unwrap();
+
+        let legacy_scheme: String = conn
+            .query_row(
+                "SELECT digest_scheme FROM api_idempotency_records WHERE record_id = ?1",
+                [legacy_record_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_scheme, "sha256-v1");
+
+        let keyed_record_id = "01990f44-1000-7000-8000-000000000013";
+        conn.execute(
+            "INSERT INTO api_idempotency_records
+                (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
+                 digest_scheme, request_sha256, state, created_at, expires_at)
+             VALUES (?1, ?2, ?3, 'provider_installation.register', ?4, 'hmac-sha256-v1', ?5,
+                     'pending', 1, 2)",
+            rusqlite::params![
+                keyed_record_id,
+                organization_id,
+                actor_id,
+                "c".repeat(64),
+                "d".repeat(64)
+            ],
+        )
+        .unwrap();
+        let keyed_scheme: String = conn
+            .query_row(
+                "SELECT digest_scheme FROM api_idempotency_records WHERE record_id = ?1",
+                [keyed_record_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(keyed_scheme, "hmac-sha256-v1");
+
+        assert!(
+            conn.execute(
+                "INSERT INTO api_idempotency_records
+                    (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
+                     digest_scheme, request_sha256, state, created_at, expires_at)
+                 VALUES ('01990f44-1000-7000-8000-000000000014', ?1, ?2,
+                         'provider_installation.register', ?3, 'md5-v0', ?4, 'pending', 1, 2)",
+                rusqlite::params![organization_id, actor_id, "e".repeat(64), "f".repeat(64)],
+            )
+            .is_err(),
+            "database accepted an unknown digest scheme"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE api_idempotency_records SET digest_scheme = 'hmac-sha256-v1'
+                  WHERE record_id = ?1",
+                [legacy_record_id],
+            )
+            .is_err(),
+            "database accepted a rewritten digest scheme on a pending record"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master
+                  WHERE type = 'trigger'
+                    AND name = 'trg_api_idempotency_records_digest_scheme_immutable_v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent() {
         let conn = Connection::open_in_memory().unwrap();
@@ -6441,6 +6832,295 @@ mod tests {
             [child_operation_id],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn provider_deployment_journal_is_rebuilt_once_to_admit_cancellation_and_rollback() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        // The shape a database recorded before cancel and rollback existed:
+        // five states, deploy steps only, no additive dispatch columns yet.
+        conn.execute_batch(
+            "CREATE TABLE product_operations (operation_id TEXT PRIMARY KEY);
+             CREATE TABLE provider_targets (target_id TEXT PRIMARY KEY);
+             CREATE TABLE provider_target_grants (grant_id TEXT PRIMARY KEY);
+             CREATE TABLE operation_actors (actor_id TEXT PRIMARY KEY);
+             CREATE TABLE provider_driver_operations (operation_id TEXT PRIMARY KEY);
+             CREATE TABLE provider_deployment_workflows (
+                operation_id TEXT PRIMARY KEY REFERENCES product_operations(operation_id),
+                application_id TEXT NOT NULL,
+                environment_id TEXT NOT NULL,
+                provider_target_id TEXT NOT NULL REFERENCES provider_targets(target_id),
+                target_revision INTEGER NOT NULL,
+                artifact_version_id TEXT NOT NULL,
+                canonical_artifact_sha256 TEXT NOT NULL,
+                provider_payload_sha256 TEXT NOT NULL,
+                desired_state_sha256 TEXT NOT NULL,
+                desired_state_json TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                state TEXT NOT NULL
+                    CHECK(state IN ('queued', 'running', 'waiting', 'succeeded', 'failed')),
+                next_step_index INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE provider_deployment_steps (
+                parent_operation_id TEXT NOT NULL
+                    REFERENCES provider_deployment_workflows(operation_id),
+                sequence INTEGER NOT NULL CHECK(sequence BETWEEN 0 AND 6),
+                driver_operation TEXT NOT NULL CHECK(driver_operation IN ('preflight')),
+                child_operation_id TEXT NOT NULL UNIQUE
+                    REFERENCES provider_driver_operations(operation_id),
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(parent_operation_id, sequence)
+             );",
+        )
+        .unwrap();
+        let operation_id = CanonicalId::new_v7().to_string();
+        let child_id = CanonicalId::new_v7().to_string();
+        let app = CanonicalId::new_v7().to_string();
+        let env = CanonicalId::new_v7().to_string();
+        let target = CanonicalId::new_v7().to_string();
+        let artifact = CanonicalId::new_v7().to_string();
+        conn.execute(
+            "INSERT INTO product_operations VALUES (?1)",
+            [&operation_id],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO provider_targets VALUES (?1)", [&target])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO provider_driver_operations VALUES (?1)",
+            [&child_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_deployment_workflows
+                (operation_id, application_id, environment_id, provider_target_id,
+                 target_revision, artifact_version_id, canonical_artifact_sha256,
+                 provider_payload_sha256, desired_state_sha256, desired_state_json,
+                 plan_json, state, next_step_index, revision, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?6, ?6, '{}', '{}', 'running', 0, 3, 10, 11)",
+            rusqlite::params![operation_id, app, env, target, artifact, "a".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_deployment_steps VALUES (?1, 0, 'preflight', ?2, 10)",
+            [&operation_id, &child_id],
+        )
+        .unwrap();
+
+        ensure_provider_deployment_journal_schema(&conn).unwrap();
+        // Idempotent: the second pass finds the current definition.
+        ensure_provider_deployment_journal_schema(&conn).unwrap();
+
+        let (kind, state, cancel, grant, failures): (
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT kind, state, cancel_requested_at, provider_target_grant_id,
+                        dispatch_failure_count
+                   FROM provider_deployment_workflows WHERE operation_id = ?1",
+                [&operation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (kind.as_str(), state.as_str(), cancel, grant, failures),
+            ("deploy", "running", None, None, 0)
+        );
+        let steps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM provider_deployment_steps WHERE parent_operation_id = ?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(steps, 1);
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('provider_deployment_steps')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0);
+        let objects: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE tbl_name IN ('provider_deployment_workflows', 'provider_deployment_steps')
+                    AND type IN ('index', 'trigger') ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        for expected in [
+            "idx_provider_deployment_one_active_target_v2",
+            "idx_provider_deployment_rollback_source_v1",
+            "trg_provider_deployment_workflow_transition_v2",
+            "trg_provider_deployment_workflow_cancel_immutable_v1",
+            "trg_provider_deployment_target_grant_insert_v1",
+            "trg_provider_deployment_dispatch_backoff_v1",
+            "trg_provider_deployment_steps_immutable_v1",
+        ] {
+            assert!(
+                objects.iter().any(|name| name == expected),
+                "{expected} missing from {objects:?}"
+            );
+        }
+        assert!(
+            !objects
+                .iter()
+                .any(|name| name == "trg_provider_deployment_workflow_transition_v1")
+        );
+
+        // The rebuilt row honours the new transition rules: cancelling needs a
+        // cancel record, is reachable from running, and ends terminal.
+        assert!(
+            conn.execute(
+                "UPDATE provider_deployment_workflows
+                    SET state = 'cancelling', revision = 4, updated_at = 12
+                  WHERE operation_id = ?1",
+                [&operation_id],
+            )
+            .is_err(),
+            "cancelling was accepted without a cancel request"
+        );
+        conn.execute("INSERT INTO operation_actors VALUES ('actor-1')", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE provider_deployment_workflows
+                SET state = 'cancelling', cancel_requested_at = 12, cancel_actor_id = 'actor-1',
+                    revision = 4, updated_at = 12
+              WHERE operation_id = ?1",
+            [&operation_id],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE provider_deployment_workflows
+                    SET cancel_requested_at = 13, revision = 5, updated_at = 13
+                  WHERE operation_id = ?1",
+                [&operation_id],
+            )
+            .is_err(),
+            "the cancel request was rewritten"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE provider_deployment_workflows
+                    SET state = 'running', revision = 5, updated_at = 13
+                  WHERE operation_id = ?1",
+                [&operation_id],
+            )
+            .is_err(),
+            "a cancelling workflow resumed"
+        );
+        let cleanup_child = CanonicalId::new_v7().to_string();
+        conn.execute(
+            "INSERT INTO provider_driver_operations VALUES (?1)",
+            [&cleanup_child],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_deployment_steps VALUES (?1, 1, 'cleanup', ?2, 13)",
+            [&operation_id, &cleanup_child],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO provider_deployment_steps VALUES (?1, 0, 'cleanup', ?2, 13)",
+                [&operation_id, &CanonicalId::new_v7().to_string()],
+            )
+            .is_err(),
+            "cleanup was accepted as a first step"
+        );
+        conn.execute(
+            "UPDATE provider_deployment_workflows
+                SET state = 'cancelled', next_step_index = 1, revision = 5, updated_at = 13
+              WHERE operation_id = ?1",
+            [&operation_id],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE provider_deployment_workflows
+                    SET state = 'running', revision = 6, updated_at = 14
+                  WHERE operation_id = ?1",
+                [&operation_id],
+            )
+            .is_err(),
+            "a cancelled workflow moved again"
+        );
+        // A cancelled workflow frees its target for the next one.
+        let next = CanonicalId::new_v7().to_string();
+        conn.execute("INSERT INTO product_operations VALUES (?1)", [&next])
+            .unwrap();
+        conn.execute("INSERT INTO provider_target_grants VALUES ('grant-1')", [])
+            .unwrap();
+        // The grant insert trigger consults grant columns the stub lacks; it
+        // is the target of its own test, so bypass it here.
+        conn.execute(
+            "DROP TRIGGER trg_provider_deployment_target_grant_insert_v1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_deployment_workflows
+                (operation_id, kind, application_id, environment_id, provider_target_id,
+                 target_revision, artifact_version_id, canonical_artifact_sha256,
+                 provider_payload_sha256, desired_state_sha256, desired_state_json,
+                 plan_json, rolled_back_from_operation_id, state, next_step_index,
+                 revision, created_at, updated_at)
+             VALUES (?1, 'rollback', ?2, ?3, ?4, 1, ?5, ?6, ?6, ?6, '{}', '{}', ?7,
+                     'queued', 0, 1, 20, 20)",
+            rusqlite::params![
+                next,
+                app,
+                env,
+                target,
+                artifact,
+                "a".repeat(64),
+                operation_id
+            ],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO provider_deployment_workflows
+                    (operation_id, kind, application_id, environment_id, provider_target_id,
+                     target_revision, artifact_version_id, canonical_artifact_sha256,
+                     provider_payload_sha256, desired_state_sha256, desired_state_json,
+                     plan_json, state, next_step_index, revision, created_at, updated_at)
+                 VALUES (?1, 'rollback', ?2, ?3, ?4, 1, ?5, ?6, ?6, ?6, '{}', '{}',
+                         'queued', 0, 1, 21, 21)",
+                rusqlite::params![
+                    CanonicalId::new_v7().to_string(),
+                    app,
+                    env,
+                    target,
+                    artifact,
+                    "a".repeat(64)
+                ],
+            )
+            .is_err(),
+            "a rollback without its source was accepted"
+        );
     }
 
     #[test]

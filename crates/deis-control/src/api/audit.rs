@@ -135,7 +135,7 @@ fn cursor_binding(filter: &AuditQuery) -> String {
     )
 }
 
-/// GET /api/audit
+/// List the audit log, newest first.
 #[utoipa::path(
     get,
     path = "/api/v1/audit",

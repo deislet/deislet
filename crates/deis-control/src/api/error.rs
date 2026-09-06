@@ -44,6 +44,11 @@ use crate::api::versioning::{ApiSurface, RequestId, finish_error_response};
 pub const OPAQUE_MESSAGE: &str =
     "The control plane could not complete the request; quote the request id to an operator.";
 
+/// The header a keyed mutation replays under, as HTTP compares header
+/// names. [`ApiError::missing_header`] recognises it to give the one
+/// omission a client acts on differently its own code.
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
 /// Stable, machine-readable error codes.
 ///
 /// Kebab-case, never renamed once shipped: a client branches on these where
@@ -53,15 +58,28 @@ pub const OPAQUE_MESSAGE: &str =
 pub mod codes {
     pub const NOT_FOUND: &str = "not-found";
     pub const INVALID_ARGUMENT: &str = "invalid-argument";
+    /// A `limit` query parameter outside `1..=1000`; see
+    /// [`crate::api::pagination::bounded_limit`], which is the one place
+    /// every list route bounds it.
     pub const LIMIT_OUT_OF_RANGE: &str = "limit-out-of-range";
+    /// Reserved, and emitted by nothing: offset paging was retired before
+    /// any route shipped it, and every list is keyset-paged behind an
+    /// opaque cursor. The token stays in the closed enum - a code is never
+    /// removed once published, and a client that already branches on it
+    /// keeps compiling - and this is the one place that says so.
     pub const OFFSET_OUT_OF_RANGE: &str = "offset-out-of-range";
+    /// A cursor that was not issued for this collection and these filters,
+    /// or has expired; see [`crate::catalog::INVALID_CURSOR_MESSAGE`].
     pub const CURSOR_INVALID: &str = "cursor-invalid";
+    /// A mutation that replays under a key was sent without one.
     pub const IDEMPOTENCY_KEY_REQUIRED: &str = "idempotency-key-required";
     pub const IDEMPOTENCY_KEY_REUSED: &str = crate::catalog::idempotency::IDEMPOTENCY_KEY_REUSED;
     pub const IDEMPOTENCY_REQUEST_IN_PROGRESS: &str =
         crate::catalog::idempotency::IDEMPOTENCY_REQUEST_IN_PROGRESS;
     pub const PRECONDITION_REQUIRED: &str = "precondition-required";
     pub const REVISION_CONFLICT: &str = "revision-conflict";
+    /// A create refused because the resource it names is already there;
+    /// see [`super::ApiError::creating`].
     pub const ALREADY_EXISTS: &str = "already-exists";
     /// A 409 that is none of the more specific conflicts: the request is
     /// well formed and clashes with the current state.
@@ -81,6 +99,11 @@ pub mod codes {
     pub const PROVIDER_INSTALLATION_IN_USE: &str = crate::catalog::PROVIDER_INSTALLATION_IN_USE;
     pub const PROVIDER_TARGET_IN_USE: &str = crate::catalog::PROVIDER_TARGET_IN_USE;
     pub const PROVIDER_RESOURCE_DELETED: &str = crate::catalog::PROVIDER_RESOURCE_DELETED;
+    /// A cancel of an operation that is terminal or already cancelling.
+    pub const OPERATION_NOT_CANCELLABLE: &str = crate::catalog::OPERATION_NOT_CANCELLABLE;
+    /// A rollback whose source is not a succeeded deployment on the named
+    /// environment, or whose authorization has since changed.
+    pub const OPERATION_NOT_ROLLBACKABLE: &str = crate::catalog::OPERATION_NOT_ROLLBACKABLE;
 
     /// Every code, for the contract tests and the OpenAPI enum.
     pub const ALL: &[&str] = &[
@@ -110,6 +133,8 @@ pub mod codes {
         PROVIDER_INSTALLATION_IN_USE,
         PROVIDER_TARGET_IN_USE,
         PROVIDER_RESOURCE_DELETED,
+        OPERATION_NOT_CANCELLABLE,
+        OPERATION_NOT_ROLLBACKABLE,
     ];
 
     /// Codes the catalog already spells out as a `<code>: ` prefix on the
@@ -122,6 +147,8 @@ pub mod codes {
         PROVIDER_INSTALLATION_IN_USE,
         PROVIDER_TARGET_IN_USE,
         PROVIDER_RESOURCE_DELETED,
+        OPERATION_NOT_CANCELLABLE,
+        OPERATION_NOT_ROLLBACKABLE,
     ];
 
     /// Whether a code names a condition that a retry of the same request,
@@ -446,6 +473,27 @@ impl ApiError {
         ApiError::Detailed(Box::new(error))
     }
 
+    /// A required request header that was not sent.
+    ///
+    /// The sentence is the one the legacy tree has always answered with,
+    /// whatever the header. `Idempotency-Key` takes its own code because a
+    /// client that omitted it has to change the request in a particular
+    /// way - mint a key and send it - rather than fix a value it already
+    /// chose, and that is worth branching on.
+    pub fn missing_header(name: &str) -> Self {
+        let message = format!("{name} header is required");
+        if name.eq_ignore_ascii_case(IDEMPOTENCY_KEY_HEADER) {
+            return Self::coded(
+                StatusCode::BAD_REQUEST,
+                codes::IDEMPOTENCY_KEY_REQUIRED,
+                message,
+            )
+            // Named as a caller writes it, not as HTTP compares it.
+            .with_target("request", Some("Idempotency-Key".to_string()));
+        }
+        ApiError::BadRequest(message)
+    }
+
     /// A body larger than the route will read.
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self::coded(
@@ -468,6 +516,47 @@ impl ApiError {
         if !detail.retryable {
             detail.retry_after_seconds = None;
         }
+        ApiError::Detailed(Box::new(detail))
+    }
+
+    /// What a create makes of a refusal.
+    ///
+    /// A plain 409 answering a create says one thing: the resource is
+    /// already there. It answers [`codes::ALREADY_EXISTS`] about
+    /// `resource`, so a client can tell "pick another name" from "the state
+    /// moved under you" without reading the sentence. Everything else goes
+    /// through untouched - a 404 for the parent, a validation refusal, and
+    /// any 409 that already carries a code of its own (`not-configured`, a
+    /// reused idempotency key, a provider-lifecycle conflict).
+    ///
+    /// The message is the store's, unchanged, so the legacy body is
+    /// byte-identical either way.
+    pub fn creating(self, resource: &str) -> Self {
+        let (status, code) = self.classify();
+        if status != StatusCode::CONFLICT || code != codes::CONFLICT {
+            return self;
+        }
+        self.with_code(codes::ALREADY_EXISTS)
+            .with_target(resource, None)
+    }
+
+    /// Name the one request member a validation refusal is about.
+    ///
+    /// Only for a 400 the route can attribute to a single field with no
+    /// guessing; the message stays what it was and becomes the violation's,
+    /// so the legacy body does not move and the structured one gains
+    /// `violations: [{field, code: "invalid", message}]`.
+    pub fn invalid_field(self, field: &str) -> Self {
+        let (status, code) = self.classify();
+        if status != StatusCode::BAD_REQUEST || code != codes::INVALID_ARGUMENT {
+            return self;
+        }
+        let mut detail = self.into_detail();
+        detail.violations = vec![Violation {
+            field: field.to_string(),
+            code: "invalid",
+            message: detail.message.clone(),
+        }];
         ApiError::Detailed(Box::new(detail))
     }
 
@@ -640,11 +729,26 @@ impl From<crate::database::DatabaseError> for ApiError {
 
 /// Map catalog failures onto HTTP status classes. The variants were
 /// chosen so this stays a straight table with no guessing.
+///
+/// The one refusal that is finer than its variant is the cursor store's:
+/// `PageCursorStore::resolve` reports a cursor it did not issue for this
+/// query as a plain [`CatalogError::Invalid`], and it is the same sentence
+/// every time - [`crate::catalog::INVALID_CURSOR_MESSAGE`], which that
+/// module owns and this reads. Recognising it here rather than adding a
+/// variant keeps the sentence in the legacy body byte for byte (a code
+/// token prefixed onto the message would change it) and keeps the ~40
+/// list routes free of a mapping each.
 impl From<crate::catalog::CatalogError> for ApiError {
     fn from(err: crate::catalog::CatalogError) -> Self {
         use crate::catalog::CatalogError;
         let message = err.to_string();
         match err {
+            CatalogError::Invalid(ref reason)
+                if reason == crate::catalog::INVALID_CURSOR_MESSAGE =>
+            {
+                ApiError::coded(StatusCode::BAD_REQUEST, codes::CURSOR_INVALID, message)
+                    .with_target("query", Some("cursor".to_string()))
+            }
             CatalogError::NotFound(_) => ApiError::NotFound(message),
             CatalogError::Conflict(_) => ApiError::Conflict(message),
             CatalogError::RevisionConflict(_) => ApiError::PreconditionFailed(message),
@@ -941,6 +1045,10 @@ mod tests {
             ApiError::insufficient_scope("apps:write", "x"),
             ApiError::route_not_found(),
             ApiError::payload_too_large("x"),
+            ApiError::missing_header("idempotency-key"),
+            ApiError::missing_header("If-Match"),
+            ApiError::Conflict("x".into()).creating("application"),
+            ApiError::BadRequest("x".into()).invalid_field("id"),
         ] {
             assert!(codes::ALL.contains(&constructor.code()), "{constructor:?}");
         }
@@ -966,6 +1074,34 @@ mod tests {
         let (_, bytes) = legacy_bytes(ApiError::BadRequest(message.to_string())).await;
         let expected = serde_json::to_vec(&json!({ "error": message })).unwrap();
         assert_eq!(bytes, expected);
+        // The helpers that add a code, a target or a violation leave the
+        // legacy sentence exactly as the route wrote it.
+        for (error, status, expected) in [
+            (
+                ApiError::missing_header("idempotency-key"),
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"idempotency-key header is required"}"#.to_vec(),
+            ),
+            (
+                ApiError::missing_header("If-Match"),
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"If-Match header is required"}"#.to_vec(),
+            ),
+            (
+                ApiError::Conflict("x".into()).creating("application"),
+                StatusCode::CONFLICT,
+                br#"{"error":"x"}"#.to_vec(),
+            ),
+            (
+                ApiError::BadRequest("x".into()).invalid_field("id"),
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"x"}"#.to_vec(),
+            ),
+        ] {
+            let (got_status, bytes) = legacy_bytes(error).await;
+            assert_eq!(got_status, status);
+            assert_eq!(bytes, expected);
+        }
     }
 
     #[tokio::test]

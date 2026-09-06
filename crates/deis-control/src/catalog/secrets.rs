@@ -10,13 +10,20 @@
 //! running - node management does not depend on secrets - but every secret
 //! endpoint fails loudly with 503. Storing a plaintext value instead would
 //! turn a configuration mistake into a silent leak.
+//!
+//! The master key also roots every purpose-bound subkey the control plane
+//! needs ([`SecretCipher::derive_key`]): HKDF-SHA256 with the purpose
+//! string as the `info` input, so two purposes never share a key and a
+//! subkey reveals nothing about the master key or its siblings.
 
 use std::fmt;
 use std::path::Path;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use hkdf::Hkdf;
 use rand::RngCore;
+use sha2::Sha256;
 use tracing::{error, info, warn};
 
 use super::{CatalogError, CatalogResult};
@@ -25,11 +32,43 @@ use super::{CatalogError, CatalogResult};
 pub const MASTER_KEY_LEN: usize = 32;
 /// AES-GCM nonce length in bytes, prefixed to every ciphertext.
 pub const NONCE_LEN: usize = 12;
+/// Length in bytes of every subkey [`SecretCipher::derive_key`] produces.
+pub const DERIVED_KEY_LEN: usize = 32;
 
 /// Holds the master key. Deliberately opaque: no `Debug` output, no
 /// accessor, no serialization.
 pub struct SecretCipher {
     cipher: Aes256Gcm,
+    /// The raw material the AES schedule was built from, kept so subkeys
+    /// can be derived from it; never exposed outside this module.
+    master_key: [u8; MASTER_KEY_LEN],
+}
+
+/// A subkey derived from the master key for one named purpose.
+///
+/// As opaque as the master key itself: no `Debug` output of the material,
+/// no serialization. The bytes are reachable only through
+/// [`DerivedKey::as_bytes`], for the primitive that consumes them.
+pub struct DerivedKey {
+    purpose: &'static str,
+    material: [u8; DERIVED_KEY_LEN],
+}
+
+impl fmt::Debug for DerivedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DerivedKey({}, <material redacted>)", self.purpose)
+    }
+}
+
+impl DerivedKey {
+    /// The purpose string the key was derived for.
+    pub fn purpose(&self) -> &'static str {
+        self.purpose
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.material
+    }
 }
 
 impl fmt::Debug for SecretCipher {
@@ -47,10 +86,32 @@ impl SecretCipher {
                 key.len()
             )));
         }
+        let mut master_key = [0u8; MASTER_KEY_LEN];
+        master_key.copy_from_slice(key);
         let key = Key::<Aes256Gcm>::from_slice(key);
         Ok(Self {
             cipher: Aes256Gcm::new(key),
+            master_key,
         })
+    }
+
+    /// Derive the subkey for `purpose` (HKDF-SHA256, no salt, the purpose
+    /// as `info`). Deterministic: the same master key and purpose always
+    /// give the same subkey, which is what lets a keyed digest computed
+    /// today match one stored yesterday. `purpose` must be a non-empty,
+    /// versioned, application-unique string such as
+    /// `deislet-control-idempotency-digest-v1`; changing it is a key
+    /// rotation for everything that used the old one.
+    pub fn derive_key(&self, purpose: &'static str) -> DerivedKey {
+        assert!(
+            !purpose.is_empty(),
+            "a derived key needs a purpose string to bind it to"
+        );
+        let mut material = [0u8; DERIVED_KEY_LEN];
+        Hkdf::<Sha256>::new(None, &self.master_key)
+            .expand(purpose.as_bytes(), &mut material)
+            .expect("HKDF-SHA256 expands to 32 bytes for any input");
+        DerivedKey { purpose, material }
     }
 
     /// Read the master key from `path`.
@@ -251,6 +312,13 @@ impl SecretsBackend {
     pub fn is_ready(&self) -> bool {
         matches!(self, SecretsBackend::Ready(_))
     }
+
+    /// Derive a purpose-bound subkey from the master key, or fail with the
+    /// same `SecretsUnavailable` a secret endpoint would when no usable
+    /// master key is configured. See [`SecretCipher::derive_key`].
+    pub fn derive_key(&self, purpose: &'static str) -> CatalogResult<DerivedKey> {
+        Ok(self.cipher()?.derive_key(purpose))
+    }
 }
 
 /// A master key other local users can read is only nominally a secret.
@@ -411,5 +479,43 @@ mod tests {
         let rendered = format!("{cipher:?}");
         assert!(rendered.contains("redacted"));
         assert!(!rendered.contains("07"));
+
+        let derived = cipher.derive_key("test-purpose-v1");
+        let rendered = format!("{derived:?}");
+        assert!(rendered.contains("redacted"));
+        assert!(rendered.contains("test-purpose-v1"));
+        assert!(!rendered.contains(&hex::encode(derived.as_bytes())));
+    }
+
+    #[test]
+    fn derived_keys_are_deterministic_and_bound_to_master_key_and_purpose() {
+        let a = test_cipher().derive_key("purpose-a-v1");
+        let again = test_cipher().derive_key("purpose-a-v1");
+        assert_eq!(a.as_bytes(), again.as_bytes());
+        assert_eq!(a.as_bytes().len(), DERIVED_KEY_LEN);
+        assert_eq!(a.purpose(), "purpose-a-v1");
+
+        let other_purpose = test_cipher().derive_key("purpose-b-v1");
+        assert_ne!(a.as_bytes(), other_purpose.as_bytes());
+
+        let other_master = SecretCipher::from_key_bytes(&[9u8; MASTER_KEY_LEN]).unwrap();
+        assert_ne!(
+            a.as_bytes(),
+            other_master.derive_key("purpose-a-v1").as_bytes()
+        );
+
+        // A subkey is never the master key itself.
+        assert_ne!(a.as_bytes(), &[7u8; MASTER_KEY_LEN]);
+
+        let unavailable = SecretsBackend::Unavailable("no key".to_string());
+        assert!(matches!(
+            unavailable.derive_key("purpose-a-v1"),
+            Err(CatalogError::SecretsUnavailable(_))
+        ));
+        let ready = SecretsBackend::Ready(Box::new(test_cipher()));
+        assert_eq!(
+            ready.derive_key("purpose-a-v1").unwrap().as_bytes(),
+            a.as_bytes()
+        );
     }
 }

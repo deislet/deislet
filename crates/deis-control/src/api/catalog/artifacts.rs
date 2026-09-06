@@ -33,7 +33,7 @@ pub struct ArtifactUploadResponse {
     pub created: bool,
 }
 
-/// POST /api/apps/:app_id/artifacts
+/// Upload a transport zip as a canonical artifact.
 ///
 /// The request body is only a transport zip. Control expands it into an
 /// isolated directory and executes the Edge Canon validator before either a
@@ -114,7 +114,7 @@ pub async fn upload_artifact(
     ))
 }
 
-/// GET /api/apps/:app_id/artifacts
+/// List an application's canonical artifacts.
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/artifacts",
@@ -174,7 +174,7 @@ pub async fn list_artifacts(
     Ok(Json(response))
 }
 
-/// GET /api/apps/:app_id/artifacts/:artifact_id
+/// Read one canonical artifact.
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/artifacts/{artifact_id}",

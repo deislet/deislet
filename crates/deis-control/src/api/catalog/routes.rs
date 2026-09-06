@@ -53,7 +53,7 @@ pub struct GlobalRoutesResponse {
     pub total: usize,
 }
 
-/// POST /api/apps/:app_id/environments/:env/routes
+/// Bind a route to an environment.
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/environments/{env_name}/routes",
@@ -83,7 +83,7 @@ pub async fn create_route(
     Ok((StatusCode::CREATED, Json(RouteResponse { route })))
 }
 
-/// GET /api/apps/:app_id/environments/:env/routes
+/// List one environment's routes.
 ///
 /// One environment's routes in the order the matcher applies them: highest
 /// priority first, then by path prefix, with the route id as the
@@ -134,7 +134,7 @@ pub async fn list_routes(
     Ok(Json(response))
 }
 
-/// GET /api/routes
+/// Read the whole routing table.
 ///
 /// Every route the platform knows, highest priority first. This is the
 /// whole routing table an edge needs in one call, and it stays unpaginated
@@ -161,7 +161,7 @@ pub async fn list_all_routes(
     }))
 }
 
-/// PUT /api/apps/:app_id/environments/:env/routes/:route_id
+/// Replace a route.
 ///
 /// Replaces the route's fields wholesale, so an omitted `host` clears it
 /// back to "any domain" rather than keeping the old value.
@@ -200,7 +200,7 @@ pub async fn update_route(
     Ok(Json(RouteResponse { route }))
 }
 
-/// DELETE /api/apps/:app_id/environments/:env/routes/:route_id
+/// Remove a route.
 #[utoipa::path(
     delete,
     path = "/api/v1/apps/{app_id}/environments/{env_name}/routes/{route_id}",

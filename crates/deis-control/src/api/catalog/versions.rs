@@ -135,7 +135,7 @@ pub const MAX_PROVIDER_ENVELOPE_BYTES: usize = super::MAX_BUNDLE_BYTES + 4 * 102
 const DERIVATION_ENTRY: &str = ".deislet/provider-derivation.json";
 const BUNDLE_ENTRY: &str = "payload/bundle.zip";
 
-/// POST /api/apps/:app_id/versions
+/// Upload a bundle as a new version.
 ///
 /// Body is the raw bundle zip. The upload is rejected outright - nothing
 /// written, no row created - when the digest does not match, the manifest
@@ -201,7 +201,7 @@ pub async fn upload_version(
     .await
 }
 
-/// POST /api/apps/:app_id/artifacts/:artifact_id/versions
+/// Upload a provider-derived version bound to its canonical artifact.
 ///
 /// The envelope contains exactly an immutable provider derivation record and
 /// the Deislet native bundle it binds. Control revalidates the stored
@@ -632,7 +632,7 @@ impl Drop for ProviderStaging {
     }
 }
 
-/// GET /api/apps/:app_id/versions
+/// List an application's versions.
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/versions",
@@ -688,7 +688,7 @@ pub async fn list_versions(
     Ok(Json(response))
 }
 
-/// GET /api/apps/:app_id/versions/:version_id
+/// Read one version.
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/versions/{version_id}",

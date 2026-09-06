@@ -9,6 +9,7 @@ pub mod cors;
 pub mod error;
 pub mod events;
 pub mod grpc;
+pub mod headers;
 pub mod identity;
 pub mod metrics;
 pub mod middleware;

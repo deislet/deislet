@@ -965,6 +965,43 @@ fn classify_canonical(
             app,
             "environments",
             env,
+            "provider-deployments",
+            operation_id,
+            "cancel",
+        ] => Requirement::new(
+            "provider_deployment.cancel",
+            Verb::Deploy,
+            named(app),
+            named(env),
+        )
+        .about(operation_id)
+        .changes_state(),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "provider-deployments",
+            operation_id,
+            "rollback",
+        ] => Requirement::new(
+            "provider_deployment.rollback",
+            // The catalog transaction requires the rolled-back deployment to
+            // be a succeeded one on this environment and its target grant to
+            // be the active one; route scope alone never confers that.
+            Verb::Deploy,
+            named(app),
+            named(env),
+        )
+        .about(operation_id)
+        .changes_state(),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
             "deployment-plans",
             plan,
         ] => {
@@ -2033,6 +2070,18 @@ mod tests {
                 "/api/apps/demo/environments/production/provider-deployments/01990f44-1000-7000-8000-000000000040",
                 "provider_deployment.get",
                 Verb::Read,
+            ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-deployments/01990f44-1000-7000-8000-000000000040/cancel",
+                "provider_deployment.cancel",
+                Verb::Deploy,
+            ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-deployments/01990f44-1000-7000-8000-000000000040/rollback",
+                "provider_deployment.rollback",
+                Verb::Deploy,
             ),
             (
                 "GET",

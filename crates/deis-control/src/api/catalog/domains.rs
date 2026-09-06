@@ -76,7 +76,7 @@ pub struct GrantSelector {
     pub environment: Option<String>,
 }
 
-/// GET /api/domains
+/// List the hostname grants.
 ///
 /// The whole registry in `(pattern, app_id, environment)` order. The scope
 /// is global: a hostname belongs to nobody's application, which is the
@@ -124,7 +124,7 @@ pub async fn list_grants(
     Ok(Json(response))
 }
 
-/// POST /api/domains
+/// Grant a hostname pattern to an application.
 #[utoipa::path(
     post,
     path = "/api/v1/domains",
@@ -149,6 +149,11 @@ pub async fn create_grant(
         .as_deref()
         .unwrap_or(EVERY_ENVIRONMENT)
         .to_string();
+    // No field is named on the 400: the pattern, the application id and
+    // the environment are each validated in the store and the refusal does
+    // not say which of the three it was, so the envelope says the same as
+    // the message rather than guessing. The 409 is unambiguous - this
+    // application already holds this pattern for this environment.
     let grant = state
         .store
         .create_domain_grant(
@@ -157,11 +162,12 @@ pub async fn create_grant(
             &environment,
             request.note,
         )
-        .await?;
+        .await
+        .map_err(|error| ApiError::from(error).creating("domain-grant"))?;
     Ok((StatusCode::CREATED, Json(GrantResponse { grant })))
 }
 
-/// DELETE /api/domains/:pattern?app_id=<app>&environment=<env>
+/// Withdraw a hostname grant.
 ///
 /// The pattern travels in the path because that is what it is - the name of
 /// the thing - and the grantee in the query because a pattern can be held by

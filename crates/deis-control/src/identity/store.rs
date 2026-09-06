@@ -478,41 +478,84 @@ impl IdentityStore {
             .map(|position| (Some(position.sort_value), position.identity))
             .unwrap_or((None, String::new()));
         let unscoped_only = filter.scope == TokenScopeFilter::Unscoped;
+        let columns = TOKEN_COLUMNS.replace(", ", ", t.");
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
-            let total = transaction.query_row(
-                "SELECT COUNT(*) FROM api_tokens t
-                  WHERE (?1 IS NULL OR t.account_id = ?1)
-                    AND (?2 = 1 OR t.revoked_at IS NULL)
-                    AND (?3 = 0 OR t.unscoped = 1)",
-                params![filter.account_id, filter.include_revoked, unscoped_only],
-                |row| row.get::<_, i64>(0),
-            )?;
-            let mut stmt = transaction.prepare(&format!(
-                "SELECT t.{}, a.name FROM api_tokens t
-                   JOIN accounts a ON a.id = t.account_id
-                  WHERE (?1 IS NULL OR t.account_id = ?1)
-                    AND (?2 = 1 OR t.revoked_at IS NULL)
-                    AND (?3 = 0 OR t.unscoped = 1)
-                    AND (?4 IS NULL OR t.created_at > ?4
-                         OR (t.created_at = ?4 AND t.id > ?5))
-                  ORDER BY t.created_at ASC, t.id ASC LIMIT ?6",
-                TOKEN_COLUMNS.replace(", ", ", t.")
-            ))?;
-            let rows = stmt
-                .query_map(
-                    params![
-                        filter.account_id,
-                        filter.include_revoked,
-                        unscoped_only,
-                        after_created_at,
-                        after_id,
-                        fetch_limit,
-                    ],
-                    read_token,
-                )?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
+            // One statement per account filter. Written as `(?1 IS NULL OR
+            // t.account_id = ?1)` the account is not an equality the planner
+            // can seek, so a per-account page would read every token on the
+            // platform in sort order; as a plain equality it seeks
+            // `idx_api_tokens_account_page_v1`, while the whole collection
+            // walks `idx_api_tokens_page_v1`. The revoked and unscoped
+            // filters are applied on top of the ordered walk either way.
+            // `pagination_plans` explains both statements.
+            let (rows, total) = match &filter.account_id {
+                Some(account_id) => {
+                    let total = transaction.query_row(
+                        "SELECT COUNT(*) FROM api_tokens t
+                          WHERE t.account_id = ?1
+                            AND (?2 = 1 OR t.revoked_at IS NULL)
+                            AND (?3 = 0 OR t.unscoped = 1)",
+                        params![account_id, filter.include_revoked, unscoped_only],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    let mut stmt = transaction.prepare(&format!(
+                        "SELECT t.{columns}, a.name FROM api_tokens t
+                           JOIN accounts a ON a.id = t.account_id
+                          WHERE t.account_id = ?1
+                            AND (?2 = 1 OR t.revoked_at IS NULL)
+                            AND (?3 = 0 OR t.unscoped = 1)
+                            AND (?4 IS NULL OR t.created_at > ?4
+                                 OR (t.created_at = ?4 AND t.id > ?5))
+                          ORDER BY t.created_at ASC, t.id ASC LIMIT ?6"
+                    ))?;
+                    let rows = stmt
+                        .query_map(
+                            params![
+                                account_id,
+                                filter.include_revoked,
+                                unscoped_only,
+                                after_created_at,
+                                after_id,
+                                fetch_limit,
+                            ],
+                            read_token,
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (rows, total)
+                }
+                None => {
+                    let total = transaction.query_row(
+                        "SELECT COUNT(*) FROM api_tokens t
+                          WHERE (?1 = 1 OR t.revoked_at IS NULL)
+                            AND (?2 = 0 OR t.unscoped = 1)",
+                        params![filter.include_revoked, unscoped_only],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    let mut stmt = transaction.prepare(&format!(
+                        "SELECT t.{columns}, a.name FROM api_tokens t
+                           JOIN accounts a ON a.id = t.account_id
+                          WHERE (?1 = 1 OR t.revoked_at IS NULL)
+                            AND (?2 = 0 OR t.unscoped = 1)
+                            AND (?3 IS NULL OR t.created_at > ?3
+                                 OR (t.created_at = ?3 AND t.id > ?4))
+                          ORDER BY t.created_at ASC, t.id ASC LIMIT ?5"
+                    ))?;
+                    let rows = stmt
+                        .query_map(
+                            params![
+                                filter.include_revoked,
+                                unscoped_only,
+                                after_created_at,
+                                after_id,
+                                fetch_limit,
+                            ],
+                            read_token,
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (rows, total)
+                }
+            };
             transaction.commit()?;
             Ok(finish_page(rows, limit, total, "tokens")?)
         })

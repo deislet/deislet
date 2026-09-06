@@ -130,6 +130,7 @@ impl ProviderDeploymentReconciler {
                     waiting = summary.waiting,
                     succeeded = summary.succeeded,
                     failed = summary.failed,
+                    cancelled = summary.cancelled,
                     errors = summary.errors,
                     "Provider deployment dispatch pass finished"
                 ),
@@ -173,6 +174,10 @@ impl ProviderDeploymentReconciler {
                         DispatchOutcome::Failed => warn!(
                             %operation_id,
                             "Provider deployment reached its durable terminal failure state"
+                        ),
+                        DispatchOutcome::Cancelled => info!(
+                            %operation_id,
+                            "Provider deployment cancel request ran to completion"
                         ),
                         DispatchOutcome::Busy
                         | DispatchOutcome::Advanced
@@ -230,6 +235,9 @@ enum DispatchOutcome {
     Waiting,
     Succeeded,
     Failed,
+    /// A cancel request settled its in-flight work and cleanup and the
+    /// workflow ended `cancelled`.
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -241,6 +249,7 @@ struct DispatchPassSummary {
     waiting: usize,
     succeeded: usize,
     failed: usize,
+    cancelled: usize,
     errors: usize,
 }
 
@@ -252,6 +261,7 @@ impl DispatchPassSummary {
             DispatchOutcome::Waiting => self.waiting += 1,
             DispatchOutcome::Succeeded => self.succeeded += 1,
             DispatchOutcome::Failed => self.failed += 1,
+            DispatchOutcome::Cancelled => self.cancelled += 1,
         }
     }
 }
@@ -314,6 +324,7 @@ impl ProviderDeploymentExecutor for CatalogProviderDeploymentExecutor {
                 ProviderDeploymentDriveOutcome::Waiting(_) => DispatchOutcome::Waiting,
                 ProviderDeploymentDriveOutcome::Succeeded(_) => DispatchOutcome::Succeeded,
                 ProviderDeploymentDriveOutcome::Failed(_) => DispatchOutcome::Failed,
+                ProviderDeploymentDriveOutcome::Cancelled(_) => DispatchOutcome::Cancelled,
             },
         )
     }
@@ -385,6 +396,45 @@ mod tests {
         assert_eq!(summary.advanced, 5);
         assert_eq!(executor.peak.load(Ordering::SeqCst), 2);
         assert_eq!(executor.owners.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_completed_cancel_is_counted_apart_from_failures() {
+        struct CancellingExecutor {
+            operation: CanonicalId,
+        }
+
+        #[async_trait]
+        impl ProviderDeploymentExecutor for CancellingExecutor {
+            async fn ready_operation_ids(
+                &self,
+                _now: DateTime<Utc>,
+                _retry_delay: Duration,
+                _limit: usize,
+            ) -> CatalogResult<Vec<CanonicalId>> {
+                Ok(vec![self.operation])
+            }
+
+            async fn drive_once(
+                &self,
+                _operation_id: CanonicalId,
+                _owner_id: CanonicalId,
+            ) -> CatalogResult<DispatchOutcome> {
+                Ok(DispatchOutcome::Cancelled)
+            }
+        }
+
+        let reconciler = ProviderDeploymentReconciler::for_test(
+            Arc::new(CancellingExecutor {
+                operation: CanonicalId::new_v7(),
+            }),
+            ProviderDeploymentReconcilerConfig::normalized(1, 30, 1),
+        );
+        let summary = reconciler.dispatch_once().await.unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.cancelled, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.succeeded, 0);
     }
 
     #[tokio::test]

@@ -39,7 +39,9 @@
             "provider-installation-has-dependents",
             "provider-installation-in-use",
             "provider-target-in-use",
-            "provider-resource-deleted"
+            "provider-resource-deleted",
+            "operation-not-cancellable",
+            "operation-not-rollbackable"
           ]
         },
         "message": {

@@ -64,8 +64,8 @@ pub use compatibility::{
 pub use deis_bundle::Manifest as BundleManifest;
 pub use domains::{ClaimRefusal, DomainGrant, GrantPattern, HostClaim};
 pub use idempotency::{
-    IdempotencyGuard, IdempotencyOutcome, IdempotencyScope, IdempotencyStore, IdempotentRequest,
-    IdempotentResource, PendingIdempotencyRecord, StoredIdempotentResponse,
+    IdempotencyDigestKey, IdempotencyGuard, IdempotencyOutcome, IdempotencyScope, IdempotencyStore,
+    IdempotentRequest, IdempotentResource, PendingIdempotencyRecord, StoredIdempotentResponse,
     complete_idempotency_record,
 };
 pub use identity_migration::{
@@ -82,7 +82,9 @@ pub use model::{
     Environment, ProviderDerivation, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
-pub use pagination::{CatalogPage, PageCursorStatistics, PageCursorStore, PagePosition};
+pub use pagination::{
+    CatalogPage, INVALID_CURSOR_MESSAGE, PageCursorStatistics, PageCursorStore, PagePosition,
+};
 pub use provider_credential::{
     CatalogProviderCredentialVault, ProviderCredentialAuditEvent, ProviderCredentialBinding,
     ProviderCredentialBindingSpec, ProviderCredentialMutationContext,
@@ -91,9 +93,11 @@ pub use provider_deployment_reconciler::{
     ProviderDeploymentReconciler, ProviderDeploymentReconcilerConfig,
 };
 pub use provider_driver_operation::{
-    PROVIDER_DEPLOYMENT_STEPS, ProviderDeploymentDriveOutcome, ProviderDeploymentSpec,
-    ProviderDeploymentStep, ProviderDeploymentWorkflow, ProviderDriverOperationRecord,
-    ProviderInstallation, ProviderInstallationSpec, ProviderTarget, ProviderTargetSpec,
+    OPERATION_NOT_CANCELLABLE, OPERATION_NOT_ROLLBACKABLE, PROVIDER_DEPLOYMENT_STEPS,
+    PROVIDER_ROLLBACK_STEPS, ProviderDeploymentCancellation, ProviderDeploymentDriveOutcome,
+    ProviderDeploymentSpec, ProviderDeploymentStep, ProviderDeploymentWorkflow,
+    ProviderDriverOperationRecord, ProviderInstallation, ProviderInstallationSpec,
+    ProviderRollbackSpec, ProviderTarget, ProviderTargetSpec, ProviderWorkflowKind,
 };
 pub use provider_driver_release::{
     ProviderDriverDispatcher, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
@@ -109,7 +113,7 @@ pub use provider_target_grant::{
     ProviderTargetGrantMutationContext, ProviderTargetGrantRevocationReason,
     ProviderTargetGrantSpec, ProviderTargetGrantStatusFilter,
 };
-pub use secrets::{SecretCipher, SecretsBackend};
+pub use secrets::{DerivedKey, SecretCipher, SecretsBackend};
 pub use store::{
     BundlePathRepair, CatalogStore, DeploymentPlanSpec, ProviderDerivationSpec, SecretHeadChange,
     domain_grant_cursor_secondary,

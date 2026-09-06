@@ -206,7 +206,7 @@ pub struct DeploymentPlanResponse {
     pub drain_observations: Vec<DeploymentDrainObservation>,
 }
 
-/// POST /api/apps/:app_id/environments/:env/deployments
+/// Deploy a version to an environment.
 ///
 /// Build the exact payload, persist a plan and snapshot, prepare every frozen
 /// runtime and trigger, then commit the pointer before activating them. An
@@ -290,7 +290,7 @@ pub async fn deploy(
     ))
 }
 
-/// POST /api/apps/:app_id/environments/:env/rollback
+/// Roll an environment back to an earlier version.
 ///
 /// Coordinate a new immutable deployment aimed at an older version and its
 /// historical binding snapshot. The current pointer is changed only after
@@ -444,7 +444,7 @@ pub(super) fn deployment_plan_location(
     headers
 }
 
-/// GET /api/apps/:app_id/environments/:env/deployment
+/// Read what an environment is running.
 ///
 /// The current version of an environment: the newest pointer row.
 #[utoipa::path(
@@ -482,7 +482,7 @@ pub async fn current_deployment(
     Ok(Json(response(&env, Some(deployment), &version, None, plan)))
 }
 
-/// GET /api/deployment-plans/:id
+/// Read a deployment plan and what every node observed of it.
 #[utoipa::path(
     get,
     path = "/api/v1/deployment-plans/{id}",
@@ -555,7 +555,7 @@ async fn deployment_plan_response(
     })
 }
 
-/// GET /api/apps/:app_id/environments/:env/deployments
+/// List an environment's deployment history, newest first.
 ///
 /// The pointer history of one environment, newest first. Every row is a
 /// deployment or a rollback; nothing is ever rewritten, so paging through

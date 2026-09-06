@@ -28,6 +28,16 @@ const TOKEN_TEXT_BYTES: usize = 43;
 /// How long an issued cursor stays resolvable. Public contract
 /// (docs/adr/016, list and query section): three days.
 pub const CURSOR_TTL_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+/// What every refusal of a cursor says, whichever way it failed: a token
+/// that is not one of ours, one that expired, and one issued for another
+/// collection or another set of filters are one answer on purpose, because
+/// telling them apart would say whether a guessed token exists.
+///
+/// One sentence in one place: it is the legacy body of every list route
+/// that refuses a cursor, and `crate::api::error` reads it to answer
+/// `cursor-invalid` on the structured surfaces without the message moving.
+pub const INVALID_CURSOR_MESSAGE: &str = "cursor is invalid, expired, or belongs to another query";
 const MAX_COLLECTION_BYTES: usize = 128;
 /// Upper bound for each textual keyset component. Identities are canonical
 /// ids today, but a secondary sort column may carry a display name or a
@@ -341,7 +351,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn invalid_cursor() -> CatalogError {
-    CatalogError::invalid("cursor is invalid, expired, or belongs to another query")
+    CatalogError::invalid(INVALID_CURSOR_MESSAGE)
 }
 
 #[cfg(test)]
