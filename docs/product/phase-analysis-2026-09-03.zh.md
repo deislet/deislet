@@ -2515,6 +2515,10 @@ Application/framework source + versioned build plan
 - 本机完整门禁通过 Control lib 484/484、API integration 14/14、architecture 2/2、docs witness 6/6、fleet credential
   2/2、严格 Control all-target Clippy、共享契约与产品治理。精确提交及三平台同归档复验尚未登记，因此本节不把本机结果
   写成跨平台 evidence。
+- 首次推送的实现提交 `0d6c1e132264e702e8a3813a2703cb442a8e34fa` 因使用显式 staging 清单，遗漏两份仍为 untracked 的
+  `api/pagination.rs` 与 `catalog/pagination.rs`；该历史提交单独检出时无法编译。推送后的强制 worktree 核对立即发现并由
+  `24e8d6f0aa0ac6b1f24eeef1cd73664315bc7ac4` 补齐，未改动已验证实现内容。后续精确 archive 只能从包含两项提交的最终
+  source commit 生成，不能把 `0d6c1e1` 单独作为通过证据；这一 packaging failure 不从记录中抹去。
 - 这是 v1 冻结前的有意归一化，现有未带显式 major 的 provider list response 因此发生形状变化；不能把这次变化带入已发布
   稳定 major。其余 Control 列表、OpenAPI/generated client、breaking-change gate 和显式 `/api/v1` 路由仍未完成，统一分页
   只能登记为 provider 首批闭环，`P1-DEPLOY-001` 与 ADR-016 整体继续 active。通用 mutation 幂等、完整 lifecycle、CLI/Web、
