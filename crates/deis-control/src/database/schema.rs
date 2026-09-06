@@ -3012,6 +3012,33 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
                                                 CHECK(state IN ('queued', 'running', 'waiting',
                                                                 'succeeded', 'failed')),
             next_step_index            INTEGER NOT NULL CHECK(next_step_index BETWEEN 0 AND 7),
+            dispatch_not_before        INTEGER,
+            dispatch_failure_count     INTEGER NOT NULL DEFAULT 0
+                                                CHECK(dispatch_failure_count >= 0),
+            dispatch_failure_child_operation_id TEXT
+                                                CHECK(
+                                                  dispatch_failure_child_operation_id IS NULL OR
+                                                  (length(dispatch_failure_child_operation_id) = 36
+                                                   AND lower(dispatch_failure_child_operation_id) =
+                                                     dispatch_failure_child_operation_id
+                                                   AND substr(dispatch_failure_child_operation_id,
+                                                              15, 1) = '7'
+                                                   AND substr(dispatch_failure_child_operation_id,
+                                                              20, 1) GLOB '[89ab]'
+                                                   AND length(replace(
+                                                     dispatch_failure_child_operation_id,
+                                                     '-', '')) = 32
+                                                   AND replace(
+                                                     dispatch_failure_child_operation_id,
+                                                     '-', '') NOT GLOB '*[^0-9a-f]*')),
+            last_dispatch_error_code   TEXT
+                                                CHECK(last_dispatch_error_code IS NULL OR
+                                                  length(last_dispatch_error_code)
+                                                    BETWEEN 2 AND 64),
+            last_dispatch_error_message TEXT
+                                                CHECK(last_dispatch_error_message IS NULL OR
+                                                  length(last_dispatch_error_message)
+                                                    BETWEEN 1 AND 2048),
             revision                   INTEGER NOT NULL CHECK(revision >= 1),
             created_at                 INTEGER NOT NULL,
             updated_at                 INTEGER NOT NULL,
@@ -3065,7 +3092,17 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
               AND lower(desired_state_sha256) = desired_state_sha256
               AND desired_state_sha256 NOT GLOB '*[^0-9a-f]*'),
             CHECK((state = 'succeeded' AND next_step_index = 7)
-               OR state != 'succeeded')
+               OR state != 'succeeded'),
+            CHECK((dispatch_failure_count = 0
+                    AND dispatch_not_before IS NULL
+                    AND dispatch_failure_child_operation_id IS NULL
+                    AND last_dispatch_error_code IS NULL
+                    AND last_dispatch_error_message IS NULL)
+               OR (dispatch_failure_count >= 1
+                    AND dispatch_not_before IS NOT NULL
+                    AND dispatch_failure_child_operation_id IS NOT NULL
+                    AND last_dispatch_error_code IS NOT NULL
+                    AND last_dispatch_error_message IS NOT NULL))
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_deployment_one_active_target
@@ -3143,6 +3180,7 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         END;
         "#,
     )?;
+    ensure_provider_deployment_dispatch_columns(conn)?;
     let quarantined = conn.execute(
         "UPDATE provider_installations
             SET status = 'revoked', revision = revision + 1,
@@ -3194,6 +3232,100 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             "Disabled legacy provider targets that have no signed and transparently logged verified driver release"
         );
     }
+    Ok(())
+}
+
+fn ensure_provider_deployment_dispatch_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(provider_deployment_workflows)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "dispatch_not_before") {
+        conn.execute(
+            "ALTER TABLE provider_deployment_workflows ADD COLUMN dispatch_not_before INTEGER",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|name| name == "dispatch_failure_count") {
+        conn.execute(
+            "ALTER TABLE provider_deployment_workflows ADD COLUMN dispatch_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_failure_count >= 0)",
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|name| name == "dispatch_failure_child_operation_id")
+    {
+        conn.execute(
+            "ALTER TABLE provider_deployment_workflows ADD COLUMN dispatch_failure_child_operation_id TEXT CHECK(dispatch_failure_child_operation_id IS NULL OR (length(dispatch_failure_child_operation_id) = 36 AND lower(dispatch_failure_child_operation_id) = dispatch_failure_child_operation_id AND substr(dispatch_failure_child_operation_id, 15, 1) = '7' AND substr(dispatch_failure_child_operation_id, 20, 1) GLOB '[89ab]' AND length(replace(dispatch_failure_child_operation_id, '-', '')) = 32 AND replace(dispatch_failure_child_operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'))",
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|name| name == "last_dispatch_error_code")
+    {
+        conn.execute(
+            "ALTER TABLE provider_deployment_workflows ADD COLUMN last_dispatch_error_code TEXT CHECK(last_dispatch_error_code IS NULL OR length(last_dispatch_error_code) BETWEEN 2 AND 64)",
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|name| name == "last_dispatch_error_message")
+    {
+        conn.execute(
+            "ALTER TABLE provider_deployment_workflows ADD COLUMN last_dispatch_error_message TEXT CHECK(last_dispatch_error_message IS NULL OR length(last_dispatch_error_message) BETWEEN 1 AND 2048)",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_provider_deployment_dispatch_ready_v1
+            ON provider_deployment_workflows(state, dispatch_not_before,
+                                             updated_at, operation_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_dispatch_backoff_insert_v1
+        BEFORE INSERT ON provider_deployment_workflows
+        WHEN NOT (
+             (NEW.dispatch_failure_count = 0
+              AND NEW.dispatch_not_before IS NULL
+              AND NEW.dispatch_failure_child_operation_id IS NULL
+              AND NEW.last_dispatch_error_code IS NULL
+              AND NEW.last_dispatch_error_message IS NULL)
+          OR (NEW.dispatch_failure_count >= 1
+              AND NEW.dispatch_not_before IS NOT NULL
+              AND NEW.dispatch_failure_child_operation_id IS NOT NULL
+              AND NEW.last_dispatch_error_code IS NOT NULL
+              AND NEW.last_dispatch_error_message IS NOT NULL)
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid provider deployment dispatch backoff');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_dispatch_backoff_v1
+        BEFORE UPDATE OF dispatch_not_before, dispatch_failure_count,
+                         dispatch_failure_child_operation_id,
+                         last_dispatch_error_code, last_dispatch_error_message,
+                         updated_at
+        ON provider_deployment_workflows
+        WHEN NOT (
+             (NEW.dispatch_failure_count = 0
+              AND NEW.dispatch_not_before IS NULL
+              AND NEW.dispatch_failure_child_operation_id IS NULL
+              AND NEW.last_dispatch_error_code IS NULL
+              AND NEW.last_dispatch_error_message IS NULL)
+          OR (NEW.dispatch_failure_count >= 1
+              AND NEW.dispatch_not_before IS NOT NULL
+              AND NEW.dispatch_failure_child_operation_id IS NOT NULL
+              AND NEW.last_dispatch_error_code IS NOT NULL
+              AND NEW.last_dispatch_error_message IS NOT NULL)
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid provider deployment dispatch backoff');
+        END;
+        "#,
+    )?;
     Ok(())
 }
 
@@ -5007,5 +5139,90 @@ mod tests {
             .unwrap();
         assert!(columns.iter().any(|name| name == "active_deployment_id"));
         assert!(columns.iter().any(|name| name == "pending_deployment_id"));
+    }
+
+    #[test]
+    fn provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE provider_deployment_workflows (
+                operation_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                next_step_index INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO provider_deployment_workflows
+                (operation_id, state, next_step_index, revision, updated_at)
+            VALUES ('legacy-operation', 'running', 0, 1, 10);",
+        )
+        .unwrap();
+
+        ensure_provider_deployment_dispatch_columns(&conn).unwrap();
+        ensure_provider_deployment_dispatch_columns(&conn).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(provider_deployment_workflows)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        for expected in [
+            "dispatch_not_before",
+            "dispatch_failure_count",
+            "dispatch_failure_child_operation_id",
+            "last_dispatch_error_code",
+            "last_dispatch_error_message",
+        ] {
+            assert!(columns.iter().any(|name| name == expected));
+        }
+        let legacy: (
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT dispatch_not_before, dispatch_failure_count,
+                        dispatch_failure_child_operation_id,
+                        last_dispatch_error_code, last_dispatch_error_message
+                   FROM provider_deployment_workflows
+                  WHERE operation_id = 'legacy-operation'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(legacy, (None, 0, None, None, None));
+        assert!(
+            conn.execute(
+                "UPDATE provider_deployment_workflows
+                    SET dispatch_failure_count = 1, revision = 2, updated_at = 11
+                  WHERE operation_id = 'legacy-operation'",
+                [],
+            )
+            .is_err(),
+            "database accepted a partial dispatch backoff"
+        );
+        let child_operation_id = CanonicalId::new_v7().to_string();
+        conn.execute(
+            "UPDATE provider_deployment_workflows
+                SET dispatch_not_before = 41, dispatch_failure_count = 1,
+                    dispatch_failure_child_operation_id = ?1,
+                    last_dispatch_error_code = 'CATALOG_INVALID',
+                    last_dispatch_error_message = 'release temporarily unavailable',
+                    revision = 2, updated_at = 11
+              WHERE operation_id = 'legacy-operation'",
+            [child_operation_id],
+        )
+        .unwrap();
     }
 }

@@ -33,6 +33,9 @@ use super::provider_driver_release::ProviderDriverDispatcher;
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
 
+const MAX_PROVIDER_DISPATCH_BACKOFF_SECONDS: u64 = 3_600;
+const MAX_PROVIDER_DISPATCH_ERROR_CHARS: usize = 2_048;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderInstallationSpec {
     pub backend_id: String,
@@ -143,6 +146,11 @@ pub struct ProviderDeploymentWorkflow {
     pub artifact: ArtifactVersionRef,
     pub plan: ProviderNeutralPlan,
     pub next_step_index: usize,
+    pub dispatch_not_before: Option<DateTime<Utc>>,
+    pub dispatch_failure_count: u64,
+    pub dispatch_failure_child_operation_id: Option<CanonicalId>,
+    pub last_dispatch_error_code: Option<String>,
+    pub last_dispatch_error_message: Option<String>,
     pub steps: Vec<ProviderDeploymentStep>,
 }
 
@@ -585,9 +593,25 @@ impl CatalogStore {
         retry_delay: Duration,
         limit: usize,
     ) -> CatalogResult<Vec<CanonicalId>> {
+        self.provider_deployments_ready_for_dispatch_with_page_size(now, retry_delay, limit, 1_000)
+            .await
+    }
+
+    async fn provider_deployments_ready_for_dispatch_with_page_size(
+        &self,
+        now: DateTime<Utc>,
+        retry_delay: Duration,
+        limit: usize,
+        scan_page_size: usize,
+    ) -> CatalogResult<Vec<CanonicalId>> {
         if !(1..=1_000).contains(&limit) {
             return Err(CatalogError::invalid(
                 "provider deployment dispatch limit must be between 1 and 1000",
+            ));
+        }
+        if !(1..=1_000).contains(&scan_page_size) {
+            return Err(CatalogError::invalid(
+                "provider deployment dispatch scan page must be between 1 and 1000",
             ));
         }
         let retry_seconds = i64::try_from(retry_delay.as_secs()).map_err(|_| {
@@ -596,55 +620,103 @@ impl CatalogStore {
         let now = now.timestamp();
         self.database()
             .with_connection(move |connection| {
-                let mut statement = connection.prepare(
-                    "SELECT operation_id FROM provider_deployment_workflows
-                      WHERE state NOT IN ('succeeded', 'failed')
-                      ORDER BY updated_at, operation_id LIMIT 1000",
-                )?;
-                let ids = statement
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
+                let transaction = connection.unchecked_transaction()?;
                 let mut ready = Vec::with_capacity(limit);
-                for id in ids {
-                    let operation_id = parse_id(&id, "provider deployment operation")?;
-                    let workflow = load_provider_deployment_workflow(connection, operation_id)?
-                        .ok_or_else(|| {
-                            CatalogError::not_found(format!(
-                                "provider deployment operation {operation_id}"
-                            ))
-                        })?;
-                    let child_id = workflow
-                        .steps
-                        .get(workflow.next_step_index)
-                        .ok_or_else(|| {
-                            CatalogError::invalid(format!(
-                                "provider deployment {operation_id} has no current child"
-                            ))
-                        })?
-                        .child_operation_id;
-                    let child = load_claim_row(connection, child_id)?.ok_or_else(|| {
-                        CatalogError::not_found(format!("provider operation {child_id}"))
-                    })?;
-                    let execution = claim_execution_operation(&child, now)?;
-                    let due = match (child.state, execution) {
-                        (ProviderOperationState::Running, None) => false,
-                        (
-                            ProviderOperationState::Failed | ProviderOperationState::Unknown,
-                            Some(_),
-                        ) => child.updated_at.saturating_add(retry_seconds) <= now,
-                        // Pending and expired-running work can run immediately.
-                        // A succeeded or terminally failed child is also ready:
-                        // the drive call folds that durable result into the parent
-                        // without invoking a provider.
-                        _ => true,
+                let page_size = i64::try_from(scan_page_size).map_err(|_| {
+                    CatalogError::invalid("provider deployment scan page exceeds SQLite range")
+                })?;
+                let mut cursor: Option<(i64, String)> = None;
+                loop {
+                    let page = if let Some((updated_at, operation_id)) = cursor.as_ref() {
+                        let mut statement = transaction.prepare(
+                            "SELECT operation_id, updated_at
+                               FROM provider_deployment_workflows
+                              WHERE state NOT IN ('succeeded', 'failed')
+                                AND (updated_at > ?1
+                                     OR (updated_at = ?1 AND operation_id > ?2))
+                              ORDER BY updated_at, operation_id
+                              LIMIT ?3",
+                        )?;
+                        statement
+                            .query_map(params![updated_at, operation_id, page_size], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        let mut statement = transaction.prepare(
+                            "SELECT operation_id, updated_at
+                               FROM provider_deployment_workflows
+                              WHERE state NOT IN ('succeeded', 'failed')
+                              ORDER BY updated_at, operation_id
+                              LIMIT ?1",
+                        )?;
+                        statement
+                            .query_map([page_size], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?
                     };
-                    if due {
-                        ready.push(operation_id);
-                        if ready.len() == limit {
-                            break;
+                    if page.is_empty() {
+                        break;
+                    }
+                    cursor = page
+                        .last()
+                        .map(|(id, updated_at)| (*updated_at, id.clone()));
+                    let last_page = page.len() < scan_page_size;
+                    for (id, _) in page {
+                        let operation_id = parse_id(&id, "provider deployment operation")?;
+                        let workflow =
+                            load_provider_deployment_workflow(&transaction, operation_id)?
+                                .ok_or_else(|| {
+                                    CatalogError::not_found(format!(
+                                        "provider deployment operation {operation_id}"
+                                    ))
+                                })?;
+                        let child_id = workflow
+                            .steps
+                            .get(workflow.next_step_index)
+                            .ok_or_else(|| {
+                                CatalogError::invalid(format!(
+                                    "provider deployment {operation_id} has no current child"
+                                ))
+                            })?
+                            .child_operation_id;
+                        if workflow.dispatch_failure_child_operation_id == Some(child_id)
+                            && workflow
+                                .dispatch_not_before
+                                .is_some_and(|not_before| not_before.timestamp() > now)
+                        {
+                            continue;
+                        }
+                        let child = load_claim_row(&transaction, child_id)?.ok_or_else(|| {
+                            CatalogError::not_found(format!("provider operation {child_id}"))
+                        })?;
+                        let execution = claim_execution_operation(&child, now)?;
+                        let due = match (child.state, execution) {
+                            (ProviderOperationState::Running, None) => false,
+                            (
+                                ProviderOperationState::Failed | ProviderOperationState::Unknown,
+                                Some(_),
+                            ) => child.updated_at.saturating_add(retry_seconds) <= now,
+                            // Pending and expired-running work can run immediately.
+                            // A succeeded or terminally failed child is also ready:
+                            // the drive call folds that durable result into the parent
+                            // without invoking a provider.
+                            _ => true,
+                        };
+                        if due {
+                            ready.push(operation_id);
+                            if ready.len() == limit {
+                                transaction.commit()?;
+                                return Ok(ready);
+                            }
                         }
                     }
+                    if last_page {
+                        break;
+                    }
                 }
+                transaction.commit()?;
                 Ok(ready)
             })
             .await
@@ -659,6 +731,7 @@ impl CatalogStore {
         owner_id: CanonicalId,
         dispatcher: &ProviderDriverDispatcher,
         config: DriverOrchestratorConfig,
+        selection_retry_delay: Duration,
     ) -> CatalogResult<ProviderDeploymentDriveOutcome> {
         if !dispatcher.belongs_to(self) {
             return Err(CatalogError::invalid(
@@ -666,10 +739,175 @@ impl CatalogStore {
             ));
         }
         let workflow = self.prepare_provider_deployment(operation_id).await?;
-        let driver = dispatcher
+        if workflow.operation.state.terminal() {
+            return Ok(classify_provider_deployment(workflow));
+        }
+        let child_operation_id = workflow
+            .steps
+            .get(workflow.next_step_index)
+            .ok_or_else(|| {
+                CatalogError::invalid(format!(
+                    "provider deployment {operation_id} has no current durable step"
+                ))
+            })?
+            .child_operation_id;
+        let driver = match dispatcher
             .driver_for_target(workflow.provider_target_id)
+            .await
+        {
+            Ok(driver) => driver,
+            Err(error) => {
+                self.defer_provider_deployment_dispatch(
+                    operation_id,
+                    child_operation_id,
+                    selection_retry_delay,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        if let Some(failure_child_operation_id) = workflow.dispatch_failure_child_operation_id {
+            self.clear_provider_deployment_dispatch_backoff(
+                operation_id,
+                failure_child_operation_id,
+            )
             .await?;
+        }
         self.drive_prepared_provider_deployment_once(workflow, owner_id, &driver, config)
+            .await
+    }
+
+    async fn defer_provider_deployment_dispatch(
+        &self,
+        operation_id: CanonicalId,
+        child_operation_id: CanonicalId,
+        retry_delay: Duration,
+        error: &CatalogError,
+    ) -> CatalogResult<()> {
+        let base_delay = retry_delay
+            .as_secs()
+            .clamp(1, MAX_PROVIDER_DISPATCH_BACKOFF_SECONDS);
+        let error_code = catalog_error_code(error).to_owned();
+        let error_message = error
+            .to_string()
+            .chars()
+            .take(MAX_PROVIDER_DISPATCH_ERROR_CHARS)
+            .collect::<String>();
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let (state, persisted_failures, failure_child, next_step_index): (
+                    String,
+                    i64,
+                    Option<String>,
+                    i64,
+                ) = transaction
+                    .query_row(
+                        "SELECT state, dispatch_failure_count,
+                                dispatch_failure_child_operation_id, next_step_index
+                           FROM provider_deployment_workflows
+                          WHERE operation_id = ?1",
+                        [operation_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        CatalogError::not_found(format!(
+                            "provider deployment operation {operation_id}"
+                        ))
+                    })?;
+                let state = parse_deployment_operation_state(&state)?;
+                if state.terminal() {
+                    transaction.commit()?;
+                    return Ok(());
+                }
+                let step = usize::try_from(next_step_index)
+                    .ok()
+                    .and_then(|index| PROVIDER_DEPLOYMENT_STEPS.get(index))
+                    .ok_or_else(|| {
+                        CatalogError::invalid("provider deployment dispatch step is invalid")
+                    })?;
+                let current_child: String = transaction
+                    .query_row(
+                        "SELECT child_operation_id FROM provider_deployment_steps
+                          WHERE parent_operation_id = ?1 AND sequence = ?2",
+                        params![operation_id.to_string(), next_step_index],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        CatalogError::not_found(format!(
+                            "provider deployment {operation_id} current child"
+                        ))
+                    })?;
+                if current_child != child_operation_id.to_string() {
+                    transaction.commit()?;
+                    return Ok(());
+                }
+                let child = load_claim_row(&transaction, child_operation_id)?.ok_or_else(|| {
+                    CatalogError::not_found(format!("provider operation {child_operation_id}"))
+                })?;
+                if claim_execution_operation(&child, now_secs())?.is_none() {
+                    transaction.commit()?;
+                    return Ok(());
+                }
+                let failures = if failure_child.as_deref() == Some(current_child.as_str()) {
+                    to_u64(persisted_failures, "provider dispatch failure count")?
+                } else {
+                    0
+                };
+                let exponent = failures.min(6);
+                let multiplier = 1_u64 << exponent;
+                let delay = base_delay
+                    .saturating_mul(multiplier)
+                    .min(MAX_PROVIDER_DISPATCH_BACKOFF_SECONDS);
+                let now = now_secs();
+                let not_before = now.saturating_add(i64::try_from(delay).map_err(|_| {
+                    CatalogError::invalid("provider dispatch retry delay exceeds timestamp range")
+                })?);
+                let next_failures = i64::try_from(failures.saturating_add(1)).unwrap_or(i64::MAX);
+                ensure_parent_waiting_tx(&transaction, operation_id, step.as_str())?;
+                let changed = transaction.execute(
+                    "UPDATE provider_deployment_workflows
+                        SET state = 'waiting', dispatch_not_before = ?2,
+                            dispatch_failure_count = ?3,
+                            dispatch_failure_child_operation_id = ?4,
+                            last_dispatch_error_code = ?5,
+                            last_dispatch_error_message = ?6,
+                            revision = revision + 1, updated_at = ?7
+                      WHERE operation_id = ?1
+                        AND state IN ('running', 'waiting')",
+                    params![
+                        operation_id.to_string(),
+                        not_before,
+                        next_failures,
+                        child_operation_id.to_string(),
+                        error_code,
+                        error_message,
+                        now,
+                    ],
+                )?;
+                ensure_parent_change(changed, operation_id, "record dispatch backoff")?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn clear_provider_deployment_dispatch_backoff(
+        &self,
+        operation_id: CanonicalId,
+        child_operation_id: CanonicalId,
+    ) -> CatalogResult<()> {
+        self.database()
+            .with_connection(move |connection| {
+                clear_provider_deployment_dispatch_backoff_tx(
+                    connection,
+                    operation_id,
+                    child_operation_id,
+                )
+            })
             .await
     }
 
@@ -1006,7 +1244,10 @@ fn load_provider_deployment_workflow(
             "SELECT application_id, environment_id, provider_target_id, target_revision,
                     artifact_version_id, canonical_artifact_sha256,
                     provider_payload_sha256, desired_state_sha256,
-                    desired_state_json, plan_json, state, next_step_index
+                    desired_state_json, plan_json, state, next_step_index,
+                    dispatch_not_before, dispatch_failure_count,
+                    dispatch_failure_child_operation_id,
+                    last_dispatch_error_code, last_dispatch_error_message
                FROM provider_deployment_workflows WHERE operation_id = ?1",
             [operation_id.to_string()],
             |row| {
@@ -1023,6 +1264,11 @@ fn load_provider_deployment_workflow(
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
                     row.get::<_, i64>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
                 ))
             },
         )
@@ -1068,6 +1314,31 @@ fn load_provider_deployment_workflow(
     let next_step_index = usize::try_from(row.11).map_err(|_| {
         CatalogError::invalid(format!("invalid provider deployment step index {}", row.11))
     })?;
+    let dispatch_not_before = row
+        .12
+        .map(|value| timestamp(value, "provider deployment dispatch not-before"))
+        .transpose()?;
+    let dispatch_failure_count = to_u64(row.13, "provider deployment dispatch failure count")?;
+    let dispatch_failure_child_operation_id = row
+        .14
+        .as_deref()
+        .map(|value| parse_id(value, "provider deployment dispatch failure child"))
+        .transpose()?;
+    let backoff_complete = dispatch_not_before.is_some()
+        && dispatch_failure_child_operation_id.is_some()
+        && row.15.as_ref().is_some_and(|value| !value.is_empty())
+        && row.16.as_ref().is_some_and(|value| !value.is_empty());
+    if (dispatch_failure_count == 0
+        && (dispatch_not_before.is_some()
+            || dispatch_failure_child_operation_id.is_some()
+            || row.15.is_some()
+            || row.16.is_some()))
+        || (dispatch_failure_count > 0 && !backoff_complete)
+    {
+        return Err(CatalogError::invalid(
+            "provider deployment has an incomplete dispatch backoff record",
+        ));
+    }
     let operation = load_operation_tx(connection, operation_id)?
         .ok_or_else(|| CatalogError::not_found(format!("operation {operation_id}")))?;
     if operation.kind != OperationKind::Deploy
@@ -1126,6 +1397,18 @@ fn load_provider_deployment_workflow(
             child_operation_id: parse_id(&row.2, "provider deployment child")?,
         });
     }
+    if dispatch_failure_child_operation_id
+        .is_some_and(|child_id| !steps.iter().any(|step| step.child_operation_id == child_id))
+    {
+        return Err(CatalogError::invalid(
+            "provider deployment dispatch backoff names an unrelated child",
+        ));
+    }
+    if workflow_state.terminal() && dispatch_failure_count > 0 {
+        return Err(CatalogError::invalid(
+            "terminal provider deployment retained a dispatch backoff",
+        ));
+    }
     if (workflow_state == OperationState::Succeeded
         && (next_step_index != PROVIDER_DEPLOYMENT_STEPS.len()
             || steps.len() != PROVIDER_DEPLOYMENT_STEPS.len()))
@@ -1150,6 +1433,11 @@ fn load_provider_deployment_workflow(
         artifact,
         plan,
         next_step_index,
+        dispatch_not_before,
+        dispatch_failure_count,
+        dispatch_failure_child_operation_id,
+        last_dispatch_error_code: row.15,
+        last_dispatch_error_message: row.16,
         steps,
     }))
 }
@@ -1179,6 +1467,11 @@ fn advance_provider_deployment_tx(
     sync_parent_provider_details_tx(connection, operation_id)?;
     match child.state {
         OperationState::Succeeded => {
+            clear_provider_deployment_dispatch_backoff_tx(
+                connection,
+                operation_id,
+                step.child_operation_id,
+            )?;
             let next_index = workflow.next_step_index + 1;
             ensure_parent_running_tx(
                 connection,
@@ -1263,6 +1556,11 @@ fn advance_provider_deployment_tx(
             }
         }
         OperationState::Failed | OperationState::Cancelled => {
+            clear_provider_deployment_dispatch_backoff_tx(
+                connection,
+                operation_id,
+                step.child_operation_id,
+            )?;
             let error = child.error.unwrap_or_else(|| OperationError {
                 code: "PROVIDER_DEPLOYMENT_STEP_FAILED".to_owned(),
                 message: format!(
@@ -1420,6 +1718,35 @@ fn update_parent_phase_tx(
         ],
     )?;
     ensure_parent_change(changed, operation_id, "update phase")
+}
+
+fn clear_provider_deployment_dispatch_backoff_tx(
+    connection: &Connection,
+    operation_id: CanonicalId,
+    child_operation_id: CanonicalId,
+) -> CatalogResult<()> {
+    let changed = connection.execute(
+        "UPDATE provider_deployment_workflows
+            SET dispatch_not_before = NULL, dispatch_failure_count = 0,
+                dispatch_failure_child_operation_id = NULL,
+                last_dispatch_error_code = NULL,
+                last_dispatch_error_message = NULL,
+                revision = revision + 1, updated_at = ?2
+          WHERE operation_id = ?1 AND dispatch_failure_count > 0
+            AND dispatch_failure_child_operation_id = ?3
+            AND state NOT IN ('succeeded', 'failed')",
+        params![
+            operation_id.to_string(),
+            now_secs(),
+            child_operation_id.to_string()
+        ],
+    )?;
+    if changed > 1 {
+        return Err(CatalogError::conflict(format!(
+            "provider deployment {operation_id} cleared multiple dispatch backoffs"
+        )));
+    }
+    Ok(())
 }
 
 fn update_provider_deployment_state_tx(
@@ -2836,6 +3163,20 @@ fn parse_id(value: &str, label: &str) -> CatalogResult<CanonicalId> {
         .map_err(|error| CatalogError::invalid(format!("invalid {label} identity: {error}")))
 }
 
+fn catalog_error_code(error: &CatalogError) -> &'static str {
+    match error {
+        CatalogError::NotFound(_) => "CATALOG_NOT_FOUND",
+        CatalogError::Conflict(_) => "CATALOG_CONFLICT",
+        CatalogError::RevisionConflict(_) => "CATALOG_REVISION_CONFLICT",
+        CatalogError::Invalid(_) => "CATALOG_INVALID",
+        CatalogError::Forbidden(_) => "CATALOG_FORBIDDEN",
+        CatalogError::BundleStorage(_) => "CATALOG_BUNDLE_STORAGE",
+        CatalogError::SecretsUnavailable(_) => "CATALOG_SECRETS_UNAVAILABLE",
+        CatalogError::Database(_) => "CATALOG_DATABASE",
+        CatalogError::Backend(_) => "CATALOG_BACKEND",
+    }
+}
+
 fn to_u64(value: i64, label: &str) -> CatalogResult<u64> {
     u64::try_from(value).map_err(|_| CatalogError::invalid(format!("invalid {label}: {value}")))
 }
@@ -3939,6 +4280,277 @@ mod tests {
                 .unwrap(),
             [parent.operation_id]
         );
+    }
+
+    #[tokio::test]
+    async fn background_dispatch_readiness_scans_past_a_delayed_page() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let second_environment = harness
+            .store
+            .create_environment("provider-test", "preview-one")
+            .await
+            .unwrap();
+        let third_environment = harness
+            .store
+            .create_environment("provider-test", "preview-two")
+            .await
+            .unwrap();
+        for (index, environment_id) in [
+            harness.environment_id,
+            second_environment.canonical_id,
+            third_environment.canonical_id,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            harness
+                .store
+                .begin_provider_deployment(
+                    ProviderDeploymentSpec {
+                        application_id: harness.application_id,
+                        environment_id,
+                        provider_target_id: harness.target.target_id,
+                        artifact: artifact.clone(),
+                        plan: ProviderNeutralPlan::default(),
+                    },
+                    context(&format!("provider-deployment-page-{index}")),
+                )
+                .await
+                .unwrap();
+        }
+        let ordered = harness
+            .database
+            .with_connection(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT operation_id FROM provider_deployment_workflows
+                      WHERE state NOT IN ('succeeded', 'failed')
+                      ORDER BY updated_at, operation_id",
+                )?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .map(|id| {
+                        id.map_err(CatalogError::from)
+                            .and_then(|id| parse_id(&id, "provider deployment operation"))
+                    })
+                    .collect::<CatalogResult<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ordered.len(), 3);
+
+        let mut latest_settlement = 0;
+        for parent_id in &ordered[..2] {
+            let workflow = harness
+                .store
+                .provider_deployment_workflow(*parent_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let child_id = workflow.steps[0].child_operation_id;
+            let claim = harness
+                .store
+                .claim(child_id, CanonicalId::new_v7(), Duration::from_secs(30))
+                .await
+                .unwrap()
+                .into_claim()
+                .unwrap();
+            harness
+                .store
+                .record_receipt(
+                    &claim,
+                    &DriverReceipt {
+                        state: DriverStepState::Failed,
+                        side_effect: SideEffect::None,
+                        next_action: DriverNextAction::Retry,
+                        diagnostic: Some("retry after the durable delay".to_owned()),
+                        ..succeeded_receipt(&claim)
+                    },
+                )
+                .await
+                .unwrap();
+            latest_settlement = latest_settlement.max(
+                harness
+                    .store
+                    .provider_driver_operation(child_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .updated_at
+                    .timestamp(),
+            );
+        }
+
+        let ready = harness
+            .store
+            .provider_deployments_ready_for_dispatch_with_page_size(
+                DateTime::from_timestamp(latest_settlement + 29, 0).unwrap(),
+                Duration::from_secs(30),
+                1,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready, [ordered[2]]);
+    }
+
+    #[tokio::test]
+    async fn driver_selection_failures_have_durable_exponential_backoff() {
+        let harness = harness().await;
+        let parent = harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: attach_cloudflare_artifact(&harness).await,
+                    plan: ProviderNeutralPlan::default(),
+                },
+                context("provider-deployment-selection-backoff"),
+            )
+            .await
+            .unwrap();
+        let prepared = harness
+            .store
+            .prepare_provider_deployment(parent.operation_id)
+            .await
+            .unwrap();
+        let child_operation_id = prepared.steps[0].child_operation_id;
+        harness
+            .store
+            .defer_provider_deployment_dispatch(
+                parent.operation_id,
+                child_operation_id,
+                Duration::from_secs(30),
+                &CatalogError::invalid("verified driver release is temporarily unavailable"),
+            )
+            .await
+            .unwrap();
+        let first = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.operation.state, OperationState::Waiting);
+        assert_eq!(first.dispatch_failure_count, 1);
+        assert_eq!(
+            first.dispatch_failure_child_operation_id,
+            Some(child_operation_id)
+        );
+        assert_eq!(
+            first.last_dispatch_error_code.as_deref(),
+            Some("CATALOG_INVALID")
+        );
+        assert_eq!(
+            first.last_dispatch_error_message.as_deref(),
+            Some("verified driver release is temporarily unavailable")
+        );
+        let first_not_before = first.dispatch_not_before.unwrap();
+        let replacement = CatalogStore::new(Arc::clone(&harness.database));
+        assert!(
+            replacement
+                .provider_deployments_ready_for_dispatch(
+                    first_not_before - chrono::TimeDelta::seconds(1),
+                    Duration::from_secs(30),
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            replacement
+                .provider_deployments_ready_for_dispatch(
+                    first_not_before,
+                    Duration::from_secs(30),
+                    10,
+                )
+                .await
+                .unwrap(),
+            [parent.operation_id]
+        );
+
+        replacement
+            .defer_provider_deployment_dispatch(
+                parent.operation_id,
+                child_operation_id,
+                Duration::from_secs(30),
+                &CatalogError::invalid("verified driver release remains unavailable"),
+            )
+            .await
+            .unwrap();
+        let second = replacement
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.dispatch_failure_count, 2);
+        let second_delay = (second.dispatch_not_before.unwrap() - first_not_before).num_seconds();
+        assert!((30..=32).contains(&second_delay));
+
+        replacement
+            .prepare_provider_deployment(parent.operation_id)
+            .await
+            .unwrap();
+        let claim = replacement
+            .claim(
+                child_operation_id,
+                CanonicalId::new_v7(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        replacement
+            .record_receipt(&claim, &success_driver_receipt(&claim.request))
+            .await
+            .unwrap();
+        let advanced = replacement
+            .refresh_provider_deployment(parent.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(advanced.next_step_index, 1);
+        let cleared = replacement
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.dispatch_failure_count, 0);
+        assert!(cleared.dispatch_not_before.is_none());
+        assert!(cleared.dispatch_failure_child_operation_id.is_none());
+        assert!(cleared.last_dispatch_error_code.is_none());
+        assert!(cleared.last_dispatch_error_message.is_none());
+
+        let next_child_operation_id = cleared.steps[1].child_operation_id;
+        replacement
+            .claim(
+                next_child_operation_id,
+                CanonicalId::new_v7(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        replacement
+            .defer_provider_deployment_dispatch(
+                parent.operation_id,
+                next_child_operation_id,
+                Duration::from_secs(30),
+                &CatalogError::invalid("a concurrent selector failed after claim"),
+            )
+            .await
+            .unwrap();
+        let live = replacement
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.operation.state, OperationState::Running);
+        assert_eq!(live.dispatch_failure_count, 0);
     }
 
     #[tokio::test]

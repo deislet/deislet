@@ -93,6 +93,7 @@ impl ProviderDeploymentReconciler {
                 store,
                 dispatcher,
                 orchestrator: config.orchestrator,
+                selection_retry_delay: config.retry_delay,
             }),
             config,
         }
@@ -275,6 +276,7 @@ struct CatalogProviderDeploymentExecutor {
     store: Arc<CatalogStore>,
     dispatcher: Arc<ProviderDriverDispatcher>,
     orchestrator: DriverOrchestratorConfig,
+    selection_retry_delay: Duration,
 }
 
 #[async_trait]
@@ -303,6 +305,7 @@ impl ProviderDeploymentExecutor for CatalogProviderDeploymentExecutor {
                     owner_id,
                     &self.dispatcher,
                     self.orchestrator,
+                    self.selection_retry_delay,
                 )
                 .await?
             {
