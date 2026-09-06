@@ -386,6 +386,13 @@ ready scan 同时折叠已完成 child 和 parent，立即发现 pending/过期 
 一样可重新 claim 原 operation；此前 claim 路径只接受存在 `driver_error` 的 retry，导致这种 receipt 永久等待，现已由回归测试
 封闭。
 
+后续审查发现，最初的 ready 查询只检查最旧 1000 条非终态 workflow；如果整页都在等待 retry，后页已经 ready 的任务会饥饿。
+现在同一稳定读事务按 `(updated_at, operation_id)` 做 keyset 分页，遍历全部页但只返回有界候选集；跨页测试用超过一页的延迟
+记录证明后续 pending workflow 仍会被选择。driver/release selection 在 child 尚未 claim 前失败时，也不再依赖普通日志和下一次
+固定轮询：workflow 持久保存 `dispatch_not_before`、指数退避计数、exact child operation ID，以及有界的类型化错误码和消息。
+只有这些字段仍绑定当前 child 时才限制 ready；child 被其他实例 live claim、成功/失败 settle 或 workflow 推进都会清除过时退避，
+因此旧 selector 不能覆盖较新的执行结果。旧数据库通过可重复的增量列迁移和一致性 trigger 升级，重启后仍保留等待边界。
+
 精确提交 `56c65844d471c956af893d7151a6ea261131a48b`（tree
 `54334c5b44e3aef27f99f0b2be9dc1ee3463a18a`）的 15,513,600-byte archive，SHA-256
 `4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7`，已在 Linux/macOS 通过 provider-driver
@@ -394,10 +401,19 @@ crate 严格 Clippy 全过。Linux 同一 archive 另通过 16 份 Schema/48 组
 被修改导致的 shell parse inconclusive，以及 macOS 非登录 PATH 与可重建临时构建目录占满磁盘的环境观察；两端随后均从
 未改变的精确 archive 重跑通过。
 
+公平性与选择退避实现提交 `b480b141ce15ac6b572c7742cc731f655fa6f4d5` 首次在 s69 暴露一项测试时钟假设：测试取两次
+settle 中较晚的秒数加 29；Windows 较慢执行使两次 settle 跨秒，较早 workflow 因而恰好达到 30 秒 retry 边界并被产品正确
+返回。该 archive 的 driver 54/54、Control 24/25，后续门禁未运行，这一失败没有被后续绿灯抹除。提交
+`518d3f83760f577a31f117a739c37f0b240509d6` 改用最早 settle 秒数加 29，精确 15,564,800-byte archive（SHA-256
+`d8216a9108eb3b57da50af369403eb3d7798c1fbf559a6d8b4348c5c555cee3d`）随后在 Linux/macOS 通过 driver 62/62、Control
+25/25、协调器 3/3、target migration 2/2、dispatch-backoff migration 1/1；Windows 为 54/54、25/25、3/3、2/2、
+1/1，三端严格 Clippy 全过。Linux 同一 archive 另通过 16 份 Schema/48 组 fixture 和产品治理；正式 evidence 同时保留
+Windows 失败—修复关系及 macOS 非登录 SSH 缺 Cargo PATH 的环境观察。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
 真实透明日志/独立 witness 的采集与可用性运营，以及真实 Windows Service 安装演练。公共
-release/vault/target/deployment API、后台选择失败的独立持久退避、三个完整 backend driver 和真实账户 evidence 也未完成。
-当前 ready scan 还必须消除固定候选窗口可能造成的后续任务饥饿。在这些完成并获得真实账户证据前，不能把当前 dispatcher
+release/vault/target/deployment API、三个完整 backend driver 和真实账户 evidence 也未完成。当前跨页扫描虽然正确，
+但会在一个读事务内遍历全部非终态 workflow；大规模 catalog 仍需可索引 eligibility、负载证据和扫描时长指标。在这些完成并获得真实账户证据前，不能把当前 dispatcher
 称作已部署的 provider 服务，更不能升级 backend 支持状态。
 
 ## 后果

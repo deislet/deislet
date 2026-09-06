@@ -2363,3 +2363,35 @@ Application/framework source + versioned build plan
   witness 或真实 provider 账户；没有公共 vault/release/target/deployment API/CLI/Web；选择 release/driver 失败也尚无独立于
   child 时间戳的持久退避。另有新发现：ready 查询固定只读取最旧 1000 条非终态记录，若这些记录都尚未到 retry 时间，后面
   已就绪的任务可能饥饿。该公平性缺陷必须在称为产品级后台服务前修复并加入超过一个扫描页的回归。
+
+## 84. Provider 调度跨页公平性与选择失败持久退避
+
+- 对第 83 节的固定候选窗口继续做状态构造后确认缺陷成立：原 SQL 先按最旧更新时间取 1000 条非终态 workflow，再在进程内
+  判断 retry/lease，因此整页未到期记录会长期遮住后页 pending 或已到期任务。修复后在一个稳定读事务内按
+  `(updated_at, operation_id)` 做 keyset 分页，遍历所有非终态页并只收集调用者要求的有界 ready 数量；超过 1000 条延迟
+  workflow 后追加 pending workflow 的专项测试证明后页不会饥饿。这个查询语义正确但最坏会扫描全部非终态行，因此大规模
+  catalog 的可索引 eligibility、负载基线和扫描时长指标仍是明确性能欠缺，不能由当前功能测试冒充完成。
+- driver/release selection 发生在 child claim 之前，原实现只有日志并会在每轮扫描重复执行。workflow 现在持久保存
+  `dispatch_not_before`、失败次数、exact child operation ID，以及有界的 Catalog 错误码/消息；退避从配置 retry delay 起按
+  2 的幂增长并限制在 3600 秒，重启不会清空。只有退避仍绑定当前 child 才限制 ready；live child claim 会阻止较旧 selector
+  写回，child 成功/失败 settle 或 workflow 推进都会清除过时字段。数据库 trigger 同时约束“有失败就必须有时间、child 和
+  完整错误，清空则全部清空”，旧库通过幂等加列和 backfill 增量升级。回归覆盖指数增长、重启读取、exact-child 绑定、旧步骤
+  不阻断新步骤，以及并发 claim/selector 和 settle/selector 两类竞态。
+- 实现提交 `b480b141ce15ac6b572c7742cc731f655fa6f4d5`（tree
+  `e487e5ba2fbb6f0ad3de132b8f8b2e9af3a6351e`）生成 15,564,800-byte archive，SHA-256
+  `21bf3d328e215971440a97d02be05d1e301feb8da83cb632b72746cbff026a5d`。s69 先通过 driver 54/54，随后 Control
+  provider 专项为 24/25：跨页测试用两次 settle 中较晚的秒数加 29 构造“全部未到期”，但 Windows 较慢执行使两次 settle
+  跨越一秒，较早 workflow 实际已恰好达到 30 秒 retry 边界，产品按契约正确返回它。协调器、迁移和 Clippy 因前一命令失败
+  未运行。该失败属于测试时钟前提错误，但仍作为失败样本保留，不能从历史中删除。
+- 修复提交 `518d3f83760f577a31f117a739c37f0b240509d6`（tree
+  `916e2ad8662b9a5e1087d2c80dedede84159ecd6`）改为用最早 settle 秒数加 29，保证所有延迟记录严格小于边界。其同一
+  15,564,800-byte archive 的 SHA-256 为
+  `d8216a9108eb3b57da50af369403eb3d7798c1fbf559a6d8b4348c5c555cee3d`；s17 Linux 与 s67 macOS 通过
+  driver 62/62、Control provider 25/25、协调器 3/3、target migration 2/2、dispatch-backoff migration 1/1，s69
+  Windows 为 54/54、25/25、3/3、2/2、1/1，三端五个部署控制 crate 的严格 all-target Clippy 全过。Linux 同一 archive
+  另通过 16 份 Schema/48 组 fixture 和 25 份 ADR/6 阶段产品治理。macOS 一次重复收集因非登录 SSH PATH 缺 Cargo 而在任何
+  产品命令前停止；显式使用 `/Users/leo/.cargo/bin/cargo` 后从未变 archive 全过，作为环境 inconclusive observation 保留。
+- 正式证据为 `docs/product/evidence/provider-driver-dispatcher-portability-518d3f8.json`，证据 Schema 向后兼容已有四/五门禁记录，
+  并新增六门禁、跨页公平、持久退避、增量迁移和竞态 fence 断言。本增量关闭第 83 节两个已知调度正确性缺陷，不关闭公共
+  vault/release/target/deployment/operation API、CLI、Web，真实 materialized release、公共透明日志、独立 witness、真实
+  Windows Service 安装、三个完整 backend driver 或账户级 lifecycle/conformance evidence。`P1-DEPLOY-001` 继续 active。

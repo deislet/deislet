@@ -1,0 +1,175 @@
+{
+  "$schema": "./provider-driver-dispatcher-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-dispatch-fairness-backoff-portability-518d3f8-2026-09-06",
+  "collectedAt": "2026-09-06T10:05:46+08:00",
+  "outcome": "passed",
+  "scope": "The exact source archive passes the platform-applicable provider driver, durable provider workflow, cross-page background dispatch fairness, durable driver-selection backoff and race fences, additive provider-target and dispatch-backoff migrations, and strict deployment-control lint checks on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "518d3f83760f577a31f117a739c37f0b240509d6",
+    "tree": "916e2ad8662b9a5e1087d2c80dedede84159ecd6",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "d8216a9108eb3b57da50af369403eb3d7798c1fbf559a6d8b4348c5c555cee3d",
+      "sizeBytes": 15564800
+    }
+  },
+  "buildEnvironment": {"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_TEST_DEBUG": "0"},
+  "commands": [
+    {"id": "provider-driver-tests", "command": "cargo +1.96.0 test -p deis-provider-driver"},
+    {"id": "provider-driver-control-tests", "command": "cargo +1.96.0 test -p deis-control provider_driver -- --nocapture"},
+    {"id": "provider-deployment-reconciler-tests", "command": "cargo +1.96.0 test -p deis-control provider_deployment_reconciler -- --nocapture"},
+    {"id": "provider-target-migration-tests", "command": "cargo +1.96.0 test -p deis-control provider_targets -- --nocapture"},
+    {"id": "provider-dispatch-backoff-migration-test", "command": "cargo +1.96.0 test -p deis-control provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent -- --nocapture"},
+    {"id": "strict-clippy", "command": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"}
+  ],
+  "sharedContractCheck": {
+    "hostAlias": "s17",
+    "command": "python3 scripts/check-shared-contracts.py",
+    "outcome": "passed",
+    "exitCode": 0,
+    "schemas": 16,
+    "fixtures": 48
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "518d3f83760f577a31f117a739c37f0b240509d6",
+      "archiveSha256": "d8216a9108eb3b57da50af369403eb3d7798c1fbf559a6d8b4348c5c555cee3d",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 62, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 25, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "provider-dispatch-backoff-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "518d3f83760f577a31f117a739c37f0b240509d6",
+      "archiveSha256": "d8216a9108eb3b57da50af369403eb3d7798c1fbf559a6d8b4348c5c555cee3d",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 62, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 25, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "provider-dispatch-backoff-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100 build 26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "518d3f83760f577a31f117a739c37f0b240509d6",
+      "archiveSha256": "d8216a9108eb3b57da50af369403eb3d7798c1fbf559a6d8b4348c5c555cee3d",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 54, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 25, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "provider-dispatch-backoff-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    }
+  ],
+  "priorFailedAttempts": [
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "b480b141ce15ac6b572c7742cc731f655fa6f4d5",
+        "tree": "e487e5ba2fbb6f0ad3de132b8f8b2e9af3a6351e",
+        "archive": {"format": "git-archive-tar", "sha256": "21bf3d328e215971440a97d02be05d1e301feb8da83cb632b72746cbff026a5d", "sizeBytes": 15564800}
+      },
+      "hostAlias": "s69",
+      "operatingSystem": "windows",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 54, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "failed", "exitCode": 101, "passed": 24, "failed": 1, "ignored": 0, "note": "background_dispatch_readiness_scans_past_a_delayed_page expected the later pending workflow but correctly received an earlier workflow that had reached its retry boundary"},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "not-run", "exitCode": null},
+        {"id": "provider-target-migration-tests", "outcome": "not-run", "exitCode": null},
+        {"id": "provider-dispatch-backoff-migration-test", "outcome": "not-run", "exitCode": null},
+        {"id": "strict-clippy", "outcome": "not-run", "exitCode": null}
+      ],
+      "cause": "The test used the later of two independently recorded settlement seconds plus 29 as its observation time. On slower Windows execution the settlements crossed a one-second boundary, so the earlier workflow was exactly 30 seconds old and legitimately ready. The product ordering and retry behavior were correct; the test's all-rows-delayed premise was false.",
+      "fixedBy": "518d3f83760f577a31f117a739c37f0b240509d6"
+    }
+  ],
+  "collectionObservations": [
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "518d3f83760f577a31f117a739c37f0b240509d6",
+        "tree": "916e2ad8662b9a5e1087d2c80dedede84159ecd6",
+        "archive": {"format": "git-archive-tar", "sha256": "d8216a9108eb3b57da50af369403eb3d7798c1fbf559a6d8b4348c5c555cee3d", "sizeBytes": 15564800}
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "classification": "environment",
+      "outcome": "inconclusive",
+      "description": "The first repeated macOS collection attempt used the non-login SSH PATH and stopped before any product command because cargo was not found.",
+      "resolution": "The unchanged exact archive was re-extracted with /Users/leo/.cargo/bin/cargo selected explicitly; all six checks then passed and the run directory was automatically cleaned."
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "exactArchiveVerifiedOnEveryHost": true,
+    "windowsAsyncSendRegressionClosed": true,
+    "sharedProcessProtocolValidated": true,
+    "signedReleaseAuthorizationValidated": true,
+    "trustRootLoaderCompiledOnWindows": true,
+    "rootRotationValidated": true,
+    "legacyTrustRootMigrationValidated": true,
+    "transientSpawnRetryBoundaryValidated": true,
+    "offlineTransparencyProofValidated": true,
+    "independentWitnessThresholdValidated": true,
+    "signedButUnloggedTargetMigrationValidated": true,
+    "windowsServiceIdentityDaclPolicyValidated": true,
+    "backgroundDispatcherLoopValidated": true,
+    "retryableReceiptRecoveryValidated": true,
+    "crossPageDispatchFairnessValidated": true,
+    "durableSelectionBackoffValidated": true,
+    "selectionBackoffMigrationValidated": true,
+    "selectionBackoffRaceFenceValidated": true,
+    "noLiveProviderClaim": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "The background loop is enabled only when Control has a valid transparent trust root and verified driver registry; these checks use synthetic releases and fake executors rather than a real signed provider installation.",
+    "The stable read transaction and keyset pagination prevent a delayed first page from starving later ready work, but they can scan every nonterminal workflow; very large catalogs still need indexed eligibility, load measurements, and scan-duration telemetry.",
+    "Driver-selection failures now persist a typed Catalog error code, a bounded message, failure count, exact child identity, and exponential retry time. Those diagnostics are not yet exposed through the public API, CLI, Web console, or production metrics.",
+    "The pass validates live-claim exclusion and stale selector/result race fences, but it does not submit a deployment to a real provider account or prove multi-Control-instance behavior against a shared production database.",
+    "The process-level 15-second drain is tested structurally and by existing server drain tests; this exact portability slice does not kill a real long-running provider CLI during shutdown on every host.",
+    "The registry and dispatcher still have no complete public vault, release, target, provider-deployment, and operation management surface in this evidence.",
+    "The release, keys, roots, transparency proof, witness signatures, and provider process fixtures remain synthetic, and no backend is certified against Edge Canon by these checks.",
+    "The exact archive does not contain generated Control dashboard assets, so the existing build warning and dashboard 404 remain outside this Rust control-path record."
+  ]
+}

@@ -52,6 +52,19 @@
             {"$ref": "#/$defs/clippyCommand"}
           ],
           "items": false
+        },
+        {
+          "minItems": 6,
+          "maxItems": 6,
+          "prefixItems": [
+            {"$ref": "#/$defs/driverCommand"},
+            {"$ref": "#/$defs/controlCommand"},
+            {"$ref": "#/$defs/reconcilerCommand"},
+            {"$ref": "#/$defs/migrationCommand"},
+            {"$ref": "#/$defs/dispatchMigrationCommand"},
+            {"$ref": "#/$defs/clippyCommand"}
+          ],
+          "items": false
         }
       ]
     },
@@ -116,7 +129,11 @@
         "signedButUnloggedTargetMigrationValidated": {"const": true},
         "windowsServiceIdentityDaclPolicyValidated": {"const": true},
         "backgroundDispatcherLoopValidated": {"const": true},
-        "retryableReceiptRecoveryValidated": {"const": true}
+        "retryableReceiptRecoveryValidated": {"const": true},
+        "crossPageDispatchFairnessValidated": {"const": true},
+        "durableSelectionBackoffValidated": {"const": true},
+        "selectionBackoffMigrationValidated": {"const": true},
+        "selectionBackoffRaceFenceValidated": {"const": true}
       }
     },
     "limitations": {
@@ -183,6 +200,12 @@
         {"properties": {"id": {"const": "provider-deployment-reconciler-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control provider_deployment_reconciler -- --nocapture"}}}
       ]
     },
+    "dispatchMigrationCommand": {
+      "allOf": [
+        {"$ref": "#/$defs/commandBase"},
+        {"properties": {"id": {"const": "provider-dispatch-backoff-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent -- --nocapture"}}}
+      ]
+    },
     "clippyCommand": {
       "allOf": [
         {"$ref": "#/$defs/commandBase"},
@@ -194,7 +217,7 @@
       "additionalProperties": false,
       "required": ["id", "outcome", "exitCode"],
       "properties": {
-        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "provider-deployment-reconciler-tests", "legacy-target-migration-test", "provider-target-migration-tests", "strict-clippy"]},
+        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "provider-deployment-reconciler-tests", "legacy-target-migration-test", "provider-target-migration-tests", "provider-dispatch-backoff-migration-test", "strict-clippy"]},
         "outcome": {"enum": ["passed", "failed", "not-run"]},
         "exitCode": {"type": ["integer", "null"], "minimum": 0},
         "passed": {"type": "integer", "minimum": 0},
@@ -225,7 +248,7 @@
         "clippy": {"type": "string", "minLength": 1},
         "commit": {"$ref": "#/$defs/gitSha"},
         "archiveSha256": {"$ref": "#/$defs/sha256"},
-        "checks": {"type": "array", "minItems": 4, "maxItems": 5, "items": {"$ref": "#/$defs/checkResult"}}
+        "checks": {"type": "array", "minItems": 4, "maxItems": 6, "items": {"$ref": "#/$defs/checkResult"}}
       }
     },
     "priorFailedAttempt": {
@@ -236,7 +259,7 @@
         "source": {"$ref": "#/$defs/source"},
         "hostAlias": {"type": "string", "minLength": 1},
         "operatingSystem": {"enum": ["linux", "macos", "windows"]},
-        "checks": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/checkResult"}},
+        "checks": {"type": "array", "minItems": 4, "maxItems": 6, "items": {"$ref": "#/$defs/checkResult"}},
         "cause": {"type": "string", "minLength": 1},
         "fixedBy": {"$ref": "#/$defs/gitSha"}
       }
