@@ -311,7 +311,9 @@ macOS 缺 `jsonschema` 被保留为环境未执行。该证据不证明跨请求
 tokens 以 `scope=all|unscoped` 过滤取代聚合字段，audit 退役自制 `before`/`max_limit`；CLI 以通用 `ListPage<T>` 跟随
 `nextCursor`，并修复自 3ebe108 起 `deis versions`/`deis status` 无法解析新 envelope 的现役缺陷。sessions、runtime、
 configs、commands、events、metrics summary 与全局 `/api/routes` 按本 ADR 的 platform diagnostics 划分暂不迁移，只收口
-无上限 `limit`；其命名空间与契约归属待产品决策。本切片仅有本机门禁，尚无提交后精确归档或三平台 portability evidence。
+无上限 `limit`；其命名空间与契约归属待产品决策。精确提交 `3013ae278f05978e19d6e06cc6a21c78df89c909` 的同一 SHA-256 校验归档已在
+Linux、macOS、Windows 通过 provider、pagination 11/11、authz、grant、协调器、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
+`../product/evidence/provider-driver-dispatcher-portability-3013ae2.json`。
 
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；平台诊断面列表的归属尚未决定；
 installation/target 生命周期尚不完整；credential provision、grant create 等非 operation 资源创建尚未统一幂等 replay；

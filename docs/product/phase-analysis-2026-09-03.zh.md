@@ -2592,8 +2592,13 @@ Application/framework source + versioned build plan
   audit 的 `before` 参数变 400。这些仍属 v1 冻结前归一化。
 - 三视角审查（契约一致性、安全与授权、客户端兼容）仅报告一项 minor（404 建议文案），已修。最终门禁：`cargo fmt --check`、
   `deis-control`/`deis` all-target 严格 Clippy、Control 525/525（lib 501、API integration 14、architecture 2、docs witness 6、
-  fleet credential 2）、CLI 150/150、共享契约 17 Schema/50 fixture、产品治理与 `git diff --check` 全部通过。本节仍是本机工作
-  节点，尚未从提交后精确归档三平台复验，也未登记新的 portability evidence。
+  fleet credential 2）、CLI 150/150、共享契约 17 Schema/50 fixture、产品治理与 `git diff --check` 全部通过。
+- 精确源码提交 `3013ae278f05978e19d6e06cc6a21c78df89c909`（tree `6efc6cb2872f0414f4dfb14f39b93c059b2e0f7a`）生成
+  16,015,360-byte git archive，SHA-256 为 `2d15f43f423683130b1f391c4b3b9eefa75f0b9fb46bc829f5400955af94fe85`。同一归档在
+  Linux/macOS 通过 provider-driver 62/62、Windows 54/54；三端通过 Control provider 49/49、pagination 11/11、authz 32/32、
+  grant 3/3、协调器 3/3、五项 migration 各 1/1 与严格五 crate all-target Clippy；Linux 另通过 17 份 Schema/50 组 fixture，
+  macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为 `evidence/provider-driver-dispatcher-portability-3013ae2.json`；
+  它证明这些列表控制路径与 CLI 页读取器的三平台代码可移植性，不证明 Web 接线、真实 provider 部署或 Edge Canon 合规。
 - 仍未完成：显式 API major、OpenAPI/generated client、breaking-change gate；平台诊断面的命名空间与契约归属；聚合端点
   （configs/events stats、metrics summary）的 summary 契约；单资源 `schemaVersion` 位宽与列表不一致（u32 与 u8）；cursor 表
   主动清理调度、容量指标与多 Control 实例共享 authority；通用 mutation 幂等；installation/target lifecycle；application
