@@ -2637,4 +2637,11 @@ Application/framework source + versioned build plan
   `deis domains list`；`EVERY_ENVIRONMENT` 在 CLI 的副本由读取 deis-control 源码的测试钉住。
 - 未完成：provider deployment cancel/rollback；installation/target 注册时的 lifecycle 首条审计；DeleteAppResponse 未回报撤销
   grant 数；`idempotency-key-reused` 等稳定码尚以 `error` 文本首 token 承载，结构化 `code` 随错误模型落地；旧库同时持有两代
-  索引尚未清退。本节为本机工作节点，尚无提交后精确归档或三平台 evidence。
+  索引尚未清退。
+- 精确源码提交 `c8d4f728cb9ac0e58e9fdeeb077b97224545507f`（tree `7aae8c7de6120a7bf4729f0fbf08fc05e268c4bd`）生成
+  16,384,000-byte git archive，SHA-256 为 `d671c73330d13a7622ae505afbab2705221c2f8602d9ed9a18216d6c55d1ae76`。同一归档在
+  Linux/macOS 通过 provider-driver 62/62、Windows 54/54；三端通过 Control provider 60/60（含幂等与生命周期回归）、
+  pagination 19/19（含 cursor 到期、容量探针与查询计划）、authz 32/32、grant 3/3、协调器 3/3、五项 migration 各 1/1 与严格
+  五 crate all-target Clippy；Linux 另通过 17 份 Schema/50 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为
+  `evidence/provider-driver-dispatcher-portability-c8d4f72.json`；它证明这些控制路径的三平台代码可移植性，不证明真实
+  provider 部署或 Edge Canon 合规。
