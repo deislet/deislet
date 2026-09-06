@@ -331,7 +331,9 @@ CLI/Web 改用新前缀并解析 envelope。精确提交 `592636306ed9c5c8092494
 Linux、macOS、Windows 通过 provider 61/61、pagination 20/20、authz 38/38、grant、协调器、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
 `../product/evidence/provider-driver-dispatcher-portability-5926363.json`。
 
-随后 limit-out-of-range、cursor-invalid、idempotency-key-required、already-exists 与字段级 violations 逐路由产出（offset-out-of-range 按兼容门禁保留为 reserved），provider deployment 获得 cancel（If-Match，`operation-not-cancellable`）与 rollback（`operation-not-rollbackable`）两条 operation 路由，幂等摘要改为服务端密钥 HMAC。
+随后 limit-out-of-range、cursor-invalid、idempotency-key-required、already-exists 与字段级 violations 逐路由产出（offset-out-of-range 按兼容门禁保留为 reserved），provider deployment 获得 cancel（If-Match，`operation-not-cancellable`）与 rollback（`operation-not-rollbackable`）两条 operation 路由，幂等摘要改为服务端密钥 HMAC。精确提交 `b45a611758dd1bae541a7eb855aa6a1a8fae23f2` 的同一 SHA-256 校验归档已在
+Linux、macOS、Windows 通过 provider 77/77、pagination 21/21、authz 38/38、协调器 4/4、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
+`../product/evidence/provider-driver-dispatcher-portability-b45a611.json`。
 
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：generated client 仍以示例反序列化校验替代；cancel/rollback 尚无 CLI 入口；Web 尚无 organization/application/environment 主线；旧前缀尚在弃用窗口内。
 

@@ -2736,4 +2736,11 @@ Application/framework source + versioned build plan
 - 未完成：rollback 原生身份的 driver 契约扩展；通用 `POST /operations/:id/cancel` 对 deploy/rollback 仍答 409 无控制器，
   provider 专用路由为受支持路径；cancel/rollback 重放未用共享 `api_idempotency_records`（其 resource_kind CHECK 需重建表）；
   `scripts/demo.sh` 仍走旧前缀；旧库两代索引清退；`download_bundle` 文案；ADR-006 所列真实签署 release、透明日志、三家
-  完整 driver 与真实账户 evidence。本节为本机工作节点，尚无提交后精确归档或三平台 evidence。
+  完整 driver 与真实账户 evidence。
+- 精确源码提交 `b45a611758dd1bae541a7eb855aa6a1a8fae23f2`（tree `73394bb55feb5044c1a423456ff27120f3a3f5c6`）生成
+  17,633,280-byte git archive，SHA-256 为 `6dc3d12a39d395dcddcaa9147f6bbc3745dea1c1ed48690fcef797cafb1ea831`。同一归档在
+  Linux/macOS 通过 provider-driver 62/62、Windows 54/54；三端通过 Control provider 77/77（含 cancel/rollback、HMAC 摘要回归）、
+  pagination 21/21、authz 38/38、grant 3/3、协调器 4/4（含 cancelling 处理）、五项 migration 各 1/1 与严格五 crate all-target
+  Clippy；Linux 另通过 18 份 Schema/57 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为
+  `evidence/provider-driver-dispatcher-portability-b45a611.json`；它证明这些控制路径的三平台代码可移植性，不证明真实
+  provider 部署或 Edge Canon 合规。
