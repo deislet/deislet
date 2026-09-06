@@ -12,7 +12,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::pagination::{ControlListPage, ListQuery, list_page};
 use crate::catalog::{App, RetiredAppName};
+use crate::identity::Principal;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
@@ -129,8 +130,13 @@ pub async fn get_app(
 pub async fn delete_app(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
+    Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<DeleteAppResponse>> {
-    let removed = state.store.delete_app(&app_id).await?;
+    // The caller is named on the grant revocations this delete performs.
+    let removed = state
+        .store
+        .delete_app_as(&app_id, &super::actor_subject(&principal))
+        .await?;
 
     // Before the bundle files: the nodes are what is still serving the
     // application, and a failure to delete a file must not stop that.

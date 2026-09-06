@@ -7,7 +7,8 @@
 //!   platform. `build --vendor cloudflare|deno|tencent`
 //!   produces what that vendor's own tooling deploys; this CLI never pushes
 //!   to them.
-//! * `deploy` / `versions` / `rollback` / `status` / `secret` / `logs` /
+//! * `deploy` / `versions` / `deployments` / `rollback` / `status` /
+//!   `routes` / `domains` / `secret` / `logs` /
 //!   `tail` / `trace` / `kv` / `db` / `blob` talk to a Deislet platform - a
 //!   `deis-control` and, for logs and traces, a `deis-telemetry`, and for
 //!   `kv`/`db`/`blob`, also a `deis-store` reached *through* `deis-control` (see
@@ -243,6 +244,20 @@ enum Commands {
         limit: usize,
     },
 
+    /// List an environment's deployment history, newest first.
+    Deployments {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Show at most this many, newest first. At most 1000: that is one
+        /// page, and this reads one page.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
     /// Move an environment's pointer back to an earlier version.
     Rollback {
         #[command(flatten)]
@@ -268,6 +283,12 @@ enum Commands {
 
         #[command(flatten)]
         format: Format,
+    },
+
+    /// Read which requests an environment answers.
+    Routes {
+        #[command(subcommand)]
+        action: RoutesAction,
     },
 
     /// Inspect build-target evidence, certification, compliance and support.
@@ -456,6 +477,16 @@ enum Commands {
         action: TokenAction,
     },
 
+    /// Read the registry of who may claim which hostname.
+    ///
+    /// A hostname is the one global namespace on this platform, so the
+    /// registry is platform-wide rather than an application's. Needs
+    /// `admin:*/*`.
+    Domains {
+        #[command(subcommand)]
+        action: DomainsAction,
+    },
+
     /// Read what was done to this platform, by whom, and how it ended.
     ///
     /// Every deploy, rollback, secret change, token mint, account change and
@@ -492,6 +523,27 @@ enum Commands {
         /// Most lines to print, newest first.
         #[arg(long, default_value = "50")]
         limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum RoutesAction {
+    /// List one environment's routes, in the order the edge applies them.
+    List {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+    },
+}
+
+#[derive(Subcommand)]
+enum DomainsAction {
+    /// List every grant in the registry.
+    List {
+        #[command(flatten)]
+        format: Format,
     },
 }
 
@@ -1156,6 +1208,15 @@ async fn run(cli: Cli) -> Result<()> {
             limit,
         } => commands::versions::execute(target.app, limit, format.into()).await,
 
+        Commands::Deployments {
+            target,
+            format,
+            limit,
+        } => {
+            commands::deployments::execute(target.app, target.environment, limit, format.into())
+                .await
+        }
+
         Commands::Rollback {
             target,
             format,
@@ -1177,6 +1238,16 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Status { target, format } => {
             commands::status::execute(target.app, format.into()).await
         }
+
+        Commands::Routes { action } => match action {
+            RoutesAction::List { target, format } => {
+                commands::routes::list(target.app, target.environment, format.into()).await
+            }
+        },
+
+        Commands::Domains { action } => match action {
+            DomainsAction::List { format } => commands::domains::list(format.into()).await,
+        },
 
         Commands::Targets { action } => match action {
             TargetsAction::List { format } => commands::targets::list(format.into()),

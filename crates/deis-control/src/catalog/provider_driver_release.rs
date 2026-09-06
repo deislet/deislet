@@ -2898,22 +2898,28 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let installation = store
-            .register_provider_installation(ProviderInstallationSpec {
-                backend_id: "cloudflare-workers-pages".to_owned(),
-                account_reference: "revocation-account".to_owned(),
-                region: None,
-                credential_binding_id: credential.binding_id,
-            })
+            .register_provider_installation(
+                ProviderInstallationSpec {
+                    backend_id: "cloudflare-workers-pages".to_owned(),
+                    account_reference: "revocation-account".to_owned(),
+                    region: None,
+                    credential_binding_id: credential.binding_id,
+                },
+                None,
+            )
             .await
             .unwrap();
         let target = store
-            .register_provider_target(ProviderTargetSpec {
-                installation_id: installation.installation_id,
-                name: "revocation-target".to_owned(),
-                standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
-                target_config_digest: "d".repeat(64).parse().unwrap(),
-                driver_manifest: fixture.manifest.clone(),
-            })
+            .register_provider_target(
+                ProviderTargetSpec {
+                    installation_id: installation.installation_id,
+                    name: "revocation-target".to_owned(),
+                    standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                    target_config_digest: "d".repeat(64).parse().unwrap(),
+                    driver_manifest: fixture.manifest.clone(),
+                },
+                None,
+            )
             .await
             .unwrap();
         registry.resolve_for_target(target.target_id).await.unwrap();
@@ -3128,22 +3134,28 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let installation = store
-            .register_provider_installation(ProviderInstallationSpec {
-                backend_id: "cloudflare-workers-pages".to_owned(),
-                account_reference: "registry-account".to_owned(),
-                region: None,
-                credential_binding_id: credential.binding_id,
-            })
+            .register_provider_installation(
+                ProviderInstallationSpec {
+                    backend_id: "cloudflare-workers-pages".to_owned(),
+                    account_reference: "registry-account".to_owned(),
+                    region: None,
+                    credential_binding_id: credential.binding_id,
+                },
+                None,
+            )
             .await
             .unwrap();
         let target = store
-            .register_provider_target(ProviderTargetSpec {
-                installation_id: installation.installation_id,
-                name: "registry-target".to_owned(),
-                standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
-                target_config_digest: "b".repeat(64).parse().unwrap(),
-                driver_manifest: fixture.manifest.clone(),
-            })
+            .register_provider_target(
+                ProviderTargetSpec {
+                    installation_id: installation.installation_id,
+                    name: "registry-target".to_owned(),
+                    standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                    target_config_digest: "b".repeat(64).parse().unwrap(),
+                    driver_manifest: fixture.manifest.clone(),
+                },
+                None,
+            )
             .await
             .unwrap();
         let dispatcher = ProviderDriverDispatcher::new(

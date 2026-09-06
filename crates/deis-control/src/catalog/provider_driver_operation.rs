@@ -25,6 +25,7 @@ use deis_wire::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
 use super::operation::{
     OperationRequestContext, actor_id, default_organization_id, find_operation_request_tx,
@@ -60,6 +61,9 @@ pub struct ProviderInstallation {
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set once by a soft delete and never cleared. A deleted installation
+    /// keeps the terminal `revoked` status the table already allows.
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,9 +92,16 @@ pub struct ProviderTarget {
     pub driver_release_digest: Sha256Digest,
     pub driver_manifest_digest: Sha256Digest,
     pub status: String,
+    /// The owning installation's status. A target only accepts new work when
+    /// both it and its installation are `active`; this lets a client see why
+    /// an `active` target is not usable.
+    pub installation_status: String,
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set once by a soft delete and never cleared. A deleted target keeps
+    /// the terminal `disabled` status the table already allows.
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,9 +218,13 @@ struct StoredTarget {
 }
 
 impl CatalogStore {
+    /// Register an installation. `idempotency_record` is the API replay
+    /// record of the request that carried an `Idempotency-Key`; it is
+    /// completed in the same transaction as the installation row.
     pub async fn register_provider_installation(
         &self,
         spec: ProviderInstallationSpec,
+        idempotency_record: Option<PendingIdempotencyRecord>,
     ) -> CatalogResult<ProviderInstallation> {
         validate_identifier("provider backend", &spec.backend_id, 1, 128)?;
         if !matches!(
@@ -231,8 +246,9 @@ impl CatalogStore {
         let now = now_secs();
         self.database()
             .with_connection(move |connection| {
-                let organization_id = default_organization_id(connection)?;
-                let credential_matches = connection
+                let transaction = connection.unchecked_transaction()?;
+                let organization_id = default_organization_id(&transaction)?;
+                let credential_matches = transaction
                     .query_row(
                         "SELECT 1 FROM provider_credential_bindings
                           WHERE binding_id = ?1 AND organization_id = ?2
@@ -251,7 +267,7 @@ impl CatalogStore {
                         "provider installation needs an active credential binding for the same organization and backend",
                     ));
                 }
-                connection.execute(
+                transaction.execute(
                     "INSERT INTO provider_installations
                        (installation_id, organization_id, backend_id, account_reference,
                         region, credential_binding_id, status, revision, created_at, updated_at)
@@ -266,9 +282,17 @@ impl CatalogStore {
                         now,
                     ],
                 )?;
-                load_installation(connection, installation_id)?.ok_or_else(|| {
-                    CatalogError::not_found(format!("provider installation {installation_id}"))
-                })
+                let installation = load_installation(&transaction, installation_id)?
+                    .ok_or_else(|| {
+                        CatalogError::not_found(format!("provider installation {installation_id}"))
+                    })?;
+                complete_idempotency_record(
+                    &transaction,
+                    idempotency_record.as_ref(),
+                    &installation,
+                )?;
+                transaction.commit()?;
+                Ok(installation)
             })
             .await
     }
@@ -333,9 +357,12 @@ impl CatalogStore {
             .await
     }
 
+    /// Register a target. `idempotency_record` is completed in the same
+    /// transaction as the target row, like the installation registration.
     pub async fn register_provider_target(
         &self,
         spec: ProviderTargetSpec,
+        idempotency_record: Option<PendingIdempotencyRecord>,
     ) -> CatalogResult<ProviderTarget> {
         validate_single_line_text("provider target name", &spec.name, 1, 128)?;
         validate_single_line_text("standard version", &spec.standard_version, 1, 128)?;
@@ -362,7 +389,8 @@ impl CatalogStore {
         let now = now_secs();
         self.database()
             .with_connection(move |connection| {
-                let installation = load_installation(connection, spec.installation_id)?
+                let transaction = connection.unchecked_transaction()?;
+                let installation = load_installation(&transaction, spec.installation_id)?
                     .ok_or_else(|| {
                         CatalogError::not_found(format!(
                             "provider installation {}",
@@ -374,7 +402,7 @@ impl CatalogStore {
                         "provider target must use an active installation for the same backend",
                     ));
                 }
-                let release_matches = connection
+                let release_matches = transaction
                     .query_row(
                         "SELECT 1 FROM provider_driver_releases
                           WHERE release_sha256 = ?1 AND host_operating_system = ?2
@@ -397,7 +425,7 @@ impl CatalogStore {
                         "provider target needs a matching verified driver release on this Control host",
                     ));
                 }
-                connection.execute(
+                transaction.execute(
                     "INSERT INTO provider_targets
                        (target_id, installation_id, backend_id, name, standard_version,
                         target_config_sha256, driver_id, driver_version,
@@ -421,9 +449,12 @@ impl CatalogStore {
                         now,
                     ],
                 )?;
-                load_target(connection, target_id)?
+                let target = load_target(&transaction, target_id)?
                     .map(|stored| stored.target)
-                    .ok_or_else(|| CatalogError::not_found(format!("provider target {target_id}")))
+                    .ok_or_else(|| CatalogError::not_found(format!("provider target {target_id}")))?;
+                complete_idempotency_record(&transaction, idempotency_record.as_ref(), &target)?;
+                transaction.commit()?;
+                Ok(target)
             })
             .await
     }
@@ -831,6 +862,11 @@ impl CatalogStore {
     /// not yet been folded into its parent are immediate. A live lease is
     /// left alone, while provider-directed retry/reconciliation observes a
     /// durable minimum delay based on the child's persisted `updated_at`.
+    ///
+    /// Selection fails closed on the target: a workflow whose target or
+    /// installation is not `active` (disabled or soft-deleted) is never
+    /// handed to a dispatcher. Its rows are left exactly as they are, so
+    /// re-enabling the resource resumes it from the same step.
     pub(crate) async fn provider_deployments_ready_for_dispatch(
         &self,
         now: DateTime<Utc>,
@@ -873,12 +909,16 @@ impl CatalogStore {
                 loop {
                     let page = if let Some((updated_at, operation_id)) = cursor.as_ref() {
                         let mut statement = transaction.prepare(
-                            "SELECT operation_id, updated_at
-                               FROM provider_deployment_workflows
-                              WHERE state NOT IN ('succeeded', 'failed')
-                                AND (updated_at > ?1
-                                     OR (updated_at = ?1 AND operation_id > ?2))
-                              ORDER BY updated_at, operation_id
+                            "SELECT w.operation_id, w.updated_at
+                               FROM provider_deployment_workflows w
+                               JOIN provider_targets t ON t.target_id = w.provider_target_id
+                               JOIN provider_installations i
+                                 ON i.installation_id = t.installation_id
+                              WHERE w.state NOT IN ('succeeded', 'failed')
+                                AND t.status = 'active' AND i.status = 'active'
+                                AND (w.updated_at > ?1
+                                     OR (w.updated_at = ?1 AND w.operation_id > ?2))
+                              ORDER BY w.updated_at, w.operation_id
                               LIMIT ?3",
                         )?;
                         statement
@@ -888,10 +928,14 @@ impl CatalogStore {
                             .collect::<Result<Vec<_>, _>>()?
                     } else {
                         let mut statement = transaction.prepare(
-                            "SELECT operation_id, updated_at
-                               FROM provider_deployment_workflows
-                              WHERE state NOT IN ('succeeded', 'failed')
-                              ORDER BY updated_at, operation_id
+                            "SELECT w.operation_id, w.updated_at
+                               FROM provider_deployment_workflows w
+                               JOIN provider_targets t ON t.target_id = w.provider_target_id
+                               JOIN provider_installations i
+                                 ON i.installation_id = t.installation_id
+                              WHERE w.state NOT IN ('succeeded', 'failed')
+                                AND t.status = 'active' AND i.status = 'active'
+                              ORDER BY w.updated_at, w.operation_id
                               LIMIT ?1",
                         )?;
                         statement
@@ -3033,14 +3077,15 @@ fn validate_artifact_lineage(
     }
 }
 
-fn load_installation(
+pub(super) fn load_installation(
     connection: &Connection,
     installation_id: CanonicalId,
 ) -> CatalogResult<Option<ProviderInstallation>> {
     connection
         .query_row(
             "SELECT installation_id, organization_id, backend_id, account_reference,
-                    region, credential_binding_id, status, revision, created_at, updated_at
+                    region, credential_binding_id, status, revision, created_at, updated_at,
+                    deleted_at
                FROM provider_installations WHERE installation_id = ?1",
             [installation_id.to_string()],
             |row| {
@@ -3055,6 +3100,7 @@ fn load_installation(
                     row.get::<_, i64>(7)?,
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
                 ))
             },
         )
@@ -3071,9 +3117,23 @@ fn load_installation(
                 revision: to_u64(row.7, "provider installation revision")?,
                 created_at: timestamp(row.8, "provider installation created time")?,
                 updated_at: timestamp(row.9, "provider installation updated time")?,
+                deleted_at: row
+                    .10
+                    .map(|value| timestamp(value, "provider installation deleted time"))
+                    .transpose()?,
             })
         })
         .transpose()
+}
+
+/// The public view of one target, re-verified against its persisted
+/// manifest exactly as [`load_target`] does, for sibling modules that do
+/// not need the manifest itself.
+pub(super) fn load_target_record(
+    connection: &Connection,
+    target_id: CanonicalId,
+) -> CatalogResult<Option<ProviderTarget>> {
+    load_target(connection, target_id).map(|stored| stored.map(|stored| stored.target))
 }
 
 fn load_target(
@@ -3087,7 +3147,8 @@ fn load_target(
                     t.driver_version, t.driver_distribution_sha256,
                     t.driver_release_sha256, t.driver_manifest_sha256,
                     t.driver_manifest_json, t.status,
-                    t.revision, t.created_at, t.updated_at, i.organization_id, i.status
+                    t.revision, t.created_at, t.updated_at, i.organization_id, i.status,
+                    t.deleted_at
                FROM provider_targets t
                JOIN provider_installations i ON i.installation_id = t.installation_id
               WHERE t.target_id = ?1",
@@ -3112,6 +3173,7 @@ fn load_target(
                     row.get::<_, i64>(15)?,
                     row.get::<_, String>(16)?,
                     row.get::<_, String>(17)?,
+                    row.get::<_, Option<i64>>(18)?,
                 ))
             },
         )
@@ -3170,9 +3232,14 @@ fn load_target(
                     driver_release_digest: release_digest,
                     driver_manifest_digest: persisted,
                     status: row.12,
+                    installation_status: row.17.clone(),
                     revision: to_u64(row.13, "provider target revision")?,
                     created_at: timestamp(row.14, "provider target created time")?,
                     updated_at: timestamp(row.15, "provider target updated time")?,
+                    deleted_at: row
+                        .18
+                        .map(|value| timestamp(value, "provider target deleted time"))
+                        .transpose()?,
                 },
                 organization_id: parse_id(&row.16, "provider organization")?,
                 installation_status: row.17,
@@ -3561,12 +3628,15 @@ mod tests {
             .await
             .unwrap();
         let installation = store
-            .register_provider_installation(ProviderInstallationSpec {
-                backend_id: "cloudflare-workers-pages".to_owned(),
-                account_reference: "account-reference".to_owned(),
-                region: None,
-                credential_binding_id: credential.binding_id,
-            })
+            .register_provider_installation(
+                ProviderInstallationSpec {
+                    backend_id: "cloudflare-workers-pages".to_owned(),
+                    account_reference: "account-reference".to_owned(),
+                    region: None,
+                    credential_binding_id: credential.binding_id,
+                },
+                None,
+            )
             .await
             .unwrap();
         let driver_manifest = manifest();
@@ -3576,13 +3646,16 @@ mod tests {
         )
         .await;
         let target = store
-            .register_provider_target(ProviderTargetSpec {
-                installation_id: installation.installation_id,
-                name: "production".to_owned(),
-                standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
-                target_config_digest: "b".repeat(64).parse().unwrap(),
-                driver_manifest,
-            })
+            .register_provider_target(
+                ProviderTargetSpec {
+                    installation_id: installation.installation_id,
+                    name: "production".to_owned(),
+                    standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                    target_config_digest: "b".repeat(64).parse().unwrap(),
+                    driver_manifest,
+                },
+                None,
+            )
             .await
             .unwrap();
         let grant = store
@@ -3595,6 +3668,7 @@ mod tests {
                 },
                 ProviderTargetGrantMutationContext {
                     actor_subject: "account:provider-test-admin".to_owned(),
+                    idempotency_record: None,
                 },
             )
             .await
@@ -4365,6 +4439,7 @@ mod tests {
                 harness.grant.revision,
                 ProviderTargetGrantMutationContext {
                     actor_subject: "account:provider-test-admin".to_owned(),
+                    idempotency_record: None,
                 },
             )
             .await
@@ -4413,6 +4488,7 @@ mod tests {
                 },
                 ProviderTargetGrantMutationContext {
                     actor_subject: "account:provider-test-admin".to_owned(),
+                    idempotency_record: None,
                 },
             )
             .await
@@ -4831,6 +4907,7 @@ mod tests {
                     },
                     ProviderTargetGrantMutationContext {
                         actor_subject: "account:provider-test-admin".to_owned(),
+                        idempotency_record: None,
                     },
                 )
                 .await

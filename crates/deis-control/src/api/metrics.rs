@@ -3,7 +3,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::error::ApiError;
-use crate::metrics::MetricsCollector;
+use crate::metrics::{MetricsCollector, page_cursor_gauges};
 
 #[derive(Clone)]
 pub struct MetricsState {
@@ -32,6 +32,15 @@ pub async fn get_metrics_summary(
                 "total_events": summary.system.total_events,
                 "total_commands": summary.system.total_commands,
                 "total_heartbeats": summary.system.total_heartbeats,
+            },
+            "pagination": {
+                // `null` when the cursor table could not be read, so a
+                // dashboard can tell "unknown" from "none".
+                "cursors": summary.pagination.cursors.map(|cursors| json!({
+                    "live": cursors.live,
+                    "expired_pending_removal": cursors.expired_pending_removal,
+                    "oldest_live_age_seconds": cursors.oldest_live_age_seconds,
+                })),
             }
         }
     })))
@@ -110,9 +119,12 @@ pub async fn export_prometheus(
     output.push_str(&format!(
         "# HELP deis_control_heartbeats_total Total number of heartbeats\n\
          # TYPE deis_control_heartbeats_total counter\n\
-         deis_control_heartbeats_total {}\n",
+         deis_control_heartbeats_total {}\n\n",
         summary.system.total_heartbeats
     ));
+
+    // Pagination capacity: the cursor table, one gauge per reading.
+    output.push_str(&page_cursor_gauges(summary.pagination.cursors.as_ref()));
 
     Ok(output)
 }

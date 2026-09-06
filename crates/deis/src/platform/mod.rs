@@ -29,7 +29,11 @@ const LIST_SCHEMA_VERSION: u8 = 1;
 /// The largest page any list route serves; a larger `limit=` is refused,
 /// not clamped, so a caller that asks for one page of "the latest N" caps
 /// N here itself.
-const MAX_LIST_LIMIT: usize = 1_000;
+///
+/// Public because a command that prints "20 of 4000 shown" has to be able to
+/// say what raising `--limit` can actually reach, and a second copy of the
+/// number in the renderer would be the copy that goes stale.
+pub const MAX_LIST_LIMIT: usize = 1_000;
 /// How many pages one list may be read as before this CLI gives up.
 ///
 /// A control plane that keeps handing out a `nextCursor` forever would
@@ -77,6 +81,72 @@ fn append_cursor(path: &str, cursor: &str) -> String {
     let separator = if path.contains('?') { '&' } else { '?' };
     let encoded: String = url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect();
     format!("{path}{separator}cursor={encoded}")
+}
+
+/// The two things every page of the unified envelope is held to, wherever it
+/// is read: an envelope version this build does not know, and a page that
+/// counted itself differently than it filled itself.
+///
+/// A free function rather than a method because there are two readers of the
+/// same envelope and they differ only in whether they follow the cursor -
+/// [`Control::list_all`] does, [`Control::list_first_page`] deliberately does
+/// not. A second copy of these checks in the second reader is exactly how a
+/// "latest N" command ends up silently reading an envelope the paging reader
+/// would have warned about.
+fn check_list_envelope<T>(path: &str, page_number: usize, page: &ListPage<T>) {
+    if page.schema_version != LIST_SCHEMA_VERSION {
+        // Readable, since the items themselves parsed - but say so once,
+        // because a field this CLI prints may have moved.
+        tracing::warn!(
+            path,
+            page_number,
+            schema_version = page.schema_version,
+            expected = LIST_SCHEMA_VERSION,
+            "control plane answered a list envelope this CLI does not know"
+        );
+    }
+    if page.page.count != page.items.len() {
+        // Only ever a control-plane bug: the contract says the two are the
+        // same number. What arrived is still what is used.
+        tracing::warn!(
+            path,
+            page_number,
+            claimed = page.page.count,
+            received = page.items.len(),
+            "control plane counted a page differently than it filled it"
+        );
+    }
+    tracing::debug!(
+        path,
+        page_number,
+        limit = page.page.limit,
+        count = page.items.len(),
+        total = page.page.total,
+        has_next = page.page.next_cursor.is_some(),
+        "read one page of a control-plane list"
+    );
+}
+
+/// The page size a "latest N" read may actually ask for, and a warning when
+/// that is not the size the operator typed.
+///
+/// The control plane *refuses* an oversized `limit=` rather than clamping it,
+/// so a command that passed the number through unchanged would answer a
+/// person who asked for 5000 rows with a bad request instead of with rows.
+/// Clamping here keeps the command working and says, at warn, that the answer
+/// is shorter than what was asked for - which is the sort of quiet difference
+/// an operator otherwise discovers by miscounting an incident.
+fn bounded_page_limit(requested: usize, what: &str) -> usize {
+    let bounded = requested.clamp(1, MAX_LIST_LIMIT);
+    if bounded != requested {
+        tracing::warn!(
+            what,
+            requested,
+            applied = bounded,
+            "the control plane serves at most {MAX_LIST_LIMIT} rows per page; reading that many"
+        );
+    }
+    bounded
 }
 
 /// An application as the catalog records it.
@@ -186,6 +256,20 @@ pub struct Deployment {
     pub snapshot_id: Option<String>,
 }
 
+/// The top of one environment's deployment history, and how deep the history
+/// goes.
+///
+/// `total` is the whole environment's count as the control plane counted it
+/// in the same read that produced the rows, not the number printed. Keeping
+/// the two apart is what lets `deis deployments` say "20 of 4000" instead of
+/// leaving a reader to assume that twenty is all there ever was.
+#[derive(Debug, Clone)]
+pub struct DeploymentHistory {
+    /// Newest first, as the route serves them.
+    pub deployments: Vec<Deployment>,
+    pub total: usize,
+}
+
 /// What a deploy, a rollback or a read of the current pointer answers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeploymentResponse {
@@ -289,6 +373,48 @@ pub struct NodeFailure {
     pub node: String,
     pub error: String,
 }
+
+/// A route as the catalog records it: what the edge matches a request
+/// against, and which environment answers it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Route {
+    pub id: String,
+    pub app_id: String,
+    pub env_id: String,
+    /// `None` matches any domain. That is the *widest* claim on this
+    /// platform rather than the mildest one, which is why it is spelled out
+    /// in the table rather than left blank.
+    #[serde(default)]
+    pub host: Option<String>,
+    pub path_prefix: String,
+    /// Higher wins when more than one route matches a request.
+    pub priority: i64,
+}
+
+/// One row of the hostname registry: which application, in which
+/// environment, may claim which name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DomainGrant {
+    /// `example.com`, `*.example.com`, `(no-host)` or `*`.
+    pub pattern: String,
+    pub app_id: String,
+    /// One environment's name, or [`EVERY_ENVIRONMENT`].
+    pub environment: String,
+    pub created_at: i64,
+    /// Free text an operator left for the next operator. Never interpreted.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// What a grant's environment column holds when the grant covers every
+/// environment of its application.
+///
+/// One character of wire format, spelled here because this CLI does not
+/// depend on deis-control and cannot import the constant it is a copy of
+/// (`catalog::domains::EVERY_ENVIRONMENT`). What keeps the two the same is
+/// `list_page_tests::the_every_environment_marker_is_the_control_planes_own`,
+/// which reads the sibling crate's source and fails if it changed.
+pub const EVERY_ENVIRONMENT: &str = "*";
 
 /// A secret's metadata. There is deliberately no field for the value: the
 /// control plane has no endpoint that returns one.
@@ -582,36 +708,7 @@ impl Control {
                 None => path.to_string(),
             };
             let page: ListPage<T> = self.send(self.request(Method::GET, &url), what).await?;
-            if page.schema_version != LIST_SCHEMA_VERSION {
-                // Readable, since the items themselves parsed - but say so
-                // once, because a field this CLI prints may have moved.
-                tracing::warn!(
-                    path,
-                    schema_version = page.schema_version,
-                    expected = LIST_SCHEMA_VERSION,
-                    "control plane answered a list envelope this CLI does not know"
-                );
-            }
-            if page.page.count != page.items.len() {
-                // Only ever a control-plane bug: the contract says the two
-                // are the same number. What arrived is still what is used.
-                tracing::warn!(
-                    path,
-                    page_number,
-                    claimed = page.page.count,
-                    received = page.items.len(),
-                    "control plane counted a page differently than it filled it"
-                );
-            }
-            tracing::debug!(
-                path,
-                page_number,
-                limit = page.page.limit,
-                count = page.items.len(),
-                total = page.page.total,
-                has_next = page.page.next_cursor.is_some(),
-                "read one page of a control-plane list"
-            );
+            check_list_envelope(path, page_number, &page);
             let empty = page.items.is_empty();
             items.extend(page.items);
             cursor = page.page.next_cursor;
@@ -643,6 +740,24 @@ impl Control {
             "{what}: the control plane is still offering more pages after {MAX_LIST_PAGES}; \
              stopping rather than reading forever"
         )
+    }
+
+    /// Read the first page of a paginated list route and stop there.
+    ///
+    /// For the commands that print "the latest N" - `deis audit`, `deis
+    /// deployments` - where the newest rows are the whole answer and the rest
+    /// of an unbounded history is not worth the requests. The envelope is
+    /// checked exactly as [`Self::list_all`] checks every page; what differs
+    /// is only that the cursor is handed back to the caller instead of
+    /// followed, so the caller can say how much it did not print.
+    async fn list_first_page<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        what: &str,
+    ) -> Result<ListPage<T>> {
+        let page: ListPage<T> = self.send(self.request(Method::GET, path), what).await?;
+        check_list_envelope(path, 1, &page);
+        Ok(page)
     }
 
     fn transport_error(&self, e: reqwest::Error) -> anyhow::Error {
@@ -1139,6 +1254,69 @@ impl Control {
         )))
     }
 
+    /// The newest `limit` deployments of one environment, and how many the
+    /// environment has behind them.
+    ///
+    /// One page on purpose. An environment gains a deployment on every
+    /// deploy, every rollback and every secret change, so its history has no
+    /// ceiling; `deis deployments` prints the top of it and says how far down
+    /// it goes rather than walking a year of rows to show twenty.
+    pub async fn list_deployments(
+        &self,
+        app_id: &str,
+        environment: &str,
+        limit: usize,
+    ) -> Result<DeploymentHistory> {
+        let what = format!("listing the deployments of {environment} of app {app_id}");
+        let limit = bounded_page_limit(limit, &what);
+        let path =
+            format!("/api/apps/{app_id}/environments/{environment}/deployments?limit={limit}");
+        let page: ListPage<Deployment> = self.list_first_page(&path, &what).await?;
+        if page.page.next_cursor.is_some() {
+            tracing::debug!(
+                app_id,
+                environment,
+                shown = page.items.len(),
+                total = page.page.total,
+                "this environment has more deployments than one page holds; raise --limit to \
+                 read further back"
+            );
+        }
+        Ok(DeploymentHistory {
+            deployments: page.items,
+            total: page.page.total,
+        })
+    }
+
+    // ---- routes -------------------------------------------------------
+
+    /// One environment's routes, in the order the edge applies them: highest
+    /// priority first, then by path prefix.
+    ///
+    /// Followed to the end rather than read one page deep, because a routing
+    /// table read that stopped halfway would show an operator a prefix and
+    /// hide the higher-priority one that actually wins - and unlike a
+    /// deployment history, a routing table is small by construction.
+    pub async fn list_routes(&self, app_id: &str, environment: &str) -> Result<Vec<Route>> {
+        self.list_all(
+            &format!("/api/apps/{app_id}/environments/{environment}/routes"),
+            &format!("listing the routes of {environment} of app {app_id}"),
+        )
+        .await
+    }
+
+    // ---- domain grants ------------------------------------------------
+
+    /// The whole hostname registry, in `(pattern, application, environment)`
+    /// order.
+    ///
+    /// Platform-wide, and read with `admin:*/*`: a hostname belongs to
+    /// nobody's application, which is the whole reason the registry exists.
+    pub async fn list_domain_grants(&self) -> Result<Vec<DomainGrant>> {
+        self.list_all("/api/domains", "listing the domain grants")
+            .await
+    }
+
     // ---- secrets ------------------------------------------------------
 
     pub async fn put_secret(
@@ -1385,16 +1563,10 @@ impl Control {
         push("outcome", filter.outcome.clone());
         push("since", filter.since.map(|s| s.to_string()));
         if let Some(limit) = filter.limit {
-            let bounded = limit.clamp(1, MAX_LIST_LIMIT);
-            if bounded != limit {
-                tracing::warn!(
-                    requested = limit,
-                    applied = bounded,
-                    "the control plane serves at most {MAX_LIST_LIMIT} audit lines per page; \
-                     reading that many"
-                );
-            }
-            push("limit", Some(bounded.to_string()));
+            push(
+                "limit",
+                Some(bounded_page_limit(limit, "the audit log").to_string()),
+            );
         }
 
         let path = if query.is_empty() {
@@ -1404,9 +1576,8 @@ impl Control {
         };
         // One page, newest first: `deis audit` prints "the latest N", not
         // the whole log, so the cursor is read for the log line only.
-        let page: ListPage<AuditEntry> = self
-            .send(self.request(Method::GET, &path), "reading the audit log")
-            .await?;
+        let page: ListPage<AuditEntry> =
+            self.list_first_page(&path, "reading the audit log").await?;
         if page.page.next_cursor.is_some() {
             tracing::debug!(
                 shown = page.items.len(),
@@ -1928,6 +2099,180 @@ mod list_page_tests {
         let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
         assert_eq!(actions, ["deploy", "rollback"]);
         let _ = shutdown.send(());
+    }
+
+    /// One page of the newest deployments, with a cursor this CLI
+    /// deliberately does not follow. The route also proves the `limit=` a
+    /// caller asked for reached it.
+    async fn deployments_page(Query(query): Query<HashMap<String, String>>) -> Response {
+        assert_eq!(query.get("limit").map(String::as_str), Some("1000"));
+        assert!(!query.contains_key("cursor"));
+        let deployment = |id: &str, at: i64, note: Option<&str>| {
+            serde_json::json!({
+                "id": id,
+                "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+                "app_id": "demo",
+                "env_id": "env-1",
+                "version_id": format!("version-{id}"),
+                "created_at": at,
+                "note": note,
+                "snapshot_id": "snapshot-1"
+            })
+        };
+        Json(serde_json::json!({
+            "schemaVersion": 1,
+            "items": [
+                deployment("dep-9", 900, Some("hotfix")),
+                deployment("dep-8", 800, None)
+            ],
+            "page": {"limit": 1000, "count": 2, "total": 137, "nextCursor": CURSOR}
+        }))
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn a_deployment_history_is_one_bounded_page_and_says_how_deep_it_goes() {
+        let router = Router::new().route(
+            "/api/apps/demo/environments/production/deployments",
+            get(deployments_page),
+        );
+        let (control, shutdown) = control_for(router).await;
+        // Asked for more than any page serves: clamped to the ceiling rather
+        // than sent on and refused, which the route asserts on arrival.
+        let history = control
+            .list_deployments("demo", "production", 5_000)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = history.deployments.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["dep-9", "dep-8"]);
+        assert_eq!(history.deployments[0].version_id, "version-dep-9");
+        assert_eq!(history.deployments[0].note.as_deref(), Some("hotfix"));
+        assert!(history.deployments[1].note.is_none());
+        assert!(history.deployments[0].canonical_id.is_some());
+        // The rest of the history is counted, not read.
+        assert_eq!(history.total, 137);
+        let _ = shutdown.send(());
+    }
+
+    /// Two pages of one environment's routes, in the order the edge applies
+    /// them; the CLI must not re-sort them.
+    async fn routes_page(Query(query): Query<HashMap<String, String>>) -> Response {
+        let route = |id: &str, host: Option<&str>, prefix: &str, priority: i64| {
+            serde_json::json!({
+                "id": id,
+                "app_id": "demo",
+                "env_id": "env-1",
+                "host": host,
+                "path_prefix": prefix,
+                "priority": priority
+            })
+        };
+        match query.get("cursor").map(String::as_str) {
+            None => Json(page(
+                vec![
+                    route("route-1", Some("shop.example.com"), "/checkout", 100),
+                    route("route-2", Some("shop.example.com"), "/", 50),
+                ],
+                Some(CURSOR),
+            ))
+            .into_response(),
+            Some(CURSOR) => Json(page(vec![route("route-3", None, "/", 0)], None)).into_response(),
+            Some(other) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("cursor arrived mangled: {other}")
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_are_read_through_the_unified_envelope_in_the_servers_order() {
+        let router = Router::new().route(
+            "/api/apps/demo/environments/production/routes",
+            get(routes_page),
+        );
+        let (control, shutdown) = control_for(router).await;
+        let routes = control.list_routes("demo", "production").await.unwrap();
+        let ids: Vec<&str> = routes.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["route-1", "route-2", "route-3"]);
+        assert_eq!(routes[0].priority, 100);
+        assert_eq!(routes[0].path_prefix, "/checkout");
+        assert_eq!(routes[0].host.as_deref(), Some("shop.example.com"));
+        // A route that names no host is the widest claim there is, and it
+        // has to survive the round trip as absent rather than as "".
+        assert!(routes[2].host.is_none());
+        let _ = shutdown.send(());
+    }
+
+    /// Two pages of the hostname registry.
+    async fn domains_page(Query(query): Query<HashMap<String, String>>) -> Response {
+        let grant = |pattern: &str, environment: &str, note: Option<&str>| {
+            serde_json::json!({
+                "pattern": pattern,
+                "app_id": "demo",
+                "environment": environment,
+                "created_at": 1,
+                "note": note
+            })
+        };
+        match query.get("cursor").map(String::as_str) {
+            None => Json(page(
+                vec![
+                    grant("*.example.com", "*", Some("the zone")),
+                    grant("shop.example.com", "production", None),
+                ],
+                Some(CURSOR),
+            ))
+            .into_response(),
+            Some(CURSOR) => {
+                Json(page(vec![grant("(no-host)", "preview", None)], None)).into_response()
+            }
+            Some(other) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("cursor arrived mangled: {other}")
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn domain_grants_are_read_through_the_unified_envelope() {
+        let router = Router::new().route("/api/domains", get(domains_page));
+        let (control, shutdown) = control_for(router).await;
+        let grants = control.list_domain_grants().await.unwrap();
+        let patterns: Vec<&str> = grants.iter().map(|g| g.pattern.as_str()).collect();
+        assert_eq!(patterns, ["*.example.com", "shop.example.com", "(no-host)"]);
+        assert_eq!(grants[0].environment, EVERY_ENVIRONMENT);
+        assert_eq!(grants[0].note.as_deref(), Some("the zone"));
+        assert_eq!(grants[1].environment, "production");
+        assert!(grants[1].note.is_none());
+        let _ = shutdown.send(());
+    }
+
+    /// [`EVERY_ENVIRONMENT`] is this crate's copy of one character of the
+    /// control plane's wire format, and the two crates cannot import each
+    /// other's constant. So the sibling's source is read: if the control
+    /// plane ever spells "every environment" differently, this fails rather
+    /// than `deis domains list` quietly printing a grant as covering one
+    /// environment named `*`.
+    #[test]
+    fn the_every_environment_marker_is_the_control_planes_own() {
+        let sibling_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../deis-control/src/catalog/domains.rs"
+        );
+        let sibling = std::fs::read_to_string(sibling_path)
+            .expect("the control plane's domain rules are in this workspace");
+        let declaration = format!("EVERY_ENVIRONMENT: &str = \"{EVERY_ENVIRONMENT}\";");
+        assert!(
+            sibling.contains(&declaration),
+            "deis-control no longer declares {declaration}; the CLI's copy has drifted from the \
+             control plane's registry format"
+        );
     }
 
     #[tokio::test]

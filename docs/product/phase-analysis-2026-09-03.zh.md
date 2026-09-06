@@ -2603,3 +2603,38 @@ Application/framework source + versioned build plan
   （configs/events stats、metrics summary）的 summary 契约；单资源 `schemaVersion` 位宽与列表不一致（u32 与 u8）；cursor 表
   主动清理调度、容量指标与多 Control 实例共享 authority；通用 mutation 幂等；installation/target lifecycle；application
   删除时 grant 收敛；provider deployment cancel/rollback；CLI/Web 对 domains、routes、deployment history 等尚无入口。
+
+## 92. Provider mutation 幂等、installation/target 生命周期、cursor 生命周期与 CLI 列表命令
+
+- 三条并行切片加一条串行切片由工作流推进，最终门禁一次通过：Control 552/552（lib 528 加 1 项显式 ignore 的负载证据、
+  API integration 14、architecture 2、docs witness 6、fleet credential 2）、CLI 161/161、严格 Clippy、共享契约、治理、
+  文档路径字面量与 `git diff --check`。三视角审查报出 9 项（4 major、5 minor），除一项 security minor 外全部修复。
+- Cursor 生命周期：`PageCursorStore` 增加 `expire` 与 `statistics`，liveness reaper 每次 sweep 顺带删除到期 cursor（启动先跑一次、
+  按 heartbeat 间隔 tick、随 shutdown 停止，删除失败只 warn 不中断）。`/api/metrics/summary` 新增
+  `metrics.pagination.cursors`（live、expired_pending_removal、oldest_live_age_seconds，读失败为 null），Prometheus 文本新增
+  `deis_control_page_cursors_live` / `_expired_pending` / `_oldest_live_age_seconds` 三个 gauge。
+- 查询计划证据：`catalog/pagination_plans.rs` 对 20 条 keyset 分页查询做 `EXPLAIN QUERY PLAN`，断言命中预期索引、无 TEMP B-TREE、
+  不裸扫分页表；SQL 文本与来源文件做归一化包含校验，来源改动即失败。一项已知不足如实记录为 `known_shortfall`：
+  environment 内 grant 列表的 `(?3 IS NULL OR status = ?3)` 形式让索引前缀止于 environment，排序落到 TEMP B-TREE；
+  tokens 与 targets 的可选过滤同样是整集合顺序扫描后过滤（排序仍走索引）。负载证据为显式 ignore 的测试：50,000 条
+  deployment 分 5 个 environment，按 limit 1000 走完 10 页，逐页 18–25 ms、深度不变，10,000 行共 214.9 ms（debug、内存库）。
+- Mutation 幂等：新增 `catalog::idempotency` 与表 `api_idempotency_records`（记录 organization、actor、route、key SHA-256、
+  JCS 规范化请求摘要、资源引用；pending 5 分钟、completed 24 小时到期；只允许 pending→completed 的不可变触发器）。
+  credential create、installation create、target create、grant create 必须带 `idempotency-key`（缺失 400）；credential rotate/
+  revoke 与 grant revoke 可选携带，已应用请求的重放返回同一 200。同 key 不同请求体返回 409 `idempotency-key-reused`
+  并指名原资源，并发中返回 409 `idempotency-request-in-progress`；key 以 (organization, actor, route) 为作用域。审查发现
+  记录与资源写入分处两个事务，已改为在同一 store 事务内完成记录，崩溃或取消不会留下无资源的 completed 记录。
+  重放响应由资源存储重建而非存储响应体，不含 secret。审查的一项 security minor 未修：请求摘要以客户端选定 key 加盐
+  覆盖 credential 原文，改为服务端密钥 HMAC 需引入 `hmac` 依赖与 secrets API，留待安全负责人决定。
+- Installation/target 生命周期：新增 disable/enable（If-Match）、DELETE（软删除，`?cascade=true` 才级联撤销 grant；
+  in-flight workflow 一律阻断并列出 operation id，不在此处取消）、以及各自的 lifecycle audit 列表。SQLite 表级 CHECK 无法
+  增量放宽，删除态以现有状态值加 `deleted_at`/`deleted_by_actor_id` 表达（installation 用 revoked、target 用 disabled）；
+  installation 禁用不改写 target 行，grant 创建、deployment 启动、child step 与 reconciler ready scan 一律要求 target 与
+  installation 同时 active。application 删除/退役在同一事务撤销其全部 active grant（reason `application-retired`），
+  schema 通过阶段一次性收敛已退役应用遗留的 grant（系统 actor `system:provider-grant-convergence`）；审查发现 backfill
+  未在事务内，已修。新增全局 `GET /api/providers/target-grants`（status/target 过滤、统一分页、admin）及其 get/audit。
+- CLI 新增 `deis deployments`（一页最新记录，`--limit` 超 1000 钳制并 warn）、`deis routes list`（按服务端顺序打印、不重排）、
+  `deis domains list`；`EVERY_ENVIRONMENT` 在 CLI 的副本由读取 deis-control 源码的测试钉住。
+- 未完成：provider deployment cancel/rollback；installation/target 注册时的 lifecycle 首条审计；DeleteAppResponse 未回报撤销
+  grant 数；`idempotency-key-reused` 等稳定码尚以 `error` 文本首 token 承载，结构化 `code` 随错误模型落地；旧库同时持有两代
+  索引尚未清退。本节为本机工作节点，尚无提交后精确归档或三平台 evidence。

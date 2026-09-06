@@ -5,12 +5,15 @@ pub mod build;
 pub mod config;
 pub mod db;
 pub mod deploy;
+pub mod deployments;
 pub mod dev;
+pub mod domains;
 pub mod init;
 pub mod kv;
 pub mod logs;
 pub mod queue;
 pub mod rollback;
+pub mod routes;
 pub mod secret;
 pub mod status;
 pub mod targets;
@@ -110,6 +113,22 @@ pub fn push_escaped(out: &mut String, character: char) -> usize {
 /// wanting an owned `String` - a table cell, mostly.
 pub fn escaped(text: &str) -> String {
     escape_control(text).into_owned()
+}
+
+/// [`escaped`] for a cell the control plane may have nothing to put in: the
+/// text, or a dash.
+///
+/// The dash is this CLI's single spelling for "there is no value here", and
+/// it is a decision the renderer makes rather than anything that arrived over
+/// the wire - which is why it lives beside `escaped` instead of being written
+/// out again at each table that needs it. Absent and empty are deliberately
+/// *not* the same: an empty note is printed as the empty string it is, and
+/// only a missing one becomes a dash.
+pub fn escaped_or_dash(value: Option<&str>) -> String {
+    match value {
+        Some(text) => escaped(text),
+        None => "-".to_string(),
+    }
 }
 
 /// The project directory a command works in: wherever it was run.
@@ -291,7 +310,7 @@ pub(crate) const ESCAPING_CASES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod escaping_test {
-    use super::{ESCAPING_CASES, escape_control, escaped};
+    use super::{ESCAPING_CASES, escape_control, escaped, escaped_or_dash};
 
     /// The module header's claim - one rule, in two crates, kept one rule -
     /// enforced rather than remembered. The two copies of `ESCAPING_CASES`
@@ -356,6 +375,18 @@ mod escaping_test {
         assert!(every_control.chars().count() >= 65);
         let rendered = escape_control(&every_control);
         assert!(!rendered.chars().any(|c| c.is_control()), "{rendered:?}");
+    }
+
+    #[test]
+    fn an_absent_cell_is_a_dash_and_a_present_one_is_still_escaped() {
+        assert_eq!(escaped_or_dash(None), "-");
+        // An empty string is a value the control plane holds, not a missing
+        // one, so it must not be dressed up as absent.
+        assert_eq!(escaped_or_dash(Some("")), "");
+        assert_eq!(
+            escaped_or_dash(Some("start\nWARN forged")),
+            "start\\nWARN forged"
+        );
     }
 
     #[test]

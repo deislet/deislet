@@ -147,6 +147,11 @@ pub struct AssignmentList {
     pub undescribable: Vec<UndescribableEnvironment>,
 }
 
+/// Actor subject recorded on grant revocations when an application is
+/// deleted through a path that has no principal, such as a test or an
+/// internal caller of [`CatalogStore::delete_app`].
+pub const APPLICATION_RETIREMENT_ACTOR: &str = "system:application-retirement";
+
 /// An environment that is deployed and yet cannot be handed to a node.
 ///
 /// Today there is exactly one way to get here: the deployment names a
@@ -326,11 +331,38 @@ impl CatalogStore {
     /// bundle files are reported back rather than deleted here, because
     /// the filesystem belongs to `BundleStore`.
     pub async fn delete_app(&self, id: &str) -> CatalogResult<DeletedApp> {
+        self.delete_app_as(id, APPLICATION_RETIREMENT_ACTOR).await
+    }
+
+    /// [`Self::delete_app`] with the actor named. The application's active
+    /// provider target grants are revoked in the same transaction, before
+    /// its rows go, and each revocation's audit event records
+    /// `application-retired` and this actor: no grant outlives the
+    /// application it named, and a failure leaves both untouched.
+    pub async fn delete_app_as(&self, id: &str, actor_subject: &str) -> CatalogResult<DeletedApp> {
         let app_id = id.to_string();
+        let actor_subject = actor_subject.to_string();
         let removed = self
             .with_conn(move |conn| {
-                load_app(conn, &app_id)?;
+                let app = load_app(conn, &app_id)?;
                 let tx = conn.unchecked_transaction()?;
+
+                let revoked_grants =
+                    super::provider_target_grant::revoke_active_grants_for_application_tx(
+                        &tx,
+                        app.canonical_id,
+                        &actor_subject,
+                        now_secs(),
+                    )?;
+                if !revoked_grants.is_empty() {
+                    info!(
+                        app_id = %app_id,
+                        application_id = %app.canonical_id,
+                        actor = %actor_subject,
+                        grants = ?revoked_grants,
+                        "Revoked the provider target grants of an application being deleted"
+                    );
+                }
 
                 let bundle_paths: Vec<String> = {
                     let mut stmt =

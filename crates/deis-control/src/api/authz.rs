@@ -498,8 +498,57 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             Resource::Every,
         )
         .changes_state(),
-        ["api", "providers", "installations", installation_id] => Requirement::new(
+        ["api", "providers", "installations", installation_id] if !writing => Requirement::new(
             "provider_installation.get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(installation_id),
+        ["api", "providers", "installations", installation_id] => Requirement::new(
+            "provider_installation.delete",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(installation_id)
+        .changes_state(),
+        [
+            "api",
+            "providers",
+            "installations",
+            installation_id,
+            "disable",
+        ] => Requirement::new(
+            "provider_installation.disable",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(installation_id)
+        .changes_state(),
+        [
+            "api",
+            "providers",
+            "installations",
+            installation_id,
+            "enable",
+        ] => Requirement::new(
+            "provider_installation.enable",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(installation_id)
+        .changes_state(),
+        [
+            "api",
+            "providers",
+            "installations",
+            installation_id,
+            "audit",
+        ] => Requirement::new(
+            "provider_installation.audit",
             Verb::Admin,
             Resource::Every,
             Resource::Every,
@@ -538,13 +587,67 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             Resource::Every,
             Resource::Every,
         ),
-        ["api", "providers", "targets", target_id] => Requirement::new(
+        ["api", "providers", "targets", target_id] if !writing => Requirement::new(
             "provider_target.get",
             Verb::Admin,
             Resource::Every,
             Resource::Every,
         )
         .about(target_id),
+        ["api", "providers", "targets", target_id] => Requirement::new(
+            "provider_target.delete",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(target_id)
+        .changes_state(),
+        ["api", "providers", "targets", target_id, "disable"] => Requirement::new(
+            "provider_target.disable",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(target_id)
+        .changes_state(),
+        ["api", "providers", "targets", target_id, "enable"] => Requirement::new(
+            "provider_target.enable",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(target_id)
+        .changes_state(),
+        ["api", "providers", "targets", target_id, "audit"] => Requirement::new(
+            "provider_target.audit",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(target_id),
+
+        // The global grant history spans every application, including ones
+        // that no longer exist, so no application scope can cover it.
+        ["api", "providers", "target-grants"] => Requirement::new(
+            "provider_target_grant.history",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "providers", "target-grants", grant_id] => Requirement::new(
+            "provider_target_grant.history_get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(grant_id),
+        ["api", "providers", "target-grants", grant_id, "audit"] => Requirement::new(
+            "provider_target_grant.history_audit",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(grant_id),
 
         // Operation IDs are globally unique, but the path alone does not
         // reveal their application/environment scope to this pure route
@@ -2078,6 +2181,72 @@ mod tests {
                 "provider_target.get",
                 Verb::Admin,
             ),
+            (
+                "DELETE",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040",
+                "provider_installation.delete",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/disable",
+                "provider_installation.disable",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/enable",
+                "provider_installation.enable",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/audit",
+                "provider_installation.audit",
+                Verb::Admin,
+            ),
+            (
+                "DELETE",
+                "/api/providers/targets/01990f44-1000-7000-8000-000000000040",
+                "provider_target.delete",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/targets/01990f44-1000-7000-8000-000000000040/disable",
+                "provider_target.disable",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/targets/01990f44-1000-7000-8000-000000000040/enable",
+                "provider_target.enable",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/targets/01990f44-1000-7000-8000-000000000040/audit",
+                "provider_target.audit",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/target-grants",
+                "provider_target_grant.history",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/target-grants/01990f44-1000-7000-8000-000000000040",
+                "provider_target_grant.history_get",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/target-grants/01990f44-1000-7000-8000-000000000040/audit",
+                "provider_target_grant.history_audit",
+                Verb::Admin,
+            ),
         ];
         for (method, path, action, verb) in routes {
             let requirement = requirement(method, path);
@@ -2263,6 +2432,36 @@ mod tests {
             (
                 "DELETE",
                 "/api/apps/demo/environments/production/provider-target-grants/01990f44-1000-7000-8000-000000000040",
+                AdministratorsAlready,
+            ),
+            (
+                "DELETE",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040",
+                AdministratorsAlready,
+            ),
+            (
+                "POST",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/disable",
+                AdministratorsAlready,
+            ),
+            (
+                "POST",
+                "/api/providers/installations/01990f44-1000-7000-8000-000000000040/enable",
+                AdministratorsAlready,
+            ),
+            (
+                "DELETE",
+                "/api/providers/targets/01990f44-1000-7000-8000-000000000040",
+                AdministratorsAlready,
+            ),
+            (
+                "POST",
+                "/api/providers/targets/01990f44-1000-7000-8000-000000000040/disable",
+                AdministratorsAlready,
+            ),
+            (
+                "POST",
+                "/api/providers/targets/01990f44-1000-7000-8000-000000000040/enable",
                 AdministratorsAlready,
             ),
         ];

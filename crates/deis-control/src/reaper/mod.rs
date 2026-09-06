@@ -32,6 +32,13 @@
 //! `heartbeats` grows by one row per node per interval for ever, and the
 //! retention query written for it had no caller either - the third mechanism
 //! in this area that was wired up and never driven.
+//!
+//! Expired list cursors are the fourth clock on the pass. A cursor row
+//! carries its own `expires_at`, and issuing a new cursor removes the ones
+//! already past it - which keeps the table bounded only while clients keep
+//! listing. A quiet installation that stopped paging with a table full of
+//! rows would keep them for ever, so the sweep runs the same removal on its
+//! own clock, whether or not anybody is listing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +47,7 @@ use chrono::Utc;
 use tokio::time::interval;
 use tracing::{info, warn};
 
+use crate::catalog::{PageCursorStore, now_secs};
 use crate::command::CommandExecutor;
 use crate::config::ControlConfig;
 use crate::database::{Database, Event, EventSeverity};
@@ -50,6 +58,9 @@ pub struct Reaper {
     sessions: Arc<SessionManager>,
     database: Arc<Database>,
     commands: Arc<CommandExecutor>,
+    /// The list-cursor table on the same database, swept for expired rows
+    /// on every pass.
+    page_cursors: PageCursorStore,
     /// How long a node may be silent before this process stops claiming it is
     /// live. Straight from `heartbeat_timeout`.
     heartbeat_timeout: chrono::Duration,
@@ -104,6 +115,7 @@ impl Reaper {
 
         Self {
             sessions,
+            page_cursors: PageCursorStore::new(Arc::clone(&database)),
             database,
             commands,
             heartbeat_timeout: chrono::Duration::seconds(config.heartbeat_timeout as i64),
@@ -124,6 +136,27 @@ impl Reaper {
         self.withdraw_silent_nodes().await;
         self.commands.cleanup_expired_commands().await;
         self.trim_heartbeat_history().await;
+        self.expire_page_cursors().await;
+    }
+
+    /// Remove list cursors that are past their expiry.
+    ///
+    /// Issuing a cursor already does this opportunistically, so during
+    /// normal paging this pass finds nothing and costs one bounded probe of
+    /// the expiry index. It exists for the other case: a table that filled
+    /// up and then went quiet. A failure is one warning and the next pass
+    /// tries again; an expired row that stays is refused on resolve anyway,
+    /// so nothing here changes what a client is told, only how much disk
+    /// the refused rows occupy.
+    async fn expire_page_cursors(&self) {
+        if let Err(e) = self.page_cursors.expire(now_secs()).await {
+            warn!(
+                error = %e,
+                "Could not remove expired list cursors on this pass; expired rows stay refused \
+                 but keep occupying the cursor table until a later pass or a new cursor issue \
+                 succeeds"
+            );
+        }
     }
 
     /// Hold the heartbeat history to a fixed size per node.
@@ -252,8 +285,9 @@ impl Reaper {
                     _ = shutdown.wait() => {
                         info!(
                             "Liveness sweep stopped for shutdown; from here nothing withdraws a \
-                             silent node or ends an overdue command until the next instance \
-                             starts, which takes both back at startup"
+                             silent node, ends an overdue command or removes an expired list \
+                             cursor until the next instance starts, which takes all of them \
+                             back at startup"
                         );
                         return;
                     }
@@ -479,5 +513,56 @@ mod tests {
                 .status,
             crate::database::CommandStatus::Timeout
         );
+    }
+
+    /// The cursor table is the fourth clock on the pass: a row past its
+    /// expiry goes even when no list request has issued a cursor since.
+    #[tokio::test]
+    async fn expired_list_cursors_are_removed_by_the_sweep() {
+        let sessions = Arc::new(SessionManager::new());
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let cfg = config(30, 90);
+        let reaper = reaper(&sessions, &database, &cfg);
+
+        let now = now_secs();
+        database
+            .with_connection(move |conn| {
+                for (digest, expires_at) in [
+                    ("1".repeat(64), now - 1),
+                    ("2".repeat(64), now - 86_400),
+                    ("3".repeat(64), now + 86_400),
+                ] {
+                    conn.execute(
+                        "INSERT INTO api_page_cursors
+                           (token_sha256, collection, query_sha256, position_json,
+                            created_at, expires_at)
+                         VALUES (?1, 'accounts', ?2, '{\"sortValue\":1,\"identity\":\"one\"}',
+                                 ?3, ?4)",
+                        rusqlite::params![digest, "b".repeat(64), expires_at - 259_200, expires_at],
+                    )?;
+                }
+                Ok::<_, crate::database::DatabaseError>(())
+            })
+            .await
+            .unwrap();
+
+        reaper.sweep().await;
+
+        let remaining: Vec<String> = database
+            .with_connection(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT token_sha256 FROM api_page_cursors ORDER BY 1")?;
+                let rows = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok::<_, crate::database::DatabaseError>(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, vec!["3".repeat(64)]);
+
+        // A second pass over a clean table is a no-op, not an error.
+        reaper.sweep().await;
+        assert_eq!(reaper.page_cursors.statistics(now).await.unwrap().live, 1);
     }
 }

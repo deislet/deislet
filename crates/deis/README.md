@@ -11,8 +11,9 @@ apart is the point:
 - **The locked standard registry.** `deis targets list|inspect` reads the same
   generated target-status JSON as the product documentation and Web console;
   it does not infer support from an adapter being present.
-- **A Deislet platform.** `deis deploy`, `deis versions`, `deis rollback`,
-  `deis status`, `deis secret`, `deis logs`, `deis tail`, `deis trace`,
+- **A Deislet platform.** `deis deploy`, `deis versions`, `deis deployments`,
+  `deis rollback`, `deis status`, `deis routes`, `deis domains`,
+  `deis secret`, `deis logs`, `deis tail`, `deis trace`,
   `deis kv`, `deis db` and `deis blob` talk to a `deis-control`; for logs and
   traces, also to a `deis-telemetry`; and for the last three, to a
   `deis-store` whose address and capability token the control plane hands
@@ -178,6 +179,17 @@ evidence is not displayed as support.
 Every version of the application: number, digest, when it was created, and
 which environments currently point at it.
 
+### `deis deployments [--limit N]`
+
+One environment's history, newest first: when its pointer moved, to which
+version id, and the note whoever moved it left. `deis status` says what runs
+now and `deis versions` says what the application has ever built; this says
+when a particular environment changed, which is where an incident starts.
+
+One request, so `--limit` is capped at 1000 — that is one page of the list
+route. The line under the table says how many rows are behind the ones
+printed, and where to look when they are further back than one page reaches.
+
 ### `deis rollback [--to N]`
 
 Move an environment's pointer back — to a version number, or with no `--to`
@@ -192,6 +204,25 @@ and which nodes are serving it (asked of the nodes themselves: environment,
 state, request and error counts). Printed as two tables because they are two
 different claims, and a node that never took the last deployment is where
 they disagree.
+
+### `deis routes list`
+
+One environment's routes in the order the edge applies them: highest priority
+first, then by path prefix, so the first row that matches a request is the row
+that wins. A route with no host prints as `(no-host)` — it answers for every
+name no more specific route claims, which is the widest claim on the platform,
+not the mildest.
+
+### `deis domains list`
+
+The hostname registry: which application, in which environment, may claim
+which name. A hostname is the one global namespace on this platform, so the
+registry is platform-wide and the control plane refuses every route claim it
+does not cover. Reading it needs `admin:*/*`.
+
+Read-only here on purpose. Granting a name decides which tenant receives
+somebody's cookies, and withdrawing one breaks whatever is already serving on
+it; neither belongs a keystroke away from a listing.
 
 ### `deis secret set|list|rm`
 

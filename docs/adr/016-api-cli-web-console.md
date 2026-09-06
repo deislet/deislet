@@ -315,9 +315,14 @@ configs、commands、events、metrics summary 与全局 `/api/routes` 按本 ADR
 Linux、macOS、Windows 通过 provider、pagination 11/11、authz、grant、协调器、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
 `../product/evidence/provider-driver-dispatcher-portability-3013ae2.json`。
 
-这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；平台诊断面列表的归属尚未决定；
-installation/target 生命周期尚不完整；credential provision、grant create 等非 operation 资源创建尚未统一幂等 replay；
-grant 在 application 删除后的生命周期收敛与全局历史查询尚未完成；CLI/Web 也没有生成 client 或交互入口。
+随后 credential/installation/target/grant 的创建与 If-Match 变更接入共享 `api_idempotency_records`（key 以 organization、
+actor、route 为作用域，JCS 规范化请求摘要，记录在资源事务内完成，重放由资源存储重建响应），installation/target 获得
+disable/enable/软删除与 lifecycle audit，application 删除在同一事务撤销其 grant，并新增全局 grant history；cursor 到期由
+reaper 主动清理并暴露容量 gauge，20 条分页查询有 `EXPLAIN QUERY PLAN` 证据；CLI 增加 deployments/routes/domains 读命令。
+稳定错误码此时仍以 `error` 文本首 token 承载。
+
+这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；结构化错误模型、OpenAPI 与 breaking-change gate
+尚未落地；平台诊断面列表尚未迁入独立命名空间；provider deployment cancel/rollback 未完成；CLI/Web 也没有生成 client 或交互入口。
 
 1. 建立 versioned API/error/operation/schema 基础与安全 Web session。
 2. 新建 organization/application/environment shell、scope switcher 与权限导航。

@@ -1154,6 +1154,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     ensure_identity_migration_schema(conn)?;
     ensure_product_operation_schema(conn)?;
     ensure_provider_driver_schema(conn)?;
+    ensure_provider_lifecycle_schema(conn)?;
+    ensure_api_idempotency_schema(conn)?;
 
     info!("Database tables created successfully");
     Ok(())
@@ -3572,6 +3574,367 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Reversible disable and soft delete for provider installations and targets,
+/// the cause a grant revocation records, the lifecycle audit trail, and the
+/// indexes behind the global grant history.
+///
+/// The status CHECKs on both resource tables are table constraints, which
+/// SQLite cannot widen in place, so a soft delete keeps the row in the
+/// terminal status the constraint already allows (`revoked` for an
+/// installation, `disabled` for a target) and marks it with `deleted_at`.
+/// Triggers make that mark permanent: a deleted row never changes status or
+/// loses its mark again, and neither table can lose rows at all, because
+/// grants, workflows and audit events point at them.
+///
+/// The same pass converges grants whose application was retired before this
+/// schema existed: every such active grant is revoked once, by a system
+/// actor, with an audit event that names the cause.
+fn ensure_provider_lifecycle_schema(conn: &Connection) -> Result<()> {
+    for table in ["provider_installations", "provider_targets"] {
+        ensure_column(conn, table, "deleted_at", "INTEGER")?;
+        ensure_column(
+            conn,
+            table,
+            "deleted_by_actor_id",
+            "TEXT REFERENCES operation_actors(actor_id)",
+        )?;
+    }
+    ensure_column(
+        conn,
+        "provider_target_grant_audit_events",
+        "reason",
+        "TEXT CHECK(reason IS NULL OR reason IN ('administrator', 'installation-deleted',
+                                                 'target-deleted', 'application-retired'))",
+    )?;
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS trg_provider_installations_soft_delete_v1
+        BEFORE UPDATE OF status, deleted_at, deleted_by_actor_id ON provider_installations
+        WHEN (OLD.deleted_at IS NOT NULL
+              AND (NEW.deleted_at IS NOT OLD.deleted_at
+                   OR NEW.deleted_by_actor_id IS NOT OLD.deleted_by_actor_id
+                   OR NEW.status != OLD.status))
+          OR (NEW.deleted_at IS NOT NULL
+              AND (NEW.status != 'revoked'
+                   OR NEW.deleted_by_actor_id IS NULL
+                   OR NEW.deleted_at < NEW.created_at))
+          OR (NEW.deleted_at IS NULL AND NEW.deleted_by_actor_id IS NOT NULL)
+        BEGIN
+            SELECT RAISE(ABORT, 'deleted provider installation is terminal');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_installations_no_delete_v1
+        BEFORE DELETE ON provider_installations
+        BEGIN
+            SELECT RAISE(ABORT, 'provider installation history cannot be deleted; soft-delete it');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_soft_delete_v1
+        BEFORE UPDATE OF status, deleted_at, deleted_by_actor_id ON provider_targets
+        WHEN (OLD.deleted_at IS NOT NULL
+              AND (NEW.deleted_at IS NOT OLD.deleted_at
+                   OR NEW.deleted_by_actor_id IS NOT OLD.deleted_by_actor_id
+                   OR NEW.status != OLD.status))
+          OR (NEW.deleted_at IS NOT NULL
+              AND (NEW.status != 'disabled'
+                   OR NEW.deleted_by_actor_id IS NULL
+                   OR NEW.deleted_at < NEW.created_at))
+          OR (NEW.deleted_at IS NULL AND NEW.deleted_by_actor_id IS NOT NULL)
+        BEGIN
+            SELECT RAISE(ABORT, 'deleted provider target is terminal');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_targets_no_delete_v1
+        BEFORE DELETE ON provider_targets
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target history cannot be deleted; soft-delete it');
+        END;
+
+        CREATE TABLE IF NOT EXISTS provider_lifecycle_audit_events (
+            event_id          TEXT PRIMARY KEY,
+            resource_kind     TEXT NOT NULL
+                                   CHECK(resource_kind IN ('provider-installation',
+                                                           'provider-target')),
+            resource_id       TEXT NOT NULL,
+            resource_revision INTEGER NOT NULL CHECK(resource_revision >= 1),
+            actor_id          TEXT NOT NULL REFERENCES operation_actors(actor_id),
+            event_type        TEXT NOT NULL
+                                   CHECK(event_type IN ('disabled', 'enabled', 'deleted')),
+            reason            TEXT NOT NULL
+                                   CHECK(reason IN ('administrator', 'installation-deleted')),
+            cascade_json      TEXT NOT NULL
+                                   CHECK(json_valid(cascade_json)
+                                     AND json_type(cascade_json) = 'array'),
+            occurred_at       INTEGER NOT NULL,
+            CHECK(length(event_id) = 36
+              AND lower(event_id) = event_id
+              AND substr(event_id, 15, 1) = '7'
+              AND substr(event_id, 20, 1) GLOB '[89ab]'
+              AND length(replace(event_id, '-', '')) = 32
+              AND replace(event_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(resource_id) = 36
+              AND lower(resource_id) = resource_id
+              AND length(replace(resource_id, '-', '')) = 32
+              AND replace(resource_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            UNIQUE(resource_kind, resource_id, resource_revision)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_lifecycle_audit_resource_v1
+            ON provider_lifecycle_audit_events(resource_kind, resource_id,
+                                               resource_revision, event_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_lifecycle_audit_scope_v1
+        BEFORE INSERT ON provider_lifecycle_audit_events
+        WHEN (NEW.resource_kind = 'provider-installation' AND NOT EXISTS (
+                SELECT 1 FROM provider_installations
+                 WHERE installation_id = NEW.resource_id
+                   AND revision = NEW.resource_revision))
+          OR (NEW.resource_kind = 'provider-target' AND NOT EXISTS (
+                SELECT 1 FROM provider_targets
+                 WHERE target_id = NEW.resource_id
+                   AND revision = NEW.resource_revision))
+        BEGIN
+            SELECT RAISE(ABORT, 'provider lifecycle audit event does not match its resource revision');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_lifecycle_audit_immutable_v1
+        BEFORE UPDATE ON provider_lifecycle_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'provider lifecycle audit is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_lifecycle_audit_no_delete_v1
+        BEFORE DELETE ON provider_lifecycle_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'provider lifecycle audit cannot be deleted');
+        END;
+
+        CREATE INDEX IF NOT EXISTS idx_provider_target_grants_history_v1
+            ON provider_target_grants(created_at DESC, grant_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_target_grants_status_history_v1
+            ON provider_target_grants(status, created_at DESC, grant_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_target_grants_target_history_v1
+            ON provider_target_grants(provider_target_id, status, created_at DESC, grant_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_target_grants_target_page_v1
+            ON provider_target_grants(provider_target_id, created_at DESC, grant_id DESC);
+        "#,
+    )?;
+    converge_retired_application_provider_target_grants(conn)
+}
+
+/// Add one nullable column when the table lacks it. Every column added this
+/// way defaults to NULL, which is the only default SQLite accepts for a
+/// column that references another table.
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let present = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column);
+    if !present {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Actor subject recorded on grants the schema pass revokes because their
+/// application was retired before grant convergence existed.
+pub const PROVIDER_GRANT_CONVERGENCE_ACTOR: &str = "system:provider-grant-convergence";
+
+/// Revoke, once, every active provider target grant whose application is
+/// gone. Deleting an application now revokes its grants in the same
+/// transaction; this covers databases where a deletion predates that rule.
+/// Idempotent: a revoked grant no longer matches, so a second start finds
+/// nothing. The audit row names `application-retired` as the cause, which is
+/// what an operator reading the global grant history needs to see.
+///
+/// The whole batch is one transaction. The grant transition trigger forbids
+/// touching a revoked grant again, so a crash between a grant's UPDATE and
+/// its audit INSERT would otherwise leave a revocation with no recorded
+/// cause that no later start could repair; atomically, a crash leaves every
+/// grant active and the next start redoes the batch.
+fn converge_retired_application_provider_target_grants(conn: &Connection) -> Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    let stale = transaction
+        .prepare(
+            "SELECT g.grant_id, g.application_id, g.environment_id, g.provider_target_id,
+                    g.revision, g.updated_at
+               FROM provider_target_grants g
+              WHERE g.status = 'active'
+                AND NOT EXISTS (SELECT 1 FROM apps a WHERE a.canonical_id = g.application_id)
+              ORDER BY g.created_at, g.grant_id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let now = crate::catalog::model::now_secs();
+    let actor_id = match transaction
+        .query_row(
+            "SELECT actor_id FROM operation_actors WHERE subject = ?1",
+            [PROVIDER_GRANT_CONVERGENCE_ACTOR],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        Some(actor_id) => actor_id,
+        None => {
+            let actor_id = CanonicalId::new_v7().to_string();
+            transaction.execute(
+                "INSERT INTO operation_actors (actor_id, subject, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![actor_id, PROVIDER_GRANT_CONVERGENCE_ACTOR, now],
+            )?;
+            actor_id
+        }
+    };
+    let mut revoked = 0_usize;
+    for (grant_id, application_id, environment_id, provider_target_id, revision, updated_at) in
+        stale
+    {
+        // The transition trigger requires a monotonic `updated_at` that
+        // equals `revoked_at`, so a clock behind the row keeps the row's
+        // own time.
+        let occurred_at = updated_at.max(now);
+        let next_revision = revision + 1;
+        let changed = transaction.execute(
+            "UPDATE provider_target_grants
+                SET status = 'revoked', revision = ?2, revoked_by_actor_id = ?3,
+                    revoked_at = ?4, updated_at = ?4
+              WHERE grant_id = ?1 AND status = 'active'",
+            rusqlite::params![grant_id, next_revision, actor_id, occurred_at],
+        )?;
+        if changed != 1 {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO provider_target_grant_audit_events
+               (event_id, grant_id, application_id, environment_id, provider_target_id,
+                grant_revision, actor_id, event_type, reason, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'revoked', 'application-retired', ?8)",
+            rusqlite::params![
+                CanonicalId::new_v7().to_string(),
+                grant_id,
+                application_id,
+                environment_id,
+                provider_target_id,
+                next_revision,
+                actor_id,
+                occurred_at,
+            ],
+        )?;
+        info!(
+            grant_id,
+            application_id,
+            environment_id,
+            provider_target_id,
+            "Revoked a provider target grant whose application was retired before grant convergence existed"
+        );
+        revoked += 1;
+    }
+    transaction.commit()?;
+    info!(
+        revoked,
+        actor = PROVIDER_GRANT_CONVERGENCE_ACTOR,
+        "Converged provider target grants of retired applications"
+    );
+    Ok(())
+}
+
+/// Replay records for the provider-management mutations that accept an
+/// `Idempotency-Key`. One row per (organization, actor, route, key digest):
+/// the raw key and the request body are never stored, only their SHA-256
+/// digests, and the completed row carries a canonical resource reference
+/// rather than a response body, so no secret material can ever land here.
+/// A row is written `pending` before the mutation runs and completes exactly
+/// once; identity columns and completed rows are immutable, and expired rows
+/// are deleted opportunistically the same way API page cursors are.
+fn ensure_api_idempotency_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS api_idempotency_records (
+            record_id              TEXT PRIMARY KEY,
+            organization_id        TEXT NOT NULL
+                                        REFERENCES product_organizations(organization_id),
+            actor_id               TEXT NOT NULL REFERENCES operation_actors(actor_id),
+            route_id               TEXT NOT NULL
+                                        CHECK(length(route_id) BETWEEN 1 AND 128
+                                          AND lower(route_id) = route_id
+                                          AND route_id NOT GLOB '*[^a-z0-9._-]*'),
+            idempotency_key_sha256 TEXT NOT NULL,
+            request_sha256         TEXT NOT NULL,
+            state                  TEXT NOT NULL CHECK(state IN ('pending', 'completed')),
+            response_status        INTEGER CHECK(response_status IS NULL
+                                                 OR response_status BETWEEN 200 AND 299),
+            resource_kind          TEXT CHECK(resource_kind IS NULL
+                                              OR resource_kind IN ('provider-credential-binding',
+                                                                   'provider-installation',
+                                                                   'provider-target',
+                                                                   'provider-target-grant')),
+            resource_id            TEXT CHECK(resource_id IS NULL
+                                              OR (length(resource_id) = 36
+                                                  AND lower(resource_id) = resource_id)),
+            resource_revision      INTEGER CHECK(resource_revision IS NULL
+                                                 OR resource_revision >= 1),
+            created_at             INTEGER NOT NULL,
+            completed_at           INTEGER,
+            expires_at             INTEGER NOT NULL,
+            CHECK(length(record_id) = 36 AND lower(record_id) = record_id),
+            CHECK(length(idempotency_key_sha256) = 64
+              AND lower(idempotency_key_sha256) = idempotency_key_sha256
+              AND idempotency_key_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(request_sha256) = 64
+              AND lower(request_sha256) = request_sha256
+              AND request_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK((state = 'pending'
+                   AND response_status IS NULL AND resource_kind IS NULL
+                   AND resource_id IS NULL AND resource_revision IS NULL
+                   AND completed_at IS NULL)
+               OR (state = 'completed'
+                   AND response_status IS NOT NULL AND resource_kind IS NOT NULL
+                   AND resource_id IS NOT NULL AND resource_revision IS NOT NULL
+                   AND completed_at IS NOT NULL AND completed_at >= created_at)),
+            CHECK(expires_at > created_at),
+            UNIQUE(organization_id, actor_id, route_id, idempotency_key_sha256)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_api_idempotency_records_expiry_v1
+            ON api_idempotency_records(expires_at, record_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_api_idempotency_records_immutable_v1
+        BEFORE UPDATE ON api_idempotency_records
+        WHEN OLD.state != 'pending'
+          OR NEW.state != 'completed'
+          OR NEW.record_id != OLD.record_id
+          OR NEW.organization_id != OLD.organization_id
+          OR NEW.actor_id != OLD.actor_id
+          OR NEW.route_id != OLD.route_id
+          OR NEW.idempotency_key_sha256 != OLD.idempotency_key_sha256
+          OR NEW.request_sha256 != OLD.request_sha256
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'API idempotency record identity is immutable and completes once');
+        END;
+        "#,
+    )
+}
+
 fn ensure_provider_deployment_dispatch_columns(conn: &Connection) -> Result<()> {
     let columns = conn
         .prepare("PRAGMA table_info(provider_deployment_workflows)")?
@@ -4467,6 +4830,173 @@ mod tests {
             )
             .unwrap();
         assert_eq!(upgraded, ("revoked".to_owned(), 2));
+    }
+
+    #[tokio::test]
+    async fn active_grants_of_already_retired_applications_are_revoked_once_on_upgrade() {
+        use crate::catalog::{
+            CatalogProviderCredentialVault, CatalogStore, ProviderCredentialBindingSpec,
+            ProviderInstallationSpec, ProviderTargetGrantMutationContext, ProviderTargetGrantSpec,
+            ProviderTargetSpec, SecretCipher, SecretsBackend,
+        };
+        use std::sync::Arc;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = Arc::new(
+            crate::database::Database::init(directory.path().join("control.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let store = CatalogStore::new(Arc::clone(&database));
+        let app = store.create_app("legacy").await.unwrap();
+        let environment = store
+            .create_environment("legacy", "production")
+            .await
+            .unwrap();
+        let vault = CatalogProviderCredentialVault::new(
+            store.clone(),
+            Arc::new(SecretsBackend::Ready(Box::new(
+                SecretCipher::from_key_bytes(&[42; 32]).unwrap(),
+            ))),
+        );
+        let credential = vault
+            .provision(
+                ProviderCredentialBindingSpec {
+                    backend_id: "cloudflare-workers-pages".to_owned(),
+                    name: "legacy".to_owned(),
+                },
+                deis_provider_driver::CredentialMaterial::new(b"legacy-credential".to_vec())
+                    .unwrap(),
+                crate::catalog::ProviderCredentialMutationContext {
+                    actor_subject: "account:legacy-admin".to_owned(),
+                    idempotency_record: None,
+                },
+            )
+            .await
+            .unwrap();
+        let installation = store
+            .register_provider_installation(
+                ProviderInstallationSpec {
+                    backend_id: "cloudflare-workers-pages".to_owned(),
+                    account_reference: "legacy-account".to_owned(),
+                    region: None,
+                    credential_binding_id: credential.binding_id,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        // The public fixture manifest declares no standard; the seeded
+        // release binds to it once the current standard is added.
+        let mut manifest: deis_provider_driver::ProviderDriverManifest = serde_json::from_slice(
+            include_bytes!("../../../../contracts/v1/fixtures/valid/provider-driver.json"),
+        )
+        .unwrap();
+        manifest
+            .supported_standard_versions
+            .push(deis_provider_driver::SupportedStandard {
+                contract_id: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION
+                    .split_once('@')
+                    .unwrap()
+                    .0
+                    .to_owned(),
+                version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                contract_digest: deis_provider_driver::ToolDigest {
+                    algorithm: "sha256".to_owned(),
+                    value: deis_wire::CURRENT_EDGE_CANON_CONTRACT_SHA256
+                        .parse()
+                        .unwrap(),
+                },
+            });
+        let manifest =
+            deis_provider_driver::ValidatedProviderDriverManifest::new(manifest).unwrap();
+        crate::catalog::provider_driver_release::seed_test_provider_driver_release(
+            &store, &manifest,
+        )
+        .await;
+        let target = store
+            .register_provider_target(
+                ProviderTargetSpec {
+                    installation_id: installation.installation_id,
+                    name: "production".to_owned(),
+                    standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                    target_config_digest: "b".repeat(64).parse().unwrap(),
+                    driver_manifest: manifest,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let grant = store
+            .grant_provider_target(
+                ProviderTargetGrantSpec {
+                    application_id: app.canonical_id,
+                    environment_id: environment.canonical_id,
+                    provider_target_id: target.target_id,
+                    note: None,
+                },
+                ProviderTargetGrantMutationContext {
+                    actor_subject: "account:legacy-admin".to_owned(),
+                    idempotency_record: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Retire the application the way a binary without grant
+        // convergence did: its rows go and the grant is left active.
+        database
+            .with_connection(|connection| {
+                connection.execute("DELETE FROM environments WHERE app_id = 'legacy'", [])?;
+                connection.execute("DELETE FROM apps WHERE id = 'legacy'", [])?;
+                Ok::<_, crate::catalog::CatalogError>(())
+            })
+            .await
+            .unwrap();
+        let stale = store
+            .provider_target_grant(grant.grant_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.status, "active");
+
+        for _ in 0..2 {
+            database
+                .with_connection(|connection| {
+                    create_tables(connection).map_err(crate::catalog::CatalogError::from)
+                })
+                .await
+                .unwrap();
+            let converged = store
+                .provider_target_grant(grant.grant_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(converged.status, "revoked");
+            assert_eq!(converged.revision, 2);
+            let events = store
+                .provider_target_grant_audit_events(grant.grant_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].event_type, "revoked");
+            assert_eq!(events[1].reason.as_deref(), Some("application-retired"));
+            assert_eq!(events[1].actor_id, converged.revoked_by_actor_id.unwrap());
+            let actor_id = events[1].actor_id.to_string();
+            let subject: String = database
+                .with_connection(move |connection| {
+                    connection
+                        .query_row(
+                            "SELECT subject FROM operation_actors WHERE actor_id = ?1",
+                            [actor_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(crate::catalog::CatalogError::from)
+                })
+                .await
+                .unwrap();
+            assert_eq!(subject, PROVIDER_GRANT_CONVERGENCE_ACTOR);
+        }
     }
 
     #[test]
@@ -5576,6 +6106,109 @@ mod tests {
         conn.execute(
             "DELETE FROM api_page_cursors WHERE token_sha256 = ?1",
             ["a".repeat(64)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn api_idempotency_record_schema_upgrades_additively_and_completes_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute("DROP TABLE api_idempotency_records", [])
+            .unwrap();
+
+        create_tables(&conn).unwrap();
+        create_tables(&conn).unwrap();
+        let organization_id: String = conn
+            .query_row(
+                "SELECT organization_id FROM product_organizations WHERE slug = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let actor_id = "01990f44-1000-7000-8000-000000000001";
+        conn.execute(
+            "INSERT INTO operation_actors (actor_id, subject, created_at)
+             VALUES (?1, 'account:test', 1)",
+            [actor_id],
+        )
+        .unwrap();
+        let record_id = "01990f44-1000-7000-8000-000000000002";
+        let key_sha256 = "a".repeat(64);
+        let request_sha256 = "b".repeat(64);
+        conn.execute(
+            "INSERT INTO api_idempotency_records
+                (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
+                 request_sha256, state, created_at, expires_at)
+             VALUES (?1, ?2, ?3, 'provider_installation.register', ?4, ?5, 'pending', 1, 2)",
+            rusqlite::params![
+                record_id,
+                organization_id,
+                actor_id,
+                key_sha256,
+                request_sha256
+            ],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO api_idempotency_records
+                    (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
+                     request_sha256, state, created_at, expires_at)
+                 VALUES ('01990f44-1000-7000-8000-000000000003', ?1, ?2,
+                         'provider_installation.register', ?3, ?4, 'pending', 1, 2)",
+                rusqlite::params![organization_id, actor_id, key_sha256, request_sha256],
+            )
+            .is_err(),
+            "database accepted a second record for one actor, route and key"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE api_idempotency_records SET request_sha256 = ?1 WHERE record_id = ?2",
+                rusqlite::params!["c".repeat(64), record_id],
+            )
+            .is_err(),
+            "database accepted a rewritten request digest"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE api_idempotency_records
+                    SET state = 'completed', response_status = 201
+                  WHERE record_id = ?1",
+                [record_id],
+            )
+            .is_err(),
+            "database accepted a completion without a resource reference"
+        );
+        conn.execute(
+            "UPDATE api_idempotency_records
+                SET state = 'completed', response_status = 201,
+                    resource_kind = 'provider-installation',
+                    resource_id = '01990f44-1000-7000-8000-000000000004',
+                    resource_revision = 1, completed_at = 1, expires_at = 86401
+              WHERE record_id = ?1",
+            [record_id],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE api_idempotency_records SET resource_revision = 2 WHERE record_id = ?1",
+                [record_id],
+            )
+            .is_err(),
+            "database accepted a mutable completed idempotency record"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE api_idempotency_records SET expires_at = 3 WHERE record_id = ?1",
+                [record_id],
+            )
+            .is_err(),
+            "database accepted a rewritten expiry on a completed idempotency record"
+        );
+        conn.execute(
+            "DELETE FROM api_idempotency_records WHERE record_id = ?1",
+            [record_id],
         )
         .unwrap();
     }

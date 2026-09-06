@@ -17,6 +17,7 @@ use deis_wire::CanonicalId;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 
+use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
 use super::operation::{OperationRequestContext, actor_id, default_organization_id};
 use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
@@ -37,16 +38,22 @@ pub struct ProviderCredentialBindingSpec {
 /// Identity attached to a provider-credential lifecycle audit event.
 /// Credential mutations are conditionally safe resource writes, not product
 /// operations, so they do not pretend to consume an operation idempotency
-/// key or request fingerprint.
+/// key or request fingerprint; the API's own replay record, when the
+/// request carried an `Idempotency-Key`, is completed inside the mutation's
+/// transaction instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderCredentialMutationContext {
     pub actor_subject: String,
+    /// The API idempotency record to complete with the binding this
+    /// mutation produces, in the same transaction.
+    pub idempotency_record: Option<PendingIdempotencyRecord>,
 }
 
 impl From<OperationRequestContext> for ProviderCredentialMutationContext {
     fn from(context: OperationRequestContext) -> Self {
         Self {
             actor_subject: context.actor_subject,
+            idempotency_record: None,
         }
     }
 }
@@ -183,6 +190,11 @@ impl CatalogProviderCredentialVault {
                 let binding = load_binding(&transaction, binding_id)?.ok_or_else(|| {
                     CatalogError::not_found(format!("provider credential binding {binding_id}"))
                 })?;
+                complete_idempotency_record(
+                    &transaction,
+                    context.idempotency_record.as_ref(),
+                    &binding,
+                )?;
                 transaction.commit()?;
                 Ok(binding)
             })
@@ -330,6 +342,11 @@ impl CatalogProviderCredentialVault {
                 let binding = load_binding(&transaction, binding_id)?.ok_or_else(|| {
                     CatalogError::not_found(format!("provider credential binding {binding_id}"))
                 })?;
+                complete_idempotency_record(
+                    &transaction,
+                    context.idempotency_record.as_ref(),
+                    &binding,
+                )?;
                 transaction.commit()?;
                 Ok(binding)
             })
@@ -358,6 +375,11 @@ impl CatalogProviderCredentialVault {
                     )));
                 }
                 if binding.status == "revoked" {
+                    complete_idempotency_record(
+                        &transaction,
+                        context.idempotency_record.as_ref(),
+                        &binding,
+                    )?;
                     transaction.commit()?;
                     return Ok(binding);
                 }
@@ -393,6 +415,11 @@ impl CatalogProviderCredentialVault {
                 let binding = load_binding(&transaction, binding_id)?.ok_or_else(|| {
                     CatalogError::not_found(format!("provider credential binding {binding_id}"))
                 })?;
+                complete_idempotency_record(
+                    &transaction,
+                    context.idempotency_record.as_ref(),
+                    &binding,
+                )?;
                 transaction.commit()?;
                 Ok(binding)
             })
@@ -1173,12 +1200,15 @@ mod tests {
             .await
             .unwrap();
         let installation = store
-            .register_provider_installation(ProviderInstallationSpec {
-                backend_id: binding.backend_id.clone(),
-                account_reference: "account-1".to_owned(),
-                region: None,
-                credential_binding_id: binding.binding_id,
-            })
+            .register_provider_installation(
+                ProviderInstallationSpec {
+                    backend_id: binding.backend_id.clone(),
+                    account_reference: "account-1".to_owned(),
+                    region: None,
+                    credential_binding_id: binding.binding_id,
+                },
+                None,
+            )
             .await
             .unwrap();
         let manifest = manifest();
@@ -1187,13 +1217,16 @@ mod tests {
         )
         .await;
         let target = store
-            .register_provider_target(ProviderTargetSpec {
-                installation_id: installation.installation_id,
-                name: "production".to_owned(),
-                standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
-                target_config_digest: digest('b'),
-                driver_manifest: manifest.clone(),
-            })
+            .register_provider_target(
+                ProviderTargetSpec {
+                    installation_id: installation.installation_id,
+                    name: "production".to_owned(),
+                    standard_version: deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned(),
+                    target_config_digest: digest('b'),
+                    driver_manifest: manifest.clone(),
+                },
+                None,
+            )
             .await
             .unwrap();
         let request = DriverRequest {
@@ -1518,22 +1551,28 @@ mod tests {
         let harness = harness(b"provider-credential").await;
         let missing = harness
             .store
-            .register_provider_installation(ProviderInstallationSpec {
-                backend_id: "deno".to_owned(),
-                account_reference: "deno-account".to_owned(),
-                region: None,
-                credential_binding_id: CanonicalId::new_v7(),
-            })
+            .register_provider_installation(
+                ProviderInstallationSpec {
+                    backend_id: "deno".to_owned(),
+                    account_reference: "deno-account".to_owned(),
+                    region: None,
+                    credential_binding_id: CanonicalId::new_v7(),
+                },
+                None,
+            )
             .await;
         assert!(matches!(missing, Err(CatalogError::Conflict(_))));
         let cross_backend = harness
             .store
-            .register_provider_installation(ProviderInstallationSpec {
-                backend_id: "deno".to_owned(),
-                account_reference: "deno-account".to_owned(),
-                region: None,
-                credential_binding_id: harness.binding.binding_id,
-            })
+            .register_provider_installation(
+                ProviderInstallationSpec {
+                    backend_id: "deno".to_owned(),
+                    account_reference: "deno-account".to_owned(),
+                    region: None,
+                    credential_binding_id: harness.binding.binding_id,
+                },
+                None,
+            )
             .await;
         assert!(matches!(cross_backend, Err(CatalogError::Conflict(_))));
     }

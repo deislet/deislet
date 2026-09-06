@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::warn;
 
+use crate::catalog::{PageCursorStatistics, PageCursorStore, now_secs};
 use crate::database::Database;
 use crate::session::{NodeState, SessionManager};
 
@@ -9,6 +11,16 @@ use crate::session::{NodeState, SessionManager};
 pub struct MetricsSummary {
     pub nodes: NodesMetrics,
     pub system: SystemMetrics,
+    pub pagination: PaginationMetrics,
+}
+
+/// Capacity of the list-pagination machinery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PaginationMetrics {
+    /// The cursor table, read once per collection. `None` when this
+    /// collector has no database or the reading failed, so the export
+    /// omits the series rather than reporting a zero it did not measure.
+    pub cursors: Option<PageCursorStatistics>,
 }
 
 /// Nodes metrics
@@ -64,8 +76,37 @@ impl MetricsCollector {
     pub async fn collect_summary(&self) -> MetricsSummary {
         let nodes = self.collect_nodes_metrics().await;
         let system = self.collect_system_metrics().await;
+        let pagination = self.collect_pagination_metrics().await;
 
-        MetricsSummary { nodes, system }
+        MetricsSummary {
+            nodes,
+            system,
+            pagination,
+        }
+    }
+
+    /// Read the cursor table once. A failed reading is a warning and an
+    /// absent value, never a fabricated zero.
+    async fn collect_pagination_metrics(&self) -> PaginationMetrics {
+        let Some(db) = &self.database else {
+            return PaginationMetrics::default();
+        };
+        match PageCursorStore::new(Arc::clone(db))
+            .statistics(now_secs())
+            .await
+        {
+            Ok(cursors) => PaginationMetrics {
+                cursors: Some(cursors),
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Could not read the list-cursor table for metrics; the page-cursor gauges \
+                     are omitted from this scrape rather than reported as zero"
+                );
+                PaginationMetrics::default()
+            }
+        }
     }
 
     /// Collect nodes metrics
@@ -207,8 +248,41 @@ impl MetricsCollector {
             summary.system.total_heartbeats
         ));
 
+        output.push_str(&page_cursor_gauges(summary.pagination.cursors.as_ref()));
+
         output
     }
+}
+
+/// The page-cursor gauges in Prometheus text form, shared by both exports
+/// so the series names cannot drift between them. Empty when the table was
+/// not read: an absent series is what Prometheus understands as "unknown",
+/// a zero is a measurement.
+pub fn page_cursor_gauges(cursors: Option<&PageCursorStatistics>) -> String {
+    let Some(cursors) = cursors else {
+        return String::new();
+    };
+    let mut output = String::new();
+    output.push_str(&format!(
+        "# HELP deis_control_page_cursors_live Number of list cursors clients can still resume from\n\
+         # TYPE deis_control_page_cursors_live gauge\n\
+         deis_control_page_cursors_live {}\n\n",
+        cursors.live
+    ));
+    output.push_str(&format!(
+        "# HELP deis_control_page_cursors_expired_pending Number of expired list cursors not yet removed by the sweep\n\
+         # TYPE deis_control_page_cursors_expired_pending gauge\n\
+         deis_control_page_cursors_expired_pending {}\n\n",
+        cursors.expired_pending_removal
+    ));
+    if let Some(age) = cursors.oldest_live_age_seconds {
+        output.push_str(&format!(
+            "# HELP deis_control_page_cursors_oldest_live_age_seconds Age in seconds of the oldest list cursor a client can still resume from\n\
+             # TYPE deis_control_page_cursors_oldest_live_age_seconds gauge\n\
+             deis_control_page_cursors_oldest_live_age_seconds {age}\n\n"
+        ));
+    }
+    output
 }
 
 #[cfg(test)]
@@ -264,5 +338,57 @@ mod tests {
 
         assert!(prometheus.contains("deis_control_nodes_total"));
         assert!(prometheus.contains("deis_control_uptime_seconds"));
+    }
+
+    #[tokio::test]
+    async fn page_cursor_gauges_are_absent_without_a_database_and_measured_with_one() {
+        let sessions = Arc::new(SessionManager::new());
+        let collector = MetricsCollector::new(Arc::clone(&sessions));
+        let summary = collector.collect_summary().await;
+        assert!(summary.pagination.cursors.is_none());
+        assert!(
+            !collector
+                .export_prometheus()
+                .await
+                .contains("deis_control_page_cursors")
+        );
+
+        let database = Arc::new(crate::database::Database::init(":memory:").await.unwrap());
+        let now = crate::catalog::now_secs();
+        database
+            .with_connection(move |conn| {
+                for (digest, expires_at) in [("1".repeat(64), now - 1), ("2".repeat(64), now + 600)]
+                {
+                    conn.execute(
+                        "INSERT INTO api_page_cursors
+                           (token_sha256, collection, query_sha256, position_json,
+                            created_at, expires_at)
+                         VALUES (?1, 'accounts', ?2, '{\"sortValue\":1,\"identity\":\"one\"}',
+                                 ?3, ?4)",
+                        rusqlite::params![digest, "b".repeat(64), expires_at - 259_200, expires_at],
+                    )?;
+                }
+                Ok::<_, crate::database::DatabaseError>(())
+            })
+            .await
+            .unwrap();
+        let collector = MetricsCollector::new(sessions).with_database(database);
+        let summary = collector.collect_summary().await;
+        let cursors = summary.pagination.cursors.unwrap();
+        assert_eq!(cursors.live, 1);
+        assert_eq!(cursors.expired_pending_removal, 1);
+        assert!(
+            cursors
+                .oldest_live_age_seconds
+                .is_some_and(|age| age >= 258_600)
+        );
+
+        let prometheus = collector.export_prometheus().await;
+        assert!(prometheus.contains("deis_control_page_cursors_live 1\n"));
+        assert!(prometheus.contains("deis_control_page_cursors_expired_pending 1\n"));
+        assert!(
+            prometheus.contains("# TYPE deis_control_page_cursors_oldest_live_age_seconds gauge\n")
+        );
+        assert!(prometheus.contains("deis_control_page_cursors_oldest_live_age_seconds "));
     }
 }

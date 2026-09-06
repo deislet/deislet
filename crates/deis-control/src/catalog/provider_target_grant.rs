@@ -9,9 +9,10 @@
 
 use chrono::{DateTime, Utc};
 use deis_wire::CanonicalId;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use serde::Serialize;
 
+use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
 use super::operation::{actor_id, default_organization_id};
 use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
@@ -31,6 +32,10 @@ pub struct ProviderTargetGrantSpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderTargetGrantMutationContext {
     pub actor_subject: String,
+    /// The API idempotency record to complete with the grant this mutation
+    /// returns, in the same transaction; `None` when the request carried
+    /// no `Idempotency-Key`.
+    pub idempotency_record: Option<PendingIdempotencyRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +43,133 @@ pub enum ProviderTargetGrantStatusFilter {
     Active,
     Revoked,
     All,
+}
+
+impl ProviderTargetGrantStatusFilter {
+    /// The stable filter name used in list query bindings.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+            Self::All => "all",
+        }
+    }
+
+    fn sql_status(self) -> Option<&'static str> {
+        match self {
+            Self::Active => Some("active"),
+            Self::Revoked => Some("revoked"),
+            Self::All => None,
+        }
+    }
+}
+
+/// Why a grant stopped being active. Recorded on the immutable `revoked`
+/// audit event so the global history can tell an administrator's decision
+/// from a convergence the platform performed on their behalf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderTargetGrantRevocationReason {
+    /// An administrator revoked exactly this grant.
+    Administrator,
+    /// The installation owning the target was deleted with cascade.
+    InstallationDeleted,
+    /// The target was deleted.
+    TargetDeleted,
+    /// The application the grant named was deleted, so the grant could not
+    /// outlive it.
+    ApplicationRetired,
+}
+
+impl ProviderTargetGrantRevocationReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Administrator => "administrator",
+            Self::InstallationDeleted => "installation-deleted",
+            Self::TargetDeleted => "target-deleted",
+            Self::ApplicationRetired => "application-retired",
+        }
+    }
+}
+
+/// Which grants the global history lists. Every field is part of the page
+/// cursor binding, so a cursor cannot be replayed under another filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderTargetGrantHistoryFilter {
+    pub status: ProviderTargetGrantStatusFilter,
+    pub provider_target_id: Option<CanonicalId>,
+}
+
+/// The global grant history's keyset statements, one per filter shape.
+///
+/// Each filter is a plain equality so the planner seeks the index built for
+/// that shape (`idx_provider_target_grants_status_history_v1`,
+/// `idx_provider_target_grants_target_page_v1`,
+/// `idx_provider_target_grants_target_history_v1`; the unfiltered form walks
+/// `idx_provider_target_grants_history_v1`). A single statement written as
+/// `(?n IS NULL OR column = ?n)` cannot be seeked through an index, so every
+/// filtered page would read every grant on the platform in sort order. The
+/// bindings are the filter values in the order named here, then the cursor
+/// (`created_at`, `grant_id`) and the limit. `pagination_plans` explains all
+/// four against the real schema.
+pub(crate) mod history_page_sql {
+    pub(crate) const UNFILTERED: &str = "SELECT grant_id FROM provider_target_grants
+                      WHERE (?1 IS NULL OR created_at < ?1
+                             OR (created_at = ?1 AND grant_id < ?2))
+                      ORDER BY created_at DESC, grant_id DESC LIMIT ?3";
+    pub(crate) const BY_STATUS: &str = "SELECT grant_id FROM provider_target_grants
+                      WHERE status = ?1
+                        AND (?2 IS NULL OR created_at < ?2
+                             OR (created_at = ?2 AND grant_id < ?3))
+                      ORDER BY created_at DESC, grant_id DESC LIMIT ?4";
+    pub(crate) const BY_TARGET: &str = "SELECT grant_id FROM provider_target_grants
+                      WHERE provider_target_id = ?1
+                        AND (?2 IS NULL OR created_at < ?2
+                             OR (created_at = ?2 AND grant_id < ?3))
+                      ORDER BY created_at DESC, grant_id DESC LIMIT ?4";
+    pub(crate) const BY_TARGET_AND_STATUS: &str = "SELECT grant_id FROM provider_target_grants
+                      WHERE provider_target_id = ?1 AND status = ?2
+                        AND (?3 IS NULL OR created_at < ?3
+                             OR (created_at = ?3 AND grant_id < ?4))
+                      ORDER BY created_at DESC, grant_id DESC LIMIT ?5";
+}
+
+/// One filter shape of the global history: its count and page statements
+/// and the filter bindings in the order the statements name them.
+struct HistoryShape {
+    count_sql: &'static str,
+    page_sql: &'static str,
+    bindings: Vec<String>,
+}
+
+impl ProviderTargetGrantHistoryFilter {
+    fn shape(&self) -> HistoryShape {
+        let status = self.status.sql_status().map(str::to_owned);
+        let target = self.provider_target_id.map(|id| id.to_string());
+        match (target, status) {
+            (None, None) => HistoryShape {
+                count_sql: "SELECT COUNT(*) FROM provider_target_grants",
+                page_sql: history_page_sql::UNFILTERED,
+                bindings: Vec::new(),
+            },
+            (None, Some(status)) => HistoryShape {
+                count_sql: "SELECT COUNT(*) FROM provider_target_grants WHERE status = ?1",
+                page_sql: history_page_sql::BY_STATUS,
+                bindings: vec![status],
+            },
+            (Some(target), None) => HistoryShape {
+                count_sql: "SELECT COUNT(*) FROM provider_target_grants
+                             WHERE provider_target_id = ?1",
+                page_sql: history_page_sql::BY_TARGET,
+                bindings: vec![target],
+            },
+            (Some(target), Some(status)) => HistoryShape {
+                count_sql: "SELECT COUNT(*) FROM provider_target_grants
+                             WHERE provider_target_id = ?1 AND status = ?2",
+                page_sql: history_page_sql::BY_TARGET_AND_STATUS,
+                bindings: vec![target, status],
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -74,6 +206,9 @@ pub struct ProviderTargetGrantAuditEvent {
     pub grant_revision: u64,
     pub actor_id: CanonicalId,
     pub event_type: String,
+    /// Present on `revoked` events written since revocation reasons exist;
+    /// `None` on `granted` events and on revocations that predate the column.
+    pub reason: Option<String>,
     pub occurred_at: DateTime<Utc>,
 }
 
@@ -138,11 +273,17 @@ impl CatalogStore {
                     1,
                     actor,
                     "granted",
+                    None,
                     now,
                 )?;
                 let grant = load_grant(&transaction, grant_id)?.ok_or_else(|| {
                     CatalogError::not_found(format!("provider target grant {grant_id}"))
                 })?;
+                complete_idempotency_record(
+                    &transaction,
+                    context.idempotency_record.as_ref(),
+                    &grant,
+                )?;
                 transaction.commit()?;
                 Ok(grant)
             })
@@ -190,11 +331,7 @@ impl CatalogStore {
             .with_connection(move |connection| {
                 let transaction = connection.unchecked_transaction()?;
                 ensure_application_environment(&transaction, application_id, environment_id)?;
-                let status = match status {
-                    ProviderTargetGrantStatusFilter::Active => Some("active"),
-                    ProviderTargetGrantStatusFilter::Revoked => Some("revoked"),
-                    ProviderTargetGrantStatusFilter::All => None,
-                };
+                let status = status.sql_status();
                 let total = transaction.query_row(
                     "SELECT COUNT(*) FROM provider_target_grants
                       WHERE application_id = ?1 AND environment_id = ?2
@@ -267,42 +404,82 @@ impl CatalogStore {
                     )));
                 }
                 if grant.status == "revoked" {
+                    complete_idempotency_record(
+                        &transaction,
+                        context.idempotency_record.as_ref(),
+                        &grant,
+                    )?;
                     transaction.commit()?;
                     return Ok(grant);
                 }
                 let actor = actor_id(&transaction, &context.actor_subject, now)?;
-                let next_revision = grant
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| CatalogError::conflict("provider target grant revision exhausted"))?;
-                transaction.execute(
-                    "UPDATE provider_target_grants
-                        SET status = 'revoked', revision = ?2,
-                            revoked_by_actor_id = ?3, revoked_at = ?4, updated_at = ?4
-                      WHERE grant_id = ?1",
-                    params![
-                        grant_id.to_string(),
-                        i64_from_u64(next_revision, "provider target grant revision")?,
-                        actor.to_string(),
-                        now,
-                    ],
-                )?;
-                insert_audit_event(
+                let grant = revoke_grant_tx(
                     &transaction,
-                    grant_id,
-                    grant.application_id,
-                    grant.environment_id,
-                    grant.provider_target_id,
-                    next_revision,
+                    &grant,
                     actor,
-                    "revoked",
+                    ProviderTargetGrantRevocationReason::Administrator,
                     now,
                 )?;
-                let grant = load_grant(&transaction, grant_id)?.ok_or_else(|| {
-                    CatalogError::not_found(format!("provider target grant {grant_id}"))
-                })?;
+                complete_idempotency_record(
+                    &transaction,
+                    context.idempotency_record.as_ref(),
+                    &grant,
+                )?;
                 transaction.commit()?;
                 Ok(grant)
+            })
+            .await
+    }
+
+    /// Every grant on the platform, newest first, for the administrator's
+    /// global history. Unlike the per-environment list this survives the
+    /// application: a grant revoked because its application was retired is
+    /// still here, with the audit event that says so.
+    pub async fn provider_target_grant_history_page(
+        &self,
+        filter: ProviderTargetGrantHistoryFilter,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderTargetGrant>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider target grant")?;
+        let shape = filter.shape();
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let total = transaction.query_row(
+                    shape.count_sql,
+                    params_from_iter(shape.bindings.iter()),
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (before_created_at, before_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut bindings: Vec<Box<dyn ToSql>> = shape
+                    .bindings
+                    .iter()
+                    .map(|value| Box::new(value.clone()) as Box<dyn ToSql>)
+                    .collect();
+                bindings.push(Box::new(before_created_at));
+                bindings.push(Box::new(before_id));
+                bindings.push(Box::new(fetch_limit));
+                let mut statement = transaction.prepare(shape.page_sql)?;
+                let ids = statement
+                    .query_map(params_from_iter(bindings.iter()), |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let grants = ids
+                    .into_iter()
+                    .map(|id| {
+                        let id = parse_id(&id, "provider target grant")?;
+                        load_grant(&transaction, id)?.ok_or_else(|| {
+                            CatalogError::not_found(format!("provider target grant {id}"))
+                        })
+                    })
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(grants, limit, total, "provider target grant")
             })
             .await
     }
@@ -345,7 +522,7 @@ impl CatalogStore {
                 let mut statement = transaction.prepare(
                     "SELECT event_id, application_id, environment_id,
                             provider_target_id, grant_revision, actor_id,
-                            event_type, occurred_at
+                            event_type, occurred_at, reason
                       FROM provider_target_grant_audit_events
                       WHERE grant_id = ?1
                         AND (?2 IS NULL OR grant_revision > ?2
@@ -365,6 +542,7 @@ impl CatalogStore {
                                 row.get::<_, String>(5)?,
                                 row.get::<_, String>(6)?,
                                 row.get::<_, i64>(7)?,
+                                row.get::<_, Option<String>>(8)?,
                             ))
                         },
                     )?
@@ -384,6 +562,7 @@ impl CatalogStore {
                             )?,
                             actor_id: parse_id(&row.5, "provider target grant actor")?,
                             event_type: row.6,
+                            reason: row.8,
                             occurred_at: timestamp(row.7, "provider target grant audit time")?,
                         })
                     })
@@ -421,6 +600,134 @@ pub(super) fn active_provider_target_grant_tx(
             .ok_or_else(|| CatalogError::not_found(format!("provider target grant {id}")))
     })
     .transpose()
+}
+
+/// Move one active grant to `revoked` and write its audit event, inside the
+/// caller's transaction. Shared by the administrator's explicit revoke and by
+/// the cascades that converge grants when their target, installation or
+/// application goes away, so every path leaves the same immutable trail.
+pub(super) fn revoke_grant_tx(
+    connection: &Connection,
+    grant: &ProviderTargetGrant,
+    actor: CanonicalId,
+    reason: ProviderTargetGrantRevocationReason,
+    now: i64,
+) -> CatalogResult<ProviderTargetGrant> {
+    let grant_id = grant.grant_id;
+    let next_revision = grant
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| CatalogError::conflict("provider target grant revision exhausted"))?;
+    // The transition trigger requires `updated_at` to be monotonic and equal
+    // to `revoked_at`; a clock behind the row keeps the row's own time.
+    let occurred_at = now.max(grant.updated_at.timestamp());
+    connection.execute(
+        "UPDATE provider_target_grants
+            SET status = 'revoked', revision = ?2,
+                revoked_by_actor_id = ?3, revoked_at = ?4, updated_at = ?4
+          WHERE grant_id = ?1 AND status = 'active'",
+        params![
+            grant_id.to_string(),
+            i64_from_u64(next_revision, "provider target grant revision")?,
+            actor.to_string(),
+            occurred_at,
+        ],
+    )?;
+    insert_audit_event(
+        connection,
+        grant_id,
+        grant.application_id,
+        grant.environment_id,
+        grant.provider_target_id,
+        next_revision,
+        actor,
+        "revoked",
+        Some(reason.as_str()),
+        occurred_at,
+    )?;
+    tracing::info!(
+        %grant_id,
+        application_id = %grant.application_id,
+        environment_id = %grant.environment_id,
+        provider_target_id = %grant.provider_target_id,
+        actor_id = %actor,
+        reason = reason.as_str(),
+        grant_revision = next_revision,
+        "Revoked provider target grant"
+    );
+    load_grant(connection, grant_id)?
+        .ok_or_else(|| CatalogError::not_found(format!("provider target grant {grant_id}")))
+}
+
+/// Revoke every active grant matching `filter_sql` (a WHERE fragment over
+/// `provider_target_grants` with one `?1` parameter), oldest first, and
+/// return their ids in that order. Used by the cascades.
+fn revoke_active_grants_where_tx(
+    connection: &Connection,
+    filter_sql: &str,
+    filter_value: String,
+    actor: CanonicalId,
+    reason: ProviderTargetGrantRevocationReason,
+    now: i64,
+) -> CatalogResult<Vec<CanonicalId>> {
+    let ids = connection
+        .prepare(&format!(
+            "SELECT grant_id FROM provider_target_grants
+              WHERE status = 'active' AND {filter_sql}
+              ORDER BY created_at, grant_id"
+        ))?
+        .query_map([filter_value], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut revoked = Vec::with_capacity(ids.len());
+    for id in ids {
+        let grant_id = parse_id(&id, "provider target grant")?;
+        let grant = load_grant(connection, grant_id)?
+            .ok_or_else(|| CatalogError::not_found(format!("provider target grant {grant_id}")))?;
+        revoke_grant_tx(connection, &grant, actor, reason, now)?;
+        revoked.push(grant_id);
+    }
+    Ok(revoked)
+}
+
+/// Cascade for a deleted target: every active grant on it is revoked with
+/// the given reason (`target-deleted`, or `installation-deleted` when the
+/// target went with its installation).
+pub(super) fn revoke_active_grants_for_target_tx(
+    connection: &Connection,
+    provider_target_id: CanonicalId,
+    actor: CanonicalId,
+    reason: ProviderTargetGrantRevocationReason,
+    now: i64,
+) -> CatalogResult<Vec<CanonicalId>> {
+    revoke_active_grants_where_tx(
+        connection,
+        "provider_target_id = ?1",
+        provider_target_id.to_string(),
+        actor,
+        reason,
+        now,
+    )
+}
+
+/// Cascade for a retired application: no grant survives the application it
+/// named. Runs inside the application delete transaction, before the
+/// application rows go, so a failure leaves both the application and its
+/// grants exactly as they were.
+pub(super) fn revoke_active_grants_for_application_tx(
+    connection: &Connection,
+    application_id: CanonicalId,
+    actor_subject: &str,
+    now: i64,
+) -> CatalogResult<Vec<CanonicalId>> {
+    let actor = actor_id(connection, actor_subject, now)?;
+    revoke_active_grants_where_tx(
+        connection,
+        "application_id = ?1",
+        application_id.to_string(),
+        actor,
+        ProviderTargetGrantRevocationReason::ApplicationRetired,
+        now,
+    )
 }
 
 fn ensure_application_environment(
@@ -471,7 +778,7 @@ fn ensure_active_target(
     }
 }
 
-fn load_grant(
+pub(super) fn load_grant(
     connection: &Connection,
     grant_id: CanonicalId,
 ) -> CatalogResult<Option<ProviderTargetGrant>> {
@@ -552,13 +859,14 @@ fn insert_audit_event(
     grant_revision: u64,
     actor_id: CanonicalId,
     event_type: &str,
+    reason: Option<&str>,
     occurred_at: i64,
 ) -> CatalogResult<()> {
     connection.execute(
         "INSERT INTO provider_target_grant_audit_events
            (event_id, grant_id, application_id, environment_id,
-            provider_target_id, grant_revision, actor_id, event_type, occurred_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            provider_target_id, grant_revision, actor_id, event_type, reason, occurred_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             CanonicalId::new_v7().to_string(),
             grant_id.to_string(),
@@ -568,6 +876,7 @@ fn insert_audit_event(
             i64_from_u64(grant_revision, "provider target grant audit revision")?,
             actor_id.to_string(),
             event_type,
+            reason,
             occurred_at,
         ],
     )?;

@@ -258,7 +258,19 @@ pub fn router(state: CatalogState) -> Router {
         )
         .route(
             "/api/providers/installations/:installation_id",
-            get(providers::get_installation),
+            get(providers::get_installation).delete(providers::delete_installation),
+        )
+        .route(
+            "/api/providers/installations/:installation_id/disable",
+            post(providers::disable_installation),
+        )
+        .route(
+            "/api/providers/installations/:installation_id/enable",
+            post(providers::enable_installation),
+        )
+        .route(
+            "/api/providers/installations/:installation_id/audit",
+            get(providers::installation_audit),
         )
         .route(
             "/api/providers/installations/:installation_id/targets",
@@ -267,9 +279,51 @@ pub fn router(state: CatalogState) -> Router {
         .route("/api/providers/targets", get(providers::list_targets))
         .route(
             "/api/providers/targets/:target_id",
-            get(providers::get_target),
+            get(providers::get_target).delete(providers::delete_target),
+        )
+        .route(
+            "/api/providers/targets/:target_id/disable",
+            post(providers::disable_target),
+        )
+        .route(
+            "/api/providers/targets/:target_id/enable",
+            post(providers::enable_target),
+        )
+        .route(
+            "/api/providers/targets/:target_id/audit",
+            get(providers::target_audit),
+        )
+        .route(
+            "/api/providers/target-grants",
+            get(providers::list_provider_target_grant_history),
+        )
+        .route(
+            "/api/providers/target-grants/:grant_id",
+            get(providers::get_provider_target_grant_history),
+        )
+        .route(
+            "/api/providers/target-grants/:grant_id/audit",
+            get(providers::provider_target_grant_history_audit),
         )
         .with_state(state)
+}
+
+/// The audit subject a catalog mutation records for its caller: the same
+/// string for every route, so an operator can join an operation, a grant
+/// revocation and an idempotency record to one principal.
+pub(super) fn actor_subject(principal: &crate::identity::Principal) -> String {
+    use crate::identity::PrincipalKind;
+    match principal.kind {
+        PrincipalKind::Account => format!(
+            "account:{}",
+            principal.account.as_deref().unwrap_or("unknown")
+        ),
+        PrincipalKind::ConfigKey => format!(
+            "config-key:{}",
+            principal.credential_id.as_deref().unwrap_or("unknown")
+        ),
+        PrincipalKind::Anonymous => "anonymous:direct-local".to_string(),
+    }
 }
 
 /// Build the node half: the assignment list, the bundle download and the

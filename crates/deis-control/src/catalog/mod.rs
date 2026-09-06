@@ -34,15 +34,19 @@ pub mod backend_restore_driver;
 pub mod bundle;
 pub mod compatibility;
 pub mod domains;
+pub mod idempotency;
 pub mod identity_migration;
 pub mod limits;
 pub mod model;
 pub mod operation;
 pub mod pagination;
+#[cfg(test)]
+mod pagination_plans;
 pub mod provider_credential;
 pub mod provider_deployment_reconciler;
 pub mod provider_driver_operation;
 pub mod provider_driver_release;
+pub mod provider_lifecycle;
 pub mod provider_target_grant;
 pub mod secrets;
 pub mod store;
@@ -59,6 +63,11 @@ pub use compatibility::{
 };
 pub use deis_bundle::Manifest as BundleManifest;
 pub use domains::{ClaimRefusal, DomainGrant, GrantPattern, HostClaim};
+pub use idempotency::{
+    IdempotencyGuard, IdempotencyOutcome, IdempotencyScope, IdempotencyStore, IdempotentRequest,
+    IdempotentResource, PendingIdempotencyRecord, StoredIdempotentResponse,
+    complete_idempotency_record,
+};
 pub use identity_migration::{
     CatalogBindingInventory, CatalogDeploymentInventory, CatalogEnvironmentInventory,
     CatalogIdentityInventory, CatalogInventoryDigest, CatalogRouteInventory,
@@ -73,7 +82,7 @@ pub use model::{
     Environment, ProviderDerivation, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
-pub use pagination::{CatalogPage, PageCursorStore, PagePosition};
+pub use pagination::{CatalogPage, PageCursorStatistics, PageCursorStore, PagePosition};
 pub use provider_credential::{
     CatalogProviderCredentialVault, ProviderCredentialAuditEvent, ProviderCredentialBinding,
     ProviderCredentialBindingSpec, ProviderCredentialMutationContext,
@@ -90,8 +99,14 @@ pub use provider_driver_release::{
     ProviderDriverDispatcher, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
     ProviderDriverReleaseRegistry, ResolvedProviderDriverRelease,
 };
+pub use provider_lifecycle::{
+    PROVIDER_INSTALLATION_HAS_DEPENDENTS, PROVIDER_INSTALLATION_IN_USE, PROVIDER_RESOURCE_DELETED,
+    PROVIDER_TARGET_IN_USE, ProviderLifecycleAuditEvent, ProviderLifecycleCascadeEntry,
+    ProviderLifecycleMutationContext, ProviderLifecycleResourceKind,
+};
 pub use provider_target_grant::{
-    ProviderTargetGrant, ProviderTargetGrantAuditEvent, ProviderTargetGrantMutationContext,
+    ProviderTargetGrant, ProviderTargetGrantAuditEvent, ProviderTargetGrantHistoryFilter,
+    ProviderTargetGrantMutationContext, ProviderTargetGrantRevocationReason,
     ProviderTargetGrantSpec, ProviderTargetGrantStatusFilter,
 };
 pub use secrets::{SecretCipher, SecretsBackend};
