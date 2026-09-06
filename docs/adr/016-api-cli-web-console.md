@@ -260,8 +260,12 @@ deployment 都通过同一 Control router、集中 authz/audit gate 与既有 do
 使用 ETag/`If-Match`，deployment 使用 `Idempotency-Key` 和 durable `ProductOperation`。target 还绑定 Control 标准 registry
 中的 exact version/contract digest，而不是把 driver 自报字符串当成标准事实。
 
-这段实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；列表没有 cursor，`total` 目前只代表本次返回数；
-provider release 安装、target grant 与 installation/target 生命周期尚无 HTTP 资源；credential provision 等资源创建尚未统一
+受信 provider release 也已具备 admin-only HTTP install/list/get/audit：签名文档先做有界解析和 DSSE/透明证明验证，随后
+按 release 对当前 host 声明的精确大小把 archive 流入受控 staging，由原 installer 复核摘要、完整树并原子发布；错误和
+成功路径都清理 staging，内容寻址重放返回同一 release 并追加验证审计。未配置受验证 registry 时该功能显式 disabled。
+
+这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；列表没有 cursor，`total` 目前只代表本次返回数；
+target grant 与 installation/target 生命周期尚无 HTTP 资源；credential provision 等资源创建尚未统一
 幂等 replay；CLI/Web 也没有生成 client 或交互入口。开始 provider deployment 因 target 尚是账户级 authority 而暂时只允许
 管理员；在 target assignment/grant 建立前不能把它误降为普通 environment deploy 权限。
 

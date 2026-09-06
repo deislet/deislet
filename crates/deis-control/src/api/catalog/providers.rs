@@ -9,15 +9,17 @@
 
 use axum::{
     Json,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Multipart, Path, Query, State, multipart::Field},
     http::{HeaderMap, HeaderValue, StatusCode, header},
 };
 use deis_provider_driver::{
     ArtifactVersionRef, CredentialMaterial, ProviderNeutralPlan, Sha256Digest,
-    ValidatedProviderDriverManifest,
+    ValidatedDriverReleaseAuthorization, ValidatedDriverReleaseTransparencyProof,
+    ValidatedProviderDriverManifest, ValidatedProviderDriverRelease,
 };
 use deis_wire::{CanonicalId, ProductOperation};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 use super::CatalogState;
 use crate::{
@@ -25,8 +27,9 @@ use crate::{
     catalog::{
         OperationRequestContext, ProviderCredentialAuditEvent, ProviderCredentialBinding,
         ProviderCredentialBindingSpec, ProviderCredentialMutationContext, ProviderDeploymentSpec,
-        ProviderDeploymentWorkflow, ProviderInstallation, ProviderInstallationSpec, ProviderTarget,
-        ProviderTargetSpec,
+        ProviderDeploymentWorkflow, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
+        ProviderDriverReleaseRegistry, ProviderInstallation, ProviderInstallationSpec,
+        ProviderTarget, ProviderTargetSpec,
     },
     identity::{Principal, PrincipalKind},
 };
@@ -36,6 +39,12 @@ const REQUEST_ID: &str = "x-request-id";
 const CORRELATION_ID: &str = "x-correlation-id";
 const IF_MATCH: &str = "if-match";
 const DEFAULT_LIST_LIMIT: usize = 100;
+const MAX_RELEASE_DOCUMENT_BYTES: usize = 1024 * 1024;
+const RELEASE_UPLOAD_PREFIX: &str = ".driver-upload.";
+/// The release contract permits a 4 GiB host archive. The remaining 5 MiB
+/// covers four bounded signed JSON documents and multipart framing.
+pub const MAX_PROVIDER_DRIVER_RELEASE_REQUEST_BYTES: usize =
+    4 * 1024 * 1024 * 1024 + 5 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -129,6 +138,190 @@ pub struct ProviderTargetsResponse {
 pub struct ProviderDeploymentsResponse {
     pub deployments: Vec<ProviderDeploymentWorkflow>,
     pub total: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDriverReleasesResponse {
+    pub releases: Vec<ProviderDriverReleaseRecord>,
+    pub total: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDriverReleaseAuditResponse {
+    pub events: Vec<ProviderDriverReleaseAuditEvent>,
+    pub total: usize,
+}
+
+pub async fn install_driver_release(
+    State(state): State<CatalogState>,
+    mut multipart: Multipart,
+) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderDriverReleaseRecord>)> {
+    let registry = provider_registry(&state)?;
+    let release = ValidatedProviderDriverRelease::parse_json(
+        &read_document(
+            next_named_field(&mut multipart, "release").await?,
+            "release",
+        )
+        .await?,
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let manifest = ValidatedProviderDriverManifest::parse_json(
+        &read_document(
+            next_named_field(&mut multipart, "manifest").await?,
+            "manifest",
+        )
+        .await?,
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let authorization = ValidatedDriverReleaseAuthorization::parse_json(
+        &read_document(
+            next_named_field(&mut multipart, "authorization").await?,
+            "authorization",
+        )
+        .await?,
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let transparency = ValidatedDriverReleaseTransparencyProof::parse_json(
+        &read_document(
+            next_named_field(&mut multipart, "transparency").await?,
+            "transparency",
+        )
+        .await?,
+    )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let expected_archive_bytes =
+        registry.validate_release_upload(&release, &manifest, &authorization, &transparency)?;
+
+    let archive = next_named_field(&mut multipart, "archive").await?;
+    let upload = tempfile::Builder::new()
+        .prefix(RELEASE_UPLOAD_PREFIX)
+        .tempfile_in(registry.installation_root())
+        .map_err(|error| {
+            ApiError::InternalError(format!(
+                "cannot create provider driver upload staging file: {error}"
+            ))
+        })?;
+    let (file, upload_path) = upload.into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    let archive_bytes = stream_archive(archive, &mut file, expected_archive_bytes).await?;
+    file.flush().await.map_err(|error| {
+        ApiError::InternalError(format!(
+            "cannot flush provider driver upload staging file: {error}"
+        ))
+    })?;
+    file.sync_all().await.map_err(|error| {
+        ApiError::InternalError(format!(
+            "cannot synchronize provider driver upload staging file: {error}"
+        ))
+    })?;
+    drop(file);
+    if archive_bytes != expected_archive_bytes {
+        return Err(ApiError::BadRequest(format!(
+            "provider driver archive contains {archive_bytes} bytes; release declares {expected_archive_bytes}"
+        )));
+    }
+    if multipart
+        .next_field()
+        .await
+        .map_err(multipart_error)?
+        .is_some()
+    {
+        return Err(ApiError::BadRequest(
+            "provider driver release multipart has fields after archive".to_string(),
+        ));
+    }
+
+    let release_digest = release
+        .canonical_sha256()
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let existed = registry.release(release_digest.clone()).await?.is_some();
+    let upload_file_path = upload_path.to_path_buf();
+    let installed = registry
+        .install_and_register(
+            release,
+            manifest,
+            authorization,
+            transparency,
+            upload_file_path,
+        )
+        .await;
+    if let Err(error) = upload_path.close() {
+        if installed.is_ok() {
+            return Err(ApiError::InternalError(format!(
+                "cannot remove provider driver upload staging file: {error}"
+            )));
+        }
+        tracing::warn!(%error, "Failed to remove rejected provider driver upload staging file");
+    }
+    let installed = installed?;
+    let status = if existed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let headers = resource_headers(
+        &format!(
+            "/api/providers/driver-releases/{}",
+            installed.release_digest
+        ),
+        installed.revision,
+    )?;
+    Ok((status, headers, Json(installed)))
+}
+
+pub async fn list_driver_releases(
+    State(state): State<CatalogState>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<(HeaderMap, Json<ProviderDriverReleasesResponse>)> {
+    let releases = provider_registry(&state)?
+        .releases(query.bounded_limit()?)
+        .await?;
+    let total = releases.len();
+    Ok((
+        no_store_headers(),
+        Json(ProviderDriverReleasesResponse { releases, total }),
+    ))
+}
+
+pub async fn get_driver_release(
+    State(state): State<CatalogState>,
+    Path(release_digest): Path<String>,
+) -> ApiResult<(HeaderMap, Json<ProviderDriverReleaseRecord>)> {
+    let release_digest = parse_digest(&release_digest, "provider driver release")?;
+    let release = provider_registry(&state)?
+        .release(release_digest.clone())
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "provider driver release {release_digest} not found"
+            ))
+        })?;
+    let headers = resource_headers("", release.revision)?;
+    Ok((headers, Json(release)))
+}
+
+pub async fn driver_release_audit(
+    State(state): State<CatalogState>,
+    Path(release_digest): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<(HeaderMap, Json<ProviderDriverReleaseAuditResponse>)> {
+    let release_digest = parse_digest(&release_digest, "provider driver release")?;
+    let registry = provider_registry(&state)?;
+    if registry.release(release_digest.clone()).await?.is_none() {
+        return Err(ApiError::NotFound(format!(
+            "provider driver release {release_digest} not found"
+        )));
+    }
+    let events = registry
+        .audit_events(release_digest, query.bounded_limit()?)
+        .await?;
+    let total = events.len();
+    Ok((
+        no_store_headers(),
+        Json(ProviderDriverReleaseAuditResponse { events, total }),
+    ))
 }
 
 pub async fn provision_credential(
@@ -478,9 +671,101 @@ pub async fn get_provider_deployment(
     Ok((headers, Json(workflow)))
 }
 
+fn provider_registry(state: &CatalogState) -> ApiResult<ProviderDriverReleaseRegistry> {
+    state
+        .provider_driver_dispatcher
+        .as_ref()
+        .map(|dispatcher| dispatcher.registry().clone())
+        .ok_or_else(|| {
+            ApiError::NotConfigured(
+                "provider driver release management is disabled; configure a verified trust root and installation directory"
+                    .to_string(),
+            )
+        })
+}
+
+async fn next_named_field<'a>(
+    multipart: &'a mut Multipart,
+    expected: &str,
+) -> ApiResult<Field<'a>> {
+    let field = multipart
+        .next_field()
+        .await
+        .map_err(multipart_error)?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "provider driver release multipart is missing the {expected} field"
+            ))
+        })?;
+    if field.name() != Some(expected) {
+        return Err(ApiError::BadRequest(format!(
+            "provider driver release multipart fields must be release, manifest, authorization, transparency, archive in that order; expected {expected}"
+        )));
+    }
+    Ok(field)
+}
+
+async fn read_document(mut field: Field<'_>, label: &str) -> ApiResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RELEASE_DOCUMENT_BYTES {
+            return Err(ApiError::BadRequest(format!(
+                "provider driver {label} document exceeds {MAX_RELEASE_DOCUMENT_BYTES} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "provider driver {label} document is empty"
+        )));
+    }
+    Ok(bytes)
+}
+
+async fn stream_archive(
+    mut field: Field<'_>,
+    file: &mut tokio::fs::File,
+    expected_bytes: u64,
+) -> ApiResult<u64> {
+    let mut written = 0_u64;
+    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
+        written = written
+            .checked_add(u64::try_from(chunk.len()).map_err(|_| {
+                ApiError::BadRequest("provider driver archive chunk is too large".to_string())
+            })?)
+            .ok_or_else(|| {
+                ApiError::BadRequest("provider driver archive size overflowed".to_string())
+            })?;
+        if written > expected_bytes {
+            return Err(ApiError::BadRequest(format!(
+                "provider driver archive exceeds its declared {expected_bytes} bytes"
+            )));
+        }
+        file.write_all(&chunk).await.map_err(|error| {
+            ApiError::InternalError(format!(
+                "cannot write provider driver upload staging file: {error}"
+            ))
+        })?;
+    }
+    Ok(written)
+}
+
+fn multipart_error(error: axum::extract::multipart::MultipartError) -> ApiError {
+    ApiError::BadRequest(format!(
+        "invalid provider driver release multipart body: {error}"
+    ))
+}
+
 fn credential_material(credential: String) -> ApiResult<CredentialMaterial> {
     CredentialMaterial::new(credential.into_bytes())
         .map_err(|error| ApiError::BadRequest(error.to_string()))
+}
+
+fn parse_digest(value: &str, label: &str) -> ApiResult<Sha256Digest> {
+    value
+        .parse()
+        .map_err(|error| ApiError::BadRequest(format!("invalid {label} digest: {error}")))
 }
 
 fn credential_mutation_context(principal: &Principal) -> ProviderCredentialMutationContext {
@@ -639,6 +924,8 @@ fn required_if_match(headers: &HeaderMap) -> ApiResult<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, sync::Arc};
+
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request},
@@ -648,6 +935,8 @@ mod tests {
 
     use super::*;
     use crate::api::catalog::tests::harness;
+    use crate::catalog::provider_driver_release::tests::Fixture as ReleaseFixture;
+    use deis_provider_driver::ExecutableProviderDriverConfig;
 
     async fn response_json(response: axum::response::Response) -> Value {
         let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
@@ -663,6 +952,212 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_vec(&value).unwrap()))
             .unwrap()
+    }
+
+    fn multipart_request(parts: Vec<(&str, Vec<u8>)>) -> Request<Body> {
+        let boundary = "deislet-provider-release-test-boundary";
+        let mut body = Vec::new();
+        for (name, value) in parts {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n").as_bytes(),
+            );
+            let content_type = if name == "archive" {
+                "application/x-tar"
+            } else {
+                "application/json"
+            };
+            body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+            body.extend_from_slice(&value);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/providers/driver-releases")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn release_router(
+        fixture: &ReleaseFixture,
+    ) -> (crate::api::catalog::tests::Harness, axum::Router) {
+        let harness = harness(true).await;
+        let registry = ProviderDriverReleaseRegistry::new(
+            harness.state.store.as_ref().clone(),
+            &fixture.install_root,
+            fixture.trust_root.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let dispatcher = crate::catalog::ProviderDriverDispatcher::new(
+            registry,
+            Arc::clone(&harness.state.provider_credentials),
+            ExecutableProviderDriverConfig::default(),
+        )
+        .unwrap();
+        let mut state = harness.state.clone();
+        state.provider_driver_dispatcher = Some(Arc::new(dispatcher));
+        let router = crate::api::catalog::router(state);
+        (harness, router)
+    }
+
+    fn release_parts(fixture: &ReleaseFixture, archive: Vec<u8>) -> Vec<(&str, Vec<u8>)> {
+        vec![
+            ("release", fixture.release.canonical_json().unwrap()),
+            ("manifest", fixture.manifest.canonical_json().unwrap()),
+            (
+                "authorization",
+                fixture.authorization.canonical_json().unwrap(),
+            ),
+            ("transparency", fixture.transparency.canonical_json()),
+            ("archive", archive),
+        ]
+    }
+
+    fn upload_staging_files(fixture: &ReleaseFixture) -> Vec<String> {
+        fs::read_dir(&fixture.install_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(RELEASE_UPLOAD_PREFIX))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn release_api_streams_exact_archive_and_replays_content_addressed_install() {
+        let fixture = ReleaseFixture::new();
+        let (_harness, router) = release_router(&fixture).await;
+        let archive = fs::read(&fixture.archive).unwrap();
+        let response = router
+            .clone()
+            .oneshot(multipart_request(release_parts(&fixture, archive.clone())))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let created = response_json(response).await;
+        let release_digest = created["releaseDigest"].as_str().unwrap();
+        assert_eq!(created["archiveSizeBytes"], archive.len());
+        assert!(upload_staging_files(&fixture).is_empty());
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/providers/driver-releases")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = response_json(response).await;
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["releases"][0]["releaseDigest"], release_digest);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/providers/driver-releases/{release_digest}/audit"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let audit = response_json(response).await;
+        assert_eq!(audit["total"], 1);
+        assert_eq!(audit["events"][0]["eventType"], "registered");
+
+        let response = router
+            .clone()
+            .oneshot(multipart_request(release_parts(&fixture, archive)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["releaseDigest"],
+            release_digest
+        );
+        assert!(upload_staging_files(&fixture).is_empty());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/providers/driver-releases/{release_digest}/audit"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let audit = response_json(response).await;
+        assert_eq!(audit["total"], 2);
+        assert_eq!(audit["events"][0]["eventType"], "registered");
+        assert_eq!(audit["events"][1]["eventType"], "verified");
+    }
+
+    #[tokio::test]
+    async fn release_api_rejects_wrong_archive_sizes_and_cleans_staging() {
+        let fixture = ReleaseFixture::new();
+        let (_harness, router) = release_router(&fixture).await;
+        let mut archive = fs::read(&fixture.archive).unwrap();
+        archive.pop();
+        let response = router
+            .clone()
+            .oneshot(multipart_request(release_parts(&fixture, archive)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("release declares")
+        );
+        assert!(upload_staging_files(&fixture).is_empty());
+
+        let mut archive = fs::read(&fixture.archive).unwrap();
+        archive.push(0);
+        let response = router
+            .oneshot(multipart_request(release_parts(&fixture, archive)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("exceeds its declared")
+        );
+        assert!(upload_staging_files(&fixture).is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_api_is_explicitly_disabled_without_a_verified_registry() {
+        let harness = harness(true).await;
+        let response = harness
+            .router
+            .oneshot(multipart_request(Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            response_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("release management is disabled")
+        );
     }
 
     #[tokio::test]

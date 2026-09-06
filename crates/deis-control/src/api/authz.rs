@@ -409,6 +409,39 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         // authority, not an application-scoped deployment secret. Opaque
         // IDs cannot narrow that authority, so every management route stays
         // administrative even when it is read-only.
+        ["api", "providers", "driver-releases"] if !writing => Requirement::new(
+            "provider_driver_release.list",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "providers", "driver-releases"] => Requirement::new(
+            "provider_driver_release.install",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state(),
+        ["api", "providers", "driver-releases", release_digest] => Requirement::new(
+            "provider_driver_release.get",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(release_digest),
+        [
+            "api",
+            "providers",
+            "driver-releases",
+            release_digest,
+            "audit",
+        ] => Requirement::new(
+            "provider_driver_release.audit",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(release_digest),
         ["api", "providers", "credentials"] if !writing => Requirement::new(
             "provider_credential.list",
             Verb::Admin,
@@ -1842,6 +1875,30 @@ mod tests {
             ),
             (
                 "GET",
+                "/api/providers/driver-releases",
+                "provider_driver_release.list",
+                Verb::Admin,
+            ),
+            (
+                "POST",
+                "/api/providers/driver-releases",
+                "provider_driver_release.install",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/driver-releases/0000000000000000000000000000000000000000000000000000000000000000",
+                "provider_driver_release.get",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/providers/driver-releases/0000000000000000000000000000000000000000000000000000000000000000/audit",
+                "provider_driver_release.audit",
+                Verb::Admin,
+            ),
+            (
+                "GET",
                 "/api/providers/credentials",
                 "provider_credential.list",
                 Verb::Admin,
@@ -2064,6 +2121,11 @@ mod tests {
             ),
             ("POST", "/api/domains", AdministratorsAlready),
             ("DELETE", "/api/domains/example.com", AdministratorsAlready),
+            (
+                "POST",
+                "/api/providers/driver-releases",
+                AdministratorsAlready,
+            ),
             ("POST", "/api/providers/credentials", AdministratorsAlready),
             (
                 "POST",
@@ -2291,6 +2353,7 @@ mod tests {
                 "POST",
                 "/api/apps/demo/environments/production/provider-deployments",
             ),
+            ("POST", "/api/providers/driver-releases"),
             ("POST", "/api/providers/credentials"),
             (
                 "POST",
@@ -2361,6 +2424,12 @@ mod tests {
                 .from_body
                 .is_none(),
             "the authorization gate must never read provider credential material"
+        );
+        assert!(
+            requirement("POST", "/api/providers/driver-releases")
+                .from_body
+                .is_none(),
+            "the authorization gate must never parse signed release material"
         );
     }
 

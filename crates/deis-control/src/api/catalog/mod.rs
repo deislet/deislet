@@ -224,6 +224,22 @@ pub fn router(state: CatalogState) -> Router {
             get(providers::credential_audit),
         )
         .route(
+            "/api/providers/driver-releases",
+            get(providers::list_driver_releases)
+                .post(providers::install_driver_release)
+                .layer(DefaultBodyLimit::max(
+                    providers::MAX_PROVIDER_DRIVER_RELEASE_REQUEST_BYTES,
+                )),
+        )
+        .route(
+            "/api/providers/driver-releases/:release_digest",
+            get(providers::get_driver_release),
+        )
+        .route(
+            "/api/providers/driver-releases/:release_digest/audit",
+            get(providers::driver_release_audit),
+        )
+        .route(
             "/api/providers/installations",
             get(providers::list_installations).post(providers::register_installation),
         )

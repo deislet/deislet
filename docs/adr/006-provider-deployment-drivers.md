@@ -412,7 +412,7 @@ Windows 失败—修复关系及 macOS 非登录 SSH 缺 Cargo PATH 的环境观
 
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
 真实透明日志/独立 witness 的采集与可用性运营，以及真实 Windows Service 安装演练。公共
-release/vault/target/deployment API、三个完整 backend driver 和真实账户 evidence 也未完成。当前跨页扫描虽然正确，
+provider 生命周期、CLI/Web、三个完整 backend driver 和真实账户 evidence 也未完成。当前跨页扫描虽然正确，
 但会在一个读事务内遍历全部非终态 workflow；大规模 catalog 仍需可索引 eligibility、负载证据和扫描时长指标。在这些完成并获得真实账户证据前，不能把当前 dispatcher
 称作已部署的 provider 服务，更不能升级 backend 支持状态。
 
@@ -436,8 +436,15 @@ target 注册不再相信调用者给出的一个版本字符串：版本必须�
 disabled。SQLite insert/activation trigger 同时拒绝没有完整 SHA-256 声明的 active target。proposal 公共 fixture 继续保持
 空 `supportedStandardVersions`，测试只为合成、已验证 release 显式加入当前声明，不能反向把 fixture 伪装成合规 driver。
 
-这只是公共管理面的第一段，并不满足本 ADR 的完整验收。release/archive/authorization/transparency 安装 API 尚未公开；
-installation/target 还没有 disable/delete 生命周期；列表只有有界 limit、没有 cursor；credential provision 和非 operation
+provider release 安装现也进入同一管理面。`multipart/form-data` 必须依次携带 release、manifest、authorization、
+transparency 与 archive；四份签名文档分别限制为 1 MiB，并在创建 archive 临时文件之前完成 manifest binding、DSSE、
+信任根、透明 inclusion/checkpoint/witness 复核。archive 随后直接流入已验证 installation root 内的专用临时文件，不在
+内存聚合，且不能超过或短于当前 host distribution 声明的精确字节数；写入会 flush/sync，既有 installer 再从同一文件
+执行 archive digest、完整文件表、tree digest 和原子只读发布。错误、过长、过短和成功路径都会清除 staging；新内容返回
+201，已存在的 content-addressed release 在重新验证并追加审计后返回 200。list/get/audit 只暴露当前 host registry；没有
+可信 registry 的 Control 明确返回 disabled，而不是接受未验证发行。
+
+这只是公共管理面的后续一段，并不满足本 ADR 的完整验收。installation/target 还没有 disable/delete 生命周期；列表只有有界 limit、没有 cursor；credential provision 和非 operation
 资源创建还没有统一幂等 replay；CLI 与 Web 尚未接线。更关键的是尚无真实签署 release、真实透明日志/独立 witness、
 三个完整 backend driver 或真实账户 lifecycle/conformance evidence。因此所有 backend 的 supported/compliant 状态保持不变。
 

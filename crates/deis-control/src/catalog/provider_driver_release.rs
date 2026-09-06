@@ -22,13 +22,15 @@ use deis_provider_driver::{
 };
 use deis_wire::CanonicalId;
 use rusqlite::{OptionalExtension, params};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use super::model::now_secs;
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogProviderCredentialVault, CatalogResult};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderDriverReleaseRecord {
     pub release_digest: Sha256Digest,
     pub host_operating_system: HostOperatingSystem,
@@ -48,7 +50,8 @@ pub struct ProviderDriverReleaseRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderDriverReleaseAuditEvent {
     pub event_id: CanonicalId,
     pub release_digest: Sha256Digest,
@@ -313,6 +316,49 @@ impl ProviderDriverReleaseRegistry {
             .await
     }
 
+    pub async fn releases(&self, limit: usize) -> CatalogResult<Vec<ProviderDriverReleaseRecord>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CatalogError::invalid(
+                "provider driver release limit must be between 1 and 1000",
+            ));
+        }
+        let database = self.store.database();
+        let host = self.host;
+        database
+            .with_connection(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT release_sha256 FROM provider_driver_releases
+                      WHERE host_operating_system = ?1
+                      ORDER BY created_at DESC, release_sha256 DESC LIMIT ?2",
+                )?;
+                let digests = statement
+                    .query_map(
+                        params![
+                            host.as_str(),
+                            i64::try_from(limit).map_err(|_| {
+                                CatalogError::invalid(
+                                    "provider driver release limit exceeds SQLite range",
+                                )
+                            })?,
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                digests
+                    .into_iter()
+                    .map(|digest| {
+                        let digest = parse_digest(&digest, "provider driver release")?;
+                        load_release_record(connection, &digest, host)?.ok_or_else(|| {
+                            CatalogError::not_found(format!(
+                                "provider driver release {digest} for {host}"
+                            ))
+                        })
+                    })
+                    .collect()
+            })
+            .await
+    }
+
     pub async fn audit_events(
         &self,
         release_digest: Sha256Digest,
@@ -412,6 +458,40 @@ impl ProviderDriverReleaseRegistry {
             &installed,
         )
         .await
+    }
+
+    /// Verify every small signed document before an HTTP caller is allowed
+    /// to stream the much larger archive to disk. Installation repeats the
+    /// same checks so elapsed time or a future call-site cannot weaken the
+    /// actual publish boundary.
+    pub fn validate_release_upload(
+        &self,
+        release: &ValidatedProviderDriverRelease,
+        manifest: &ValidatedProviderDriverManifest,
+        authorization: &ValidatedDriverReleaseAuthorization,
+        transparency: &ValidatedDriverReleaseTransparencyProof,
+    ) -> CatalogResult<u64> {
+        release.bind_to_manifest(manifest).map_err(|error| {
+            CatalogError::invalid(format!(
+                "provider driver release does not match its manifest: {error}"
+            ))
+        })?;
+        let now = Utc::now();
+        authorization
+            .verify(release, manifest, &self.trust_root, now)
+            .map_err(authorization_error)?;
+        transparency
+            .verify(authorization, &self.trust_root, now)
+            .map_err(transparency_error)?;
+        release
+            .distribution_for(self.host)
+            .map(|distribution| distribution.archive.size_bytes)
+            .ok_or_else(|| {
+                CatalogError::invalid(format!(
+                    "provider driver release has no archive for {}",
+                    self.host
+                ))
+            })
     }
 
     pub async fn register_existing(
@@ -1887,7 +1967,7 @@ pub(crate) async fn seed_test_provider_driver_release(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::BTreeMap,
         fs::{self, File},
@@ -1925,20 +2005,20 @@ mod tests {
     const MANIFEST_FIXTURE: &[u8] =
         include_bytes!("../../../../contracts/v1/fixtures/valid/provider-driver.json");
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         temporary: TempDir,
-        install_root: PathBuf,
-        archive: PathBuf,
-        release: ValidatedProviderDriverRelease,
-        manifest: ValidatedProviderDriverManifest,
-        trust_root: ValidatedDriverReleaseTrustRoot,
-        authorization: ValidatedDriverReleaseAuthorization,
-        transparency: ValidatedDriverReleaseTransparencyProof,
+        pub(crate) install_root: PathBuf,
+        pub(crate) archive: PathBuf,
+        pub(crate) release: ValidatedProviderDriverRelease,
+        pub(crate) manifest: ValidatedProviderDriverManifest,
+        pub(crate) trust_root: ValidatedDriverReleaseTrustRoot,
+        pub(crate) authorization: ValidatedDriverReleaseAuthorization,
+        pub(crate) transparency: ValidatedDriverReleaseTransparencyProof,
         contents: BTreeMap<String, Vec<u8>>,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let install_root = temporary.path().join("installed");
             fs::create_dir(&install_root).unwrap();

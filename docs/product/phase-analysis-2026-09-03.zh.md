@@ -2419,3 +2419,25 @@ Application/framework source + versioned build plan
   target grant 未建；列表尚无 cursor 且 `total` 只是当前页计数；credential provision 等资源创建缺统一幂等 replay；API 尚无显式
   major/schema client generation；CLI/Web 未接线。三个真实 backend driver、真实签署 release、透明日志/独立 witness、真实账户
   lifecycle/conformance 也均未完成，因此 `P1-DEPLOY-001` 继续 active，所有 backend 支持/合规状态不变。
+
+## 86. Provider driver release 的受限流式安装 API
+
+- 公共管理面现新增 provider release 的 install/list/get/audit。安装请求固定为 `multipart/form-data` 的
+  `release → manifest → authorization → transparency → archive` 顺序；四份签名 JSON 各自限制在 1 MiB，Control 在创建
+  archive staging 前先验证 release 与 manifest 绑定、当前信任根下的 DSSE 授权，以及 RFC 6962 inclusion、signed
+  checkpoint 和独立 witness 阈值。这样任意未受信的大 archive 不能先消耗安装盘空间。
+- 通过元数据验证后，archive 直接流入受验证 installation root 内的专用随机临时文件，不在内存聚合。流量上限由当前 host
+  distribution 的声明大小收紧，请求总边界只额外预留四份有界文档和 multipart framing；过长在越过声明边界时立即拒绝，
+  过短在 EOF 后拒绝。文件 flush/sync 后交给既有 installer；installer 仍从 regular handle 重新核对长度、archive digest、
+  完整文件表、tree digest、可执行项和原子只读发布，预验证不替代最终安装门禁。
+- 新安装返回 201 与 content-addressed `Location`/ETag；同一 release 重放会重新验证 authorization/transparency、复核安装树、
+  追加 `verified` 审计并返回 200，不创建第二条 release。短 archive、长 archive、安装失败及成功路径都清除 staging。
+  list/get/audit 只返回本机 host registry 且统一 `Cache-Control: no-store`；所有发行端点保持 `admin:*/*`，未配置透明信任根、
+  registry 与 dispatcher 的 Control 明确返回 disabled，不回退到未验证 upload。
+- 本机门禁已通过 provider release API 3/3、Control lib 477/477、API integration 14/14、严格
+  `cargo clippy -p deis-control --all-targets -- -D warnings`、格式与 diff 检查。当前结果仍是提交前本机证据；精确提交的
+  Linux/macOS/Windows archive 复验尚未登记，不能提前写成可移植性结论。
+- 本切片关闭第 85 节的安全 release upload API 缺口，但不关闭通用资源幂等：内容寻址只解决 exact release 重放，不能代替
+  credential/installation/target 等 mutation 的 `Idempotency-Key` 契约。target grant、cursor 与真实 total、
+  installation/target disable/delete、CLI/Web、真实签署 materialized release、公共透明日志/独立 witness、三家完整 driver、
+  真实账户 lifecycle/live conformance 仍未完成；`P1-DEPLOY-001` 保持 active，backend 支持状态不变。
