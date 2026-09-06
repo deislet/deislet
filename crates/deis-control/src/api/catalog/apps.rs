@@ -12,7 +12,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -20,18 +20,13 @@ use tracing::{info, warn};
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::pagination::{ControlListPage, ListQuery, list_page};
 use crate::catalog::{App, RetiredAppName};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
     /// App name; also the app_id every component keys off.
     pub id: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AppsResponse {
-    pub apps: Vec<App>,
-    pub total: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,12 +54,6 @@ pub struct DeleteAppResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct RetiredAppsResponse {
-    pub retired: Vec<RetiredAppName>,
-    pub total: usize,
-}
-
-#[derive(Debug, Serialize)]
 pub struct ReleaseRetiredAppResponse {
     pub app_id: String,
     pub released: RetiredAppName,
@@ -83,12 +72,23 @@ pub async fn create_app(
 }
 
 /// GET /api/apps
-pub async fn list_apps(State(state): State<CatalogState>) -> ApiResult<Json<AppsResponse>> {
-    let apps = state.store.list_apps().await?;
-    Ok(Json(AppsResponse {
-        total: apps.len(),
-        apps,
-    }))
+pub async fn list_apps(
+    State(state): State<CatalogState>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<App>>> {
+    let collection = "applications";
+    let binding = "scope=global;filter=all;sort=id-asc-v1";
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, binding).await?;
+    let page = state.store.list_apps_page(limit, cursor).await?;
+    let response = list_page(&state.store, collection, binding, limit, page, |app| {
+        crate::catalog::PagePosition {
+            sort_value: 0,
+            identity: app.id.clone(),
+        }
+    })
+    .await?;
+    Ok(Json(response))
 }
 
 /// GET /api/apps/:app_id
@@ -220,12 +220,21 @@ pub async fn delete_app(
 /// created, and what it says about the data is as true as it ever was.
 pub async fn list_retired_apps(
     State(state): State<CatalogState>,
-) -> ApiResult<Json<RetiredAppsResponse>> {
-    let retired = state.store.list_retired_names().await?;
-    Ok(Json(RetiredAppsResponse {
-        total: retired.len(),
-        retired,
-    }))
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<RetiredAppName>>> {
+    let collection = "retired-applications";
+    let binding = "scope=global;filter=all;sort=application-id-asc-v1";
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, binding).await?;
+    let page = state.store.list_retired_names_page(limit, cursor).await?;
+    let response = list_page(&state.store, collection, binding, limit, page, |retired| {
+        crate::catalog::PagePosition {
+            sort_value: 0,
+            identity: retired.app_id.clone(),
+        }
+    })
+    .await?;
+    Ok(Json(response))
 }
 
 /// DELETE /api/retired-apps/:app_id
@@ -357,9 +366,10 @@ mod tests {
 
         let (status, listed) = json(&h.router, "GET", "/api/retired-apps", Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{listed}");
-        assert_eq!(listed["total"], 1);
-        assert_eq!(listed["retired"][0]["app_id"], "victim");
-        assert_eq!(listed["retired"][0]["environments"][0], "production");
+        assert_eq!(listed["schemaVersion"], 1);
+        assert_eq!(listed["page"]["total"], 1);
+        assert_eq!(listed["items"][0]["app_id"], "victim");
+        assert_eq!(listed["items"][0]["environments"][0], "production");
 
         let (status, released) =
             json(&h.router, "DELETE", "/api/retired-apps/victim", Value::Null).await;

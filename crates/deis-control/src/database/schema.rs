@@ -320,6 +320,13 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_canonical_artifacts_app ON canonical_artifacts(app_id, created_at DESC)",
         [],
     )?;
+    // Keep the immutable identity in the index because public pagination uses
+    // it to make equal-second creation times deterministic. This needs a new
+    // index name so existing databases receive the wider index on startup.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_canonical_artifacts_page_v1 ON canonical_artifacts(app_id, created_at DESC, id DESC)",
+        [],
+    )?;
 
     // A provider derivation is content addressed by its canonical JSON
     // manifest. It binds one exact provider payload root to one exact

@@ -33,6 +33,7 @@ use super::model::{
     RetiredAppName, Route, SecretMeta, Version, now_secs, validate_app_id,
     validate_environment_name, validate_path_prefix, validate_route_priority, validate_secret_name,
 };
+use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
@@ -277,6 +278,33 @@ impl CatalogStore {
         .await
     }
 
+    /// Public API page ordered by immutable application name.
+    pub async fn list_apps_page(
+        &self,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<App>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "applications")?;
+        let after_id = identity_only_cursor(cursor, "applications")?;
+        self.with_conn(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let total = transaction
+                .query_row("SELECT COUNT(*) FROM apps", [], |row| row.get::<_, i64>(0))?;
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {APP_COLUMNS} FROM apps
+                  WHERE (?1 IS NULL OR id > ?1)
+                  ORDER BY id ASC LIMIT ?2"
+            ))?;
+            let rows = statement
+                .query_map(params![after_id, fetch_limit], map_app)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "applications")
+        })
+        .await
+    }
+
     pub async fn get_app(&self, id: &str) -> CatalogResult<App> {
         let id = id.to_string();
         self.with_conn(move |conn| load_app(conn, &id)).await
@@ -446,6 +474,35 @@ impl CatalogStore {
                 retired.push(row?);
             }
             Ok(retired)
+        })
+        .await
+    }
+
+    /// Public API page over the retained-name ledger, including released rows.
+    pub async fn list_retired_names_page(
+        &self,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<RetiredAppName>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "retired application names")?;
+        let after_id = identity_only_cursor(cursor, "retired application names")?;
+        self.with_conn(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let total =
+                transaction.query_row("SELECT COUNT(*) FROM retired_app_names", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {RETIRED_NAME_COLUMNS} FROM retired_app_names
+                  WHERE (?1 IS NULL OR app_id > ?1)
+                  ORDER BY app_id ASC LIMIT ?2"
+            ))?;
+            let rows = statement
+                .query_map(params![after_id, fetch_limit], map_retired_name)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "retired application names")
         })
         .await
     }
@@ -715,6 +772,44 @@ impl CatalogStore {
             let rows = statement.query_map(params![app_id], map_canonical_artifact)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(CatalogError::from)
+        })
+        .await
+    }
+
+    /// Public API page ordered newest first with canonical identity as the tie-breaker.
+    pub async fn list_canonical_artifacts_page(
+        &self,
+        app_id: &str,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<CanonicalArtifact>> {
+        let app_id = app_id.to_string();
+        let fetch_limit = sqlite_fetch_limit(limit, "canonical artifacts")?;
+        let (before_created_at, before_id) = descending_cursor(cursor);
+        self.with_conn(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            load_app(&transaction, &app_id)?;
+            let total = transaction.query_row(
+                "SELECT COUNT(*) FROM canonical_artifacts WHERE app_id = ?1",
+                [&app_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {CANONICAL_ARTIFACT_COLUMNS} FROM canonical_artifacts
+                  WHERE app_id = ?1
+                    AND (?2 IS NULL OR created_at < ?2
+                         OR (created_at = ?2 AND id < ?3))
+                  ORDER BY created_at DESC, id DESC LIMIT ?4"
+            ))?;
+            let rows = statement
+                .query_map(
+                    params![app_id, before_created_at, before_id, fetch_limit],
+                    map_canonical_artifact,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "canonical artifacts")
         })
         .await
     }
@@ -1066,6 +1161,44 @@ impl CatalogStore {
         .await
     }
 
+    /// Public API page ordered by the immutable per-application version number.
+    pub async fn list_versions_page(
+        &self,
+        app_id: &str,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<Version>> {
+        let app_id = app_id.to_string();
+        let fetch_limit = sqlite_fetch_limit(limit, "versions")?;
+        let (before_number, before_id) = descending_cursor(cursor);
+        self.with_conn(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            load_app(&transaction, &app_id)?;
+            let total = transaction.query_row(
+                "SELECT COUNT(*) FROM versions WHERE app_id = ?1",
+                [&app_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {VERSION_COLUMNS} FROM versions
+                  WHERE app_id = ?1
+                    AND (?2 IS NULL OR number < ?2
+                         OR (number = ?2 AND id < ?3))
+                  ORDER BY number DESC, id DESC LIMIT ?4"
+            ))?;
+            let rows = statement
+                .query_map(
+                    params![app_id, before_number, before_id, fetch_limit],
+                    map_version,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "versions")
+        })
+        .await
+    }
+
     pub async fn get_version(&self, app_id: &str, version_id: &str) -> CatalogResult<Version> {
         let app_id = app_id.to_string();
         let version_id = version_id.to_string();
@@ -1159,6 +1292,39 @@ impl CatalogStore {
                 envs.push(row?);
             }
             Ok(envs)
+        })
+        .await
+    }
+
+    /// Public API page ordered by immutable environment name within one application.
+    pub async fn list_environments_page(
+        &self,
+        app_id: &str,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<Environment>> {
+        let app_id = app_id.to_string();
+        let fetch_limit = sqlite_fetch_limit(limit, "environments")?;
+        let after_name = identity_only_cursor(cursor, "environments")?;
+        self.with_conn(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            load_app(&transaction, &app_id)?;
+            let total = transaction.query_row(
+                "SELECT COUNT(*) FROM environments WHERE app_id = ?1",
+                [&app_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {ENVIRONMENT_COLUMNS} FROM environments
+                  WHERE app_id = ?1 AND (?2 IS NULL OR name > ?2)
+                  ORDER BY name ASC LIMIT ?3"
+            ))?;
+            let rows = statement
+                .query_map(params![app_id, after_name, fetch_limit], map_environment)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "environments")
         })
         .await
     }
@@ -3913,6 +4079,25 @@ impl CatalogStore {
 // --------------------------------------------------------------------
 // Row mapping and lookup helpers
 // --------------------------------------------------------------------
+
+fn identity_only_cursor(
+    cursor: Option<PagePosition>,
+    resource: &str,
+) -> CatalogResult<Option<String>> {
+    match cursor {
+        Some(position) if position.sort_value != 0 => Err(CatalogError::invalid(format!(
+            "{resource} cursor contains an invalid sort position"
+        ))),
+        Some(position) => Ok(Some(position.identity)),
+        None => Ok(None),
+    }
+}
+
+fn descending_cursor(cursor: Option<PagePosition>) -> (Option<i64>, String) {
+    cursor
+        .map(|position| (Some(position.sort_value), position.identity))
+        .unwrap_or((None, String::new()))
+}
 
 fn map_app(row: &Row<'_>) -> rusqlite::Result<App> {
     Ok(App {

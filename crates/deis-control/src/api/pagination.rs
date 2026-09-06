@@ -101,10 +101,6 @@ where
     })
 }
 
-pub fn global_binding() -> &'static str {
-    "scope=global;filter=all;sort=v1"
-}
-
-pub fn id_binding(scope: &str, id: CanonicalId) -> String {
-    format!("scope={scope}:{id};filter=all;sort=v1")
+pub fn id_scope(scope: &str, id: CanonicalId) -> String {
+    format!("scope={scope}:{id}")
 }

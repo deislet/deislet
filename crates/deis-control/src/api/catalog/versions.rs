@@ -21,7 +21,8 @@ use tracing::{info, warn};
 use super::CatalogState;
 use crate::api::bindings::{BindingRefusal, check_service_bindings};
 use crate::api::error::{ApiError, ApiResult};
-use crate::catalog::{ProviderDerivationSpec, StoredBundle, Version};
+use crate::api::pagination::{ControlListPage, ListQuery, id_scope, list_page};
+use crate::catalog::{CatalogPage, PagePosition, ProviderDerivationSpec, StoredBundle, Version};
 use crate::identity::Principal;
 
 /// Version as seen from outside. `bundle_path` is deliberately absent: it
@@ -119,12 +120,6 @@ pub struct UploadResponse {
     /// case the existing version is returned unchanged.
     pub created: bool,
     pub bundle_url: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VersionsResponse {
-    pub versions: Vec<VersionView>,
-    pub total: usize,
 }
 
 /// The provider upload envelope has a small derivation record beside the
@@ -598,13 +593,34 @@ impl Drop for ProviderStaging {
 pub async fn list_versions(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
-) -> ApiResult<Json<VersionsResponse>> {
-    let versions = state.store.list_versions(&app_id).await?;
-    let views: Vec<VersionView> = versions.iter().map(VersionView::from).collect();
-    Ok(Json(VersionsResponse {
-        total: views.len(),
-        versions: views,
-    }))
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<VersionView>>> {
+    let app = state.store.get_app(&app_id).await?;
+    let collection = "application-versions";
+    let binding = format!(
+        "{};filter=all;sort=number-desc,version-id-desc-v1",
+        id_scope("application", app.canonical_id)
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, &binding).await?;
+    let page = state
+        .store
+        .list_versions_page(&app_id, limit, cursor)
+        .await?;
+    let next_position = page.items.last().map(|version| PagePosition {
+        sort_value: version.number,
+        identity: version.id.clone(),
+    });
+    let page = CatalogPage {
+        items: page.items.iter().map(VersionView::from).collect(),
+        total: page.total,
+        has_more: page.has_more,
+    };
+    let response = list_page(&state.store, collection, &binding, limit, page, move |_| {
+        next_position.expect("a page with a successor has a last version")
+    })
+    .await?;
+    Ok(Json(response))
 }
 
 /// GET /api/apps/:app_id/versions/:version_id

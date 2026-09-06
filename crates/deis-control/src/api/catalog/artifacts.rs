@@ -13,6 +13,8 @@ use tracing::{info, warn};
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::pagination::{ControlListPage, ListQuery, id_scope, list_page};
+use crate::catalog::{CatalogPage, PagePosition};
 
 #[derive(Debug, Deserialize)]
 pub struct ArtifactUploadQuery {
@@ -24,12 +26,6 @@ pub struct ArtifactUploadQuery {
 pub struct ArtifactUploadResponse {
     pub artifact: Value,
     pub created: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ArtifactsResponse {
-    pub artifacts: Vec<Value>,
-    pub total: usize,
 }
 
 /// POST /api/apps/:app_id/artifacts
@@ -99,15 +95,38 @@ pub async fn upload_artifact(
 pub async fn list_artifacts(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
-) -> ApiResult<Json<ArtifactsResponse>> {
-    let artifacts = state.store.list_canonical_artifacts(&app_id).await?;
-    Ok(Json(ArtifactsResponse {
-        total: artifacts.len(),
-        artifacts: artifacts
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<Value>>> {
+    let app = state.store.get_app(&app_id).await?;
+    let collection = "application-artifacts";
+    let binding = format!(
+        "{};filter=all;sort=created-at-desc,artifact-id-desc-v1",
+        id_scope("application", app.canonical_id)
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, &binding).await?;
+    let page = state
+        .store
+        .list_canonical_artifacts_page(&app_id, limit, cursor)
+        .await?;
+    let next_position = page.items.last().map(|artifact| PagePosition {
+        sort_value: artifact.created_at,
+        identity: artifact.id.to_string(),
+    });
+    let page = CatalogPage {
+        items: page
+            .items
             .into_iter()
             .map(|artifact| artifact.record)
             .collect(),
-    }))
+        total: page.total,
+        has_more: page.has_more,
+    };
+    let response = list_page(&state.store, collection, &binding, limit, page, move |_| {
+        next_position.expect("a page with a successor has a last artifact")
+    })
+    .await?;
+    Ok(Json(response))
 }
 
 /// GET /api/apps/:app_id/artifacts/:artifact_id

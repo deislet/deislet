@@ -976,7 +976,10 @@ pub(crate) mod tests {
 
         let (status, body) = json(router, "GET", "/api/apps/demo/versions", Value::Null).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["total"], 2);
+        assert_eq!(body["page"]["total"], 2);
+        assert_eq!(body["page"]["count"], 2);
+        assert_eq!(body["items"][0]["number"], 2);
+        assert_eq!(body["items"][1]["number"], 1);
 
         // A bundle for another app must never land under this app.
         let (status, _) = call(
@@ -1083,6 +1086,168 @@ pub(crate) mod tests {
             get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body[0]["version_id"], v1);
+    }
+
+    #[tokio::test]
+    async fn application_catalog_lists_share_one_opaque_pagination_contract() {
+        let h = harness(true).await;
+        let router = &h.router;
+
+        for app_id in ["pagination-charlie", "pagination-alpha", "pagination-bravo"] {
+            let (status, _) = json(
+                router,
+                "POST",
+                "/api/apps",
+                serde_json::json!({"id": app_id}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let (status, first) = json(router, "GET", "/api/apps?limit=2", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["schemaVersion"], 1);
+        assert_eq!(first["page"]["limit"], 2);
+        assert_eq!(first["page"]["count"], 2);
+        assert_eq!(first["page"]["total"], 3);
+        assert_eq!(first["items"][0]["id"], "pagination-alpha");
+        assert_eq!(first["items"][1]["id"], "pagination-bravo");
+        let applications_cursor = first["page"]["nextCursor"].as_str().unwrap();
+        assert_eq!(applications_cursor.len(), 43);
+        assert!(!applications_cursor.contains("pagination"));
+
+        let (status, second) = json(
+            router,
+            "GET",
+            &format!("/api/apps?limit=1&cursor={applications_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["items"][0]["id"], "pagination-charlie");
+        assert_eq!(second["page"]["total"], 3);
+        assert!(second["page"]["nextCursor"].is_null());
+
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("/api/retired-apps?cursor={applications_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        for environment in ["production", "preview"] {
+            let (status, _) = json(
+                router,
+                "POST",
+                "/api/apps/pagination-alpha/environments",
+                serde_json::json!({"name": environment}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        let (status, _) = json(
+            router,
+            "POST",
+            "/api/apps/pagination-bravo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, environments) = json(
+            router,
+            "GET",
+            "/api/apps/pagination-alpha/environments?limit=1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{environments}");
+        assert_eq!(environments["items"][0]["name"], "preview");
+        assert_eq!(environments["page"]["total"], 2);
+        let environment_cursor = environments["page"]["nextCursor"].as_str().unwrap();
+
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("/api/apps/pagination-bravo/environments?cursor={environment_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, environments) = json(
+            router,
+            "GET",
+            &format!("/api/apps/pagination-alpha/environments?limit=1&cursor={environment_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{environments}");
+        assert_eq!(environments["items"][0]["name"], "production");
+        assert!(environments["page"]["nextCursor"].is_null());
+
+        let (status, _) = call(
+            router,
+            "POST",
+            "/api/apps/pagination-alpha/versions",
+            Body::from(sample_bundle("pagination-alpha")),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let second_bundle = crate::catalog::bundle::tests::bundle_with_manifest(
+            r#"{"schema":1,"app":"pagination-alpha","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            true,
+        );
+        let (status, _) = call(
+            router,
+            "POST",
+            "/api/apps/pagination-alpha/versions",
+            Body::from(second_bundle),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, versions) = json(
+            router,
+            "GET",
+            "/api/apps/pagination-alpha/versions?limit=1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{versions}");
+        assert_eq!(versions["items"][0]["number"], 2);
+        assert_eq!(versions["page"]["total"], 2);
+        let versions_cursor = versions["page"]["nextCursor"].as_str().unwrap();
+        let (status, versions) = json(
+            router,
+            "GET",
+            &format!("/api/apps/pagination-alpha/versions?limit=1&cursor={versions_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{versions}");
+        assert_eq!(versions["items"][0]["number"], 1);
+        assert!(versions["page"]["nextCursor"].is_null());
+
+        for app_id in ["pagination-bravo", "pagination-charlie"] {
+            let (status, deleted) = json(
+                router,
+                "DELETE",
+                &format!("/api/apps/{app_id}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{deleted}");
+        }
+        let (status, retired) = json(router, "GET", "/api/retired-apps?limit=1", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{retired}");
+        assert_eq!(retired["items"][0]["app_id"], "pagination-bravo");
+        assert_eq!(retired["page"]["total"], 2);
+        assert!(retired["page"]["nextCursor"].is_string());
     }
 
     #[tokio::test]
@@ -1630,6 +1795,21 @@ pub(crate) mod tests {
             artifact["validation"]["requirementsDigest"]["value"],
             deis_wire::CURRENT_EDGE_CANON_REQUIREMENTS_SHA256
         );
+
+        let (status, artifacts) = json(
+            router,
+            "GET",
+            "/api/apps/demo/artifacts?limit=1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{artifacts}");
+        assert_eq!(artifacts["schemaVersion"], 1);
+        assert_eq!(artifacts["page"]["limit"], 1);
+        assert_eq!(artifacts["page"]["count"], 1);
+        assert_eq!(artifacts["page"]["total"], 1);
+        assert!(artifacts["page"]["nextCursor"].is_null());
+        assert_eq!(artifacts["items"][0]["artifactId"], artifact_id);
 
         let payload = tempfile::tempdir().unwrap();
         let bundle = sample_bundle("demo");

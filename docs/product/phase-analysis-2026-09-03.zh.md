@@ -2528,3 +2528,24 @@ Application/framework source + versioned build plan
   稳定 major。其余 Control 列表、OpenAPI/generated client、breaking-change gate 和显式 `/api/v1` 路由仍未完成，统一分页
   只能登记为 provider 首批闭环，`P1-DEPLOY-001` 与 ADR-016 整体继续 active。通用 mutation 幂等、完整 lifecycle、CLI/Web、
   真实 driver/账户/live conformance 等既有欠缺保持不变。
+
+## 90. 应用目录五类列表迁入统一分页契约
+
+- 在 provider 管理面首批迁移之后，应用目录的五条公共列表路由也已复用同一个
+  `control-list-page` v1：`GET /api/apps`、`GET /api/retired-apps`、应用下的
+  `artifacts`、`versions` 与 `environments`。旧的资源专用 `apps/retired/artifacts/versions/environments + total`
+  envelope 已删除，避免两套响应类型继续成为事实上的公共契约。
+- 应用和退役名称按不可变名称升序，environment 按名称升序，version 按 `(number, id)` 降序，canonical artifact
+  按 `(created_at, id)` 降序；全部用 keyset 读取 `limit + 1`，并在同一个 SQLite 读事务中计算精确 `total`。
+  Artifact 新增带 identity tie-breaker 的增量索引，使用新索引名保证已有数据库启动时也能获得完整排序索引。
+- 应用内 cursor 的 query binding 使用 canonical application ID，不依赖可读名称；集合、scope、filter 或 sort 不同均拒绝复用。
+  专项 HTTP 回归覆盖应用跨页且下一页改变 limit、token 不泄漏名称、跨集合拒绝、environment 跨应用拒绝、version 降序跨页、
+  retired-name 分页以及 artifact 统一 envelope。
+- 本机最终通过 Control lib 485/485、API integration 14/14、architecture 2/2、docs witness 6/6、fleet credential 2/2；
+  目录 API 专项为 14/14，格式与严格 Clippy 通过。这里记录的是本机工作节点：尚未从提交后精确 archive 在 Linux、macOS、
+  Windows 复验，也未登记新的 portability evidence，不能沿用 `dc9a19a` 的旧归档为本切片背书。
+- 仍未迁移的公共列表至少包括 deployment history、application/global routes、secrets、domain grants，以及 identity、fleet、
+  config/command/event/audit 等控制面集合；必须先完成公共/内部边界盘点，再逐组使用同一契约。显式 API major、OpenAPI/generated
+  client、breaking-change gate、通用 mutation 幂等、完整 lifecycle、CLI/Web 与真实 driver/account/conformance 也仍未完成。
+  现有无 major 路由的响应变化只能属于 v1 冻结前归一化，不能在稳定 major 内无迁移重复发生。本轮依产品负责人要求在此形成
+  可交接节点并停止继续执行，不把阶段收尾写成总 Goal 已完成。

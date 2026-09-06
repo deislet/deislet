@@ -293,12 +293,18 @@ Provider 管理面的 10 条 list/audit 路由（9 个集合契约）已迁入�
 读事务中的精确 `total`，并为实际排序/过滤增加复合索引。cursor 表是旧库可重复执行的增量升级，token 只以 SHA-256 保存；
 共享 Schema/fixture 和 API 回归覆盖改页大小、重复使用、跨 collection/filter 复用和篡改拒绝。
 
+应用目录的 applications、retired applications、artifacts、versions、environments 五类列表随后也迁入同一 envelope。
+它们按不可变名称或带 canonical identity tie-breaker 的稳定 keyset 排序；应用内 cursor 绑定 canonical application ID，
+跨应用复用失败关闭。专项回归覆盖跨页、改页大小、跨集合/跨 scope 拒绝和五类响应形状；本切片仅有本机门禁，尚无新的
+提交后精确归档或三平台 portability evidence。
+
 该分页切片的精确提交 `dc9a19a65f34fd6dda6a5fc9992842a8f5ca75ae` 已用同一 SHA-256 校验归档在 Linux、macOS、
 Windows 通过平台适用的 provider、pagination、authz、grant、协调器、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
 `../product/evidence/provider-driver-dispatcher-portability-dc9a19a.json`。共享契约在 Linux 通过 17 份 Schema/50 组 fixture，
 macOS 缺 `jsonschema` 被保留为环境未执行。该证据不证明跨请求快照、CLI/Web 接线、真实 provider 部署或标准合规。
 
-这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；其余 Control 列表尚未全部迁移；
+这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；deployment history、routes、secrets、domain
+grants、identity/fleet/config/command/event/audit 等 Control 列表尚未迁移；
 installation/target 生命周期尚不完整；credential provision、grant create 等非 operation 资源创建尚未统一幂等 replay；
 grant 在 application 删除后的生命周期收敛与全局历史查询尚未完成；CLI/Web 也没有生成 client 或交互入口。
 
