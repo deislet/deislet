@@ -29,15 +29,31 @@
     },
     "commands": {
       "type": "array",
-      "minItems": 4,
-      "maxItems": 4,
-      "prefixItems": [
-        {"$ref": "#/$defs/driverCommand"},
-        {"$ref": "#/$defs/controlCommand"},
-        {"$ref": "#/$defs/migrationCommand"},
-        {"$ref": "#/$defs/clippyCommand"}
-      ],
-      "items": false
+      "oneOf": [
+        {
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {"$ref": "#/$defs/driverCommand"},
+            {"$ref": "#/$defs/controlCommand"},
+            {"$ref": "#/$defs/migrationCommand"},
+            {"$ref": "#/$defs/clippyCommand"}
+          ],
+          "items": false
+        },
+        {
+          "minItems": 5,
+          "maxItems": 5,
+          "prefixItems": [
+            {"$ref": "#/$defs/driverCommand"},
+            {"$ref": "#/$defs/controlCommand"},
+            {"$ref": "#/$defs/reconcilerCommand"},
+            {"$ref": "#/$defs/migrationCommand"},
+            {"$ref": "#/$defs/clippyCommand"}
+          ],
+          "items": false
+        }
+      ]
     },
     "sharedContractCheck": {
       "type": "object",
@@ -98,7 +114,9 @@
         "offlineTransparencyProofValidated": {"const": true},
         "independentWitnessThresholdValidated": {"const": true},
         "signedButUnloggedTargetMigrationValidated": {"const": true},
-        "windowsServiceIdentityDaclPolicyValidated": {"const": true}
+        "windowsServiceIdentityDaclPolicyValidated": {"const": true},
+        "backgroundDispatcherLoopValidated": {"const": true},
+        "retryableReceiptRecoveryValidated": {"const": true}
       }
     },
     "limitations": {
@@ -159,6 +177,12 @@
         }
       ]
     },
+    "reconcilerCommand": {
+      "allOf": [
+        {"$ref": "#/$defs/commandBase"},
+        {"properties": {"id": {"const": "provider-deployment-reconciler-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control provider_deployment_reconciler -- --nocapture"}}}
+      ]
+    },
     "clippyCommand": {
       "allOf": [
         {"$ref": "#/$defs/commandBase"},
@@ -170,7 +194,7 @@
       "additionalProperties": false,
       "required": ["id", "outcome", "exitCode"],
       "properties": {
-        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "legacy-target-migration-test", "provider-target-migration-tests", "strict-clippy"]},
+        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "provider-deployment-reconciler-tests", "legacy-target-migration-test", "provider-target-migration-tests", "strict-clippy"]},
         "outcome": {"enum": ["passed", "failed", "not-run"]},
         "exitCode": {"type": ["integer", "null"], "minimum": 0},
         "passed": {"type": "integer", "minimum": 0},
@@ -201,7 +225,7 @@
         "clippy": {"type": "string", "minLength": 1},
         "commit": {"$ref": "#/$defs/gitSha"},
         "archiveSha256": {"$ref": "#/$defs/sha256"},
-        "checks": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/checkResult"}}
+        "checks": {"type": "array", "minItems": 4, "maxItems": 5, "items": {"$ref": "#/$defs/checkResult"}}
       }
     },
     "priorFailedAttempt": {

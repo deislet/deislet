@@ -1,0 +1,159 @@
+{
+  "$schema": "./provider-driver-dispatcher-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-background-dispatch-portability-56c6584-2026-09-06",
+  "collectedAt": "2026-09-06T09:02:00+08:00",
+  "outcome": "passed",
+  "scope": "The exact source archive passes the platform-applicable provider driver, durable provider workflow, bounded background dispatcher, retryable receipt recovery, provider-target migration, and strict deployment-control lint checks on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "56c65844d471c956af893d7151a6ea261131a48b",
+    "tree": "54334c5b44e3aef27f99f0b2be9dc1ee3463a18a",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7",
+      "sizeBytes": 15513600
+    }
+  },
+  "buildEnvironment": {"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_TEST_DEBUG": "0"},
+  "commands": [
+    {"id": "provider-driver-tests", "command": "cargo +1.96.0 test -p deis-provider-driver"},
+    {"id": "provider-driver-control-tests", "command": "cargo +1.96.0 test -p deis-control provider_driver -- --nocapture"},
+    {"id": "provider-deployment-reconciler-tests", "command": "cargo +1.96.0 test -p deis-control provider_deployment_reconciler -- --nocapture"},
+    {"id": "provider-target-migration-tests", "command": "cargo +1.96.0 test -p deis-control provider_targets -- --nocapture"},
+    {"id": "strict-clippy", "command": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"}
+  ],
+  "sharedContractCheck": {
+    "hostAlias": "s17",
+    "command": "python3 scripts/check-shared-contracts.py",
+    "outcome": "passed",
+    "exitCode": 0,
+    "schemas": 16,
+    "fixtures": 48
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "56c65844d471c956af893d7151a6ea261131a48b",
+      "archiveSha256": "4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 62, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 23, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "56c65844d471c956af893d7151a6ea261131a48b",
+      "archiveSha256": "4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 62, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 23, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "SERV69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro 10.0.26100 build 26100",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "56c65844d471c956af893d7151a6ea261131a48b",
+      "archiveSha256": "4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 54, "failed": 0, "ignored": 0},
+        {"id": "provider-driver-control-tests", "outcome": "passed", "exitCode": 0, "passed": 23, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-target-migration-tests", "outcome": "passed", "exitCode": 0, "passed": 2, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    }
+  ],
+  "priorFailedAttempts": [],
+  "collectionObservations": [
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "56c65844d471c956af893d7151a6ea261131a48b",
+        "tree": "54334c5b44e3aef27f99f0b2be9dc1ee3463a18a",
+        "archive": {"format": "git-archive-tar", "sha256": "4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7", "sizeBytes": 15513600}
+      },
+      "hostAlias": "s17",
+      "operatingSystem": "linux",
+      "classification": "harness",
+      "outcome": "inconclusive",
+      "description": "The first Linux collection passed all 62 provider-driver tests, then read a verification script while that script was being revised for the macOS Cargo path and stopped with an unmatched-quote shell parse error before any Control check ran.",
+      "resolution": "The unchanged exact archive was re-extracted and the now-stable script completed all five checks."
+    },
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "56c65844d471c956af893d7151a6ea261131a48b",
+        "tree": "54334c5b44e3aef27f99f0b2be9dc1ee3463a18a",
+        "archive": {"format": "git-archive-tar", "sha256": "4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7", "sizeBytes": 15513600}
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "classification": "environment",
+      "outcome": "inconclusive",
+      "description": "The first macOS attempt found no Cargo in the non-login SSH PATH. The second used the fixed Cargo path and passed all 62 driver tests, then exhausted the data volume while linking Control.",
+      "resolution": "Only a 1.9 GiB disposable exact-archive build directory created by the preceding Deislet verification was removed. The unchanged archive was re-extracted, all five checks passed, and the current run directory was automatically cleaned."
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "exactArchiveVerifiedOnEveryHost": true,
+    "windowsAsyncSendRegressionClosed": true,
+    "sharedProcessProtocolValidated": true,
+    "signedReleaseAuthorizationValidated": true,
+    "trustRootLoaderCompiledOnWindows": true,
+    "rootRotationValidated": true,
+    "legacyTrustRootMigrationValidated": true,
+    "transientSpawnRetryBoundaryValidated": true,
+    "offlineTransparencyProofValidated": true,
+    "independentWitnessThresholdValidated": true,
+    "signedButUnloggedTargetMigrationValidated": true,
+    "windowsServiceIdentityDaclPolicyValidated": true,
+    "backgroundDispatcherLoopValidated": true,
+    "retryableReceiptRecoveryValidated": true,
+    "noLiveProviderClaim": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "The background loop is enabled only when Control has a valid transparent trust root and verified driver registry; this evidence uses unit-level fake executors and synthetic releases rather than a real signed provider driver installation.",
+    "The pass validates bounded concurrency, distinct owner identities, live-lease exclusion, durable retry delay, restart discovery, retryable failed-receipt recovery, and shutdown behavior; it does not submit a deployment to a real provider account.",
+    "Provider driver selection failures are visible and retried on later scans but do not yet have a dedicated durable backoff timestamp distinct from the child operation's state timestamp.",
+    "The process-level 15-second drain is tested structurally and by existing server drain tests; this exact portability slice does not kill a real long-running provider CLI during shutdown on every host.",
+    "The registry and dispatcher still have no public vault, release, target, or provider-deployment API, CLI, or Web management surface in this evidence.",
+    "The release, keys, roots, transparency proof, witness signatures, and provider process fixtures remain synthetic, and no backend is certified against Edge Canon by these checks.",
+    "The exact archive does not contain generated Control dashboard assets, so the existing build warning and dashboard 404 remain outside this Rust control-path record."
+  ]
+}

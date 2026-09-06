@@ -373,10 +373,32 @@ provider-driver、Control provider、两项 target migration 和五 crate 严格
 protected DACL、非可信 writer、trust file 与 root handle pinning。正式 evidence 明确保留测试使用提升的交互式 token，
 尚未把 Control 安装为使用虚拟、托管或域账户的 Windows Service，不能把 API 语义验证夸大成服务部署验收。
 
+## 后台部署协调器
+
+Control 启动时只在透明信任根、已验证 release registry 和 dispatcher 都成功构造后启动 provider deployment
+协调器；未达到这一前提时保持外部执行关闭，而不是退回未验证入口。协调器按配置的轮询周期扫描持久 workflow，限制并发，
+并为每次执行生成不同的 UUIDv7 owner。真正的高可用互斥仍由数据库内 owner/epoch lease 保证：live lease 不被接管，过期
+lease 只能按 operation 的副作用状态进入 retry 或 reconcile；进程退出时停止接收新一轮任务，并在统一 drain 窗口内等待
+当前轮次收敛，超时后由下一实例通过过期 lease 接续。
+
+ready scan 同时折叠已完成 child 和 parent，立即发现 pending/过期 running；retry/reconcile 则按持久 `updated_at` 计算延迟，
+避免重启后丢失等待边界。合法的 failed receipt 若声明 `side_effect=none` 且 `next_action=retry`，现在和 driver error 的 retry
+一样可重新 claim 原 operation；此前 claim 路径只接受存在 `driver_error` 的 retry，导致这种 receipt 永久等待，现已由回归测试
+封闭。
+
+精确提交 `56c65844d471c956af893d7151a6ea261131a48b`（tree
+`54334c5b44e3aef27f99f0b2be9dc1ee3463a18a`）的 15,513,600-byte archive，SHA-256
+`4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7`，已在 Linux/macOS 通过 provider-driver
+62/62、Control provider 23/23、协调器 3/3、target migration 2/2；Windows 为 54/54、23/23、3/3、2/2，三端五
+crate 严格 Clippy 全过。Linux 同一 archive 另通过 16 份 Schema/48 组 fixture。正式 evidence 保留 Linux 收集脚本在运行中
+被修改导致的 shell parse inconclusive，以及 macOS 非登录 PATH 与可重建临时构建目录占满磁盘的环境观察；两端随后均从
+未改变的精确 archive 重跑通过。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
-真实透明日志/独立 witness 的采集与可用性运营，以及真实 Windows Service 安装演练。公共 release/vault/target/deployment API、后台 dispatcher loop、三个
-完整 backend driver 和真实账户 evidence 也未完成。在这些完成并获得真实账户证据前，不能把当前 dispatcher 称作已部署
-的 provider 服务，更不能升级 backend 支持状态。
+真实透明日志/独立 witness 的采集与可用性运营，以及真实 Windows Service 安装演练。公共
+release/vault/target/deployment API、后台选择失败的独立持久退避、三个完整 backend driver 和真实账户 evidence 也未完成。
+当前 ready scan 还必须消除固定候选窗口可能造成的后续任务饥饿。在这些完成并获得真实账户证据前，不能把当前 dispatcher
+称作已部署的 provider 服务，更不能升级 backend 支持状态。
 
 ## 后果
 

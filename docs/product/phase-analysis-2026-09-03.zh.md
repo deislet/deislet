@@ -2331,3 +2331,35 @@ Application/framework source + versioned build plan
   提升的交互式 token，尚未以虚拟、托管或域 service account 安装/启动 Control。真实 materialized release、离线签署、
   公共透明日志与独立 witness、后台 dispatcher、公共 API/CLI/Web、三家 driver 和真实账户 lifecycle/conformance 仍是
   `P1-DEPLOY-001` 的明确阻断项。
+
+## 83. Provider deployment 后台协调器与 receipt retry 恢复
+
+- 前一阶段已经有完整的 `execute_provider_deployment` application service，却只由库调用者显式触发；生产 Control 没有
+  持续发现 pending、过期 running、retry/reconcile 或 child 已终结但 parent 尚未聚合的 durable workflow。重启、暂时性
+  错误或 API 调用返回后都可能留下无人推进的操作，因此“具备流程函数”不等于“具备后台执行产品能力”。
+- 审查还发现一条真实状态机死路：合法 failed receipt 可以声明 `side_effect=none`、`next_action=retry`，settle 会把
+  ProductOperation 置为 waiting；但 claim retry 分支此前强制要求 `driver_error` 存在。receipt 与 error 在协议上是两条合法
+  结果路径，所以该操作之后永远无法重新 claim。修复后 receipt-based retry 和 error-based retry 都重用原 operation identity，
+  并由专项回归测试覆盖。
+- 新 `ProviderDeploymentReconciler` 是进程所属的后台任务，仅在透明信任根、已验证 release registry 和 dispatcher 全部构造
+  成功时启动。poll interval、retry delay、最大并发可配置并分别限制在 1–300 秒、poll–3600 秒和 1–64；单轮候选上限为
+  `min(concurrency×4, 1000)`，实际并发由 `JoinSet` 限制。每次 attempt 使用不同 UUIDv7 owner，SQLite 中 owner/epoch lease
+  仍是多实例互斥和旧 owner 落账拒绝的最终依据。
+- ready scan 立即返回 pending、过期 running 和需要折叠终态 child 的 workflow；live lease 被排除，retry/reconcile 按数据库
+  `updated_at` 延迟，进程重启不会清空等待边界。统一 shutdown 先停止新轮次并让当前 pass 收敛，整个 server drain 最多等待
+  15 秒；随后未完成的外部执行只能由下一实例在 lease 过期后按 reconcile 规则接续。
+- 实现提交 `56c65844d471c956af893d7151a6ea261131a48b`（tree
+  `54334c5b44e3aef27f99f0b2be9dc1ee3463a18a`）生成 15,513,600-byte archive，SHA-256 为
+  `4775d5c52bddfafaef60e83db29a2946d24d594c39157e7f548eeb733d5814a7`。s17 Linux 与 s67 macOS 分别通过
+  provider-driver 62/62、Control provider 23/23、协调器 3/3、target migration 2/2；s69 Windows 为 54/54、23/23、
+  3/3、2/2；三端五个相关 crate 严格 Clippy 全部通过。Linux 同一 archive 另通过 16 份 Schema/48 组 fixture 与产品治理。
+- 首次 Linux 收集在 driver 62/62 后读取到了正被修改以适配 macOS 固定 Cargo 路径的同一个 shell 脚本，因引号未闭合而在
+  Control 测试前停止；稳定脚本从未变 archive 重跑全过。macOS 首轮非登录 PATH 找不到 Cargo，第二轮使用明确路径并在
+  driver 62/62 后因 data volume 满而链接失败；只删除此前本任务生成的 1.9 GiB 可重建精确归档目录
+  `deislet-2f215a8-macos.iyEZzm` 后，从未变 archive 重跑全过。这些均作为 harness/environment
+  inconclusive observation 写入 `docs/product/evidence/provider-driver-dispatcher-portability-56c6584.json`，没有伪装成产品失败
+  或从记录中删除。
+- 当前结论只证明后台调度和 durable retry/reconcile 的代码级三平台可移植性。没有使用真实签署 release、公共透明日志、独立
+  witness 或真实 provider 账户；没有公共 vault/release/target/deployment API/CLI/Web；选择 release/driver 失败也尚无独立于
+  child 时间戳的持久退避。另有新发现：ready 查询固定只读取最旧 1000 条非终态记录，若这些记录都尚未到 retry 时间，后面
+  已就绪的任务可能饥饿。该公平性缺陷必须在称为产品级后台服务前修复并加入超过一个扫描页的回归。
