@@ -161,6 +161,19 @@ pub fn router(state: CatalogState) -> Router {
             post(deployments::rollback),
         )
         .route(
+            "/api/apps/:app_id/environments/:env/provider-target-grants",
+            get(providers::list_provider_target_grants).post(providers::grant_provider_target),
+        )
+        .route(
+            "/api/apps/:app_id/environments/:env/provider-target-grants/:grant_id",
+            get(providers::get_provider_target_grant)
+                .delete(providers::revoke_provider_target_grant),
+        )
+        .route(
+            "/api/apps/:app_id/environments/:env/provider-target-grants/:grant_id/audit",
+            get(providers::provider_target_grant_audit),
+        )
+        .route(
             "/api/apps/:app_id/environments/:env/provider-deployments",
             get(providers::list_provider_deployments).post(providers::begin_provider_deployment),
         )

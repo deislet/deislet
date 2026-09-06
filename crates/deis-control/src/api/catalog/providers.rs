@@ -3,9 +3,9 @@
 //! Credential values enter only the vault write handlers. They are never
 //! returned, formatted with `Debug`, copied into an operation, or inspected
 //! by the authorization middleware. Every opaque provider resource lives on
-//! the installation-wide administrator surface. Deployment status is scoped
-//! by the application and environment names in its path; starting one stays
-//! administrative until the product model can grant a target to that scope.
+//! the installation-wide administrator surface. An administrator explicitly
+//! grants a target to one application environment; deployment credentials can
+//! start work only through that durable, revision-pinned grant.
 
 use axum::{
     Json,
@@ -29,7 +29,9 @@ use crate::{
         ProviderCredentialBindingSpec, ProviderCredentialMutationContext, ProviderDeploymentSpec,
         ProviderDeploymentWorkflow, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
         ProviderDriverReleaseRegistry, ProviderInstallation, ProviderInstallationSpec,
-        ProviderTarget, ProviderTargetSpec,
+        ProviderTarget, ProviderTargetGrant, ProviderTargetGrantAuditEvent,
+        ProviderTargetGrantMutationContext, ProviderTargetGrantSpec,
+        ProviderTargetGrantStatusFilter, ProviderTargetSpec,
     },
     identity::{Principal, PrincipalKind},
 };
@@ -88,6 +90,13 @@ pub struct BeginProviderDeploymentRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GrantProviderTargetRequest {
+    pub provider_target_id: CanonicalId,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListQuery {
     pub limit: Option<usize>,
@@ -102,6 +111,30 @@ impl ListQuery {
             ));
         }
         Ok(limit)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderTargetGrantListQuery {
+    pub limit: Option<usize>,
+    pub status: Option<String>,
+}
+
+impl ProviderTargetGrantListQuery {
+    fn bounded_limit(&self) -> ApiResult<usize> {
+        ListQuery { limit: self.limit }.bounded_limit()
+    }
+
+    fn status_filter(&self) -> ApiResult<ProviderTargetGrantStatusFilter> {
+        match self.status.as_deref().unwrap_or("active") {
+            "active" => Ok(ProviderTargetGrantStatusFilter::Active),
+            "revoked" => Ok(ProviderTargetGrantStatusFilter::Revoked),
+            "all" => Ok(ProviderTargetGrantStatusFilter::All),
+            status => Err(ApiError::BadRequest(format!(
+                "provider target grant status must be active, revoked, or all; got {status}"
+            ))),
+        }
     }
 }
 
@@ -137,6 +170,20 @@ pub struct ProviderTargetsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDeploymentsResponse {
     pub deployments: Vec<ProviderDeploymentWorkflow>,
+    pub total: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTargetGrantsResponse {
+    pub grants: Vec<ProviderTargetGrant>,
+    pub total: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTargetGrantAuditResponse {
+    pub events: Vec<ProviderTargetGrantAuditEvent>,
     pub total: usize,
 }
 
@@ -586,6 +633,140 @@ pub async fn get_target(
     Ok((headers, Json(target)))
 }
 
+pub async fn grant_provider_target(
+    State(state): State<CatalogState>,
+    Path((app_name, environment_name)): Path<(String, String)>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<GrantProviderTargetRequest>,
+) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderTargetGrant>)> {
+    let app = state.store.get_app(&app_name).await?;
+    let environment = state
+        .store
+        .get_environment(&app_name, &environment_name)
+        .await?;
+    let grant = state
+        .store
+        .grant_provider_target(
+            ProviderTargetGrantSpec {
+                application_id: app.canonical_id,
+                environment_id: environment.canonical_id,
+                provider_target_id: request.provider_target_id,
+                note: request.note,
+            },
+            provider_target_grant_mutation_context(&principal),
+        )
+        .await?;
+    let headers = resource_headers(
+        &format!(
+            "/api/apps/{app_name}/environments/{environment_name}/provider-target-grants/{}",
+            grant.grant_id
+        ),
+        grant.revision,
+    )?;
+    Ok((StatusCode::CREATED, headers, Json(grant)))
+}
+
+pub async fn list_provider_target_grants(
+    State(state): State<CatalogState>,
+    Path((app_name, environment_name)): Path<(String, String)>,
+    Query(query): Query<ProviderTargetGrantListQuery>,
+) -> ApiResult<(HeaderMap, Json<ProviderTargetGrantsResponse>)> {
+    let app = state.store.get_app(&app_name).await?;
+    let environment = state
+        .store
+        .get_environment(&app_name, &environment_name)
+        .await?;
+    let grants = state
+        .store
+        .provider_target_grants_for_environment(
+            app.canonical_id,
+            environment.canonical_id,
+            query.status_filter()?,
+            query.bounded_limit()?,
+        )
+        .await?;
+    let total = grants.len();
+    Ok((
+        no_store_headers(),
+        Json(ProviderTargetGrantsResponse { grants, total }),
+    ))
+}
+
+pub async fn get_provider_target_grant(
+    State(state): State<CatalogState>,
+    Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
+) -> ApiResult<(HeaderMap, Json<ProviderTargetGrant>)> {
+    let grant_id = parse_id(&grant_id, "provider target grant")?;
+    let grant =
+        provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
+    let headers = resource_headers("", grant.revision)?;
+    Ok((headers, Json(grant)))
+}
+
+pub async fn revoke_provider_target_grant(
+    State(state): State<CatalogState>,
+    Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<(HeaderMap, Json<ProviderTargetGrant>)> {
+    let grant_id = parse_id(&grant_id, "provider target grant")?;
+    provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
+    let expected_revision = required_if_match(&headers)?;
+    let grant = state
+        .store
+        .revoke_provider_target_grant(
+            grant_id,
+            expected_revision,
+            provider_target_grant_mutation_context(&principal),
+        )
+        .await?;
+    let headers = resource_headers("", grant.revision)?;
+    Ok((headers, Json(grant)))
+}
+
+pub async fn provider_target_grant_audit(
+    State(state): State<CatalogState>,
+    Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<(HeaderMap, Json<ProviderTargetGrantAuditResponse>)> {
+    let grant_id = parse_id(&grant_id, "provider target grant")?;
+    provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
+    let events = state
+        .store
+        .provider_target_grant_audit_events(grant_id, query.bounded_limit()?)
+        .await?;
+    let total = events.len();
+    Ok((
+        no_store_headers(),
+        Json(ProviderTargetGrantAuditResponse { events, total }),
+    ))
+}
+
+async fn provider_target_grant_in_scope(
+    state: &CatalogState,
+    app_name: &str,
+    environment_name: &str,
+    grant_id: CanonicalId,
+) -> ApiResult<ProviderTargetGrant> {
+    let app = state.store.get_app(app_name).await?;
+    let environment = state
+        .store
+        .get_environment(app_name, environment_name)
+        .await?;
+    let grant = state
+        .store
+        .provider_target_grant(grant_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("provider target grant {grant_id} not found")))?;
+    if grant.application_id != app.canonical_id || grant.environment_id != environment.canonical_id
+    {
+        return Err(ApiError::NotFound(format!(
+            "provider target grant {grant_id} not found for {app_name}/{environment_name}"
+        )));
+    }
+    Ok(grant)
+}
+
 pub async fn begin_provider_deployment(
     State(state): State<CatalogState>,
     Path((app_name, environment_name)): Path<(String, String)>,
@@ -774,6 +955,14 @@ fn credential_mutation_context(principal: &Principal) -> ProviderCredentialMutat
     }
 }
 
+fn provider_target_grant_mutation_context(
+    principal: &Principal,
+) -> ProviderTargetGrantMutationContext {
+    ProviderTargetGrantMutationContext {
+        actor_subject: actor_subject(principal),
+    }
+}
+
 fn operation_context(
     headers: &HeaderMap,
     principal: &Principal,
@@ -899,7 +1088,7 @@ fn required_if_match(headers: &HeaderMap) -> ApiResult<u64> {
     let value = single_header(headers, IF_MATCH)?
         .ok_or_else(|| {
             ApiError::PreconditionRequired(
-                "If-Match with the current provider credential ETag is required".to_string(),
+                "If-Match with the current resource ETag is required".to_string(),
             )
         })?
         .to_str()
@@ -1003,7 +1192,7 @@ mod tests {
         .unwrap();
         let mut state = harness.state.clone();
         state.provider_driver_dispatcher = Some(Arc::new(dispatcher));
-        let router = crate::api::catalog::router(state);
+        let router = crate::api::catalog::router(state).layer(Extension(Principal::anonymous()));
         (harness, router)
     }
 
@@ -1370,6 +1559,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_grant_api_is_scoped_audited_revision_fenced_and_revocable() {
+        let fixture = ReleaseFixture::new();
+        let (harness, router) = release_router(&fixture).await;
+        harness.state.store.create_app("demo").await.unwrap();
+        harness
+            .state
+            .store
+            .create_environment("demo", "production")
+            .await
+            .unwrap();
+        harness
+            .state
+            .store
+            .create_environment("demo", "preview")
+            .await
+            .unwrap();
+
+        let archive = fs::read(&fixture.archive).unwrap();
+        let response = router
+            .clone()
+            .oneshot(multipart_request(release_parts(&fixture, archive)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/providers/credentials",
+                json!({
+                    "backendId": "cloudflare-workers-pages",
+                    "name": "grant-test",
+                    "credential": "grant-test-token"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let binding_id = response_json(response).await["bindingId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/providers/installations",
+                json!({
+                    "backendId": "cloudflare-workers-pages",
+                    "accountReference": "grant-account",
+                    "credentialBindingId": binding_id
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let installation_id = response_json(response).await["installationId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/api/providers/installations/{installation_id}/targets"),
+                json!({
+                    "name": "grant-target",
+                    "standardVersion": deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                    "targetConfigDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "driverManifest": fixture.manifest.get()
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let target_id = response_json(response).await["targetId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/apps/demo/environments/production/provider-target-grants",
+                json!({"providerTargetId": target_id, "note": "production publishing"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()[header::ETAG], "\"1\"");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let created = response_json(response).await;
+        let grant_id = created["grantId"].as_str().unwrap();
+        assert!(location.ends_with(grant_id));
+        assert_eq!(created["status"], "active");
+        assert_eq!(created["targetName"], "grant-target");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/demo/environments/production/provider-target-grants")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = response_json(response).await;
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["grants"][0]["grantId"], grant_id);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/apps/demo/environments/preview/provider-target-grants/{grant_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&location)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&location)
+                    .header(header::IF_MATCH, "\"2\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&location)
+                    .header(header::IF_MATCH, "\"1\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ETAG], "\"2\"");
+        assert_eq!(response_json(response).await["status"], "revoked");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{location}/audit"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let audit = response_json(response).await;
+        assert_eq!(audit["total"], 2);
+        assert_eq!(audit["events"][0]["eventType"], "granted");
+        assert_eq!(audit["events"][1]["eventType"], "revoked");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/demo/environments/production/provider-target-grants?status=all")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["total"], 1);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/demo/environments/production/provider-target-grants?status=unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn provider_deployment_rejects_a_missing_idempotency_key_before_catalog_work() {
         let harness = harness(true).await;
         harness.state.store.create_app("demo").await.unwrap();
@@ -1420,13 +1823,13 @@ mod tests {
             HeaderValue::from_static("deploy-request-001"),
         );
         let response = harness.router.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(
-            response_json(response).await["error"]
-                .as_str()
-                .unwrap()
-                .contains(&missing_target.to_string())
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let failure = response_json(response).await;
+        assert_eq!(
+            failure["error"],
+            "provider target is not granted to this application/environment"
         );
+        assert!(!failure.to_string().contains(&missing_target.to_string()));
 
         let response = harness
             .router

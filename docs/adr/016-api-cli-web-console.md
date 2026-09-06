@@ -266,10 +266,14 @@ deployment 都通过同一 Control router、集中 authz/audit gate 与既有 do
 精确提交 `dae492a0c266297c94263d8afd44a56eca452654` 的同一 archive 已在 Linux/macOS/Windows 通过 release API
 3/3、相关 provider/协调器/迁移门禁与严格 Clippy，并登记受 Schema 约束的 evidence；这不改变 CLI/Web 尚未接线的事实。
 
+target grant 已成为 application/environment-scoped HTTP 资源：管理员创建和以强 `If-Match` 撤销，scope 内读者可列出、
+读取和查看不可变审计。开始 provider deployment 现要求 `deploy:<app>/<environment>`，并由 Catalog 事务对 body 中的
+target ID 执行第二层 exact active-grant 校验；接受后把 grant ID/revision 固定进 durable workflow。撤销只阻断新操作，
+不会把可能已产生外部副作用的既有 operation 抹掉；同一幂等请求仍返回原 operation。
+
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；列表没有 cursor，`total` 目前只代表本次返回数；
-target grant 与 installation/target 生命周期尚无 HTTP 资源；credential provision 等资源创建尚未统一
-幂等 replay；CLI/Web 也没有生成 client 或交互入口。开始 provider deployment 因 target 尚是账户级 authority 而暂时只允许
-管理员；在 target assignment/grant 建立前不能把它误降为普通 environment deploy 权限。
+installation/target 生命周期尚不完整；credential provision、grant create 等非 operation 资源创建尚未统一幂等 replay；
+grant 在 application 删除后的生命周期收敛与全局历史查询尚未完成；CLI/Web 也没有生成 client 或交互入口。
 
 1. 建立 versioned API/error/operation/schema 基础与安全 Web session。
 2. 新建 organization/application/environment shell、scope switcher 与权限导航。

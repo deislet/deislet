@@ -2461,3 +2461,30 @@ Application/framework source + versioned build plan
   和 in-process router，没有经真实反向代理传输多 GiB archive，没有真实签署官方工具安装树、公共透明日志、独立 witness、
   Windows Service 身份或真实 provider 账户。target grant、cursor/真实 total、通用 mutation 幂等、完整生命周期、CLI/Web、
   三家 driver 与 live conformance 仍是明确欠缺，`P1-DEPLOY-001` 保持 active。
+
+## 88. Provider target 授权与 environment deploy 权限收窄
+
+- `ProviderTarget` 代表安装级外部账户与发布能力，单独持有 `deploy:<app>/<environment>` 不能推导出可选择平台上任意
+  target。Control 现新增持久 `ProviderTargetGrant`：平台管理员把一个 immutable target ID 授权给一个 canonical
+  application/environment；create/revoke 与每次 revision 都写入不可更新、不可删除的专用审计。HTTP 提供 scope 内
+  create/list/get/revoke/audit，创建与撤销保持 admin-only，撤销要求当前强 ETag；读操作按 URL 的 app/env scope 授权，
+  同一 grant ID 经其他 environment 读取返回 not found。
+- provider deployment start 已从 `admin:*/*` 收窄为 `deploy:<app>/<environment>`，但 route scope 只回答“调用者能否在该
+  environment 部署”。Catalog 在记录 operation 的同一事务内另行要求 `(application_id, environment_id,
+  provider_target_id)` 存在 exact active grant，并把 grant ID/revision、target ID/revision 和标准/artifact 一起纳入 durable
+  desired state。SQLite insert trigger 重复执行该约束；升级后的旧 binary 若尝试写入无 grant pin 的新 workflow 会失败关闭。
+- grant 只能从 active revision 1 变为 revoked revision 2；重新授权创建新 ID，不复活历史。撤销立即拒绝不同
+  Idempotency-Key 的新部署，但不会破坏已经接受的 operation：外部副作用可能已发生，原 operation 必须继续使用接受时 pin
+  进行查询/reconcile/完成，取消或回滚属于独立操作。同 actor、同 key、同调用方请求事实的 replay 在读取可变 target/grant
+  前返回原 operation。deployment fingerprint 因此改为绑定规范化请求，而不是包含服务端当前状态的 desired-state digest。
+- 旧数据库对既有 workflow 增量加入 nullable grant pin，使升级前 operation 可继续读取和收敛；升级后的新 workflow 必须同时
+  写入两个 pin。读取路径核对 database facts、desired state 与 pin 完全一致，独立 trigger 禁止后续改写。专项测试覆盖撤销、
+  re-grant、新请求阻断、旧请求 replay、跨 scope 隐藏、ETag fence、不可变 audit/pin 与 additive migration。
+- 本机首次全量运行 479/480：跨页公平性测试另建的两个 environment 没有新契约要求的 target grant，产品按设计返回
+  `Forbidden`；测试夹具随后为两个 canonical environment 显式建立授权，专项复跑通过。最终本机门禁为 Control 480/480、
+  API integration 14/14、architecture 2/2、docs witness 6/6、fleet credential 2/2，以及严格
+  `cargo clippy -p deis-control --all-targets -- -D warnings`。这是未提交工作树证据；精确提交的 Linux/macOS/Windows archive
+  复验尚未登记，不能提前宣称跨平台完成。
+- target grant 这一阻断项已关闭，但 `P1-DEPLOY-001` 仍保持 active：列表 cursor/真实 total、grant create 等通用 mutation
+  幂等、installation/target disable/delete、application 删除时 grant 生命周期收敛与全局历史查询、provider deployment
+  cancel/rollback 公共操作、CLI/Web、真实签署 release/透明服务、三个完整 driver、真实账户与 live conformance 均未完成。

@@ -653,9 +653,9 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             app,
             "environments",
             env,
-            "provider-deployments",
+            "provider-target-grants",
         ] if !writing => Requirement::new(
-            "provider_deployment.list",
+            "provider_target_grant.list",
             Verb::Read,
             named(app),
             named(env),
@@ -666,16 +666,89 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             _app,
             "environments",
             _env,
-            "provider-deployments",
+            "provider-target-grants",
         ] => Requirement::new(
-            "provider_deployment.start",
-            // A target currently grants access to an installation-wide
-            // provider account; until target assignment is itself scoped to
-            // an environment, an ordinary deploy credential must not be able
-            // to spend or publish through any configured account.
+            "provider_target_grant.create",
             Verb::Admin,
             Resource::Every,
             Resource::Every,
+        )
+        .changes_state(),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "provider-target-grants",
+            grant_id,
+        ] if !writing => Requirement::new(
+            "provider_target_grant.get",
+            Verb::Read,
+            named(app),
+            named(env),
+        )
+        .about(grant_id),
+        [
+            "api",
+            "apps",
+            _app,
+            "environments",
+            _env,
+            "provider-target-grants",
+            grant_id,
+        ] => Requirement::new(
+            "provider_target_grant.revoke",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(grant_id)
+        .changes_state(),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "provider-target-grants",
+            grant_id,
+            "audit",
+        ] if !writing => Requirement::new(
+            "provider_target_grant.audit",
+            Verb::Read,
+            named(app),
+            named(env),
+        )
+        .about(grant_id),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "provider-deployments",
+        ] if !writing => Requirement::new(
+            "provider_deployment.list",
+            Verb::Read,
+            named(app),
+            named(env),
+        ),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "provider-deployments",
+        ] => Requirement::new(
+            "provider_deployment.start",
+            // The catalog transaction independently requires an exact active
+            // target grant for this canonical application/environment. Route
+            // scope alone never confers access to a provider account.
+            Verb::Deploy,
+            named(app),
+            named(env),
         )
         .changes_state(),
         [
@@ -1708,6 +1781,36 @@ mod tests {
             ),
             (
                 "GET",
+                "/api/apps/demo/environments/production/provider-target-grants",
+                "provider_target_grant.list",
+                Verb::Read,
+            ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-target-grants",
+                "provider_target_grant.create",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/apps/demo/environments/production/provider-target-grants/01990f44-1000-7000-8000-000000000040",
+                "provider_target_grant.get",
+                Verb::Read,
+            ),
+            (
+                "DELETE",
+                "/api/apps/demo/environments/production/provider-target-grants/01990f44-1000-7000-8000-000000000040",
+                "provider_target_grant.revoke",
+                Verb::Admin,
+            ),
+            (
+                "GET",
+                "/api/apps/demo/environments/production/provider-target-grants/01990f44-1000-7000-8000-000000000040/audit",
+                "provider_target_grant.audit",
+                Verb::Read,
+            ),
+            (
+                "GET",
                 "/api/apps/demo/environments/production/provider-deployments",
                 "provider_deployment.list",
                 Verb::Read,
@@ -1716,7 +1819,7 @@ mod tests {
                 "POST",
                 "/api/apps/demo/environments/production/provider-deployments",
                 "provider_deployment.start",
-                Verb::Admin,
+                Verb::Deploy,
             ),
             (
                 "GET",
@@ -2007,6 +2110,9 @@ mod tests {
             /// records it; something else authorises it, and that something
             /// is named here.
             AuthorisedElsewhere { claim: BodyClaim, by: &'static str },
+            /// The catalog transaction authorizes an opaque identity in the
+            /// body without asking this generic middleware to interpret it.
+            AuthorisedByCatalog { by: &'static str },
             /// The route answers to `admin:*/*`, so a caller who can reach it
             /// at all already holds everything the body could name.
             AdministratorsAlready,
@@ -2066,7 +2172,9 @@ mod tests {
             (
                 "POST",
                 "/api/apps/demo/environments/production/provider-deployments",
-                AdministratorsAlready,
+                AuthorisedByCatalog {
+                    by: "catalog::provider_target_grant::active_provider_target_grant_tx",
+                },
             ),
             (
                 "POST",
@@ -2147,6 +2255,16 @@ mod tests {
                 "/api/providers/installations/01990f44-1000-7000-8000-000000000040/targets",
                 AdministratorsAlready,
             ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-target-grants",
+                AdministratorsAlready,
+            ),
+            (
+                "DELETE",
+                "/api/apps/demo/environments/production/provider-target-grants/01990f44-1000-7000-8000-000000000040",
+                AdministratorsAlready,
+            ),
         ];
 
         for (method, path, reach) in routes {
@@ -2184,6 +2302,13 @@ mod tests {
                              line names the address, whatever the outcome"
                         );
                     }
+                }
+                AuthorisedByCatalog { by } => {
+                    assert!(
+                        !by.is_empty(),
+                        "{method} {path} carries an opaque identity that the catalog must authorize"
+                    );
+                    assert!(requirement.from_body.is_none(), "{method} {path}");
                 }
                 AdministratorsAlready => {
                     assert_eq!(
@@ -2353,6 +2478,14 @@ mod tests {
                 "POST",
                 "/api/apps/demo/environments/production/provider-deployments",
             ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-target-grants",
+            ),
+            (
+                "DELETE",
+                "/api/apps/demo/environments/production/provider-target-grants/01990f44-1000-7000-8000-000000000040",
+            ),
             ("POST", "/api/providers/driver-releases"),
             ("POST", "/api/providers/credentials"),
             (
@@ -2454,6 +2587,14 @@ mod tests {
             ("GET", "/api/apps/myapp/environments/preview"),
             ("POST", "/api/apps/myapp/environments/preview/deployments"),
             ("POST", "/api/apps/myapp/environments/preview/rollback"),
+            (
+                "POST",
+                "/api/apps/myapp/environments/preview/provider-deployments",
+            ),
+            (
+                "GET",
+                "/api/apps/myapp/environments/preview/provider-target-grants",
+            ),
             ("GET", "/api/apps/myapp/versions"),
             ("GET", "/api/runtime"),
         ];
@@ -2487,7 +2628,11 @@ mod tests {
             ("POST", "/api/commands/execute/node-1"),
             (
                 "POST",
-                "/api/apps/myapp/environments/preview/provider-deployments",
+                "/api/apps/myapp/environments/production/provider-deployments",
+            ),
+            (
+                "POST",
+                "/api/apps/myapp/environments/preview/provider-target-grants",
             ),
             ("GET", "/api/providers/credentials"),
             ("DELETE", "/api/apps/myapp"),
@@ -2799,6 +2944,14 @@ mod gate_tests {
                 post(ok).get(ok),
             )
             .route(
+                "/api/apps/:app/environments/:env/provider-deployments",
+                post(ok).get(ok),
+            )
+            .route(
+                "/api/apps/:app/environments/:env/provider-target-grants",
+                post(ok).get(ok),
+            )
+            .route(
                 "/api/apps/:app/environments/:env/secrets/:name",
                 put(created),
             )
@@ -2981,11 +3134,39 @@ mod gate_tests {
             .await,
             StatusCode::OK
         );
+        assert_eq!(
+            call(
+                &gate,
+                "POST",
+                "/api/apps/myapp/environments/preview/provider-deployments",
+                Some(&secret)
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &gate,
+                "GET",
+                "/api/apps/myapp/environments/preview/provider-target-grants",
+                Some(&secret)
+            )
+            .await,
+            StatusCode::OK
+        );
 
         for (method, path) in [
             (
                 "POST",
                 "/api/apps/myapp/environments/production/deployments",
+            ),
+            (
+                "POST",
+                "/api/apps/myapp/environments/production/provider-deployments",
+            ),
+            (
+                "POST",
+                "/api/apps/myapp/environments/preview/provider-target-grants",
             ),
             ("PUT", "/api/apps/myapp/environments/preview/secrets/TOKEN"),
             ("GET", "/api/apps/myapp/environments/preview/storage-token"),

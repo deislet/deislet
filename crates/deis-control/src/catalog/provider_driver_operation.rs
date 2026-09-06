@@ -31,6 +31,7 @@ use super::operation::{
     load_operation_tx, transition_operation_tx,
 };
 use super::provider_driver_release::ProviderDriverDispatcher;
+use super::provider_target_grant::active_provider_target_grant_tx;
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
 
@@ -126,7 +127,8 @@ pub const PROVIDER_DEPLOYMENT_STEPS: [DriverOperation; 7] = [
     DriverOperation::Observe,
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderDeploymentSpec {
     pub application_id: CanonicalId,
     pub environment_id: CanonicalId,
@@ -149,6 +151,8 @@ pub struct ProviderDeploymentWorkflow {
     pub operation: ProductOperation,
     pub provider_target_id: CanonicalId,
     pub target_revision: u64,
+    pub provider_target_grant_id: Option<CanonicalId>,
+    pub target_grant_revision: Option<u64>,
     pub desired_state_digest: Sha256Digest,
     pub artifact: ArtifactVersionRef,
     pub plan: ProviderNeutralPlan,
@@ -184,6 +188,10 @@ struct ProviderDeploymentDesiredState {
     environment_id: CanonicalId,
     target: ProviderTargetRef,
     target_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_target_grant_id: Option<CanonicalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_grant_revision: Option<u64>,
     standard_version: String,
     artifact: ArtifactVersionRef,
     plan: ProviderNeutralPlan,
@@ -522,10 +530,38 @@ impl CatalogStore {
         spec: ProviderDeploymentSpec,
         context: OperationRequestContext,
     ) -> CatalogResult<ProductOperation> {
+        let request_json = canonical_json(&spec, "provider deployment request")?;
+        let request_digest = sha256_hex(request_json.as_bytes());
+        let context = context
+            .for_request_fact("provider-deployment-request-sha256", &request_digest)
+            .for_target("provider-target", spec.provider_target_id);
         let operation_id = CanonicalId::new_v7();
         self.database()
             .with_connection(move |connection| {
                 let transaction = connection.unchecked_transaction()?;
+                if let Some(existing_id) =
+                    find_operation_request_tx(&transaction, OperationKind::Deploy, &context)?
+                {
+                    let existing = load_provider_deployment_workflow(&transaction, existing_id)?
+                        .ok_or_else(|| {
+                            CatalogError::conflict(format!(
+                                "deployment operation {existing_id} is missing its provider workflow"
+                            ))
+                        })?;
+                    transaction.commit()?;
+                    return Ok(existing.operation);
+                }
+                let grant = active_provider_target_grant_tx(
+                    &transaction,
+                    spec.application_id,
+                    spec.environment_id,
+                    spec.provider_target_id,
+                )?
+                .ok_or_else(|| {
+                    CatalogError::forbidden(
+                        "provider target is not granted to this application/environment",
+                    )
+                })?;
                 let target = load_target(&transaction, spec.provider_target_id)?.ok_or_else(|| {
                     CatalogError::not_found(format!(
                         "provider target {}",
@@ -553,6 +589,8 @@ impl CatalogStore {
                     environment_id: spec.environment_id,
                     target: target_ref,
                     target_revision: target.target.revision,
+                    provider_target_grant_id: Some(grant.grant_id),
+                    target_grant_revision: Some(grant.revision),
                     standard_version: target.target.standard_version.clone(),
                     artifact: spec.artifact.clone(),
                     plan: spec.plan.clone(),
@@ -562,21 +600,6 @@ impl CatalogStore {
                     .parse()
                     .expect("SHA-256 formatter is canonical");
                 let plan_json = canonical_json(&spec.plan, "provider deployment plan")?;
-                let context = context
-                    .for_request_fact("provider-deployment-sha256", desired_state_digest.as_str())
-                    .for_target("provider-target", spec.provider_target_id);
-                if let Some(existing_id) =
-                    find_operation_request_tx(&transaction, OperationKind::Deploy, &context)?
-                {
-                    let existing = load_provider_deployment_workflow(&transaction, existing_id)?
-                        .ok_or_else(|| {
-                            CatalogError::conflict(format!(
-                                "deployment operation {existing_id} is missing its provider workflow"
-                            ))
-                        })?;
-                    transaction.commit()?;
-                    return Ok(existing.operation);
-                }
                 if let Some(active_id) = transaction
                     .query_row(
                         "SELECT operation_id FROM provider_deployment_workflows
@@ -629,11 +652,12 @@ impl CatalogStore {
                 transaction.execute(
                     "INSERT INTO provider_deployment_workflows
                        (operation_id, application_id, environment_id, provider_target_id,
-                        target_revision, artifact_version_id, canonical_artifact_sha256,
+                        target_revision, provider_target_grant_id, target_grant_revision,
+                        artifact_version_id, canonical_artifact_sha256,
                         provider_payload_sha256, desired_state_sha256, desired_state_json,
                         plan_json, state, next_step_index, revision, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                             'queued', 0, 1, ?12, ?12)",
+                             ?12, ?13, 'queued', 0, 1, ?14, ?14)",
                     params![
                         operation_id.to_string(),
                         spec.application_id.to_string(),
@@ -641,6 +665,12 @@ impl CatalogStore {
                         spec.provider_target_id.to_string(),
                         i64::try_from(target.target.revision).map_err(|_| {
                             CatalogError::invalid("provider target revision exceeds SQLite range")
+                        })?,
+                        grant.grant_id.to_string(),
+                        i64::try_from(grant.revision).map_err(|_| {
+                            CatalogError::invalid(
+                                "provider target grant revision exceeds SQLite range",
+                            )
                         })?,
                         spec.artifact.artifact_version_id.to_string(),
                         spec.artifact.canonical_artifact_sha256.as_str(),
@@ -1423,6 +1453,7 @@ fn load_provider_deployment_workflow(
     let row = connection
         .query_row(
             "SELECT application_id, environment_id, provider_target_id, target_revision,
+                    provider_target_grant_id, target_grant_revision,
                     artifact_version_id, canonical_artifact_sha256,
                     provider_payload_sha256, desired_state_sha256,
                     desired_state_json, plan_json, state, next_step_index,
@@ -1437,19 +1468,21 @@ fn load_provider_deployment_workflow(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
-                    row.get::<_, i64>(11)?,
-                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
                     row.get::<_, i64>(13)?,
-                    row.get::<_, Option<String>>(14)?,
-                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, i64>(15)?,
                     row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             },
         )
@@ -1461,29 +1494,45 @@ fn load_provider_deployment_workflow(
     let environment_id = parse_id(&row.1, "provider deployment environment")?;
     let provider_target_id = parse_id(&row.2, "provider deployment target")?;
     let target_revision = to_u64(row.3, "provider deployment target revision")?;
+    let provider_target_grant_id = row
+        .4
+        .as_deref()
+        .map(|value| parse_id(value, "provider deployment target grant"))
+        .transpose()?;
+    let target_grant_revision = row
+        .5
+        .map(|value| to_u64(value, "provider deployment target grant revision"))
+        .transpose()?;
+    if provider_target_grant_id.is_some() != target_grant_revision.is_some() {
+        return Err(CatalogError::invalid(
+            "provider deployment has an incomplete target grant pin",
+        ));
+    }
     let artifact = ArtifactVersionRef {
-        artifact_version_id: parse_id(&row.4, "provider deployment artifact version")?,
-        canonical_artifact_sha256: row.5.parse().map_err(|error| {
+        artifact_version_id: parse_id(&row.6, "provider deployment artifact version")?,
+        canonical_artifact_sha256: row.7.parse().map_err(|error| {
             CatalogError::invalid(format!("invalid canonical artifact digest: {error}"))
         })?,
-        provider_payload_sha256: row.6.parse().map_err(|error| {
+        provider_payload_sha256: row.8.parse().map_err(|error| {
             CatalogError::invalid(format!("invalid provider payload digest: {error}"))
         })?,
     };
-    let desired_state_digest: Sha256Digest = row.7.parse().map_err(|error| {
+    let desired_state_digest: Sha256Digest = row.9.parse().map_err(|error| {
         CatalogError::invalid(format!("invalid provider desired state digest: {error}"))
     })?;
     let desired: ProviderDeploymentDesiredState =
-        parse_json(&row.8, "provider deployment desired state")?;
-    let plan: ProviderNeutralPlan = parse_json(&row.9, "provider deployment plan")?;
+        parse_json(&row.10, "provider deployment desired state")?;
+    let plan: ProviderNeutralPlan = parse_json(&row.11, "provider deployment plan")?;
     let computed_json = canonical_json(&desired, "provider deployment desired state")?;
     let computed_digest = sha256_hex(computed_json.as_bytes());
-    if computed_json != row.8
+    if computed_json != row.10
         || computed_digest != desired_state_digest.as_str()
         || desired.application_id != application_id
         || desired.environment_id != environment_id
         || desired.target.provider_target_id != provider_target_id
         || desired.target_revision != target_revision
+        || desired.provider_target_grant_id != provider_target_grant_id
+        || desired.target_grant_revision != target_grant_revision
         || desired.artifact != artifact
         || desired.plan != plan
     {
@@ -1491,29 +1540,29 @@ fn load_provider_deployment_workflow(
             "provider deployment desired state does not match its durable facts",
         ));
     }
-    let workflow_state = parse_deployment_operation_state(&row.10)?;
-    let next_step_index = usize::try_from(row.11).map_err(|_| {
-        CatalogError::invalid(format!("invalid provider deployment step index {}", row.11))
+    let workflow_state = parse_deployment_operation_state(&row.12)?;
+    let next_step_index = usize::try_from(row.13).map_err(|_| {
+        CatalogError::invalid(format!("invalid provider deployment step index {}", row.13))
     })?;
     let dispatch_not_before = row
-        .12
+        .14
         .map(|value| timestamp(value, "provider deployment dispatch not-before"))
         .transpose()?;
-    let dispatch_failure_count = to_u64(row.13, "provider deployment dispatch failure count")?;
+    let dispatch_failure_count = to_u64(row.15, "provider deployment dispatch failure count")?;
     let dispatch_failure_child_operation_id = row
-        .14
+        .16
         .as_deref()
         .map(|value| parse_id(value, "provider deployment dispatch failure child"))
         .transpose()?;
     let backoff_complete = dispatch_not_before.is_some()
         && dispatch_failure_child_operation_id.is_some()
-        && row.15.as_ref().is_some_and(|value| !value.is_empty())
-        && row.16.as_ref().is_some_and(|value| !value.is_empty());
+        && row.17.as_ref().is_some_and(|value| !value.is_empty())
+        && row.18.as_ref().is_some_and(|value| !value.is_empty());
     if (dispatch_failure_count == 0
         && (dispatch_not_before.is_some()
             || dispatch_failure_child_operation_id.is_some()
-            || row.15.is_some()
-            || row.16.is_some()))
+            || row.17.is_some()
+            || row.18.is_some()))
         || (dispatch_failure_count > 0 && !backoff_complete)
     {
         return Err(CatalogError::invalid(
@@ -1610,6 +1659,8 @@ fn load_provider_deployment_workflow(
         operation,
         provider_target_id,
         target_revision,
+        provider_target_grant_id,
+        target_grant_revision,
         desired_state_digest,
         artifact,
         plan,
@@ -1617,8 +1668,8 @@ fn load_provider_deployment_workflow(
         dispatch_not_before,
         dispatch_failure_count,
         dispatch_failure_child_operation_id,
-        last_dispatch_error_code: row.15,
-        last_dispatch_error_message: row.16,
+        last_dispatch_error_code: row.17,
+        last_dispatch_error_message: row.18,
         steps,
     }))
 }
@@ -3430,7 +3481,9 @@ mod tests {
 
     use super::*;
     use crate::catalog::{
-        CatalogProviderCredentialVault, ProviderCredentialBindingSpec, SecretCipher, SecretsBackend,
+        CatalogProviderCredentialVault, ProviderCredentialBindingSpec,
+        ProviderTargetGrantMutationContext, ProviderTargetGrantSpec,
+        ProviderTargetGrantStatusFilter, SecretCipher, SecretsBackend,
     };
     use crate::database::Database;
 
@@ -3441,6 +3494,7 @@ mod tests {
         application_id: CanonicalId,
         environment_id: CanonicalId,
         target: ProviderTarget,
+        grant: crate::catalog::ProviderTargetGrant,
     }
 
     async fn harness() -> Harness {
@@ -3498,6 +3552,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let grant = store
+            .grant_provider_target(
+                ProviderTargetGrantSpec {
+                    application_id: app.canonical_id,
+                    environment_id: environment.canonical_id,
+                    provider_target_id: target.target_id,
+                    note: Some("provider deployment test target".to_owned()),
+                },
+                ProviderTargetGrantMutationContext {
+                    actor_subject: "account:provider-test-admin".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
         Harness {
             _directory: directory,
             database,
@@ -3505,6 +3573,7 @@ mod tests {
             application_id: app.canonical_id,
             environment_id: environment.canonical_id,
             target,
+            grant,
         }
     }
 
@@ -4127,6 +4196,17 @@ mod tests {
         assert_eq!(parent.kind, OperationKind::Deploy);
         assert_eq!(parent.state, OperationState::Queued);
         assert_eq!(parent.child_operation_ids.len(), 1);
+        let accepted = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted.provider_target_grant_id,
+            Some(harness.grant.grant_id)
+        );
+        assert_eq!(accepted.target_grant_revision, Some(harness.grant.revision));
         assert_eq!(
             harness
                 .store
@@ -4229,6 +4309,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_grant_revocation_blocks_new_work_but_not_an_exact_replay() {
+        let harness = harness().await;
+        let spec = ProviderDeploymentSpec {
+            application_id: harness.application_id,
+            environment_id: harness.environment_id,
+            provider_target_id: harness.target.target_id,
+            artifact: attach_cloudflare_artifact(&harness).await,
+            plan: ProviderNeutralPlan::default(),
+        };
+        let request_context = context("provider-deployment-before-revoke");
+        let accepted = harness
+            .store
+            .begin_provider_deployment(spec.clone(), request_context.clone())
+            .await
+            .unwrap();
+
+        let revoked = harness
+            .store
+            .revoke_provider_target_grant(
+                harness.grant.grant_id,
+                harness.grant.revision,
+                ProviderTargetGrantMutationContext {
+                    actor_subject: "account:provider-test-admin".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status, "revoked");
+        assert_eq!(revoked.revision, 2);
+        assert_eq!(
+            harness
+                .store
+                .provider_target_grant_audit_events(revoked.grant_id, 100)
+                .await
+                .unwrap()
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["granted", "revoked"]
+        );
+
+        let replay = harness
+            .store
+            .begin_provider_deployment(spec.clone(), request_context)
+            .await
+            .unwrap();
+        assert_eq!(replay.operation_id, accepted.operation_id);
+
+        let refused = harness
+            .store
+            .begin_provider_deployment(spec, context("provider-deployment-after-revoke"))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, CatalogError::Forbidden(_)));
+        assert!(
+            !refused
+                .to_string()
+                .contains(&harness.target.target_id.to_string())
+        );
+
+        let replacement = harness
+            .store
+            .grant_provider_target(
+                ProviderTargetGrantSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    note: Some("replacement grant".to_owned()),
+                },
+                ProviderTargetGrantMutationContext {
+                    actor_subject: "account:provider-test-admin".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(replacement.grant_id, harness.grant.grant_id);
+        assert_eq!(replacement.revision, 1);
+        assert_eq!(
+            harness
+                .store
+                .provider_target_grants_for_environment(
+                    harness.application_id,
+                    harness.environment_id,
+                    ProviderTargetGrantStatusFilter::Active,
+                    100,
+                )
+                .await
+                .unwrap(),
+            [replacement]
+        );
+    }
+
+    #[tokio::test]
     async fn deployment_desired_state_and_step_journal_are_immutable() {
         let harness = harness().await;
         let parent = harness
@@ -4255,6 +4428,21 @@ mod tests {
                             SET desired_state_sha256 = ?2
                           WHERE operation_id = ?1",
                         params![operation_id.to_string(), "f".repeat(64)],
+                    )?;
+                    Ok::<(), crate::database::DatabaseError>(())
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .database
+                .with_connection(move |connection| {
+                    connection.execute(
+                        "UPDATE provider_deployment_workflows
+                            SET provider_target_grant_id = ?2
+                          WHERE operation_id = ?1",
+                        params![operation_id.to_string(), CanonicalId::new_v7().to_string()],
                     )?;
                     Ok::<(), crate::database::DatabaseError>(())
                 })
@@ -4595,6 +4783,26 @@ mod tests {
             .create_environment("provider-test", "preview-two")
             .await
             .unwrap();
+        for environment_id in [
+            second_environment.canonical_id,
+            third_environment.canonical_id,
+        ] {
+            harness
+                .store
+                .grant_provider_target(
+                    ProviderTargetGrantSpec {
+                        application_id: harness.application_id,
+                        environment_id,
+                        provider_target_id: harness.target.target_id,
+                        note: Some("dispatch page test target".to_owned()),
+                    },
+                    ProviderTargetGrantMutationContext {
+                        actor_subject: "account:provider-test-admin".to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
         for (index, environment_id) in [
             harness.environment_id,
             second_environment.canonical_id,

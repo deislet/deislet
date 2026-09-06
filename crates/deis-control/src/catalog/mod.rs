@@ -42,6 +42,7 @@ pub mod provider_credential;
 pub mod provider_deployment_reconciler;
 pub mod provider_driver_operation;
 pub mod provider_driver_release;
+pub mod provider_target_grant;
 pub mod secrets;
 pub mod store;
 
@@ -87,6 +88,10 @@ pub use provider_driver_release::{
     ProviderDriverDispatcher, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
     ProviderDriverReleaseRegistry, ResolvedProviderDriverRelease,
 };
+pub use provider_target_grant::{
+    ProviderTargetGrant, ProviderTargetGrantAuditEvent, ProviderTargetGrantMutationContext,
+    ProviderTargetGrantSpec, ProviderTargetGrantStatusFilter,
+};
 pub use secrets::{SecretCipher, SecretsBackend};
 pub use store::{
     BundlePathRepair, CatalogStore, DeploymentPlanSpec, ProviderDerivationSpec, SecretHeadChange,
@@ -119,9 +124,9 @@ pub enum CatalogError {
 
     /// The caller is who they say they are and is not entitled to what they
     /// asked for. Distinct from `Invalid`, which is a request nobody could
-    /// make: this one is a request somebody else could. The only thing that
-    /// raises it today is a hostname claim reaching past what the
-    /// installation granted; see [`domains`].
+    /// make: this one is a request somebody else could. Hostname claims and
+    /// provider deployments both use this when an installation-wide resource
+    /// was not granted to the canonical application/environment.
     #[error("{0}")]
     Forbidden(String),
 

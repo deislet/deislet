@@ -425,10 +425,21 @@ Control 的 human API 现已公开 provider-neutral 的 credential、installatio
 `Cache-Control: no-store`。
 
 凭据值只反序列化进 vault 写入路径；response model、operation、授权中间件和审计均没有明文字段。provider credential、
-installation 与 target 是账户级 authority，因此当前全部要求平台管理员。deployment status 可按 application/environment
-授权读取；但 target 尚未有 application/environment grant 模型，普通 deploy credential 不能选择任意账户发布，故开始
-provider deployment 暂时也保持管理员权限。后续必须先建立 target assignment/grant，再把开始操作收窄到 deploy scope，
-不能直接放宽路由权限。
+installation 与 target 是账户级 authority，因此全部要求平台管理员。target grant 也是管理员资源：管理员把一个不可变
+target ID 明确授权给一个 canonical application/environment，普通 `deploy:<app>/<environment>` 凭据不能创建、撤销或把
+授权改指向另一个 target。授权可按 application/environment 读取，跨 scope 的 grant ID 返回 not found。
+
+开始 provider deployment 已收窄为 `deploy:<app>/<environment>`，但 HTTP scope 不是 provider account 的授权来源。
+Catalog 在写入 operation 的同一事务里要求 `(application_id, environment_id, provider_target_id)` 存在 exact active grant，
+并把 grant ID/revision 与 target revision 一起固定到 desired state 和 workflow；数据库 insert trigger 独立执行同一约束，
+旧 binary 不能绕过新规则写入无授权 workflow。授权记录只能从 active revision 1 转为 revoked revision 2，使用强
+`If-Match` 并写入不可变审计；重新授权会得到新的 grant ID，历史记录不会复活或改写。
+
+撤销立即阻断新 operation，但不取消已持久接受的 operation：该 operation 可能已经在外部产生副作用，必须继续依照原
+grant pin 查询、reconcile、完成或由独立 cancel/rollback 契约处理。同 actor、同 Idempotency-Key、同请求事实的 replay
+先返回原 operation，即使授权随后撤销；不同 key 的新请求立即失败。幂等 fingerprint 只由调用方请求事实组成，不能混入
+可能变化的 target/grant 当前状态。旧数据库为历史 workflow 增量加入 nullable pin，既有 operation 可继续读取；升级后的
+任何新 workflow 都必须携带完整 pin，两个字段不得部分存在或修改。
 
 target 注册不再相信调用者给出的一个版本字符串：版本必须是 `contractId@40-hex-commit` exact pin，必须存在于 Control
 当前标准 registry，driver manifest 必须逐项声明相同 contract ID/version/digest，且 contract digest 必须与仓库锁一致。
@@ -450,8 +461,9 @@ transparency 与 archive；四份签名文档分别限制为 1 MiB，并在创�
 Clippy；正式 evidence 为 `../product/evidence/provider-driver-dispatcher-portability-dae492a.json`。该结果只证明合成发行的
 HTTP 安装边界可移植，不证明真实 driver 发行、公共透明服务、真实 provider 部署或 Edge Canon 合规。
 
-这只是公共管理面的后续一段，并不满足本 ADR 的完整验收。installation/target 还没有 disable/delete 生命周期；列表只有有界 limit、没有 cursor；credential provision 和非 operation
-资源创建还没有统一幂等 replay；CLI 与 Web 尚未接线。更关键的是尚无真实签署 release、真实透明日志/独立 witness、
+这只是公共管理面的后续一段，并不满足本 ADR 的完整验收。installation/target 还没有 disable/delete 生命周期；列表只有有界 limit、没有 cursor；credential provision、grant create 和其他非 operation
+资源创建还没有统一幂等 replay；grant 在 application 删除后的生命周期收敛与全局历史查询也仍需并入统一数据生命周期；
+CLI 与 Web 尚未接线。更关键的是尚无真实签署 release、真实透明日志/独立 witness、
 三个完整 backend driver 或真实账户 lifecycle/conformance evidence。因此所有 backend 的 supported/compliant 状态保持不变。
 
 ## 后果

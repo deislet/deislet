@@ -2703,6 +2703,169 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             SELECT RAISE(ABORT, 'provider target facts are immutable; register a new target');
         END;
 
+        CREATE TABLE IF NOT EXISTS provider_target_grants (
+            grant_id             TEXT PRIMARY KEY,
+            organization_id      TEXT NOT NULL
+                                      REFERENCES product_organizations(organization_id),
+            application_id       TEXT NOT NULL,
+            environment_id       TEXT NOT NULL,
+            provider_target_id   TEXT NOT NULL REFERENCES provider_targets(target_id),
+            status               TEXT NOT NULL CHECK(status IN ('active', 'revoked')),
+            revision             INTEGER NOT NULL CHECK(revision >= 1),
+            note                 TEXT CHECK(note IS NULL OR length(note) BETWEEN 1 AND 2048),
+            granted_by_actor_id  TEXT NOT NULL REFERENCES operation_actors(actor_id),
+            revoked_by_actor_id  TEXT REFERENCES operation_actors(actor_id),
+            created_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL,
+            revoked_at           INTEGER,
+            CHECK(length(grant_id) = 36
+              AND lower(grant_id) = grant_id
+              AND substr(grant_id, 9, 1) = '-'
+              AND substr(grant_id, 14, 1) = '-'
+              AND substr(grant_id, 15, 1) = '7'
+              AND substr(grant_id, 19, 1) = '-'
+              AND substr(grant_id, 20, 1) GLOB '[89ab]'
+              AND substr(grant_id, 24, 1) = '-'
+              AND length(replace(grant_id, '-', '')) = 32
+              AND replace(grant_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(application_id) = 36
+              AND lower(application_id) = application_id
+              AND substr(application_id, 9, 1) = '-'
+              AND substr(application_id, 14, 1) = '-'
+              AND substr(application_id, 15, 1) = '7'
+              AND substr(application_id, 19, 1) = '-'
+              AND substr(application_id, 20, 1) GLOB '[89ab]'
+              AND substr(application_id, 24, 1) = '-'
+              AND length(replace(application_id, '-', '')) = 32
+              AND replace(application_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(environment_id) = 36
+              AND lower(environment_id) = environment_id
+              AND substr(environment_id, 9, 1) = '-'
+              AND substr(environment_id, 14, 1) = '-'
+              AND substr(environment_id, 15, 1) = '7'
+              AND substr(environment_id, 19, 1) = '-'
+              AND substr(environment_id, 20, 1) GLOB '[89ab]'
+              AND substr(environment_id, 24, 1) = '-'
+              AND length(replace(environment_id, '-', '')) = 32
+              AND replace(environment_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(updated_at >= created_at),
+            CHECK((status = 'active' AND revision = 1
+                    AND revoked_by_actor_id IS NULL AND revoked_at IS NULL)
+               OR (status = 'revoked' AND revision >= 2
+                    AND revoked_by_actor_id IS NOT NULL AND revoked_at IS NOT NULL
+                    AND revoked_at >= created_at))
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_target_grants_one_active_v1
+            ON provider_target_grants(application_id, environment_id, provider_target_id)
+            WHERE status = 'active';
+
+        CREATE INDEX IF NOT EXISTS idx_provider_target_grants_environment_v1
+            ON provider_target_grants(application_id, environment_id, status,
+                                      created_at DESC, grant_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_target_grants_target_v1
+            ON provider_target_grants(provider_target_id, status, grant_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_target_grants_scope_v1
+        BEFORE INSERT ON provider_target_grants
+        WHEN NOT EXISTS (
+            SELECT 1 FROM apps a
+            JOIN environments e ON e.app_id = a.id
+             WHERE a.canonical_id = NEW.application_id
+               AND e.canonical_id = NEW.environment_id
+        ) OR NOT EXISTS (
+            SELECT 1 FROM provider_targets t
+            JOIN provider_installations i ON i.installation_id = t.installation_id
+             WHERE t.target_id = NEW.provider_target_id
+               AND t.status = 'active' AND i.status = 'active'
+               AND i.organization_id = NEW.organization_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target grant scope or target mismatch');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_target_grants_identity_immutable_v1
+        BEFORE UPDATE OF grant_id, organization_id, application_id, environment_id,
+                         provider_target_id, note, granted_by_actor_id, created_at
+        ON provider_target_grants
+        WHEN NEW.grant_id != OLD.grant_id
+          OR NEW.organization_id != OLD.organization_id
+          OR NEW.application_id != OLD.application_id
+          OR NEW.environment_id != OLD.environment_id
+          OR NEW.provider_target_id != OLD.provider_target_id
+          OR NEW.note IS NOT OLD.note
+          OR NEW.granted_by_actor_id != OLD.granted_by_actor_id
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target grant identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_target_grants_transition_v1
+        BEFORE UPDATE OF status, revision, revoked_by_actor_id, revoked_at, updated_at
+        ON provider_target_grants
+        WHEN OLD.status != 'active'
+          OR NEW.status != 'revoked'
+          OR NEW.revision != OLD.revision + 1
+          OR NEW.revoked_by_actor_id IS NULL
+          OR NEW.revoked_at IS NULL
+          OR NEW.updated_at < OLD.updated_at
+          OR NEW.updated_at != NEW.revoked_at
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid provider target grant transition');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_target_grants_no_delete_v1
+        BEFORE DELETE ON provider_target_grants
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target grant history cannot be deleted');
+        END;
+
+        CREATE TABLE IF NOT EXISTS provider_target_grant_audit_events (
+            event_id             TEXT PRIMARY KEY,
+            grant_id             TEXT NOT NULL REFERENCES provider_target_grants(grant_id),
+            application_id       TEXT NOT NULL,
+            environment_id       TEXT NOT NULL,
+            provider_target_id   TEXT NOT NULL REFERENCES provider_targets(target_id),
+            grant_revision       INTEGER NOT NULL CHECK(grant_revision >= 1),
+            actor_id             TEXT NOT NULL REFERENCES operation_actors(actor_id),
+            event_type           TEXT NOT NULL CHECK(event_type IN ('granted', 'revoked')),
+            occurred_at          INTEGER NOT NULL,
+            CHECK(length(event_id) = 36
+              AND lower(event_id) = event_id
+              AND substr(event_id, 15, 1) = '7'
+              AND substr(event_id, 20, 1) GLOB '[89ab]'
+              AND length(replace(event_id, '-', '')) = 32
+              AND replace(event_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            UNIQUE(grant_id, grant_revision)
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_target_grant_audit_scope_v1
+        BEFORE INSERT ON provider_target_grant_audit_events
+        WHEN NOT EXISTS (
+            SELECT 1 FROM provider_target_grants g
+             WHERE g.grant_id = NEW.grant_id
+               AND g.application_id = NEW.application_id
+               AND g.environment_id = NEW.environment_id
+               AND g.provider_target_id = NEW.provider_target_id
+        ) OR (NEW.event_type = 'granted' AND NEW.grant_revision != 1)
+          OR (NEW.event_type = 'revoked' AND NEW.grant_revision < 2)
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target grant audit identity mismatch');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_target_grant_audit_immutable_v1
+        BEFORE UPDATE ON provider_target_grant_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target grant audit is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_target_grant_audit_no_delete_v1
+        BEFORE DELETE ON provider_target_grant_audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'provider target grant audit cannot be deleted');
+        END;
+
         CREATE TABLE IF NOT EXISTS provider_driver_operations (
             operation_id               TEXT PRIMARY KEY
                                                 REFERENCES product_operations(operation_id),
@@ -3040,6 +3203,9 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             environment_id             TEXT NOT NULL,
             provider_target_id         TEXT NOT NULL REFERENCES provider_targets(target_id),
             target_revision            INTEGER NOT NULL CHECK(target_revision >= 1),
+            provider_target_grant_id   TEXT NOT NULL
+                                                REFERENCES provider_target_grants(grant_id),
+            target_grant_revision      INTEGER NOT NULL CHECK(target_grant_revision >= 1),
             artifact_version_id        TEXT NOT NULL,
             canonical_artifact_sha256  TEXT NOT NULL,
             provider_payload_sha256    TEXT NOT NULL,
@@ -3219,6 +3385,7 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
     ensure_provider_deployment_dispatch_columns(conn)?;
+    ensure_provider_deployment_target_grant_columns(conn)?;
     let quarantined = conn.execute(
         "UPDATE provider_installations
             SET status = 'revoked', revision = revision + 1,
@@ -3377,6 +3544,58 @@ fn ensure_provider_deployment_dispatch_columns(conn: &Connection) -> Result<()> 
         )
         BEGIN
             SELECT RAISE(ABORT, 'invalid provider deployment dispatch backoff');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn ensure_provider_deployment_target_grant_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(provider_deployment_workflows)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?;
+    if !columns
+        .iter()
+        .any(|name| name == "provider_target_grant_id")
+    {
+        conn.execute(
+            "ALTER TABLE provider_deployment_workflows ADD COLUMN provider_target_grant_id TEXT",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|name| name == "target_grant_revision") {
+        conn.execute(
+            "ALTER TABLE provider_deployment_workflows ADD COLUMN target_grant_revision INTEGER CHECK(target_grant_revision IS NULL OR target_grant_revision >= 1)",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_target_grant_insert_v1
+        BEFORE INSERT ON provider_deployment_workflows
+        WHEN NEW.provider_target_grant_id IS NULL
+          OR NEW.target_grant_revision IS NULL
+          OR NOT EXISTS (
+              SELECT 1 FROM provider_target_grants g
+               WHERE g.grant_id = NEW.provider_target_grant_id
+                 AND g.application_id = NEW.application_id
+                 AND g.environment_id = NEW.environment_id
+                 AND g.provider_target_id = NEW.provider_target_id
+                 AND g.status = 'active'
+                 AND g.revision = NEW.target_grant_revision
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'provider deployment requires an exact active target grant');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_target_grant_immutable_v1
+        BEFORE UPDATE OF provider_target_grant_id, target_grant_revision
+        ON provider_deployment_workflows
+        WHEN NEW.provider_target_grant_id IS NOT OLD.provider_target_grant_id
+          OR NEW.target_grant_revision IS NOT OLD.target_grant_revision
+        BEGIN
+            SELECT RAISE(ABORT, 'provider deployment target grant pin is immutable');
         END;
         "#,
     )?;
@@ -5292,5 +5511,72 @@ mod tests {
             [child_operation_id],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn provider_target_grant_pins_upgrade_additively_and_fail_closed_for_new_work() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE provider_target_grants (
+                grant_id TEXT PRIMARY KEY,
+                application_id TEXT NOT NULL,
+                environment_id TEXT NOT NULL,
+                provider_target_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL
+            );
+            CREATE TABLE provider_deployment_workflows (
+                operation_id TEXT PRIMARY KEY,
+                application_id TEXT NOT NULL,
+                environment_id TEXT NOT NULL,
+                provider_target_id TEXT NOT NULL,
+                revision INTEGER NOT NULL
+            );
+            INSERT INTO provider_deployment_workflows
+                (operation_id, application_id, environment_id,
+                 provider_target_id, revision)
+            VALUES ('legacy-operation', 'legacy-app', 'legacy-env',
+                    'legacy-target', 1);",
+        )
+        .unwrap();
+
+        ensure_provider_deployment_target_grant_columns(&conn).unwrap();
+        ensure_provider_deployment_target_grant_columns(&conn).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(provider_deployment_workflows)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            columns
+                .iter()
+                .any(|name| name == "provider_target_grant_id")
+        );
+        assert!(columns.iter().any(|name| name == "target_grant_revision"));
+        let legacy: (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT provider_target_grant_id, target_grant_revision
+                   FROM provider_deployment_workflows
+                  WHERE operation_id = 'legacy-operation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (None, None));
+
+        assert!(
+            conn.execute(
+                "INSERT INTO provider_deployment_workflows
+                    (operation_id, application_id, environment_id,
+                     provider_target_id, revision)
+                 VALUES ('new-operation', 'legacy-app', 'legacy-env',
+                         'legacy-target', 1)",
+                [],
+            )
+            .is_err(),
+            "an upgraded database accepted new provider work without a target grant"
+        );
     }
 }
