@@ -96,6 +96,25 @@
             {"$ref": "#/$defs/clippyCommand"}
           ],
           "items": false
+        },
+        {
+          "minItems": 12,
+          "maxItems": 12,
+          "prefixItems": [
+            {"$ref": "#/$defs/driverCommand"},
+            {"$ref": "#/$defs/providerControlCommand"},
+            {"$ref": "#/$defs/paginationControlCommand"},
+            {"$ref": "#/$defs/authzCommand"},
+            {"$ref": "#/$defs/targetGrantCommand"},
+            {"$ref": "#/$defs/reconcilerCommand"},
+            {"$ref": "#/$defs/legacyTargetMigrationCommand"},
+            {"$ref": "#/$defs/transparencyTargetMigrationCommand"},
+            {"$ref": "#/$defs/dispatchMigrationCommand"},
+            {"$ref": "#/$defs/targetGrantMigrationCommand"},
+            {"$ref": "#/$defs/paginationCursorMigrationCommand"},
+            {"$ref": "#/$defs/clippyCommand"}
+          ],
+          "items": false
         }
       ]
     },
@@ -108,8 +127,8 @@
         "command": {"const": "python3 scripts/check-shared-contracts.py"},
         "outcome": {"const": "passed"},
         "exitCode": {"const": 0},
-        "schemas": {"enum": [11, 14, 15, 16]},
-        "fixtures": {"enum": [29, 37, 42, 48]}
+        "schemas": {"enum": [11, 14, 15, 16, 17]},
+        "fixtures": {"enum": [29, 37, 42, 48, 50]}
       }
     },
     "requiredOperatingSystems": {
@@ -168,7 +187,11 @@
         "providerReleaseHttpInstallValidated": {"const": true},
         "providerTargetGrantValidated": {"const": true},
         "deployScopeAuthorizationValidated": {"const": true},
-        "providerTargetGrantMigrationValidated": {"const": true}
+        "providerTargetGrantMigrationValidated": {"const": true},
+        "providerListPaginationValidated": {"const": true},
+        "queryBoundOpaqueCursorValidated": {"const": true},
+        "exactCollectionTotalValidated": {"const": true},
+        "paginationCursorMigrationValidated": {"const": true}
       }
     },
     "limitations": {
@@ -228,6 +251,12 @@
       "allOf": [
         {"$ref": "#/$defs/commandBase"},
         {"properties": {"id": {"const": "provider-control-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control provider"}}}
+      ]
+    },
+    "paginationControlCommand": {
+      "allOf": [
+        {"$ref": "#/$defs/commandBase"},
+        {"properties": {"id": {"const": "provider-pagination-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control pagination"}}}
       ]
     },
     "authzCommand": {
@@ -295,6 +324,12 @@
         {"properties": {"id": {"const": "provider-target-grant-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_target_grant_pins_upgrade_additively_and_fail_closed_for_new_work -- --exact"}}}
       ]
     },
+    "paginationCursorMigrationCommand": {
+      "allOf": [
+        {"$ref": "#/$defs/commandBase"},
+        {"properties": {"id": {"const": "provider-pagination-cursor-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::api_page_cursor_schema_upgrades_additively_and_is_immutable -- --exact"}}}
+      ]
+    },
     "clippyCommand": {
       "allOf": [
         {"$ref": "#/$defs/commandBase"},
@@ -306,7 +341,7 @@
       "additionalProperties": false,
       "required": ["id", "outcome", "exitCode"],
       "properties": {
-        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "provider-control-tests", "provider-authz-tests", "provider-target-grant-tests", "provider-release-api-tests", "provider-deployment-reconciler-tests", "legacy-target-migration-test", "transparency-target-migration-test", "provider-target-migration-tests", "provider-dispatch-backoff-migration-test", "provider-target-grant-migration-test", "strict-clippy"]},
+        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "provider-control-tests", "provider-pagination-tests", "provider-authz-tests", "provider-target-grant-tests", "provider-release-api-tests", "provider-deployment-reconciler-tests", "legacy-target-migration-test", "transparency-target-migration-test", "provider-target-migration-tests", "provider-dispatch-backoff-migration-test", "provider-target-grant-migration-test", "provider-pagination-cursor-migration-test", "strict-clippy"]},
         "outcome": {"enum": ["passed", "failed", "not-run"]},
         "exitCode": {"type": ["integer", "null"], "minimum": 0},
         "passed": {"type": "integer", "minimum": 0},
@@ -337,7 +372,7 @@
         "clippy": {"type": "string", "minLength": 1},
         "commit": {"$ref": "#/$defs/gitSha"},
         "archiveSha256": {"$ref": "#/$defs/sha256"},
-        "checks": {"type": "array", "minItems": 4, "maxItems": 10, "items": {"$ref": "#/$defs/checkResult"}}
+        "checks": {"type": "array", "minItems": 4, "maxItems": 12, "items": {"$ref": "#/$defs/checkResult"}}
       }
     },
     "priorFailedAttempt": {
@@ -348,7 +383,7 @@
         "source": {"$ref": "#/$defs/source"},
         "hostAlias": {"type": "string", "minLength": 1},
         "operatingSystem": {"enum": ["linux", "macos", "windows"]},
-        "checks": {"type": "array", "minItems": 4, "maxItems": 10, "items": {"$ref": "#/$defs/checkResult"}},
+        "checks": {"type": "array", "minItems": 4, "maxItems": 12, "items": {"$ref": "#/$defs/checkResult"}},
         "cause": {"type": "string", "minLength": 1},
         "fixedBy": {"$ref": "#/$defs/gitSha"}
       }

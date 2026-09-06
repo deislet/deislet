@@ -2512,9 +2512,14 @@ Application/framework source + versioned build plan
   `control-list-page.schema.json`。回归覆盖真实 total、末页 null cursor、下一页改变 limit、cursor 重放、跨集合/跨 status
   复用与篡改拒绝；数据库专项覆盖旧库幂等增量建表、不可变 cursor 行和可删除的到期清理。共享契约校验现为 17 份 Schema、
   50 组正反 fixture。
-- 本机完整门禁通过 Control lib 484/484、API integration 14/14、architecture 2/2、docs witness 6/6、fleet credential
-  2/2、严格 Control all-target Clippy、共享契约与产品治理。精确提交及三平台同归档复验尚未登记，因此本节不把本机结果
-  写成跨平台 evidence。
+- 精确源码提交 `dc9a19a65f34fd6dda6a5fc9992842a8f5ca75ae`（tree
+  `26e3dfe4d270bab0cdb1620b4bcfb726e0a02c67`）已生成 15,851,520-byte git archive，SHA-256 为
+  `e7b291238b22772e2da975f406b44b393f6342fe8c3e0bc58863b5d6b0c125df`。同一归档在 Linux/macOS 通过
+  provider-driver 62/62、Control provider 49/49、pagination 2/2、authz 32/32、grant 3/3、协调器 3/3、五项
+  migration 各 1/1 与严格五 crate all-target Clippy；Windows 除平台适用的 provider-driver 为 54/54 外计数相同并全过。
+  Linux 另通过 17 份 Schema/50 组 fixture；macOS 缺 Python `jsonschema` 如实登记为环境未执行。正式记录为
+  `evidence/provider-driver-dispatcher-portability-dc9a19a.json`。它证明该控制路径的三平台代码可移植性，不证明真实 provider
+  账户部署或 Edge Canon 合规；跨请求 cursor 也不是冻结 snapshot。
 - 首次推送的实现提交 `0d6c1e132264e702e8a3813a2703cb442a8e34fa` 因使用显式 staging 清单，遗漏两份仍为 untracked 的
   `api/pagination.rs` 与 `catalog/pagination.rs`；该历史提交单独检出时无法编译。推送后的强制 worktree 核对立即发现并由
   `24e8d6f0aa0ac6b1f24eeef1cd73664315bc7ac4` 补齐，未改动已验证实现内容。后续精确 archive 只能从包含两项提交的最终
