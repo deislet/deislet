@@ -26,6 +26,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use super::model::now_secs;
+use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogProviderCredentialVault, CatalogResult};
 
@@ -317,44 +318,56 @@ impl ProviderDriverReleaseRegistry {
     }
 
     pub async fn releases(&self, limit: usize) -> CatalogResult<Vec<ProviderDriverReleaseRecord>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider driver release limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self.releases_page(limit, None).await?.items)
+    }
+
+    pub async fn releases_page(
+        &self,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderDriverReleaseRecord>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider driver release")?;
         let database = self.store.database();
         let host = self.host;
         database
             .with_connection(move |connection| {
-                let mut statement = connection.prepare(
+                let transaction = connection.unchecked_transaction()?;
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_driver_releases
+                      WHERE host_operating_system = ?1",
+                    [host.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (before_created_at, before_digest) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
                     "SELECT release_sha256 FROM provider_driver_releases
                       WHERE host_operating_system = ?1
-                      ORDER BY created_at DESC, release_sha256 DESC LIMIT ?2",
+                        AND (?2 IS NULL OR created_at < ?2
+                             OR (created_at = ?2 AND release_sha256 < ?3))
+                      ORDER BY created_at DESC, release_sha256 DESC LIMIT ?4",
                 )?;
                 let digests = statement
                     .query_map(
-                        params![
-                            host.as_str(),
-                            i64::try_from(limit).map_err(|_| {
-                                CatalogError::invalid(
-                                    "provider driver release limit exceeds SQLite range",
-                                )
-                            })?,
-                        ],
+                        params![host.as_str(), before_created_at, before_digest, fetch_limit,],
                         |row| row.get::<_, String>(0),
                     )?
                     .collect::<Result<Vec<_>, _>>()?;
-                digests
+                let releases = digests
                     .into_iter()
                     .map(|digest| {
                         let digest = parse_digest(&digest, "provider driver release")?;
-                        load_release_record(connection, &digest, host)?.ok_or_else(|| {
+                        load_release_record(&transaction, &digest, host)?.ok_or_else(|| {
                             CatalogError::not_found(format!(
                                 "provider driver release {digest} for {host}"
                             ))
                         })
                     })
-                    .collect()
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(releases, limit, total, "provider driver release")
             })
             .await
     }
@@ -364,31 +377,49 @@ impl ProviderDriverReleaseRegistry {
         release_digest: Sha256Digest,
         limit: usize,
     ) -> CatalogResult<Vec<ProviderDriverReleaseAuditEvent>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider driver release audit limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self
+            .audit_events_page(release_digest, limit, None)
+            .await?
+            .items)
+    }
+
+    pub async fn audit_events_page(
+        &self,
+        release_digest: Sha256Digest,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderDriverReleaseAuditEvent>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider driver release audit")?;
         let database = self.store.database();
         let host = self.host;
         database
             .with_connection(move |connection| {
-                let mut statement = connection.prepare(
+                let transaction = connection.unchecked_transaction()?;
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_driver_release_audit
+                      WHERE release_sha256 = ?1 AND host_operating_system = ?2",
+                    params![release_digest.as_str(), host.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (after_observed_at, after_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
                     "SELECT event_id, event_type, detail, observed_at
                        FROM provider_driver_release_audit
                       WHERE release_sha256 = ?1 AND host_operating_system = ?2
-                      ORDER BY observed_at, event_id LIMIT ?3",
+                        AND (?3 IS NULL OR observed_at > ?3
+                             OR (observed_at = ?3 AND event_id > ?4))
+                      ORDER BY observed_at, event_id LIMIT ?5",
                 )?;
-                statement
+                let events = statement
                     .query_map(
                         params![
                             release_digest.as_str(),
                             host.as_str(),
-                            i64::try_from(limit).map_err(|_| {
-                                CatalogError::invalid(
-                                    "provider driver release audit limit exceeds SQLite range",
-                                )
-                            })?,
+                            after_observed_at,
+                            after_id,
+                            fetch_limit,
                         ],
                         |row| {
                             Ok((
@@ -410,7 +441,10 @@ impl ProviderDriverReleaseRegistry {
                             observed_at: timestamp(row.3, "provider driver release audit time")?,
                         })
                     })
-                    .collect()
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(events, limit, total, "provider driver release audit")
             })
             .await
     }

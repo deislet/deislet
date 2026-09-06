@@ -41,6 +41,7 @@ EXPECTED_DOCUMENTS = {
     "backend-migration-evidence",
     "backend-restore-set",
     "backend-restore-report",
+    "control-list-page",
 }
 EXPECTED_PROVIDER_OPERATIONS = [
     "preflight",
@@ -625,6 +626,16 @@ def validate_cross_document_invariants(registry: dict) -> None:
     require(
         restore_report.get("restoreSetId") == restore_set.get("restoreSetId"),
         "backend restore report fixture must bind the restore set fixture",
+    )
+    list_page = load_json("contracts/v1/fixtures/valid/control-list-page.json")
+    page = list_page.get("page", {})
+    items = list_page.get("items", [])
+    require(
+        list_page.get("schemaVersion") == 1
+        and page.get("count") == len(items)
+        and page.get("count", -1) <= page.get("limit", -1)
+        and page.get("total", -1) >= page.get("count", -1),
+        "Control list page fixture violates count, limit, or exact-total invariants",
     )
     restore_set_canonical = json.dumps(
         restore_set, ensure_ascii=False, separators=(",", ":"), sort_keys=True

@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use super::model::now_secs;
 use super::operation::{actor_id, default_organization_id};
+use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
 
@@ -164,24 +165,57 @@ impl CatalogStore {
         status: ProviderTargetGrantStatusFilter,
         limit: usize,
     ) -> CatalogResult<Vec<ProviderTargetGrant>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider target grant limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self
+            .provider_target_grants_for_environment_page(
+                application_id,
+                environment_id,
+                status,
+                limit,
+                None,
+            )
+            .await?
+            .items)
+    }
+
+    pub async fn provider_target_grants_for_environment_page(
+        &self,
+        application_id: CanonicalId,
+        environment_id: CanonicalId,
+        status: ProviderTargetGrantStatusFilter,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderTargetGrant>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider target grant")?;
         self.database()
             .with_connection(move |connection| {
-                ensure_application_environment(connection, application_id, environment_id)?;
+                let transaction = connection.unchecked_transaction()?;
+                ensure_application_environment(&transaction, application_id, environment_id)?;
                 let status = match status {
                     ProviderTargetGrantStatusFilter::Active => Some("active"),
                     ProviderTargetGrantStatusFilter::Revoked => Some("revoked"),
                     ProviderTargetGrantStatusFilter::All => None,
                 };
-                let mut statement = connection.prepare(
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_target_grants
+                      WHERE application_id = ?1 AND environment_id = ?2
+                        AND (?3 IS NULL OR status = ?3)",
+                    params![
+                        application_id.to_string(),
+                        environment_id.to_string(),
+                        status,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (before_created_at, before_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
                     "SELECT grant_id FROM provider_target_grants
                       WHERE application_id = ?1 AND environment_id = ?2
                         AND (?3 IS NULL OR status = ?3)
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?4",
+                        AND (?4 IS NULL OR created_at < ?4
+                             OR (created_at = ?4 AND grant_id < ?5))
+                      ORDER BY created_at DESC, grant_id DESC LIMIT ?6",
                 )?;
                 let ids = statement
                     .query_map(
@@ -189,23 +223,25 @@ impl CatalogStore {
                             application_id.to_string(),
                             environment_id.to_string(),
                             status,
-                            i64::try_from(limit).map_err(|_| {
-                                CatalogError::invalid(
-                                    "provider target grant limit exceeds SQLite range",
-                                )
-                            })?,
+                            before_created_at,
+                            before_id,
+                            fetch_limit,
                         ],
                         |row| row.get::<_, String>(0),
                     )?
                     .collect::<Result<Vec<_>, _>>()?;
-                ids.into_iter()
+                let grants = ids
+                    .into_iter()
                     .map(|id| {
                         let id = parse_id(&id, "provider target grant")?;
-                        load_grant(connection, id)?.ok_or_else(|| {
+                        load_grant(&transaction, id)?.ok_or_else(|| {
                             CatalogError::not_found(format!("provider target grant {id}"))
                         })
                     })
-                    .collect()
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(grants, limit, total, "provider target grant")
             })
             .await
     }
@@ -276,36 +312,49 @@ impl CatalogStore {
         grant_id: CanonicalId,
         limit: usize,
     ) -> CatalogResult<Vec<ProviderTargetGrantAuditEvent>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider target grant audit limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self
+            .provider_target_grant_audit_events_page(grant_id, limit, None)
+            .await?
+            .items)
+    }
+
+    pub async fn provider_target_grant_audit_events_page(
+        &self,
+        grant_id: CanonicalId,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderTargetGrantAuditEvent>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider target grant audit")?;
         self.database()
             .with_connection(move |connection| {
-                if load_grant(connection, grant_id)?.is_none() {
+                let transaction = connection.unchecked_transaction()?;
+                if load_grant(&transaction, grant_id)?.is_none() {
                     return Err(CatalogError::not_found(format!(
                         "provider target grant {grant_id}"
                     )));
                 }
-                let mut statement = connection.prepare(
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_target_grant_audit_events
+                      WHERE grant_id = ?1",
+                    [grant_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (after_revision, after_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
                     "SELECT event_id, application_id, environment_id,
                             provider_target_id, grant_revision, actor_id,
                             event_type, occurred_at
                       FROM provider_target_grant_audit_events
                       WHERE grant_id = ?1
-                      ORDER BY grant_revision LIMIT ?2",
+                        AND (?2 IS NULL OR grant_revision > ?2
+                             OR (grant_revision = ?2 AND event_id > ?3))
+                      ORDER BY grant_revision, event_id LIMIT ?4",
                 )?;
                 let rows = statement
                     .query_map(
-                        params![
-                            grant_id.to_string(),
-                            i64::try_from(limit).map_err(|_| {
-                                CatalogError::invalid(
-                                    "provider target grant audit limit exceeds SQLite range",
-                                )
-                            })?,
-                        ],
+                        params![grant_id.to_string(), after_revision, after_id, fetch_limit,],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -320,7 +369,8 @@ impl CatalogStore {
                         },
                     )?
                     .collect::<Result<Vec<_>, _>>()?;
-                rows.into_iter()
+                let events = rows
+                    .into_iter()
                     .map(|row| {
                         Ok(ProviderTargetGrantAuditEvent {
                             event_id: parse_id(&row.0, "provider target grant audit event")?,
@@ -337,7 +387,10 @@ impl CatalogStore {
                             occurred_at: timestamp(row.7, "provider target grant audit time")?,
                         })
                     })
-                    .collect()
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(events, limit, total, "provider target grant audit")
             })
             .await
     }

@@ -78,7 +78,7 @@ ML-DSA-44 等后续行业能力须以版本化契约演进。
 
 这些切片仍不代表八阶段 identity 迁移或统一部署完成。当前迁移、restore、单步 provider work 与 provider deployment parent 已满足 `operation.schema.json` 全字段与通用状态图，credential vault/broker、验证安装器、Control release registry、DSSE 阈值授权、透明 proof、旧根/新根双阈值轮换与进程 dispatcher 已存在；但真实官方工具 materialized release、真实公共日志/见证服务与发行 ceremony、Windows service DACL、Cloudflare/EdgeOne/Deislet 完整 driver、后台执行循环和 API/CLI/Web 仍未接线。Stateful Objects 与 provider resources 仍无 inventory/fence/restore；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
 
-## 十六份机器契约
+## 十七份机器契约
 
 1. [`resource-identity.schema.json`](resource-identity.schema.json)：主要对象的 canonical ID、kind、scope、display name 和 revision。ID 是定位符，不是凭证。
 2. [`canonical-artifact.schema.json`](canonical-artifact.schema.json)：Deislet 控制面的 canonical artifact record，不再复制 payload 格式。真正的输出目录、根清单、文件集合和构建输入只由标准锁定的上游 `schemas/canonical-build-output.schema.json` 定义；record 绑定 manifest identity、content root、标准/schema 摘要、SBOM/provenance/validation 文档和外置签名。Proposal artifact 必须是 `deployable: false`；可部署 record 必须锁定已发布标准、验证通过并有签名。
@@ -96,6 +96,7 @@ ML-DSA-44 等后续行业能力须以版本化契约演进。
 14. [`backend-migration-evidence.schema.json`](backend-migration-evidence.schema.json)：后端在持久 writer fence 下取得的 component count/bytes/digest/orphan evidence；明确认证域、backend incarnation 和 receipt，但禁止保存 fence token。
 15. [`backend-restore-set.schema.json`](backend-restore-set.schema.json)：把 store、queue、telemetry 三份本地快照绑定到同一个全平台停写/停服屏障、固定 topology driver 和不可变 snapshot digest；明确禁止复制 migration fence journal。缺少任一组件、只具有各自一致点或无法证明 outage barrier 的集合不能进入平台级 Restore Operation。
 16. [`backend-restore-report.schema.json`](backend-restore-report.schema.json)：topology driver 对同一 operation/restore set 的可对账终态证据，只允许 `succeeded` 或 `rolled-back`，并按固定顺序记录三后端切换前后的 incarnation。`restoreSetSha256` 统一是 restore set 的 RFC 8785 JCS 字节摘要；进程退出、timeout 或中间阶段不属于 report 状态。
+17. [`control-list-page.schema.json`](control-list-page.schema.json)：Control 所有资源列表共用的 v1 envelope：`items` 与 `page.limit/count/total/nextCursor`。`total` 是同一读快照中符合 scope/filter 的精确总数；cursor 是 256-bit 随机、URL-safe、不透明且有期限的定位符，只能用于签发它的 collection/scope/filter/sort，不能替代正常授权。当前 provider 管理面的 10 条 list/audit 路由（9 个集合契约）已消费该契约，其余旧列表仍须在公共 API v1 冻结前迁移。
 
 UUIDv7 目前是 draft 实现选择：它标准化、可跨进程生成并按时间大致排序；其时间部分不是秘密，因此授权永远另行校验。若安全或存储评审否决该格式，必须在 v1 冻结前更新所有 schema/fixture；已发布后不得原地换格式。
 

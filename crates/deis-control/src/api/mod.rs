@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod migrations;
 pub mod nodes;
+pub mod pagination;
 pub mod registration;
 pub mod restores;
 pub mod static_files;

@@ -2344,6 +2344,9 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_credential_bindings_status
             ON provider_credential_bindings(organization_id, backend_id, status, binding_id);
 
+        CREATE INDEX IF NOT EXISTS idx_provider_credential_bindings_page_v1
+            ON provider_credential_bindings(created_at, binding_id);
+
         CREATE TABLE IF NOT EXISTS provider_credential_revisions (
             binding_id          TEXT NOT NULL
                                      REFERENCES provider_credential_bindings(binding_id),
@@ -2443,6 +2446,9 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_installations_backend
             ON provider_installations(organization_id, backend_id, status);
 
+        CREATE INDEX IF NOT EXISTS idx_provider_installations_page_v1
+            ON provider_installations(created_at, installation_id);
+
         CREATE TRIGGER IF NOT EXISTS trg_provider_installations_credential_v1
         BEFORE INSERT ON provider_installations
         WHEN NOT EXISTS (
@@ -2520,6 +2526,12 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_provider_targets_backend
             ON provider_targets(backend_id, status, target_id);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_targets_page_v1
+            ON provider_targets(created_at, target_id);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_targets_installation_page_v1
+            ON provider_targets(installation_id, created_at, target_id);
 
         CREATE TRIGGER IF NOT EXISTS trg_provider_targets_installation_backend_v1
         BEFORE INSERT ON provider_targets
@@ -2766,6 +2778,34 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_provider_target_grants_target_v1
             ON provider_target_grants(provider_target_id, status, grant_id);
+
+        CREATE TABLE IF NOT EXISTS api_page_cursors (
+            token_sha256  TEXT PRIMARY KEY,
+            collection    TEXT NOT NULL,
+            query_sha256  TEXT NOT NULL,
+            position_json TEXT NOT NULL CHECK(json_valid(position_json)),
+            created_at    INTEGER NOT NULL,
+            expires_at    INTEGER NOT NULL,
+            CHECK(length(token_sha256) = 64
+              AND lower(token_sha256) = token_sha256
+              AND token_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(query_sha256) = 64
+              AND lower(query_sha256) = query_sha256
+              AND query_sha256 NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(collection) BETWEEN 1 AND 128
+              AND lower(collection) = collection
+              AND collection NOT GLOB '*[^a-z0-9.-]*'),
+            CHECK(expires_at > created_at)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_api_page_cursors_expiry_v1
+            ON api_page_cursors(expires_at, token_sha256);
+
+        CREATE TRIGGER IF NOT EXISTS trg_api_page_cursors_immutable_v1
+        BEFORE UPDATE ON api_page_cursors
+        BEGIN
+            SELECT RAISE(ABORT, 'API page cursor is immutable');
+        END;
 
         CREATE TRIGGER IF NOT EXISTS trg_provider_target_grants_scope_v1
         BEFORE INSERT ON provider_target_grants
@@ -3316,6 +3356,10 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_deployment_reconcile
             ON provider_deployment_workflows(state, updated_at, operation_id);
 
+        CREATE INDEX IF NOT EXISTS idx_provider_deployment_environment_page_v1
+            ON provider_deployment_workflows(application_id, environment_id,
+                                             created_at DESC, operation_id DESC);
+
         CREATE TRIGGER IF NOT EXISTS trg_provider_deployment_workflow_facts_immutable_v1
         BEFORE UPDATE OF operation_id, application_id, environment_id,
                          provider_target_id, target_revision, artifact_version_id,
@@ -3651,6 +3695,10 @@ fn ensure_provider_driver_release_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_driver_releases_selection
             ON provider_driver_releases(status, backend_id, host_operating_system,
                                         driver_id, driver_version, release_sha256);
+
+        CREATE INDEX IF NOT EXISTS idx_provider_driver_releases_page_v1
+            ON provider_driver_releases(host_operating_system,
+                                        created_at DESC, release_sha256 DESC);
 
         CREATE TABLE IF NOT EXISTS provider_driver_trust_roots (
             root_version INTEGER PRIMARY KEY CHECK(root_version >= 1),
@@ -5426,6 +5474,38 @@ mod tests {
             .unwrap();
         assert!(columns.iter().any(|name| name == "active_deployment_id"));
         assert!(columns.iter().any(|name| name == "pending_deployment_id"));
+    }
+
+    #[test]
+    fn api_page_cursor_schema_upgrades_additively_and_is_immutable() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute("DROP TABLE api_page_cursors", []).unwrap();
+
+        create_tables(&conn).unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO api_page_cursors
+                (token_sha256, collection, query_sha256, position_json,
+                 created_at, expires_at)
+             VALUES (?1, 'provider-targets', ?2, '{\"sortValue\":1,\"identity\":\"one\"}',
+                     1, 2)",
+            ["a".repeat(64), "b".repeat(64)],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE api_page_cursors SET expires_at = 3 WHERE token_sha256 = ?1",
+                ["a".repeat(64)],
+            )
+            .is_err(),
+            "database accepted a mutable API page cursor"
+        );
+        conn.execute(
+            "DELETE FROM api_page_cursors WHERE token_sha256 = ?1",
+            ["a".repeat(64)],
+        )
+        .unwrap();
     }
 
     #[test]

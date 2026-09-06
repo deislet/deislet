@@ -87,11 +87,24 @@ Web console ───────┘             │
 
 ### 列表与查询
 
-- 统一 cursor pagination，明确稳定排序字段与 next cursor。
-- Filter/sort/search 使用版本化字段和受限语法。
-- 响应包含 total 仅在后端可合理计算时提供，不能用假精确值。
+- 所有公共资源列表统一接受 `limit` 与 `cursor`；`limit` 默认 100，范围 1–1000。响应统一为
+  `{"schemaVersion":1,"items":[],"page":{"limit":100,"count":0,"total":0,"nextCursor":null}}`，
+  `count` 必须等于本页 `items` 数量，`total` 必须是同一读快照中符合 scope/filter 的精确总数。
+- 每个列表固定并版本化复合 keyset 排序，不使用 offset 作为公共遍历状态；`nextCursor = null` 表示遍历结束。
+- Cursor 是 256-bit 随机 URL-safe 不透明 token，Control 只持久化 token SHA-256、签发 collection、query binding、
+  位置和三天有效期。query binding 必须包含 canonical scope、filter 与 sort，允许下一页改变 `limit`；跨 collection、
+  scope/filter/sort 复用、篡改、格式错误和过期全部返回 bad request。Cursor 不是 authorization，每次使用仍执行路由权限检查。
+- Filter/sort/search 使用版本化字段和受限语法。大集合不得要求 CLI/Web 拉全量后在客户端过滤。
+- 单页 `items` 与 `total` 共享数据库读事务；cursor 跨请求不承诺历史快照隔离，期间创建、删除或状态变化可反映在后续页和
+  新的 `total` 中。需要冻结视图的产品工作流必须使用显式 snapshot/export resource，不能暗示 cursor 等于 snapshot。
 - 所有时间使用 UTC/RFC 3339，UI 再按用户时区呈现。
-- 大集合不得要求 CLI/Web 拉全量后在客户端过滤；现有应用日志的客户端 environment filter 等做法需要迁移到服务端查询。
+
+这一选择参考行业主流实现，但固定为 Deislet 的单一公共契约：[Google AIP-158](https://google.aip.dev/158) 要求不透明
+page token、除 page size 外查询参数一致且 token 不能承担授权；[Cloudflare API](https://developers.cloudflare.com/fundamentals/api/how-to/make-api-calls/)
+和[资源标签过滤](https://developers.cloudflare.com/resource-tagging/how-to/filter-resources/)同时采用分页 metadata 与 cursor；
+[EdgeOne API](https://cloud.tencent.com/document/api/1552/80699) 的列表返回精确 `TotalCount`；
+[Stripe API](https://docs.stripe.com/api/pagination) 提供一致的 cursor 分页结构。供应商差异由 adapter/driver 消化，不能泄漏为
+同一 Deislet API 的多套分页模型。
 
 ### Mutation、并发与幂等
 
@@ -276,7 +289,11 @@ Linux、macOS、Windows 通过平台适用的 provider、authz、grant、协调�
 记录为 `../product/evidence/provider-driver-dispatcher-portability-69f1343.json`。它证明这一 API 控制路径的代码可移植性，
 不证明 CLI/Web 已接线或真实 provider 账户可用。
 
-这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；列表没有 cursor，`total` 目前只代表本次返回数；
+Provider 管理面的 10 条 list/audit 路由（9 个集合契约）已迁入上述共享 envelope：使用稳定复合 keyset、query-bound opaque cursor、同一 SQLite
+读事务中的精确 `total`，并为实际排序/过滤增加复合索引。cursor 表是旧库可重复执行的增量升级，token 只以 SHA-256 保存；
+共享 Schema/fixture 和 API 回归覆盖改页大小、重复使用、跨 collection/filter 复用和篡改拒绝。
+
+这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；其余 Control 列表尚未全部迁移；
 installation/target 生命周期尚不完整；credential provision、grant create 等非 operation 资源创建尚未统一幂等 replay；
 grant 在 application 删除后的生命周期收敛与全局历史查询尚未完成；CLI/Web 也没有生成 client 或交互入口。
 

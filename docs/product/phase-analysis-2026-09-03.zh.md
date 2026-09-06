@@ -2493,3 +2493,29 @@ Application/framework source + versioned build plan
 - target grant 这一阻断项已关闭，但 `P1-DEPLOY-001` 仍保持 active：列表 cursor/真实 total、grant create 等通用 mutation
   幂等、installation/target disable/delete、application 删除时 grant 生命周期收敛与全局历史查询、provider deployment
   cancel/rollback 公共操作、CLI/Web、真实签署 release/透明服务、三个完整 driver、真实账户与 live conformance 均未完成。
+
+## 89. Control 统一分页契约与 provider 管理面首批迁移
+
+- 依据已确认的产品原则，Deislet 公共 API 不能因 Cloudflare、EdgeOne 或自建后端而暴露多套列表协议。参考 Google AIP-158、
+  Cloudflare cursor/分页 metadata、EdgeOne `TotalCount` 与 Stripe cursor 的行业实现后，正式契约固定为
+  `schemaVersion/items/page.limit/count/total/nextCursor`：`limit` 默认 100、范围 1–1000；`count` 等于本页条目数；`total`
+  是同一 scope/filter 在本页数据库读快照中的精确总数；`nextCursor = null` 表示结束。供应商 offset/page number 只能留在
+  driver 内部，不得改变 Deislet 客户端契约。
+- Cursor 不是把 SQLite sort key 做 base64。Control 为每个位置生成 256-bit 随机 URL-safe token，只保存 token SHA-256、
+  collection、scope/filter/sort 的 query binding SHA-256、位置、创建时间与三天到期时间。页大小不参与 binding，因此客户端可
+  调整下一页 limit；跨 collection、scope、filter 或 sort 复用、任意篡改、错误格式和过期都统一拒绝。持有 cursor 不授予
+  权限，每次请求仍走原 route authz。cursor 可在有效期内重放，方便网络重试。
+- Catalog 统一以复合 keyset 排序读取 `limit + 1` 判断下一页，COUNT 与 items 在同一个 SQLite 读事务中完成；credential、
+  installation、target、release、grant、deployment 与各自 audit 的实际 filter/order 均增加匹配索引。跨 HTTP 请求不伪装
+  成冻结快照：期间 mutation 可进入后续页和新的 total；需要冻结视图的导出/审计产品必须另建 snapshot resource。
+- Provider 管理面的 10 条 list/audit 路由（9 个集合契约）已迁到同一个 generic Rust response 与共享
+  `control-list-page.schema.json`。回归覆盖真实 total、末页 null cursor、下一页改变 limit、cursor 重放、跨集合/跨 status
+  复用与篡改拒绝；数据库专项覆盖旧库幂等增量建表、不可变 cursor 行和可删除的到期清理。共享契约校验现为 17 份 Schema、
+  50 组正反 fixture。
+- 本机完整门禁通过 Control lib 484/484、API integration 14/14、architecture 2/2、docs witness 6/6、fleet credential
+  2/2、严格 Control all-target Clippy、共享契约与产品治理。精确提交及三平台同归档复验尚未登记，因此本节不把本机结果
+  写成跨平台 evidence。
+- 这是 v1 冻结前的有意归一化，现有未带显式 major 的 provider list response 因此发生形状变化；不能把这次变化带入已发布
+  稳定 major。其余 Control 列表、OpenAPI/generated client、breaking-change gate 和显式 `/api/v1` 路由仍未完成，统一分页
+  只能登记为 provider 首批闭环，`P1-DEPLOY-001` 与 ADR-016 整体继续 active。通用 mutation 幂等、完整 lifecycle、CLI/Web、
+  真实 driver/账户/live conformance 等既有欠缺保持不变。

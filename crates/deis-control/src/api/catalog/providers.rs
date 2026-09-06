@@ -13,21 +13,25 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
 };
 use deis_provider_driver::{
-    ArtifactVersionRef, CredentialMaterial, ProviderNeutralPlan, Sha256Digest,
+    ArtifactVersionRef, CredentialMaterial, HostOperatingSystem, ProviderNeutralPlan, Sha256Digest,
     ValidatedDriverReleaseAuthorization, ValidatedDriverReleaseTransparencyProof,
     ValidatedProviderDriverManifest, ValidatedProviderDriverRelease,
 };
 use deis_wire::{CanonicalId, ProductOperation};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
 use super::CatalogState;
 use crate::{
-    api::error::{ApiError, ApiResult},
+    api::{
+        error::{ApiError, ApiResult},
+        pagination::{ControlListPage, ListQuery, list_page},
+    },
     catalog::{
-        OperationRequestContext, ProviderCredentialAuditEvent, ProviderCredentialBinding,
-        ProviderCredentialBindingSpec, ProviderCredentialMutationContext, ProviderDeploymentSpec,
-        ProviderDeploymentWorkflow, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
+        OperationRequestContext, PagePosition, ProviderCredentialAuditEvent,
+        ProviderCredentialBinding, ProviderCredentialBindingSpec,
+        ProviderCredentialMutationContext, ProviderDeploymentSpec, ProviderDeploymentWorkflow,
+        ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
         ProviderDriverReleaseRegistry, ProviderInstallation, ProviderInstallationSpec,
         ProviderTarget, ProviderTargetGrant, ProviderTargetGrantAuditEvent,
         ProviderTargetGrantMutationContext, ProviderTargetGrantSpec,
@@ -40,7 +44,6 @@ const IDEMPOTENCY_KEY: &str = "idempotency-key";
 const REQUEST_ID: &str = "x-request-id";
 const CORRELATION_ID: &str = "x-correlation-id";
 const IF_MATCH: &str = "if-match";
-const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_RELEASE_DOCUMENT_BYTES: usize = 1024 * 1024;
 const RELEASE_UPLOAD_PREFIX: &str = ".driver-upload.";
 /// The release contract permits a 4 GiB host archive. The remaining 5 MiB
@@ -98,32 +101,18 @@ pub struct GrantProviderTargetRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ListQuery {
-    pub limit: Option<usize>,
-}
-
-impl ListQuery {
-    fn bounded_limit(&self) -> ApiResult<usize> {
-        let limit = self.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        if !(1..=1_000).contains(&limit) {
-            return Err(ApiError::BadRequest(
-                "limit must be between 1 and 1000".to_string(),
-            ));
-        }
-        Ok(limit)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProviderTargetGrantListQuery {
     pub limit: Option<usize>,
+    pub cursor: Option<String>,
     pub status: Option<String>,
 }
 
 impl ProviderTargetGrantListQuery {
-    fn bounded_limit(&self) -> ApiResult<usize> {
-        ListQuery { limit: self.limit }.bounded_limit()
+    fn page_query(&self) -> ListQuery {
+        ListQuery {
+            limit: self.limit,
+            cursor: self.cursor.clone(),
+        }
     }
 
     fn status_filter(&self) -> ApiResult<ProviderTargetGrantStatusFilter> {
@@ -136,69 +125,6 @@ impl ProviderTargetGrantListQuery {
             ))),
         }
     }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderCredentialBindingsResponse {
-    pub bindings: Vec<ProviderCredentialBinding>,
-    pub total: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderCredentialAuditResponse {
-    pub events: Vec<ProviderCredentialAuditEvent>,
-    pub total: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderInstallationsResponse {
-    pub installations: Vec<ProviderInstallation>,
-    pub total: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderTargetsResponse {
-    pub targets: Vec<ProviderTarget>,
-    pub total: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderDeploymentsResponse {
-    pub deployments: Vec<ProviderDeploymentWorkflow>,
-    pub total: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderTargetGrantsResponse {
-    pub grants: Vec<ProviderTargetGrant>,
-    pub total: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderTargetGrantAuditResponse {
-    pub events: Vec<ProviderTargetGrantAuditEvent>,
-    pub total: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderDriverReleasesResponse {
-    pub releases: Vec<ProviderDriverReleaseRecord>,
-    pub total: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderDriverReleaseAuditResponse {
-    pub events: Vec<ProviderDriverReleaseAuditEvent>,
-    pub total: usize,
 }
 
 pub async fn install_driver_release(
@@ -321,15 +247,28 @@ pub async fn install_driver_release(
 pub async fn list_driver_releases(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderDriverReleasesResponse>)> {
-    let releases = provider_registry(&state)?
-        .releases(query.bounded_limit()?)
+) -> ApiResult<(
+    HeaderMap,
+    Json<ControlListPage<ProviderDriverReleaseRecord>>,
+)> {
+    let collection = "provider-driver-releases";
+    let binding = format!(
+        "{};filter=all;sort=created-at-desc,release-digest-desc-v1",
+        provider_host_scope()?
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, &binding).await?;
+    let page = provider_registry(&state)?
+        .releases_page(limit, cursor)
         .await?;
-    let total = releases.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderDriverReleasesResponse { releases, total }),
-    ))
+    let response = list_page(&state.store, collection, &binding, limit, page, |release| {
+        PagePosition {
+            sort_value: release.created_at.timestamp(),
+            identity: release.release_digest.to_string(),
+        }
+    })
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn get_driver_release(
@@ -353,7 +292,10 @@ pub async fn driver_release_audit(
     State(state): State<CatalogState>,
     Path(release_digest): Path<String>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderDriverReleaseAuditResponse>)> {
+) -> ApiResult<(
+    HeaderMap,
+    Json<ControlListPage<ProviderDriverReleaseAuditEvent>>,
+)> {
     let release_digest = parse_digest(&release_digest, "provider driver release")?;
     let registry = provider_registry(&state)?;
     if registry.release(release_digest.clone()).await?.is_none() {
@@ -361,14 +303,25 @@ pub async fn driver_release_audit(
             "provider driver release {release_digest} not found"
         )));
     }
-    let events = registry
-        .audit_events(release_digest, query.bounded_limit()?)
+    let collection = "provider-driver-release-audit";
+    let binding = format!(
+        "{};release={};filter=all;sort=observed-at-asc,event-id-asc-v1",
+        provider_host_scope()?,
+        release_digest
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, &binding).await?;
+    let page = registry
+        .audit_events_page(release_digest, limit, cursor)
         .await?;
-    let total = events.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderDriverReleaseAuditResponse { events, total }),
-    ))
+    let response = list_page(&state.store, collection, &binding, limit, page, |event| {
+        PagePosition {
+            sort_value: event.observed_at.timestamp(),
+            identity: event.event_id.to_string(),
+        }
+    })
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn provision_credential(
@@ -398,16 +351,28 @@ pub async fn provision_credential(
 pub async fn list_credentials(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderCredentialBindingsResponse>)> {
-    let bindings = state
+) -> ApiResult<(HeaderMap, Json<ControlListPage<ProviderCredentialBinding>>)> {
+    let collection = "provider-credentials";
+    let binding = "scope=default-organization;filter=all;sort=created-at-asc,binding-id-asc-v1";
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, binding).await?;
+    let page = state
         .provider_credentials
-        .bindings(query.bounded_limit()?)
+        .bindings_page(limit, cursor)
         .await?;
-    let total = bindings.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderCredentialBindingsResponse { bindings, total }),
-    ))
+    let response = list_page(
+        &state.store,
+        collection,
+        binding,
+        limit,
+        page,
+        |credential| PagePosition {
+            sort_value: credential.created_at.timestamp(),
+            identity: credential.binding_id.to_string(),
+        },
+    )
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn get_credential(
@@ -475,7 +440,10 @@ pub async fn credential_audit(
     State(state): State<CatalogState>,
     Path(binding_id): Path<String>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderCredentialAuditResponse>)> {
+) -> ApiResult<(
+    HeaderMap,
+    Json<ControlListPage<ProviderCredentialAuditEvent>>,
+)> {
     let binding_id = parse_id(&binding_id, "provider credential binding")?;
     if state
         .provider_credentials
@@ -487,15 +455,24 @@ pub async fn credential_audit(
             "provider credential binding {binding_id} not found"
         )));
     }
-    let events = state
+    let collection = "provider-credential-audit";
+    let binding = format!(
+        "scope=provider-credential:{binding_id};filter=all;sort=occurred-at-asc,event-id-asc-v1"
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, &binding).await?;
+    let page = state
         .provider_credentials
-        .audit_events(binding_id, query.bounded_limit()?)
+        .audit_events_page(binding_id, limit, cursor)
         .await?;
-    let total = events.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderCredentialAuditResponse { events, total }),
-    ))
+    let response = list_page(&state.store, collection, &binding, limit, page, |event| {
+        PagePosition {
+            sort_value: event.occurred_at.timestamp(),
+            identity: event.event_id.to_string(),
+        }
+    })
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn register_installation(
@@ -524,19 +501,29 @@ pub async fn register_installation(
 pub async fn list_installations(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderInstallationsResponse>)> {
-    let installations = state
+) -> ApiResult<(HeaderMap, Json<ControlListPage<ProviderInstallation>>)> {
+    let collection = "provider-installations";
+    let binding =
+        "scope=default-organization;filter=all;sort=created-at-asc,installation-id-asc-v1";
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, binding).await?;
+    let page = state
         .store
-        .provider_installations(query.bounded_limit()?)
+        .provider_installations_page(limit, cursor)
         .await?;
-    let total = installations.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderInstallationsResponse {
-            installations,
-            total,
-        }),
-    ))
+    let response = list_page(
+        &state.store,
+        collection,
+        binding,
+        limit,
+        page,
+        |installation| PagePosition {
+            sort_value: installation.created_at.timestamp(),
+            identity: installation.installation_id.to_string(),
+        },
+    )
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn get_installation(
@@ -591,32 +578,48 @@ pub async fn list_installation_targets(
     State(state): State<CatalogState>,
     Path(installation_id): Path<String>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderTargetsResponse>)> {
+) -> ApiResult<(HeaderMap, Json<ControlListPage<ProviderTarget>>)> {
     let installation_id = parse_id(&installation_id, "provider installation")?;
-    let targets = state
+    let collection = "provider-targets";
+    let binding = format!(
+        "scope=provider-installation:{installation_id};filter=all;sort=created-at-asc,target-id-asc-v1"
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, &binding).await?;
+    let page = state
         .store
-        .provider_targets(Some(installation_id), query.bounded_limit()?)
+        .provider_targets_page(Some(installation_id), limit, cursor)
         .await?;
-    let total = targets.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderTargetsResponse { targets, total }),
-    ))
+    let response = list_page(&state.store, collection, &binding, limit, page, |target| {
+        PagePosition {
+            sort_value: target.created_at.timestamp(),
+            identity: target.target_id.to_string(),
+        }
+    })
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn list_targets(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderTargetsResponse>)> {
-    let targets = state
+) -> ApiResult<(HeaderMap, Json<ControlListPage<ProviderTarget>>)> {
+    let collection = "provider-targets";
+    let binding = "scope=default-organization;filter=all;sort=created-at-asc,target-id-asc-v1";
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, binding).await?;
+    let page = state
         .store
-        .provider_targets(None, query.bounded_limit()?)
+        .provider_targets_page(None, limit, cursor)
         .await?;
-    let total = targets.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderTargetsResponse { targets, total }),
-    ))
+    let response = list_page(&state.store, collection, binding, limit, page, |target| {
+        PagePosition {
+            sort_value: target.created_at.timestamp(),
+            identity: target.target_id.to_string(),
+        }
+    })
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn get_target(
@@ -670,26 +673,46 @@ pub async fn list_provider_target_grants(
     State(state): State<CatalogState>,
     Path((app_name, environment_name)): Path<(String, String)>,
     Query(query): Query<ProviderTargetGrantListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderTargetGrantsResponse>)> {
+) -> ApiResult<(HeaderMap, Json<ControlListPage<ProviderTargetGrant>>)> {
     let app = state.store.get_app(&app_name).await?;
     let environment = state
         .store
         .get_environment(&app_name, &environment_name)
         .await?;
-    let grants = state
+    let status = query.status_filter()?;
+    let status_name = match status {
+        ProviderTargetGrantStatusFilter::Active => "active",
+        ProviderTargetGrantStatusFilter::Revoked => "revoked",
+        ProviderTargetGrantStatusFilter::All => "all",
+    };
+    let collection = "provider-target-grants";
+    let binding = format!(
+        "scope=application:{}/environment:{};filter=status:{status_name};sort=created-at-desc,grant-id-desc-v1",
+        app.canonical_id, environment.canonical_id
+    );
+    let page_query = query.page_query();
+    let limit = page_query.bounded_limit()?;
+    let cursor = page_query
+        .position(&state.store, collection, &binding)
+        .await?;
+    let page = state
         .store
-        .provider_target_grants_for_environment(
+        .provider_target_grants_for_environment_page(
             app.canonical_id,
             environment.canonical_id,
-            query.status_filter()?,
-            query.bounded_limit()?,
+            status,
+            limit,
+            cursor,
         )
         .await?;
-    let total = grants.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderTargetGrantsResponse { grants, total }),
-    ))
+    let response = list_page(&state.store, collection, &binding, limit, page, |grant| {
+        PagePosition {
+            sort_value: grant.created_at.timestamp(),
+            identity: grant.grant_id.to_string(),
+        }
+    })
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn get_provider_target_grant(
@@ -728,18 +751,33 @@ pub async fn provider_target_grant_audit(
     State(state): State<CatalogState>,
     Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderTargetGrantAuditResponse>)> {
+) -> ApiResult<(
+    HeaderMap,
+    Json<ControlListPage<ProviderTargetGrantAuditEvent>>,
+)> {
     let grant_id = parse_id(&grant_id, "provider target grant")?;
-    provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
-    let events = state
+    let grant =
+        provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
+    let collection = "provider-target-grant-audit";
+    let binding = format!(
+        "scope=application:{}/environment:{}/grant:{};filter=all;sort=grant-revision-asc,event-id-asc-v1",
+        grant.application_id, grant.environment_id, grant.grant_id
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, &binding).await?;
+    let page = state
         .store
-        .provider_target_grant_audit_events(grant_id, query.bounded_limit()?)
+        .provider_target_grant_audit_events_page(grant_id, limit, cursor)
         .await?;
-    let total = events.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderTargetGrantAuditResponse { events, total }),
-    ))
+    let response = list_page(&state.store, collection, &binding, limit, page, |event| {
+        PagePosition {
+            sort_value: i64::try_from(event.grant_revision)
+                .expect("stored provider target grant revision fits SQLite INTEGER"),
+            identity: event.event_id.to_string(),
+        }
+    })
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 async fn provider_target_grant_in_scope(
@@ -801,25 +839,41 @@ pub async fn list_provider_deployments(
     State(state): State<CatalogState>,
     Path((app_name, environment_name)): Path<(String, String)>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<(HeaderMap, Json<ProviderDeploymentsResponse>)> {
+) -> ApiResult<(HeaderMap, Json<ControlListPage<ProviderDeploymentWorkflow>>)> {
     let app = state.store.get_app(&app_name).await?;
     let environment = state
         .store
         .get_environment(&app_name, &environment_name)
         .await?;
-    let deployments = state
+    let collection = "provider-deployments";
+    let binding = format!(
+        "scope=application:{}/environment:{};filter=all;sort=created-at-desc,operation-id-desc-v1",
+        app.canonical_id, environment.canonical_id
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query.position(&state.store, collection, &binding).await?;
+    let page = state
         .store
-        .provider_deployments_for_environment(
+        .provider_deployments_for_environment_page(
             app.canonical_id,
             environment.canonical_id,
-            query.bounded_limit()?,
+            limit,
+            cursor,
         )
         .await?;
-    let total = deployments.len();
-    Ok((
-        no_store_headers(),
-        Json(ProviderDeploymentsResponse { deployments, total }),
-    ))
+    let response = list_page(
+        &state.store,
+        collection,
+        &binding,
+        limit,
+        page,
+        |workflow| PagePosition {
+            sort_value: workflow.operation.created_at.timestamp(),
+            identity: workflow.operation.operation_id.to_string(),
+        },
+    )
+    .await?;
+    Ok((no_store_headers(), Json(response)))
 }
 
 pub async fn get_provider_deployment(
@@ -863,6 +917,15 @@ fn provider_registry(state: &CatalogState) -> ApiResult<ProviderDriverReleaseReg
                     .to_string(),
             )
         })
+}
+
+fn provider_host_scope() -> ApiResult<String> {
+    let host = HostOperatingSystem::current().ok_or_else(|| {
+        ApiError::NotConfigured(
+            "provider driver release management is unsupported on this Control host".to_string(),
+        )
+    })?;
+    Ok(format!("scope=host:{}", host.as_str()))
 }
 
 async fn next_named_field<'a>(
@@ -1246,8 +1309,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let listed = response_json(response).await;
-        assert_eq!(listed["total"], 1);
-        assert_eq!(listed["releases"][0]["releaseDigest"], release_digest);
+        assert_eq!(listed["page"]["total"], 1);
+        assert_eq!(listed["items"][0]["releaseDigest"], release_digest);
 
         let response = router
             .clone()
@@ -1263,8 +1326,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let audit = response_json(response).await;
-        assert_eq!(audit["total"], 1);
-        assert_eq!(audit["events"][0]["eventType"], "registered");
+        assert_eq!(audit["page"]["total"], 1);
+        assert_eq!(audit["items"][0]["eventType"], "registered");
 
         let response = router
             .clone()
@@ -1291,9 +1354,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let audit = response_json(response).await;
-        assert_eq!(audit["total"], 2);
-        assert_eq!(audit["events"][0]["eventType"], "registered");
-        assert_eq!(audit["events"][1]["eventType"], "verified");
+        assert_eq!(audit["page"]["total"], 2);
+        assert_eq!(audit["items"][0]["eventType"], "registered");
+        assert_eq!(audit["items"][1]["eventType"], "verified");
     }
 
     #[tokio::test]
@@ -1416,9 +1479,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let audit = response_json(response).await;
-        assert_eq!(audit["total"], 2);
-        assert_eq!(audit["events"][0]["eventType"], "provisioned");
-        assert_eq!(audit["events"][1]["eventType"], "rotated");
+        assert_eq!(audit["page"]["total"], 2);
+        assert_eq!(audit["items"][0]["eventType"], "provisioned");
+        assert_eq!(audit["items"][1]["eventType"], "rotated");
         assert!(!audit.to_string().contains(secret));
 
         let response = harness
@@ -1438,6 +1501,121 @@ mod tests {
         assert_eq!(response.headers()[header::ETAG], "\"3\"");
         let revoked = response_json(response).await;
         assert_eq!(revoked["status"], "revoked");
+    }
+
+    #[tokio::test]
+    async fn provider_lists_use_opaque_query_bound_cursors_and_true_totals() {
+        let harness = harness(true).await;
+        for name in ["account-a", "account-b", "account-c"] {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(json_request(
+                    Method::POST,
+                    "/api/providers/credentials",
+                    json!({
+                        "backendId": "cloudflare-workers-pages",
+                        "name": name,
+                        "credential": format!("test-only-{name}")
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/providers/credentials?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first = response_json(response).await;
+        assert_eq!(first["schemaVersion"], 1);
+        assert_eq!(first["items"].as_array().unwrap().len(), 2);
+        assert_eq!(first["page"]["limit"], 2);
+        assert_eq!(first["page"]["count"], 2);
+        assert_eq!(first["page"]["total"], 3);
+        let cursor = first["page"]["nextCursor"].as_str().unwrap();
+        assert_eq!(cursor.len(), 43);
+        assert!(!cursor.contains("account"));
+
+        let second_uri = format!("/api/providers/credentials?limit=1&cursor={cursor}");
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&second_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let second = response_json(response).await;
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second["page"]["limit"], 1);
+        assert_eq!(second["page"]["count"], 1);
+        assert_eq!(second["page"]["total"], 3);
+        assert!(second["page"]["nextCursor"].is_null());
+        assert!(
+            first["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["bindingId"] != second["items"][0]["bindingId"])
+        );
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&second_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["items"], second["items"]);
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/providers/installations?cursor={cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let mut tampered = cursor.as_bytes().to_vec();
+        tampered[0] = if tampered[0] == b'a' { b'b' } else { b'a' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        let response = harness
+            .router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/providers/credentials?limit=2&cursor={tampered}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1555,7 +1733,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let targets = response_json(response).await;
-        assert_eq!(targets["total"], 0);
+        assert_eq!(targets["page"]["total"], 0);
     }
 
     #[tokio::test]
@@ -1674,8 +1852,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let listed = response_json(response).await;
-        assert_eq!(listed["total"], 1);
-        assert_eq!(listed["grants"][0]["grantId"], grant_id);
+        assert_eq!(listed["page"]["total"], 1);
+        assert_eq!(listed["items"][0]["grantId"], grant_id);
 
         let response = router
             .clone()
@@ -1744,9 +1922,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let audit = response_json(response).await;
-        assert_eq!(audit["total"], 2);
-        assert_eq!(audit["events"][0]["eventType"], "granted");
-        assert_eq!(audit["events"][1]["eventType"], "revoked");
+        assert_eq!(audit["page"]["total"], 2);
+        assert_eq!(audit["items"][0]["eventType"], "granted");
+        assert_eq!(audit["items"][1]["eventType"], "revoked");
 
         let response = router
             .clone()
@@ -1759,7 +1937,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_json(response).await["total"], 1);
+        assert_eq!(response_json(response).await["page"]["total"], 1);
+
+        let response = router
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/apps/demo/environments/production/provider-target-grants",
+                json!({"providerTargetId": target_id, "note": "replacement grant"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let replacement_grant_id = response_json(response).await["grantId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(replacement_grant_id, grant_id);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/demo/environments/production/provider-target-grants?status=all&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first_page = response_json(response).await;
+        assert_eq!(first_page["page"]["total"], 2);
+        assert_eq!(first_page["page"]["count"], 1);
+        let cursor = first_page["page"]["nextCursor"].as_str().unwrap();
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/apps/demo/environments/production/provider-target-grants?status=active&cursor={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/apps/demo/environments/production/provider-target-grants?status=all&cursor={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let second_page = response_json(response).await;
+        assert_eq!(second_page["page"]["total"], 2);
+        assert_eq!(second_page["page"]["count"], 1);
+        assert!(second_page["page"]["nextCursor"].is_null());
+        assert_ne!(
+            first_page["items"][0]["grantId"],
+            second_page["items"][0]["grantId"]
+        );
+
         let response = router
             .oneshot(
                 Request::builder()
@@ -1843,6 +2090,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let deployments = response_json(response).await;
-        assert_eq!(deployments["total"], 0);
+        assert_eq!(deployments["page"]["total"], 0);
     }
 }

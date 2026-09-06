@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/contracts/v1/control-list-page.schema.json",
+  "title": "Deislet Control list page envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "items", "page"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "items": {
+      "type": "array",
+      "maxItems": 1000,
+      "description": "Resources in stable keyset order. Its length MUST equal page.count."
+    },
+    "page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit", "count", "total", "nextCursor"],
+      "properties": {
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "count": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exact number of resources matching the bound scope and filters in the read snapshot; MUST be at least page.count."
+        },
+        "nextCursor": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$",
+              "description": "Opaque URL-safe 256-bit cursor. It is not authorization and MUST be rejected outside the issuing collection, scope, filter, and sort."
+            },
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  }
+}

@@ -30,6 +30,7 @@ use super::operation::{
     OperationRequestContext, actor_id, default_organization_id, find_operation_request_tx,
     load_operation_tx, transition_operation_tx,
 };
+use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
 use super::provider_driver_release::ProviderDriverDispatcher;
 use super::provider_target_grant::active_provider_target_grant_tx;
 use super::store::CatalogStore;
@@ -285,35 +286,49 @@ impl CatalogStore {
         &self,
         limit: usize,
     ) -> CatalogResult<Vec<ProviderInstallation>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider installation limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self.provider_installations_page(limit, None).await?.items)
+    }
+
+    pub async fn provider_installations_page(
+        &self,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderInstallation>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider installation")?;
         self.database()
             .with_connection(move |connection| {
-                let mut statement = connection.prepare(
+                let transaction = connection.unchecked_transaction()?;
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_installations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (after_created_at, after_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
                     "SELECT installation_id FROM provider_installations
-                      ORDER BY created_at, installation_id LIMIT ?1",
+                      WHERE ?1 IS NULL OR created_at > ?1
+                         OR (created_at = ?1 AND installation_id > ?2)
+                      ORDER BY created_at, installation_id LIMIT ?3",
                 )?;
                 let ids = statement
-                    .query_map(
-                        [i64::try_from(limit).map_err(|_| {
-                            CatalogError::invalid(
-                                "provider installation limit exceeds SQLite range",
-                            )
-                        })?],
-                        |row| row.get::<_, String>(0),
-                    )?
+                    .query_map(params![after_created_at, after_id, fetch_limit], |row| {
+                        row.get::<_, String>(0)
+                    })?
                     .collect::<Result<Vec<_>, _>>()?;
-                ids.into_iter()
+                let installations = ids
+                    .into_iter()
                     .map(|id| {
                         let id = parse_id(&id, "provider installation")?;
-                        load_installation(connection, id)?.ok_or_else(|| {
+                        load_installation(&transaction, id)?.ok_or_else(|| {
                             CatalogError::not_found(format!("provider installation {id}"))
                         })
                     })
-                    .collect()
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(installations, limit, total, "provider installation")
             })
             .await
     }
@@ -429,69 +444,64 @@ impl CatalogStore {
         installation_id: Option<CanonicalId>,
         limit: usize,
     ) -> CatalogResult<Vec<ProviderTarget>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider target limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self
+            .provider_targets_page(installation_id, limit, None)
+            .await?
+            .items)
+    }
+
+    pub async fn provider_targets_page(
+        &self,
+        installation_id: Option<CanonicalId>,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderTarget>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider target")?;
         self.database()
             .with_connection(move |connection| {
-                let mut ids = Vec::new();
-                match installation_id {
-                    Some(installation_id) => {
-                        if load_installation(connection, installation_id)?.is_none() {
-                            return Err(CatalogError::not_found(format!(
-                                "provider installation {installation_id}"
-                            )));
-                        }
-                        let mut statement = connection.prepare(
-                            "SELECT target_id FROM provider_targets
-                              WHERE installation_id = ?1
-                              ORDER BY created_at, target_id LIMIT ?2",
-                        )?;
-                        ids.extend(
-                            statement
-                                .query_map(
-                                    params![
-                                        installation_id.to_string(),
-                                        i64::try_from(limit).map_err(|_| {
-                                            CatalogError::invalid(
-                                                "provider target limit exceeds SQLite range",
-                                            )
-                                        })?,
-                                    ],
-                                    |row| row.get::<_, String>(0),
-                                )?
-                                .collect::<Result<Vec<_>, _>>()?,
-                        );
-                    }
-                    None => {
-                        let mut statement = connection.prepare(
-                            "SELECT target_id FROM provider_targets
-                              ORDER BY created_at, target_id LIMIT ?1",
-                        )?;
-                        ids.extend(
-                            statement
-                                .query_map(
-                                    [i64::try_from(limit).map_err(|_| {
-                                        CatalogError::invalid(
-                                            "provider target limit exceeds SQLite range",
-                                        )
-                                    })?],
-                                    |row| row.get::<_, String>(0),
-                                )?
-                                .collect::<Result<Vec<_>, _>>()?,
-                        );
-                    }
+                let transaction = connection.unchecked_transaction()?;
+                if let Some(installation_id) = installation_id
+                    && load_installation(&transaction, installation_id)?.is_none()
+                {
+                    return Err(CatalogError::not_found(format!(
+                        "provider installation {installation_id}"
+                    )));
                 }
-                ids.into_iter()
+                let installation_id = installation_id.map(|id| id.to_string());
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_targets
+                      WHERE ?1 IS NULL OR installation_id = ?1",
+                    [installation_id.as_deref()],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (after_created_at, after_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
+                    "SELECT target_id FROM provider_targets
+                      WHERE (?1 IS NULL OR installation_id = ?1)
+                        AND (?2 IS NULL OR created_at > ?2
+                             OR (created_at = ?2 AND target_id > ?3))
+                      ORDER BY created_at, target_id LIMIT ?4",
+                )?;
+                let ids = statement
+                    .query_map(
+                        params![installation_id, after_created_at, after_id, fetch_limit,],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let targets = ids
+                    .into_iter()
                     .map(|id| {
                         let id = parse_id(&id, "provider target")?;
-                        load_target(connection, id)?
+                        load_target(&transaction, id)?
                             .map(|stored| stored.target)
                             .ok_or_else(|| CatalogError::not_found(format!("provider target {id}")))
                     })
-                    .collect()
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(targets, limit, total, "provider target")
             })
             .await
     }
@@ -715,40 +725,63 @@ impl CatalogStore {
         environment_id: CanonicalId,
         limit: usize,
     ) -> CatalogResult<Vec<ProviderDeploymentWorkflow>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider deployment limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self
+            .provider_deployments_for_environment_page(application_id, environment_id, limit, None)
+            .await?
+            .items)
+    }
+
+    pub async fn provider_deployments_for_environment_page(
+        &self,
+        application_id: CanonicalId,
+        environment_id: CanonicalId,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderDeploymentWorkflow>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider deployment")?;
         self.database()
             .with_connection(move |connection| {
-                let mut statement = connection.prepare(
+                let transaction = connection.unchecked_transaction()?;
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_deployment_workflows
+                      WHERE application_id = ?1 AND environment_id = ?2",
+                    params![application_id.to_string(), environment_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (before_created_at, before_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
                     "SELECT operation_id FROM provider_deployment_workflows
                       WHERE application_id = ?1 AND environment_id = ?2
-                      ORDER BY created_at DESC, operation_id DESC LIMIT ?3",
+                        AND (?3 IS NULL OR created_at < ?3
+                             OR (created_at = ?3 AND operation_id < ?4))
+                      ORDER BY created_at DESC, operation_id DESC LIMIT ?5",
                 )?;
                 let ids = statement
                     .query_map(
                         params![
                             application_id.to_string(),
                             environment_id.to_string(),
-                            i64::try_from(limit).map_err(|_| {
-                                CatalogError::invalid(
-                                    "provider deployment limit exceeds SQLite range",
-                                )
-                            })?,
+                            before_created_at,
+                            before_id,
+                            fetch_limit,
                         ],
                         |row| row.get::<_, String>(0),
                     )?
                     .collect::<Result<Vec<_>, _>>()?;
-                ids.into_iter()
+                let deployments = ids
+                    .into_iter()
                     .map(|id| {
                         let id = parse_id(&id, "provider deployment operation")?;
-                        load_provider_deployment_workflow(connection, id)?.ok_or_else(|| {
+                        load_provider_deployment_workflow(&transaction, id)?.ok_or_else(|| {
                             CatalogError::not_found(format!("provider deployment operation {id}"))
                         })
                     })
-                    .collect()
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(deployments, limit, total, "provider deployment")
             })
             .await
     }

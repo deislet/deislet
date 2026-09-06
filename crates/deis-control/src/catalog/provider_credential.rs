@@ -19,6 +19,7 @@ use serde::Serialize;
 
 use super::model::now_secs;
 use super::operation::{OperationRequestContext, actor_id, default_organization_id};
+use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
 use super::secrets::{SecretsBackend, provider_credential_revision_aad};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
@@ -199,36 +200,50 @@ impl CatalogProviderCredentialVault {
     }
 
     pub async fn bindings(&self, limit: usize) -> CatalogResult<Vec<ProviderCredentialBinding>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider credential binding limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self.bindings_page(limit, None).await?.items)
+    }
+
+    pub async fn bindings_page(
+        &self,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderCredentialBinding>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider credential binding")?;
         self.store
             .database()
             .with_connection(move |connection| {
-                let mut statement = connection.prepare(
+                let transaction = connection.unchecked_transaction()?;
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_credential_bindings",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (after_created_at, after_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
                     "SELECT binding_id FROM provider_credential_bindings
-                      ORDER BY created_at, binding_id LIMIT ?1",
+                      WHERE ?1 IS NULL OR created_at > ?1
+                         OR (created_at = ?1 AND binding_id > ?2)
+                      ORDER BY created_at, binding_id LIMIT ?3",
                 )?;
                 let ids = statement
-                    .query_map(
-                        [i64::try_from(limit).map_err(|_| {
-                            CatalogError::invalid(
-                                "provider credential binding limit exceeds SQLite range",
-                            )
-                        })?],
-                        |row| row.get::<_, String>(0),
-                    )?
+                    .query_map(params![after_created_at, after_id, fetch_limit], |row| {
+                        row.get::<_, String>(0)
+                    })?
                     .collect::<Result<Vec<_>, _>>()?;
-                ids.into_iter()
+                let bindings = ids
+                    .into_iter()
                     .map(|id| {
                         let id = parse_id(&id, "provider credential binding")?;
-                        load_binding(connection, id)?.ok_or_else(|| {
+                        load_binding(&transaction, id)?.ok_or_else(|| {
                             CatalogError::not_found(format!("provider credential binding {id}"))
                         })
                     })
-                    .collect()
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(bindings, limit, total, "provider credential binding")
             })
             .await
     }
@@ -389,36 +404,62 @@ impl CatalogProviderCredentialVault {
         binding_id: CanonicalId,
         limit: usize,
     ) -> CatalogResult<Vec<ProviderCredentialAuditEvent>> {
-        if !(1..=1_000).contains(&limit) {
-            return Err(CatalogError::invalid(
-                "provider credential audit limit must be between 1 and 1000",
-            ));
-        }
+        Ok(self.audit_events_page(binding_id, limit, None).await?.items)
+    }
+
+    pub async fn audit_events_page(
+        &self,
+        binding_id: CanonicalId,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<ProviderCredentialAuditEvent>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "provider credential audit")?;
         self.store
             .database()
             .with_connection(move |connection| {
-                let mut statement = connection.prepare(
+                let transaction = connection.unchecked_transaction()?;
+                if load_binding(&transaction, binding_id)?.is_none() {
+                    return Err(CatalogError::not_found(format!(
+                        "provider credential binding {binding_id}"
+                    )));
+                }
+                let total = transaction.query_row(
+                    "SELECT COUNT(*) FROM provider_credential_audit_events
+                      WHERE binding_id = ?1",
+                    [binding_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let (after_occurred_at, after_id) = cursor
+                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
+                    .unwrap_or((None, String::new()));
+                let mut statement = transaction.prepare(
                     "SELECT event_id, binding_id, credential_revision, lease_id,
                             operation_id, owner_id, claim_epoch, actor_id,
                             event_type, disposition, occurred_at
                        FROM provider_credential_audit_events
                       WHERE binding_id = ?1
-                      ORDER BY occurred_at, event_id LIMIT ?2",
+                        AND (?2 IS NULL OR occurred_at > ?2
+                             OR (occurred_at = ?2 AND event_id > ?3))
+                      ORDER BY occurred_at, event_id LIMIT ?4",
                 )?;
                 let rows = statement
                     .query_map(
                         params![
                             binding_id.to_string(),
-                            i64::try_from(limit).map_err(|_| {
-                                CatalogError::invalid(
-                                    "provider credential audit limit exceeds SQLite range",
-                                )
-                            })?,
+                            after_occurred_at,
+                            after_id,
+                            fetch_limit,
                         ],
                         audit_event_from_row,
                     )?
                     .collect::<Result<Vec<_>, _>>()?;
-                rows.into_iter().map(try_audit_event).collect()
+                let events = rows
+                    .into_iter()
+                    .map(try_audit_event)
+                    .collect::<CatalogResult<Vec<_>>>()?;
+                drop(statement);
+                transaction.commit()?;
+                finish_page(events, limit, total, "provider credential audit")
             })
             .await
     }

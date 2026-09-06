@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {"id": "0199b603-0e48-733c-9864-4c9dd92d5328"},
+    {"id": "0199b603-20bd-7342-9be3-cef10620d8bb"}
+  ],
+  "page": {
+    "limit": 2,
+    "count": 2,
+    "total": 3,
+    "nextCursor": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+  }
+}

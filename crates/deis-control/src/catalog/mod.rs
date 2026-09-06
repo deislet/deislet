@@ -38,6 +38,7 @@ pub mod identity_migration;
 pub mod limits;
 pub mod model;
 pub mod operation;
+pub mod pagination;
 pub mod provider_credential;
 pub mod provider_deployment_reconciler;
 pub mod provider_driver_operation;
@@ -72,6 +73,7 @@ pub use model::{
     Environment, ProviderDerivation, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
+pub use pagination::{CatalogPage, PagePosition};
 pub use provider_credential::{
     CatalogProviderCredentialVault, ProviderCredentialAuditEvent, ProviderCredentialBinding,
     ProviderCredentialBindingSpec, ProviderCredentialMutationContext,
