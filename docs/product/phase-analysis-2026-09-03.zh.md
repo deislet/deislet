@@ -2694,4 +2694,11 @@ Application/framework source + versioned build plan
   12 项（1 blocker、6 major、5 minor）全部修复。
 - 未完成：五个已定义但尚无路由产出的细粒度码（limit-out-of-range、offset-out-of-range、cursor-invalid、already-exists、
   idempotency-key-required）待逐路由采用；`scripts/demo.sh` 仍走旧前缀（demo CI 最慢，单独切换）；幂等请求摘要的服务端
-  HMAC；provider deployment cancel/rollback；旧库两代索引清退。本节为本机工作节点，尚无提交后精确归档或三平台 evidence。
+  HMAC；provider deployment cancel/rollback；旧库两代索引清退。
+- 精确源码提交 `592636306ed9c5c80924940e2d39b590487a9919`（tree `b4c363b5e831cadde18489b838bbd2086d147392`）生成
+  17,418,240-byte git archive，SHA-256 为 `bea11cdee9102b6788c67fe50ab850b040a7abdc21b00971059d3a0c3921dee2`。同一归档在
+  Linux/macOS 通过 provider-driver 62/62、Windows 54/54；三端通过 Control provider 61/61、pagination 20/20、authz 38/38
+  （含前缀折叠与 Operator scope 回归）、grant 3/3、协调器 3/3、五项 migration 各 1/1 与严格五 crate all-target Clippy；
+  Linux 另通过 18 份 Schema/57 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。evidence Schema 相应放行 18/57 计数。
+  正式记录为 `evidence/provider-driver-dispatcher-portability-5926363.json`；它证明这些控制路径的三平台代码可移植性，
+  不证明真实 provider 部署或 Edge Canon 合规。

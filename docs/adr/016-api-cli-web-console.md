@@ -327,7 +327,9 @@ Linux、macOS、Windows 通过 provider 60/60、pagination 19/19、authz、grant
 平台诊断面移入 `/api/platform/*` 并在 authz 表标为 Operator scope，events/commands/heartbeats/config history 迁入统一分页
 契约；`/api/v1` 与 `/api/platform` 返回 `control-error` 结构化 envelope（26 个稳定码、requestId、retryable），旧前缀逐字节
 不变；OpenAPI 由 utoipa 生成并提交为 `contracts/openapi/v1.json`，drift 测试与仓内 `check-openapi-compat.py` 门禁进 CI；
-CLI/Web 改用新前缀并解析 envelope。
+CLI/Web 改用新前缀并解析 envelope。精确提交 `592636306ed9c5c80924940e2d39b590487a9919` 的同一 SHA-256 校验归档已在
+Linux、macOS、Windows 通过 provider 61/61、pagination 20/20、authz 38/38、grant、协调器、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
+`../product/evidence/provider-driver-dispatcher-portability-5926363.json`。
 
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：细粒度错误码尚未逐路由采用；generated client 仍以示例反序列化校验替代；
 provider deployment cancel/rollback 未完成；Web 尚无 organization/application/environment 主线。

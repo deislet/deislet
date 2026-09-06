@@ -127,8 +127,8 @@
         "command": {"const": "python3 scripts/check-shared-contracts.py"},
         "outcome": {"const": "passed"},
         "exitCode": {"const": 0},
-        "schemas": {"enum": [11, 14, 15, 16, 17]},
-        "fixtures": {"enum": [29, 37, 42, 48, 50]}
+        "schemas": {"enum": [11, 14, 15, 16, 17, 18]},
+        "fixtures": {"enum": [29, 37, 42, 48, 50, 57]}
       }
     },
     "requiredOperatingSystems": {
