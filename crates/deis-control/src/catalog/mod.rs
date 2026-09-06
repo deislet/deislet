@@ -73,7 +73,7 @@ pub use model::{
     Environment, ProviderDerivation, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
 pub use operation::OperationRequestContext;
-pub use pagination::{CatalogPage, PagePosition};
+pub use pagination::{CatalogPage, PageCursorStore, PagePosition};
 pub use provider_credential::{
     CatalogProviderCredentialVault, ProviderCredentialAuditEvent, ProviderCredentialBinding,
     ProviderCredentialBindingSpec, ProviderCredentialMutationContext,
@@ -97,6 +97,7 @@ pub use provider_target_grant::{
 pub use secrets::{SecretCipher, SecretsBackend};
 pub use store::{
     BundlePathRepair, CatalogStore, DeploymentPlanSpec, ProviderDerivationSpec, SecretHeadChange,
+    domain_grant_cursor_secondary,
 };
 
 use thiserror::Error;

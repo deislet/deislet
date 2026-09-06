@@ -38,14 +38,10 @@ use serde::Serialize;
 use tracing::{error, info, warn};
 
 use crate::catalog::model::now_secs;
+use crate::catalog::pagination::{finish_page, sqlite_fetch_limit};
+use crate::catalog::{CatalogError, CatalogPage, CatalogResult, PageCursorStore, PagePosition};
 use crate::database::{Database, DatabaseError};
 use crate::identity::{Principal, PrincipalKind};
-
-/// Most lines one query will return, whatever the caller asks for. A reader
-/// that wants more pages back through `before`.
-pub const MAX_QUERY_LIMIT: usize = 500;
-
-const DEFAULT_QUERY_LIMIT: usize = 50;
 
 const AUDIT_COLUMNS: &str = "id, at, actor_kind, actor_account, actor_credential, action, \
                              app_id, environment, target, method, path, peer, outcome, \
@@ -259,20 +255,75 @@ impl AuditRecordBuilder {
     }
 }
 
-/// What a reader is asking the log for.
-#[derive(Debug, Clone, Default)]
+/// The filters a reader combines with "and". Paging is not one of them:
+/// the position is an opaque cursor the list route hands out, bound to
+/// exactly this set of filters.
+///
+/// `app_id` and `environment` are matched against what the audit line
+/// recorded, which is the name in the request path at the time - a line
+/// outlives the application it names, so there is no id to resolve it to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditQuery {
     pub app_id: Option<String>,
     pub environment: Option<String>,
     pub account: Option<String>,
     pub action: Option<String>,
     pub outcome: Option<Outcome>,
+    /// Unix seconds, inclusive.
     pub since: Option<i64>,
     pub until: Option<i64>,
-    /// Return only lines older than this id, which is how a reader pages
-    /// backwards through a log that is still being written to.
-    pub before: Option<i64>,
-    pub limit: Option<usize>,
+}
+
+impl AuditQuery {
+    /// The `WHERE` clauses and their bound values, in order. Shared by the
+    /// count and the row read so the two can never disagree about which
+    /// lines they are talking about.
+    fn clauses(self) -> (Vec<String>, Vec<Box<dyn rusqlite::ToSql + Send>>) {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<Box<dyn rusqlite::ToSql + Send>> = Vec::new();
+        let mut push = |clause: &str, value: Box<dyn rusqlite::ToSql + Send>| {
+            binds.push(value);
+            clauses.push(format!("{clause} ?{}", binds.len()));
+        };
+        if let Some(app) = self.app_id {
+            push("app_id =", Box::new(app));
+        }
+        if let Some(environment) = self.environment {
+            push("environment =", Box::new(environment));
+        }
+        if let Some(account) = self.account {
+            push("actor_account =", Box::new(account));
+        }
+        if let Some(action) = self.action {
+            push("action =", Box::new(action));
+        }
+        if let Some(outcome) = self.outcome {
+            push("outcome =", Box::new(outcome.as_str().to_string()));
+        }
+        if let Some(since) = self.since {
+            push("at >=", Box::new(since));
+        }
+        if let Some(until) = self.until {
+            push("at <=", Box::new(until));
+        }
+        (clauses, binds)
+    }
+}
+
+/// Decode an audit cursor into `(at, id)`. The line id is an integer
+/// column, so it travels as text in the position and is parsed back here;
+/// anything else is a cursor that was never issued for this list.
+fn audit_cursor(cursor: Option<PagePosition>) -> CatalogResult<(Option<i64>, i64)> {
+    match cursor {
+        Some(position) => {
+            let id = position
+                .identity
+                .parse::<i64>()
+                .map_err(|_| CatalogError::invalid("audit cursor position is malformed"))?;
+            Ok((Some(position.sort_value), id))
+        }
+        None => Ok((None, 0)),
+    }
 }
 
 pub struct AuditStore {
@@ -282,6 +333,12 @@ pub struct AuditStore {
 impl AuditStore {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
+    }
+
+    /// Opaque list-cursor persistence for the audit list, backed by the
+    /// same table the catalog lists use.
+    pub fn page_cursors(&self) -> PageCursorStore {
+        PageCursorStore::new(Arc::clone(&self.db))
     }
 
     /// Append one line.
@@ -346,59 +403,58 @@ impl AuditStore {
         }
     }
 
-    /// Read the log back, newest first.
-    pub async fn query(&self, query: AuditQuery) -> Result<Vec<AuditEntry>, DatabaseError> {
-        let limit = query
-            .limit
-            .unwrap_or(DEFAULT_QUERY_LIMIT)
-            .clamp(1, MAX_QUERY_LIMIT);
-
+    /// One page of the log, newest first: `(at DESC, id DESC)`, the wall
+    /// clock an operator reads and the insertion id to make equal seconds
+    /// deterministic. The total is counted over the same filters in the
+    /// same read transaction as the rows, so it is exact for the page.
+    pub async fn query_page(
+        &self,
+        query: AuditQuery,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<AuditEntry>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "audit entries")?;
+        let (before_at, before_id) = audit_cursor(cursor)?;
         self.db
             .with_connection(move |conn| {
-                let mut sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log");
-                let mut clauses: Vec<String> = Vec::new();
-                let mut binds: Vec<Box<dyn rusqlite::ToSql + Send>> = Vec::new();
-
-                let mut push = |clause: &str, value: Box<dyn rusqlite::ToSql + Send>| {
-                    binds.push(value);
-                    clauses.push(format!("{clause} ?{}", binds.len()));
+                let transaction = conn.unchecked_transaction()?;
+                let (mut clauses, mut binds) = query.clauses();
+                let filter = if clauses.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WHERE {}", clauses.join(" AND "))
                 };
-                if let Some(app) = query.app_id {
-                    push("app_id =", Box::new(app));
-                }
-                if let Some(environment) = query.environment {
-                    push("environment =", Box::new(environment));
-                }
-                if let Some(account) = query.account {
-                    push("actor_account =", Box::new(account));
-                }
-                if let Some(action) = query.action {
-                    push("action =", Box::new(action));
-                }
-                if let Some(outcome) = query.outcome {
-                    push("outcome =", Box::new(outcome.as_str().to_string()));
-                }
-                if let Some(since) = query.since {
-                    push("at >=", Box::new(since));
-                }
-                if let Some(until) = query.until {
-                    push("at <=", Box::new(until));
-                }
-                if let Some(before) = query.before {
-                    push("id <", Box::new(before));
-                }
-                if !clauses.is_empty() {
-                    sql.push_str(" WHERE ");
-                    sql.push_str(&clauses.join(" AND "));
-                }
-                sql.push_str(&format!(" ORDER BY id DESC LIMIT {limit}"));
+                let total = transaction.query_row(
+                    &format!("SELECT COUNT(*) FROM audit_log{filter}"),
+                    rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+                    |row| row.get::<_, i64>(0),
+                )?;
 
-                let mut stmt = conn.prepare(&sql)?;
-                let params = rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref()));
+                binds.push(Box::new(before_at));
+                let at_index = binds.len();
+                binds.push(Box::new(before_id));
+                let id_index = binds.len();
+                clauses.push(format!(
+                    "(?{at_index} IS NULL OR at < ?{at_index} \
+                       OR (at = ?{at_index} AND id < ?{id_index}))"
+                ));
+                binds.push(Box::new(fetch_limit));
+                let limit_index = binds.len();
+                let sql = format!(
+                    "SELECT {AUDIT_COLUMNS} FROM audit_log WHERE {} \
+                     ORDER BY at DESC, id DESC LIMIT ?{limit_index}",
+                    clauses.join(" AND ")
+                );
+                let mut stmt = transaction.prepare(&sql)?;
                 let rows = stmt
-                    .query_map(params, read_entry)?
+                    .query_map(
+                        rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+                        read_entry,
+                    )?
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, DatabaseError>(rows)
+                drop(stmt);
+                transaction.commit()?;
+                finish_page(rows, limit, total, "audit entries")
             })
             .await
     }
@@ -460,6 +516,15 @@ mod tests {
         AuditStore::new(Arc::new(db))
     }
 
+    async fn page(
+        store: &AuditStore,
+        query: AuditQuery,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogPage<AuditEntry> {
+        store.query_page(query, limit, cursor).await.unwrap()
+    }
+
     fn alice() -> Principal {
         Principal {
             kind: PrincipalKind::Account,
@@ -487,7 +552,7 @@ mod tests {
             )
             .await;
 
-        let lines = store.query(AuditQuery::default()).await.unwrap();
+        let lines = page(&store, AuditQuery::default(), 100, None).await.items;
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
         assert_eq!(line.actor_account.as_deref(), Some("alice"));
@@ -532,13 +597,17 @@ mod tests {
             )
             .await;
 
-        let refusals = store
-            .query(AuditQuery {
+        let refusals = page(
+            &store,
+            AuditQuery {
                 outcome: Some(Outcome::Refused),
                 ..Default::default()
-            })
-            .await
-            .unwrap();
+            },
+            100,
+            None,
+        )
+        .await
+        .items;
         assert_eq!(refusals.len(), 1);
         assert_eq!(refusals[0].target.as_deref(), Some("TOKEN"));
         assert_eq!(refusals[0].actor_kind, "anonymous");
@@ -570,7 +639,8 @@ mod tests {
             )
             .await;
         let dump =
-            serde_json::to_string(&store.query(AuditQuery::default()).await.unwrap()).unwrap();
+            serde_json::to_string(&page(&store, AuditQuery::default(), 100, None).await.items)
+                .unwrap();
         assert!(dump.contains("DB_URL"));
         assert!(
             !dump.contains("postgres://"),
@@ -605,49 +675,69 @@ mod tests {
         }
 
         let by_app = store
-            .query(AuditQuery {
-                app_id: Some("demo".to_string()),
-                ..Default::default()
-            })
+            .query_page(
+                AuditQuery {
+                    app_id: Some("demo".to_string()),
+                    ..Default::default()
+                },
+                100,
+                None,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(by_app.len(), 2);
         // Newest first, so an operator reads what just happened at the top.
         assert_eq!(by_app[0].action, "rollback");
 
         let by_account = store
-            .query(AuditQuery {
-                account: Some("bob".to_string()),
-                ..Default::default()
-            })
+            .query_page(
+                AuditQuery {
+                    account: Some("bob".to_string()),
+                    ..Default::default()
+                },
+                100,
+                None,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(by_account.len(), 1);
         assert_eq!(by_account[0].app_id.as_deref(), Some("other"));
 
         let by_action = store
-            .query(AuditQuery {
-                action: Some("deploy".to_string()),
-                ..Default::default()
-            })
+            .query_page(
+                AuditQuery {
+                    action: Some("deploy".to_string()),
+                    ..Default::default()
+                },
+                100,
+                None,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(by_action.len(), 2);
 
         let future = store
-            .query(AuditQuery {
-                since: Some(now_secs() + 3600),
-                ..Default::default()
-            })
+            .query_page(
+                AuditQuery {
+                    since: Some(now_secs() + 3600),
+                    ..Default::default()
+                },
+                100,
+                None,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert!(future.is_empty());
     }
 
-    /// A reader must not be able to ask for the whole table in one call, and
-    /// must be able to walk backwards through it.
+    /// A page is bounded, its total counts the whole filtered log, and the
+    /// cursor position it ends on resumes exactly one line later.
     #[tokio::test]
-    async fn a_query_is_bounded_and_pages_backwards() {
+    async fn a_query_is_bounded_and_pages_through_a_keyset() {
         let store = store().await;
         for index in 0..5 {
             store
@@ -661,33 +751,66 @@ mod tests {
                 .await;
         }
 
-        let first = store
-            .query(AuditQuery {
-                limit: Some(2),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[0].action, "action.4");
+        let first = page(&store, AuditQuery::default(), 2, None).await;
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(first.total, 5);
+        assert!(first.has_more);
+        assert_eq!(first.items[0].action, "action.4");
 
-        let next = store
-            .query(AuditQuery {
-                limit: Some(2),
-                before: Some(first[1].id),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(next[0].action, "action.2");
+        let last = &first.items[1];
+        let next = page(
+            &store,
+            AuditQuery::default(),
+            2,
+            Some(PagePosition {
+                sort_value: last.at,
+                identity: last.id.to_string(),
+                secondary: None,
+            }),
+        )
+        .await;
+        assert_eq!(next.items[0].action, "action.2");
+        assert_eq!(next.total, 5);
 
-        let capped = store
-            .query(AuditQuery {
-                limit: Some(usize::MAX),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(capped.len() <= MAX_QUERY_LIMIT);
+        let end = page(
+            &store,
+            AuditQuery::default(),
+            2,
+            Some(PagePosition {
+                sort_value: next.items[1].at,
+                identity: next.items[1].id.to_string(),
+                secondary: None,
+            }),
+        )
+        .await;
+        assert_eq!(end.items.len(), 1);
+        assert!(!end.has_more);
+
+        assert!(
+            store
+                .query_page(AuditQuery::default(), 0, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .query_page(AuditQuery::default(), 1_001, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .query_page(
+                    AuditQuery::default(),
+                    2,
+                    Some(PagePosition {
+                        sort_value: 0,
+                        identity: "not-a-line-id".to_string(),
+                        secondary: None,
+                    }),
+                )
+                .await
+                .is_err()
+        );
     }
 }

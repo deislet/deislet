@@ -33,7 +33,9 @@ use super::model::{
     RetiredAppName, Route, SecretMeta, Version, now_secs, validate_app_id,
     validate_environment_name, validate_path_prefix, validate_route_priority, validate_secret_name,
 };
-use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
+use super::pagination::{
+    CatalogPage, PageCursorStore, PagePosition, finish_page, sqlite_fetch_limit,
+};
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
@@ -188,6 +190,13 @@ impl CatalogStore {
     /// planes that must not both fire have in common.
     pub fn database(&self) -> Arc<Database> {
         Arc::clone(&self.db)
+    }
+
+    /// Opaque list-cursor persistence for the catalog lists. Every store on
+    /// this database hands out the same table, so a cursor issued here is
+    /// resolvable by whichever list API bound it.
+    pub fn page_cursors(&self) -> PageCursorStore {
+        PageCursorStore::new(Arc::clone(&self.db))
     }
 
     /// Run a closure against the shared connection with the error type
@@ -3041,25 +3050,49 @@ impl CatalogStore {
         .await
     }
 
-    /// Deployment history, newest first.
-    pub async fn list_deployments(
+    /// Deployment history page, newest first, with the canonical (UUIDv7)
+    /// identity as the tie-breaker.
+    ///
+    /// This is the public history read, not the pointer read: "the current
+    /// deployment" still resolves through `DEPLOYMENT_ORDER`, whose `rowid`
+    /// tie-breaker is an internal SQLite detail a cursor must not encode
+    /// (`VACUUM` may renumber it). The public row `id` is a random UUIDv4,
+    /// so it cannot order pointers written inside one second either. The
+    /// canonical id is allocated monotonically by the writer, so several
+    /// pointers landing in the same second still list in the order they
+    /// were written, which is the order the pointer read observes.
+    pub async fn list_deployments_page(
         &self,
         env_id: &str,
         limit: usize,
-    ) -> CatalogResult<Vec<Deployment>> {
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<Deployment>> {
         let env_id = env_id.to_string();
-        let limit = limit as i64;
+        let fetch_limit = sqlite_fetch_limit(limit, "deployments")?;
+        let (before_created_at, before_id) = descending_cursor(cursor);
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(&format!(
+            let transaction = conn.unchecked_transaction()?;
+            let total = transaction.query_row(
+                "SELECT COUNT(*) FROM deployments WHERE env_id = ?1",
+                [&env_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut statement = transaction.prepare(&format!(
                 "SELECT {DEPLOYMENT_COLUMNS} FROM deployments
-                     WHERE env_id = ?1 ORDER BY {DEPLOYMENT_ORDER} LIMIT ?2"
+                  WHERE env_id = ?1
+                    AND (?2 IS NULL OR created_at < ?2
+                         OR (created_at = ?2 AND canonical_id < ?3))
+                  ORDER BY created_at DESC, canonical_id DESC LIMIT ?4"
             ))?;
-            let rows = stmt.query_map(params![env_id, limit], map_deployment)?;
-            let mut deployments = Vec::new();
-            for row in rows {
-                deployments.push(row?);
-            }
-            Ok(deployments)
+            let rows = statement
+                .query_map(
+                    params![env_id, before_created_at, before_id, fetch_limit],
+                    map_deployment,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "deployments")
         })
         .await
     }
@@ -3197,6 +3230,53 @@ impl CatalogStore {
                 routes.push(row?);
             }
             Ok(routes)
+        })
+        .await
+    }
+
+    /// Public API page of one environment's routes in matcher order: highest
+    /// priority first, then path prefix, then the immutable route id so two
+    /// routes sharing a priority and prefix (on different hosts) still page
+    /// deterministically.
+    pub async fn list_routes_page(
+        &self,
+        env_id: &str,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<Route>> {
+        let env_id = env_id.to_string();
+        let fetch_limit = sqlite_fetch_limit(limit, "routes")?;
+        let (after_priority, after_path_prefix, after_id) = route_cursor(cursor)?;
+        self.with_conn(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let total = transaction.query_row(
+                "SELECT COUNT(*) FROM routes WHERE env_id = ?1",
+                [&env_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {ROUTE_COLUMNS} FROM routes
+                  WHERE env_id = ?1
+                    AND (?2 IS NULL OR priority < ?2
+                         OR (priority = ?2 AND path_prefix > ?3)
+                         OR (priority = ?2 AND path_prefix = ?3 AND id > ?4))
+                  ORDER BY priority DESC, path_prefix ASC, id ASC LIMIT ?5"
+            ))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        env_id,
+                        after_priority,
+                        after_path_prefix,
+                        after_id,
+                        fetch_limit
+                    ],
+                    map_route,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "routes")
         })
         .await
     }
@@ -3362,9 +3442,45 @@ impl CatalogStore {
         Ok(grant)
     }
 
-    /// The whole registry, in a stable order.
-    pub async fn list_domain_grants(&self) -> CatalogResult<Vec<DomainGrant>> {
-        self.with_conn(load_domain_grants_ordered).await
+    /// Public API page of the whole registry in primary-key order:
+    /// `(pattern, app_id, environment)` ascending. The table has no id
+    /// column, so the triple itself is the keyset.
+    pub async fn list_domain_grants_page(
+        &self,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<DomainGrant>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "domain grants")?;
+        let after = domain_grant_cursor(cursor)?;
+        self.with_conn(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let total = transaction.query_row("SELECT COUNT(*) FROM domain_grants", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            let (after_pattern, after_app_id, after_environment) = match &after {
+                Some((pattern, app_id, environment)) => (
+                    Some(pattern.as_str()),
+                    Some(app_id.as_str()),
+                    Some(environment.as_str()),
+                ),
+                None => (None, None, None),
+            };
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {DOMAIN_GRANT_COLUMNS} FROM domain_grants
+                  WHERE (?1 IS NULL OR (pattern, app_id, environment) > (?1, ?2, ?3))
+                  ORDER BY pattern ASC, app_id ASC, environment ASC LIMIT ?4"
+            ))?;
+            let rows = statement
+                .query_map(
+                    params![after_pattern, after_app_id, after_environment, fetch_limit],
+                    map_domain_grant,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "domain grants")
+        })
+        .await
     }
 
     /// Withdraw a grant.
@@ -3790,25 +3906,42 @@ impl CatalogStore {
         .await
     }
 
-    /// Names and timestamps only. There is deliberately no API that reads
-    /// a secret value back out.
-    pub async fn list_secrets(&self, env_id: &str) -> CatalogResult<Vec<SecretMeta>> {
+    /// Names and timestamps only, one page at a time in name order. There
+    /// is deliberately no API that reads a secret value back out. The
+    /// `secret_heads` primary key `(env_id, name)` is the keyset index.
+    pub async fn list_secrets_page(
+        &self,
+        env_id: &str,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> CatalogResult<CatalogPage<SecretMeta>> {
         let env_id = env_id.to_string();
+        let fetch_limit = sqlite_fetch_limit(limit, "secrets")?;
+        let after_name = identity_only_cursor(cursor, "secrets")?;
         self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare("SELECT name, revision_id, updated_at FROM secret_heads WHERE env_id = ?1 ORDER BY name")?;
-            let rows = stmt.query_map(params![env_id], |row| {
-                Ok(SecretMeta {
-                    name: row.get(0)?,
-                    revision: row.get(1)?,
-                    updated_at: row.get(2)?,
-                })
-            })?;
-            let mut secrets = Vec::new();
-            for row in rows {
-                secrets.push(row?);
-            }
-            Ok(secrets)
+            let transaction = conn.unchecked_transaction()?;
+            let total = transaction.query_row(
+                "SELECT COUNT(*) FROM secret_heads WHERE env_id = ?1",
+                [&env_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut statement = transaction.prepare(
+                "SELECT name, revision_id, updated_at FROM secret_heads
+                  WHERE env_id = ?1 AND (?2 IS NULL OR name > ?2)
+                  ORDER BY name ASC LIMIT ?3",
+            )?;
+            let rows = statement
+                .query_map(params![env_id, after_name, fetch_limit], |row| {
+                    Ok(SecretMeta {
+                        name: row.get(0)?,
+                        revision: row.get(1)?,
+                        updated_at: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            finish_page(rows, limit, total, "secrets")
         })
         .await
     }
@@ -4099,6 +4232,70 @@ fn descending_cursor(cursor: Option<PagePosition>) -> (Option<i64>, String) {
         .unwrap_or((None, String::new()))
 }
 
+/// Separator between the application id and the environment name inside a
+/// domain-grant cursor's secondary key. Both halves are slugs (or the `*`
+/// every-environment marker), so the character cannot occur in either.
+const DOMAIN_GRANT_CURSOR_SEPARATOR: char = '/';
+
+/// Encode the grantee half of a domain-grant keyset position.
+pub fn domain_grant_cursor_secondary(app_id: &str, environment: &str) -> String {
+    format!("{app_id}{DOMAIN_GRANT_CURSOR_SEPARATOR}{environment}")
+}
+
+/// Decode a route cursor into `(priority, path_prefix, id)`.
+///
+/// Routes have no timestamp, so the sort is `priority DESC, path_prefix ASC,
+/// id ASC` and the cursor carries all three: `sort_value` is the priority,
+/// `secondary` the path prefix, `identity` the route id.
+fn route_cursor(cursor: Option<PagePosition>) -> CatalogResult<(Option<i64>, String, String)> {
+    match cursor {
+        Some(PagePosition {
+            sort_value,
+            identity,
+            secondary: Some(path_prefix),
+        }) => Ok((Some(sort_value), path_prefix, identity)),
+        Some(_) => Err(CatalogError::invalid(
+            "routes cursor is missing its path prefix position",
+        )),
+        None => Ok((None, String::new(), String::new())),
+    }
+}
+
+/// Decode a domain-grant cursor into `(pattern, app_id, environment)`.
+///
+/// The registry's key is that triple and it has no id column, so the
+/// position stores the pattern as `identity`, the grantee as
+/// `secondary` (see [`domain_grant_cursor_secondary`]) and no numeric
+/// sort value.
+fn domain_grant_cursor(
+    cursor: Option<PagePosition>,
+) -> CatalogResult<Option<(String, String, String)>> {
+    let Some(position) = cursor else {
+        return Ok(None);
+    };
+    let grantee = match (position.sort_value, position.secondary) {
+        (0, Some(grantee)) => grantee,
+        _ => {
+            return Err(CatalogError::invalid(
+                "domain grants cursor contains an invalid sort position",
+            ));
+        }
+    };
+    let (app_id, environment) = grantee
+        .split_once(DOMAIN_GRANT_CURSOR_SEPARATOR)
+        .ok_or_else(|| CatalogError::invalid("domain grants cursor grantee is malformed"))?;
+    if app_id.is_empty() || environment.is_empty() {
+        return Err(CatalogError::invalid(
+            "domain grants cursor grantee is malformed",
+        ));
+    }
+    Ok(Some((
+        position.identity,
+        app_id.to_string(),
+        environment.to_string(),
+    )))
+}
+
 fn map_app(row: &Row<'_>) -> rusqlite::Result<App> {
     Ok(App {
         id: row.get(0)?,
@@ -4314,17 +4511,6 @@ fn load_domain_grants(conn: &Connection) -> CatalogResult<Vec<DomainGrant>> {
     for row in rows {
         grants.push(row?);
     }
-    Ok(grants)
-}
-
-fn load_domain_grants_ordered(conn: &Connection) -> CatalogResult<Vec<DomainGrant>> {
-    let mut grants = load_domain_grants(conn)?;
-    grants.sort_by(|a, b| {
-        a.pattern
-            .cmp(&b.pattern)
-            .then_with(|| a.app_id.cmp(&b.app_id))
-            .then_with(|| a.environment.cmp(&b.environment))
-    });
     Ok(grants)
 }
 
@@ -4878,9 +5064,16 @@ mod tests {
         assert_eq!(current.note.as_deref(), Some("rollback"));
 
         // Nothing was rewritten: the whole history is still there.
-        let history = store.list_deployments(&env.id, 50).await.unwrap();
+        let history = store
+            .list_deployments_page(&env.id, 50, None)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(history.len(), 4);
         assert_eq!(history[0].version_id, v1.id);
+        assert_eq!(history[0].note.as_deref(), Some("rollback"));
+        assert_eq!(history[1].version_id, v3.id);
+        assert_eq!(history[2].version_id, v2.id);
         assert_eq!(history[3].version_id, v1.id);
     }
 
@@ -5788,14 +5981,24 @@ mod tests {
             .unwrap();
         store.delete_app("demo").await.unwrap();
         assert_eq!(
-            store.list_domain_grants().await.unwrap().len(),
+            store
+                .list_domain_grants_page(100, None)
+                .await
+                .unwrap()
+                .items
+                .len(),
             1,
             "a deletion alone retires the name and hands it to nobody, so the grant stands"
         );
 
         store.release_retired_name("demo").await.unwrap();
         assert!(
-            store.list_domain_grants().await.unwrap().is_empty(),
+            store
+                .list_domain_grants_page(100, None)
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
             "the next application called demo is somebody else and inherits no hostname"
         );
     }
@@ -5823,7 +6026,11 @@ mod tests {
             "the same grant twice is a conflict, not a silent second row"
         );
 
-        let listed = store.list_domain_grants().await.unwrap();
+        let listed = store
+            .list_domain_grants_page(100, None)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].pattern, "*.example.com");
         assert_eq!(listed[0].environment, "production");
@@ -5837,7 +6044,14 @@ mod tests {
             .delete_domain_grant("*.example.com", "demo", "production")
             .await
             .unwrap();
-        assert!(store.list_domain_grants().await.unwrap().is_empty());
+        assert!(
+            store
+                .list_domain_grants_page(100, None)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
         assert!(
             store.get_route(&env.id, &route.id).await.is_ok(),
             "withdrawing a grant must not be a way to take an application off the internet"
@@ -5902,7 +6116,11 @@ mod tests {
             .await
             .unwrap();
 
-        let listed = store.list_secrets(&env.id).await.unwrap();
+        let listed = store
+            .list_secrets_page(&env.id, 100, None)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(listed.len(), 2, "the same name must not be stored twice");
         assert_eq!(listed[0].name, "API_KEY");
 
@@ -5912,7 +6130,15 @@ mod tests {
         assert!(store.put_secret(&env, "bad-name", vec![1]).await.is_err());
 
         store.delete_secret(&env, "API_KEY").await.unwrap();
-        assert_eq!(store.list_secrets(&env.id).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_secrets_page(&env.id, 100, None)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
         assert!(store.delete_secret(&env, "API_KEY").await.is_err());
     }
 
@@ -6025,7 +6251,15 @@ mod tests {
             winner.id,
             "a stale activation moved the pointer after losing compare-and-swap"
         );
-        assert_eq!(store.list_deployments(&env.id, 10).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_deployments_page(&env.id, 10, None)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6534,5 +6768,136 @@ mod tests {
             ],
             "a name can be retired twice and both applications' data is still there"
         );
+    }
+
+    /// The product-list pages walk their keysets exactly as the API binds
+    /// them, and a cursor lacking the column a sort needs is refused rather
+    /// than silently treated as "from the start".
+    #[tokio::test]
+    async fn environment_product_pages_walk_their_composite_keysets() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        grant_everything(&store, "demo").await;
+
+        // Routes: priority DESC, then path prefix, then id.
+        for (path_prefix, priority) in [("/zzz", 10), ("/", 0), ("/api", 10), ("/a", 5)] {
+            store
+                .create_route(&env, None, path_prefix, priority)
+                .await
+                .unwrap();
+        }
+        let page = store.list_routes_page(&env.id, 1, None).await.unwrap();
+        assert_eq!(page.total, 4);
+        assert!(page.has_more);
+        assert_eq!(page.items[0].path_prefix, "/api");
+        let after = PagePosition {
+            sort_value: page.items[0].priority,
+            identity: page.items[0].id.clone(),
+            secondary: Some(page.items[0].path_prefix.clone()),
+        };
+        let page = store
+            .list_routes_page(&env.id, 10, Some(after.clone()))
+            .await
+            .unwrap();
+        assert_eq!(page.total, 4);
+        assert!(!page.has_more);
+        let prefixes: Vec<&str> = page
+            .items
+            .iter()
+            .map(|route| route.path_prefix.as_str())
+            .collect();
+        assert_eq!(prefixes, ["/zzz", "/a", "/"]);
+        let missing_prefix = PagePosition {
+            secondary: None,
+            ..after
+        };
+        assert!(
+            store
+                .list_routes_page(&env.id, 10, Some(missing_prefix))
+                .await
+                .is_err(),
+            "a route cursor without its path prefix cannot resume anywhere"
+        );
+
+        // Domain grants: the primary-key triple, ascending.
+        store
+            .create_domain_grant("*.example.com", "demo", "production", None)
+            .await
+            .unwrap();
+        store
+            .create_domain_grant("*.example.com", "demo", EVERY_ENVIRONMENT, None)
+            .await
+            .unwrap();
+        let page = store.list_domain_grants_page(2, None).await.unwrap();
+        assert_eq!(page.total, 3);
+        assert!(page.has_more);
+        assert_eq!(page.items[0].pattern, "*");
+        assert_eq!(page.items[1].pattern, "*.example.com");
+        assert_eq!(page.items[1].environment, EVERY_ENVIRONMENT);
+        let after = PagePosition {
+            sort_value: 0,
+            identity: page.items[1].pattern.clone(),
+            secondary: Some(domain_grant_cursor_secondary(
+                &page.items[1].app_id,
+                &page.items[1].environment,
+            )),
+        };
+        let page = store
+            .list_domain_grants_page(2, Some(after.clone()))
+            .await
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert!(!page.has_more);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].environment, "production");
+        for malformed in [
+            PagePosition {
+                secondary: None,
+                ..after.clone()
+            },
+            PagePosition {
+                secondary: Some("no-separator".to_string()),
+                ..after.clone()
+            },
+            PagePosition {
+                sort_value: 1,
+                ..after
+            },
+        ] {
+            assert!(
+                store
+                    .list_domain_grants_page(2, Some(malformed))
+                    .await
+                    .is_err()
+            );
+        }
+
+        // Secrets: name only, like environments.
+        store
+            .put_secret(&env, "ZED", b"ciphertext".to_vec())
+            .await
+            .unwrap();
+        store
+            .put_secret(&env, "ALPHA", b"ciphertext".to_vec())
+            .await
+            .unwrap();
+        let page = store.list_secrets_page(&env.id, 1, None).await.unwrap();
+        assert_eq!(page.total, 2);
+        assert!(page.has_more);
+        assert_eq!(page.items[0].name, "ALPHA");
+        let page = store
+            .list_secrets_page(
+                &env.id,
+                1,
+                Some(PagePosition {
+                    sort_value: 0,
+                    identity: "ALPHA".to_string(),
+                    secondary: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!page.has_more);
+        assert_eq!(page.items[0].name, "ZED");
     }
 }

@@ -462,6 +462,18 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // the database fills it before a newer process can observe a NULL.
     ensure_canonical_ids(conn)?;
 
+    // The public history page reads `created_at DESC, canonical_id DESC`
+    // with a keyset cursor, so the tie-breaker has to be in the index too or
+    // every page after the first sorts the whole environment again. The
+    // canonical id (UUIDv7, allocated in write order) is the tie-breaker
+    // because the public `id` is a random UUIDv4 that cannot order pointers
+    // written inside one second. It is created after `ensure_canonical_ids`
+    // because a legacy database gains the column only there.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_deployments_env_page_v1 ON deployments(env_id, created_at DESC, canonical_id DESC)",
+        [],
+    )?;
+
     // Routes bind a host plus path prefix to one environment of one app.
     // A NULL host matches any domain.
     conn.execute(
@@ -480,6 +492,13 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_routes_env ON routes(env_id)",
+        [],
+    )?;
+
+    // The per-environment route page reads matcher order
+    // (`priority DESC, path_prefix, id`) with a keyset cursor.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_routes_env_page_v1 ON routes(env_id, priority DESC, path_prefix, id)",
         [],
     )?;
 
@@ -1039,6 +1058,27 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Keyset paging over the account list: `created_at` then the unique
+    // name, which is the tie-breaker the cursor carries. New names so an
+    // existing database receives the indexes on its next start.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_accounts_page_v1 ON accounts(created_at, name)",
+        [],
+    )?;
+
+    // Keyset paging over the token list, whole collection and per account.
+    // The token id is the tie-breaker; the revoked and unscoped filters are
+    // applied on top of the ordered scan.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_api_tokens_page_v1 ON api_tokens(created_at, id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_api_tokens_account_page_v1 \
+         ON api_tokens(account_id, created_at, id)",
+        [],
+    )?;
+
     // The audit log. Append-only by construction: nothing in this codebase
     // updates or deletes a row, and no endpoint reaches one.
     conn.execute(
@@ -1078,6 +1118,31 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_audit_outcome ON audit_log(outcome, id DESC)",
+        [],
+    )?;
+
+    // The audit list pages by `(at DESC, id DESC)`: the wall clock first,
+    // because that is what an operator reads, and the insertion id to make
+    // equal seconds deterministic. One index per common filter so the
+    // filtered scans stay ordered, plus one for the unfiltered log. New
+    // names so existing databases receive them on their next start.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_page_v1 ON audit_log(at DESC, id DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_app_page_v1 \
+         ON audit_log(app_id, at DESC, id DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_account_page_v1 \
+         ON audit_log(actor_account, at DESC, id DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_outcome_page_v1 \
+         ON audit_log(outcome, at DESC, id DESC)",
         [],
     )?;
 

@@ -79,14 +79,22 @@ pub async fn list_apps(
     let collection = "applications";
     let binding = "scope=global;filter=all;sort=id-asc-v1";
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, binding)
+        .await?;
     let page = state.store.list_apps_page(limit, cursor).await?;
-    let response = list_page(&state.store, collection, binding, limit, page, |app| {
-        crate::catalog::PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        binding,
+        limit,
+        page,
+        |app| crate::catalog::PagePosition {
             sort_value: 0,
             identity: app.id.clone(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok(Json(response))
 }
@@ -225,14 +233,22 @@ pub async fn list_retired_apps(
     let collection = "retired-applications";
     let binding = "scope=global;filter=all;sort=application-id-asc-v1";
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, binding)
+        .await?;
     let page = state.store.list_retired_names_page(limit, cursor).await?;
-    let response = list_page(&state.store, collection, binding, limit, page, |retired| {
-        crate::catalog::PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        binding,
+        limit,
+        page,
+        |retired| crate::catalog::PagePosition {
             sort_value: 0,
             identity: retired.app_id.clone(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok(Json(response))
 }
@@ -277,8 +293,20 @@ pub(super) async fn resolve_environment(
     app_id: &str,
     env_name: &str,
 ) -> Result<crate::catalog::Environment, ApiError> {
-    state.store.get_app(app_id).await?;
-    Ok(state.store.get_environment(app_id, env_name).await?)
+    let (_, environment) = resolve_app_environment(state, app_id, env_name).await?;
+    Ok(environment)
+}
+
+/// Like [`resolve_environment`], keeping the application too. The list
+/// endpoints need both canonical ids to bind a cursor to its scope.
+pub(super) async fn resolve_app_environment(
+    state: &CatalogState,
+    app_id: &str,
+    env_name: &str,
+) -> Result<(crate::catalog::App, crate::catalog::Environment), ApiError> {
+    let app = state.store.get_app(app_id).await?;
+    let environment = state.store.get_environment(app_id, env_name).await?;
+    Ok((app, environment))
 }
 
 #[cfg(test)]

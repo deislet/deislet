@@ -602,7 +602,9 @@ pub async fn list_versions(
         id_scope("application", app.canonical_id)
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = state
         .store
         .list_versions_page(&app_id, limit, cursor)
@@ -610,15 +612,21 @@ pub async fn list_versions(
     let next_position = page.items.last().map(|version| PagePosition {
         sort_value: version.number,
         identity: version.id.clone(),
+        secondary: None,
     });
     let page = CatalogPage {
         items: page.items.iter().map(VersionView::from).collect(),
         total: page.total,
         has_more: page.has_more,
     };
-    let response = list_page(&state.store, collection, &binding, limit, page, move |_| {
-        next_position.expect("a page with a successor has a last version")
-    })
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        move |_| next_position.expect("a page with a successor has a last version"),
+    )
     .await?;
     Ok(Json(response))
 }

@@ -18,7 +18,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
@@ -26,8 +26,9 @@ use tracing::warn;
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::pagination::{ControlListPage, ListQuery, environment_scope, list_page};
 use crate::catalog::secrets::secret_revision_aad;
-use crate::catalog::{DeploymentPlan, SecretMeta};
+use crate::catalog::{DeploymentPlan, PagePosition, SecretMeta};
 use crate::delivery::{DeliveryReport, SecretChangePreparation};
 
 #[derive(Deserialize)]
@@ -35,12 +36,6 @@ pub struct PutSecretRequest {
     /// Plaintext value. It is encrypted before it touches the database and
     /// is never written to a log.
     pub value: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SecretsResponse {
-    pub secrets: Vec<SecretMeta>,
-    pub total: usize,
 }
 
 /// What a write to a secret answers: the metadata of the secret itself -
@@ -208,13 +203,36 @@ async fn discard_staged_revision(
 pub async fn list_secrets(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
-) -> ApiResult<Json<SecretsResponse>> {
-    let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
-    let secrets = state.store.list_secrets(&env.id).await?;
-    Ok(Json(SecretsResponse {
-        total: secrets.len(),
-        secrets,
-    }))
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<SecretMeta>>> {
+    let (app, env) = super::apps::resolve_app_environment(&state, &app_id, &env_name).await?;
+    let collection = "environment-secrets";
+    let binding = format!(
+        "{};filter=all;sort=name-asc-v1",
+        environment_scope(app.canonical_id, env.canonical_id)
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
+    let page = state
+        .store
+        .list_secrets_page(&env.id, limit, cursor)
+        .await?;
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |secret| PagePosition {
+            sort_value: 0,
+            identity: secret.name.clone(),
+            secondary: None,
+        },
+    )
+    .await?;
+    Ok(Json(response))
 }
 
 /// DELETE /api/apps/:app_id/environments/:env/secrets/:name
@@ -374,7 +392,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{listed}");
-        assert_eq!(listed["secrets"][0]["revision"], second_revision);
+        assert_eq!(listed["items"][0]["revision"], second_revision);
 
         // Deleting is the same story: without a redelivery the nodes would
         // keep serving a value that no longer exists.

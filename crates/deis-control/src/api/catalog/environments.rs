@@ -46,13 +46,15 @@ pub async fn list_environments(
         id_scope("application", app.canonical_id)
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = state
         .store
         .list_environments_page(&app_id, limit, cursor)
         .await?;
     let response = list_page(
-        &state.store,
+        &state.store.page_cursors(),
         collection,
         &binding,
         limit,
@@ -60,6 +62,7 @@ pub async fn list_environments(
         |environment| crate::catalog::PagePosition {
             sort_value: 0,
             identity: environment.name.clone(),
+            secondary: None,
         },
     )
     .await?;

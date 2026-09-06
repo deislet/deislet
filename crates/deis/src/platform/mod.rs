@@ -24,6 +24,61 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 const DEPLOYMENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const DEPLOYMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The version of the control plane's list envelope this build reads.
+const LIST_SCHEMA_VERSION: u8 = 1;
+/// The largest page any list route serves; a larger `limit=` is refused,
+/// not clamped, so a caller that asks for one page of "the latest N" caps
+/// N here itself.
+const MAX_LIST_LIMIT: usize = 1_000;
+/// How many pages one list may be read as before this CLI gives up.
+///
+/// A control plane that keeps handing out a `nextCursor` forever would
+/// otherwise turn one `deis versions` into an unbounded stream of requests.
+/// At the server's default page size this cap is a million rows, so nothing
+/// a real catalog holds ever reaches it.
+const MAX_LIST_PAGES: usize = 10_000;
+
+/// One page of the control plane's unified list envelope.
+///
+/// Every paginated list route answers this exact shape, so one type reads
+/// all of them and one helper walks them to the end. `T` is whatever the
+/// route lists.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPage<T> {
+    pub schema_version: u8,
+    pub items: Vec<T>,
+    pub page: PageMeta,
+}
+
+/// What the control plane says about the page it just answered with.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageMeta {
+    /// The page size actually applied, which is the server's default when
+    /// the request named none.
+    pub limit: usize,
+    /// How many rows this page carries. Equal to `items.len()`.
+    pub count: usize,
+    /// How many rows the same query has in total, counted by the control
+    /// plane in the same read as the items.
+    pub total: usize,
+    /// The token that reads the page after this one, absent on the last.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// Add `cursor=<token>` to a list path, keeping whatever query it already
+/// carries.
+///
+/// The token is opaque to this CLI - it is the control plane's own string -
+/// so it is percent-encoded rather than trusted to be URL-safe.
+fn append_cursor(path: &str, cursor: &str) -> String {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    let encoded: String = url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect();
+    format!("{path}{separator}cursor={encoded}")
+}
+
 /// An application as the catalog records it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct App {
@@ -70,11 +125,6 @@ pub struct Version {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct VersionsResponse {
-    pub versions: Vec<Version>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct UploadResponse {
     pub version: Version,
     /// False when a byte-identical bundle was already stored, in which case
@@ -115,11 +165,6 @@ pub struct Environment {
     pub app_id: String,
     pub name: String,
     pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct EnvironmentsResponse {
-    pub environments: Vec<Environment>,
 }
 
 /// One pointer row: this environment ran this version from this moment.
@@ -256,11 +301,6 @@ pub struct SecretMeta {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SecretsResponse {
-    pub secrets: Vec<SecretMeta>,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecretChangeResponse {
     pub secret: SecretMeta,
@@ -367,11 +407,6 @@ pub struct Account {
     pub disabled_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AccountsResponse {
-    pub accounts: Vec<Account>,
-}
-
 /// One credential, as a listing shows it. There is deliberately no field a
 /// secret could arrive in: the control plane stores a digest and has no
 /// endpoint that reads a token back.
@@ -396,12 +431,13 @@ pub struct ApiToken {
     pub revoked_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct TokensResponse {
+/// What `deis token list` prints: every credential the filters admit, and
+/// how many live credentials answer to no scope at all. The count is the
+/// control plane's own (the total of a `scope=unscoped` listing), so every
+/// reader gets the same number.
+#[derive(Debug, Clone)]
+pub struct TokenListing {
     pub tokens: Vec<ApiToken>,
-    /// How many of them are unscoped, counted by the control plane so every
-    /// reader gets the same number.
-    #[serde(default)]
     pub unscoped: usize,
 }
 
@@ -440,11 +476,6 @@ pub struct AuditEntry {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AuditResponse {
-    pub entries: Vec<AuditEntry>,
-}
-
 /// What `deis audit` is asking for. Every field is optional and they are
 /// combined with "and", which is how an operator narrows a log down to the
 /// one thing they are chasing.
@@ -456,6 +487,7 @@ pub struct AuditFilter {
     pub action: Option<String>,
     pub outcome: Option<String>,
     pub since: Option<i64>,
+    /// Most lines to read, newest first: one page of at most this many.
     pub limit: Option<usize>,
 }
 
@@ -531,6 +563,88 @@ impl Control {
         Ok((status, headers, body))
     }
 
+    /// Read a paginated list route to its end, following `nextCursor` until
+    /// the control plane stops handing one out.
+    ///
+    /// The page size is left to the server's default; a caller that wants a
+    /// different one writes `limit=` into `path` itself, and this helper
+    /// carries that query along when it appends the cursor.
+    async fn list_all<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        what: &str,
+    ) -> Result<Vec<T>> {
+        let mut items: Vec<T> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for page_number in 1..=MAX_LIST_PAGES {
+            let url = match &cursor {
+                Some(token) => append_cursor(path, token),
+                None => path.to_string(),
+            };
+            let page: ListPage<T> = self.send(self.request(Method::GET, &url), what).await?;
+            if page.schema_version != LIST_SCHEMA_VERSION {
+                // Readable, since the items themselves parsed - but say so
+                // once, because a field this CLI prints may have moved.
+                tracing::warn!(
+                    path,
+                    schema_version = page.schema_version,
+                    expected = LIST_SCHEMA_VERSION,
+                    "control plane answered a list envelope this CLI does not know"
+                );
+            }
+            if page.page.count != page.items.len() {
+                // Only ever a control-plane bug: the contract says the two
+                // are the same number. What arrived is still what is used.
+                tracing::warn!(
+                    path,
+                    page_number,
+                    claimed = page.page.count,
+                    received = page.items.len(),
+                    "control plane counted a page differently than it filled it"
+                );
+            }
+            tracing::debug!(
+                path,
+                page_number,
+                limit = page.page.limit,
+                count = page.items.len(),
+                total = page.page.total,
+                has_next = page.page.next_cursor.is_some(),
+                "read one page of a control-plane list"
+            );
+            let empty = page.items.is_empty();
+            items.extend(page.items);
+            cursor = page.page.next_cursor;
+            match cursor {
+                None => return Ok(items),
+                Some(_) if empty => {
+                    // Following this would ask for page after page of
+                    // nothing, so refuse instead of hanging on a control
+                    // plane that contradicts itself.
+                    tracing::error!(
+                        path,
+                        page_number,
+                        "control plane offered another page after an empty one"
+                    );
+                    bail!(
+                        "{what}: the control plane answered an empty page and still offered \
+                         another one; it is not paginating this list correctly"
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        tracing::error!(
+            path,
+            pages = MAX_LIST_PAGES,
+            "gave up following a control-plane list that never ended"
+        );
+        bail!(
+            "{what}: the control plane is still offering more pages after {MAX_LIST_PAGES}; \
+             stopping rather than reading forever"
+        )
+    }
+
     fn transport_error(&self, e: reqwest::Error) -> anyhow::Error {
         anyhow::anyhow!(
             "could not reach the control plane at {}: {e}\nCheck that deis-control is running and \
@@ -578,11 +692,15 @@ impl Control {
                                       your account."
                 .to_string(),
             StatusCode::NOT_FOUND => {
-                // Every 404 this CLI can provoke means the same thing: it
-                // named an application, environment or version the catalog
-                // does not have. Two commands list all three.
-                "\nThe control plane has no such record. `deis versions` lists an application's \
-                 versions; `deis status` lists its environments and what each runs."
+                // A 404 means this CLI named something the control plane
+                // does not have - an application, environment or version
+                // most often, but `deis token list` and `deis token create`
+                // provoke one for an unknown `--account` too. The control
+                // plane's own message says which, so this only names the
+                // commands that list each kind.
+                "\nThe control plane has no such record; its message above names it. `deis \
+                 versions` lists an application's versions, `deis status` its environments and \
+                 what each runs, and `deis account list` the accounts."
                     .to_string()
             }
             StatusCode::SERVICE_UNAVAILABLE => {
@@ -707,25 +825,21 @@ impl Control {
     }
 
     pub async fn list_versions(&self, app_id: &str) -> Result<Vec<Version>> {
-        let response: VersionsResponse = self
-            .send(
-                self.request(Method::GET, &format!("/api/apps/{app_id}/versions")),
-                &format!("listing the versions of app {app_id}"),
-            )
-            .await?;
-        Ok(response.versions)
+        self.list_all(
+            &format!("/api/apps/{app_id}/versions"),
+            &format!("listing the versions of app {app_id}"),
+        )
+        .await
     }
 
     // ---- environments -------------------------------------------------
 
     pub async fn list_environments(&self, app_id: &str) -> Result<Vec<Environment>> {
-        let response: EnvironmentsResponse = self
-            .send(
-                self.request(Method::GET, &format!("/api/apps/{app_id}/environments")),
-                &format!("listing the environments of app {app_id}"),
-            )
-            .await?;
-        Ok(response.environments)
+        self.list_all(
+            &format!("/api/apps/{app_id}/environments"),
+            &format!("listing the environments of app {app_id}"),
+        )
+        .await
     }
 
     /// Create the environment unless it is already there. Returns true when
@@ -1065,17 +1179,14 @@ impl Control {
         Ok(response)
     }
 
+    /// Every secret name of one environment, in name order. Values never
+    /// travel on this route; see the control plane's secret endpoints.
     pub async fn list_secrets(&self, app_id: &str, environment: &str) -> Result<Vec<SecretMeta>> {
-        let response: SecretsResponse = self
-            .send(
-                self.request(
-                    Method::GET,
-                    &format!("/api/apps/{app_id}/environments/{environment}/secrets"),
-                ),
-                &format!("listing the secrets of {environment} of app {app_id}"),
-            )
-            .await?;
-        Ok(response.secrets)
+        self.list_all(
+            &format!("/api/apps/{app_id}/environments/{environment}/secrets"),
+            &format!("listing the secrets of {environment} of app {app_id}"),
+        )
+        .await
     }
 
     pub async fn delete_secret(
@@ -1151,13 +1262,7 @@ impl Control {
     // ---- accounts, tokens and the audit log ---------------------------
 
     pub async fn list_accounts(&self) -> Result<Vec<Account>> {
-        let response: AccountsResponse = self
-            .send(
-                self.request(Method::GET, "/api/accounts"),
-                "listing the accounts",
-            )
-            .await?;
-        Ok(response.accounts)
+        self.list_all("/api/accounts", "listing the accounts").await
     }
 
     pub async fn create_account(&self, name: &str, role: &str) -> Result<Account> {
@@ -1220,19 +1325,42 @@ impl Control {
         .await
     }
 
-    /// Every credential the control plane knows about, and how many of them
-    /// answer to no scope at all.
+    /// Every credential the control plane knows about, and how many of
+    /// them answer to no scope at all.
+    ///
+    /// Two reads: the listing itself, paged to the end, and one page of
+    /// size one under `scope=unscoped` whose total is the number of live
+    /// root credentials - live whatever `include_revoked` says, because
+    /// that is the number an operator drives to zero.
     pub async fn list_tokens(
         &self,
         account: Option<&str>,
         include_revoked: bool,
-    ) -> Result<TokensResponse> {
-        let mut path = format!("/api/tokens?include_revoked={include_revoked}");
-        if let Some(account) = account {
-            path.push_str(&format!("&account={account}"));
-        }
-        self.send(self.request(Method::GET, &path), "listing the tokens")
-            .await
+    ) -> Result<TokenListing> {
+        let account_query = account
+            .map(|account| format!("&account={account}"))
+            .unwrap_or_default();
+        let tokens = self
+            .list_all(
+                &format!("/api/tokens?include_revoked={include_revoked}&scope=all{account_query}"),
+                "listing the tokens",
+            )
+            .await?;
+        let unscoped: ListPage<ApiToken> = self
+            .send(
+                self.request(
+                    Method::GET,
+                    &format!(
+                        "/api/tokens?include_revoked=false&scope=unscoped&limit=1{account_query}"
+                    ),
+                ),
+                "counting the unscoped tokens",
+            )
+            .await?;
+        Ok(TokenListing {
+            tokens,
+            unscoped: unscoped.page.total,
+        })
     }
 
     pub async fn revoke_token(&self, id: &str) -> Result<ApiToken> {
@@ -1256,17 +1384,37 @@ impl Control {
         push("action", filter.action.clone());
         push("outcome", filter.outcome.clone());
         push("since", filter.since.map(|s| s.to_string()));
-        push("limit", filter.limit.map(|l| l.to_string()));
+        if let Some(limit) = filter.limit {
+            let bounded = limit.clamp(1, MAX_LIST_LIMIT);
+            if bounded != limit {
+                tracing::warn!(
+                    requested = limit,
+                    applied = bounded,
+                    "the control plane serves at most {MAX_LIST_LIMIT} audit lines per page; \
+                     reading that many"
+                );
+            }
+            push("limit", Some(bounded.to_string()));
+        }
 
         let path = if query.is_empty() {
             "/api/audit".to_string()
         } else {
             format!("/api/audit?{}", query.join("&"))
         };
-        let response: AuditResponse = self
+        // One page, newest first: `deis audit` prints "the latest N", not
+        // the whole log, so the cursor is read for the log line only.
+        let page: ListPage<AuditEntry> = self
             .send(self.request(Method::GET, &path), "reading the audit log")
             .await?;
-        Ok(response.entries)
+        if page.page.next_cursor.is_some() {
+            tracing::debug!(
+                shown = page.items.len(),
+                total = page.page.total,
+                "the audit log continues past this page; raise --limit or narrow the filters"
+            );
+        }
+        Ok(page.items)
     }
 
     // ---- nodes --------------------------------------------------------
@@ -1310,8 +1458,39 @@ impl Control {
     }
 }
 
+/// A control plane on a loopback port, for the tests below.
+///
+/// Both test modules here drive the real HTTP client against a real server
+/// rather than a stub, so this lives once instead of in each of them.
+#[cfg(test)]
+mod test_server {
+    use super::Control;
+    use axum::Router;
+
+    /// Serve `router` on a free loopback port and return a `Control` pointed
+    /// at it. Sending on the returned channel stops the server.
+    pub async fn control_for(router: Router) -> (Control, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        (
+            Control::new(&format!("http://{address}"), None).unwrap(),
+            shutdown,
+        )
+    }
+}
+
 #[cfg(test)]
 mod deployment_plan_tests {
+    use super::test_server::control_for;
     use super::*;
     use axum::{Json, Router, http::header::LOCATION, response::IntoResponse, routing::get};
 
@@ -1398,24 +1577,6 @@ mod deployment_plan_tests {
         }))
     }
 
-    async fn control_for(router: Router) -> (Control, tokio::sync::oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = stopped.await;
-                })
-                .await
-                .unwrap();
-        });
-        (
-            Control::new(&format!("http://{address}"), None).unwrap(),
-            shutdown,
-        )
-    }
-
     #[tokio::test]
     async fn accepted_deploy_waits_for_the_exact_plan_and_pointer() {
         let router = Router::new()
@@ -1464,6 +1625,321 @@ mod deployment_plan_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("has no Location"), "{error}");
+        let _ = shutdown.send(());
+    }
+}
+
+#[cfg(test)]
+mod list_page_tests {
+    use super::test_server::control_for;
+    use super::*;
+    use axum::{
+        Json, Router,
+        extract::Query,
+        response::{IntoResponse, Response},
+        routing::get,
+    };
+    use std::collections::HashMap;
+
+    /// Deliberately full of characters a URL gives a meaning to, so a token
+    /// that survives this round trip survives any the control plane mints.
+    const CURSOR: &str = "sort=created-at-desc,id-desc-v1|after=2 versions/one+two==";
+
+    fn version(id: &str, number: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "app_id": "demo",
+            "number": number,
+            "bundle_sha": "sha256",
+            "created_at": number
+        })
+    }
+
+    fn page(items: Vec<serde_json::Value>, next: Option<&str>) -> serde_json::Value {
+        let count = items.len();
+        serde_json::json!({
+            "schemaVersion": 1,
+            "items": items,
+            "page": {
+                "limit": 100,
+                "count": count,
+                "total": 3,
+                "nextCursor": next
+            }
+        })
+    }
+
+    /// Two pages: the first hands out `CURSOR`, the second ends the list.
+    async fn versions_page(Query(query): Query<HashMap<String, String>>) -> Response {
+        match query.get("cursor").map(String::as_str) {
+            None => Json(page(
+                vec![version("version-3", 3), version("version-2", 2)],
+                Some(CURSOR),
+            ))
+            .into_response(),
+            Some(CURSOR) => Json(page(vec![version("version-1", 1)], None)).into_response(),
+            Some(other) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("cursor arrived mangled: {other}")
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    /// Contradicts itself: nothing on the page, and another page promised.
+    async fn endless_empty_page() -> Response {
+        Json(serde_json::json!({
+            "schemaVersion": 1,
+            "items": [],
+            "page": {"limit": 100, "count": 0, "total": 7, "nextCursor": "again"}
+        }))
+        .into_response()
+    }
+
+    #[test]
+    fn the_unified_envelope_is_read_as_typed_items() {
+        let body = serde_json::json!({
+            "schemaVersion": 1,
+            "items": [version("version-2", 2), version("version-1", 1)],
+            "page": {
+                "limit": 2,
+                "count": 2,
+                "total": 5,
+                "nextCursor": "opaque-token"
+            }
+        });
+        let read: ListPage<Version> = serde_json::from_value(body).unwrap();
+        assert_eq!(read.schema_version, LIST_SCHEMA_VERSION);
+        assert_eq!(read.items.len(), read.page.count);
+        assert_eq!(read.page.limit, 2);
+        assert_eq!(read.page.total, 5);
+        assert_eq!(read.page.next_cursor.as_deref(), Some("opaque-token"));
+        assert_eq!(read.items[0].id, "version-2");
+        assert_eq!(read.items[1].number, 1);
+    }
+
+    #[test]
+    fn a_last_page_reads_as_no_cursor() {
+        let read: ListPage<Environment> = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1,
+            "items": [{"id": "env-1", "app_id": "demo", "name": "production", "created_at": 1}],
+            "page": {"limit": 100, "count": 1, "total": 1, "nextCursor": null}
+        }))
+        .unwrap();
+        assert!(read.page.next_cursor.is_none());
+        assert_eq!(read.items[0].name, "production");
+    }
+
+    #[test]
+    fn a_cursor_is_appended_and_percent_encoded() {
+        let url = append_cursor("/api/apps/demo/versions", CURSOR);
+        assert!(url.starts_with("/api/apps/demo/versions?cursor="), "{url}");
+        assert!(!url.contains(' '), "{url}");
+        assert!(url.contains("%2C"), "{url}");
+        assert!(url.contains("%3D"), "{url}");
+
+        let with_query = append_cursor("/api/apps/demo/versions?limit=1000", CURSOR);
+        assert!(with_query.contains("?limit=1000&cursor="), "{with_query}");
+    }
+
+    #[tokio::test]
+    async fn every_page_is_followed_until_the_cursor_runs_out() {
+        let router = Router::new().route("/api/apps/demo/versions", get(versions_page));
+        let (control, shutdown) = control_for(router).await;
+        let versions = control.list_versions("demo").await.unwrap();
+        let ids: Vec<&str> = versions.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["version-3", "version-2", "version-1"]);
+        let _ = shutdown.send(());
+    }
+
+    /// Two pages of secret names: metadata only, and the second page ends
+    /// the list.
+    async fn secrets_page(Query(query): Query<HashMap<String, String>>) -> Response {
+        let secret =
+            |name: &str| serde_json::json!({"name": name, "revision": "rev-1", "updated_at": 1});
+        match query.get("cursor").map(String::as_str) {
+            None => Json(page(
+                vec![secret("API_KEY"), secret("DB_URL")],
+                Some(CURSOR),
+            ))
+            .into_response(),
+            Some(CURSOR) => Json(page(vec![secret("TOKEN")], None)).into_response(),
+            Some(other) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("cursor arrived mangled: {other}")
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_names_are_read_through_the_unified_envelope() {
+        let router = Router::new().route(
+            "/api/apps/demo/environments/production/secrets",
+            get(secrets_page),
+        );
+        let (control, shutdown) = control_for(router).await;
+        let secrets = control.list_secrets("demo", "production").await.unwrap();
+        let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["API_KEY", "DB_URL", "TOKEN"]);
+        assert_eq!(secrets[0].revision.as_deref(), Some("rev-1"));
+        let _ = shutdown.send(());
+    }
+
+    /// Accounts arrive through the same envelope and are followed to the
+    /// end like every other list.
+    async fn accounts_page(Query(query): Query<HashMap<String, String>>) -> Response {
+        let account = |name: &str| {
+            serde_json::json!({
+                "id": format!("id-{name}"),
+                "name": name,
+                "role": "viewer",
+                "created_at": 1
+            })
+        };
+        match query.get("cursor").map(String::as_str) {
+            None => {
+                Json(page(vec![account("alice"), account("bob")], Some(CURSOR))).into_response()
+            }
+            Some(CURSOR) => Json(page(vec![account("carol")], None)).into_response(),
+            Some(other) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("cursor arrived mangled: {other}")
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn accounts_are_read_through_the_unified_envelope() {
+        let router = Router::new().route("/api/accounts", get(accounts_page));
+        let (control, shutdown) = control_for(router).await;
+        let accounts = control.list_accounts().await.unwrap();
+        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["alice", "bob", "carol"]);
+        let _ = shutdown.send(());
+    }
+
+    /// The token route answers the listing under `scope=all` and the
+    /// unscoped count as the total of a one-row `scope=unscoped` page.
+    async fn tokens_page(Query(query): Query<HashMap<String, String>>) -> Response {
+        let token = |name: &str, unscoped: bool| {
+            serde_json::json!({
+                "id": format!("tok-{name}"),
+                "account": "ops",
+                "name": name,
+                "origin": "minted",
+                "scopes": if unscoped { "unscoped" } else { "deploy:demo/preview" },
+                "unscoped": unscoped,
+                "created_at": 1
+            })
+        };
+        if query.get("scope").map(String::as_str) == Some("unscoped") {
+            assert_eq!(query.get("limit").map(String::as_str), Some("1"));
+            assert_eq!(
+                query.get("include_revoked").map(String::as_str),
+                Some("false")
+            );
+            return Json(serde_json::json!({
+                "schemaVersion": 1,
+                "items": [token("old-root", true)],
+                "page": {"limit": 1, "count": 1, "total": 2, "nextCursor": "more"}
+            }))
+            .into_response();
+        }
+        assert_eq!(
+            query.get("include_revoked").map(String::as_str),
+            Some("true")
+        );
+        match query.get("cursor").map(String::as_str) {
+            None => Json(page(
+                vec![token("preview", false), token("old-root", true)],
+                Some(CURSOR),
+            ))
+            .into_response(),
+            Some(CURSOR) => Json(page(vec![token("laptop", true)], None)).into_response(),
+            Some(other) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("cursor arrived mangled: {other}")
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tokens_are_listed_to_the_end_and_the_unscoped_count_is_the_filtered_total() {
+        let router = Router::new().route("/api/tokens", get(tokens_page));
+        let (control, shutdown) = control_for(router).await;
+        let listing = control.list_tokens(None, true).await.unwrap();
+        let names: Vec<&str> = listing.tokens.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["preview", "old-root", "laptop"]);
+        assert_eq!(listing.unscoped, 2);
+        let _ = shutdown.send(());
+    }
+
+    /// `deis audit` reads one page of the latest lines; the filters and
+    /// the bounded page size travel as query parameters.
+    async fn audit_page(Query(query): Query<HashMap<String, String>>) -> Response {
+        assert_eq!(query.get("app").map(String::as_str), Some("demo"));
+        assert_eq!(query.get("limit").map(String::as_str), Some("1000"));
+        assert!(!query.contains_key("before"));
+        let entry = |id: i64, action: &str| {
+            serde_json::json!({
+                "id": id,
+                "at": id,
+                "actor_kind": "account",
+                "actor_account": "alice",
+                "action": action,
+                "app_id": "demo",
+                "method": "POST",
+                "path": "/api/apps",
+                "outcome": "accepted",
+                "status": 200
+            })
+        };
+        Json(serde_json::json!({
+            "schemaVersion": 1,
+            "items": [entry(9, "deploy"), entry(8, "rollback")],
+            "page": {"limit": 1000, "count": 2, "total": 40, "nextCursor": CURSOR}
+        }))
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn the_audit_log_is_read_as_one_bounded_page() {
+        let router = Router::new().route("/api/audit", get(audit_page));
+        let (control, shutdown) = control_for(router).await;
+        let entries = control
+            .read_audit(&AuditFilter {
+                app: Some("demo".to_string()),
+                limit: Some(5_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(actions, ["deploy", "rollback"]);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn an_empty_page_that_still_offers_another_is_refused() {
+        let router = Router::new().route("/api/apps/demo/environments", get(endless_empty_page));
+        let (control, shutdown) = control_for(router).await;
+        let error = control
+            .list_environments("demo")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty page"), "{error}");
         let _ = shutdown.send(());
     }
 }

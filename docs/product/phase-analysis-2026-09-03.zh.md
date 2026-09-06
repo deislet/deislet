@@ -2557,3 +2557,44 @@ Application/framework source + versioned build plan
   client、breaking-change gate、通用 mutation 幂等、完整 lifecycle、CLI/Web 与真实 driver/account/conformance 也仍未完成。
   现有无 major 路由的响应变化只能属于 v1 冻结前归一化，不能在稳定 major 内无迁移重复发生。本轮依产品负责人要求在此形成
   可交接节点并停止继续执行，不把阶段收尾写成总 Goal 已完成。
+
+## 91. 剩余公共列表迁入统一分页契约与 CLI 消费方修复
+
+- 恢复执行后先做公共/内部列表边界盘点：两条独立视角（路由表逐条、store/消费方逐条）合并后共计 67 条 GET 路由，其中
+  15 条已在 `control-list-page` 上，26 条仍返回数组或四种并存的旧 envelope。盘点确认每个未迁移 `total` 实际都是本页
+  长度，九个读取完全没有 SQL LIMIT，三条路由接受无上限 `limit`，`/api/events` 以 `offset` 作为公共遍历状态，`/api/audit`
+  另有自制 `before` cursor 与 `max_limit`。盘点还发现 3ebe108 的服务端 envelope 变更没有同步 CLI：`deis versions` 与
+  `deis status` 自该提交起解析失败。这一现役缺陷不从记录中抹去。
+- 依 ADR-016 authz 表把余下列表分为三类：application/environment 产品列表（deployment history、environment routes、
+  secrets）、organization 产品列表（accounts、tokens、audit、domain grants）与平台诊断面（sessions、runtime、configs、
+  commands、events、metrics summary、全局 `/api/routes`，以及仅供节点/代理的 assignments 与 routing-table）。前两类本轮
+  全部迁入统一契约；第三类因 Web 控制台只消费这些路由、其中两条由进程内内存而非数据库读快照供数据、两条节点路由必须
+  保持整表原子语义，其形态归属留给产品决策，本轮只把无上限 `limit` 收口。
+- 前置改造：cursor 持久化从 CatalogStore 抽出为共享 `PageCursorStore`（同一 `api_page_cursors` 表、同一 token 格式、
+  三天到期与顺带清理），CatalogStore、IdentityStore、AuditStore 各以已持有的 `Arc<Database>` 派生，identity/audit 路由因此
+  无需新增 state 字段即可复用 cursor；`PagePosition` 增加可选 `secondary` 文本排序键，identity 上限提到 1024 字节，旧
+  cursor 行原样解码且序列化字节不变。
+- 七条列表迁入契约：environment deployments 按 `(created_at DESC, canonical_id DESC)`——首次实现用随机 UUIDv4 `id` 作
+  tie-breaker，同一秒内四次部署的历史顺序随机，被全量门禁捕获后改为单调 UUIDv7 canonical ID，旧的 `rowid` 因 VACUUM 可
+  重编号不能进 cursor；environment routes 按 `(priority DESC, path_prefix ASC, id ASC)` 保持匹配器顺序；environment secrets
+  按名称升序；domain grants 把原本读整表后在 Rust 排序改为 SQL 主键序 `(pattern, app_id, environment)`；accounts 按
+  `(created_at, name)`；tokens 保持 `(created_at, id)` 升序并新增 `scope=all|unscoped` 过滤，原 `unscoped` 聚合字段由
+  `scope=unscoped` 下的精确 `page.total` 承担；audit 按 `(at DESC, id DESC)`，退役 `before` 与 `max_limit`，七个真实
+  filter 全部进入 cursor binding。所有 filter 使用 canonical ID 或审计行记录的原值，不用可读名称。新增 `_v1` 索引九个；
+  旧 `idx_api_tokens_account`、`idx_audit_*` 未删除，旧库同时持有两代索引。旧 envelope 类型全部删除，全局 `/api/routes`
+  改名为明确的 `GlobalRoutesResponse` 并注明待决。
+- 诊断路由 heartbeats、config history 两条与 events 复用同一 `bounded_limit`（默认 100、1–1000、越界 400），events 另对
+  `offset` 设 1,000,000 上限；响应形状不变。
+- CLI 新增通用 `ListPage<T>` 与逐页跟随 `nextCursor` 的 `list_all`（cursor URL 编码、最多 10,000 页、schemaVersion 不符
+  时提示一次），versions、environments、secrets、accounts、tokens 五个命令迁到其上；`deis token list` 以一次
+  `scope=unscoped&limit=1` 读 `page.total` 复现原有 unscoped 提示；`deis audit --limit N` 只读最新一页而不跟随全部。
+  客户端可见变化：deployment history 默认页由 50 变 100、越界由钳制变 400；tokens 的未知 `--account` 由空列表变 404；
+  audit 的 `before` 参数变 400。这些仍属 v1 冻结前归一化。
+- 三视角审查（契约一致性、安全与授权、客户端兼容）仅报告一项 minor（404 建议文案），已修。最终门禁：`cargo fmt --check`、
+  `deis-control`/`deis` all-target 严格 Clippy、Control 525/525（lib 501、API integration 14、architecture 2、docs witness 6、
+  fleet credential 2）、CLI 150/150、共享契约 17 Schema/50 fixture、产品治理与 `git diff --check` 全部通过。本节仍是本机工作
+  节点，尚未从提交后精确归档三平台复验，也未登记新的 portability evidence。
+- 仍未完成：显式 API major、OpenAPI/generated client、breaking-change gate；平台诊断面的命名空间与契约归属；聚合端点
+  （configs/events stats、metrics summary）的 summary 契约；单资源 `schemaVersion` 位宽与列表不一致（u32 与 u8）；cursor 表
+  主动清理调度、容量指标与多 Control 实例共享 authority；通用 mutation 幂等；installation/target lifecycle；application
+  删除时 grant 收敛；provider deployment cancel/rollback；CLI/Web 对 domains、routes、deployment history 等尚无入口。

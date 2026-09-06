@@ -257,16 +257,24 @@ pub async fn list_driver_releases(
         provider_host_scope()?
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = provider_registry(&state)?
         .releases_page(limit, cursor)
         .await?;
-    let response = list_page(&state.store, collection, &binding, limit, page, |release| {
-        PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |release| PagePosition {
             sort_value: release.created_at.timestamp(),
             identity: release.release_digest.to_string(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok((no_store_headers(), Json(response)))
 }
@@ -310,16 +318,24 @@ pub async fn driver_release_audit(
         release_digest
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = registry
         .audit_events_page(release_digest, limit, cursor)
         .await?;
-    let response = list_page(&state.store, collection, &binding, limit, page, |event| {
-        PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |event| PagePosition {
             sort_value: event.observed_at.timestamp(),
             identity: event.event_id.to_string(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok((no_store_headers(), Json(response)))
 }
@@ -355,13 +371,15 @@ pub async fn list_credentials(
     let collection = "provider-credentials";
     let binding = "scope=default-organization;filter=all;sort=created-at-asc,binding-id-asc-v1";
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, binding)
+        .await?;
     let page = state
         .provider_credentials
         .bindings_page(limit, cursor)
         .await?;
     let response = list_page(
-        &state.store,
+        &state.store.page_cursors(),
         collection,
         binding,
         limit,
@@ -369,6 +387,7 @@ pub async fn list_credentials(
         |credential| PagePosition {
             sort_value: credential.created_at.timestamp(),
             identity: credential.binding_id.to_string(),
+            secondary: None,
         },
     )
     .await?;
@@ -460,17 +479,25 @@ pub async fn credential_audit(
         "scope=provider-credential:{binding_id};filter=all;sort=occurred-at-asc,event-id-asc-v1"
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = state
         .provider_credentials
         .audit_events_page(binding_id, limit, cursor)
         .await?;
-    let response = list_page(&state.store, collection, &binding, limit, page, |event| {
-        PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |event| PagePosition {
             sort_value: event.occurred_at.timestamp(),
             identity: event.event_id.to_string(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok((no_store_headers(), Json(response)))
 }
@@ -506,13 +533,15 @@ pub async fn list_installations(
     let binding =
         "scope=default-organization;filter=all;sort=created-at-asc,installation-id-asc-v1";
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, binding)
+        .await?;
     let page = state
         .store
         .provider_installations_page(limit, cursor)
         .await?;
     let response = list_page(
-        &state.store,
+        &state.store.page_cursors(),
         collection,
         binding,
         limit,
@@ -520,6 +549,7 @@ pub async fn list_installations(
         |installation| PagePosition {
             sort_value: installation.created_at.timestamp(),
             identity: installation.installation_id.to_string(),
+            secondary: None,
         },
     )
     .await?;
@@ -585,17 +615,25 @@ pub async fn list_installation_targets(
         "scope=provider-installation:{installation_id};filter=all;sort=created-at-asc,target-id-asc-v1"
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = state
         .store
         .provider_targets_page(Some(installation_id), limit, cursor)
         .await?;
-    let response = list_page(&state.store, collection, &binding, limit, page, |target| {
-        PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |target| PagePosition {
             sort_value: target.created_at.timestamp(),
             identity: target.target_id.to_string(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok((no_store_headers(), Json(response)))
 }
@@ -607,17 +645,25 @@ pub async fn list_targets(
     let collection = "provider-targets";
     let binding = "scope=default-organization;filter=all;sort=created-at-asc,target-id-asc-v1";
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, binding)
+        .await?;
     let page = state
         .store
         .provider_targets_page(None, limit, cursor)
         .await?;
-    let response = list_page(&state.store, collection, binding, limit, page, |target| {
-        PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        binding,
+        limit,
+        page,
+        |target| PagePosition {
             sort_value: target.created_at.timestamp(),
             identity: target.target_id.to_string(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok((no_store_headers(), Json(response)))
 }
@@ -693,7 +739,7 @@ pub async fn list_provider_target_grants(
     let page_query = query.page_query();
     let limit = page_query.bounded_limit()?;
     let cursor = page_query
-        .position(&state.store, collection, &binding)
+        .position(&state.store.page_cursors(), collection, &binding)
         .await?;
     let page = state
         .store
@@ -705,12 +751,18 @@ pub async fn list_provider_target_grants(
             cursor,
         )
         .await?;
-    let response = list_page(&state.store, collection, &binding, limit, page, |grant| {
-        PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |grant| PagePosition {
             sort_value: grant.created_at.timestamp(),
             identity: grant.grant_id.to_string(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok((no_store_headers(), Json(response)))
 }
@@ -764,18 +816,26 @@ pub async fn provider_target_grant_audit(
         grant.application_id, grant.environment_id, grant.grant_id
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = state
         .store
         .provider_target_grant_audit_events_page(grant_id, limit, cursor)
         .await?;
-    let response = list_page(&state.store, collection, &binding, limit, page, |event| {
-        PagePosition {
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |event| PagePosition {
             sort_value: i64::try_from(event.grant_revision)
                 .expect("stored provider target grant revision fits SQLite INTEGER"),
             identity: event.event_id.to_string(),
-        }
-    })
+            secondary: None,
+        },
+    )
     .await?;
     Ok((no_store_headers(), Json(response)))
 }
@@ -851,7 +911,9 @@ pub async fn list_provider_deployments(
         app.canonical_id, environment.canonical_id
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = state
         .store
         .provider_deployments_for_environment_page(
@@ -862,7 +924,7 @@ pub async fn list_provider_deployments(
         )
         .await?;
     let response = list_page(
-        &state.store,
+        &state.store.page_cursors(),
         collection,
         &binding,
         limit,
@@ -870,6 +932,7 @@ pub async fn list_provider_deployments(
         |workflow| PagePosition {
             sort_value: workflow.operation.created_at.timestamp(),
             identity: workflow.operation.operation_id.to_string(),
+            secondary: None,
         },
     )
     .await?;

@@ -33,8 +33,9 @@ use serde::{Deserialize, Serialize};
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::catalog::DomainGrant;
+use crate::api::pagination::{ControlListPage, ListQuery, list_page};
 use crate::catalog::domains::EVERY_ENVIRONMENT;
+use crate::catalog::{DomainGrant, PagePosition, domain_grant_cursor_secondary};
 
 #[derive(Debug, Deserialize)]
 pub struct GrantRequest {
@@ -58,12 +59,6 @@ pub struct GrantResponse {
     pub grant: DomainGrant,
 }
 
-#[derive(Debug, Serialize)]
-pub struct GrantsResponse {
-    pub grants: Vec<DomainGrant>,
-    pub total: usize,
-}
-
 /// Which grant a `DELETE` is about. The pattern is in the path; a grant is
 /// identified by all three columns, because two applications can hold the
 /// same pattern.
@@ -75,12 +70,38 @@ pub struct GrantSelector {
 }
 
 /// GET /api/domains
-pub async fn list_grants(State(state): State<CatalogState>) -> ApiResult<Json<GrantsResponse>> {
-    let grants = state.store.list_domain_grants().await?;
-    Ok(Json(GrantsResponse {
-        total: grants.len(),
-        grants,
-    }))
+///
+/// The whole registry in `(pattern, app_id, environment)` order. The scope
+/// is global: a hostname belongs to nobody's application, which is the
+/// whole point of the table.
+pub async fn list_grants(
+    State(state): State<CatalogState>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<DomainGrant>>> {
+    let collection = "domain-grants";
+    let binding = "scope=global;filter=all;sort=pattern-asc,application-asc,environment-asc-v1";
+    let limit = query.bounded_limit()?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, binding)
+        .await?;
+    let page = state.store.list_domain_grants_page(limit, cursor).await?;
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        binding,
+        limit,
+        page,
+        |grant| PagePosition {
+            sort_value: 0,
+            identity: grant.pattern.clone(),
+            secondary: Some(domain_grant_cursor_secondary(
+                &grant.app_id,
+                &grant.environment,
+            )),
+        },
+    )
+    .await?;
+    Ok(Json(response))
 }
 
 /// POST /api/domains

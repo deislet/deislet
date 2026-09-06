@@ -27,6 +27,8 @@ use uuid::Uuid;
 use super::token;
 use super::{Authority, Principal, PrincipalKind, Role, Scope};
 use crate::catalog::model::now_secs;
+use crate::catalog::pagination::{finish_page, sqlite_fetch_limit};
+use crate::catalog::{CatalogError, CatalogPage, PageCursorStore, PagePosition};
 use crate::database::{Database, DatabaseError};
 
 /// Longest an account or token name may be. Both are printed in audit lines
@@ -73,6 +75,20 @@ impl From<DatabaseError> for IdentityError {
     fn from(err: DatabaseError) -> Self {
         match err {
             DatabaseError::SqliteError(e) => IdentityError::Database(e),
+            other => IdentityError::Backend(other.to_string()),
+        }
+    }
+}
+
+/// The shared pagination helpers speak the catalog's error type; the list
+/// pages here map it onto the same HTTP classes every other identity
+/// failure uses.
+impl From<CatalogError> for IdentityError {
+    fn from(err: CatalogError) -> Self {
+        match err {
+            CatalogError::NotFound(what) => IdentityError::NotFound(what),
+            CatalogError::Invalid(what) => IdentityError::Invalid(what),
+            CatalogError::Database(e) => IdentityError::Database(e),
             other => IdentityError::Backend(other.to_string()),
         }
     }
@@ -164,6 +180,39 @@ pub enum Resolution {
     },
 }
 
+/// Which credentials a token listing is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenScopeFilter {
+    /// Every credential the other filters admit.
+    #[default]
+    All,
+    /// Only the credentials that answer to no scope at all - the number an
+    /// operator drives to zero. Combined with `include_revoked = false`
+    /// this is exactly the count [`IdentityStore::unscoped_count`] reports.
+    Unscoped,
+}
+
+impl TokenScopeFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenScopeFilter::All => "all",
+            TokenScopeFilter::Unscoped => "unscoped",
+        }
+    }
+}
+
+/// The filters a token listing combines with "and".
+#[derive(Debug, Clone, Default)]
+pub struct TokenListFilter {
+    /// The canonical account id, never its name: a listing bound to an id
+    /// keeps meaning the same account whatever the name is later used for.
+    pub account_id: Option<String>,
+    /// Keep the credentials that no longer work. Off by default so a
+    /// listing answers "what can reach this platform right now".
+    pub include_revoked: bool,
+    pub scope: TokenScopeFilter,
+}
+
 pub struct IdentityStore {
     db: Arc<Database>,
 }
@@ -171,6 +220,12 @@ pub struct IdentityStore {
 impl IdentityStore {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
+    }
+
+    /// Opaque list-cursor persistence for the account and token lists,
+    /// backed by the same table the catalog lists use.
+    pub fn page_cursors(&self) -> PageCursorStore {
+        PageCursorStore::new(Arc::clone(&self.db))
     }
 
     async fn with_conn<T, F>(&self, f: F) -> IdentityResult<T>
@@ -217,15 +272,39 @@ impl IdentityStore {
         .await
     }
 
-    pub async fn list_accounts(&self) -> IdentityResult<Vec<Account>> {
+    /// One page of accounts, oldest first, in the order `(created_at ASC,
+    /// name ASC)`. The name is the tie-breaker because it is unique and
+    /// never changes, so a cursor resumes at exactly one row. The total is
+    /// counted in the same read transaction as the rows.
+    pub async fn list_accounts_page(
+        &self,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> IdentityResult<CatalogPage<Account>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "accounts")?;
+        let (after_created_at, after_name) = cursor
+            .map(|position| (Some(position.sort_value), position.identity))
+            .unwrap_or((None, String::new()));
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {ACCOUNT_COLUMNS} FROM accounts ORDER BY created_at, name"
+            let transaction = conn.unchecked_transaction()?;
+            let total = transaction.query_row("SELECT COUNT(*) FROM accounts", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            let mut stmt = transaction.prepare(&format!(
+                "SELECT {ACCOUNT_COLUMNS} FROM accounts
+                  WHERE (?1 IS NULL OR created_at > ?1
+                         OR (created_at = ?1 AND name > ?2))
+                  ORDER BY created_at ASC, name ASC LIMIT ?3"
             ))?;
             let rows = stmt
-                .query_map([], read_account)?
+                .query_map(
+                    params![after_created_at, after_name, fetch_limit],
+                    read_account,
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+            drop(stmt);
+            transaction.commit()?;
+            Ok(finish_page(rows, limit, total, "accounts")?)
         })
         .await
     }
@@ -383,45 +462,58 @@ impl IdentityStore {
         .await
     }
 
-    /// Every credential this control plane knows about, newest last.
-    ///
-    /// `account` narrows the list to one account's; `include_revoked` keeps
-    /// the ones that no longer work, because "when did this stop working"
-    /// is a question an operator asks after an incident.
-    pub async fn list_tokens(
+    /// One page of credentials, oldest first, in the order `(created_at
+    /// ASC, id ASC)`; the token id is the tie-breaker. Every filter in
+    /// `filter` narrows both the rows and the total, which is counted in
+    /// the same read transaction as the rows.
+    pub async fn list_tokens_page(
         &self,
-        account: Option<&str>,
-        include_revoked: bool,
-    ) -> IdentityResult<Vec<ApiToken>> {
-        let account = account.map(|a| a.to_string());
+        filter: TokenListFilter,
+        limit: usize,
+        cursor: Option<PagePosition>,
+    ) -> IdentityResult<CatalogPage<ApiToken>> {
+        let fetch_limit = sqlite_fetch_limit(limit, "tokens")?;
+        let (after_created_at, after_id) = cursor
+            .map(|position| (Some(position.sort_value), position.identity))
+            .unwrap_or((None, String::new()));
+        let unscoped_only = filter.scope == TokenScopeFilter::Unscoped;
         self.with_conn(move |conn| {
-            let mut sql = format!(
-                "SELECT t.{}, a.name FROM api_tokens t JOIN accounts a ON a.id = t.account_id",
+            let transaction = conn.unchecked_transaction()?;
+            let total = transaction.query_row(
+                "SELECT COUNT(*) FROM api_tokens t
+                  WHERE (?1 IS NULL OR t.account_id = ?1)
+                    AND (?2 = 1 OR t.revoked_at IS NULL)
+                    AND (?3 = 0 OR t.unscoped = 1)",
+                params![filter.account_id, filter.include_revoked, unscoped_only],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut stmt = transaction.prepare(&format!(
+                "SELECT t.{}, a.name FROM api_tokens t
+                   JOIN accounts a ON a.id = t.account_id
+                  WHERE (?1 IS NULL OR t.account_id = ?1)
+                    AND (?2 = 1 OR t.revoked_at IS NULL)
+                    AND (?3 = 0 OR t.unscoped = 1)
+                    AND (?4 IS NULL OR t.created_at > ?4
+                         OR (t.created_at = ?4 AND t.id > ?5))
+                  ORDER BY t.created_at ASC, t.id ASC LIMIT ?6",
                 TOKEN_COLUMNS.replace(", ", ", t.")
-            );
-            let mut clauses: Vec<String> = Vec::new();
-            if account.is_some() {
-                clauses.push("a.name = ?1".to_string());
-            }
-            if !include_revoked {
-                clauses.push("t.revoked_at IS NULL".to_string());
-            }
-            if !clauses.is_empty() {
-                sql.push_str(" WHERE ");
-                sql.push_str(&clauses.join(" AND "));
-            }
-            sql.push_str(" ORDER BY t.created_at, t.id");
-
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = match &account {
-                Some(name) => stmt
-                    .query_map(params![name], read_token)?
-                    .collect::<Result<Vec<_>, _>>()?,
-                None => stmt
-                    .query_map([], read_token)?
-                    .collect::<Result<Vec<_>, _>>()?,
-            };
-            Ok(rows)
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        filter.account_id,
+                        filter.include_revoked,
+                        unscoped_only,
+                        after_created_at,
+                        after_id,
+                        fetch_limit,
+                    ],
+                    read_token,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            transaction.commit()?;
+            Ok(finish_page(rows, limit, total, "tokens")?)
         })
         .await
     }
@@ -933,6 +1025,32 @@ mod tests {
         Authority::Scoped(Scope::parse_list(text).unwrap())
     }
 
+    /// The whole token list as one page, the way the tests below read it:
+    /// `account` is a name here and is resolved to the id the filter takes.
+    async fn tokens(
+        store: &IdentityStore,
+        account: Option<&str>,
+        include_revoked: bool,
+    ) -> Vec<ApiToken> {
+        let account_id = match account {
+            Some(name) => Some(store.get_account(name).await.unwrap().id),
+            None => None,
+        };
+        store
+            .list_tokens_page(
+                TokenListFilter {
+                    account_id,
+                    include_revoked,
+                    scope: TokenScopeFilter::All,
+                },
+                100,
+                None,
+            )
+            .await
+            .unwrap()
+            .items
+    }
+
     /// The whole life of a scoped credential: minted once, usable, listed
     /// without its secret, revoked, and then refused.
     #[tokio::test]
@@ -959,7 +1077,7 @@ mod tests {
                 .is_ok()
         );
 
-        let listed = store.list_tokens(None, false).await.unwrap();
+        let listed = tokens(&store, None, false).await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].scopes, "deploy:myapp/preview");
         assert!(
@@ -975,8 +1093,8 @@ mod tests {
             ),
             "a revoked token must be refused on its very next request"
         );
-        assert!(store.list_tokens(None, false).await.unwrap().is_empty());
-        assert_eq!(store.list_tokens(None, true).await.unwrap().len(), 1);
+        assert!(tokens(&store, None, false).await.is_empty());
+        assert_eq!(tokens(&store, None, true).await.len(), 1);
     }
 
     /// The point of storing a digest: whatever a reader of the database
@@ -1079,7 +1197,7 @@ mod tests {
         assert_eq!(store.sync_config_keys(&keys).await.unwrap(), 2);
         assert_eq!(store.unscoped_count().await.unwrap(), 2);
 
-        let listed = store.list_tokens(None, false).await.unwrap();
+        let listed = tokens(&store, None, false).await;
         assert_eq!(listed.len(), 2);
         for entry in &listed {
             assert!(entry.unscoped);
@@ -1157,7 +1275,7 @@ mod tests {
         assert!(token.last_used_at.is_none());
 
         store.resolve_token(&secret).await.unwrap();
-        let listed = store.list_tokens(Some("ci"), false).await.unwrap();
+        let listed = tokens(&store, Some("ci"), false).await;
         assert!(
             listed[0].last_used_at.is_some(),
             "a token that authenticated must be recorded as used"

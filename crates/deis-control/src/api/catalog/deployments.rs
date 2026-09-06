@@ -23,17 +23,16 @@ use tracing::{info, warn};
 use super::CatalogState;
 use super::versions::VersionView;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::pagination::{ControlListPage, ListQuery, environment_scope, list_page};
 use crate::catalog::{
     CatalogError, CatalogStore, Deployment, DeploymentDrainObservation, DeploymentEvent,
     DeploymentGenerationDrain, DeploymentPlan, DeploymentPlanSpec, DeploymentProxyObservation,
-    DeploymentQueueObservation, DeploymentTargetObservation, Environment, Version, now_secs,
+    DeploymentQueueObservation, DeploymentTargetObservation, Environment, PagePosition, Version,
+    now_secs,
 };
 use crate::delivery::{DeliveryReason, DeliveryReport, DeploymentPayload};
 use crate::message::NodeRole;
 
-/// Default and maximum number of history rows returned at once.
-const DEFAULT_HISTORY_LIMIT: usize = 50;
-const MAX_HISTORY_LIMIT: usize = 500;
 const SECRET_REVISION_GC_INTERVAL_SECONDS: i64 = 300;
 const DEPLOYMENT_COORDINATOR_LEASE_SECONDS: u64 = 30;
 const DEPLOYMENT_COORDINATOR_HEARTBEAT_SECONDS: u64 = 10;
@@ -175,11 +174,6 @@ pub struct RollbackRequest {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct HistoryQuery {
-    pub limit: Option<usize>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct DeploymentResponse {
     /// Absent while an accepted plan is still draining its pre-commit queue
@@ -207,12 +201,6 @@ pub struct DeploymentPlanResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<DeploymentGenerationDrain>,
     pub drain_observations: Vec<DeploymentDrainObservation>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DeploymentHistoryResponse {
-    pub deployments: Vec<Deployment>,
-    pub total: usize,
 }
 
 /// POST /api/apps/:app_id/environments/:env/deployments
@@ -484,21 +472,43 @@ async fn deployment_plan_response(
 }
 
 /// GET /api/apps/:app_id/environments/:env/deployments
+///
+/// The pointer history of one environment, newest first. Every row is a
+/// deployment or a rollback; nothing is ever rewritten, so paging through
+/// it is a stable walk backwards in time.
 pub async fn list_deployments(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
-    Query(query): Query<HistoryQuery>,
-) -> ApiResult<Json<DeploymentHistoryResponse>> {
-    let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_HISTORY_LIMIT)
-        .clamp(1, MAX_HISTORY_LIMIT);
-    let deployments = state.store.list_deployments(&env.id, limit).await?;
-    Ok(Json(DeploymentHistoryResponse {
-        total: deployments.len(),
-        deployments,
-    }))
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<Deployment>>> {
+    let (app, env) = super::apps::resolve_app_environment(&state, &app_id, &env_name).await?;
+    let collection = "environment-deployments";
+    let binding = format!(
+        "{};filter=all;sort=created-at-desc,canonical-id-desc-v1",
+        environment_scope(app.canonical_id, env.canonical_id)
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
+    let page = state
+        .store
+        .list_deployments_page(&env.id, limit, cursor)
+        .await?;
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |deployment| PagePosition {
+            sort_value: deployment.created_at,
+            identity: deployment.canonical_id.to_string(),
+            secondary: None,
+        },
+    )
+    .await?;
+    Ok(Json(response))
 }
 
 async fn coordinate_strict_deployment(

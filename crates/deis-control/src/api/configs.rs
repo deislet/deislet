@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::error::ApiError;
+use super::pagination::bounded_limit;
 use crate::config_manager::ConfigManager;
 use crate::database::Database;
 
@@ -188,12 +189,9 @@ pub async fn get_config_stats(
 
 #[derive(Debug, Deserialize)]
 pub struct HistoryQuery {
-    #[serde(default = "default_limit")]
-    pub limit: usize,
-}
-
-fn default_limit() -> usize {
-    100
+    /// Absent means the shared default; out of range is refused, see
+    /// [`bounded_limit`].
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,9 +212,10 @@ pub async fn get_config_history(
     Path(node_id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let limit = bounded_limit(query.limit)?;
     let history = state
         .database
-        .get_config_history(&node_id, query.limit)
+        .get_config_history(&node_id, limit)
         .await
         .map_err(|e| ApiError::InternalError(e.to_string()))?;
 
@@ -248,9 +247,10 @@ pub async fn get_config_key_history(
     Path((node_id, config_key)): Path<(String, String)>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let limit = bounded_limit(query.limit)?;
     let history = state
         .database
-        .get_config_key_history(&node_id, &config_key, query.limit)
+        .get_config_key_history(&node_id, &config_key, limit)
         .await
         .map_err(|e| ApiError::InternalError(e.to_string()))?;
 
@@ -320,4 +320,54 @@ pub async fn rollback_config_key(
         "value": config_value,
         "message": "Config rolled back successfully"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionManager;
+    use axum::http::StatusCode;
+
+    async fn state() -> ConfigsState {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let sessions = Arc::new(SessionManager::new());
+        ConfigsState {
+            config_manager: Arc::new(ConfigManager::new(Arc::clone(&database), sessions)),
+            database,
+        }
+    }
+
+    async fn node_history(limit: Option<usize>) -> StatusCode {
+        get_config_history(
+            State(state().await),
+            Path("node-a".to_string()),
+            Query(HistoryQuery { limit }),
+        )
+        .await
+        .into_response()
+        .status()
+    }
+
+    async fn key_history(limit: Option<usize>) -> StatusCode {
+        get_config_key_history(
+            State(state().await),
+            Path(("node-a".to_string(), "key1".to_string())),
+            Query(HistoryQuery { limit }),
+        )
+        .await
+        .into_response()
+        .status()
+    }
+
+    /// Both history routes fed their limit to SQLite unclamped.
+    #[tokio::test]
+    async fn an_oversized_history_limit_is_refused_and_the_ceiling_is_accepted() {
+        assert_eq!(node_history(Some(1_001)).await, StatusCode::BAD_REQUEST);
+        assert_eq!(node_history(Some(1_000)).await, StatusCode::OK);
+        assert_eq!(node_history(None).await, StatusCode::OK);
+
+        assert_eq!(key_history(Some(1_001)).await, StatusCode::BAD_REQUEST);
+        assert_eq!(key_history(Some(1_000)).await, StatusCode::OK);
+        assert_eq!(key_history(None).await, StatusCode::OK);
+    }
 }

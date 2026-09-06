@@ -306,8 +306,14 @@ Windows 通过平台适用的 provider、pagination、authz、grant、协调器�
 `../product/evidence/provider-driver-dispatcher-portability-dc9a19a.json`。共享契约在 Linux 通过 17 份 Schema/50 组 fixture，
 macOS 缺 `jsonschema` 被保留为环境未执行。该证据不证明跨请求快照、CLI/Web 接线、真实 provider 部署或标准合规。
 
-这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；deployment history、routes、secrets、domain
-grants、identity/fleet/config/command/event/audit 等 Control 列表尚未迁移；
+随后 environment deployments、environment routes、environment secrets、domain grants、accounts、tokens 与 audit 七条
+产品列表也迁入同一 envelope：cursor 持久化抽为三家 store 共享的 `PageCursorStore`，`PagePosition` 支持第二文本排序键；
+tokens 以 `scope=all|unscoped` 过滤取代聚合字段，audit 退役自制 `before`/`max_limit`；CLI 以通用 `ListPage<T>` 跟随
+`nextCursor`，并修复自 3ebe108 起 `deis versions`/`deis status` 无法解析新 envelope 的现役缺陷。sessions、runtime、
+configs、commands、events、metrics summary 与全局 `/api/routes` 按本 ADR 的 platform diagnostics 划分暂不迁移，只收口
+无上限 `limit`；其命名空间与契约归属待产品决策。本切片仅有本机门禁，尚无提交后精确归档或三平台 portability evidence。
+
+这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；平台诊断面列表的归属尚未决定；
 installation/target 生命周期尚不完整；credential provision、grant create 等非 operation 资源创建尚未统一幂等 replay；
 grant 在 application 删除后的生命周期收敛与全局历史查询尚未完成；CLI/Web 也没有生成 client 或交互入口。
 

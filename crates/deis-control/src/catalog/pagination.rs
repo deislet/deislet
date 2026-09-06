@@ -5,26 +5,47 @@
 //! therefore cannot become an accidental public encoding of SQLite columns,
 //! and possession never grants access: the normal route authorization and
 //! the query binding are checked again on every request.
+//!
+//! Cursor persistence is deliberately independent of any one resource
+//! store: catalog, identity and audit lists all page through the same
+//! `api_page_cursors` table, so each of those stores hands out a
+//! [`PageCursorStore`] built on the database it already owns.
+
+use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::debug;
 
-use super::{CatalogError, CatalogResult, CatalogStore, now_secs};
+use super::{CatalogError, CatalogResult, now_secs};
+use crate::database::Database;
 
 const TOKEN_BYTES: usize = 32;
 const TOKEN_TEXT_BYTES: usize = 43;
 const CURSOR_TTL_SECONDS: i64 = 3 * 24 * 60 * 60;
 const MAX_COLLECTION_BYTES: usize = 128;
-const MAX_POSITION_IDENTITY_BYTES: usize = 256;
+/// Upper bound for each textual keyset component. Identities are canonical
+/// ids today, but a secondary sort column may carry a display name or a
+/// hostname, so the bound leaves room without becoming a storage sink.
+const MAX_POSITION_IDENTITY_BYTES: usize = 1024;
 
+/// The keyset position a cursor resumes from.
+///
+/// `sort_value` and `identity` form the versioned composite sort every
+/// migrated list uses today. `secondary` is reserved for lists whose sort
+/// needs a second textual column between them (for example a name sorted
+/// before the id tie-breaker); it is omitted from stored JSON when unused so
+/// rows written before it existed keep decoding unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PagePosition {
     pub sort_value: i64,
     pub identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,11 +90,23 @@ pub(crate) fn finish_page<T>(
     })
 }
 
-impl CatalogStore {
+/// Persistence for opaque list cursors, shared by every resource store that
+/// lives in the Control database. Cheap to construct: it holds only the
+/// database handle, so stores hand one out per request.
+#[derive(Clone)]
+pub struct PageCursorStore {
+    db: Arc<Database>,
+}
+
+impl PageCursorStore {
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
     /// Resolve a client token only for the exact collection, scope, filter,
     /// and sort definition that issued it. Page size is intentionally absent
     /// from `query_binding`, so callers may change `limit` between pages.
-    pub async fn resolve_page_cursor(
+    pub async fn resolve(
         &self,
         token: &str,
         collection: &str,
@@ -85,7 +118,7 @@ impl CatalogStore {
         let binding_sha256 = binding_sha256(collection, query_binding);
         let collection = collection.to_string();
         let now = now_secs();
-        self.database()
+        self.db
             .with_connection(move |connection| {
                 let position_json = connection
                     .query_row(
@@ -97,6 +130,10 @@ impl CatalogStore {
                     )
                     .optional()?;
                 let Some(position_json) = position_json else {
+                    debug!(
+                        collection,
+                        "list cursor rejected: unknown, expired, or bound to another query"
+                    );
                     return Err(invalid_cursor());
                 };
                 let position: PagePosition =
@@ -109,7 +146,7 @@ impl CatalogStore {
 
     /// Persist the next keyset position and return a random URL-safe token.
     /// Expired cursors are opportunistically removed in the same transaction.
-    pub async fn issue_page_cursor(
+    pub async fn issue(
         &self,
         collection: &str,
         query_binding: &str,
@@ -129,7 +166,7 @@ impl CatalogStore {
         let now = now_secs();
         let expires_at = now.saturating_add(CURSOR_TTL_SECONDS);
         let collection = collection.to_string();
-        self.database()
+        self.db
             .with_connection(move |connection| {
                 let transaction = connection.unchecked_transaction()?;
                 transaction
@@ -184,13 +221,23 @@ fn validate_collection(collection: &str) -> CatalogResult<()> {
 }
 
 fn validate_position(position: &PagePosition) -> CatalogResult<()> {
-    if position.identity.is_empty()
-        || position.identity.len() > MAX_POSITION_IDENTITY_BYTES
-        || position.identity.contains(['\r', '\n', '\0'])
+    if position.identity.is_empty() || !position_text_is_valid(&position.identity) {
+        return Err(invalid_cursor());
+    }
+    // A secondary sort column may legitimately be empty text (an unnamed
+    // row still sorts), so only the size and control-character bounds apply.
+    if position
+        .secondary
+        .as_deref()
+        .is_some_and(|secondary| !position_text_is_valid(secondary))
     {
         return Err(invalid_cursor());
     }
     Ok(())
+}
+
+fn position_text_is_valid(text: &str) -> bool {
+    text.len() <= MAX_POSITION_IDENTITY_BYTES && !text.contains(['\r', '\n', '\0'])
 }
 
 fn binding_sha256(collection: &str, query_binding: &str) -> String {
@@ -220,40 +267,41 @@ mod tests {
     #[tokio::test]
     async fn cursor_is_opaque_reusable_query_bound_and_expirable() {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
-        let store = CatalogStore::new(database.clone());
+        let store = PageCursorStore::new(database.clone());
         let position = PagePosition {
             sort_value: 17,
             identity: "0199b603-20bd-7342-9be3-cef10620d8bb".to_string(),
+            secondary: None,
         };
         let token = store
-            .issue_page_cursor("provider-targets", "installation=one", position.clone())
+            .issue("provider-targets", "installation=one", position.clone())
             .await
             .unwrap();
         assert_eq!(token.len(), TOKEN_TEXT_BYTES);
         assert!(!token.contains("0199b603"));
         assert_eq!(
             store
-                .resolve_page_cursor(&token, "provider-targets", "installation=one")
+                .resolve(&token, "provider-targets", "installation=one")
                 .await
                 .unwrap(),
             position
         );
         assert_eq!(
             store
-                .resolve_page_cursor(&token, "provider-targets", "installation=one")
+                .resolve(&token, "provider-targets", "installation=one")
                 .await
                 .unwrap(),
             position
         );
         assert!(
             store
-                .resolve_page_cursor(&token, "provider-targets", "installation=two")
+                .resolve(&token, "provider-targets", "installation=two")
                 .await
                 .is_err()
         );
         assert!(
             store
-                .resolve_page_cursor(&token, "provider-installations", "installation=one")
+                .resolve(&token, "provider-installations", "installation=one")
                 .await
                 .is_err()
         );
@@ -281,9 +329,160 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .resolve_page_cursor(&token, "provider-targets", "installation=one")
+                .resolve(&token, "provider-targets", "installation=one")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_store_shares_one_cursor_table() {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let catalog = crate::catalog::CatalogStore::new(database.clone());
+        let identity = crate::identity::IdentityStore::new(database.clone());
+        let audit = crate::audit::AuditStore::new(database);
+        let position = PagePosition {
+            sort_value: 5,
+            identity: "0199b603-20bd-7342-9be3-cef10620d8bb".to_string(),
+            secondary: None,
+        };
+        let token = catalog
+            .page_cursors()
+            .issue("accounts", "scope=installation;sort=v1", position.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            identity
+                .page_cursors()
+                .resolve(&token, "accounts", "scope=installation;sort=v1")
+                .await
+                .unwrap(),
+            position
+        );
+        assert_eq!(
+            audit
+                .page_cursors()
+                .resolve(&token, "accounts", "scope=installation;sort=v1")
+                .await
+                .unwrap(),
+            position
+        );
+    }
+
+    #[test]
+    fn stored_positions_without_secondary_still_decode() {
+        let position: PagePosition = serde_json::from_str(
+            r#"{"sortValue":42,"identity":"0199b603-20bd-7342-9be3-cef10620d8bb"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            position,
+            PagePosition {
+                sort_value: 42,
+                identity: "0199b603-20bd-7342-9be3-cef10620d8bb".to_string(),
+                secondary: None,
+            }
+        );
+        // Positions without a secondary keep the exact JSON shape they had
+        // before the field existed, so nothing rewrites old rows.
+        assert_eq!(
+            serde_json::to_string(&position).unwrap(),
+            r#"{"sortValue":42,"identity":"0199b603-20bd-7342-9be3-cef10620d8bb"}"#
+        );
+        assert!(
+            serde_json::from_str::<PagePosition>(
+                r#"{"sortValue":42,"identity":"x","unexpected":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_sort_column_round_trips_through_a_cursor() {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let store = PageCursorStore::new(database);
+        let position = PagePosition {
+            sort_value: 0,
+            identity: "0199b603-20bd-7342-9be3-cef10620d8bb".to_string(),
+            secondary: Some("release-manager".to_string()),
+        };
+        let json = serde_json::to_string(&position).unwrap();
+        assert!(json.contains(r#""secondary":"release-manager""#));
+        assert_eq!(
+            serde_json::from_str::<PagePosition>(&json).unwrap(),
+            position
+        );
+        let token = store
+            .issue(
+                "accounts",
+                "scope=installation;sort=name-asc,id-asc-v1",
+                position.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve(
+                    &token,
+                    "accounts",
+                    "scope=installation;sort=name-asc,id-asc-v1"
+                )
+                .await
+                .unwrap(),
+            position
+        );
+    }
+
+    #[test]
+    fn position_text_bounds_apply_to_both_columns() {
+        let base = PagePosition {
+            sort_value: 1,
+            identity: "id".to_string(),
+            secondary: None,
+        };
+        assert!(validate_position(&base).is_ok());
+        let long = "a".repeat(MAX_POSITION_IDENTITY_BYTES);
+        assert!(
+            validate_position(&PagePosition {
+                identity: long.clone(),
+                ..base.clone()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_position(&PagePosition {
+                identity: format!("{long}a"),
+                ..base.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_position(&PagePosition {
+                secondary: Some(long.clone()),
+                ..base.clone()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_position(&PagePosition {
+                secondary: Some(format!("{long}a")),
+                ..base.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_position(&PagePosition {
+                secondary: Some("line\nbreak".to_string()),
+                ..base.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_position(&PagePosition {
+                secondary: Some(String::new()),
+                ..base
+            })
+            .is_ok()
         );
     }
 

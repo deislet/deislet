@@ -1080,7 +1080,10 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["total"], 3, "rollback must append, never rewrite");
+        assert_eq!(
+            body["page"]["total"], 3,
+            "rollback must append, never rewrite"
+        );
 
         let (status, body) =
             get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
@@ -1250,6 +1253,407 @@ pub(crate) mod tests {
         assert!(retired["page"]["nextCursor"].is_string());
     }
 
+    /// The four environment-product lists (deployments, routes, secrets) and
+    /// the global hostname registry answer the same envelope as the
+    /// application catalog, and a cursor from any one of them opens nothing
+    /// else: not another collection, not another environment.
+    #[tokio::test]
+    async fn environment_product_lists_share_one_opaque_pagination_contract() {
+        let h = harness(true).await;
+        let router = &h.router;
+
+        for (app_id, environments) in [
+            ("paged", vec!["production", "preview"]),
+            ("paged-other", vec!["production"]),
+        ] {
+            let (status, _) = json(
+                router,
+                "POST",
+                "/api/apps",
+                serde_json::json!({"id": app_id}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            for environment in environments {
+                let (status, _) = json(
+                    router,
+                    "POST",
+                    &format!("/api/apps/{app_id}/environments"),
+                    serde_json::json!({"name": environment}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED);
+            }
+        }
+        let production = "/api/apps/paged/environments/production";
+        let preview = "/api/apps/paged/environments/preview";
+
+        // ---- deployments: deploy, deploy, roll back = three history rows.
+        let (status, body) = call(
+            router,
+            "POST",
+            "/api/apps/paged/versions",
+            Body::from(sample_bundle("paged")),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let v1 = body["version"]["id"].as_str().unwrap().to_string();
+        let second_bundle = crate::catalog::bundle::tests::bundle_with_manifest(
+            r#"{"schema":1,"app":"paged","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            true,
+        );
+        let (status, body) = call(
+            router,
+            "POST",
+            "/api/apps/paged/versions",
+            Body::from(second_bundle),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let v2 = body["version"]["id"].as_str().unwrap().to_string();
+        for version_id in [&v1, &v2] {
+            let (status, body) = json(
+                router,
+                "POST",
+                &format!("{production}/deployments"),
+                serde_json::json!({"version_id": version_id}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        let (status, body) = json(
+            router,
+            "POST",
+            &format!("{production}/rollback"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, first) = json(
+            router,
+            "GET",
+            &format!("{production}/deployments?limit=2"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["schemaVersion"], 1);
+        assert_eq!(first["page"]["limit"], 2);
+        assert_eq!(first["page"]["count"], 2);
+        assert_eq!(first["page"]["total"], 3);
+        assert_eq!(first["items"].as_array().unwrap().len(), 2);
+        let deployments_cursor = first["page"]["nextCursor"].as_str().unwrap().to_string();
+        assert_eq!(deployments_cursor.len(), 43);
+        let (status, second) = json(
+            router,
+            "GET",
+            &format!("{production}/deployments?limit=1&cursor={deployments_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["page"]["limit"], 1);
+        assert_eq!(second["page"]["count"], 1);
+        assert_eq!(second["page"]["total"], 3);
+        assert!(second["page"]["nextCursor"].is_null());
+        // Three distinct rows, walked newest first with the canonical id
+        // breaking ties.
+        let walked: Vec<(i64, String)> = first["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(second["items"].as_array().unwrap())
+            .map(|row| {
+                (
+                    row["created_at"].as_i64().unwrap(),
+                    row["canonical_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let mut expected = walked.clone();
+        expected.sort_by(|a, b| b.cmp(a));
+        expected.dedup();
+        assert_eq!(
+            walked, expected,
+            "history must page in (created_at, canonical_id) descending order"
+        );
+        assert_eq!(walked.len(), 3);
+        // The rollback row is the newest and points back at v1.
+        assert_eq!(first["items"][0]["version_id"], v1);
+
+        // A deployments cursor opens neither another environment nor
+        // another collection.
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{preview}/deployments?cursor={deployments_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{production}/routes?cursor={deployments_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{production}/deployments?limit=0"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{production}/deployments?limit=1001"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // ---- routes: matcher order is priority DESC, then path prefix.
+        let (status, body) = json(
+            router,
+            "POST",
+            "/api/domains",
+            serde_json::json!({"pattern": "*", "app_id": "paged"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        for (path_prefix, priority) in [("/zzz", 10), ("/", 0), ("/api", 10), ("/a", 5)] {
+            let (status, body) = json(
+                router,
+                "POST",
+                &format!("{production}/routes"),
+                serde_json::json!({"path_prefix": path_prefix, "priority": priority}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{path_prefix}: {body}");
+        }
+        let (status, routes) = json(
+            router,
+            "GET",
+            &format!("{production}/routes?limit=1"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{routes}");
+        assert_eq!(routes["page"]["total"], 4);
+        assert_eq!(routes["page"]["count"], 1);
+        assert_eq!(routes["items"][0]["path_prefix"], "/api");
+        assert_eq!(routes["items"][0]["priority"], 10);
+        let routes_cursor = routes["page"]["nextCursor"].as_str().unwrap().to_string();
+        // The page boundary falls between two routes of one priority, so
+        // the second page must resume by path prefix, not skip to the next
+        // priority.
+        let (status, routes) = json(
+            router,
+            "GET",
+            &format!("{production}/routes?limit=2&cursor={routes_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{routes}");
+        assert_eq!(routes["page"]["limit"], 2);
+        assert_eq!(routes["page"]["count"], 2);
+        assert_eq!(routes["page"]["total"], 4);
+        assert_eq!(routes["items"][0]["path_prefix"], "/zzz");
+        assert_eq!(routes["items"][0]["priority"], 10);
+        assert_eq!(routes["items"][1]["path_prefix"], "/a");
+        assert_eq!(routes["items"][1]["priority"], 5);
+        let routes_cursor = routes["page"]["nextCursor"].as_str().unwrap().to_string();
+        let (status, routes) = json(
+            router,
+            "GET",
+            &format!("{production}/routes?cursor={routes_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{routes}");
+        assert_eq!(routes["page"]["limit"], 100);
+        assert_eq!(routes["page"]["count"], 1);
+        assert_eq!(routes["page"]["total"], 4);
+        assert_eq!(routes["items"][0]["path_prefix"], "/");
+        assert!(routes["page"]["nextCursor"].is_null());
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{preview}/routes?cursor={routes_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{production}/secrets?cursor={routes_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // ---- secrets: names only, name order.
+        for name in ["ZED", "ALPHA", "MID"] {
+            let (status, body) = json(
+                router,
+                "PUT",
+                &format!("{production}/secrets/{name}"),
+                serde_json::json!({"value": format!("value-of-{name}")}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        }
+        let (status, secrets) = json(
+            router,
+            "GET",
+            &format!("{production}/secrets?limit=2"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{secrets}");
+        assert_eq!(secrets["page"]["total"], 3);
+        assert_eq!(secrets["page"]["count"], 2);
+        assert_eq!(secrets["items"][0]["name"], "ALPHA");
+        assert_eq!(secrets["items"][1]["name"], "MID");
+        assert!(!secrets.to_string().contains("value-of"));
+        let secrets_cursor = secrets["page"]["nextCursor"].as_str().unwrap().to_string();
+        let (status, secrets) = json(
+            router,
+            "GET",
+            &format!("{production}/secrets?limit=1&cursor={secrets_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{secrets}");
+        assert_eq!(secrets["page"]["limit"], 1);
+        assert_eq!(secrets["page"]["count"], 1);
+        assert_eq!(secrets["page"]["total"], 3);
+        assert_eq!(secrets["items"][0]["name"], "ZED");
+        assert!(secrets["page"]["nextCursor"].is_null());
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{preview}/secrets?cursor={secrets_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{production}/deployments?cursor={secrets_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // ---- domain grants: global scope, (pattern, app_id, environment).
+        for (pattern, app_id, environment) in [
+            ("*.example.com", "paged-other", None),
+            ("api.example.com", "paged", None),
+            ("*.example.com", "paged", Some("production")),
+            ("*.example.com", "paged", None),
+        ] {
+            let (status, body) = json(
+                router,
+                "POST",
+                "/api/domains",
+                serde_json::json!({
+                    "pattern": pattern,
+                    "app_id": app_id,
+                    "environment": environment,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{pattern}: {body}");
+        }
+        let grant_key = |grant: &Value| {
+            (
+                grant["pattern"].as_str().unwrap().to_string(),
+                grant["app_id"].as_str().unwrap().to_string(),
+                grant["environment"].as_str().unwrap().to_string(),
+            )
+        };
+        let key = |pattern: &str, app_id: &str, environment: &str| {
+            (
+                pattern.to_string(),
+                app_id.to_string(),
+                environment.to_string(),
+            )
+        };
+        let (status, grants) = json(router, "GET", "/api/domains?limit=2", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{grants}");
+        assert_eq!(grants["page"]["total"], 5);
+        assert_eq!(grants["page"]["count"], 2);
+        assert_eq!(grant_key(&grants["items"][0]), key("*", "paged", "*"));
+        assert_eq!(
+            grant_key(&grants["items"][1]),
+            key("*.example.com", "paged", "*")
+        );
+        let grants_cursor = grants["page"]["nextCursor"].as_str().unwrap().to_string();
+        // The boundary splits one pattern across pages; the second page
+        // resumes on the grantee, which is the rest of the primary key.
+        let (status, grants) = json(
+            router,
+            "GET",
+            &format!("/api/domains?limit=2&cursor={grants_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{grants}");
+        assert_eq!(grants["page"]["total"], 5);
+        assert_eq!(grants["page"]["count"], 2);
+        assert_eq!(
+            grant_key(&grants["items"][0]),
+            key("*.example.com", "paged", "production")
+        );
+        assert_eq!(
+            grant_key(&grants["items"][1]),
+            key("*.example.com", "paged-other", "*")
+        );
+        let grants_cursor = grants["page"]["nextCursor"].as_str().unwrap().to_string();
+        let (status, grants) = json(
+            router,
+            "GET",
+            &format!("/api/domains?limit=3&cursor={grants_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{grants}");
+        assert_eq!(grants["page"]["limit"], 3);
+        assert_eq!(grants["page"]["count"], 1);
+        assert_eq!(grants["page"]["total"], 5);
+        assert_eq!(
+            grant_key(&grants["items"][0]),
+            key("api.example.com", "paged", "*")
+        );
+        assert!(grants["page"]["nextCursor"].is_null());
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("{production}/routes?cursor={grants_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json(
+            router,
+            "GET",
+            &format!("/api/domains?cursor={routes_cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn bundle_download_streams_the_stored_zip() {
         let h = harness(true).await;
@@ -1390,7 +1794,7 @@ pub(crate) mod tests {
 
         let (status, listed) = json(router, "GET", "/api/domains", Value::Null).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(listed["total"], 3, "{listed}");
+        assert_eq!(listed["page"]["total"], 3, "{listed}");
 
         // A pattern can be held by more than one application, so a delete
         // that does not say which one it means is a bad request rather than a
@@ -1409,7 +1813,7 @@ pub(crate) mod tests {
             assert_eq!(status, StatusCode::OK, "{pattern}: {body}");
         }
         let (_, listed) = json(router, "GET", "/api/domains", Value::Null).await;
-        assert_eq!(listed["total"], 0, "{listed}");
+        assert_eq!(listed["page"]["total"], 0, "{listed}");
 
         // Withdrawing something nobody holds is a 404, not a quiet success:
         // a caller told "ok" for a pattern they misspelled would believe they
@@ -1636,7 +2040,7 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["secrets"][0]["name"], "API_KEY");
+        assert_eq!(body["items"][0]["name"], "API_KEY");
         assert!(!body.to_string().contains("super-secret"));
 
         let (status, _) = json(
@@ -1654,7 +2058,7 @@ pub(crate) mod tests {
             Value::Null,
         )
         .await;
-        assert_eq!(body["total"], 0);
+        assert_eq!(body["page"]["total"], 0);
     }
 
     /// Without a master key the secret endpoints must refuse loudly rather
@@ -1697,7 +2101,7 @@ pub(crate) mod tests {
             Value::Null,
         )
         .await;
-        assert_eq!(body["total"], 0);
+        assert_eq!(body["page"]["total"], 0);
     }
 
     #[tokio::test]

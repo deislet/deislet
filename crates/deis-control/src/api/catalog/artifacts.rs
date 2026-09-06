@@ -104,7 +104,9 @@ pub async fn list_artifacts(
         id_scope("application", app.canonical_id)
     );
     let limit = query.bounded_limit()?;
-    let cursor = query.position(&state.store, collection, &binding).await?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
+        .await?;
     let page = state
         .store
         .list_canonical_artifacts_page(&app_id, limit, cursor)
@@ -112,6 +114,7 @@ pub async fn list_artifacts(
     let next_position = page.items.last().map(|artifact| PagePosition {
         sort_value: artifact.created_at,
         identity: artifact.id.to_string(),
+        secondary: None,
     });
     let page = CatalogPage {
         items: page
@@ -122,9 +125,14 @@ pub async fn list_artifacts(
         total: page.total,
         has_more: page.has_more,
     };
-    let response = list_page(&state.store, collection, &binding, limit, page, move |_| {
-        next_position.expect("a page with a successor has a last artifact")
-    })
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        move |_| next_position.expect("a page with a successor has a last artifact"),
+    )
     .await?;
     Ok(Json(response))
 }

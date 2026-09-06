@@ -415,11 +415,22 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
     const OLD_KEY: &str = "the-operators-old-key";
 
     // The flat key is listed, and listed as unscoped: that count is what an
-    // operator drives to zero.
+    // operator drives to zero, and it is the total of the `scope=unscoped`
+    // listing in the unified envelope.
     let (status, listed) = call("GET", "/api/tokens", Some(OLD_KEY), "").await;
     assert_eq!(status, StatusCode::OK, "{listed}");
-    assert_eq!(listed["unscoped"], 1);
-    assert_eq!(listed["tokens"][0]["origin"], "config");
+    assert_eq!(listed["schemaVersion"], 1);
+    assert_eq!(listed["page"]["total"], 1);
+    assert_eq!(listed["items"][0]["origin"], "config");
+    let (status, unscoped) = call(
+        "GET",
+        "/api/tokens?scope=unscoped&limit=1",
+        Some(OLD_KEY),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unscoped}");
+    assert_eq!(unscoped["page"]["total"], 1);
 
     // An account and a token for one environment of one application.
     let (status, account) = call(
@@ -502,7 +513,7 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
     // reads: the application that was created, the refusal, and the mint.
     let (status, log) = call("GET", "/api/audit?limit=100", Some(OLD_KEY), "").await;
     assert_eq!(status, StatusCode::OK, "{log}");
-    let actions: Vec<&str> = log["entries"]
+    let actions: Vec<&str> = log["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -515,7 +526,7 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
         );
     }
 
-    let refusal = log["entries"]
+    let refusal = log["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -527,11 +538,11 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
 
     // There is no way to take a line back out. Not for the unscoped key
     // either, which is the most powerful credential this control plane has.
-    let before = log["entries"].as_array().unwrap().len();
+    let before = log["items"].as_array().unwrap().len();
     let (status, _) = call("DELETE", "/api/audit", Some(OLD_KEY), "").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     let (_, after) = call("GET", "/api/audit?limit=100", Some(OLD_KEY), "").await;
-    assert!(after["entries"].as_array().unwrap().len() >= before);
+    assert!(after["items"].as_array().unwrap().len() >= before);
 }
 
 /// The Restart button's whole round trip, in the shape the dashboard sends

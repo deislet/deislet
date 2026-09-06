@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     AppState,
     error::{ApiError, ApiResult},
+    pagination::bounded_limit,
 };
 
 /// One open control channel.
@@ -115,7 +116,7 @@ pub async fn get_heartbeats(
         .as_ref()
         .ok_or_else(|| ApiError::InternalError("Database not available".to_string()))?;
 
-    let limit = query.limit.unwrap_or(100);
+    let limit = bounded_limit(query.limit)?;
     let heartbeats = db.get_recent_heartbeats(&node_id, limit).await?;
 
     Ok(Json(
@@ -127,4 +128,40 @@ pub async fn get_heartbeats(
             })
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::Database;
+    use crate::session::SessionManager;
+    use axum::{http::StatusCode, response::IntoResponse};
+    use std::sync::Arc;
+
+    async fn state() -> AppState {
+        AppState {
+            sessions: Arc::new(SessionManager::new()),
+            database: Some(Arc::new(Database::init(":memory:").await.unwrap())),
+        }
+    }
+
+    async fn heartbeats(limit: Option<usize>) -> StatusCode {
+        get_heartbeats(
+            State(state().await),
+            Path("node-a".to_string()),
+            Query(HeartbeatsQuery { limit }),
+        )
+        .await
+        .into_response()
+        .status()
+    }
+
+    /// The limit went straight into the `LIMIT` clause, so one query could
+    /// ask SQLite for every heartbeat ever recorded.
+    #[tokio::test]
+    async fn an_oversized_heartbeat_limit_is_refused_and_the_ceiling_is_accepted() {
+        assert_eq!(heartbeats(Some(1_001)).await, StatusCode::BAD_REQUEST);
+        assert_eq!(heartbeats(Some(1_000)).await, StatusCode::OK);
+        assert_eq!(heartbeats(None).await, StatusCode::OK);
+    }
 }

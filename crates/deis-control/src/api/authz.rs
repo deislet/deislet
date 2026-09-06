@@ -3044,9 +3044,10 @@ mod gate_tests {
     async fn lines(gate: &Gate) -> Vec<crate::audit::AuditEntry> {
         gate.state
             .audit
-            .query(crate::audit::AuditQuery::default())
+            .query_page(crate::audit::AuditQuery::default(), 100, None)
             .await
             .unwrap()
+            .items
     }
 
     /// The migration promise: a control plane upgraded with an `api_keys`
@@ -3078,7 +3079,17 @@ mod gate_tests {
 
         // And it is visible as unscoped, which is the thing an operator has
         // to be able to see in order to retire it.
-        let listed = gate.state.identity.list_tokens(None, false).await.unwrap();
+        let listed = gate
+            .state
+            .identity
+            .list_tokens_page(
+                crate::identity::store::TokenListFilter::default(),
+                100,
+                None,
+            )
+            .await
+            .unwrap()
+            .items;
         assert_eq!(listed.len(), 1);
         assert!(listed[0].unscoped);
         assert_eq!(gate.state.identity.unscoped_count().await.unwrap(), 1);

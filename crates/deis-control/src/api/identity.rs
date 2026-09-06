@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::api::error::{ApiError, ApiResult};
-use crate::identity::{ApiToken, Authority, IdentityStore, Role, Scope, store::Account};
+use crate::api::pagination::{ControlListPage, ListQuery, list_page};
+use crate::catalog::PagePosition;
+use crate::identity::{
+    ApiToken, Authority, IdentityStore, Role, Scope,
+    store::{Account, TokenListFilter, TokenScopeFilter},
+};
 
 #[derive(Clone)]
 pub struct IdentityApiState {
@@ -40,12 +45,6 @@ impl From<crate::identity::IdentityError> for ApiError {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct AccountsResponse {
-    pub accounts: Vec<Account>,
-    pub total: usize,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct CreateAccountRequest {
     pub name: String,
@@ -56,14 +55,35 @@ pub struct CreateAccountRequest {
 }
 
 /// GET /api/accounts
+///
+/// The unified list envelope, oldest account first. There is one scope
+/// (the whole installation) and no filter, so the cursor binding only has
+/// to name the sort.
 pub async fn list_accounts(
     State(state): State<IdentityApiState>,
-) -> ApiResult<Json<AccountsResponse>> {
-    let accounts = state.identity.list_accounts().await?;
-    Ok(Json(AccountsResponse {
-        total: accounts.len(),
-        accounts,
-    }))
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<Account>>> {
+    let collection = "accounts";
+    let binding = "scope=global;filter=all;sort=created-at-asc,name-asc-v1";
+    let limit = query.bounded_limit()?;
+    let cursor = query
+        .position(&state.identity.page_cursors(), collection, binding)
+        .await?;
+    let page = state.identity.list_accounts_page(limit, cursor).await?;
+    let response = list_page(
+        &state.identity.page_cursors(),
+        collection,
+        binding,
+        limit,
+        page,
+        |account| PagePosition {
+            sort_value: account.created_at,
+            identity: account.name.clone(),
+            secondary: None,
+        },
+    )
+    .await?;
+    Ok(Json(response))
 }
 
 /// POST /api/accounts
@@ -183,43 +203,104 @@ pub async fn create_token(
     }))
 }
 
+/// What `GET /api/tokens` accepts: the page controls of every list route
+/// plus the three filters a token listing combines with "and".
 #[derive(Debug, Deserialize)]
-pub struct ListTokensQuery {
+#[serde(deny_unknown_fields)]
+pub struct TokenListQuery {
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+    /// An account's name. Resolved to its id before anything is read, so an
+    /// unknown name is a 404 rather than an empty list.
     #[serde(default)]
     pub account: Option<String>,
     /// Include credentials that no longer work. Off by default so a listing
     /// answers "what can reach this platform right now".
     #[serde(default)]
     pub include_revoked: bool,
+    /// `all` (the default) or `unscoped`. Under `unscoped` the page total
+    /// is the number of credentials that answer to no scope, which is what
+    /// `deis token list` warns about; a caller that only wants the number
+    /// asks for `scope=unscoped&limit=1` and reads `page.total`.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TokensResponse {
-    pub tokens: Vec<ApiToken>,
-    pub total: usize,
-    /// How many of the listed credentials answer to no scope at all. Served
-    /// as a number so a dashboard, a script or `deis token list` can put it
-    /// in front of an operator without counting for itself.
-    pub unscoped: usize,
+impl TokenListQuery {
+    fn page_query(&self) -> ListQuery {
+        ListQuery {
+            limit: self.limit,
+            cursor: self.cursor.clone(),
+        }
+    }
+
+    fn scope_filter(&self) -> ApiResult<TokenScopeFilter> {
+        match self.scope.as_deref().unwrap_or("all") {
+            "all" => Ok(TokenScopeFilter::All),
+            "unscoped" => Ok(TokenScopeFilter::Unscoped),
+            scope => Err(ApiError::BadRequest(format!(
+                "token scope filter must be all or unscoped; got {scope}"
+            ))),
+        }
+    }
 }
 
 /// GET /api/tokens
+///
+/// The unified list envelope, oldest credential first. Every filter is part
+/// of the cursor binding - by the account's id, never its name - so a
+/// cursor issued for one listing cannot be resumed under another.
 pub async fn list_tokens(
     State(state): State<IdentityApiState>,
-    Query(query): Query<ListTokensQuery>,
-) -> ApiResult<Json<TokensResponse>> {
-    let tokens = state
-        .identity
-        .list_tokens(query.account.as_deref(), query.include_revoked)
+    Query(query): Query<TokenListQuery>,
+) -> ApiResult<Json<ControlListPage<ApiToken>>> {
+    let account_id = match query.account.as_deref() {
+        Some(name) => Some(state.identity.get_account(name).await?.id),
+        None => None,
+    };
+    let scope = query.scope_filter()?;
+    let collection = "api-tokens";
+    let binding = format!(
+        "scope=global;filter=account:{},revoked:{},scope:{};sort=created-at-asc,id-asc-v1",
+        account_id.as_deref().unwrap_or("all"),
+        if query.include_revoked {
+            "included"
+        } else {
+            "excluded"
+        },
+        scope.as_str()
+    );
+    let page_query = query.page_query();
+    let limit = page_query.bounded_limit()?;
+    let cursor = page_query
+        .position(&state.identity.page_cursors(), collection, &binding)
         .await?;
-    Ok(Json(TokensResponse {
-        total: tokens.len(),
-        unscoped: tokens
-            .iter()
-            .filter(|token| token.unscoped && token.revoked_at.is_none())
-            .count(),
-        tokens,
-    }))
+    let page = state
+        .identity
+        .list_tokens_page(
+            TokenListFilter {
+                account_id,
+                include_revoked: query.include_revoked,
+                scope,
+            },
+            limit,
+            cursor,
+        )
+        .await?;
+    let response = list_page(
+        &state.identity.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |token| PagePosition {
+            sort_value: token.created_at,
+            identity: token.id.clone(),
+            secondary: None,
+        },
+    )
+    .await?;
+    Ok(Json(response))
 }
 
 /// DELETE /api/tokens/:id
@@ -237,4 +318,238 @@ fn parse_role(text: &str) -> ApiResult<Role> {
             Role::names()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::catalog::tests::json;
+    use crate::database::Database;
+    use axum::{
+        Router,
+        http::StatusCode,
+        routing::{delete, get, post},
+    };
+    use rusqlite::params;
+    use serde_json::Value;
+
+    async fn harness() -> (Router, Arc<IdentityStore>, Arc<Database>) {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let identity = Arc::new(IdentityStore::new(Arc::clone(&database)));
+        let router = Router::new()
+            .route("/api/accounts", get(list_accounts).post(create_account))
+            .route("/api/accounts/:name/tokens", post(create_token))
+            .route("/api/tokens", get(list_tokens))
+            .route("/api/tokens/:id", delete(revoke_token))
+            .with_state(IdentityApiState {
+                identity: Arc::clone(&identity),
+            });
+        (router, identity, database)
+    }
+
+    /// Accounts with a chosen `created_at`, so the tie-breaker is exercised
+    /// on purpose rather than left to whether the clock ticked mid-test.
+    async fn insert_account(database: &Database, name: &str, created_at: i64) {
+        let name = name.to_string();
+        database
+            .with_connection(move |conn| {
+                conn.execute(
+                    "INSERT INTO accounts (id, name, role, created_at, disabled_at)
+                     VALUES (?1, ?2, 'viewer', ?3, NULL)",
+                    params![format!("id-{name}"), name, created_at],
+                )?;
+                Ok::<_, crate::database::DatabaseError>(())
+            })
+            .await
+            .unwrap();
+    }
+
+    fn names(page: &Value) -> Vec<String> {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn ids(page: &Value) -> Vec<String> {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn accounts_page_through_the_unified_envelope_oldest_first() {
+        let (router, _, database) = harness().await;
+        insert_account(&database, "zulu", 5).await;
+        insert_account(&database, "bravo", 10).await;
+        insert_account(&database, "alpha", 10).await;
+
+        let (status, first) = json(&router, "GET", "/api/accounts?limit=2", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["schemaVersion"], 1);
+        assert_eq!(first["page"]["limit"], 2);
+        assert_eq!(first["page"]["count"], 2);
+        assert_eq!(first["page"]["total"], 3);
+        assert_eq!(names(&first), ["zulu", "alpha"]);
+        let cursor = first["page"]["nextCursor"].as_str().unwrap().to_string();
+        assert_eq!(cursor.len(), 43);
+
+        // The page size may change between pages; the position may not.
+        let (status, second) = json(
+            &router,
+            "GET",
+            &format!("/api/accounts?limit=1&cursor={cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(names(&second), ["bravo"]);
+        assert_eq!(second["page"]["total"], 3);
+        assert!(second["page"]["nextCursor"].is_null());
+
+        // An accounts cursor opens no other collection.
+        let (status, _) = json(
+            &router,
+            "GET",
+            &format!("/api/tokens?cursor={cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = json(&router, "GET", "/api/accounts?limit=0", Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json(&router, "GET", "/api/accounts?limit=1001", Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tokens_page_through_the_unified_envelope_and_count_the_unscoped_ones() {
+        let (router, identity, _) = harness().await;
+        identity.create_account("ci", Role::Deployer).await.unwrap();
+        identity.create_account("ops", Role::Owner).await.unwrap();
+        for (account, name, authority) in [
+            (
+                "ci",
+                "preview",
+                Authority::Scoped(Role::Deployer.default_scopes()),
+            ),
+            ("ops", "laptop", Authority::Unscoped),
+            (
+                "ci",
+                "release",
+                Authority::Scoped(Role::Deployer.default_scopes()),
+            ),
+            ("ops", "old-root", Authority::Unscoped),
+        ] {
+            identity
+                .create_token(account, name, authority)
+                .await
+                .unwrap();
+        }
+        let (status, all) = json(&router, "GET", "/api/tokens", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(all["page"]["total"], 4);
+        assert_eq!(all["page"]["count"], 4);
+        assert!(all["page"]["nextCursor"].is_null());
+        let everything = ids(&all);
+        // Same-second tokens tie-break on their random id, so the one to
+        // revoke is found by name, not by position.
+        let old_root = all["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|token| token["name"] == "old-root")
+            .map(|token| token["id"].as_str().unwrap().to_string())
+            .unwrap();
+        let live: Vec<String> = everything
+            .iter()
+            .filter(|id| **id != old_root)
+            .cloned()
+            .collect();
+
+        // Revoking one drops it from the default listing and its total.
+        let (status, _) = json(
+            &router,
+            "DELETE",
+            &format!("/api/tokens/{old_root}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, first) = json(&router, "GET", "/api/tokens?limit=2", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["page"]["total"], 3);
+        assert_eq!(first["page"]["count"], 2);
+        assert_eq!(ids(&first), live[..2]);
+        let cursor = first["page"]["nextCursor"].as_str().unwrap().to_string();
+
+        let (status, second) = json(
+            &router,
+            "GET",
+            &format!("/api/tokens?limit=5&cursor={cursor}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(ids(&second), live[2..3]);
+        assert_eq!(second["page"]["total"], 3);
+        assert!(second["page"]["nextCursor"].is_null());
+        assert!(
+            !second.to_string().contains("secret"),
+            "a token listing must never carry a credential"
+        );
+
+        // The same cursor under any other filter is refused: the scope
+        // filter, the revoked filter and the account filter each change
+        // the binding.
+        for uri in [
+            format!("/api/tokens?scope=unscoped&cursor={cursor}"),
+            format!("/api/tokens?include_revoked=true&cursor={cursor}"),
+            format!("/api/tokens?account=ci&cursor={cursor}"),
+            format!("/api/accounts?cursor={cursor}"),
+        ] {
+            let (status, _) = json(&router, "GET", &uri, Value::Null).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+
+        // The unscoped count is a filtered total, one live root token now.
+        let (status, unscoped) = json(
+            &router,
+            "GET",
+            "/api/tokens?scope=unscoped&limit=1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{unscoped}");
+        assert_eq!(unscoped["page"]["total"], 1);
+        assert_eq!(unscoped["items"][0]["name"], "laptop");
+        let (_, unscoped_ever) = json(
+            &router,
+            "GET",
+            "/api/tokens?scope=unscoped&include_revoked=true&limit=1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(unscoped_ever["page"]["total"], 2);
+
+        // Per account, by the id the binding carries; an unknown name is
+        // an error, not an empty page.
+        let (status, ci) = json(&router, "GET", "/api/tokens?account=ci", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{ci}");
+        assert_eq!(ci["page"]["total"], 2);
+        let (status, _) = json(&router, "GET", "/api/tokens?account=nobody", Value::Null).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = json(&router, "GET", "/api/tokens?scope=root", Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = json(&router, "GET", "/api/tokens?before=1", Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }

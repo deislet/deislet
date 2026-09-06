@@ -11,14 +11,15 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 
 use super::CatalogState;
 use crate::api::error::ApiResult;
-use crate::catalog::Route;
+use crate::api::pagination::{ControlListPage, ListQuery, environment_scope, list_page};
+use crate::catalog::{PagePosition, Route};
 
 #[derive(Debug, Deserialize)]
 pub struct RouteRequest {
@@ -39,8 +40,13 @@ pub struct RouteResponse {
     pub route: Route,
 }
 
+/// The whole routing table as one unpaginated diagnostic (`GET /api/routes`).
+///
+/// This is deliberately not the unified list envelope: the endpoint is a
+/// platform-wide edge diagnostic whose paging is still a pending product
+/// decision, and the per-environment list no longer shares this shape.
 #[derive(Debug, Serialize)]
-pub struct RoutesResponse {
+pub struct GlobalRoutesResponse {
     pub routes: Vec<Route>,
     pub total: usize,
 }
@@ -60,28 +66,52 @@ pub async fn create_route(
 }
 
 /// GET /api/apps/:app_id/environments/:env/routes
+///
+/// One environment's routes in the order the matcher applies them: highest
+/// priority first, then by path prefix, with the route id as the
+/// tie-breaker so paging across two routes on one prefix is stable.
 pub async fn list_routes(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
-) -> ApiResult<Json<RoutesResponse>> {
-    let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
-    let routes = state
-        .store
-        .list_routes(Some(&app_id), Some(&env.id))
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ControlListPage<Route>>> {
+    let (app, env) = super::apps::resolve_app_environment(&state, &app_id, &env_name).await?;
+    let collection = "environment-routes";
+    let binding = format!(
+        "{};filter=all;sort=priority-desc,path-prefix-asc,id-asc-v1",
+        environment_scope(app.canonical_id, env.canonical_id)
+    );
+    let limit = query.bounded_limit()?;
+    let cursor = query
+        .position(&state.store.page_cursors(), collection, &binding)
         .await?;
-    Ok(Json(RoutesResponse {
-        total: routes.len(),
-        routes,
-    }))
+    let page = state.store.list_routes_page(&env.id, limit, cursor).await?;
+    let response = list_page(
+        &state.store.page_cursors(),
+        collection,
+        &binding,
+        limit,
+        page,
+        |route| PagePosition {
+            sort_value: route.priority,
+            identity: route.id.clone(),
+            secondary: Some(route.path_prefix.clone()),
+        },
+    )
+    .await?;
+    Ok(Json(response))
 }
 
 /// GET /api/routes
 ///
 /// Every route the platform knows, highest priority first. This is the
-/// whole routing table an edge needs in one call.
-pub async fn list_all_routes(State(state): State<CatalogState>) -> ApiResult<Json<RoutesResponse>> {
+/// whole routing table an edge needs in one call, and it stays unpaginated
+/// until the product decides how an edge should read a table in pieces.
+pub async fn list_all_routes(
+    State(state): State<CatalogState>,
+) -> ApiResult<Json<GlobalRoutesResponse>> {
     let routes = state.store.list_routes(None, None).await?;
-    Ok(Json(RoutesResponse {
+    Ok(Json(GlobalRoutesResponse {
         total: routes.len(),
         routes,
     }))
