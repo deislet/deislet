@@ -6,6 +6,7 @@
 
 use deis_wire::CanonicalId;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use super::CatalogError;
 
@@ -26,9 +27,10 @@ pub const MAX_PATH_PREFIX_LEN: usize = 512;
 /// built from the pair by `deis_wire::conventions::tenant_id`, so a preview
 /// deployment cannot read or overwrite what production stored while those
 /// services still understand exactly one tenant dimension.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct App {
     pub id: String,
+    #[schema(value_type = String, format = Uuid)]
     pub canonical_id: CanonicalId,
     /// Monotonic catalog revision used to fence identity migration. It moves
     /// whenever an environment, version, deployment, route or secret changes.
@@ -92,9 +94,10 @@ pub struct ProviderDerivation {
 
 /// An environment: `production` or any preview name. Deployment pointers,
 /// routes and secrets all hang off this, never off the bare app.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Environment {
     pub id: String,
+    #[schema(value_type = String, format = Uuid)]
     pub canonical_id: CanonicalId,
     pub app_id: String,
     pub name: String,
@@ -103,9 +106,10 @@ pub struct Environment {
 
 /// One pointer row. The newest row of an environment is its current
 /// version; older rows are the deployment history.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Deployment {
     pub id: String,
+    #[schema(value_type = String, format = Uuid)]
     pub canonical_id: CanonicalId,
     pub app_id: String,
     pub env_id: String,
@@ -119,9 +123,10 @@ pub struct Deployment {
 }
 
 /// Immutable deployment intent plus its durable coordinator state.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeploymentPlan {
     pub id: String,
+    #[schema(value_type = String, format = Uuid)]
     pub routing_generation: CanonicalId,
     pub app_id: String,
     pub env_id: String,
@@ -148,6 +153,7 @@ pub struct DeploymentPlan {
     /// Short-lived owner of the next coordinator action. This is mutable
     /// execution state and is deliberately outside `plan_sha256`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub coordinator_id: Option<CanonicalId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_expires_at: Option<i64>,
@@ -155,7 +161,7 @@ pub struct DeploymentPlan {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeploymentTargetObservation {
     pub plan_id: String,
     pub node_id: String,
@@ -166,7 +172,7 @@ pub struct DeploymentTargetObservation {
     pub observed_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeploymentProxyObservation {
     pub plan_id: String,
     pub proxy_id: String,
@@ -176,7 +182,7 @@ pub struct DeploymentProxyObservation {
     pub observed_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeploymentQueueObservation {
     pub plan_id: String,
     pub observed_state: String,
@@ -192,7 +198,7 @@ pub struct DeploymentQueueObservation {
     pub observed_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeploymentEvent {
     pub sequence: i64,
     pub plan_id: String,
@@ -202,7 +208,7 @@ pub struct DeploymentEvent {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeploymentGenerationDrain {
     pub plan_id: String,
     pub generation: String,
@@ -213,7 +219,7 @@ pub struct DeploymentGenerationDrain {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeploymentDrainObservation {
     pub plan_id: String,
     pub node_id: String,
@@ -225,7 +231,7 @@ pub struct DeploymentDrainObservation {
 
 /// A host plus path prefix bound to one environment. `host: None` matches
 /// any domain.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Route {
     pub id: String,
     pub app_id: String,
@@ -238,7 +244,7 @@ pub struct Route {
 /// What a caller is allowed to learn about a secret: that it exists and
 /// when it last changed. The value never leaves the control plane except
 /// as part of a deployment payload to a node.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SecretMeta {
     pub name: String,
     /// Opaque immutable revision identity. A later write creates another one.
@@ -292,7 +298,7 @@ pub struct DeployedVersion {
 
 /// Everything deleting an app removed. Returned so the caller can clean up
 /// the bundle files on disk and log exactly how much history was destroyed.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct DeletedApp {
     pub canonical_artifacts: usize,
     pub provider_derivations: usize,
@@ -338,7 +344,7 @@ pub struct DeletedApp {
 /// be deployed onto it until somebody says out loud that the next application
 /// of that name may have what the last one left - see
 /// `CatalogStore::release_retired_name`.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct RetiredAppName {
     pub app_id: String,
     /// When the application was deleted, Unix epoch seconds.

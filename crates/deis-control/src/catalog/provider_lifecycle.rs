@@ -27,6 +27,7 @@ use deis_wire::CanonicalId;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use utoipa::ToSchema;
 
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
@@ -88,21 +89,25 @@ impl ProviderLifecycleResourceKind {
 
 /// One dependent a cascade acted on, recorded on the audit event of the
 /// resource whose deletion caused it.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderLifecycleCascadeEntry {
     /// `provider-target` (deleted) or `provider-target-grant` (revoked).
     pub kind: String,
+    #[schema(value_type = String, format = Uuid)]
     pub id: CanonicalId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderLifecycleAuditEvent {
+    #[schema(value_type = String, format = Uuid)]
     pub event_id: CanonicalId,
     pub resource_kind: String,
+    #[schema(value_type = String, format = Uuid)]
     pub resource_id: CanonicalId,
     pub resource_revision: u64,
+    #[schema(value_type = String, format = Uuid)]
     pub actor_id: CanonicalId,
     /// `disabled`, `enabled` or `deleted`.
     pub event_type: String,

@@ -48,9 +48,11 @@ use axum::{
 };
 use serde::Serialize;
 use tracing::{info, warn};
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::openapi;
 use crate::identity::Principal;
 
 /// What a caller needs in order to act as one tenant of deis-store.
@@ -58,7 +60,7 @@ use crate::identity::Principal;
 /// Every field is always present: an answer carrying an empty token would be
 /// one the caller cannot use, so that case is a refusal rather than a field
 /// left blank.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageTokenResponse {
     /// The `<app>.<environment>` pair the token authorises, which the caller
     /// must send back in `x-deis-tenant` on every storage call. Included so
@@ -76,6 +78,21 @@ pub struct StorageTokenResponse {
 /// Answers 404 when the application or the environment is unknown - the same
 /// resolution every other endpoint under this prefix does - and 409 when this
 /// control plane is not configured to reach or authorise storage at all.
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/storage-token",
+    operation_id = "getStorageToken",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name.")),
+    responses(
+        (status = 200, description = "A credential for the environment's storage tenant.", body = StorageTokenResponse),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn storage_token(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,

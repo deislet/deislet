@@ -14,6 +14,7 @@ use deis_wire::{
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use utoipa::ToSchema;
 
 use super::model::now_secs;
 use super::operation::{
@@ -26,17 +27,19 @@ const RESTORE_COLUMNS: &str = "restore_id, operation_id, restore_set_id, install
     expected_installation_revision, restore_set_sha256, restore_set_json, state, attempt_count, \
     coordinator_id, lease_expires_at, execution_report_json, last_error, created_at, updated_at";
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProductInstallation {
+    #[schema(value_type = String, format = Uuid)]
     pub installation_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub organization_id: CanonicalId,
     pub revision: u64,
     pub created_at_unix_seconds: i64,
     pub updated_at_unix_seconds: i64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendRestoreState {
     Planned,
@@ -79,22 +82,30 @@ impl BackendRestoreState {
     ];
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendRestorePlan {
+    #[schema(value_type = String, format = Uuid)]
     pub restore_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub operation_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub restore_set_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub installation_id: CanonicalId,
     pub expected_installation_revision: u64,
+    #[schema(value_type = crate::api::openapi::RestoreDigestDocument)]
     pub restore_set_digest: RestoreDigest,
+    #[schema(value_type = crate::api::openapi::BackendRestoreSetDocument)]
     pub restore_set: BackendRestoreSet,
     pub state: BackendRestoreState,
     pub attempt_count: u64,
     #[serde(skip_serializing)]
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub(crate) coordinator_id: Option<CanonicalId>,
     #[serde(skip_serializing)]
     pub(crate) lease_expires_at_unix_seconds: Option<i64>,
+    #[schema(value_type = Option<crate::api::openapi::BackendRestoreExecutionReportDocument>)]
     pub execution_report: Option<BackendRestoreExecutionReport>,
     pub last_error: Option<String>,
     pub created_at_unix_seconds: i64,

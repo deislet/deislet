@@ -22,7 +22,8 @@
     {"id": "backend-migration-evidence", "schema": "contracts/v1/backend-migration-evidence.schema.json"},
     {"id": "backend-restore-set", "schema": "contracts/v1/backend-restore-set.schema.json"},
     {"id": "backend-restore-report", "schema": "contracts/v1/backend-restore-report.schema.json"},
-    {"id": "control-list-page", "schema": "contracts/v1/control-list-page.schema.json"}
+    {"id": "control-list-page", "schema": "contracts/v1/control-list-page.schema.json"},
+    {"id": "control-error", "schema": "contracts/v1/control-error.schema.json"}
   ],
   "operationTransitions": "contracts/v1/operation-transitions.json",
   "fixtures": "contracts/v1/fixtures.json",

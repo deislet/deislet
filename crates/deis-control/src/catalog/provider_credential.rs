@@ -16,6 +16,7 @@ use deis_provider_driver::{
 use deis_wire::CanonicalId;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
@@ -58,10 +59,12 @@ impl From<OperationRequestContext> for ProviderCredentialMutationContext {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderCredentialBinding {
+    #[schema(value_type = String, format = Uuid)]
     pub binding_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub organization_id: CanonicalId,
     pub backend_id: String,
     pub name: String,
@@ -73,16 +76,22 @@ pub struct ProviderCredentialBinding {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderCredentialAuditEvent {
+    #[schema(value_type = String, format = Uuid)]
     pub event_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub binding_id: CanonicalId,
     pub credential_revision: u64,
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub lease_id: Option<CanonicalId>,
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub operation_id: Option<CanonicalId>,
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub owner_id: Option<CanonicalId>,
     pub claim_epoch: Option<u64>,
+    #[schema(value_type = String, format = Uuid)]
     pub actor_id: CanonicalId,
     pub event_type: String,
     pub disposition: Option<String>,

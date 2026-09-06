@@ -2645,3 +2645,53 @@ Application/framework source + versioned build plan
   五 crate all-target Clippy；Linux 另通过 17 份 Schema/50 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为
   `evidence/provider-driver-dispatcher-portability-c8d4f72.json`；它证明这些控制路径的三平台代码可移植性，不证明真实
   provider 部署或 Edge Canon 合规。
+
+## 93. 显式 API major、结构化错误模型、平台诊断命名空间与 OpenAPI 门禁
+
+- 产品负责人本轮拍板四项：显式 major 用 `/api/v1` 路径前缀；平台诊断面移入 `/api/platform/*`；结构化错误模型与 OpenAPI/
+  破坏性变更门禁随 v1 一次性落地；验证通过即推送。两项运维判断按规划建议执行：Prometheus 抓取端点 `GET /api/metrics`
+  原地永久保留、不进入任何命名空间；`DELETE /api/runtime/:node/apps/:app_id` 随 runtime 进入 `/api/platform`，授权要求
+  逐位保留。
+- 挂载：axum 0.7 的 `nest("/api")` 会独占子树并与节点路由冲突，因此旧 `/api/*` 保持平铺 merge，只把 `/api/v1` 与
+  `/api/platform` 做 nest；各 router 构造函数按前缀参数化。authz 在 classify 前把 `["api","v1"|"platform",…]` 折叠为
+  `["api",…]`，`Requirement` 新增 `RequirementScope { Product, Operator }`，11 个平台动作标为 Operator；产品路由拼在
+  `/api/platform` 下或平台路由拼在 `/api/v1` 下一律回落到 admin-only 的 unclassified。表驱动测试证明每条 classify 分支在
+  三个前缀下要求完全相等（含 audit 规则与 body claim），并有 router 构造 smoke test 让 nest 冲突在 CI 而非首次启动时暴露。
+  节点路由（registration、assignments、routing-table、bundle）与 `middleware::node_auth` 的错误形状一律不动。
+- 请求上下文与弃用：每个响应带 `x-request-id`/`x-correlation-id`（入站值只在恰好一个且为 canonical UUIDv7 时采纳，否则
+  铸新，从不反射）；旧前缀响应带 `Deprecation: @1788652800`、`Sunset: Wed, 30 Jun 2027 00:00:00 GMT` 与
+  `Link: </api/v1|platform/...>; rel="successor-version"`，每个路由模板每进程只 warn 一次。旧的长操作路由此前对畸形
+  `x-request-id` 回 400，现与其它路由一致改为铸新，已在 API 参考中记录。审计行新增 `request_id`（增量列），gate 的 401/403
+  与 outcome 行使用同一个已确定的 id。
+- 错误模型：`error::codes` 共 26 个稳定 kebab-case 码，`classify` 对 `ApiError` 每个变体与每个 `From` 实现做穷尽匹配；
+  `/api/v1` 与 `/api/platform` 返回 `{"error": {code, message, requestId, target?, violations, retryable, retryAfterSeconds?,
+  docs?, provider?}}`，旧前缀逐字节保持 `{"error": "message"}`（含 `Database error: ` 前缀）。审查发现 5xx envelope 会把
+  SQLite/IO/gRPC 原文暴露给客户端，已改为固定不透明文案并以 error 级日志带 request id 记录原文；`provider` 诊断由开放
+  JSON 改为复用 driver crate 的 category/side-effect 枚举的封闭对象；`retryable` 严格由码决定，retry hint 不能反向抬升。
+  gate 的 401/403、路由 fallback 404 与 413 在 v1/platform 上同样走 envelope。共享契约新增 `control-error`（18 份 Schema、
+  57 组 fixture），`violations` 必填可空数组，checker 校验 retryable 码集合与 fixture 一致。
+- 平台诊断列表：events（退役 `offset`，node/severity 过滤进 binding，severity 校验）、commands 两条、heartbeats、
+  config history 两条迁入统一分页契约，keyset 直接落在存储的 RFC 3339 文本列上（写入方统一 `to_rfc3339`，文本序即时间序），
+  COUNT 与 items 同一事务；新增 `database::read_keyset_page` 共享读取；事件与 command 新增 `_v1` 索引，heartbeats 复用既有
+  索引（EXPLAIN 证实无排序）。这些路由的旧前缀同样变形，属 v1 冻结前归一化。
+- OpenAPI：引入 utoipa 5.5（仅 core；utoipa-axum 需 axum 0.8，明确不加），111 个 operation 全部带 operationId、product/platform
+  tag、错误响应；`ControlListPage<T>` 走泛型 schema；`ErrorCode` 由 `codes::ALL` 手工渲染，服务端未产出的码进不了文档；跨 crate
+  共享模型以指向 `contracts/v1` 的标记 schema 表达；`CanonicalId` 在使用处标 `value_type = String, format = Uuid`，deis-wire
+  不引入文档依赖。文档提交为 `contracts/openapi/v1.json`，`tests/openapi_drift.rs` 逐字节比对（`UPDATE_OPENAPI=1` 重生成）；
+  `v1-examples.json` 从真实 handler 输出捕获并归一化 id/时间/摘要/cursor，31 个需要真实节点或 driver 的响应无示例。
+  卫生测试：无 secret 类属性名（显式 allowlist 除外）、无凭据样例、无节点路径、平台 tag 路径全在 `/api/platform/`。
+  `scripts/check-openapi-compat.py`（纯标准库）对比 `origin/main` 基线：删路径/操作/2xx、删响应属性、改类型、删枚举值、
+  参数或请求体变必填、新增安全要求均为破坏性，除非 major 提升；自检覆盖 15 个变异案例；CI 在 product-governance job
+  显式 fetch origin/main 后执行。审查发现文档声明 secrets PUT/DELETE 需要 `If-Match` 而 handler 从不读取，已从文档删除
+  （服务端 compare-and-set 基于自身读取）。
+- 客户端：CLI 以 `API_MAJOR`/`API_PLATFORM` 两个前缀发请求，对 v1 路径的无 envelope 404 一次性回落旧前缀并 warn（按
+  Control 实例记忆，不重复），解析 envelope 打印 code/message/violations/request id 与 retry 提示；`deis audit` 有 id 时增加
+  REQUEST 列。Web 控制台全部调用改为 `/api/platform`，events/commands/heartbeats/config history 消费统一 envelope，错误
+  信息附 request id，去掉了原本猜测响应形状的 hook 辅助。`API_DOCUMENTATION.md` 由 OpenAPI 与示例生成重写，节点路径只以
+  常量名出现。
+- 门禁：fmt、`deis-control`/`deis` 严格 Clippy、Control 616/616（lib 590 加 1 ignore，含 openapi drift 2/2）、CLI 171/171、
+  共享契约 18/57、治理、OpenAPI 兼容、文档路径字面量、`git diff --check` 与 web `tsc -b && vite build` 全部通过；三视角审查
+  12 项（1 blocker、6 major、5 minor）全部修复。
+- 未完成：五个已定义但尚无路由产出的细粒度码（limit-out-of-range、offset-out-of-range、cursor-invalid、already-exists、
+  idempotency-key-required）待逐路由采用；`scripts/demo.sh` 仍走旧前缀（demo CI 最慢，单独切换）；幂等请求摘要的服务端
+  HMAC；provider deployment cancel/rollback；旧库两代索引清退。本节为本机工作节点，尚无提交后精确归档或三平台 evidence。

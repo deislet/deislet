@@ -17,19 +17,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
+use utoipa::IntoParams;
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use crate::api::bindings::{BindingRefusal, check_service_bindings};
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, id_scope, list_page};
 use crate::catalog::{CatalogPage, PagePosition, ProviderDerivationSpec, StoredBundle, Version};
 use crate::identity::Principal;
 
 /// Version as seen from outside. `bundle_path` is deliberately absent: it
 /// is a control-plane local path and no client has any use for it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct VersionView {
     pub id: String,
+    #[schema(value_type = String, format = Uuid)]
     pub canonical_id: CanonicalId,
     pub app_id: String,
     pub number: i64,
@@ -37,6 +41,7 @@ pub struct VersionView {
     /// Exact provider-neutral parent and provider derivation. Both are absent
     /// only for legacy raw-bundle uploads.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub canonical_artifact_id: Option<CanonicalId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_derivation_sha256: Option<String>,
@@ -55,6 +60,7 @@ pub struct VersionView {
     ///
     /// `None` means the stored manifest could not be read at all, which is the
     /// same condition that leaves `manifest` holding a raw string.
+    #[schema(value_type = Option<crate::api::openapi::CompatibilityProfileDocument>)]
     pub compatibility: Option<crate::catalog::CompatibilityProfile>,
 }
 
@@ -105,7 +111,8 @@ impl From<&Version> for VersionView {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct UploadQuery {
     /// Digest the client computed over the bundle. When present the bytes
     /// must hash to exactly this, which is how a truncated upload is
@@ -113,7 +120,7 @@ pub struct UploadQuery {
     pub sha256: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UploadResponse {
     pub version: VersionView,
     /// False when a byte-identical bundle was already recorded, in which
@@ -133,6 +140,24 @@ const BUNDLE_ENTRY: &str = "payload/bundle.zip";
 /// Body is the raw bundle zip. The upload is rejected outright - nothing
 /// written, no row created - when the digest does not match, the manifest
 /// does not parse, or the manifest names a different app.
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/versions",
+    operation_id = "uploadVersion",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), UploadQuery),
+    request_body(content = openapi::BinaryBody, content_type = "application/octet-stream", description = "The bundle bytes."),
+    responses(
+        (status = 201, description = "The version was stored; `created` is false when the same bundle was already there.", body = UploadResponse),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 413, response = openapi::PayloadTooLarge),
+        (status = 422, response = openapi::UnprocessableEntity),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn upload_version(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -182,6 +207,24 @@ pub async fn upload_version(
 /// the Deislet native bundle it binds. Control revalidates the stored
 /// canonical parent, the derivation, the payload root and the native bundle
 /// before creating one lineage-bound version row.
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/artifacts/{artifact_id}/versions",
+    operation_id = "uploadVersionWithLineage",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("artifact_id" = String, Path, description = "The canonical artifact's UUIDv7."), UploadQuery),
+    request_body(content = openapi::BinaryBody, content_type = "application/octet-stream", description = "The provider derivation envelope."),
+    responses(
+        (status = 201, description = "The version was stored with its lineage to the canonical artifact.", body = UploadResponse),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 413, response = openapi::PayloadTooLarge),
+        (status = 422, response = openapi::UnprocessableEntity),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn upload_version_with_lineage(
     State(state): State<CatalogState>,
     Path((app_id, artifact_id)): Path<(String, String)>,
@@ -590,6 +633,20 @@ impl Drop for ProviderStaging {
 }
 
 /// GET /api/apps/:app_id/versions
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/versions",
+    operation_id = "listVersions",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ListQuery),
+    responses(
+        (status = 200, description = "One page of versions.", body = ControlListPage<VersionView>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_versions(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -632,6 +689,19 @@ pub async fn list_versions(
 }
 
 /// GET /api/apps/:app_id/versions/:version_id
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/versions/{version_id}",
+    operation_id = "getVersion",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("version_id" = String, Path, description = "The version's id.")),
+    responses(
+        (status = 200, description = "The version.", body = VersionView),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_version(
     State(state): State<CatalogState>,
     Path((app_id, version_id)): Path<(String, String)>,

@@ -24,24 +24,30 @@ use deis_wire::CanonicalId;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use utoipa::ToSchema;
 
 use super::model::now_secs;
 use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogProviderCredentialVault, CatalogResult};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDriverReleaseRecord {
+    #[schema(value_type = String)]
     pub release_digest: Sha256Digest,
+    #[schema(value_type = String)]
     pub host_operating_system: HostOperatingSystem,
     pub driver_contract_version: String,
     pub backend_id: String,
     pub driver_id: String,
     pub driver_version: String,
+    #[schema(value_type = String)]
     pub manifest_digest: Sha256Digest,
+    #[schema(value_type = String)]
     pub archive_digest: Sha256Digest,
     pub archive_size_bytes: u64,
+    #[schema(value_type = String)]
     pub tree_digest: Sha256Digest,
     pub installation_dir_name: String,
     pub status: String,
@@ -51,11 +57,14 @@ pub struct ProviderDriverReleaseRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDriverReleaseAuditEvent {
+    #[schema(value_type = String, format = Uuid)]
     pub event_id: CanonicalId,
+    #[schema(value_type = String)]
     pub release_digest: Sha256Digest,
+    #[schema(value_type = String)]
     pub host_operating_system: HostOperatingSystem,
     pub event_type: String,
     pub detail: String,

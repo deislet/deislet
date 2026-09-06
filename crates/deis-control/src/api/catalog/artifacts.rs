@@ -10,20 +10,25 @@ use deis_wire::CanonicalId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
+use utoipa::IntoParams;
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, id_scope, list_page};
 use crate::catalog::{CatalogPage, PagePosition};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ArtifactUploadQuery {
     /// Expected identity of `.edge-canon/output.json`, not the transport zip.
     pub sha256: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactUploadResponse {
+    #[schema(value_type = crate::api::openapi::CanonicalArtifactDocument)]
     pub artifact: Value,
     pub created: bool,
 }
@@ -33,6 +38,24 @@ pub struct ArtifactUploadResponse {
 /// The request body is only a transport zip. Control expands it into an
 /// isolated directory and executes the Edge Canon validator before either a
 /// storage path or catalog record becomes visible.
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/artifacts",
+    operation_id = "uploadArtifact",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ArtifactUploadQuery),
+    request_body(content = openapi::BinaryBody, content_type = "application/octet-stream", description = "The canonical artifact archive."),
+    responses(
+        (status = 201, description = "The artifact was verified and stored; `created` is false when it was already there.", body = ArtifactUploadResponse),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 413, response = openapi::PayloadTooLarge),
+        (status = 422, response = openapi::UnprocessableEntity),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn upload_artifact(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -92,6 +115,20 @@ pub async fn upload_artifact(
 }
 
 /// GET /api/apps/:app_id/artifacts
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/artifacts",
+    operation_id = "listArtifacts",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ListQuery),
+    responses(
+        (status = 200, description = "One page of canonical artifact records.", body = ControlListPage<openapi::CanonicalArtifactDocument>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_artifacts(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -138,6 +175,19 @@ pub async fn list_artifacts(
 }
 
 /// GET /api/apps/:app_id/artifacts/:artifact_id
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/artifacts/{artifact_id}",
+    operation_id = "getArtifact",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("artifact_id" = String, Path, description = "The canonical artifact's UUIDv7.")),
+    responses(
+        (status = 200, description = "The canonical artifact record.", body = openapi::CanonicalArtifactDocument),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_artifact(
     State(state): State<CatalogState>,
     Path((app_id, artifact_id)): Path<(String, String)>,

@@ -74,7 +74,12 @@ pub async fn execute(
         return Ok(());
     }
 
-    let mut table = Table::new(&["WHEN", "WHO", "ACTION", "TARGET", "FROM", "OUTCOME"]);
+    // The request id is the handle an operator searches the control plane's
+    // log with, and the one the refused caller was shown. Lines from before
+    // it was recorded have none; when no line on this page has one the
+    // column is left out rather than printed as a column of dashes.
+    let with_request_ids = entries.iter().any(|entry| entry.request_id.is_some());
+    let mut table = Table::new(&headers(with_request_ids));
     for entry in &entries {
         // Every cell of this table is a string deis-control recorded off a
         // request. The audit log's whole job is to hold what *refused*
@@ -96,7 +101,7 @@ pub async fn execute(
                 entry.status
             ),
         };
-        table.row(vec![
+        let mut row = vec![
             timestamp(entry.at),
             who,
             escaped(&entry.action),
@@ -109,7 +114,11 @@ pub async fn execute(
                 .map(escaped)
                 .unwrap_or_else(|| "-".to_string()),
             outcome,
-        ]);
+        ];
+        if with_request_ids {
+            row.push(request_cell(entry));
+        }
+        table.row(row);
     }
     println!();
     table.print();
@@ -130,6 +139,28 @@ pub async fn execute(
     }
     println!();
     Ok(())
+}
+
+/// The column headings, with the request id column only when this page
+/// has an id to put in it.
+fn headers(with_request_ids: bool) -> Vec<&'static str> {
+    let mut headers = vec!["WHEN", "WHO", "ACTION", "TARGET", "FROM", "OUTCOME"];
+    if with_request_ids {
+        headers.push("REQUEST");
+    }
+    headers
+}
+
+/// The request id, as one cell. The control plane mints these itself and
+/// never reflects a caller's garbage into the log, but the cell is escaped
+/// like every other one here: the rule is by provenance of the table, not
+/// by trust in one column.
+fn request_cell(entry: &AuditEntry) -> String {
+    entry
+        .request_id
+        .as_deref()
+        .map(escaped)
+        .unwrap_or_else(|| "-".to_string())
 }
 
 /// Who did it, as one cell.
@@ -195,7 +226,23 @@ mod terminal_safety_test {
             outcome: "refused".to_string(),
             status: 403,
             detail: None,
+            request_id: None,
         }
+    }
+
+    /// The request id column appears only when there is an id to show, and
+    /// a line without one on such a page prints a dash rather than nothing.
+    #[test]
+    fn the_request_column_is_there_only_when_a_line_carries_an_id() {
+        assert_eq!(headers(false).len(), 6);
+        assert_eq!(headers(true).last(), Some(&"REQUEST"));
+        assert_eq!(request_cell(&entry()), "-");
+        let mut with_id = entry();
+        with_id.request_id = Some("018f2518-7e38-7f80-8000-000000000001".to_string());
+        assert_eq!(
+            request_cell(&with_id),
+            "018f2518-7e38-7f80-8000-000000000001"
+        );
     }
 
     /// Every arm of both cells, not the one an attacker happened to use

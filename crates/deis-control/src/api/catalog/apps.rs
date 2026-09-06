@@ -17,20 +17,22 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, list_page};
 use crate::catalog::{App, RetiredAppName};
 use crate::identity::Principal;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateAppRequest {
     /// App name; also the app_id every component keys off.
     pub id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DeleteAppResponse {
     pub app_id: String,
     pub removed: crate::catalog::DeletedApp,
@@ -54,7 +56,7 @@ pub struct DeleteAppResponse {
     pub retained_note: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ReleaseRetiredAppResponse {
     pub app_id: String,
     pub released: RetiredAppName,
@@ -64,6 +66,20 @@ pub struct ReleaseRetiredAppResponse {
 }
 
 /// POST /api/apps
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps",
+    operation_id = "createApp",
+    tag = "product",
+    request_body = CreateAppRequest,
+    responses(
+        (status = 201, description = "The application as created.", body = App),
+        (status = 400, response = openapi::BadRequest),
+        (status = 409, response = openapi::Conflict),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn create_app(
     State(state): State<CatalogState>,
     Json(request): Json<CreateAppRequest>,
@@ -73,6 +89,19 @@ pub async fn create_app(
 }
 
 /// GET /api/apps
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps",
+    operation_id = "listApps",
+    tag = "product",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "One page of applications.", body = ControlListPage<App>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_apps(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
@@ -101,6 +130,19 @@ pub async fn list_apps(
 }
 
 /// GET /api/apps/:app_id
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}",
+    operation_id = "getApp",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id.")),
+    responses(
+        (status = 200, description = "The application.", body = App),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_app(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -127,6 +169,21 @@ pub async fn get_app(
 /// control plane has no call that drops a tenant there, so the answer reports
 /// the tenants that still hold it and the name is retained so that the next
 /// application of that name cannot be handed it silently.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/apps/{app_id}",
+    operation_id = "deleteApp",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id.")),
+    responses(
+        (status = 200, description = "What was removed, what was unloaded, and the name now retired.", body = DeleteAppResponse),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn delete_app(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -232,6 +289,19 @@ pub async fn delete_app(
 ///
 /// A row with `released_at` set is a name somebody freed again: it can be
 /// created, and what it says about the data is as true as it ever was.
+#[utoipa::path(
+    get,
+    path = "/api/v1/retired-apps",
+    operation_id = "listRetiredApps",
+    tag = "product",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "One page of retired names.", body = ControlListPage<RetiredAppName>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_retired_apps(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
@@ -271,6 +341,20 @@ pub async fn list_retired_apps(
 /// purges it - `deis kv`, `deis db`, `deis blob` against those tenants while
 /// the application still exists, or the tenant's files under deis-store's own
 /// data directory - and then releases the name.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/retired-apps/{app_id}",
+    operation_id = "releaseRetiredApp",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id.")),
+    responses(
+        (status = 200, description = "The name is free again.", body = ReleaseRetiredAppResponse),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn release_retired_app(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,

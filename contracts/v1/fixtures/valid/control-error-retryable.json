@@ -1,0 +1,14 @@
+{
+  "error": {
+    "code": "backend-unavailable",
+    "message": "The provider driver could not reach the backend management API; no deployment state changed",
+    "requestId": "0199b603-5b04-7e39-b0a7-6c7d8e9f0a1b",
+    "target": {
+      "resource": "provider-installation"
+    },
+    "violations": [],
+    "retryable": true,
+    "retryAfterSeconds": 30,
+    "docs": "https://deislet.dev/docs/api/v1/errors#backend-unavailable"
+  }
+}

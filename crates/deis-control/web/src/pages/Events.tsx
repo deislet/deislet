@@ -1,4 +1,5 @@
 import { useEvents } from '@/hooks/useApi'
+import { asPlainObject } from '@/lib/api'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -19,7 +20,7 @@ function getSeverityBadgeVariant(severity: string) {
 }
 
 export function Events() {
-  const { events, loading, error, refetch } = useEvents()
+  const { events, total, loading, error, refetch } = useEvents()
 
   return (
     <div className="space-y-6">
@@ -45,6 +46,13 @@ export function Events() {
       <Card>
         <CardHeader>
           <CardTitle>Recent Events</CardTitle>
+          {/* The newest page of the log, re-read every few seconds; the
+              control plane counts the whole log in the same read. */}
+          {total > events.length && (
+            <p className="text-sm text-muted-foreground">
+              Newest {events.length} of {total}
+            </p>
+          )}
         </CardHeader>
         <CardContent>
           {loading && events.length === 0 ? (
@@ -54,9 +62,9 @@ export function Events() {
           ) : (
             <ScrollArea className="h-[600px]">
               <div className="space-y-4">
-                {events.map((event, index) => (
+                {events.map((event) => (
                   <div
-                    key={index}
+                    key={event.id}
                     className="flex items-start gap-4 rounded-md border p-4"
                   >
                     <div className="flex flex-col gap-2">
@@ -79,11 +87,16 @@ export function Events() {
                           Node: <span className="font-mono">{event.node_id}</span>
                         </p>
                       )}
-                      {event.metadata && Object.keys(event.metadata).length > 0 && (
-                        <pre className="mt-2 rounded bg-muted p-2 text-xs overflow-auto max-h-32">
-                          {JSON.stringify(event.metadata, null, 2)}
-                        </pre>
-                      )}
+                      {(() => {
+                        // Metadata is whatever JSON the node attached; only a
+                        // non-empty object is worth a block of its own.
+                        const metadata = asPlainObject(event.metadata)
+                        return metadata && Object.keys(metadata).length > 0 ? (
+                          <pre className="mt-2 rounded bg-muted p-2 text-xs overflow-auto max-h-32">
+                            {JSON.stringify(metadata, null, 2)}
+                          </pre>
+                        ) : null
+                      })()}
                     </div>
                   </div>
                 ))}

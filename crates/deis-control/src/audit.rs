@@ -23,6 +23,10 @@
 //! log and data directory for the demo secret, and this table is one of the
 //! places it looks.
 //!
+//! A line also carries the request id the answer echoed in `x-request-id`,
+//! when there was one, so the caller holding a response and the operator
+//! reading the log are talking about the same call.
+//!
 //! # Why nothing can erase it
 //!
 //! There is no update and no delete anywhere in this module, and no endpoint
@@ -36,6 +40,7 @@ use std::sync::Arc;
 use rusqlite::{Row, params};
 use serde::Serialize;
 use tracing::{error, info, warn};
+use utoipa::ToSchema;
 
 use crate::catalog::model::now_secs;
 use crate::catalog::pagination::{finish_page, sqlite_fetch_limit};
@@ -45,10 +50,10 @@ use crate::identity::{Principal, PrincipalKind};
 
 const AUDIT_COLUMNS: &str = "id, at, actor_kind, actor_account, actor_credential, action, \
                              app_id, environment, target, method, path, peer, outcome, \
-                             status, detail";
+                             status, detail, request_id";
 
 /// How a call ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// The caller was entitled to it and it worked.
@@ -92,7 +97,7 @@ impl Outcome {
 }
 
 /// One line of the log, as it is written and as it is read back.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AuditEntry {
     /// Insertion order. The only ordering that is true under a clock with
     /// one-second resolution.
@@ -124,6 +129,14 @@ pub struct AuditEntry {
     pub status: i64,
     /// Why it was refused, when it was. Empty for an ordinary acceptance.
     pub detail: Option<String>,
+    /// The request id the answer echoed (`x-request-id`). `None` only for a
+    /// line written before ids were recorded; every line written since
+    /// carries the id the caller was given, a refusal's included. Left out
+    /// of the wire form when absent, so a line written before the member
+    /// existed still serialises byte for byte as it did.
+    #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub request_id: Option<String>,
 }
 
 /// A line about to be written. Separate from [`AuditEntry`] because the id
@@ -143,6 +156,7 @@ pub struct AuditRecord {
     pub outcome: Outcome,
     pub status: u16,
     pub detail: Option<String>,
+    pub request_id: Option<String>,
 }
 
 impl AuditRecord {
@@ -164,6 +178,7 @@ impl AuditRecord {
                 outcome: Outcome::Accepted,
                 status: 200,
                 detail: None,
+                request_id: None,
             },
         }
     }
@@ -191,6 +206,7 @@ impl AuditRecord {
                 outcome: Outcome::Refused,
                 status: 401,
                 detail: None,
+                request_id: None,
             },
         }
     }
@@ -247,6 +263,14 @@ impl AuditRecordBuilder {
 
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
         self.record.detail = Some(detail.into());
+        self
+    }
+
+    /// The request id the answer carried, already validated as a canonical
+    /// id by whoever settled it: the log holds ids, never whatever text a
+    /// caller happened to send in the header.
+    pub fn request_id(mut self, request_id: Option<String>) -> Self {
+        self.record.request_id = request_id;
         self
     }
 
@@ -371,8 +395,10 @@ impl AuditStore {
                 conn.execute(
                     "INSERT INTO audit_log \
                      (at, actor_kind, actor_account, actor_credential, action, app_id, \
-                      environment, target, method, path, peer, outcome, status, detail) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                      environment, target, method, path, peer, outcome, status, detail, \
+                      request_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                             ?15)",
                     params![
                         at,
                         record.actor_kind,
@@ -388,6 +414,7 @@ impl AuditStore {
                         record.outcome.as_str(),
                         record.status as i64,
                         record.detail,
+                        record.request_id,
                     ],
                 )?;
                 Ok::<(), DatabaseError>(())
@@ -503,6 +530,7 @@ fn read_entry(row: &Row<'_>) -> rusqlite::Result<AuditEntry> {
         outcome: Outcome::parse(&outcome).unwrap_or(Outcome::Failed),
         status: row.get(13)?,
         detail: row.get(14)?,
+        request_id: row.get(15)?,
     })
 }
 
@@ -548,6 +576,7 @@ mod tests {
                     .resource(Some("demo".to_string()), Some("production".to_string()))
                     .peer(Some("10.0.0.4:51234".to_string()))
                     .outcome(Outcome::Accepted, 200)
+                    .request_id(Some("018f2518-7e38-7f80-8000-000000000001".to_string()))
                     .build(),
             )
             .await;
@@ -563,6 +592,84 @@ mod tests {
         assert_eq!(line.peer.as_deref(), Some("10.0.0.4:51234"));
         assert_eq!(line.outcome, Outcome::Accepted);
         assert_eq!(line.status, 200);
+        assert_eq!(
+            line.request_id.as_deref(),
+            Some("018f2518-7e38-7f80-8000-000000000001")
+        );
+        // On the wire the id is `requestId`, like the one the error
+        // envelope carries, so a client joins the two by one name.
+        let dump = serde_json::to_value(line).unwrap();
+        assert_eq!(dump["requestId"], "018f2518-7e38-7f80-8000-000000000001");
+    }
+
+    /// A log written before request ids were recorded is read through the
+    /// same store: the column arrives on the next start, the old lines read
+    /// back with no id, and new lines carry theirs.
+    #[tokio::test]
+    async fn an_older_log_reads_back_with_no_request_id_and_keeps_taking_lines() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("control.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE audit_log (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at               INTEGER NOT NULL,
+                    actor_kind       TEXT NOT NULL,
+                    actor_account    TEXT,
+                    actor_credential TEXT,
+                    action           TEXT NOT NULL,
+                    app_id           TEXT,
+                    environment      TEXT,
+                    target           TEXT,
+                    method           TEXT NOT NULL,
+                    path             TEXT NOT NULL,
+                    peer             TEXT,
+                    outcome          TEXT NOT NULL,
+                    status           INTEGER NOT NULL,
+                    detail           TEXT
+                );
+                INSERT INTO audit_log
+                    (at, actor_kind, actor_account, action, app_id, environment, method,
+                     path, outcome, status)
+                    VALUES (1700000000, 'account', 'alice', 'deploy', 'demo', 'production',
+                            'POST', '/api/apps/demo/environments/production/deployments',
+                            'accepted', 201);",
+            )
+            .unwrap();
+        }
+
+        let store = AuditStore::new(Arc::new(Database::init(&path).await.unwrap()));
+        let lines = page(&store, AuditQuery::default(), 100, None).await.items;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].action, "deploy");
+        assert_eq!(lines[0].request_id, None);
+        // A line from before ids were recorded keeps its old wire form: the
+        // member is left out rather than sent as null.
+        assert!(
+            serde_json::to_value(&lines[0])
+                .unwrap()
+                .get("requestId")
+                .is_none()
+        );
+
+        store
+            .record(
+                AuditRecord::by(&alice())
+                    .action("rollback")
+                    .request("POST", "/api/v1/apps/demo/environments/production/rollback")
+                    .outcome(Outcome::Accepted, 201)
+                    .request_id(Some("018f2518-7e38-7f80-8000-000000000002".to_string()))
+                    .build(),
+            )
+            .await;
+        let lines = page(&store, AuditQuery::default(), 100, None).await.items;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].request_id.as_deref(),
+            Some("018f2518-7e38-7f80-8000-000000000002")
+        );
+        assert_eq!(lines[1].request_id, None);
     }
 
     /// A refused call is as important as an accepted one, and has to be

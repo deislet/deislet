@@ -85,6 +85,12 @@ aes-gcm = "0.10"
 rust-embed = "8"
 mime_guess = "2"
 
+# OpenAPI document of the human API (`api::openapi`). Core crate only: the
+# axum integration crate needs axum 0.8 and this workspace is on 0.7, so the
+# routes are described by `#[utoipa::path]` beside each handler and listed
+# by hand in the document root.
+utoipa = { version = "5.5", features = ["axum_extras", "uuid", "chrono", "preserve_path_order"] }
+
 
 # Control Wire SDK
 deis-wire = { path = "../deis-wire" }

@@ -91,6 +91,21 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Keyset pages of the configuration history: `(created_at DESC, id DESC)`
+    // under the node, and under the node and key. Additive, `_v1`: a page
+    // index is named for the sort it serves, so a later sort gets its own.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_config_history_node_page_v1 \
+         ON config_history(node_id, created_at DESC, id DESC)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_config_history_key_page_v1 \
+         ON config_history(node_id, config_key, created_at DESC, id DESC)",
+        [],
+    )?;
+
     // Heartbeats table
     conn.execute(
         r#"
@@ -117,6 +132,12 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_heartbeats_timestamp ON heartbeats(timestamp)",
         [],
     )?;
+
+    // Keyset pages of one node's heartbeat history, `(timestamp DESC, id
+    // DESC)`, are served by `idx_heartbeats_node` above: a non-unique index
+    // ends in the rowid, so `(node_id, timestamp)` read backwards is that
+    // order exactly and SQLite plans it without a sort. A second index on
+    // the highest-volume table would only cost every heartbeat a write.
 
     // Commands table
     conn.execute(
@@ -154,6 +175,19 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Keyset pages of the command history, `(created_at DESC, id DESC)`,
+    // across every node and under one node.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_commands_page_v1 ON commands(created_at DESC, id DESC)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_commands_node_page_v1 \
+         ON commands(node_id, created_at DESC, id DESC)",
+        [],
+    )?;
+
     // Events table
     conn.execute(
         r#"
@@ -188,6 +222,26 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)",
+        [],
+    )?;
+
+    // Keyset pages of the event log, `(timestamp DESC, id DESC)`: unfiltered,
+    // under one node, and under one severity. A request filtering on both
+    // walks the node index, which is the more selective of the two.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_page_v1 ON events(timestamp DESC, id DESC)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_node_page_v1 \
+         ON events(node_id, timestamp DESC, id DESC)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_severity_page_v1 \
+         ON events(severity, timestamp DESC, id DESC)",
         [],
     )?;
 
@@ -1145,6 +1199,12 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          ON audit_log(outcome, at DESC, id DESC)",
         [],
     )?;
+
+    // The request id the answer echoed (`x-request-id`), so a line can be
+    // joined to the response a caller is holding and to the tracing span
+    // that served it. Added after the table shipped, so it is nullable and
+    // every line written before it reads back as none.
+    ensure_column(conn, "audit_log", "request_id", "TEXT")?;
 
     // A migration is planned from one immutable catalog snapshot. This adds
     // the revision, durable plan and catalog-side fence that make such a
@@ -5863,6 +5923,91 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// An audit log written before request ids were recorded gains the
+    /// column on the next start, keeps every line it held with no request id,
+    /// and a second start changes nothing.
+    #[test]
+    fn an_older_audit_log_gains_the_request_id_column_and_keeps_its_lines() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE audit_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                at               INTEGER NOT NULL,
+                actor_kind       TEXT NOT NULL,
+                actor_account    TEXT,
+                actor_credential TEXT,
+                action           TEXT NOT NULL,
+                app_id           TEXT,
+                environment      TEXT,
+                target           TEXT,
+                method           TEXT NOT NULL,
+                path             TEXT NOT NULL,
+                peer             TEXT,
+                outcome          TEXT NOT NULL,
+                status           INTEGER NOT NULL,
+                detail           TEXT
+            );
+            INSERT INTO audit_log
+                (at, actor_kind, actor_account, actor_credential, action, app_id,
+                 environment, target, method, path, peer, outcome, status, detail)
+                VALUES (1700000000, 'account', 'alice', '0011223344556677', 'deploy',
+                        'demo', 'production', NULL, 'POST',
+                        '/api/apps/demo/environments/production/deployments',
+                        '10.0.0.4:51234', 'accepted', 201, NULL);
+            "#,
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+        // Twice, because every start runs it.
+        create_tables(&conn).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(audit_log)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns.iter().filter(|c| *c == "request_id").count(),
+            1,
+            "{columns:?}"
+        );
+
+        let (action, request_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT action, request_id FROM audit_log WHERE actor_account = 'alice'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, "deploy");
+        assert_eq!(request_id, None);
+
+        // And the shape a running control plane writes now goes in.
+        conn.execute(
+            "INSERT INTO audit_log
+                (at, actor_kind, action, method, path, outcome, status, request_id)
+                VALUES (1700000001, 'account', 'rollback', 'POST', '/api/v1/apps',
+                        'accepted', 200, '018f2518-7e38-7f80-8000-000000000001')",
+            [],
+        )
+        .unwrap();
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT request_id FROM audit_log WHERE action = 'rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("018f2518-7e38-7f80-8000-000000000001")
+        );
     }
 
     /// The first identity migration is an additive rolling upgrade: rows

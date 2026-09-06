@@ -88,15 +88,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    Json,
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
-use serde_json::json;
+use deis_wire::CanonicalId;
 use tracing::{info, warn};
 
+use crate::api::error::ApiError;
+use crate::api::versioning::{ApiSurface, REQUEST_ID_HEADER, RequestId, inbound_canonical_id};
 use crate::audit::{AuditRecord, AuditStore, Outcome};
 use crate::identity::store::Resolution;
 use crate::identity::{Demand, IdentityStore, Principal, Selector, Verb};
@@ -229,8 +230,28 @@ pub enum AuditWhen {
     OnRefusal,
 }
 
+/// Which face of the API a route belongs to: the product API, whose
+/// versioned spelling is `/api/v1`, or the platform diagnostics, whose
+/// spelling is `/api/platform`.
+///
+/// Written on the requirement rather than worked out from the path, so the
+/// table stays the one place that says what a route is. The gate reads it to
+/// refuse a route spelled under the other prefix: `/api/platform/apps` names
+/// no route, and a caller who spells it is not thereby an application
+/// reader - see [`classify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequirementScope {
+    /// Applications and everything inside them, accounts, tokens, the audit
+    /// log, hostname grants, providers and long operations.
+    Product,
+    /// The fleet and the control plane itself: node sessions, node
+    /// configuration and commands, events, metrics, the runtime nodes and the
+    /// global route table.
+    Operator,
+}
+
 /// What one route needs before it may run, and what the log should call it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requirement {
     /// The stable name of the operation, as the audit log records it. Taken
     /// from here rather than from the URL so a route that moves does not
@@ -245,6 +266,10 @@ pub struct Requirement {
     pub audit: AuditWhen,
     /// What this route names in its body instead of in its path.
     pub from_body: Option<BodyClaim>,
+    /// Which surface the route is served on. Product unless the table says
+    /// otherwise; the closing arm is an operator's, like everything it
+    /// refuses.
+    pub scope: RequirementScope,
 }
 
 impl Requirement {
@@ -257,11 +282,18 @@ impl Requirement {
             target: None,
             audit: AuditWhen::OnRefusal,
             from_body: None,
+            scope: RequirementScope::Product,
         }
     }
 
     fn changes_state(mut self) -> Self {
         self.audit = AuditWhen::Always;
+        self
+    }
+
+    /// A platform diagnostic: served under `/api/platform`, never `/api/v1`.
+    fn operator(mut self) -> Self {
+        self.scope = RequirementScope::Operator;
         self
     }
 
@@ -332,11 +364,69 @@ fn narrowing_query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a st
 /// `query` is the raw query string, without the `?`, exactly as
 /// [`axum::http::Uri::query`] hands it over. One route reads it; see the
 /// module header.
+///
+/// The table is written once, in the legacy spelling. A path under
+/// `/api/v1` or `/api/platform` is the same route with its surface named, and
+/// is folded onto the legacy spelling by [`canonical_segments`] before the
+/// match; a route folded from the *wrong* surface - `/api/v1/runtime`,
+/// `/api/platform/apps` - is nothing this control plane mounts, and is
+/// answered with the closing arm rather than with the requirement of a route
+/// the caller did not name.
 pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (surface, segments) = canonical_segments(&segments);
     let writing = method != Method::GET && method != Method::HEAD;
 
-    match segments.as_slice() {
+    let requirement = classify_canonical(method, &segments, query, writing);
+    match (surface, requirement.scope) {
+        (ApiSurface::V1, RequirementScope::Operator)
+        | (ApiSurface::Platform, RequirementScope::Product) => unclassified(),
+        _ => requirement,
+    }
+}
+
+/// The legacy spelling of a path's segments, and the surface the path named.
+///
+/// `["api", "v1", rest..]` and `["api", "platform", rest..]` become
+/// `["api", rest..]`. Exactly one marker is folded, and only in second
+/// position, so `/api/v1/v1/apps` and `/api/platform/v1/apps` keep their extra
+/// segment and fall to the closing arm; the comparison is byte-exact, so
+/// `/api/V1/apps` does too. Nothing else is touched: `/api/nodes/..` and
+/// `/api/routing-table` are the node channel, which is never versioned and
+/// never reaches this gate.
+fn canonical_segments<'a>(segments: &[&'a str]) -> (ApiSurface, Vec<&'a str>) {
+    match segments {
+        ["api", "v1", rest @ ..] => (ApiSurface::V1, fold(rest)),
+        ["api", "platform", rest @ ..] => (ApiSurface::Platform, fold(rest)),
+        _ => (ApiSurface::Legacy, segments.to_vec()),
+    }
+}
+
+fn fold<'a>(rest: &[&'a str]) -> Vec<&'a str> {
+    std::iter::once("api").chain(rest.iter().copied()).collect()
+}
+
+/// Anything the table does not know is an administrator's until somebody
+/// writes down what it should be. See the module header.
+fn unclassified() -> Requirement {
+    Requirement::new(
+        "unclassified",
+        Verb::Admin,
+        Resource::Every,
+        Resource::Every,
+    )
+    .changes_state()
+    .operator()
+}
+
+/// The route table proper, over segments already in the legacy spelling.
+fn classify_canonical(
+    method: &Method,
+    segments: &[&str],
+    query: Option<&str>,
+    writing: bool,
+) -> Requirement {
+    match segments {
         // ---- applications ------------------------------------------------
         ["api", "apps"] if !writing => {
             Requirement::new("app.list", Verb::Read, Resource::Every, Resource::Every)
@@ -1033,12 +1123,14 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             Verb::Read,
             Resource::Every,
             Resource::Every,
-        ),
+        )
+        .operator(),
         ["api", "sessions", ..] => {
             Requirement::new("session.read", Verb::Read, Resource::Every, Resource::Every)
+                .operator()
         }
         ["api", "events", ..] => {
-            Requirement::new("event.read", Verb::Read, Resource::Every, Resource::Every)
+            Requirement::new("event.read", Verb::Read, Resource::Every, Resource::Every).operator()
         }
         // Both the Prometheus text at `/api/metrics` and the JSON summary
         // next to it. The exposition names no application, but it counts all
@@ -1053,45 +1145,50 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         // `api_auth_enabled` is off, exactly like every other read.
         ["api", "metrics", ..] => {
             Requirement::new("metrics.read", Verb::Read, Resource::Every, Resource::Every)
+                .operator()
         }
         ["api", "configs", ..] if !writing => Requirement::new(
             "node.config.read",
             Verb::Read,
             Resource::Every,
             Resource::Every,
-        ),
+        )
+        .operator(),
         ["api", "configs", ..] => Requirement::new(
             "node.config.write",
             Verb::Admin,
             Resource::Every,
             Resource::Every,
         )
-        .changes_state(),
+        .changes_state()
+        .operator(),
         ["api", "commands", ..] if !writing => Requirement::new(
             "node.command.read",
             Verb::Read,
             Resource::Every,
             Resource::Every,
-        ),
+        )
+        .operator(),
         ["api", "commands", ..] => Requirement::new(
             "node.command",
             Verb::Admin,
             Resource::Every,
             Resource::Every,
         )
-        .changes_state(),
+        .changes_state()
+        .operator(),
 
         // The bare fleet list is which machines exist and whether they are
         // healthy. Any credential with any scope may see it, because
         // `deis status` prints it and a credential scoped to one environment
         // still deploys onto those machines.
         ["api", "runtime"] => {
-            Requirement::new("node.list", Verb::Read, Resource::Any, Resource::Any)
+            Requirement::new("node.list", Verb::Read, Resource::Any, Resource::Any).operator()
         }
         // What one node is running names every application on it, which is
         // another tenant's business.
         ["api", "runtime", _node, "status"] => {
-            Requirement::new("node.status", Verb::Read, Resource::Every, Resource::Every)
+            Requirement::new("node.status", Verb::Read, Resource::Every, Resource::Every).operator()
         }
         // Stopping an application on a node. `?environment=<name>` takes
         // that one off; with nothing named the node takes off *every*
@@ -1108,17 +1205,11 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             };
             Requirement::new("node.app.unload", Verb::Deploy, named(app), environment)
                 .changes_state()
+                .operator()
         }
 
-        // Anything this table does not know is an administrator's until
-        // somebody writes down what it should be. See the module header.
-        _ => Requirement::new(
-            "unclassified",
-            Verb::Admin,
-            Resource::Every,
-            Resource::Every,
-        )
-        .changes_state(),
+        // Anything this table does not know: see `unclassified`.
+        _ => unclassified(),
     }
 }
 
@@ -1179,6 +1270,13 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
     let method = request.method().clone();
     let headers = request.headers().clone();
     let query = request.uri().query().map(str::to_string);
+    // Settled before anything is decided, so a refusal is audited and
+    // answered under one id. The gate runs outside the surface mounts, so
+    // this is the caller's own id when it sent a usable one and a fresh one
+    // otherwise; an accepted call is re-read from the answer below, because
+    // the mount it went on to settles its own.
+    let request_id = gate_request_id(&request);
+    let surface = ApiSurface::of_path(&path);
     // The address this request was actually sent to, as the sender wrote it:
     // `:authority` over HTTP/2 and absolute-form URIs, the `Host` header over
     // HTTP/1.1. Compared with `Origin` to tell the console this port serves
@@ -1231,10 +1329,12 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
                         .peer(peer)
                         .outcome(Outcome::Refused, 401)
                         .detail(refusal.log_reason)
+                        .request_id(Some(request_id.to_string()))
                         .build(),
                 )
                 .await;
-            return unauthenticated(refusal.caller_detail);
+            return ApiError::unauthenticated(refusal.caller_detail)
+                .into_response_for(surface, Some(request_id));
         }
     };
 
@@ -1289,10 +1389,12 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
                     .peer(peer)
                     .outcome(Outcome::Refused, 403)
                     .detail(detail.clone())
+                    .request_id(Some(request_id.to_string()))
                     .build(),
             )
             .await;
-        return forbidden(&demand.required_scope(), &detail);
+        return ApiError::insufficient_scope(&demand.required_scope(), &detail)
+            .into_response_for(surface, Some(request_id));
     }
 
     // Handlers that want to know who is calling read it from here. Inserted
@@ -1322,6 +1424,9 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
                     .target(requirement.target)
                     .peer(peer)
                     .outcome(outcome, status.as_u16())
+                    // What the answer echoes is what the caller will quote:
+                    // the id the mount settled, which may be one it minted.
+                    .request_id(echoed_request_id(&response).or(Some(request_id.to_string())))
                     .build(),
             )
             .await;
@@ -1611,16 +1716,14 @@ async fn peek_body(request: Request) -> Result<(Request, Option<serde_json::Valu
                 limit = MAX_BODY_PEEK_BYTES,
                 "Refused a call because its body is larger than the gate will read; these routes take a small JSON object naming one thing"
             );
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({
-                    "error": format!(
-                        "This request's body is larger than {MAX_BODY_PEEK_BYTES} bytes, and this \
-                         route takes a small JSON object naming what to create."
-                    )
-                })),
-            )
-                .into_response());
+            return Err(ApiError::payload_too_large(format!(
+                "This request's body is larger than {MAX_BODY_PEEK_BYTES} bytes, and this \
+                 route takes a small JSON object naming what to create."
+            ))
+            .into_response_for(
+                ApiSurface::of_path(parts.uri.path()),
+                RequestId::of(&parts.extensions),
+            ));
         }
     };
 
@@ -1720,29 +1823,28 @@ fn describe_route_address(body: Option<&serde_json::Value>) -> String {
     format!("host={host} path_prefix={path_prefix} priority={priority}")
 }
 
-fn unauthenticated(detail: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({
-            "error": "Unauthorized",
-            "details": detail,
-        })),
-    )
-        .into_response()
+/// The request id a call can be found by before it is answered: the one the
+/// surface's request context settled when the gate runs inside a mount,
+/// otherwise the inbound `x-request-id` when it is exactly one canonical id
+/// (the same rule the surfaces apply), otherwise one minted here. A refusal
+/// is audited and answered under this id, so what the caller quotes is what
+/// the log holds; anything a client sent that is not an id is never either.
+fn gate_request_id(request: &Request) -> RequestId {
+    RequestId::of(request.extensions())
+        .or_else(|| inbound_canonical_id(request.headers(), REQUEST_ID_HEADER).map(RequestId))
+        .unwrap_or_else(|| RequestId(CanonicalId::new_v7()))
 }
 
-fn forbidden(required_scope: &str, detail: &str) -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({
-            "error": format!("This credential may not do that: {detail}"),
-            "details": format!(
-                "A token carrying {required_scope} would be allowed. Ask an owner for one with \
-                 `deis token create --account <you> --scope {required_scope}`."
-            ),
-        })),
-    )
-        .into_response()
+/// The request id an answer carries, which is the one the caller holds.
+fn echoed_request_id(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(REQUEST_ID_HEADER)?
+        .to_str()
+        .ok()?
+        .parse::<CanonicalId>()
+        .ok()
+        .map(|id| id.to_string())
 }
 
 /// Say, once, what the human API answers to.
@@ -1792,12 +1894,14 @@ mod tests {
         classify(&Method::from_bytes(method.as_bytes()).unwrap(), path, query)
     }
 
-    /// The route table, spelled out. Every route the human router mounts has
-    /// a line here; a route that is missing would fall to the closing arm and
-    /// be visible as `unclassified`.
-    #[test]
-    fn every_mounted_route_has_a_requirement_of_its_own() {
-        let routes = [
+    /// The route table, spelled out in the legacy form: every route the
+    /// human router mounts, with the action and verb the table gives it.
+    /// Shared by the tests below, which read it three ways - as the routes
+    /// that must classify, as the routes whose `/api/v1` or `/api/platform`
+    /// spelling must classify identically, and as the set that decides which
+    /// actions are an operator's.
+    fn mounted_routes() -> Vec<(&'static str, &'static str, &'static str, Verb)> {
+        vec![
             ("GET", "/api/apps", "app.list", Verb::Read),
             ("POST", "/api/apps", "app.create", Verb::Deploy),
             ("GET", "/api/apps/demo", "app.get", Verb::Read),
@@ -2247,11 +2351,150 @@ mod tests {
                 "provider_target_grant.history_audit",
                 Verb::Admin,
             ),
-        ];
-        for (method, path, action, verb) in routes {
+        ]
+    }
+
+    /// Every route the human router mounts has a line in the table; a route
+    /// that is missing would fall to the closing arm and be visible as
+    /// `unclassified`.
+    #[test]
+    fn every_mounted_route_has_a_requirement_of_its_own() {
+        for (method, path, action, verb) in mounted_routes() {
             let requirement = requirement(method, path);
             assert_eq!(requirement.action, action, "{method} {path}");
             assert_eq!(requirement.verb, verb, "{method} {path}");
+        }
+    }
+
+    /// The actions served under `/api/platform`, and nothing else: the whole
+    /// of what an operator credential is for. Everything else the table
+    /// knows is product API and is served under `/api/v1`.
+    const OPERATOR_ACTIONS: &[&str] = &[
+        "route.list_all",
+        "session.read",
+        "event.read",
+        "metrics.read",
+        "node.config.read",
+        "node.config.write",
+        "node.command.read",
+        "node.command",
+        "node.list",
+        "node.status",
+        "node.app.unload",
+    ];
+
+    /// The prefix a legacy route is served under once it has moved.
+    fn successor_prefix(requirement: &Requirement) -> &'static str {
+        match requirement.scope {
+            RequirementScope::Product => ApiSurface::V1.prefix(),
+            RequirementScope::Operator => ApiSurface::Platform.prefix(),
+        }
+    }
+
+    /// The same route under its versioned prefix gets the same requirement,
+    /// field for field - action, verb, resources, target, audit rule, body
+    /// claim and scope. The table is written once; this is what says a
+    /// versioned path is not a second table that can drift.
+    #[test]
+    fn a_versioned_path_is_classified_exactly_like_its_legacy_spelling() {
+        for (method, path, _, _) in mounted_routes() {
+            let legacy = requirement(method, path);
+            let moved = path.replacen("/api", successor_prefix(&legacy), 1);
+            assert_eq!(requirement(method, &moved), legacy, "{method} {moved}");
+        }
+
+        // The one arm that reads the query string narrows the same way on
+        // both spellings, and refuses to narrow the same way too.
+        for query in [
+            "",
+            "?environment=production",
+            "?environment=production&environment=preview",
+            "?environment=%70roduction",
+        ] {
+            let legacy = requirement("DELETE", &format!("/api/runtime/n1/apps/demo{query}"));
+            assert_eq!(legacy.action, "node.app.unload");
+            assert_eq!(
+                requirement(
+                    "DELETE",
+                    &format!("/api/platform/runtime/n1/apps/demo{query}")
+                ),
+                legacy,
+                "{query:?}"
+            );
+        }
+        assert_eq!(
+            requirement(
+                "DELETE",
+                "/api/platform/runtime/n1/apps/demo?environment=preview"
+            )
+            .environment,
+            Resource::Named("preview".to_string())
+        );
+        assert_eq!(
+            requirement("DELETE", "/api/platform/runtime/n1/apps/demo").environment,
+            Resource::Every
+        );
+    }
+
+    /// The operator scope is exactly the platform routes: no product route
+    /// carries it, and no platform route lacks it.
+    #[test]
+    fn the_operator_scope_is_exactly_the_platform_routes() {
+        use std::collections::BTreeSet;
+
+        let mut operator = BTreeSet::new();
+        let mut product = BTreeSet::new();
+        for (method, path, action, _) in mounted_routes() {
+            match requirement(method, path).scope {
+                RequirementScope::Operator => operator.insert(action),
+                RequirementScope::Product => product.insert(action),
+            };
+        }
+        let expected: BTreeSet<&str> = OPERATOR_ACTIONS.iter().copied().collect();
+        assert_eq!(operator, expected);
+        assert!(
+            product.is_disjoint(&operator),
+            "an action cannot be on both surfaces"
+        );
+        // The closing arm refuses as an operator's: what it guards is not
+        // an application.
+        assert_eq!(
+            requirement("GET", "/api/nothing-of-the-kind").scope,
+            RequirementScope::Operator
+        );
+    }
+
+    /// A path that names a surface the route is not on, or that spells the
+    /// surface wrongly, is not the route. It gets the closing arm - an
+    /// administrator's, recorded every time - and nothing narrower.
+    #[test]
+    fn a_route_spelled_under_the_wrong_prefix_is_an_administrators() {
+        for (method, path) in [
+            // A marker folded twice, or once in the wrong place.
+            ("GET", "/api/v1/v1/apps"),
+            ("GET", "/api/platform/v1/apps"),
+            ("GET", "/api/v1/platform/runtime"),
+            ("GET", "/v1/api/apps"),
+            // The wrong case, and the wrong version.
+            ("GET", "/api/V1/apps"),
+            ("GET", "/api/Platform/runtime"),
+            ("GET", "/api/v2/apps"),
+            // A product route under the platform prefix, and the reverse.
+            ("GET", "/api/platform/apps"),
+            ("POST", "/api/platform/apps/demo/versions"),
+            ("GET", "/api/platform/accounts"),
+            ("GET", "/api/v1/runtime"),
+            ("DELETE", "/api/v1/runtime/n1/apps/demo?environment=preview"),
+            ("GET", "/api/v1/sessions"),
+            ("GET", "/api/v1/metrics/summary"),
+            ("POST", "/api/v1/configs/n1"),
+        ] {
+            let got = requirement(method, path);
+            assert_eq!(got.action, "unclassified", "{method} {path}");
+            assert_eq!(got.verb, Verb::Admin, "{method} {path}");
+            assert_eq!(got.app, Resource::Every, "{method} {path}");
+            assert_eq!(got.environment, Resource::Every, "{method} {path}");
+            assert_eq!(got.audit, AuditWhen::Always, "{method} {path}");
         }
     }
 
@@ -3105,10 +3348,16 @@ mod gate_tests {
     use axum::{Json, Router};
     use tower::ServiceExt;
 
-    /// A router shaped like the human API: three real routes behind the real
-    /// gate, over a real database. Everything below asserts on what a caller
-    /// gets and on what the audit log then holds, which is the only pair that
+    /// A router shaped like the human API: real routes behind the real gate,
+    /// over a real database. Everything below asserts on what a caller gets
+    /// and on what the audit log then holds, which is the only pair that
     /// matters.
+    ///
+    /// The routes are mounted in the legacy `/api/*` spelling on purpose, and
+    /// stay so: that tree keeps answering for the whole deprecation window,
+    /// and these are its regression tests. The two routes spelled under
+    /// `/api/v1` and `/api/platform` are there for the one test that proves
+    /// the gate reads a versioned path as the route it is.
     struct Gate {
         router: Router,
         state: AuthzState,
@@ -3157,10 +3406,19 @@ mod gate_tests {
             .route("/api/apps/:app/environments/:env/routes", post(created))
             .route("/api/apps/:app/environments/:env/storage-token", get(ok))
             .route("/api/runtime/:node/apps/:app", delete(ok))
+            .route("/api/v1/apps/:app/versions", post(ok))
+            .route("/api/platform/runtime/:node/apps/:app", delete(ok))
             .route("/api/audit", get(ok))
             .route("/api/events", get(ok))
             .route("/api/metrics", get(ok))
             .route("/api/metrics/summary", get(ok))
+            // The request context sits where the real router puts it: on
+            // the mount, inside the gate. A refusal is answered before it
+            // runs; an accepted call comes back with the id it settled.
+            .layer(axum::middleware::from_fn_with_state(
+                ApiSurface::Legacy,
+                crate::api::versioning::attach_request_context,
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 authorize,
@@ -4161,6 +4419,311 @@ mod gate_tests {
     /// differently means judging one application and creating another - and
     /// since no scope can contain a space, the credential that owns the
     /// application is the one that gets refused.
+    /// A versioned path is the legacy route with its surface named: the
+    /// credential that may call one may call the other, the one that may
+    /// not still may not, and the audit line records the path as it was
+    /// spelled, so an operator can see which surface a client is on.
+    #[tokio::test]
+    async fn the_gate_reads_a_versioned_path_as_the_route_it_is() {
+        let gate = gate(true, vec![]).await;
+        gate.state
+            .identity
+            .create_account("ci", Role::Deployer)
+            .await
+            .unwrap();
+        let (_, secret) = gate
+            .state
+            .identity
+            .create_token(
+                "ci",
+                "preview-pipeline",
+                Authority::Scoped(Scope::parse_list("deploy:myapp/preview").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call(&gate, "POST", "/api/v1/apps/myapp/versions", Some(&secret)).await,
+            StatusCode::OK,
+            "the upload this credential may make on /api is the same upload on /api/v1"
+        );
+        assert_eq!(
+            call(
+                &gate,
+                "DELETE",
+                "/api/platform/runtime/n1/apps/myapp",
+                Some(&secret)
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "unloading every environment needs a wildcard on /api/platform exactly as on /api"
+        );
+        assert_eq!(
+            call(
+                &gate,
+                "DELETE",
+                "/api/platform/runtime/n1/apps/myapp?environment=preview",
+                Some(&secret)
+            )
+            .await,
+            StatusCode::OK,
+            "and the query narrows it to the one environment the credential holds"
+        );
+
+        let lines = lines(&gate).await;
+        let upload: Vec<_> = lines
+            .iter()
+            .filter(|line| line.path == "/api/v1/apps/myapp/versions")
+            .collect();
+        assert_eq!(upload.len(), 1, "{upload:?}");
+        assert_eq!(upload[0].action, "version.upload");
+        assert_eq!(upload[0].outcome, crate::audit::Outcome::Accepted);
+        // The two unloads record the same path - the query is not part of
+        // it - and are told apart by what the gate made of the query.
+        let unloads: Vec<_> = lines
+            .iter()
+            .filter(|line| line.path == "/api/platform/runtime/n1/apps/myapp")
+            .collect();
+        assert_eq!(unloads.len(), 2, "{unloads:?}");
+        for line in &unloads {
+            assert_eq!(line.action, "node.app.unload");
+            assert_eq!(line.app_id.as_deref(), Some("myapp"));
+            match line.environment.as_deref() {
+                None => assert_eq!(line.outcome, crate::audit::Outcome::Refused),
+                Some("preview") => assert_eq!(line.outcome, crate::audit::Outcome::Accepted),
+                other => panic!("unexpected environment {other:?}"),
+            }
+        }
+    }
+
+    /// The id in the audit line is the id the caller holds. An accepted call
+    /// records what the answer echoed - the caller's own id when it sent a
+    /// usable one, the minted one otherwise. A refusal is answered before
+    /// the mount's request context runs, so it records the caller's own id
+    /// when there was a usable one and nothing when there was not; garbage
+    /// in the header is never written down.
+    #[tokio::test]
+    async fn an_audit_line_carries_the_request_id_the_caller_holds() {
+        let gate = gate(true, vec![]).await;
+        gate.state
+            .identity
+            .create_account("ci", Role::Deployer)
+            .await
+            .unwrap();
+        let (_, secret) = gate
+            .state
+            .identity
+            .create_token(
+                "ci",
+                "preview-pipeline",
+                Authority::Scoped(Scope::parse_list("deploy:myapp/preview").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        async fn send(
+            gate: &Gate,
+            method: &str,
+            path: &str,
+            secret: Option<&str>,
+            request_id: Option<&str>,
+        ) -> (StatusCode, Option<String>) {
+            let mut builder = HttpRequest::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost:8080")
+                .header("content-type", "application/json");
+            if let Some(secret) = secret {
+                builder = builder.header("Authorization", format!("Bearer {secret}"));
+            }
+            if let Some(request_id) = request_id {
+                builder = builder.header(REQUEST_ID_HEADER, request_id);
+            }
+            let mut request = builder.body(Body::from("{}")).unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                ON_THE_BOX.parse::<SocketAddr>().expect("a peer address"),
+            ));
+            let response = gate.router.clone().oneshot(request).await.unwrap();
+            let echoed = response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .map(|value| value.to_str().unwrap().to_string());
+            (response.status(), echoed)
+        }
+
+        let sent = CanonicalId::new_v7().to_string();
+        let (status, echoed) = send(
+            &gate,
+            "POST",
+            "/api/apps/myapp/versions",
+            Some(&secret),
+            Some(&sent),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(echoed.as_deref(), Some(sent.as_str()));
+
+        let (status, minted) = send(
+            &gate,
+            "POST",
+            "/api/apps/myapp/versions",
+            Some(&secret),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let minted = minted.expect("an accepted call always echoes an id");
+        minted
+            .parse::<CanonicalId>()
+            .expect("the minted id is canonical");
+
+        // Refused before the request context exists: the gate settles the
+        // id itself - the caller's own when it is one, a minted one when it
+        // is not - and answers and audits under that one id.
+        let refused_with_id = CanonicalId::new_v7().to_string();
+        let (status, echoed) = send(
+            &gate,
+            "POST",
+            "/api/apps/other/versions",
+            Some(&secret),
+            Some(&refused_with_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(echoed.as_deref(), Some(refused_with_id.as_str()));
+        let (status, replaced) = send(
+            &gate,
+            "POST",
+            "/api/apps/other/versions",
+            Some(&secret),
+            Some("<script>not-an-id</script>"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let replaced = replaced.expect("a refusal echoes the id it was audited under");
+        replaced
+            .parse::<CanonicalId>()
+            .expect("garbage is replaced by a minted id");
+        let unauthenticated_id = CanonicalId::new_v7().to_string();
+        let (status, echoed) = send(
+            &gate,
+            "POST",
+            "/api/apps/myapp/versions",
+            Some("not-a-token"),
+            Some(&unauthenticated_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(echoed.as_deref(), Some(unauthenticated_id.as_str()));
+
+        let lines = lines(&gate).await;
+        let by_status: Vec<(i64, Option<&str>)> = lines
+            .iter()
+            .rev()
+            .map(|line| (line.status, line.request_id.as_deref()))
+            .collect();
+        assert_eq!(
+            by_status,
+            vec![
+                (200, Some(sent.as_str())),
+                (200, Some(minted.as_str())),
+                (403, Some(refused_with_id.as_str())),
+                (403, Some(replaced.as_str())),
+                (401, Some(unauthenticated_id.as_str())),
+            ],
+            "{lines:?}"
+        );
+        let dump = serde_json::to_string(&lines).unwrap();
+        assert!(
+            !dump.contains("<script>"),
+            "garbage in x-request-id must never reach the audit log"
+        );
+    }
+
+    /// The gate answers in the shape of the prefix it was called through:
+    /// the two-key legacy body under `/api`, byte for byte as before, and
+    /// the structured envelope with the request id under `/api/v1` and
+    /// `/api/platform`.
+    #[tokio::test]
+    async fn a_refusal_takes_the_shape_of_the_prefix_it_was_called_through() {
+        let gate = gate(true, vec![]).await;
+        gate.state
+            .identity
+            .create_account("ci", Role::Deployer)
+            .await
+            .unwrap();
+        let (_, secret) = gate
+            .state
+            .identity
+            .create_token(
+                "ci",
+                "pipeline",
+                Authority::Scoped(Scope::parse_list("deploy:myapp/preview").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let (status, body) =
+            call_with_body(&gate, "POST", "/api/apps/other/versions", None, "{}").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            body.starts_with(r#"{"error":"Unauthorized","details":"#),
+            "{body}"
+        );
+        let (status, body) = call_with_body(
+            &gate,
+            "POST",
+            "/api/apps/other/versions",
+            Some(&secret),
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body.starts_with(r#"{"error":"This credential may not do that: "#),
+            "{body}"
+        );
+
+        let (status, body) =
+            call_with_body(&gate, "POST", "/api/v1/apps/other/versions", None, "{}").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "unauthenticated");
+        assert!(body["error"]["requestId"].is_string(), "{body}");
+        assert_eq!(body["error"]["retryable"], false);
+
+        let (status, body) = call_with_body(
+            &gate,
+            "POST",
+            "/api/v1/apps/other/versions",
+            Some(&secret),
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "insufficient-scope");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("deploy:other/"),
+            "{body}"
+        );
+
+        let (status, body) = call_with_body(
+            &gate,
+            "DELETE",
+            "/api/platform/runtime/n1/apps/other",
+            Some(&secret),
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "insufficient-scope");
+    }
+
     #[tokio::test]
     async fn a_padded_name_in_the_body_is_judged_as_the_name_that_gets_created() {
         let gate = gate(true, vec![]).await;

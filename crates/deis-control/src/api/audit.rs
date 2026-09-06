@@ -9,6 +9,15 @@
 //! It answers to `admin:*/*`, because one line names an application, an
 //! environment and a person, and a log filtered per caller would be a log an
 //! operator could not use to find the caller they are looking for.
+//!
+//! Each item is one [`AuditEntry`]: who (`actor_kind`, `actor_account`,
+//! `actor_credential`), what (`action`, `method`, `path`, `app_id`,
+//! `environment`, `target`), from where (`peer`), how it ended (`outcome`,
+//! `status`, `detail`), and `requestId` - the `x-request-id` the answer
+//! echoed, null for lines written before it was recorded or for a refusal
+//! the gate answered without one. It is the same id the v1 error envelope
+//! carries as `requestId`, so a failed call is found in the log by the value
+//! the caller already holds.
 
 use axum::{
     Json,
@@ -16,7 +25,9 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+use utoipa::IntoParams;
 
+use super::openapi;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::pagination::{ControlListPage, ListQuery, list_page};
 use crate::audit::{AuditEntry, AuditQuery, AuditStore, Outcome};
@@ -30,16 +41,24 @@ pub struct AuditApiState {
 /// What `GET /api/audit` accepts: the page controls of every list route
 /// plus the filters an operator reaches for after an incident. Every filter
 /// is optional, they combine with "and", and the answer is newest first.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct AuditListQuery {
+    /// Page size, `1..=1000`; absent means 100.
+    #[param(minimum = 1, maximum = 1000)]
     pub limit: Option<usize>,
+    /// The `page.nextCursor` of the previous answer. Opaque, bound to the
+    /// collection and the filters it was issued for, and refused with 400
+    /// `cursor-invalid` anywhere else.
     pub cursor: Option<String>,
     /// The application's name as the audit line recorded it from the
     /// request path. A line outlives the application it names, so it is
     /// matched verbatim rather than resolved to an id.
     #[serde(default)]
     pub app: Option<String>,
+    /// The environment's name as the audit line recorded it, matched
+    /// verbatim like `app`.
     #[serde(default)]
     pub environment: Option<String>,
     /// The account's name, as it appears in the `actor_account` column.
@@ -55,6 +74,7 @@ pub struct AuditListQuery {
     /// Unix seconds, inclusive.
     #[serde(default)]
     pub since: Option<i64>,
+    /// Unix seconds, inclusive; the upper bound of the window `since` opens.
     #[serde(default)]
     pub until: Option<i64>,
 }
@@ -116,6 +136,19 @@ fn cursor_binding(filter: &AuditQuery) -> String {
 }
 
 /// GET /api/audit
+#[utoipa::path(
+    get,
+    path = "/api/v1/audit",
+    operation_id = "listAuditLog",
+    tag = "product",
+    params(AuditListQuery),
+    responses(
+        (status = 200, description = "One page of audit lines, newest first.", body = ControlListPage<AuditEntry>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn read_audit(
     State(state): State<AuditApiState>,
     Query(query): Query<AuditListQuery>,
@@ -232,6 +265,10 @@ mod tests {
                         .request("POST", "/api/apps")
                         .resource(Some(app.to_string()), Some("production".to_string()))
                         .outcome(outcome, status)
+                        .request_id(
+                            (index == 3)
+                                .then(|| "018f2518-7e38-7f80-8000-000000000003".to_string()),
+                        )
                         .build(),
                 )
                 .await;
@@ -284,6 +321,14 @@ mod tests {
         assert_eq!(refused["page"]["total"], 1);
         assert_eq!(actions(&refused), ["action.3"]);
         assert_eq!(refused["items"][0]["status"], 403);
+        assert_eq!(
+            refused["items"][0]["requestId"],
+            "018f2518-7e38-7f80-8000-000000000003"
+        );
+        // A line recorded before ids existed keeps its old wire form: the
+        // member is left out, never sent as null, so the legacy list is
+        // byte for byte what it was for those rows.
+        assert!(first["items"][0].get("requestId").is_none());
 
         let (status, demo) = json(&router, "GET", "/api/audit?app=demo&limit=1", Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{demo}");

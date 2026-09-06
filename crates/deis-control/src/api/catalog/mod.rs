@@ -91,25 +91,31 @@ pub struct CatalogState {
     pub sessions: Arc<SessionManager>,
 }
 
-/// Build the human half of the catalog router: everything the dashboard
-/// and the CLI call. The caller merges it into the API-key-guarded router.
-pub fn router(state: CatalogState) -> Router {
+/// Build the product half of the catalog router: everything the dashboard
+/// and the CLI call about applications. The caller merges it into the
+/// API-key-guarded router.
+///
+/// `prefix` is where the routes are mounted: `"/api"` for the legacy flat
+/// tree, `""` inside a `/api/v1` nest. The one catalog route that is not
+/// about an application, the global route table, is [`platform_router`].
+pub fn router(prefix: &str, state: CatalogState) -> Router {
+    let at = |path: &str| format!("{prefix}{path}");
     Router::new()
-        .route("/api/apps", get(apps::list_apps).post(apps::create_app))
+        .route(&at("/apps"), get(apps::list_apps).post(apps::create_app))
         .route(
-            "/api/apps/:app_id",
+            &at("/apps/:app_id"),
             get(apps::get_app).delete(apps::delete_app),
         )
         // Not under /api/apps: an application id is a slug, so any name
         // reserved beneath that prefix would be a name nobody could use for
         // an application.
-        .route("/api/retired-apps", get(apps::list_retired_apps))
+        .route(&at("/retired-apps"), get(apps::list_retired_apps))
         .route(
-            "/api/retired-apps/:app_id",
+            &at("/retired-apps/:app_id"),
             delete(apps::release_retired_app),
         )
         .route(
-            "/api/apps/:app_id/artifacts",
+            &at("/apps/:app_id/artifacts"),
             get(artifacts::list_artifacts)
                 .post(artifacts::upload_artifact)
                 .layer(DefaultBodyLimit::max(
@@ -117,127 +123,126 @@ pub fn router(state: CatalogState) -> Router {
                 )),
         )
         .route(
-            "/api/apps/:app_id/artifacts/:artifact_id",
+            &at("/apps/:app_id/artifacts/:artifact_id"),
             get(artifacts::get_artifact),
         )
         .route(
-            "/api/apps/:app_id/artifacts/:artifact_id/versions",
+            &at("/apps/:app_id/artifacts/:artifact_id/versions"),
             post(versions::upload_version_with_lineage)
                 .layer(DefaultBodyLimit::max(versions::MAX_PROVIDER_ENVELOPE_BYTES)),
         )
         .route(
-            "/api/apps/:app_id/versions",
+            &at("/apps/:app_id/versions"),
             get(versions::list_versions)
                 .post(versions::upload_version)
                 // Only this route accepts a multi-megabyte body.
                 .layer(DefaultBodyLimit::max(MAX_BUNDLE_BYTES)),
         )
         .route(
-            "/api/apps/:app_id/versions/:version_id",
+            &at("/apps/:app_id/versions/:version_id"),
             get(versions::get_version),
         )
         .route(
-            "/api/apps/:app_id/environments",
+            &at("/apps/:app_id/environments"),
             get(environments::list_environments).post(environments::create_environment),
         )
         .route(
-            "/api/apps/:app_id/environments/:env",
+            &at("/apps/:app_id/environments/:env"),
             get(environments::get_environment),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/deployment",
+            &at("/apps/:app_id/environments/:env/deployment"),
             get(deployments::current_deployment),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/deployments",
+            &at("/apps/:app_id/environments/:env/deployments"),
             get(deployments::list_deployments).post(deployments::deploy),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/deployment-plans/:id",
+            &at("/apps/:app_id/environments/:env/deployment-plans/:id"),
             get(deployments::deployment_plan_for_environment),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/rollback",
+            &at("/apps/:app_id/environments/:env/rollback"),
             post(deployments::rollback),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/provider-target-grants",
+            &at("/apps/:app_id/environments/:env/provider-target-grants"),
             get(providers::list_provider_target_grants).post(providers::grant_provider_target),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/provider-target-grants/:grant_id",
+            &at("/apps/:app_id/environments/:env/provider-target-grants/:grant_id"),
             get(providers::get_provider_target_grant)
                 .delete(providers::revoke_provider_target_grant),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/provider-target-grants/:grant_id/audit",
+            &at("/apps/:app_id/environments/:env/provider-target-grants/:grant_id/audit"),
             get(providers::provider_target_grant_audit),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/provider-deployments",
+            &at("/apps/:app_id/environments/:env/provider-deployments"),
             get(providers::list_provider_deployments).post(providers::begin_provider_deployment),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/provider-deployments/:operation_id",
+            &at("/apps/:app_id/environments/:env/provider-deployments/:operation_id"),
             get(providers::get_provider_deployment),
         )
         .route(
-            "/api/deployment-plans/:id",
+            &at("/deployment-plans/:id"),
             get(deployments::deployment_plan),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/routes",
+            &at("/apps/:app_id/environments/:env/routes"),
             get(routes::list_routes).post(routes::create_route),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/routes/:route_id",
+            &at("/apps/:app_id/environments/:env/routes/:route_id"),
             put(routes::update_route).delete(routes::delete_route),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/secrets",
+            &at("/apps/:app_id/environments/:env/secrets"),
             get(secrets::list_secrets),
         )
         // Beside the secret routes and behind the same API key, because it
         // hands out a credential: see `storage::storage_token` for why the
         // credential that deploys is the right gate for it.
         .route(
-            "/api/apps/:app_id/environments/:env/storage-token",
+            &at("/apps/:app_id/environments/:env/storage-token"),
             get(storage::storage_token),
         )
         .route(
-            "/api/apps/:app_id/environments/:env/secrets/:name",
+            &at("/apps/:app_id/environments/:env/secrets/:name"),
             put(secrets::put_secret).delete(secrets::delete_secret),
         )
-        .route("/api/routes", get(routes::list_all_routes))
         // Who may claim which hostname. Not under `/api/apps`, because a
         // hostname is not a name inside an application - it is the one
         // namespace on this platform that is global, which is the whole
         // reason it needs a registry of its own. See `catalog::domains`.
         .route(
-            "/api/domains",
+            &at("/domains"),
             get(domains::list_grants).post(domains::create_grant),
         )
-        .route("/api/domains/:pattern", delete(domains::delete_grant))
+        .route(&at("/domains/:pattern"), delete(domains::delete_grant))
         .route(
-            "/api/providers/credentials",
+            &at("/providers/credentials"),
             get(providers::list_credentials)
                 .post(providers::provision_credential)
                 .layer(DefaultBodyLimit::max(70 * 1024)),
         )
         .route(
-            "/api/providers/credentials/:binding_id",
+            &at("/providers/credentials/:binding_id"),
             get(providers::get_credential).delete(providers::revoke_credential),
         )
         .route(
-            "/api/providers/credentials/:binding_id/rotate",
+            &at("/providers/credentials/:binding_id/rotate"),
             post(providers::rotate_credential).layer(DefaultBodyLimit::max(70 * 1024)),
         )
         .route(
-            "/api/providers/credentials/:binding_id/audit",
+            &at("/providers/credentials/:binding_id/audit"),
             get(providers::credential_audit),
         )
         .route(
-            "/api/providers/driver-releases",
+            &at("/providers/driver-releases"),
             get(providers::list_driver_releases)
                 .post(providers::install_driver_release)
                 .layer(DefaultBodyLimit::max(
@@ -245,66 +250,75 @@ pub fn router(state: CatalogState) -> Router {
                 )),
         )
         .route(
-            "/api/providers/driver-releases/:release_digest",
+            &at("/providers/driver-releases/:release_digest"),
             get(providers::get_driver_release),
         )
         .route(
-            "/api/providers/driver-releases/:release_digest/audit",
+            &at("/providers/driver-releases/:release_digest/audit"),
             get(providers::driver_release_audit),
         )
         .route(
-            "/api/providers/installations",
+            &at("/providers/installations"),
             get(providers::list_installations).post(providers::register_installation),
         )
         .route(
-            "/api/providers/installations/:installation_id",
+            &at("/providers/installations/:installation_id"),
             get(providers::get_installation).delete(providers::delete_installation),
         )
         .route(
-            "/api/providers/installations/:installation_id/disable",
+            &at("/providers/installations/:installation_id/disable"),
             post(providers::disable_installation),
         )
         .route(
-            "/api/providers/installations/:installation_id/enable",
+            &at("/providers/installations/:installation_id/enable"),
             post(providers::enable_installation),
         )
         .route(
-            "/api/providers/installations/:installation_id/audit",
+            &at("/providers/installations/:installation_id/audit"),
             get(providers::installation_audit),
         )
         .route(
-            "/api/providers/installations/:installation_id/targets",
+            &at("/providers/installations/:installation_id/targets"),
             get(providers::list_installation_targets).post(providers::register_target),
         )
-        .route("/api/providers/targets", get(providers::list_targets))
+        .route(&at("/providers/targets"), get(providers::list_targets))
         .route(
-            "/api/providers/targets/:target_id",
+            &at("/providers/targets/:target_id"),
             get(providers::get_target).delete(providers::delete_target),
         )
         .route(
-            "/api/providers/targets/:target_id/disable",
+            &at("/providers/targets/:target_id/disable"),
             post(providers::disable_target),
         )
         .route(
-            "/api/providers/targets/:target_id/enable",
+            &at("/providers/targets/:target_id/enable"),
             post(providers::enable_target),
         )
         .route(
-            "/api/providers/targets/:target_id/audit",
+            &at("/providers/targets/:target_id/audit"),
             get(providers::target_audit),
         )
         .route(
-            "/api/providers/target-grants",
+            &at("/providers/target-grants"),
             get(providers::list_provider_target_grant_history),
         )
         .route(
-            "/api/providers/target-grants/:grant_id",
+            &at("/providers/target-grants/:grant_id"),
             get(providers::get_provider_target_grant_history),
         )
         .route(
-            "/api/providers/target-grants/:grant_id/audit",
+            &at("/providers/target-grants/:grant_id/audit"),
             get(providers::provider_target_grant_history_audit),
         )
+        .with_state(state)
+}
+
+/// The catalog's platform diagnostic: the route table of every application
+/// on the platform, which is an operator's view rather than a tenant's.
+/// Mounted beside [`router`] with the same state; `prefix` as there.
+pub fn platform_router(prefix: &str, state: CatalogState) -> Router {
+    Router::new()
+        .route(&format!("{prefix}/routes"), get(routes::list_all_routes))
         .with_state(state)
 }
 
@@ -669,7 +683,13 @@ pub(crate) mod tests {
             // catalog rather than about who may reach it, so the gate is not
             // in the way - but the principal it would have left has to be,
             // or a handler that names its caller would fail to extract one.
-            router: router(state.clone())
+            //
+            // Mounted in the legacy `/api/*` spelling on purpose, and kept
+            // so: that tree answers for the whole deprecation window, and
+            // these are its regression tests. The versioned mounts are the
+            // same routers under another prefix, covered in `api::tests`.
+            router: router("/api", state.clone())
+                .merge(platform_router("/api", state.clone()))
                 .layer(axum::middleware::from_fn(supply_test_principal))
                 .merge(node_router(state.clone())),
             state: state.clone(),

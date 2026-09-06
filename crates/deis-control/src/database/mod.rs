@@ -2,7 +2,7 @@ pub mod command_status;
 pub mod schema;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use serde_json::Value as JsonValue;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use yasm::StateMachine;
 
 pub use command_status::{CommandEvent, CommandFSM, CommandStatus};
 
+use crate::catalog::{CatalogPage, PageCursorStore};
 use crate::message::NodeRole;
 use crate::session::{NodeFSM, NodeSession, NodeState};
 
@@ -89,6 +90,9 @@ pub struct Event {
 /// Event entry with timestamp (for queries)
 #[derive(Debug, Clone)]
 pub struct EventEntry {
+    /// The row id: the tie-breaker of the event log's order and the
+    /// identity a list cursor resumes from.
+    pub id: i64,
     pub event_type: String,
     pub node_id: Option<String>,
     pub severity: EventSeverity,
@@ -105,6 +109,19 @@ pub struct EventEntry {
 /// would be invented here rather than reported by the node.
 #[derive(Debug, Clone)]
 pub struct HeartbeatEntry {
+    pub node_id: String,
+    pub instance_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub latency_ms: Option<i64>,
+}
+
+/// One heartbeat as the history table holds it: [`HeartbeatEntry`] plus the
+/// row id, which is the tie-breaker of the history's order and the identity a
+/// list cursor resumes from. Separate from the insert type because a
+/// heartbeat has no id until SQLite assigns one.
+#[derive(Debug, Clone)]
+pub struct HeartbeatRecord {
+    pub id: i64,
     pub node_id: String,
     pub instance_id: String,
     pub timestamp: DateTime<Utc>,
@@ -150,6 +167,35 @@ pub struct ConfigHistoryEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// The keyset position a diagnostic history resumes from.
+///
+/// The diagnostic histories - events, heartbeats, commands and configuration
+/// history - sort on an RFC 3339 `TEXT` column, newest first, with the row
+/// id as the tie-breaker. Every writer stores `DateTime<Utc>::to_rfc3339()`,
+/// which always spells the offset as `+00:00` and the fraction in whole
+/// groups of three digits, so SQLite's binary text order is the
+/// chronological order and the same text round-trips through
+/// `parse_from_rfc3339` unchanged. A page resumes strictly after the row
+/// whose sort text and id these are, in that same order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysetAfter<Id> {
+    /// The sort column's text of the previous page's last row.
+    pub sort_text: String,
+    /// That row's id: an integer for the autoincrement tables, the command
+    /// uuid for `commands`.
+    pub id: Id,
+}
+
+/// One diagnostic table read as a keyset page by [`read_keyset_page`].
+struct KeysetListing {
+    table: &'static str,
+    columns: &'static str,
+    /// The RFC 3339 text column the history is ordered by.
+    sort_column: &'static str,
+    /// Equality filters, `column = value`, combined with `AND`.
+    filters: Vec<(&'static str, Box<dyn ToSql>)>,
+}
+
 /// Database manager
 pub struct Database {
     /// The one connection of the process, shared with the blocking threads
@@ -177,6 +223,13 @@ impl Database {
         .await?;
 
         Ok(db)
+    }
+
+    /// Opaque list-cursor persistence for the lists that read this
+    /// database directly - the diagnostic histories - backed by the same
+    /// table every resource store's lists page through.
+    pub fn page_cursors(self: &Arc<Self>) -> PageCursorStore {
+        PageCursorStore::new(Arc::clone(self))
     }
 
     /// Run `f` with the shared SQLite connection held, on a blocking
@@ -598,45 +651,29 @@ impl Database {
         .await
     }
 
-    /// Get recent heartbeats for a node
-    pub async fn get_recent_heartbeats(
+    /// One page of a node's recorded heartbeats, newest first, with the exact
+    /// count of the node's heartbeats read in the same transaction.
+    pub async fn list_heartbeats_page(
         &self,
         node_id: &str,
         limit: usize,
-    ) -> Result<Vec<HeartbeatEntry>, DatabaseError> {
+        after: Option<KeysetAfter<i64>>,
+    ) -> Result<CatalogPage<HeartbeatRecord>, DatabaseError> {
         let node_id = node_id.to_string();
 
         self.with_connection(move |conn| {
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT node_id, instance_id, timestamp, latency_ms
-                FROM heartbeats
-                WHERE node_id = ?1
-                ORDER BY timestamp DESC
-                LIMIT ?2
-                "#,
-            )?;
-
-            let rows = stmt.query_map(params![node_id, limit], |row| {
-                let timestamp_str: String = row.get(2)?;
-                let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                    .with_timezone(&Utc);
-
-                Ok(HeartbeatEntry {
-                    node_id: row.get(0)?,
-                    instance_id: row.get(1)?,
-                    timestamp,
-                    latency_ms: row.get(3)?,
-                })
-            })?;
-
-            let mut heartbeats = Vec::new();
-            for row in rows {
-                heartbeats.push(row?);
-            }
-
-            Ok(heartbeats)
+            read_keyset_page(
+                conn,
+                KeysetListing {
+                    table: "heartbeats",
+                    columns: "id, node_id, instance_id, timestamp, latency_ms",
+                    sort_column: "timestamp",
+                    filters: vec![("node_id", Box::new(node_id))],
+                },
+                after,
+                limit,
+                map_heartbeat_record,
+            )
         })
         .await
     }
@@ -874,70 +911,37 @@ impl Database {
         .await
     }
 
-    /// Get config history for a node
-    ///
-    /// Returns all configuration changes for the specified node, ordered by timestamp descending
-    pub async fn get_config_history(
+    /// One page of a node's configuration history, newest change first,
+    /// optionally narrowed to one key, with the exact count of the matching
+    /// changes read in the same transaction.
+    pub async fn list_config_history_page(
         &self,
         node_id: &str,
+        config_key: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<ConfigHistoryEntry>, DatabaseError> {
+        after: Option<KeysetAfter<i64>>,
+    ) -> Result<CatalogPage<ConfigHistoryEntry>, DatabaseError> {
         let node_id = node_id.to_string();
+        let config_key = config_key.map(str::to_string);
 
         self.with_connection(move |conn| {
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT id, node_id, config_key, config_value, version_timestamp, operation, created_at
-                FROM config_history
-                WHERE node_id = ?1
-                ORDER BY created_at DESC
-                LIMIT ?2
-                "#,
-            )?;
-
-            let rows = stmt.query_map(params![node_id, limit], map_config_history)?;
-
-            let mut history = Vec::new();
-            for row in rows {
-                history.push(row?);
+            let mut filters: Vec<(&'static str, Box<dyn ToSql>)> =
+                vec![("node_id", Box::new(node_id))];
+            if let Some(config_key) = config_key {
+                filters.push(("config_key", Box::new(config_key)));
             }
-
-            Ok(history)
-        })
-        .await
-    }
-
-    /// Get config history for a specific config key
-    ///
-    /// Returns all changes for a specific configuration key, ordered by timestamp descending
-    pub async fn get_config_key_history(
-        &self,
-        node_id: &str,
-        config_key: &str,
-        limit: usize,
-    ) -> Result<Vec<ConfigHistoryEntry>, DatabaseError> {
-        let node_id = node_id.to_string();
-        let config_key = config_key.to_string();
-
-        self.with_connection(move |conn| {
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT id, node_id, config_key, config_value, version_timestamp, operation, created_at
-                FROM config_history
-                WHERE node_id = ?1 AND config_key = ?2
-                ORDER BY created_at DESC
-                LIMIT ?3
-                "#,
-            )?;
-
-            let rows = stmt.query_map(params![node_id, config_key, limit], map_config_history)?;
-
-            let mut history = Vec::new();
-            for row in rows {
-                history.push(row?);
-            }
-
-            Ok(history)
+            read_keyset_page(
+                conn,
+                KeysetListing {
+                    table: "config_history",
+                    columns: "id, node_id, config_key, config_value, version_timestamp, operation, created_at",
+                    sort_column: "created_at",
+                    filters,
+                },
+                after,
+                limit,
+                map_config_history,
+            )
         })
         .await
     }
@@ -993,7 +997,47 @@ impl Database {
         .await
     }
 
-    /// List events with filters
+    /// One page of the event log, newest first, optionally narrowed by node
+    /// and by severity, with the exact count of the matching events read in
+    /// the same transaction.
+    pub async fn list_events_page(
+        &self,
+        node_id: Option<&str>,
+        severity: Option<&str>,
+        limit: usize,
+        after: Option<KeysetAfter<i64>>,
+    ) -> Result<CatalogPage<EventEntry>, DatabaseError> {
+        let node_id = node_id.map(str::to_string);
+        let severity = severity.map(str::to_string);
+
+        self.with_connection(move |conn| {
+            let mut filters: Vec<(&'static str, Box<dyn ToSql>)> = Vec::new();
+            if let Some(node_id) = node_id {
+                filters.push(("node_id", Box::new(node_id)));
+            }
+            if let Some(severity) = severity {
+                filters.push(("severity", Box::new(severity)));
+            }
+            read_keyset_page(
+                conn,
+                KeysetListing {
+                    table: "events",
+                    columns: EVENT_COLUMNS,
+                    sort_column: "timestamp",
+                    filters,
+                },
+                after,
+                limit,
+                map_event_entry,
+            )
+        })
+        .await
+    }
+
+    /// List events with filters, offset-paged.
+    ///
+    /// The Control API pages the event log with [`Self::list_events_page`];
+    /// this remains for callers that want a bounded recent slice.
     pub async fn list_events(
         &self,
         node_id: Option<&str>,
@@ -1005,7 +1049,7 @@ impl Database {
         let severity = severity.map(str::to_string);
 
         self.with_connection(move |conn| {
-            let mut sql = "SELECT event_type, node_id, severity, message, metadata, timestamp FROM events WHERE 1=1".to_string();
+            let mut sql = format!("SELECT {EVENT_COLUMNS} FROM events WHERE 1=1");
             let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
             if let Some(wid) = node_id {
@@ -1028,22 +1072,7 @@ impl Database {
                 params_vec.iter().map(|b| b.as_ref()).collect();
 
             let mut stmt = conn.prepare(&sql)?;
-            let events = stmt.query_map(params_refs.as_slice(), |row| {
-                Ok(EventEntry {
-                    event_type: row.get(0)?,
-                    node_id: row.get(1)?,
-                    severity: EventSeverity::from_str(&row.get::<_, String>(2)?)
-                        .unwrap_or(EventSeverity::Info),
-                    message: row.get(3)?,
-                    metadata: row
-                        .get::<_, Option<String>>(4)?
-                        .and_then(|s| serde_json::from_str(&s).ok()),
-                    timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(Utc::now),
-                })
-            })?;
+            let events = stmt.query_map(params_refs.as_slice(), map_event_entry)?;
 
             events
                 .collect::<Result<Vec<_>, _>>()
@@ -1102,33 +1131,34 @@ impl Database {
         .await
     }
 
-    /// List commands with optional node_id filter
-    pub async fn list_commands(
+    /// One page of the command history, newest first, optionally narrowed
+    /// to one node, with the exact count of the matching commands read in
+    /// the same transaction.
+    pub async fn list_commands_page(
         &self,
         node_id: Option<&str>,
-    ) -> Result<Vec<CommandEntry>, DatabaseError> {
+        limit: usize,
+        after: Option<KeysetAfter<String>>,
+    ) -> Result<CatalogPage<CommandEntry>, DatabaseError> {
         let node_id = node_id.map(str::to_string);
 
         self.with_connection(move |conn| {
-            let mut sql = "SELECT id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message \
-                           FROM commands".to_string();
-
-            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-            if let Some(wid) = node_id {
-                sql.push_str(" WHERE node_id = ?1");
-                params_vec.push(Box::new(wid));
+            let mut filters: Vec<(&'static str, Box<dyn ToSql>)> = Vec::new();
+            if let Some(node_id) = node_id {
+                filters.push(("node_id", Box::new(node_id)));
             }
-            sql.push_str(" ORDER BY created_at DESC");
-
-            let params_refs: Vec<&dyn rusqlite::ToSql> =
-                params_vec.iter().map(|b| b.as_ref()).collect();
-
-            let mut stmt = conn.prepare(&sql)?;
-            let commands = stmt.query_map(params_refs.as_slice(), map_command_entry)?;
-
-            commands
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(DatabaseError::from)
+            read_keyset_page(
+                conn,
+                KeysetListing {
+                    table: "commands",
+                    columns: COMMAND_COLUMNS,
+                    sort_column: "created_at",
+                    filters,
+                },
+                after,
+                limit,
+                map_command_entry,
+            )
         })
         .await
     }
@@ -1141,10 +1171,9 @@ impl Database {
         let command_id = command_id.to_string();
 
         self.with_connection(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message \
-                 FROM commands WHERE id = ?1"
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COMMAND_COLUMNS} FROM commands WHERE id = ?1"
+            ))?;
 
             let mut rows = stmt.query([command_id])?;
 
@@ -1168,9 +1197,133 @@ impl Database {
     }
 }
 
+/// Read one keyset page of a diagnostic history.
+///
+/// `SELECT columns FROM table WHERE filters [AND after] ORDER BY sort DESC,
+/// id DESC LIMIT limit + 1`, with the exact count of the filtered rows read
+/// in the same transaction, so the page and its `total` describe one
+/// instant. The extra row only says whether a further page exists; it is
+/// not returned.
+fn read_keyset_page<T, Id, F>(
+    conn: &Connection,
+    listing: KeysetListing,
+    after: Option<KeysetAfter<Id>>,
+    limit: usize,
+    map: F,
+) -> Result<CatalogPage<T>, DatabaseError>
+where
+    Id: ToSql + 'static,
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    let fetch = i64::try_from(limit)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| DatabaseError::ParseError {
+            message: format!("{} page limit {limit} is out of range", listing.table),
+        })?;
+
+    let transaction = conn.unchecked_transaction()?;
+    let mut clauses: Vec<String> = Vec::new();
+    let mut binds: Vec<Box<dyn ToSql>> = Vec::new();
+    for (column, value) in listing.filters {
+        binds.push(value);
+        clauses.push(format!("{column} = ?{}", binds.len()));
+    }
+    let where_clause = |clauses: &[String]| {
+        if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        }
+    };
+    let total: i64 = transaction.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM {}{}",
+            listing.table,
+            where_clause(&clauses)
+        ),
+        params_from_iter(binds.iter().map(|bind| bind.as_ref())),
+        |row| row.get(0),
+    )?;
+
+    if let Some(after) = after {
+        binds.push(Box::new(after.sort_text));
+        let text_index = binds.len();
+        binds.push(Box::new(after.id));
+        let id_index = binds.len();
+        clauses.push(format!(
+            "({sort} < ?{text_index} OR ({sort} = ?{text_index} AND id < ?{id_index}))",
+            sort = listing.sort_column
+        ));
+    }
+    binds.push(Box::new(fetch));
+    let limit_index = binds.len();
+    let sql = format!(
+        "SELECT {} FROM {}{} ORDER BY {sort} DESC, id DESC LIMIT ?{limit_index}",
+        listing.columns,
+        listing.table,
+        where_clause(&clauses),
+        sort = listing.sort_column
+    );
+    let mut stmt = transaction.prepare(&sql)?;
+    let mut items = stmt
+        .query_map(
+            params_from_iter(binds.iter().map(|bind| bind.as_ref())),
+            map,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    transaction.commit()?;
+
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let total = usize::try_from(total).map_err(|_| DatabaseError::ParseError {
+        message: format!("{} count {total} is out of range", listing.table),
+    })?;
+    Ok(CatalogPage {
+        items,
+        total,
+        has_more,
+    })
+}
+
+const EVENT_COLUMNS: &str = "id, event_type, node_id, severity, message, metadata, timestamp";
+const COMMAND_COLUMNS: &str = "id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message";
+
 /// Free functions, not methods: the row mappers run inside closures that are
 /// moved to a blocking thread, so anything they capture would have to be
 /// `'static` - and `&self` is not.
+fn map_event_entry(row: &rusqlite::Row) -> Result<EventEntry, rusqlite::Error> {
+    Ok(EventEntry {
+        id: row.get(0)?,
+        event_type: row.get(1)?,
+        node_id: row.get(2)?,
+        severity: EventSeverity::from_str(&row.get::<_, String>(3)?).unwrap_or(EventSeverity::Info),
+        message: row.get(4)?,
+        metadata: row
+            .get::<_, Option<String>>(5)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now),
+    })
+}
+
+fn map_heartbeat_record(row: &rusqlite::Row) -> Result<HeartbeatRecord, rusqlite::Error> {
+    let timestamp_str: String = row.get(3)?;
+    let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .with_timezone(&Utc);
+    Ok(HeartbeatRecord {
+        id: row.get(0)?,
+        node_id: row.get(1)?,
+        instance_id: row.get(2)?,
+        timestamp,
+        latency_ms: row.get(4)?,
+    })
+}
+
 fn map_command_entry(row: &rusqlite::Row) -> Result<CommandEntry, rusqlite::Error> {
     Ok(CommandEntry {
         id: row.get(0)?,
@@ -1325,7 +1478,11 @@ mod tests {
         db.save_heartbeat(&entry).await.unwrap();
 
         // Verify we can retrieve it
-        let heartbeats = db.get_recent_heartbeats("node-1", 10).await.unwrap();
+        let heartbeats = db
+            .list_heartbeats_page("node-1", 10, None)
+            .await
+            .unwrap()
+            .items;
         assert_eq!(heartbeats.len(), 1);
         assert_eq!(heartbeats[0].latency_ms, Some(10));
     }
@@ -1355,6 +1512,114 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A diagnostic history is paged by keyset on its RFC 3339 text and its
+    /// row id: two rows written in the same instant are told apart by id,
+    /// the stored text is exactly what the parsed timestamp renders back
+    /// to, and the count is the count of the whole filtered history.
+    #[tokio::test]
+    async fn a_keyset_page_resumes_after_its_last_row_even_on_equal_timestamps() {
+        let db = Database::init(":memory:").await.unwrap();
+        for node in ["node-1", "node-2"] {
+            let session = crate::session::NodeSession::new(
+                node.to_string(),
+                crate::message::NodeInfo {
+                    node_role: NodeRole::Runtime("1.0.0".to_string()),
+                    listen_host: "localhost".to_string(),
+                    listen_port: vec![8000],
+                },
+            );
+            db.save_node(&session).await.unwrap();
+        }
+        let base = DateTime::parse_from_rfc3339("2026-09-06T10:00:00.123456789+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (latency, (node, offset_ms)) in [
+            ("node-1", 0),
+            ("node-1", 0),
+            ("node-1", 0),
+            ("node-2", 0),
+            ("node-1", 1_000),
+            ("node-1", 1_000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.save_heartbeat(&HeartbeatEntry {
+                node_id: node.to_string(),
+                instance_id: "instance".to_string(),
+                timestamp: base + chrono::Duration::milliseconds(offset_ms),
+                latency_ms: Some(latency as i64),
+            })
+            .await
+            .unwrap();
+        }
+        let latencies = |page: &CatalogPage<HeartbeatRecord>| {
+            page.items
+                .iter()
+                .map(|row| row.latency_ms.unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let first = db.list_heartbeats_page("node-1", 2, None).await.unwrap();
+        assert_eq!(first.total, 5, "node-2's heartbeat is not counted");
+        assert!(first.has_more);
+        assert_eq!(
+            latencies(&first),
+            [5, 4],
+            "same instant: the later row first"
+        );
+
+        let last = first.items.last().unwrap();
+        let after = KeysetAfter {
+            sort_text: last.timestamp.to_rfc3339(),
+            id: last.id,
+        };
+        let last_id = last.id;
+        let stored: String = db
+            .with_connection(move |conn| {
+                Ok::<_, DatabaseError>(conn.query_row(
+                    "SELECT timestamp FROM heartbeats WHERE id = ?1",
+                    [last_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored, after.sort_text,
+            "the cursor's text must be the text SQLite compares"
+        );
+
+        let second = db
+            .list_heartbeats_page("node-1", 2, Some(after))
+            .await
+            .unwrap();
+        assert_eq!(latencies(&second), [2, 1]);
+        assert_eq!(second.total, 5);
+        assert!(second.has_more);
+
+        let last = second.items.last().unwrap();
+        let third = db
+            .list_heartbeats_page(
+                "node-1",
+                2,
+                Some(KeysetAfter {
+                    sort_text: last.timestamp.to_rfc3339(),
+                    id: last.id,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(latencies(&third), [0]);
+        assert!(!third.has_more);
+
+        let empty = db.list_heartbeats_page("node-3", 2, None).await.unwrap();
+        assert_eq!(
+            (empty.items.len(), empty.total, empty.has_more),
+            (0, 0, false)
+        );
     }
 
     /// `CommandExecutor::execute_command` writes its own timeout while
@@ -1457,7 +1722,11 @@ mod tests {
         db.save_configs(node_id, &configs, v2).await.unwrap();
 
         // Get history
-        let history = db.get_config_history(node_id, 100).await.unwrap();
+        let history = db
+            .list_config_history_page(node_id, None, 100, None)
+            .await
+            .unwrap()
+            .items;
 
         // Should have 4 entries: 2 creates + 2 updates (port + host)
         assert_eq!(history.len(), 4);
@@ -1490,9 +1759,10 @@ mod tests {
 
         // Get history for "port" key only
         let port_history = db
-            .get_config_key_history(node_id, "port", 100)
+            .list_config_history_page(node_id, Some("port"), 100, None)
             .await
-            .unwrap();
+            .unwrap()
+            .items;
 
         // Should have 2 entries for port: 1 create + 1 update
         assert_eq!(port_history.len(), 2);
@@ -1517,9 +1787,10 @@ mod tests {
 
         // Get history
         let history = db
-            .get_config_key_history(node_id, "port", 100)
+            .list_config_history_page(node_id, Some("port"), 100, None)
             .await
-            .unwrap();
+            .unwrap()
+            .items;
 
         // Should have 2 entries: create + delete
         assert_eq!(history.len(), 2);
@@ -1617,9 +1888,10 @@ mod tests {
         assert_eq!(rows, 1, "one node, one row, however often it reconnects");
 
         assert_eq!(
-            db.get_recent_heartbeats("node-alpha", 10)
+            db.list_heartbeats_page("node-alpha", 10, None)
                 .await
                 .unwrap()
+                .items
                 .len(),
             1,
             "the reconnect must not have cascaded the heartbeat history away"
@@ -1823,17 +2095,19 @@ mod tests {
         db.cleanup_old_heartbeats(5).await.unwrap();
 
         assert_eq!(
-            db.get_recent_heartbeats("node-quiet", 100)
+            db.list_heartbeats_page("node-quiet", 100, None)
                 .await
                 .unwrap()
+                .items
                 .len(),
             2,
             "the quiet node keeps all it has; it is under the cap"
         );
         assert_eq!(
-            db.get_recent_heartbeats("node-busy", 100)
+            db.list_heartbeats_page("node-busy", 100, None)
                 .await
                 .unwrap()
+                .items
                 .len(),
             5,
             "the busy node is trimmed to the cap"

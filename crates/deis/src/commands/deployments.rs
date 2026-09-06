@@ -18,7 +18,7 @@ use anyhow::Result;
 use colored::Colorize;
 
 use crate::commands::{Session, escaped, escaped_or_dash};
-use crate::platform::MAX_LIST_LIMIT;
+use crate::platform::{API_MAJOR, MAX_LIST_LIMIT};
 use crate::render::{Output, Table, age, timestamp};
 use crate::settings::Overrides;
 
@@ -135,7 +135,7 @@ fn deeper_history(shown: usize, total: usize) -> Option<String> {
         format!(
             "{MAX_LIST_LIMIT} is the most this command reads (one page), so anything older is \
              only reachable through the API's page cursor: GET \
-             /api/apps/<app>/environments/<environment>/deployments?limit={MAX_LIST_LIMIT}&cursor=<nextCursor>"
+             {API_MAJOR}/apps/<app>/environments/<environment>/deployments?limit={MAX_LIST_LIMIT}&cursor=<nextCursor>"
         )
     };
     Some(format!("{shown} of {total} shown; {advice}."))
@@ -190,7 +190,7 @@ mod tests {
         assert!(!advice.contains("deis audit"), "{advice}");
         assert!(advice.contains("cursor=<nextCursor>"), "{advice}");
         assert!(
-            advice.contains("/api/apps/<app>/environments/<environment>/deployments"),
+            advice.contains("/api/v1/apps/<app>/environments/<environment>/deployments"),
             "{advice}"
         );
     }

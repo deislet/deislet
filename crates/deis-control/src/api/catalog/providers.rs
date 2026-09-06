@@ -28,12 +28,16 @@ use serde::Deserialize;
 use serde_json::json;
 use std::future::Future;
 use tokio::io::AsyncWriteExt;
+use utoipa::IntoParams;
+use utoipa::ToSchema;
 
 use super::{CatalogState, actor_subject};
+use crate::api::openapi;
 use crate::{
     api::{
         error::{ApiError, ApiResult},
         pagination::{ControlListPage, ListQuery, list_page},
+        paths::ApiPaths,
     },
     catalog::{
         IdempotencyOutcome, IdempotencyScope, IdempotencyStore, IdempotentRequest,
@@ -78,7 +82,32 @@ const RELEASE_UPLOAD_PREFIX: &str = ".driver-upload.";
 pub const MAX_PROVIDER_DRIVER_RELEASE_REQUEST_BYTES: usize =
     4 * 1024 * 1024 * 1024 + 5 * 1024 * 1024;
 
-#[derive(Deserialize)]
+/// The five parts of a driver release upload, in this order.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub struct DriverReleaseUpload {
+    /// The release document, canonical JSON
+    /// (`contracts/v1/provider-driver-release.schema.json`).
+    #[schema(value_type = String)]
+    pub release: String,
+    /// The driver manifest, canonical JSON
+    /// (`contracts/v1/provider-driver.schema.json`).
+    #[schema(value_type = String)]
+    pub manifest: String,
+    /// The release authorization envelope, canonical JSON
+    /// (`contracts/v1/provider-driver-release-envelope.schema.json`).
+    #[schema(value_type = String)]
+    pub authorization: String,
+    /// The transparency proof, canonical JSON
+    /// (`contracts/v1/provider-driver-transparency-proof.schema.json`).
+    #[schema(value_type = String)]
+    pub transparency: String,
+    /// The driver archive the release names.
+    #[schema(value_type = String, format = Binary)]
+    pub archive: Vec<u8>,
+}
+
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProvisionCredentialRequest {
     pub backend_id: String,
@@ -86,51 +115,65 @@ pub struct ProvisionCredentialRequest {
     pub credential: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RotateCredentialRequest {
     pub credential: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegisterInstallationRequest {
     pub backend_id: String,
     pub account_reference: String,
     pub region: Option<String>,
+    #[schema(value_type = String, format = Uuid)]
     pub credential_binding_id: CanonicalId,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegisterTargetRequest {
     pub name: String,
     pub standard_version: String,
+    #[schema(value_type = String)]
     pub target_config_digest: Sha256Digest,
+    #[schema(value_type = crate::api::openapi::ProviderDriverManifestDocument)]
     pub driver_manifest: serde_json::Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BeginProviderDeploymentRequest {
+    #[schema(value_type = String, format = Uuid)]
     pub provider_target_id: CanonicalId,
+    #[schema(value_type = crate::api::openapi::ArtifactVersionRefDocument)]
     pub artifact: ArtifactVersionRef,
     #[serde(default)]
+    #[schema(value_type = crate::api::openapi::ProviderNeutralPlanDocument)]
     pub plan: ProviderNeutralPlan,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GrantProviderTargetRequest {
+    #[schema(value_type = String, format = Uuid)]
     pub provider_target_id: CanonicalId,
     pub note: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct ProviderTargetGrantListQuery {
+    /// Page size, `1..=1000`; absent means 100.
+    #[param(minimum = 1, maximum = 1000)]
     pub limit: Option<usize>,
+    /// The `page.nextCursor` of the previous answer. Opaque, bound to the
+    /// collection and the filters it was issued for, and refused with 400
+    /// `cursor-invalid` anywhere else.
     pub cursor: Option<String>,
+    /// `active` (the default), `revoked` or `all`.
     pub status: Option<String>,
 }
 
@@ -150,12 +193,20 @@ impl ProviderTargetGrantListQuery {
 /// `GET /api/providers/target-grants`: the whole platform's grant history.
 /// The status defaults to `all` because this is history, not the live
 /// authorization view a single environment lists.
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct ProviderTargetGrantHistoryQuery {
+    /// Page size, `1..=1000`; absent means 100.
+    #[param(minimum = 1, maximum = 1000)]
     pub limit: Option<usize>,
+    /// The `page.nextCursor` of the previous answer. Opaque, bound to the
+    /// collection and the filters it was issued for, and refused with 400
+    /// `cursor-invalid` anywhere else.
     pub cursor: Option<String>,
+    /// `all` (the default), `active` or `revoked`.
     pub status: Option<String>,
+    /// A provider target's id; narrows the history to grants on that target.
     pub target: Option<String>,
 }
 
@@ -193,14 +244,39 @@ fn grant_status_filter(status: &str) -> ApiResult<ProviderTargetGrantStatusFilte
 /// `DELETE /api/providers/installations/:id?cascade=true`. Without
 /// `cascade` an installation that still has targets or active grants is
 /// refused with `provider-installation-has-dependents`.
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct DeleteInstallationQuery {
+    /// Also revoke the installation's targets and active grants. Off by
+    /// default, in which case an installation with dependents is refused
+    /// with `provider-installation-has-dependents`.
     pub cascade: Option<bool>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/driver-releases",
+    operation_id = "installDriverRelease",
+    tag = "product",
+    params(("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
+    request_body(content = DriverReleaseUpload, content_type = "multipart/form-data", description = "The release documents and the archive, in this order."),
+    responses(
+        (status = 201, description = "The release was verified and installed.", body = ProviderDriverReleaseRecord, headers(("Location" = String, description = "The new resource."), ("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 200, description = "The same release was already installed.", body = ProviderDriverReleaseRecord, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 409, response = openapi::Conflict),
+        (status = 413, response = openapi::PayloadTooLarge),
+        (status = 422, response = openapi::UnprocessableEntity),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn install_driver_release(
     State(state): State<CatalogState>,
+    paths: ApiPaths,
     mut multipart: Multipart,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderDriverReleaseRecord>)> {
     let registry = provider_registry(&state)?;
@@ -307,15 +383,29 @@ pub async fn install_driver_release(
         StatusCode::CREATED
     };
     let headers = resource_headers(
-        &format!(
-            "/api/providers/driver-releases/{}",
+        &paths.absolute(&format!(
+            "/providers/driver-releases/{}",
             installed.release_digest
-        ),
+        )),
         installed.revision,
     )?;
     Ok((status, headers, Json(installed)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/driver-releases",
+    operation_id = "listDriverReleases",
+    tag = "product",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "One page of installed releases.", body = ControlListPage<ProviderDriverReleaseRecord>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_driver_releases(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
@@ -351,6 +441,21 @@ pub async fn list_driver_releases(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/driver-releases/{release_digest}",
+    operation_id = "getDriverRelease",
+    tag = "product",
+    params(("release_digest" = String, Path, description = "The release digest, 64 lowercase hexadecimal digits.")),
+    responses(
+        (status = 200, description = "The release.", body = ProviderDriverReleaseRecord, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_driver_release(
     State(state): State<CatalogState>,
     Path(release_digest): Path<String>,
@@ -368,6 +473,21 @@ pub async fn get_driver_release(
     Ok((headers, Json(release)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/driver-releases/{release_digest}/audit",
+    operation_id = "listDriverReleaseAudit",
+    tag = "product",
+    params(("release_digest" = String, Path, description = "The release digest, 64 lowercase hexadecimal digits."), ListQuery),
+    responses(
+        (status = 200, description = "One page of audit events, newest first.", body = ControlListPage<ProviderDriverReleaseAuditEvent>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn driver_release_audit(
     State(state): State<CatalogState>,
     Path(release_digest): Path<String>,
@@ -412,10 +532,29 @@ pub async fn driver_release_audit(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/credentials",
+    operation_id = "provisionProviderCredential",
+    tag = "product",
+    params(("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
+    request_body = ProvisionCredentialRequest,
+    responses(
+        (status = 201, description = "The credential was sealed and bound.", body = ProviderCredentialBinding, headers(("Location" = String, description = "The new resource."), ("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 409, response = openapi::Conflict),
+        (status = 413, response = openapi::PayloadTooLarge),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn provision_credential(
     State(state): State<CatalogState>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Json(request): Json<ProvisionCredentialRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderCredentialBinding>)> {
     let idempotency_key = required_header(&headers, IDEMPOTENCY_KEY)?;
@@ -435,7 +574,7 @@ pub async fn provision_credential(
         replay,
         StatusCode::CREATED,
         |binding: &ProviderCredentialBinding| {
-            format!("/api/providers/credentials/{}", binding.binding_id)
+            paths.absolute(&format!("/providers/credentials/{}", binding.binding_id))
         },
         |record| {
             state.provider_credentials.provision(
@@ -452,6 +591,19 @@ pub async fn provision_credential(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/credentials",
+    operation_id = "listProviderCredentials",
+    tag = "product",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "One page of bindings; never a credential value.", body = ControlListPage<ProviderCredentialBinding>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_credentials(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
@@ -482,6 +634,20 @@ pub async fn list_credentials(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/credentials/{binding_id}",
+    operation_id = "getProviderCredential",
+    tag = "product",
+    params(("binding_id" = String, Path, description = "The credential binding's UUIDv7.")),
+    responses(
+        (status = 200, description = "The binding.", body = ProviderCredentialBinding, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_credential(
     State(state): State<CatalogState>,
     Path(binding_id): Path<String>,
@@ -500,6 +666,26 @@ pub async fn get_credential(
     Ok((headers, Json(binding)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/credentials/{binding_id}/rotate",
+    operation_id = "rotateProviderCredential",
+    tag = "product",
+    params(("binding_id" = String, Path, description = "The credential binding's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    request_body = RotateCredentialRequest,
+    responses(
+        (status = 200, description = "The binding at its new revision.", body = ProviderCredentialBinding, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 413, response = openapi::PayloadTooLarge),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn rotate_credential(
     State(state): State<CatalogState>,
     Path(binding_id): Path<String>,
@@ -538,6 +724,23 @@ pub async fn rotate_credential(
     .await
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/providers/credentials/{binding_id}",
+    operation_id = "revokeProviderCredential",
+    tag = "product",
+    params(("binding_id" = String, Path, description = "The credential binding's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    responses(
+        (status = 200, description = "The binding, now revoked.", body = ProviderCredentialBinding, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn revoke_credential(
     State(state): State<CatalogState>,
     Path(binding_id): Path<String>,
@@ -569,6 +772,20 @@ pub async fn revoke_credential(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/credentials/{binding_id}/audit",
+    operation_id = "listProviderCredentialAudit",
+    tag = "product",
+    params(("binding_id" = String, Path, description = "The credential binding's UUIDv7."), ListQuery),
+    responses(
+        (status = 200, description = "One page of audit events, newest first.", body = ControlListPage<ProviderCredentialAuditEvent>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn credential_audit(
     State(state): State<CatalogState>,
     Path(binding_id): Path<String>,
@@ -616,10 +833,28 @@ pub async fn credential_audit(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/installations",
+    operation_id = "registerProviderInstallation",
+    tag = "product",
+    params(("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
+    request_body = RegisterInstallationRequest,
+    responses(
+        (status = 201, description = "The installation was registered.", body = ProviderInstallation, headers(("Location" = String, description = "The new resource."), ("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn register_installation(
     State(state): State<CatalogState>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Json(request): Json<RegisterInstallationRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderInstallation>)> {
     let idempotency_key = required_header(&headers, IDEMPOTENCY_KEY)?;
@@ -639,10 +874,10 @@ pub async fn register_installation(
         replay,
         StatusCode::CREATED,
         |installation: &ProviderInstallation| {
-            format!(
-                "/api/providers/installations/{}",
+            paths.absolute(&format!(
+                "/providers/installations/{}",
                 installation.installation_id
-            )
+            ))
         },
         |record| {
             state.store.register_provider_installation(
@@ -660,6 +895,19 @@ pub async fn register_installation(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/installations",
+    operation_id = "listProviderInstallations",
+    tag = "product",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "One page of installations.", body = ControlListPage<ProviderInstallation>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_installations(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
@@ -691,6 +939,20 @@ pub async fn list_installations(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/installations/{installation_id}",
+    operation_id = "getProviderInstallation",
+    tag = "product",
+    params(("installation_id" = String, Path, description = "The installation's UUIDv7.")),
+    responses(
+        (status = 200, description = "The installation.", body = ProviderInstallation, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_installation(
     State(state): State<CatalogState>,
     Path(installation_id): Path<String>,
@@ -707,11 +969,31 @@ pub async fn get_installation(
     Ok((headers, Json(installation)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/installations/{installation_id}/targets",
+    operation_id = "registerProviderTarget",
+    tag = "product",
+    params(("installation_id" = String, Path, description = "The installation's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
+    request_body = RegisterTargetRequest,
+    responses(
+        (status = 201, description = "The target was registered against an installed driver release.", body = ProviderTarget, headers(("Location" = String, description = "The new resource."), ("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 422, response = openapi::UnprocessableEntity),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn register_target(
     State(state): State<CatalogState>,
     Path(installation_id): Path<String>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Json(request): Json<RegisterTargetRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderTarget>)> {
     let idempotency_key = required_header(&headers, IDEMPOTENCY_KEY)?;
@@ -741,7 +1023,9 @@ pub async fn register_target(
         &principal,
         replay,
         StatusCode::CREATED,
-        |target: &ProviderTarget| format!("/api/providers/targets/{}", target.target_id),
+        |target: &ProviderTarget| {
+            paths.absolute(&format!("/providers/targets/{}", target.target_id))
+        },
         |record| {
             state.store.register_provider_target(
                 ProviderTargetSpec {
@@ -759,6 +1043,20 @@ pub async fn register_target(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/installations/{installation_id}/targets",
+    operation_id = "listProviderInstallationTargets",
+    tag = "product",
+    params(("installation_id" = String, Path, description = "The installation's UUIDv7."), ListQuery),
+    responses(
+        (status = 200, description = "One page of the installation's targets.", body = ControlListPage<ProviderTarget>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_installation_targets(
     State(state): State<CatalogState>,
     Path(installation_id): Path<String>,
@@ -793,6 +1091,19 @@ pub async fn list_installation_targets(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/targets",
+    operation_id = "listProviderTargets",
+    tag = "product",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "One page of targets.", body = ControlListPage<ProviderTarget>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_targets(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
@@ -823,6 +1134,20 @@ pub async fn list_targets(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/targets/{target_id}",
+    operation_id = "getProviderTarget",
+    tag = "product",
+    params(("target_id" = String, Path, description = "The target's UUIDv7.")),
+    responses(
+        (status = 200, description = "The target.", body = ProviderTarget, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_target(
     State(state): State<CatalogState>,
     Path(target_id): Path<String>,
@@ -837,6 +1162,23 @@ pub async fn get_target(
     Ok((headers, Json(target)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/installations/{installation_id}/disable",
+    operation_id = "disableProviderInstallation",
+    tag = "product",
+    params(("installation_id" = String, Path, description = "The installation's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    responses(
+        (status = 200, description = "The installation, now disabled.", body = ProviderInstallation, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn disable_installation(
     State(state): State<CatalogState>,
     Path(installation_id): Path<String>,
@@ -868,6 +1210,23 @@ pub async fn disable_installation(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/installations/{installation_id}/enable",
+    operation_id = "enableProviderInstallation",
+    tag = "product",
+    params(("installation_id" = String, Path, description = "The installation's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    responses(
+        (status = 200, description = "The installation, now enabled.", body = ProviderInstallation, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn enable_installation(
     State(state): State<CatalogState>,
     Path(installation_id): Path<String>,
@@ -901,6 +1260,23 @@ pub async fn enable_installation(
 
 /// Soft delete. The response is the installation with `deletedAt` set and
 /// status `revoked`; its targets, grants, workflows and audit stay readable.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/providers/installations/{installation_id}",
+    operation_id = "deleteProviderInstallation",
+    tag = "product",
+    params(("installation_id" = String, Path, description = "The installation's UUIDv7."), DeleteInstallationQuery, ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    responses(
+        (status = 200, description = "The installation, now deleted; with `cascade=true` its targets and their grants too.", body = ProviderInstallation, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn delete_installation(
     State(state): State<CatalogState>,
     Path(installation_id): Path<String>,
@@ -939,6 +1315,20 @@ pub async fn delete_installation(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/installations/{installation_id}/audit",
+    operation_id = "listProviderInstallationAudit",
+    tag = "product",
+    params(("installation_id" = String, Path, description = "The installation's UUIDv7."), ListQuery),
+    responses(
+        (status = 200, description = "One page of lifecycle events, newest first.", body = ControlListPage<ProviderLifecycleAuditEvent>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn installation_audit(
     State(state): State<CatalogState>,
     Path(installation_id): Path<String>,
@@ -957,6 +1347,23 @@ pub async fn installation_audit(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/targets/{target_id}/disable",
+    operation_id = "disableProviderTarget",
+    tag = "product",
+    params(("target_id" = String, Path, description = "The target's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    responses(
+        (status = 200, description = "The target, now disabled.", body = ProviderTarget, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn disable_target(
     State(state): State<CatalogState>,
     Path(target_id): Path<String>,
@@ -988,6 +1395,23 @@ pub async fn disable_target(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/providers/targets/{target_id}/enable",
+    operation_id = "enableProviderTarget",
+    tag = "product",
+    params(("target_id" = String, Path, description = "The target's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    responses(
+        (status = 200, description = "The target, now enabled.", body = ProviderTarget, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn enable_target(
     State(state): State<CatalogState>,
     Path(target_id): Path<String>,
@@ -1022,6 +1446,23 @@ pub async fn enable_target(
 /// Soft delete. Active grants on the target are revoked in the same
 /// transaction; a non-terminal provider deployment workflow on it makes the
 /// request a `provider-target-in-use` conflict that lists the operations.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/providers/targets/{target_id}",
+    operation_id = "deleteProviderTarget",
+    tag = "product",
+    params(("target_id" = String, Path, description = "The target's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    responses(
+        (status = 200, description = "The target, now deleted, and its grants revoked.", body = ProviderTarget, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn delete_target(
     State(state): State<CatalogState>,
     Path(target_id): Path<String>,
@@ -1053,6 +1494,20 @@ pub async fn delete_target(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/targets/{target_id}/audit",
+    operation_id = "listProviderTargetAudit",
+    tag = "product",
+    params(("target_id" = String, Path, description = "The target's UUIDv7."), ListQuery),
+    responses(
+        (status = 200, description = "One page of lifecycle events, newest first.", body = ControlListPage<ProviderLifecycleAuditEvent>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn target_audit(
     State(state): State<CatalogState>,
     Path(target_id): Path<String>,
@@ -1113,6 +1568,19 @@ async fn lifecycle_audit_page(
 /// Every grant on the platform, newest first, including grants whose
 /// application no longer exists. Administrator-only, like every other
 /// installation-wide provider resource.
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/target-grants",
+    operation_id = "listProviderTargetGrantHistory",
+    tag = "product",
+    params(ProviderTargetGrantHistoryQuery),
+    responses(
+        (status = 200, description = "One page of grants across every application.", body = ControlListPage<ProviderTargetGrant>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_provider_target_grant_history(
     State(state): State<CatalogState>,
     Query(query): Query<ProviderTargetGrantHistoryQuery>,
@@ -1151,6 +1619,20 @@ pub async fn list_provider_target_grant_history(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/target-grants/{grant_id}",
+    operation_id = "getProviderTargetGrantHistory",
+    tag = "product",
+    params(("grant_id" = String, Path, description = "The grant's UUIDv7.")),
+    responses(
+        (status = 200, description = "The grant.", body = ProviderTargetGrant, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_provider_target_grant_history(
     State(state): State<CatalogState>,
     Path(grant_id): Path<String>,
@@ -1167,6 +1649,20 @@ pub async fn get_provider_target_grant_history(
 
 /// The per-grant audit envelope without an application scope, so the trail
 /// of a grant remains readable after its application was retired.
+#[utoipa::path(
+    get,
+    path = "/api/v1/providers/target-grants/{grant_id}/audit",
+    operation_id = "listProviderTargetGrantHistoryAudit",
+    tag = "product",
+    params(("grant_id" = String, Path, description = "The grant's UUIDv7."), ListQuery),
+    responses(
+        (status = 200, description = "One page of grant events, newest first.", body = ControlListPage<ProviderTargetGrantAuditEvent>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn provider_target_grant_history_audit(
     State(state): State<CatalogState>,
     Path(grant_id): Path<String>,
@@ -1210,11 +1706,29 @@ pub async fn provider_target_grant_history_audit(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants",
+    operation_id = "grantProviderTarget",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
+    request_body = GrantProviderTargetRequest,
+    responses(
+        (status = 201, description = "The grant was recorded.", body = ProviderTargetGrant, headers(("Location" = String, description = "The new resource."), ("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn grant_provider_target(
     State(state): State<CatalogState>,
     Path((app_name, environment_name)): Path<(String, String)>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Json(request): Json<GrantProviderTargetRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderTargetGrant>)> {
     let idempotency_key = required_header(&headers, IDEMPOTENCY_KEY)?;
@@ -1241,10 +1755,10 @@ pub async fn grant_provider_target(
         replay,
         StatusCode::CREATED,
         |grant: &ProviderTargetGrant| {
-            format!(
-                "/api/apps/{app_name}/environments/{environment_name}/provider-target-grants/{}",
+            paths.absolute(&format!(
+                "/apps/{app_name}/environments/{environment_name}/provider-target-grants/{}",
                 grant.grant_id
-            )
+            ))
         },
         |record| {
             state.store.grant_provider_target(
@@ -1262,6 +1776,20 @@ pub async fn grant_provider_target(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants",
+    operation_id = "listProviderTargetGrants",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ProviderTargetGrantListQuery),
+    responses(
+        (status = 200, description = "One page of the environment's grants.", body = ControlListPage<ProviderTargetGrant>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_provider_target_grants(
     State(state): State<CatalogState>,
     Path((app_name, environment_name)): Path<(String, String)>,
@@ -1310,6 +1838,20 @@ pub async fn list_provider_target_grants(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants/{grant_id}",
+    operation_id = "getProviderTargetGrant",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7.")),
+    responses(
+        (status = 200, description = "The grant.", body = ProviderTargetGrant, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_provider_target_grant(
     State(state): State<CatalogState>,
     Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
@@ -1321,6 +1863,23 @@ pub async fn get_provider_target_grant(
     Ok((headers, Json(grant)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants/{grant_id}",
+    operation_id = "revokeProviderTargetGrant",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    responses(
+        (status = 200, description = "The grant, now revoked.", body = ProviderTargetGrant, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn revoke_provider_target_grant(
     State(state): State<CatalogState>,
     Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
@@ -1353,6 +1912,20 @@ pub async fn revoke_provider_target_grant(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants/{grant_id}/audit",
+    operation_id = "listProviderTargetGrantAudit",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7."), ListQuery),
+    responses(
+        (status = 200, description = "One page of grant events, newest first.", body = ControlListPage<ProviderTargetGrantAuditEvent>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn provider_target_grant_audit(
     State(state): State<CatalogState>,
     Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
@@ -1419,11 +1992,31 @@ async fn provider_target_grant_in_scope(
     Ok(grant)
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments",
+    operation_id = "beginProviderDeployment",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
+    request_body = BeginProviderDeploymentRequest,
+    responses(
+        (status = 202, description = "The deployment was recorded and will be driven; poll `Location`.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 403, response = openapi::Forbidden),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn begin_provider_deployment(
     State(state): State<CatalogState>,
     Path((app_name, environment_name)): Path<(String, String)>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Json(request): Json<BeginProviderDeploymentRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
     let app = state.store.get_app(&app_name).await?;
@@ -1445,10 +2038,24 @@ pub async fn begin_provider_deployment(
             context,
         )
         .await?;
-    let headers = operation_headers(&operation, &app_name, &environment_name)?;
+    let headers = operation_headers(paths, &operation, &app_name, &environment_name)?;
     Ok((StatusCode::ACCEPTED, headers, Json(operation)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments",
+    operation_id = "listProviderDeployments",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ListQuery),
+    responses(
+        (status = 200, description = "One page of provider deployments, newest first.", body = ControlListPage<ProviderDeploymentWorkflow>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_provider_deployments(
     State(state): State<CatalogState>,
     Path((app_name, environment_name)): Path<(String, String)>,
@@ -1493,9 +2100,24 @@ pub async fn list_provider_deployments(
     Ok((no_store_headers(), Json(response)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}",
+    operation_id = "getProviderDeployment",
+    tag = "product",
+    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The deployment operation's UUIDv7.")),
+    responses(
+        (status = 200, description = "The workflow and its operation.", body = ProviderDeploymentWorkflow, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_provider_deployment(
     State(state): State<CatalogState>,
     Path((app_name, environment_name, operation_id)): Path<(String, String, String)>,
+    paths: ApiPaths,
 ) -> ApiResult<(HeaderMap, Json<ProviderDeploymentWorkflow>)> {
     let app = state.store.get_app(&app_name).await?;
     let environment = state
@@ -1519,7 +2141,7 @@ pub async fn get_provider_deployment(
             "provider deployment operation {operation_id} not found for {app_name}/{environment_name}"
         )));
     }
-    let headers = operation_headers(&workflow.operation, &app_name, &environment_name)?;
+    let headers = operation_headers(paths, &workflow.operation, &app_name, &environment_name)?;
     Ok((headers, Json(workflow)))
 }
 
@@ -1796,15 +2418,16 @@ fn operation_context(
 }
 
 fn operation_headers(
+    paths: ApiPaths,
     operation: &ProductOperation,
     app_name: &str,
     environment_name: &str,
 ) -> ApiResult<HeaderMap> {
     let mut headers = resource_headers(
-        &format!(
-            "/api/apps/{app_name}/environments/{environment_name}/provider-deployments/{}",
+        &paths.absolute(&format!(
+            "/apps/{app_name}/environments/{environment_name}/provider-deployments/{}",
             operation.operation_id
-        ),
+        )),
         operation.revision,
     )?;
     headers.insert(
@@ -1820,6 +2443,9 @@ fn operation_headers(
     Ok(headers)
 }
 
+/// The headers of one provider resource answer. `location` is the absolute
+/// path of the resource, already spelled for the caller's surface by
+/// [`ApiPaths::absolute`], or empty for a read that is the resource itself.
 fn resource_headers(location: &str, revision: u64) -> ApiResult<HeaderMap> {
     let mut headers = HeaderMap::new();
     if !location.is_empty() {
@@ -1979,7 +2605,7 @@ mod tests {
     }
 
     fn account_router(state: &CatalogState, account: &str) -> axum::Router {
-        crate::api::catalog::router(state.clone()).layer(Extension(Principal {
+        crate::api::catalog::router("/api", state.clone()).layer(Extension(Principal {
             kind: crate::identity::PrincipalKind::Account,
             account: Some(account.to_string()),
             role: Some(crate::identity::Role::Owner),
@@ -2081,7 +2707,8 @@ mod tests {
         .unwrap();
         let mut state = harness.state.clone();
         state.provider_driver_dispatcher = Some(Arc::new(dispatcher));
-        let router = crate::api::catalog::router(state).layer(Extension(Principal::anonymous()));
+        let router =
+            crate::api::catalog::router("/api", state).layer(Extension(Principal::anonymous()));
         (harness, router)
     }
 
@@ -2903,6 +3530,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The versioned mount as the router builds it: the product routes
+    /// nested under `/api/v1`, an anonymous principal where the gate would
+    /// have left one, and the request context that names the surface.
+    fn v1_router(state: &CatalogState) -> axum::Router {
+        axum::Router::new()
+            .nest("/api/v1", crate::api::catalog::router("", state.clone()))
+            .layer(Extension(Principal::anonymous()))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::api::versioning::ApiSurface::V1,
+                crate::api::versioning::attach_request_context,
+            ))
+    }
+
+    /// A provider resource created through `/api/v1` is located under
+    /// `/api/v1`; through the legacy tree, under `/api`. A v1 client is never
+    /// handed a deprecated path to follow.
+    #[tokio::test]
+    async fn a_provider_resource_location_is_spelled_for_the_surface_the_caller_used() {
+        let harness = harness(true).await;
+        let v1 = v1_router(&harness.state);
+        for (router, uri, name, expected_prefix) in [
+            (
+                &harness.router,
+                "/api/providers/credentials",
+                "legacy",
+                "/api/providers/credentials/",
+            ),
+            (
+                &v1,
+                "/api/v1/providers/credentials",
+                "versioned",
+                "/api/v1/providers/credentials/",
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(json_request(
+                    Method::POST,
+                    uri,
+                    json!({
+                        "backendId": "cloudflare-workers-pages",
+                        "name": name,
+                        "credential": "test-only-token"
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED, "{uri}");
+            let location = response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let created = response_json(response).await;
+            let binding_id = created["bindingId"].as_str().unwrap();
+            assert_eq!(location, format!("{expected_prefix}{binding_id}"), "{uri}");
+        }
     }
 
     #[tokio::test]

@@ -6,6 +6,9 @@ use axum::{
 };
 use rust_embed::Embed;
 
+use crate::api::error::ApiError;
+use crate::api::versioning::{ApiSurface, RequestId};
+
 #[derive(Embed)]
 #[folder = "web/dist"]
 struct WebAssets;
@@ -31,19 +34,21 @@ pub async fn serve_assets(Path(path): Path<String>) -> impl IntoResponse {
 /// tells a caller its request succeeded when the endpoint does not exist,
 /// which is exactly what a caller written against a renamed endpoint would
 /// hit.
+///
+/// The refusal is `route-not-found` in the shape of the surface the path
+/// names: the structured envelope under `/api/v1` and `/api/platform`, the
+/// two-key legacy body everywhere else under `/api`. The fallback runs
+/// outside every mount, so the request id is minted here.
 pub async fn serve_fallback<B>(req: Request<B>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
     if let Some(response) = try_serve_file(path) {
         return response;
     }
     if is_api_path(path) {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"Not Found","details":"No such endpoint. The API surface is listed in the component's API_DOCUMENTATION.md."}"#,
-            ))
-            .unwrap();
+        return ApiError::route_not_found().into_response_for(
+            ApiSurface::of_path(req.uri().path()),
+            RequestId::of(req.extensions()),
+        );
     }
     serve_embedded_file("index.html")
 }
@@ -204,6 +209,50 @@ mod tests {
                 "application/json",
                 "{uri} was answered with something other than the API refusal"
             );
+        }
+    }
+
+    /// The refusal takes the shape of the surface the path names: the
+    /// legacy two-key body, byte for byte as before, under `/api`, and the
+    /// structured envelope with a minted request id under `/api/v1` and
+    /// `/api/platform`.
+    #[tokio::test]
+    async fn the_refusal_takes_the_shape_of_the_surface_the_path_names() {
+        use axum::body::to_bytes;
+
+        let response = serve_fallback(
+            HttpRequest::builder()
+                .uri("/api/nodes")
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .into_response();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &bytes[..],
+            br#"{"error":"Not Found","details":"No such endpoint. The API surface is listed in the component's API_DOCUMENTATION.md."}"#
+        );
+
+        for uri in ["/api/v1/nope", "/api/platform/nope"] {
+            let response = serve_fallback(
+                HttpRequest::builder()
+                    .uri(uri)
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            let echoed = response.headers()[crate::api::versioning::REQUEST_ID_HEADER]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "route-not-found", "{uri}");
+            assert_eq!(body["error"]["requestId"], echoed, "{uri}");
         }
     }
 

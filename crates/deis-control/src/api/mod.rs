@@ -14,10 +14,13 @@ pub mod metrics;
 pub mod middleware;
 pub mod migrations;
 pub mod nodes;
+pub mod openapi;
 pub mod pagination;
+pub mod paths;
 pub mod registration;
 pub mod restores;
 pub mod static_files;
+pub mod versioning;
 
 use axum::{
     Router, middleware as axum_middleware,
@@ -174,105 +177,27 @@ pub async fn build_api_router(
         audit: Arc::clone(&audit_store),
     };
 
-    let protected_routes = Router::new()
-        // Not "/api/nodes": that prefix belongs to the endpoints nodes
-        // themselves call. These three are about the control channels open
-        // to this process - see `api::nodes`.
-        .route("/api/sessions", get(nodes::list_sessions))
-        .route("/api/sessions/:id", get(nodes::get_session))
-        .route("/api/sessions/:id/heartbeats", get(nodes::get_heartbeats))
-        .with_state(app_state.clone())
-        .route("/api/configs", get(configs::list_all_configs))
-        .route("/api/configs/stats", get(configs::get_config_stats))
-        .route("/api/configs/:node_id", get(configs::get_node_configs))
-        .route("/api/configs/:node_id", post(configs::update_node_configs))
-        .route(
-            "/api/configs/:node_id",
-            delete(configs::delete_node_configs),
-        )
-        .route(
-            "/api/configs/:node_id/history",
-            get(configs::get_config_history),
-        )
-        .route(
-            "/api/configs/:node_id/:config_key",
-            get(configs::get_config_value),
-        )
-        .route(
-            "/api/configs/:node_id/:config_key",
-            delete(configs::delete_config),
-        )
-        .route(
-            "/api/configs/:node_id/:config_key/history",
-            get(configs::get_config_key_history),
-        )
-        .route(
-            "/api/configs/:node_id/:config_key/rollback",
-            post(configs::rollback_config_key),
-        )
-        .route(
-            "/api/configs/push/:node_id",
-            post(configs::push_all_configs),
-        )
-        .route(
-            "/api/configs/push/:node_id/:config_key",
-            post(configs::push_config),
-        )
-        .with_state(configs_state)
-        .route("/api/commands", get(commands::list_commands))
-        .route(
-            "/api/commands/execute/:node_id",
-            post(commands::execute_command),
-        )
-        .route(
-            "/api/commands/node/:node_id",
-            get(commands::list_node_commands),
-        )
-        .route(
-            "/api/commands/status/:command_id",
-            get(commands::get_command_status),
-        )
-        .route(
-            "/api/commands/cancel/:command_id",
-            post(commands::cancel_command),
-        )
-        .with_state(commands_state)
-        .route("/api/events", get(events::list_events))
-        .route("/api/events/stats", get(events::get_event_stats))
-        .with_state(events_state)
-        .route("/api/metrics", get(metrics::export_prometheus))
-        .route("/api/metrics/summary", get(metrics::get_metrics_summary))
-        .with_state(metrics_state)
-        .route("/api/runtime", get(apps::list_fleet))
-        .route("/api/runtime/:node/status", get(apps::node_status))
-        .route("/api/runtime/:node/apps/:app_id", delete(apps::unload_app))
-        .with_state(apps_state)
-        // Accounts and tokens: how authority is handed out and taken back.
-        .route(
-            "/api/accounts",
-            get(identity::list_accounts).post(identity::create_account),
-        )
-        .route(
-            "/api/accounts/:name",
-            get(identity::get_account).patch(identity::update_account),
-        )
-        .route("/api/accounts/:name/tokens", post(identity::create_token))
-        .route("/api/tokens", get(identity::list_tokens))
-        .route("/api/tokens/:id", delete(identity::revoke_token))
-        .with_state(identity_state)
-        // Read only, and no companion that could remove a line: the audit
-        // log has no delete anywhere in this process.
-        .route("/api/audit", get(audit::read_audit))
-        .with_state(audit_api_state)
-        // The catalog brings its own state, so it is merged as a
-        // finished router rather than threaded through the chain above.
-        .merge(catalog::router(catalog_state.clone()))
-        .merge(migrations::router(migration_state))
-        .merge(restores::router(restore_state))
-        .layer(axum_middleware::from_fn_with_state(
-            authz_state.clone(),
-            authz::authorize,
-        ));
+    let states = HumanStates {
+        app: app_state,
+        configs: configs_state,
+        commands: commands_state,
+        events: events_state,
+        metrics: metrics_state,
+        apps: apps_state,
+        identity: identity_state,
+        audit: audit_api_state,
+        catalog: catalog_state.clone(),
+        migrations: migration_state,
+        restores: restore_state,
+    };
+
+    // The gate goes outside all three mounts, so a route gets the same check
+    // whichever prefix it is spelled under; `authz::classify` folds the
+    // versioned spellings onto the one table.
+    let protected_routes = human_router(&states).layer(axum_middleware::from_fn_with_state(
+        authz_state.clone(),
+        authz::authorize,
+    ));
 
     // The endpoints nodes call carry their own authentication and must not be
     // layered with the API key middleware: `api_auth_enabled` is a dashboard
@@ -324,6 +249,247 @@ pub async fn build_api_router(
         cors_origins: cors.origins,
         tls_enabled,
     }
+}
+
+/// Every state the human routers are built over, so the same tree can be
+/// mounted more than once - flat under `/api`, nested under `/api/v1` and
+/// `/api/platform` - from one set of components.
+#[derive(Clone)]
+struct HumanStates {
+    app: AppState,
+    configs: configs::ConfigsState,
+    commands: commands::CommandsState,
+    events: events::EventsState,
+    metrics: metrics::MetricsState,
+    apps: apps::AppsState,
+    identity: identity::IdentityApiState,
+    audit: audit::AuditApiState,
+    catalog: catalog::CatalogState,
+    migrations: migrations::MigrationApiState,
+    restores: restores::RestoreApiState,
+}
+
+/// The Prometheus exposition. The one route of the human API that never
+/// moves and is mirrored nowhere: every scrape configuration names it, so it
+/// stays outside both `/api/v1` and `/api/platform` and carries no
+/// deprecation. Only the JSON summary beside it is a platform diagnostic.
+const PROMETHEUS_ROUTE: &str = "/api/metrics";
+
+/// Legacy route templates that moved to `/api/platform`, by whole segment
+/// prefix. Everything else in the legacy tree moved to `/api/v1`, except
+/// [`LEGACY_KEPT_ROUTES`]. This is [`platform_router`] as a list of prefixes,
+/// and `tests::every_legacy_route_points_at_the_surface_that_serves_it`
+/// holds the two together.
+const PLATFORM_LEGACY_PREFIXES: &[&str] = &[
+    "/api/sessions",
+    "/api/configs",
+    "/api/commands",
+    "/api/events",
+    "/api/metrics/summary",
+    "/api/runtime",
+    "/api/routes",
+];
+
+/// Legacy route templates that are not deprecated because they never move.
+const LEGACY_KEPT_ROUTES: &[&str] = &[PROMETHEUS_ROUTE];
+
+/// Where each legacy route template moved, for the `Deprecation`, `Sunset`
+/// and successor `Link` headers on the flat tree. Templates are matched
+/// exactly for the kept routes and by whole segments for the platform
+/// prefixes, so `/api/metrics` is kept while `/api/metrics/summary` moves.
+fn legacy_deprecation() -> versioning::LegacyDeprecation {
+    versioning::LegacyDeprecation::new(|template| {
+        if LEGACY_KEPT_ROUTES.contains(&template) {
+            None
+        } else if PLATFORM_LEGACY_PREFIXES
+            .iter()
+            .any(|prefix| names_or_contains(prefix, template))
+        {
+            Some(versioning::ApiSurface::Platform)
+        } else {
+            Some(versioning::ApiSurface::V1)
+        }
+    })
+}
+
+/// `prefix` is `template` itself or an ancestor of it, whole segments only:
+/// `/api/runtime` names `/api/runtime/:node/status` and not `/api/runtimes`.
+fn names_or_contains(prefix: &str, template: &str) -> bool {
+    match template.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// The product API: applications and everything inside them, accounts and
+/// tokens, the audit log, hostname grants, providers, backend restores and
+/// long operations. Served flat under `/api` and nested under `/api/v1`.
+///
+/// `prefix` is where the routes are mounted - `"/api"` for the legacy tree,
+/// `""` inside a nest, which prepends its own.
+fn product_router(prefix: &str, states: &HumanStates) -> Router {
+    let at = |path: &str| format!("{prefix}{path}");
+    Router::new()
+        // Accounts and tokens: how authority is handed out and taken back.
+        .route(
+            &at("/accounts"),
+            get(identity::list_accounts).post(identity::create_account),
+        )
+        .route(
+            &at("/accounts/:name"),
+            get(identity::get_account).patch(identity::update_account),
+        )
+        .route(&at("/accounts/:name/tokens"), post(identity::create_token))
+        .route(&at("/tokens"), get(identity::list_tokens))
+        .route(&at("/tokens/:id"), delete(identity::revoke_token))
+        .with_state(states.identity.clone())
+        // Read only, and no companion that could remove a line: the audit
+        // log has no delete anywhere in this process.
+        .route(&at("/audit"), get(audit::read_audit))
+        .with_state(states.audit.clone())
+        // The catalog, the migrations and the restores bring their own
+        // state, so they are merged as finished routers rather than threaded
+        // through the chain above.
+        .merge(catalog::router(prefix, states.catalog.clone()))
+        .merge(migrations::router(prefix, states.migrations.clone()))
+        .merge(restores::router(prefix, states.restores.clone()))
+}
+
+/// The platform diagnostics: the control channels open to this process,
+/// node configuration and commands, events, the metrics summary, the
+/// runtime fleet and the global route table. Served flat under `/api` and
+/// nested under `/api/platform`. The Prometheus exposition is not here; see
+/// [`PROMETHEUS_ROUTE`].
+///
+/// `prefix` as for [`product_router`].
+fn platform_router(prefix: &str, states: &HumanStates) -> Router {
+    let at = |path: &str| format!("{prefix}{path}");
+    Router::new()
+        // Not "/nodes": that prefix belongs to the endpoints nodes
+        // themselves call. These three are about the control channels open
+        // to this process - see `api::nodes`.
+        .route(&at("/sessions"), get(nodes::list_sessions))
+        .route(&at("/sessions/:id"), get(nodes::get_session))
+        .route(&at("/sessions/:id/heartbeats"), get(nodes::get_heartbeats))
+        .with_state(states.app.clone())
+        .route(&at("/configs"), get(configs::list_all_configs))
+        .route(&at("/configs/stats"), get(configs::get_config_stats))
+        .route(&at("/configs/:node_id"), get(configs::get_node_configs))
+        .route(&at("/configs/:node_id"), post(configs::update_node_configs))
+        .route(
+            &at("/configs/:node_id"),
+            delete(configs::delete_node_configs),
+        )
+        .route(
+            &at("/configs/:node_id/history"),
+            get(configs::get_config_history),
+        )
+        .route(
+            &at("/configs/:node_id/:config_key"),
+            get(configs::get_config_value),
+        )
+        .route(
+            &at("/configs/:node_id/:config_key"),
+            delete(configs::delete_config),
+        )
+        .route(
+            &at("/configs/:node_id/:config_key/history"),
+            get(configs::get_config_key_history),
+        )
+        .route(
+            &at("/configs/:node_id/:config_key/rollback"),
+            post(configs::rollback_config_key),
+        )
+        .route(
+            &at("/configs/push/:node_id"),
+            post(configs::push_all_configs),
+        )
+        .route(
+            &at("/configs/push/:node_id/:config_key"),
+            post(configs::push_config),
+        )
+        .with_state(states.configs.clone())
+        .route(&at("/commands"), get(commands::list_commands))
+        .route(
+            &at("/commands/execute/:node_id"),
+            post(commands::execute_command),
+        )
+        .route(
+            &at("/commands/node/:node_id"),
+            get(commands::list_node_commands),
+        )
+        .route(
+            &at("/commands/status/:command_id"),
+            get(commands::get_command_status),
+        )
+        .route(
+            &at("/commands/cancel/:command_id"),
+            post(commands::cancel_command),
+        )
+        .with_state(states.commands.clone())
+        .route(&at("/events"), get(events::list_events))
+        .route(&at("/events/stats"), get(events::get_event_stats))
+        .with_state(states.events.clone())
+        .route(&at("/metrics/summary"), get(metrics::get_metrics_summary))
+        .with_state(states.metrics.clone())
+        .route(&at("/runtime"), get(apps::list_fleet))
+        .route(&at("/runtime/:node/status"), get(apps::node_status))
+        .route(&at("/runtime/:node/apps/:app_id"), delete(apps::unload_app))
+        .with_state(states.apps.clone())
+        .merge(catalog::platform_router(prefix, states.catalog.clone()))
+}
+
+/// The three mounts of the human API, each under its own contract.
+///
+/// * The legacy flat tree under `/api`, spelled exactly as it always was,
+///   with the Prometheus exposition beside it. It is deprecated route by
+///   route (`Deprecation`, `Sunset`, successor `Link`), and it is *merged*
+///   rather than nested: `Router::nest("/api", ..)` would claim the whole
+///   subtree and collide with the node channel, which lives under `/api`
+///   too and is mounted by the caller.
+/// * `/api/v1`, the product API, nested.
+/// * `/api/platform`, the diagnostics, nested.
+///
+/// Each mount carries its own request context and error rendering, applied
+/// to the mount rather than inside the nest, so the middleware sees the
+/// path as the client spelled it. The authorization gate is the caller's,
+/// outside all three.
+fn human_router(states: &HumanStates) -> Router {
+    use versioning::ApiSurface;
+
+    let legacy = product_router(ApiSurface::Legacy.prefix(), states)
+        .merge(platform_router(ApiSurface::Legacy.prefix(), states))
+        .merge(
+            Router::new()
+                .route(PROMETHEUS_ROUTE, get(metrics::export_prometheus))
+                .with_state(states.metrics.clone()),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            legacy_deprecation(),
+            versioning::deprecate_legacy,
+        ));
+    let v1 = Router::new().nest(ApiSurface::V1.prefix(), product_router("", states));
+    let platform = Router::new().nest(ApiSurface::Platform.prefix(), platform_router("", states));
+
+    surfaced(ApiSurface::Legacy, legacy)
+        .merge(surfaced(ApiSurface::V1, v1))
+        .merge(surfaced(ApiSurface::Platform, platform))
+}
+
+/// Put one mount under its surface's contract: the request context
+/// outermost, so the ids exist before the error renderer needs them and the
+/// span covers everything underneath.
+fn surfaced(surface: versioning::ApiSurface, mount: Router) -> Router {
+    mount
+        .layer(axum_middleware::from_fn_with_state(
+            surface,
+            versioning::render_errors,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            surface,
+            versioning::attach_request_context,
+        ))
 }
 
 /// Finish the parts of startup that need the database.
@@ -885,4 +1051,408 @@ pub async fn start_api_server(
 
 async fn handle_health() -> &'static str {
     "OK"
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::{
+        command::CommandExecutor, config_manager::ConfigManager, database::Database,
+        metrics::MetricsCollector, runtime_client::RuntimeNodeManager, session::SessionManager,
+    };
+    use axum::{
+        body::{Body, to_bytes},
+        extract::ConnectInfo,
+        http::{Request, StatusCode, header},
+        response::Response,
+    };
+    use serde_json::Value;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+    use versioning::{ApiSurface, CORRELATION_ID_HEADER, REQUEST_ID_HEADER};
+
+    const DEPRECATION: &str = "deprecation";
+    const SUNSET: &str = "sunset";
+
+    /// The whole router, built the way the binary builds it - every mount,
+    /// the gate, the node channel - over an in-memory database and a
+    /// temporary bundle directory. `api_auth_enabled` is off, so a direct
+    /// local caller is admitted as anonymous and every route can be reached.
+    pub(crate) async fn full_router() -> (Router, tempfile::TempDir) {
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let config = ControlConfig {
+            bundle_dir: bundle_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let sessions = Arc::new(SessionManager::new());
+        let config_manager = Arc::new(ConfigManager::new(
+            Arc::clone(&database),
+            Arc::clone(&sessions),
+        ));
+        let command_executor = Arc::new(CommandExecutor::new(
+            Arc::clone(&sessions),
+            Arc::clone(&database),
+        ));
+        let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+        let api = build_api_router(
+            sessions,
+            database,
+            config_manager,
+            command_executor,
+            metrics_collector,
+            Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
+            Arc::new(config),
+        )
+        .await;
+        // As the binary mounts it: the route fallback goes on last, over
+        // the whole tree. Without it an unmatched path falls to the node
+        // channel's default fallback - `Router::layer` wraps a router's
+        // default fallback too, and `merge` keeps the merged-in one.
+        let router = api
+            .router
+            .fallback(axum::routing::get(static_files::serve_fallback));
+        (router, bundle_dir)
+    }
+
+    /// A call from the machine the control plane runs on, which is what the
+    /// gate admits without a credential while nothing is enforced.
+    async fn call(router: &Router, method: &str, uri: &str) -> Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(&bytes)))
+    }
+
+    fn header_str<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+        response.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// Building the router is the test: axum panics at construction on a
+    /// nest or merge that claims a path another mount already has, so a
+    /// collision between the three mounts and the node channel fails here
+    /// rather than at the first request in production. The requests then
+    /// pin which routes each mount serves and which it does not.
+    #[tokio::test]
+    async fn the_three_mounts_and_the_node_channel_build_together_and_serve_their_own_routes() {
+        let (router, _dir) = full_router().await;
+
+        for (uri, expected) in [
+            // Product routes: legacy and v1, not platform.
+            ("/api/apps", StatusCode::OK),
+            ("/api/v1/apps", StatusCode::OK),
+            ("/api/platform/apps", StatusCode::NOT_FOUND),
+            ("/api/v1/accounts", StatusCode::OK),
+            ("/api/platform/accounts", StatusCode::NOT_FOUND),
+            // Platform routes: legacy and platform, not v1.
+            ("/api/runtime", StatusCode::OK),
+            ("/api/platform/runtime", StatusCode::OK),
+            ("/api/v1/runtime", StatusCode::NOT_FOUND),
+            ("/api/routes", StatusCode::OK),
+            ("/api/platform/routes", StatusCode::OK),
+            ("/api/v1/routes", StatusCode::NOT_FOUND),
+            ("/api/platform/sessions", StatusCode::OK),
+            ("/api/platform/events/stats", StatusCode::OK),
+            ("/api/platform/configs/stats", StatusCode::OK),
+            ("/api/platform/commands", StatusCode::OK),
+            // The metrics summary is a platform diagnostic; the Prometheus
+            // exposition stays where scrapers find it and nowhere else.
+            ("/api/metrics/summary", StatusCode::OK),
+            ("/api/platform/metrics/summary", StatusCode::OK),
+            ("/api/v1/metrics/summary", StatusCode::NOT_FOUND),
+            ("/api/metrics", StatusCode::OK),
+            ("/api/v1/metrics", StatusCode::NOT_FOUND),
+            ("/api/platform/metrics", StatusCode::NOT_FOUND),
+            // Neither prefix is a route of its own.
+            ("/api/v1", StatusCode::NOT_FOUND),
+            ("/api/platform", StatusCode::NOT_FOUND),
+        ] {
+            let response = call(&router, "GET", uri).await;
+            assert_eq!(response.status(), expected, "GET {uri}");
+        }
+    }
+
+    /// One error per surface, from the same handlers: the legacy body is the
+    /// flat string it always was, the two versioned surfaces carry the
+    /// envelope, and all three echo the request id the client sent.
+    #[tokio::test]
+    async fn each_surface_renders_an_error_in_its_own_shape_and_echoes_the_request_id() {
+        let (router, _dir) = full_router().await;
+        const SENT: &str = "018f2518-7e38-7f80-8000-0000000000aa";
+
+        async fn call_with_id(router: &Router, uri: &str) -> Response {
+            let mut request = Request::builder()
+                .uri(uri)
+                .header(REQUEST_ID_HEADER, SENT)
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+            ));
+            router.clone().oneshot(request).await.unwrap()
+        }
+
+        // Legacy: `{"error": "<message>"}` and nothing else in the body.
+        for uri in ["/api/apps/no-such-app", "/api/sessions/no-such-node"] {
+            let response = call_with_id(&router, uri).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                header_str(&response, REQUEST_ID_HEADER),
+                Some(SENT),
+                "{uri}"
+            );
+            assert_eq!(
+                header_str(&response, CORRELATION_ID_HEADER),
+                Some(SENT),
+                "{uri}"
+            );
+            let body = body_json(response).await;
+            assert!(body["error"].is_string(), "{uri}: {body}");
+            assert_eq!(body.as_object().unwrap().len(), 1, "{uri}: {body}");
+        }
+
+        // v1 and platform: the structured envelope, with the id inside it.
+        for (uri, surface) in [
+            ("/api/v1/apps/no-such-app", ApiSurface::V1),
+            ("/api/platform/sessions/no-such-node", ApiSurface::Platform),
+        ] {
+            let response = call_with_id(&router, uri).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                header_str(&response, REQUEST_ID_HEADER),
+                Some(SENT),
+                "{uri}"
+            );
+            assert_eq!(
+                header_str(&response, header::CONTENT_TYPE.as_str()),
+                Some("application/json"),
+                "{uri}"
+            );
+            let body = body_json(response).await;
+            let error = body["error"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{surface} {uri}: {body}"));
+            assert_eq!(error["code"], "not-found", "{uri}");
+            assert_eq!(error["requestId"], SENT, "{uri}");
+            assert_eq!(error["retryable"], false, "{uri}");
+            assert!(error["message"].is_string(), "{uri}");
+        }
+
+        // A success on every surface echoes the id too.
+        for uri in ["/api/apps", "/api/v1/apps", "/api/platform/runtime"] {
+            let response = call_with_id(&router, uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                header_str(&response, REQUEST_ID_HEADER),
+                Some(SENT),
+                "{uri}"
+            );
+        }
+    }
+
+    /// Every legacy answer says it is deprecated and where the same route
+    /// now lives; a versioned answer, the Prometheus exposition and the node
+    /// channel say nothing of the kind.
+    #[tokio::test]
+    async fn every_legacy_route_points_at_the_surface_that_serves_it() {
+        let (router, _dir) = full_router().await;
+
+        // (method, legacy path, successor). Product routes move to /api/v1,
+        // the platform diagnostics to /api/platform - one entry per legacy
+        // prefix in `PLATFORM_LEGACY_PREFIXES` and one for each product
+        // family, so a prefix that fell out of the table shows up here.
+        let moved = [
+            ("GET", "/api/apps", "/api/v1/apps"),
+            ("GET", "/api/apps/no-such-app", "/api/v1/apps/no-such-app"),
+            ("GET", "/api/retired-apps", "/api/v1/retired-apps"),
+            ("GET", "/api/accounts?limit=1", "/api/v1/accounts?limit=1"),
+            ("GET", "/api/tokens", "/api/v1/tokens"),
+            ("GET", "/api/audit", "/api/v1/audit"),
+            ("GET", "/api/domains", "/api/v1/domains"),
+            ("GET", "/api/providers/targets", "/api/v1/providers/targets"),
+            ("GET", "/api/installation", "/api/v1/installation"),
+            (
+                "GET",
+                "/api/deployment-plans/p1",
+                "/api/v1/deployment-plans/p1",
+            ),
+            (
+                "GET",
+                "/api/operations/not-an-id",
+                "/api/v1/operations/not-an-id",
+            ),
+            ("GET", "/api/sessions", "/api/platform/sessions"),
+            ("GET", "/api/sessions/n1", "/api/platform/sessions/n1"),
+            (
+                "GET",
+                "/api/sessions/n1/heartbeats",
+                "/api/platform/sessions/n1/heartbeats",
+            ),
+            ("GET", "/api/configs", "/api/platform/configs"),
+            ("GET", "/api/configs/stats", "/api/platform/configs/stats"),
+            ("GET", "/api/configs/n1", "/api/platform/configs/n1"),
+            (
+                "GET",
+                "/api/configs/n1/history",
+                "/api/platform/configs/n1/history",
+            ),
+            ("GET", "/api/configs/n1/key", "/api/platform/configs/n1/key"),
+            ("GET", "/api/commands", "/api/platform/commands"),
+            (
+                "GET",
+                "/api/commands/node/n1",
+                "/api/platform/commands/node/n1",
+            ),
+            (
+                "GET",
+                "/api/commands/status/c1",
+                "/api/platform/commands/status/c1",
+            ),
+            ("GET", "/api/events", "/api/platform/events"),
+            ("GET", "/api/events/stats", "/api/platform/events/stats"),
+            (
+                "GET",
+                "/api/metrics/summary",
+                "/api/platform/metrics/summary",
+            ),
+            ("GET", "/api/runtime", "/api/platform/runtime"),
+            (
+                "GET",
+                "/api/runtime/n1/status",
+                "/api/platform/runtime/n1/status",
+            ),
+            (
+                "DELETE",
+                "/api/runtime/n1/apps/demo?environment=preview",
+                "/api/platform/runtime/n1/apps/demo?environment=preview",
+            ),
+            ("GET", "/api/routes", "/api/platform/routes"),
+        ];
+        for (method, legacy, successor) in moved {
+            let response = call(&router, method, legacy).await;
+            assert_eq!(
+                header_str(&response, DEPRECATION),
+                Some(versioning::deprecation_header_value().as_str()),
+                "{method} {legacy}"
+            );
+            assert_eq!(
+                header_str(&response, SUNSET),
+                Some(versioning::sunset_header_value().as_str()),
+                "{method} {legacy}"
+            );
+            assert_eq!(
+                header_str(&response, header::LINK.as_str()),
+                Some(format!("<{successor}>; rel=\"successor-version\"").as_str()),
+                "{method} {legacy}"
+            );
+            // The successor is the same route: whatever the legacy spelling
+            // answered, the versioned one answers.
+            let moved = call(&router, method, successor).await;
+            assert_eq!(moved.status(), response.status(), "{method} {successor}");
+            assert!(
+                header_str(&moved, DEPRECATION).is_none(),
+                "{method} {successor} is not deprecated"
+            );
+            assert!(header_str(&moved, SUNSET).is_none(), "{method} {successor}");
+            assert!(
+                header_str(&moved, header::LINK.as_str()).is_none(),
+                "{method} {successor}"
+            );
+        }
+
+        // The Prometheus exposition never moves.
+        let response = call(&router, "GET", PROMETHEUS_ROUTE).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(header_str(&response, DEPRECATION).is_none());
+        assert!(header_str(&response, SUNSET).is_none());
+        assert!(header_str(&response, header::LINK.as_str()).is_none());
+        assert!(
+            header_str(&response, REQUEST_ID_HEADER).is_some(),
+            "kept, but still on the legacy mount and so still carries the request context"
+        );
+
+        // The node channel is outside every surface: no deprecation, no
+        // request context, and its hand-written body untouched.
+        for uri in [
+            "/api/nodes/n1/assignments",
+            "/api/routing-table",
+            "/api/apps/demo/versions/v1/bundle",
+        ] {
+            let response = call(&router, "GET", uri).await;
+            assert!(
+                matches!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+                ),
+                "{uri}: {}",
+                response.status()
+            );
+            assert!(header_str(&response, DEPRECATION).is_none(), "{uri}");
+            assert!(header_str(&response, SUNSET).is_none(), "{uri}");
+            assert!(
+                header_str(&response, header::LINK.as_str()).is_none(),
+                "{uri}"
+            );
+            assert!(header_str(&response, REQUEST_ID_HEADER).is_none(), "{uri}");
+            let body = body_json(response).await;
+            assert!(body["error"].is_string(), "{uri}: {body}");
+        }
+    }
+
+    /// The table behind the headers, checked on its own so a template that
+    /// moves to the wrong surface is caught without a request.
+    #[test]
+    fn the_deprecation_policy_sends_platform_templates_to_platform_and_the_rest_to_v1() {
+        let policy = legacy_deprecation();
+        assert_eq!(policy.successor_of(PROMETHEUS_ROUTE), None);
+        assert_eq!(
+            policy.successor_of("/api/metrics/summary"),
+            Some(ApiSurface::Platform)
+        );
+        for template in [
+            "/api/sessions/:id/heartbeats",
+            "/api/configs/push/:node_id/:config_key",
+            "/api/commands/cancel/:command_id",
+            "/api/events/stats",
+            "/api/runtime/:node/apps/:app_id",
+            "/api/routes",
+        ] {
+            assert_eq!(
+                policy.successor_of(template),
+                Some(ApiSurface::Platform),
+                "{template}"
+            );
+        }
+        for template in [
+            "/api/apps/:app_id/environments/:env/routes/:route_id",
+            "/api/accounts/:name/tokens",
+            "/api/audit",
+            "/api/domains/:pattern",
+            "/api/providers/targets/:target_id",
+            "/api/operations/:operation_id/cancel",
+            "/api/backend-restores/:restore_id",
+            "/api/installation",
+            // Whole segments only: a product route that merely starts with
+            // a platform word is a product route.
+            "/api/runtimes",
+            "/api/eventsourcing",
+        ] {
+            assert_eq!(
+                policy.successor_of(template),
+                Some(ApiSurface::V1),
+                "{template}"
+            );
+        }
+    }
 }

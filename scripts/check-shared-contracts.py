@@ -42,6 +42,7 @@ EXPECTED_DOCUMENTS = {
     "backend-restore-set",
     "backend-restore-report",
     "control-list-page",
+    "control-error",
 }
 EXPECTED_PROVIDER_OPERATIONS = [
     "preflight",
@@ -67,6 +68,18 @@ EXPECTED_MIGRATION_PHASES = [
     "revoke-legacy-capabilities",
     "tombstone",
 ]
+CONTROL_ERROR_SCHEMA = "contracts/v1/control-error.schema.json"
+# Failure classes whose contract is "the identical request may succeed later".
+# Every other enumerated code is a caller-visible defect and must never invite
+# a blind retry. Kept in step with `codes::is_retryable` in
+# crates/deis-control/src/api/error.rs and the `ErrorCode` description in
+# contracts/openapi/v1.json.
+RETRYABLE_CONTROL_ERROR_CODES = {
+    "service-unavailable",
+    "backend-unavailable",
+    "database-unavailable",
+    "idempotency-request-in-progress",
+}
 UUID7_PATTERN = (
     "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
     "[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -236,6 +249,36 @@ def validate_operation_transitions(registry: dict, operation_schema: dict) -> No
                     seen.add(target)
                     queue.append(target)
         require(can_finish, f"operation state cannot reach a terminal state: {state}")
+
+
+def validate_control_error_invariants(registry: dict) -> None:
+    """The retryable flag is a property of the error code, not of a response."""
+    schema = load_json(CONTROL_ERROR_SCHEMA)
+    codes = set(schema["properties"]["error"]["properties"]["code"]["enum"])
+    require(
+        RETRYABLE_CONTROL_ERROR_CODES <= codes,
+        "Control error envelope dropped a retryable failure class",
+    )
+    covered: set[str] = set()
+    for case in load_json(registry["fixtures"])["cases"]:
+        if case.get("schema") != CONTROL_ERROR_SCHEMA or not case.get("expectedValid"):
+            continue
+        error = fixture_document(case)["error"]
+        code = error["code"]
+        expected = code in RETRYABLE_CONTROL_ERROR_CODES
+        require(
+            error["retryable"] is expected,
+            f"{case['id']}: {code} must report retryable={expected}",
+        )
+        require(
+            expected or "retryAfterSeconds" not in error,
+            f"{case['id']}: {code} is not retryable and must not advise a retry delay",
+        )
+        covered.add(code)
+    require(
+        bool(covered & RETRYABLE_CONTROL_ERROR_CODES) and bool(covered - RETRYABLE_CONTROL_ERROR_CODES),
+        "Control error fixtures must cover a retryable and a non-retryable failure class",
+    )
 
 
 def validate_cross_document_invariants(registry: dict) -> None:
@@ -659,6 +702,7 @@ def main() -> int:
         registry = load_json(REGISTRY_PATH)
         schemas = validate_schemas_and_fixtures(registry)
         validate_operation_transitions(registry, schemas["contracts/v1/operation.schema.json"])
+        validate_control_error_invariants(registry)
         validate_cross_document_invariants(registry)
     except (KeyError, IndexError, TypeError, jsonschema.SchemaError, ContractError) as error:
         print(f"shared contract validation failed: {error}", file=sys.stderr)

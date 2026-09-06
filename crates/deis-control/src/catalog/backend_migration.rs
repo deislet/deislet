@@ -27,6 +27,7 @@ use thiserror::Error;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Endpoint;
 use tonic::{Request, Status};
+use utoipa::ToSchema;
 
 use crate::config::ControlConfig;
 
@@ -40,7 +41,7 @@ const EVIDENCE_SCHEMA: &str =
     "https://github.com/deislet/deislet/contracts/v1/backend-migration-evidence.schema.json";
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendAttemptState {
     Acquiring,
@@ -76,17 +77,19 @@ impl BackendAttemptState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidenceDigest {
     pub algorithm: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendFenceEvidence {
+    #[schema(value_type = String, format = Uuid)]
     pub backend_incarnation_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub migration_id: CanonicalId,
     pub expected_application_revision: u64,
     pub epoch: u64,
@@ -94,7 +97,7 @@ pub struct BackendFenceEvidence {
     pub receipt_digest: EvidenceDigest,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendComponentEvidence {
     pub component: String,
@@ -107,7 +110,7 @@ pub struct BackendComponentEvidence {
 
 /// The exact JSON shape governed by
 /// `contracts/v1/backend-migration-evidence.schema.json`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendMigrationEvidence {
     #[serde(rename = "$schema")]
@@ -122,14 +125,16 @@ pub struct BackendMigrationEvidence {
 }
 
 /// One backend/tenant row in Control's recovery journal.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendMigrationAttempt {
+    #[schema(value_type = String, format = Uuid)]
     pub migration_id: CanonicalId,
     pub backend: String,
     pub tenant: String,
     pub expected_application_revision: u64,
     pub target_endpoint_sha256: String,
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub backend_incarnation_id: Option<CanonicalId>,
     pub state: BackendAttemptState,
     pub attempt_count: u64,

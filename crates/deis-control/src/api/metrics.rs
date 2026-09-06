@@ -1,8 +1,11 @@
 use axum::{Json, extract::State, response::IntoResponse};
-use serde_json::json;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
-use super::error::ApiError;
+use super::error::{ApiError, ApiResult};
+use super::openapi;
 use crate::metrics::{MetricsCollector, page_cursor_gauges};
 
 #[derive(Clone)]
@@ -10,40 +13,103 @@ pub struct MetricsState {
     pub metrics_collector: Arc<MetricsCollector>,
 }
 
-/// Get metrics summary
+/// The control channels, by state.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NodeCounts {
+    pub total: usize,
+    pub active: usize,
+    pub connected: usize,
+    pub registered: usize,
+    pub disconnected: usize,
+    /// Node role name to count.
+    pub by_type: HashMap<String, usize>,
+}
+
+/// Process-wide counters.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SystemCounts {
+    pub uptime_seconds: u64,
+    pub total_events: usize,
+    pub total_commands: usize,
+    pub total_heartbeats: usize,
+}
+
+/// The page-cursor table.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CursorCounts {
+    pub live: usize,
+    pub expired_pending_removal: usize,
+    pub oldest_live_age_seconds: Option<i64>,
+}
+
+/// Pagination health.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PaginationCounts {
+    /// `null` when the cursor table could not be read, so a dashboard can
+    /// tell "unknown" from "none".
+    #[schema(required)]
+    pub cursors: Option<CursorCounts>,
+}
+
+/// What the summary carries.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MetricsSummaryView {
+    pub nodes: NodeCounts,
+    pub system: SystemCounts,
+    pub pagination: PaginationCounts,
+}
+
+/// The JSON twin of the Prometheus exposition.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MetricsSummaryResponse {
+    pub success: bool,
+    pub metrics: MetricsSummaryView,
+}
+
+/// GET /api/platform/metrics/summary - the same numbers the Prometheus
+/// exposition at `GET /api/metrics` reports, as JSON.
+#[utoipa::path(
+    get,
+    path = "/api/platform/metrics/summary",
+    operation_id = "getMetricsSummary",
+    tag = "platform",
+    responses(
+        (status = 200, description = "The current counters.", body = MetricsSummaryResponse),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_metrics_summary(
     State(state): State<MetricsState>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> ApiResult<Json<MetricsSummaryResponse>> {
     let summary = state.metrics_collector.collect_summary().await;
 
-    Ok(Json(json!({
-        "success": true,
-        "metrics": {
-            "nodes": {
-                "total": summary.nodes.total,
-                "active": summary.nodes.active,
-                "connected": summary.nodes.connected,
-                "registered": summary.nodes.registered,
-                "disconnected": summary.nodes.disconnected,
-                "by_type": summary.nodes.by_type,
+    Ok(Json(MetricsSummaryResponse {
+        success: true,
+        metrics: MetricsSummaryView {
+            nodes: NodeCounts {
+                total: summary.nodes.total,
+                active: summary.nodes.active,
+                connected: summary.nodes.connected,
+                registered: summary.nodes.registered,
+                disconnected: summary.nodes.disconnected,
+                by_type: summary.nodes.by_type,
             },
-            "system": {
-                "uptime_seconds": summary.system.uptime_seconds,
-                "total_events": summary.system.total_events,
-                "total_commands": summary.system.total_commands,
-                "total_heartbeats": summary.system.total_heartbeats,
+            system: SystemCounts {
+                uptime_seconds: summary.system.uptime_seconds,
+                total_events: summary.system.total_events,
+                total_commands: summary.system.total_commands,
+                total_heartbeats: summary.system.total_heartbeats,
             },
-            "pagination": {
-                // `null` when the cursor table could not be read, so a
-                // dashboard can tell "unknown" from "none".
-                "cursors": summary.pagination.cursors.map(|cursors| json!({
-                    "live": cursors.live,
-                    "expired_pending_removal": cursors.expired_pending_removal,
-                    "oldest_live_age_seconds": cursors.oldest_live_age_seconds,
-                })),
-            }
-        }
-    })))
+            pagination: PaginationCounts {
+                cursors: summary.pagination.cursors.map(|cursors| CursorCounts {
+                    live: cursors.live,
+                    expired_pending_removal: cursors.expired_pending_removal,
+                    oldest_live_age_seconds: cursors.oldest_live_age_seconds,
+                }),
+            },
+        },
+    }))
 }
 
 /// Export in Prometheus format

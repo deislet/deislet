@@ -16,8 +16,14 @@ use axum::{
 use deis_wire::{CanonicalId, OperationKind, ProductOperation};
 use serde::Serialize;
 use tracing::{error, info, warn};
+use utoipa::ToSchema;
 
+use super::openapi;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::paths::ApiPaths;
+use crate::api::versioning::{
+    CORRELATION_ID_HEADER as CORRELATION_ID, REQUEST_ID_HEADER as REQUEST_ID,
+};
 use crate::catalog::{
     BackendMigrationAttempt, CatalogStore, IdentityMigrationCoordinator, IdentityMigrationRun,
     IdentityMigrationState, OperationRequestContext, summarize_identity_migration,
@@ -26,8 +32,6 @@ use crate::config::ControlConfig;
 use crate::identity::{Principal, PrincipalKind};
 
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
-const REQUEST_ID: &str = "x-request-id";
-const CORRELATION_ID: &str = "x-correlation-id";
 const IF_MATCH: &str = "if-match";
 
 #[derive(Clone)]
@@ -214,15 +218,20 @@ impl MigrationApiState {
     }
 }
 
-pub fn router(state: MigrationApiState) -> Router {
+/// `prefix` is where the routes are mounted: `"/api"` for the legacy flat
+/// tree, `""` inside a `/api/v1` nest.
+pub fn router(prefix: &str, state: MigrationApiState) -> Router {
     Router::new()
         .route(
-            "/api/apps/:app_id/identity-migration",
+            &format!("{prefix}/apps/:app_id/identity-migration"),
             get(get_migration).post(start_migration),
         )
-        .route("/api/operations/:operation_id", get(get_operation))
         .route(
-            "/api/operations/:operation_id/cancel",
+            &format!("{prefix}/operations/:operation_id"),
+            get(get_operation),
+        )
+        .route(
+            &format!("{prefix}/operations/:operation_id/cancel"),
             axum::routing::post(cancel_operation),
         )
         .with_state(state)
@@ -230,14 +239,17 @@ pub fn router(state: MigrationApiState) -> Router {
 
 /// A public status deliberately omits the fence token and every management
 /// credential. The operation and migration IDs are stable polling handles.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationStatusResponse {
     pub schema_version: u32,
+    #[schema(value_type = String, format = Uuid)]
     pub migration_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub operation_id: CanonicalId,
     pub state: IdentityMigrationState,
     pub legacy_application_name: String,
+    #[schema(value_type = String, format = Uuid)]
     pub canonical_application_id: CanonicalId,
     pub expected_application_revision: i64,
     pub record_revision: i64,
@@ -290,6 +302,19 @@ async fn status(
     Ok(summarize_identity_migration(plan, attempts).into())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{application_name}/identity-migration",
+    operation_id = "getIdentityMigration",
+    tag = "product",
+    params(("application_name" = String, Path, description = "The application's id.")),
+    responses(
+        (status = 200, description = "The migration's status.", body = MigrationStatusResponse),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_migration(
     State(state): State<MigrationApiState>,
     Path(application_name): Path<String>,
@@ -297,10 +322,29 @@ pub async fn get_migration(
     Ok(Json(status(&state, &application_name).await?))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{application_name}/identity-migration",
+    operation_id = "startIdentityMigration",
+    tag = "product",
+    params(("application_name" = String, Path, description = "The application's id."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation."), ("If-Match" = String, Header, description = "The application revision the caller expects.")),
+    responses(
+        (status = 202, description = "The migration was started or is already running; poll `Location`.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn start_migration(
     State(state): State<MigrationApiState>,
     Path(application_name): Path<String>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
     let coordinator = state.ready()?;
@@ -332,8 +376,7 @@ pub async fn start_migration(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         header::LOCATION,
-        HeaderValue::from_str(&format!("/api/operations/{operation_id}"))
-            .map_err(|error| ApiError::InternalError(error.to_string()))?,
+        paths.location(&format!("/operations/{operation_id}"))?,
     );
     response_headers.insert(
         REQUEST_ID,
@@ -354,6 +397,20 @@ pub async fn start_migration(
     Ok((StatusCode::ACCEPTED, response_headers, Json(operation)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/operations/{operation_id}",
+    operation_id = "getOperation",
+    tag = "product",
+    params(("operation_id" = String, Path, description = "The operation's canonical UUIDv7.")),
+    responses(
+        (status = 200, description = "The operation.", body = openapi::ProductOperationDocument, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_operation(
     State(state): State<MigrationApiState>,
     Path(operation_id): Path<String>,
@@ -386,10 +443,29 @@ pub async fn get_operation(
     Ok((headers, Json(operation)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/operations/{operation_id}/cancel",
+    operation_id = "cancelOperation",
+    tag = "product",
+    params(("operation_id" = String, Path, description = "The operation's canonical UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation."), ("If-Match" = String, Header, description = "The operation revision the caller expects.")),
+    responses(
+        (status = 202, description = "Cancellation was requested; poll `Location`.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn cancel_operation(
     State(state): State<MigrationApiState>,
     Path(operation_id): Path<String>,
     headers: HeaderMap,
+    paths: ApiPaths,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
     let operation_id = operation_id.parse().map_err(|error| {
         ApiError::BadRequest(format!("operation ID must be a canonical UUIDv7: {error}"))
@@ -433,8 +509,7 @@ pub async fn cancel_operation(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         header::LOCATION,
-        HeaderValue::from_str(&format!("/api/operations/{operation_id}"))
-            .map_err(|error| ApiError::InternalError(error.to_string()))?,
+        paths.location(&format!("/operations/{operation_id}"))?,
     );
     response_headers.insert(
         header::ETAG,
@@ -582,7 +657,8 @@ mod tests {
             running: Arc::new(Mutex::new(BTreeSet::new())),
             cancelling: Arc::new(Mutex::new(BTreeSet::new())),
         };
-        let api = router(state);
+        // Legacy prefix on purpose: the flat tree's regression coverage.
+        let api = router("/api", state);
 
         let response = api
             .clone()
@@ -645,7 +721,7 @@ mod tests {
             telemetry_migration_admin_token: Some("t".repeat(32)),
             ..Default::default()
         };
-        let api = router(MigrationApiState::new(store, &config));
+        let api = router("/api", MigrationApiState::new(store, &config));
         let request_id = CanonicalId::new_v7();
         let correlation_id = CanonicalId::new_v7();
         let idempotency_key = "migration-shop-2026-09-04";
@@ -760,7 +836,7 @@ mod tests {
             telemetry_migration_admin_token: Some("t".repeat(32)),
             ..Default::default()
         };
-        let api = router(MigrationApiState::new(Arc::clone(&store), &config));
+        let api = router("/api", MigrationApiState::new(Arc::clone(&store), &config));
         let path = format!("/api/operations/{}/cancel", plan.operation_id);
 
         let missing_precondition = api

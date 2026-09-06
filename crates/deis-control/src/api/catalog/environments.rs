@@ -8,19 +8,37 @@ use axum::{
     http::StatusCode,
 };
 use serde::Deserialize;
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use crate::api::error::ApiResult;
+use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, id_scope, list_page};
 use crate::catalog::Environment;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateEnvironmentRequest {
     /// `production` or any preview name.
     pub name: String,
 }
 
 /// POST /api/apps/:app_id/environments
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/environments",
+    operation_id = "createEnvironment",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id.")),
+    request_body = CreateEnvironmentRequest,
+    responses(
+        (status = 201, description = "The environment as created.", body = Environment),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn create_environment(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -34,6 +52,20 @@ pub async fn create_environment(
 }
 
 /// GET /api/apps/:app_id/environments
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/environments",
+    operation_id = "listEnvironments",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ListQuery),
+    responses(
+        (status = 200, description = "One page of environments.", body = ControlListPage<Environment>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_environments(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -70,6 +102,19 @@ pub async fn list_environments(
 }
 
 /// GET /api/apps/:app_id/environments/:env
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}",
+    operation_id = "getEnvironment",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name.")),
+    responses(
+        (status = 200, description = "The environment.", body = Environment),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_environment(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,

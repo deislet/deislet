@@ -30,6 +30,7 @@ use crate::catalog::model::now_secs;
 use crate::catalog::pagination::{finish_page, sqlite_fetch_limit};
 use crate::catalog::{CatalogError, CatalogPage, PageCursorStore, PagePosition};
 use crate::database::{Database, DatabaseError};
+use utoipa::ToSchema;
 
 /// Longest an account or token name may be. Both are printed in audit lines
 /// and in CLI tables, so they are short on purpose.
@@ -97,7 +98,7 @@ impl From<CatalogError> for IdentityError {
 pub type IdentityResult<T> = Result<T, IdentityError>;
 
 /// One account: the thing an audit line blames.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
 pub struct Account {
     pub id: String,
     pub name: String,
@@ -110,7 +111,7 @@ pub struct Account {
 }
 
 /// Where a credential came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenOrigin {
     /// Minted by this control plane, shown once, stored as a hash.
@@ -139,7 +140,7 @@ impl TokenOrigin {
 
 /// One credential, as a listing shows it. There is deliberately no field
 /// that could hold the secret: this type is what `GET /api/tokens` serialises.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
 pub struct ApiToken {
     pub id: String,
     pub account_id: String,

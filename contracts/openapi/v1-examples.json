@@ -1,0 +1,994 @@
+{
+  "$comment": "Captured from real handler answers by deis-control's openapi tests; identifiers, instants, digests and cursors are replaced by fixed placeholders. Regenerate with UPDATE_OPENAPI=1.",
+  "examples": {
+    "Account": {
+      "body": {
+        "created_at": 1767225600,
+        "disabled_at": null,
+        "id": "018f2518-7e38-7f80-8000-000000000001",
+        "name": "alice",
+        "role": "viewer"
+      },
+      "operationId": "createAccount",
+      "status": 200
+    },
+    "ApiToken": {
+      "body": {
+        "account": "alice",
+        "account_id": "018f2518-7e38-7f80-8000-000000000001",
+        "created_at": 1767225600,
+        "id": "0000000000000000",
+        "last_used_at": null,
+        "name": "laptop",
+        "origin": "minted",
+        "revoked_at": 1767225600,
+        "scopes": "read:*/*",
+        "unscoped": false
+      },
+      "operationId": "revokeToken",
+      "status": 200
+    },
+    "App": {
+      "body": {
+        "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+        "created_at": 1767225600,
+        "id": "demo",
+        "revision": 1
+      },
+      "operationId": "createApp",
+      "status": 201
+    },
+    "ConfigKeyOutcome": {
+      "body": {
+        "config_key": "port",
+        "message": "Config deleted successfully",
+        "node_id": "node-a",
+        "success": true
+      },
+      "operationId": "deleteNodeConfigValue",
+      "status": 200
+    },
+    "ConfigStatsResponse": {
+      "body": {
+        "node_count": 1,
+        "success": true,
+        "total_configs": 1
+      },
+      "operationId": "getNodeConfigStats",
+      "status": 200
+    },
+    "ConfigValue": {
+      "body": {
+        "config_key": "port",
+        "node_id": "node-a",
+        "success": true,
+        "value": 8080
+      },
+      "operationId": "getNodeConfigValue",
+      "status": 200
+    },
+    "ConfigsListing": {
+      "body": {
+        "count": 1,
+        "data": {
+          "node-a": {
+            "port": 8080
+          }
+        },
+        "success": true
+      },
+      "operationId": "listNodeConfigs",
+      "status": 200
+    },
+    "ConfigsUpdated": {
+      "body": {
+        "message": "Configs updated successfully",
+        "node_id": "node-a",
+        "success": true,
+        "updated_keys": [
+          "port"
+        ],
+        "version_timestamp": "2026-01-01T00:00:00Z"
+      },
+      "operationId": "updateNodeConfigs",
+      "status": 200
+    },
+    "ControlListPage_Account": {
+      "body": {
+        "items": [
+          {
+            "created_at": 1767225600,
+            "disabled_at": null,
+            "id": "018f2518-7e38-7f80-8000-000000000001",
+            "name": "alice",
+            "role": "viewer"
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listAccounts",
+      "status": 200
+    },
+    "ControlListPage_ApiToken": {
+      "body": {
+        "items": [
+          {
+            "account": "alice",
+            "account_id": "018f2518-7e38-7f80-8000-000000000001",
+            "created_at": 1767225600,
+            "id": "0000000000000000",
+            "last_used_at": null,
+            "name": "laptop",
+            "origin": "minted",
+            "revoked_at": null,
+            "scopes": "read:*/*",
+            "unscoped": false
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listTokens",
+      "status": 200
+    },
+    "ControlListPage_App": {
+      "body": {
+        "items": [
+          {
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+            "created_at": 1767225600,
+            "id": "demo",
+            "revision": 1
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listApps",
+      "status": 200
+    },
+    "ControlListPage_AuditEntry": {
+      "body": {
+        "items": [
+          {
+            "action": "token.revoke",
+            "actor_account": null,
+            "actor_credential": null,
+            "actor_kind": "anonymous",
+            "app_id": null,
+            "at": 1767225600,
+            "detail": null,
+            "environment": null,
+            "id": 3,
+            "method": "DELETE",
+            "outcome": "accepted",
+            "path": "/api/v1/tokens/0000000000000000",
+            "peer": "127.0.0.1:40000",
+            "requestId": "018f2518-7e38-7f80-8000-000000000001",
+            "status": 200,
+            "target": "0000000000000000"
+          },
+          {
+            "action": "token.mint",
+            "actor_account": null,
+            "actor_credential": null,
+            "actor_kind": "anonymous",
+            "app_id": null,
+            "at": 1767225600,
+            "detail": null,
+            "environment": null,
+            "id": 2,
+            "method": "POST",
+            "outcome": "accepted",
+            "path": "/api/v1/accounts/alice/tokens",
+            "peer": "127.0.0.1:40000",
+            "requestId": "018f2518-7e38-7f80-8000-000000000001",
+            "status": 200,
+            "target": "alice"
+          },
+          {
+            "action": "account.create",
+            "actor_account": null,
+            "actor_credential": null,
+            "actor_kind": "anonymous",
+            "app_id": null,
+            "at": 1767225600,
+            "detail": null,
+            "environment": null,
+            "id": 1,
+            "method": "POST",
+            "outcome": "accepted",
+            "path": "/api/v1/accounts",
+            "peer": "127.0.0.1:40000",
+            "requestId": "018f2518-7e38-7f80-8000-000000000001",
+            "status": 200,
+            "target": null
+          }
+        ],
+        "page": {
+          "count": 3,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 3
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listAuditLog",
+      "status": 200
+    },
+    "ControlListPage_CommandSummary": {
+      "body": {
+        "items": [],
+        "page": {
+          "count": 0,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 0
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listNodeCommands",
+      "status": 200
+    },
+    "ControlListPage_ConfigHistoryItem": {
+      "body": {
+        "items": [
+          {
+            "config_key": "port",
+            "config_value": 8080,
+            "created_at": "2026-01-01T00:00:00Z",
+            "id": 1,
+            "operation": "create",
+            "version_timestamp": "2026-01-01T00:00:00Z"
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listNodeConfigHistory",
+      "status": 200
+    },
+    "ControlListPage_Deployment": {
+      "body": {
+        "items": [
+          {
+            "app_id": "demo",
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+            "created_at": 1767225600,
+            "env_id": "018f2518-7e38-7f80-8000-000000000001",
+            "id": "018f2518-7e38-7f80-8000-000000000001",
+            "note": null,
+            "version_id": "018f2518-7e38-7f80-8000-000000000001"
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listDeployments",
+      "status": 200
+    },
+    "ControlListPage_DomainGrant": {
+      "body": {
+        "items": [
+          {
+            "app_id": "demo",
+            "created_at": 1767225600,
+            "environment": "*",
+            "note": null,
+            "pattern": "demo.example.com"
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listDomainGrants",
+      "status": 200
+    },
+    "ControlListPage_Environment": {
+      "body": {
+        "items": [
+          {
+            "app_id": "demo",
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+            "created_at": 1767225600,
+            "id": "018f2518-7e38-7f80-8000-000000000001",
+            "name": "production"
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listEnvironments",
+      "status": 200
+    },
+    "ControlListPage_EventItem": {
+      "body": {
+        "items": [],
+        "page": {
+          "count": 0,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 0
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listEvents",
+      "status": 200
+    },
+    "ControlListPage_ProviderCredentialBinding": {
+      "body": {
+        "items": [],
+        "page": {
+          "count": 0,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 0
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listProviderCredentials",
+      "status": 200
+    },
+    "ControlListPage_ProviderInstallation": {
+      "body": {
+        "items": [],
+        "page": {
+          "count": 0,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 0
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listProviderInstallations",
+      "status": 200
+    },
+    "ControlListPage_ProviderTarget": {
+      "body": {
+        "items": [],
+        "page": {
+          "count": 0,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 0
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listProviderTargets",
+      "status": 200
+    },
+    "ControlListPage_ProviderTargetGrant": {
+      "body": {
+        "items": [],
+        "page": {
+          "count": 0,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 0
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listProviderTargetGrantHistory",
+      "status": 200
+    },
+    "ControlListPage_RetiredAppName": {
+      "body": {
+        "items": [],
+        "page": {
+          "count": 0,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 0
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listRetiredApps",
+      "status": 200
+    },
+    "ControlListPage_Route": {
+      "body": {
+        "items": [
+          {
+            "app_id": "demo",
+            "env_id": "018f2518-7e38-7f80-8000-000000000001",
+            "host": "demo.example.com",
+            "id": "018f2518-7e38-7f80-8000-000000000001",
+            "path_prefix": "/",
+            "priority": 0
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listRoutes",
+      "status": 200
+    },
+    "ControlListPage_SecretMeta": {
+      "body": {
+        "items": [
+          {
+            "name": "API_KEY",
+            "revision": "018f2518-7e38-7f80-8000-000000000001",
+            "updated_at": 1767225600
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listSecrets",
+      "status": 200
+    },
+    "ControlListPage_VersionView": {
+      "body": {
+        "items": [
+          {
+            "app_id": "demo",
+            "bundle_sha": "0000000000000000000000000000000000000000000000000000000000000000",
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+            "compatibility": {},
+            "created_at": 1767225600,
+            "id": "018f2518-7e38-7f80-8000-000000000001",
+            "manifest": {
+              "app": "demo",
+              "entry": "worker/index.js",
+              "schema": 1,
+              "secrets": [
+                "API_KEY"
+              ],
+              "services": {
+                "kv": true
+              }
+            },
+            "number": 1
+          }
+        ],
+        "page": {
+          "count": 1,
+          "limit": 100,
+          "nextCursor": null,
+          "total": 1
+        },
+        "schemaVersion": 1
+      },
+      "operationId": "listVersions",
+      "status": 200
+    },
+    "DeleteAppResponse": {
+      "body": {
+        "app_id": "demo",
+        "artifact_directories_removed": 0,
+        "bundle_files_removed": 1,
+        "removed": {
+          "canonical_artifacts": 0,
+          "deployments": 1,
+          "environments": 1,
+          "provider_derivations": 0,
+          "routes": 0,
+          "secrets": 0,
+          "versions": 1
+        },
+        "retained": {
+          "app_id": "demo",
+          "environments": [
+            "production"
+          ],
+          "released_at": null,
+          "retired_at": 1767225600
+        },
+        "retained_note": "the kv, database, object and queue data of demo is still in deis-store and deis-queue under tenant(s) demo.production. No part of this platform deletes it. The name is retained until it is released with DELETE /api/retired-apps/demo, so nothing can be deployed onto that data by accident",
+        "unloaded": {
+          "app_id": "demo",
+          "environments": [
+            "production"
+          ],
+          "failed": [],
+          "skipped": null,
+          "unloaded": [
+            "runtime-test"
+          ]
+        }
+      },
+      "operationId": "deleteApp",
+      "status": 200
+    },
+    "DeploymentPlanResponse": {
+      "body": {
+        "drain_observations": [],
+        "events": [
+          {
+            "created_at": 1767225600,
+            "detail": "plan persisted before prepare",
+            "from_state": null,
+            "plan_id": "018f2518-7e38-7f80-8000-000000000001",
+            "sequence": 1,
+            "to_state": "preparing"
+          },
+          {
+            "created_at": 1767225600,
+            "detail": "every frozen runtime target acknowledged the exact candidate generation",
+            "from_state": "preparing",
+            "plan_id": "018f2518-7e38-7f80-8000-000000000001",
+            "sequence": 2,
+            "to_state": "prepared"
+          },
+          {
+            "created_at": 1767225600,
+            "detail": "production pointer committed",
+            "from_state": "prepared",
+            "plan_id": "018f2518-7e38-7f80-8000-000000000001",
+            "sequence": 3,
+            "to_state": "activating"
+          },
+          {
+            "created_at": 1767225600,
+            "detail": "all frozen runtime and proxy targets report the exact production generation",
+            "from_state": "activating",
+            "plan_id": "018f2518-7e38-7f80-8000-000000000001",
+            "sequence": 4,
+            "to_state": "active"
+          }
+        ],
+        "plan": {
+          "app_id": "demo",
+          "compare_secret_heads": true,
+          "created_at": 1767225600,
+          "env_id": "018f2518-7e38-7f80-8000-000000000001",
+          "expected_secret_heads": {},
+          "id": "018f2518-7e38-7f80-8000-000000000001",
+          "last_error": "all frozen runtime and proxy targets report the exact production generation",
+          "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "policy": {
+            "activation": "strict_all",
+            "affinity": "stable",
+            "drain": {
+              "retentionSeconds": 300,
+              "timeoutSeconds": 30
+            },
+            "operation": "deployment",
+            "queueFence": false,
+            "secretChange": null,
+            "traffic": [
+              {
+                "basisPoints": 10000,
+                "generation": "018f2518-7e38-7f80-8000-000000000001"
+              }
+            ]
+          },
+          "proxy_ids": [],
+          "routing_generation": "018f2518-7e38-7f80-8000-000000000001",
+          "state": "active",
+          "target_ids": [
+            "runtime-test"
+          ],
+          "updated_at": 1767225600,
+          "version_id": "018f2518-7e38-7f80-8000-000000000001"
+        },
+        "proxies": [],
+        "targets": [
+          {
+            "message": null,
+            "node_id": "runtime-test",
+            "observed_at": 1767225600,
+            "observed_state": "active",
+            "plan_id": "018f2518-7e38-7f80-8000-000000000001",
+            "routing_generation": "018f2518-7e38-7f80-8000-000000000001",
+            "version_id": "018f2518-7e38-7f80-8000-000000000001"
+          }
+        ]
+      },
+      "operationId": "getDeploymentPlan",
+      "status": 200
+    },
+    "DeploymentResponse": {
+      "body": {
+        "delivery": {
+          "app_id": "demo",
+          "delivered": [
+            "runtime-test"
+          ],
+          "environment": "production",
+          "failed": [],
+          "phase": "activate",
+          "reason": "deployment",
+          "skipped": null,
+          "version_id": "018f2518-7e38-7f80-8000-000000000001"
+        },
+        "deployment": {
+          "app_id": "demo",
+          "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+          "created_at": 1767225600,
+          "env_id": "018f2518-7e38-7f80-8000-000000000001",
+          "id": "018f2518-7e38-7f80-8000-000000000001",
+          "note": null,
+          "version_id": "018f2518-7e38-7f80-8000-000000000001"
+        },
+        "environment": "production",
+        "plan": {
+          "app_id": "demo",
+          "compare_secret_heads": true,
+          "created_at": 1767225600,
+          "env_id": "018f2518-7e38-7f80-8000-000000000001",
+          "expected_secret_heads": {},
+          "id": "018f2518-7e38-7f80-8000-000000000001",
+          "last_error": "all frozen runtime and proxy targets report the exact production generation",
+          "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "policy": {
+            "activation": "strict_all",
+            "affinity": "stable",
+            "drain": {
+              "retentionSeconds": 300,
+              "timeoutSeconds": 30
+            },
+            "operation": "deployment",
+            "queueFence": false,
+            "secretChange": null,
+            "traffic": [
+              {
+                "basisPoints": 10000,
+                "generation": "018f2518-7e38-7f80-8000-000000000001"
+              }
+            ]
+          },
+          "proxy_ids": [],
+          "routing_generation": "018f2518-7e38-7f80-8000-000000000001",
+          "state": "active",
+          "target_ids": [
+            "runtime-test"
+          ],
+          "updated_at": 1767225600,
+          "version_id": "018f2518-7e38-7f80-8000-000000000001"
+        },
+        "version": {
+          "app_id": "demo",
+          "bundle_sha": "0000000000000000000000000000000000000000000000000000000000000000",
+          "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+          "compatibility": {},
+          "created_at": 1767225600,
+          "id": "018f2518-7e38-7f80-8000-000000000001",
+          "manifest": {
+            "app": "demo",
+            "entry": "worker/index.js",
+            "schema": 1,
+            "secrets": [
+              "API_KEY"
+            ],
+            "services": {
+              "kv": true
+            }
+          },
+          "number": 1
+        }
+      },
+      "operationId": "deploy",
+      "status": 201
+    },
+    "Environment": {
+      "body": {
+        "app_id": "demo",
+        "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+        "created_at": 1767225600,
+        "id": "018f2518-7e38-7f80-8000-000000000001",
+        "name": "production"
+      },
+      "operationId": "createEnvironment",
+      "status": 201
+    },
+    "ErrorBody": {
+      "body": {
+        "error": {
+          "code": "not-found",
+          "message": "app no-such-app not found",
+          "requestId": "018f2518-7e38-7f80-8000-000000000001",
+          "retryable": false,
+          "violations": []
+        }
+      },
+      "operationId": "getApp",
+      "status": 404
+    },
+    "EventStatsResponse": {
+      "body": {
+        "stats": {
+          "by_severity": {},
+          "by_type": {},
+          "total": 0
+        },
+        "success": true
+      },
+      "operationId": "getEventStats",
+      "status": 200
+    },
+    "FleetResponse": {
+      "body": {
+        "contested": [],
+        "lost": [],
+        "nodes": []
+      },
+      "operationId": "listRuntimeFleet",
+      "status": 200
+    },
+    "GlobalRoutesResponse": {
+      "body": {
+        "routes": [
+          {
+            "app_id": "demo",
+            "env_id": "018f2518-7e38-7f80-8000-000000000001",
+            "host": "demo.example.com",
+            "id": "018f2518-7e38-7f80-8000-000000000001",
+            "path_prefix": "/",
+            "priority": 0
+          }
+        ],
+        "total": 1
+      },
+      "operationId": "listAllRoutes",
+      "status": 200
+    },
+    "GrantResponse": {
+      "body": {
+        "grant": {
+          "app_id": "demo",
+          "created_at": 1767225600,
+          "environment": "*",
+          "note": null,
+          "pattern": "demo.example.com"
+        }
+      },
+      "operationId": "createDomainGrant",
+      "status": 201
+    },
+    "GrantWithdrawn": {
+      "body": {
+        "app_id": "demo",
+        "environment": "*",
+        "withdrawn": "demo.example.com"
+      },
+      "operationId": "deleteDomainGrant",
+      "status": 200
+    },
+    "MetricsSummaryResponse": {
+      "body": {
+        "metrics": {
+          "nodes": {
+            "active": 0,
+            "by_type": {},
+            "connected": 0,
+            "disconnected": 0,
+            "registered": 0,
+            "total": 0
+          },
+          "pagination": {
+            "cursors": null
+          },
+          "system": {
+            "total_commands": 0,
+            "total_events": 0,
+            "total_heartbeats": 0,
+            "uptime_seconds": 0
+          }
+        },
+        "success": true
+      },
+      "operationId": "getMetricsSummary",
+      "status": 200
+    },
+    "NodeConfigOutcome": {
+      "body": {
+        "message": "All configs deleted successfully",
+        "node_id": "node-a",
+        "success": true
+      },
+      "operationId": "deleteNodeConfigs",
+      "status": 200
+    },
+    "NodeConfigs": {
+      "body": {
+        "count": 1,
+        "data": {
+          "port": 8080
+        },
+        "node_id": "node-a",
+        "success": true
+      },
+      "operationId": "getNodeConfigs",
+      "status": 200
+    },
+    "ProductInstallation": {
+      "body": {
+        "createdAtUnixSeconds": 1767225600,
+        "installationId": "018f2518-7e38-7f80-8000-000000000001",
+        "organizationId": "018f2518-7e38-7f80-8000-000000000001",
+        "revision": 1,
+        "updatedAtUnixSeconds": 1767225600
+      },
+      "operationId": "getProductInstallation",
+      "status": 200
+    },
+    "ReleaseRetiredAppResponse": {
+      "body": {
+        "accepted": "demo is free again. the kv, database, object and queue data of demo is still in deis-store and deis-queue under tenant(s) demo.production, and the next application created under this name is that same tenant: it will read and overwrite whatever is there. Credentials follow the name too - a token scoped to this application, or a storage capability token minted for one of those tenants, still authorises the next one, so revoke what the deleted application's owner still holds",
+        "app_id": "demo",
+        "released": {
+          "app_id": "demo",
+          "environments": [
+            "production"
+          ],
+          "released_at": 1767225600,
+          "retired_at": 1767225600
+        }
+      },
+      "operationId": "releaseRetiredApp",
+      "status": 200
+    },
+    "RouteDeleted": {
+      "body": {
+        "deleted": "018f2518-7e38-7f80-8000-000000000001"
+      },
+      "operationId": "deleteRoute",
+      "status": 200
+    },
+    "RouteResponse": {
+      "body": {
+        "route": {
+          "app_id": "demo",
+          "env_id": "018f2518-7e38-7f80-8000-000000000001",
+          "host": "demo.example.com",
+          "id": "018f2518-7e38-7f80-8000-000000000001",
+          "path_prefix": "/",
+          "priority": 0
+        }
+      },
+      "operationId": "createRoute",
+      "status": 201
+    },
+    "SecretChangeResponse": {
+      "body": {
+        "delivery": {
+          "app_id": "demo",
+          "delivered": [
+            "runtime-test"
+          ],
+          "environment": "production",
+          "failed": [],
+          "phase": "legacy_apply",
+          "reason": "secret_change",
+          "skipped": null,
+          "version_id": "018f2518-7e38-7f80-8000-000000000001"
+        },
+        "secret": {
+          "name": "API_KEY",
+          "revision": "018f2518-7e38-7f80-8000-000000000001",
+          "updated_at": 1767225600
+        }
+      },
+      "operationId": "putSecret",
+      "status": 200
+    },
+    "SecretDeletedResponse": {
+      "body": {
+        "deleted": "API_KEY",
+        "delivery": {
+          "app_id": "demo",
+          "delivered": [
+            "runtime-test"
+          ],
+          "environment": "production",
+          "failed": [],
+          "phase": "legacy_apply",
+          "reason": "secret_change",
+          "skipped": null,
+          "version_id": "018f2518-7e38-7f80-8000-000000000001"
+        }
+      },
+      "operationId": "deleteSecret",
+      "status": 200
+    },
+    "SessionsResponse": {
+      "body": {
+        "sessions": [],
+        "total": 0
+      },
+      "operationId": "listSessions",
+      "status": 200
+    },
+    "UploadResponse": {
+      "body": {
+        "bundle_url": "http://control.test/api/apps/demo/versions/018f2518-7e38-7f80-8000-000000000001/bundle",
+        "created": true,
+        "version": {
+          "app_id": "demo",
+          "bundle_sha": "0000000000000000000000000000000000000000000000000000000000000000",
+          "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+          "compatibility": {},
+          "created_at": 1767225600,
+          "id": "018f2518-7e38-7f80-8000-000000000001",
+          "manifest": {
+            "app": "demo",
+            "entry": "worker/index.js",
+            "schema": 1,
+            "secrets": [
+              "API_KEY"
+            ],
+            "services": {
+              "kv": true
+            }
+          },
+          "number": 1
+        }
+      },
+      "operationId": "uploadVersion",
+      "status": 201
+    },
+    "VersionView": {
+      "body": {
+        "app_id": "demo",
+        "bundle_sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
+        "compatibility": {},
+        "created_at": 1767225600,
+        "id": "018f2518-7e38-7f80-8000-000000000001",
+        "manifest": {
+          "app": "demo",
+          "entry": "worker/index.js",
+          "schema": 1,
+          "secrets": [
+            "API_KEY"
+          ],
+          "services": {
+            "kv": true
+          }
+        },
+        "number": 1
+      },
+      "operationId": "getVersion",
+      "status": 200
+    }
+  },
+  "openapiVersion": "1.0.0"
+}

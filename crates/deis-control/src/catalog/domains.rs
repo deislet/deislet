@@ -85,6 +85,7 @@
 //! module's call to make.
 
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use super::CatalogError;
 
@@ -292,7 +293,7 @@ fn is_strictly_under(name: &str, zone: &str) -> bool {
 }
 
 /// One row of the registry.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DomainGrant {
     /// Canonical pattern text: `example.com`, `*.example.com`, `(no-host)`
     /// or `*`.

@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "not-found",
+    "message": "Application 0199b603-0e48-733c-9864-4c9dd92d5328 does not exist",
+    "requestId": "0199b603-3f21-7c1e-9f7a-2f4d5b6c7d8e",
+    "violations": [],
+    "retryable": false
+  }
+}

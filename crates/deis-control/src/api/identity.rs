@@ -16,7 +16,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::{IntoParams, ToSchema};
 
+use super::openapi;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::pagination::{ControlListPage, ListQuery, list_page};
 use crate::catalog::PagePosition;
@@ -45,7 +47,7 @@ impl From<crate::identity::IdentityError> for ApiError {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateAccountRequest {
     pub name: String,
     /// One of the names in [`Role`]. Required rather than defaulted: the
@@ -59,6 +61,19 @@ pub struct CreateAccountRequest {
 /// The unified list envelope, oldest account first. There is one scope
 /// (the whole installation) and no filter, so the cursor binding only has
 /// to name the sort.
+#[utoipa::path(
+    get,
+    path = "/api/v1/accounts",
+    operation_id = "listAccounts",
+    tag = "product",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "One page of accounts.", body = ControlListPage<Account>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_accounts(
     State(state): State<IdentityApiState>,
     Query(query): Query<ListQuery>,
@@ -87,6 +102,20 @@ pub async fn list_accounts(
 }
 
 /// POST /api/accounts
+#[utoipa::path(
+    post,
+    path = "/api/v1/accounts",
+    operation_id = "createAccount",
+    tag = "product",
+    request_body = CreateAccountRequest,
+    responses(
+        (status = 200, description = "The account as created.", body = Account),
+        (status = 400, response = openapi::BadRequest),
+        (status = 409, response = openapi::Conflict),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn create_account(
     State(state): State<IdentityApiState>,
     Json(request): Json<CreateAccountRequest>,
@@ -97,6 +126,19 @@ pub async fn create_account(
 }
 
 /// GET /api/accounts/:name
+#[utoipa::path(
+    get,
+    path = "/api/v1/accounts/{name}",
+    operation_id = "getAccount",
+    tag = "product",
+    params(("name" = String, Path, description = "The account's name.")),
+    responses(
+        (status = 200, description = "The account.", body = Account),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_account(
     State(state): State<IdentityApiState>,
     Path(name): Path<String>,
@@ -104,7 +146,7 @@ pub async fn get_account(
     Ok(Json(state.identity.get_account(&name).await?))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateAccountRequest {
     /// Absent means "leave it".
     #[serde(default)]
@@ -116,6 +158,21 @@ pub struct UpdateAccountRequest {
 }
 
 /// PATCH /api/accounts/:name
+#[utoipa::path(
+    patch,
+    path = "/api/v1/accounts/{name}",
+    operation_id = "updateAccount",
+    tag = "product",
+    params(("name" = String, Path, description = "The account's name.")),
+    request_body = UpdateAccountRequest,
+    responses(
+        (status = 200, description = "The account after the change.", body = Account),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn update_account(
     State(state): State<IdentityApiState>,
     Path(name): Path<String>,
@@ -129,7 +186,7 @@ pub async fn update_account(
     Ok(Json(account))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTokenRequest {
     /// What this credential is for, in a word: `ci-preview`, `alice-laptop`.
     /// It is printed in every listing, so it is how a person decides which
@@ -150,7 +207,7 @@ pub struct CreateTokenRequest {
 
 /// What creating a token answers. The only place a token's secret is ever
 /// serialised.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MintResponse {
     pub token: ApiToken,
     /// The credential itself, in full. It is not stored anywhere in this form
@@ -163,6 +220,21 @@ pub struct MintResponse {
 }
 
 /// POST /api/accounts/:name/tokens
+#[utoipa::path(
+    post,
+    path = "/api/v1/accounts/{account}/tokens",
+    operation_id = "createToken",
+    tag = "product",
+    params(("account" = String, Path, description = "The account the token belongs to.")),
+    request_body = CreateTokenRequest,
+    responses(
+        (status = 200, description = "The token and, once only, its secret.", body = MintResponse),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn create_token(
     State(state): State<IdentityApiState>,
     Path(account): Path<String>,
@@ -205,10 +277,16 @@ pub async fn create_token(
 
 /// What `GET /api/tokens` accepts: the page controls of every list route
 /// plus the three filters a token listing combines with "and".
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct TokenListQuery {
+    /// Page size, `1..=1000`; absent means 100.
+    #[param(minimum = 1, maximum = 1000)]
     pub limit: Option<usize>,
+    /// The `page.nextCursor` of the previous answer. Opaque, bound to the
+    /// collection and the filters it was issued for, and refused with 400
+    /// `cursor-invalid` anywhere else.
     pub cursor: Option<String>,
     /// An account's name. Resolved to its id before anything is read, so an
     /// unknown name is a 404 rather than an empty list.
@@ -250,6 +328,20 @@ impl TokenListQuery {
 /// The unified list envelope, oldest credential first. Every filter is part
 /// of the cursor binding - by the account's id, never its name - so a
 /// cursor issued for one listing cannot be resumed under another.
+#[utoipa::path(
+    get,
+    path = "/api/v1/tokens",
+    operation_id = "listTokens",
+    tag = "product",
+    params(TokenListQuery),
+    responses(
+        (status = 200, description = "One page of tokens.", body = ControlListPage<ApiToken>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_tokens(
     State(state): State<IdentityApiState>,
     Query(query): Query<TokenListQuery>,
@@ -304,6 +396,19 @@ pub async fn list_tokens(
 }
 
 /// DELETE /api/tokens/:id
+#[utoipa::path(
+    delete,
+    path = "/api/v1/tokens/{id}",
+    operation_id = "revokeToken",
+    tag = "product",
+    params(("id" = String, Path, description = "The token's id.")),
+    responses(
+        (status = 200, description = "The token, now revoked.", body = ApiToken),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn revoke_token(
     State(state): State<IdentityApiState>,
     Path(id): Path<String>,

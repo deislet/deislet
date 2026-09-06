@@ -23,15 +23,18 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, environment_scope, list_page};
+use crate::api::paths::ApiPaths;
 use crate::catalog::secrets::secret_revision_aad;
 use crate::catalog::{DeploymentPlan, PagePosition, SecretMeta};
 use crate::delivery::{DeliveryReport, SecretChangePreparation};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct PutSecretRequest {
     /// Plaintext value. It is encrypted before it touches the database and
     /// is never written to a log.
@@ -40,7 +43,7 @@ pub struct PutSecretRequest {
 
 /// What a write to a secret answers: the metadata of the secret itself -
 /// never its value - plus where the reloaded deployment landed.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SecretChangeResponse {
     pub secret: SecretMeta,
     /// Nodes that picked the new environment up. A secret change creates
@@ -51,7 +54,7 @@ pub struct SecretChangeResponse {
 }
 
 /// What deleting a secret answers.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SecretDeletedResponse {
     pub deleted: String,
     pub delivery: DeliveryReport,
@@ -60,10 +63,29 @@ pub struct SecretDeletedResponse {
 }
 
 /// PUT /api/apps/:app_id/environments/:env/secrets/:name
+#[utoipa::path(
+    put,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/secrets/{name}",
+    operation_id = "putSecret",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("name" = String, Path, description = "The secret's name.")),
+    request_body = PutSecretRequest,
+    responses(
+        (status = 200, description = "The secret was stored and delivered to every node.", body = SecretChangeResponse),
+        (status = 202, description = "The secret was stored; the running deployment is being re-planned, poll `Location`.", body = SecretChangeResponse, headers(("Location" = String, description = "Where to poll the deployment plan."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn put_secret(
     State(state): State<CatalogState>,
     Path((app_id, env_name, name)): Path<(String, String, String)>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Json(request): Json<PutSecretRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<SecretChangeResponse>)> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
@@ -144,7 +166,9 @@ pub async fn put_secret(
     };
     let response_headers = plan
         .as_ref()
-        .map(|plan| super::deployments::deployment_plan_location(&app_id, &env_name, &plan.id))
+        .map(|plan| {
+            super::deployments::deployment_plan_location(paths, &app_id, &env_name, &plan.id)
+        })
         .unwrap_or_default();
     Ok((
         status,
@@ -200,6 +224,21 @@ async fn discard_staged_revision(
 ///
 /// Names and timestamps only. There is deliberately no endpoint that
 /// returns a secret value.
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/secrets",
+    operation_id = "listSecrets",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ListQuery),
+    responses(
+        (status = 200, description = "One page of secret names and revisions; never values.", body = ControlListPage<SecretMeta>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_secrets(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
@@ -236,10 +275,27 @@ pub async fn list_secrets(
 }
 
 /// DELETE /api/apps/:app_id/environments/:env/secrets/:name
+#[utoipa::path(
+    delete,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/secrets/{name}",
+    operation_id = "deleteSecret",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("name" = String, Path, description = "The secret's name.")),
+    responses(
+        (status = 200, description = "The secret was removed and every node told.", body = SecretDeletedResponse),
+        (status = 202, description = "The secret was removed; the running deployment is being re-planned, poll `Location`.", body = SecretDeletedResponse, headers(("Location" = String, description = "Where to poll the deployment plan."))),
+        (status = 404, response = openapi::NotFound),
+        (status = 412, response = openapi::PreconditionFailed),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn delete_secret(
     State(state): State<CatalogState>,
     Path((app_id, env_name, name)): Path<(String, String, String)>,
     headers: HeaderMap,
+    paths: ApiPaths,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<SecretDeletedResponse>)> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
     let expected_revision = state
@@ -282,7 +338,9 @@ pub async fn delete_secret(
     };
     let response_headers = plan
         .as_ref()
-        .map(|plan| super::deployments::deployment_plan_location(&app_id, &env_name, &plan.id))
+        .map(|plan| {
+            super::deployments::deployment_plan_location(paths, &app_id, &env_name, &plan.id)
+        })
         .unwrap_or_default();
     Ok((
         status,

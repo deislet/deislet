@@ -10,8 +10,12 @@ pub mod telemetry;
 
 use anyhow::{Context, Result, bail};
 use deis_wire::CanonicalId;
-use reqwest::{Method, StatusCode, header::HeaderMap};
+use reqwest::{
+    Method, StatusCode,
+    header::{ACCEPT, HeaderMap},
+};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How long one control-plane call may take.
 ///
@@ -41,6 +45,36 @@ pub const MAX_LIST_LIMIT: usize = 1_000;
 /// At the server's default page size this cap is a million rows, so nothing
 /// a real catalog holds ever reaches it.
 const MAX_LIST_PAGES: usize = 10_000;
+
+/// Path prefix of the product API this build speaks: applications,
+/// versions, environments, deployments, secrets, accounts, tokens and the
+/// audit log. Every route below is spelled without it and [`Control`] puts
+/// it on, so this is the one place the major version is written.
+pub const API_MAJOR: &str = "/api/v1";
+/// Path prefix of the platform diagnostics API: the runtime fleet and what
+/// each node reports it is running.
+pub const API_PLATFORM: &str = "/api/platform";
+/// The flat prefix every route lived under before the two above existed.
+///
+/// A control plane from before that split still answers here and nowhere
+/// else, and a newer one keeps it for a deprecation window. This CLI speaks
+/// the versioned prefixes and drops back to this one only after a control
+/// plane has shown it does not know them - see [`Control::dispatch`].
+const API_LEGACY: &str = "/api";
+/// The response header every versioned answer carries: the id the control
+/// plane logged the request under, which is what to quote when asking an
+/// operator what happened.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Spell a versioned path the way the legacy tree spells it, or `None` when
+/// the path is not under a versioned prefix and there is nothing to fall
+/// back to.
+fn legacy_spelling(path: &str) -> Option<String> {
+    [API_MAJOR, API_PLATFORM].into_iter().find_map(|prefix| {
+        let rest = path.strip_prefix(prefix)?;
+        (rest.is_empty() || rest.starts_with('/')).then(|| format!("{API_LEGACY}{rest}"))
+    })
+}
 
 /// One page of the control plane's unified list envelope.
 ///
@@ -600,6 +634,116 @@ pub struct AuditEntry {
     pub status: i64,
     #[serde(default)]
     pub detail: Option<String>,
+    /// The id the control plane handled the request under, which is the
+    /// same id it printed in the refusal the caller saw and the one its own
+    /// log lines carry. Absent on lines written before it was recorded.
+    #[serde(default, rename = "requestId")]
+    pub request_id: Option<String>,
+}
+
+/// What a versioned surface answers instead of a record when it refuses a
+/// call: one `error` object carrying a stable code, a sentence, the id the
+/// control plane logged the refusal under, and - for a bad request - which
+/// fields were wrong.
+///
+/// Mirrors `contracts/v1/control-error.schema.json`. Everything past the
+/// three fields this CLI prints is read leniently, so a member added there
+/// does not stop an older CLI from printing the message.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub violations: Vec<Violation>,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub retry_after_seconds: Option<u64>,
+}
+
+/// One field a request got wrong, as the control plane names it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Violation {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// The whole body of a refusal on a versioned surface.
+#[derive(Debug, Clone, Deserialize)]
+struct ErrorEnvelope {
+    error: ControlError,
+}
+
+/// A refusal in either of the two shapes a control plane sends one.
+#[derive(Debug)]
+enum Refusal {
+    /// The envelope of `/api/v1` and `/api/platform`.
+    Structured(ControlError),
+    /// The flat `{"error": "<message>"}` of the legacy tree - and of the
+    /// authorization gate, which answers that way on every surface.
+    Plain(String),
+}
+
+impl Refusal {
+    /// Read whichever shape the body is, or `None` for a body that is
+    /// neither, such as an empty one or a proxy's HTML.
+    fn parse(body: &[u8]) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        match value.get("error")? {
+            serde_json::Value::String(message) => Some(Self::Plain(message.clone())),
+            serde_json::Value::Object(_) => serde_json::from_value::<ErrorEnvelope>(value.clone())
+                .ok()
+                .map(|envelope| Self::Structured(envelope.error)),
+            _ => None,
+        }
+    }
+
+    /// Whether a body is the versioned envelope. A 404 that carries one is
+    /// an answer about a record from a control plane that knows the route;
+    /// a 404 without one is a control plane that does not know the route.
+    fn is_structured(body: &[u8]) -> bool {
+        matches!(Self::parse(body), Some(Self::Structured(_)))
+    }
+}
+
+/// One answer from the control plane, body already read.
+///
+/// Everything a caller decides on is here, so a response is never half read:
+/// the status, the headers (`Location` on an accepted mutation, the request
+/// id on everything) and the bytes.
+struct Reply {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+impl Reply {
+    async fn read(response: reqwest::Response) -> Self {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default();
+        Self {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    /// The id the control plane logged this exchange under, when it said.
+    fn request_id(&self) -> Option<String> {
+        self.headers
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string())
+    }
 }
 
 /// What `deis audit` is asking for. Every field is optional and they are
@@ -622,6 +766,10 @@ pub struct Control {
     base: String,
     token: Option<String>,
     http: reqwest::Client,
+    /// Set once this control plane has answered a versioned path with a
+    /// 404 that carried no envelope: it predates [`API_MAJOR`], and every
+    /// later call goes straight to [`API_LEGACY`] rather than probing again.
+    legacy: AtomicBool,
 }
 
 impl Control {
@@ -634,6 +782,7 @@ impl Control {
             base: base.trim_end_matches('/').to_string(),
             token: token.map(|t| t.to_string()),
             http,
+            legacy: AtomicBool::new(false),
         })
     }
 
@@ -641,16 +790,110 @@ impl Control {
         &self.base
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base, path)
+    /// Whether this control plane has shown it predates the versioned
+    /// prefixes and is being driven through the legacy tree.
+    fn speaks_legacy(&self) -> bool {
+        self.legacy.load(Ordering::Relaxed)
     }
 
-    fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
-        let builder = self.http.request(method, self.url(path));
+    /// The prefix a product route is sent under right now.
+    fn product_prefix(&self) -> &'static str {
+        if self.speaks_legacy() {
+            API_LEGACY
+        } else {
+            API_MAJOR
+        }
+    }
+
+    /// The prefix a platform route is sent under right now.
+    fn platform_prefix(&self) -> &'static str {
+        if self.speaks_legacy() {
+            API_LEGACY
+        } else {
+            API_PLATFORM
+        }
+    }
+
+    fn url(&self, prefix: &str, route: &str) -> String {
+        format!("{}{prefix}{route}", self.base)
+    }
+
+    /// A request to a product route: `route` is spelled without any prefix
+    /// (`/apps/demo`), and the one the control plane answers on is put in
+    /// front of it here.
+    fn request(&self, method: Method, route: &str) -> reqwest::RequestBuilder {
+        self.build(method, self.product_prefix(), route)
+    }
+
+    /// A request to a platform diagnostics route, prefixed the same way.
+    fn platform_request(&self, method: Method, route: &str) -> reqwest::RequestBuilder {
+        self.build(method, self.platform_prefix(), route)
+    }
+
+    fn build(&self, method: Method, prefix: &str, route: &str) -> reqwest::RequestBuilder {
+        let builder = self
+            .http
+            .request(method, self.url(prefix, route))
+            .header(ACCEPT, "application/json");
         match &self.token {
             Some(token) => builder.bearer_auth(token),
             None => builder,
         }
+    }
+
+    /// Send one request and read the whole answer.
+    ///
+    /// The seam every call goes through, and the one place the deprecation
+    /// window is handled. A control plane from before the versioned prefixes
+    /// answers `/api/v1/...` with its route fallback: a 404 whose body is the
+    /// flat legacy string, where every versioned route - including for its
+    /// own 404 about a missing record - answers the envelope. That answer is
+    /// taken once as "this control plane is older than this CLI", said at
+    /// warn, and the same request is re-sent under the legacy prefix; every
+    /// later request is built for the legacy tree directly. A 404 that does
+    /// carry the envelope is returned as the answer it is.
+    async fn dispatch(&self, builder: reqwest::RequestBuilder) -> Result<Reply> {
+        let request = builder
+            .build()
+            .context("building a request to the control plane")?;
+        // `None` only for a streaming body, which this CLI never sends.
+        let retry = request.try_clone();
+        let path = request.url().path().to_string();
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|e| self.transport_error(e))?;
+        let reply = Reply::read(response).await;
+        if reply.status != StatusCode::NOT_FOUND || Refusal::is_structured(&reply.body) {
+            return Ok(reply);
+        }
+        let (Some(mut retry), Some(legacy_path)) = (retry, legacy_spelling(&path)) else {
+            return Ok(reply);
+        };
+        if !self.legacy.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                control = %self.base,
+                path,
+                cli_version = env!("CARGO_PKG_VERSION"),
+                "the control plane does not serve {API_MAJOR}: it is most likely a deis-control \
+                 older than this CLI, from before the versioned API; driving it through \
+                 {API_LEGACY} instead, which newer control planes keep only for a deprecation \
+                 window - upgrade it before that window closes"
+            );
+        }
+        tracing::debug!(
+            from = path,
+            to = legacy_path,
+            "re-sending under the legacy prefix"
+        );
+        retry.url_mut().set_path(&legacy_path);
+        let response = self
+            .http
+            .execute(retry)
+            .await
+            .map_err(|e| self.transport_error(e))?;
+        Ok(Reply::read(response).await)
     }
 
     /// Send a request and read its body as `T`, turning every failure into a
@@ -673,20 +916,18 @@ impl Control {
         builder: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<(StatusCode, HeaderMap, T)> {
-        let response = builder.send().await.map_err(|e| self.transport_error(e))?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = response.bytes().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!(self.http_error(status, &body, what));
+        let reply = self.dispatch(builder).await?;
+        if !reply.status.is_success() {
+            bail!(self.http_error(&reply, what));
         }
-        let body = serde_json::from_slice(&body).with_context(|| {
+        let status = reply.status;
+        let body = serde_json::from_slice(&reply.body).with_context(|| {
             format!(
                 "{what}: the control plane answered {status} with a body this CLI could not read; \
                  it may be a newer or older version than this build"
             )
         })?;
-        Ok((status, headers, body))
+        Ok((status, reply.headers, body))
     }
 
     /// Read a paginated list route to its end, following `nextCursor` until
@@ -768,20 +1009,51 @@ impl Control {
         )
     }
 
-    fn http_error(&self, status: StatusCode, body: &[u8], what: &str) -> String {
-        let detail = serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
+    /// One sentence for a refusal, whichever shape it arrived in.
+    ///
+    /// The versioned envelope is printed as `code: message`, then each field
+    /// it names as wrong, then the request id - the one thing an operator can
+    /// search the control plane's log for. The legacy string is printed as
+    /// it is, with the request id from the header when there was one.
+    fn http_error(&self, reply: &Reply, what: &str) -> String {
+        let status = reply.status;
+        let (detail, request_id, retry) = match Refusal::parse(&reply.body) {
+            Some(Refusal::Structured(error)) => {
+                let mut detail = format!("{}: {}", error.code, error.message);
+                for violation in &error.violations {
+                    detail.push_str(&format!(
+                        "\n  - {}: {} ({})",
+                        violation.field, violation.message, violation.code
+                    ));
+                }
+                let retry = error.retryable.then(|| match error.retry_after_seconds {
+                    Some(seconds) => {
+                        format!("\nThe control plane says to try again in {seconds} seconds.")
+                    }
+                    None => "\nThe control plane says this may succeed if tried again.".to_string(),
+                });
+                (
+                    detail,
+                    error.request_id.or_else(|| reply.request_id()),
+                    retry,
+                )
+            }
+            Some(Refusal::Plain(message)) => (message, reply.request_id(), None),
+            None => (
+                String::from_utf8_lossy(&reply.body).trim().to_string(),
+                reply.request_id(),
+                None,
+            ),
+        };
         let detail = if detail.is_empty() {
             "no detail given".to_string()
         } else {
             detail
         };
+        let reference = request_id
+            .map(|id| format!(" [request {id}]"))
+            .unwrap_or_default();
+        let retry = retry.unwrap_or_default();
 
         let advice = match status {
             // 401 and 403 are different problems and lead to different next
@@ -826,33 +1098,31 @@ impl Control {
             _ => String::new(),
         };
 
-        format!("{what} failed: the control plane answered {status}: {detail}{advice}")
+        format!(
+            "{what} failed: the control plane answered {status}: {detail}{reference}{retry}{advice}"
+        )
     }
 
     // ---- applications -------------------------------------------------
 
     pub async fn get_app(&self, app_id: &str) -> Result<Option<App>> {
-        let response = self
-            .request(Method::GET, &format!("/api/apps/{app_id}"))
-            .send()
-            .await
-            .map_err(|e| self.transport_error(e))?;
-        if response.status() == StatusCode::NOT_FOUND {
+        let reply = self
+            .dispatch(self.request(Method::GET, &format!("/apps/{app_id}")))
+            .await?;
+        if reply.status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let status = response.status();
-        let body = response.bytes().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!(self.http_error(status, &body, format!("looking up app {app_id}").as_str()));
+        if !reply.status.is_success() {
+            bail!(self.http_error(&reply, &format!("looking up app {app_id}")));
         }
-        Ok(Some(serde_json::from_slice(&body).with_context(|| {
-            format!("reading the description of app {app_id}")
-        })?))
+        Ok(Some(serde_json::from_slice(&reply.body).with_context(
+            || format!("reading the description of app {app_id}"),
+        )?))
     }
 
     pub async fn create_app(&self, app_id: &str) -> Result<App> {
         self.send(
-            self.request(Method::POST, "/api/apps")
+            self.request(Method::POST, "/apps")
                 .json(&serde_json::json!({ "id": app_id })),
             &format!("creating app {app_id}"),
         )
@@ -884,7 +1154,7 @@ impl Control {
         self.send(
             self.request(
                 Method::POST,
-                &format!("/api/apps/{app_id}/versions?sha256={sha256}"),
+                &format!("/apps/{app_id}/versions?sha256={sha256}"),
             )
             .header(reqwest::header::CONTENT_TYPE, "application/zip")
             .body(bundle),
@@ -904,7 +1174,7 @@ impl Control {
         self.send(
             self.request(
                 Method::POST,
-                &format!("/api/apps/{app_id}/artifacts?sha256={artifact_sha256}"),
+                &format!("/apps/{app_id}/artifacts?sha256={artifact_sha256}"),
             )
             .header(reqwest::header::CONTENT_TYPE, "application/zip")
             .body(transport),
@@ -925,9 +1195,7 @@ impl Control {
         self.send(
             self.request(
                 Method::POST,
-                &format!(
-                    "/api/apps/{app_id}/artifacts/{artifact_id}/versions?sha256={bundle_sha256}"
-                ),
+                &format!("/apps/{app_id}/artifacts/{artifact_id}/versions?sha256={bundle_sha256}"),
             )
             .header(
                 reqwest::header::CONTENT_TYPE,
@@ -941,7 +1209,7 @@ impl Control {
 
     pub async fn list_versions(&self, app_id: &str) -> Result<Vec<Version>> {
         self.list_all(
-            &format!("/api/apps/{app_id}/versions"),
+            &format!("/apps/{app_id}/versions"),
             &format!("listing the versions of app {app_id}"),
         )
         .await
@@ -951,7 +1219,7 @@ impl Control {
 
     pub async fn list_environments(&self, app_id: &str) -> Result<Vec<Environment>> {
         self.list_all(
-            &format!("/api/apps/{app_id}/environments"),
+            &format!("/apps/{app_id}/environments"),
             &format!("listing the environments of app {app_id}"),
         )
         .await
@@ -960,29 +1228,24 @@ impl Control {
     /// Create the environment unless it is already there. Returns true when
     /// this call is what created it.
     pub async fn ensure_environment(&self, app_id: &str, environment: &str) -> Result<bool> {
-        let response = self
-            .request(
+        let reply = self
+            .dispatch(self.request(
                 Method::GET,
-                &format!("/api/apps/{app_id}/environments/{environment}"),
-            )
-            .send()
-            .await
-            .map_err(|e| self.transport_error(e))?;
-        if response.status().is_success() {
+                &format!("/apps/{app_id}/environments/{environment}"),
+            ))
+            .await?;
+        if reply.status.is_success() {
             return Ok(false);
         }
-        if response.status() != StatusCode::NOT_FOUND {
-            let status = response.status();
-            let body = response.bytes().await.unwrap_or_default();
+        if reply.status != StatusCode::NOT_FOUND {
             bail!(self.http_error(
-                status,
-                &body,
+                &reply,
                 &format!("looking up environment {environment} of app {app_id}")
             ));
         }
         let _: Environment = self
             .send(
-                self.request(Method::POST, &format!("/api/apps/{app_id}/environments"))
+                self.request(Method::POST, &format!("/apps/{app_id}/environments"))
                     .json(&serde_json::json!({ "name": environment })),
                 &format!("creating environment {environment} of app {app_id}"),
             )
@@ -1012,7 +1275,7 @@ impl Control {
             .send_with_metadata::<DeploymentMutationResponse>(
                 self.request(
                     Method::POST,
-                    &format!("/api/apps/{app_id}/environments/{environment}/deployments"),
+                    &format!("/apps/{app_id}/environments/{environment}/deployments"),
                 )
                 .json(&body),
                 &what,
@@ -1043,7 +1306,7 @@ impl Control {
             .send_with_metadata::<DeploymentMutationResponse>(
                 self.request(
                     Method::POST,
-                    &format!("/api/apps/{app_id}/environments/{environment}/rollback"),
+                    &format!("/apps/{app_id}/environments/{environment}/rollback"),
                 )
                 .json(&serde_json::Value::Object(body)),
                 &what,
@@ -1145,10 +1408,15 @@ impl Control {
             return Ok(Some(plan));
         }
 
-        let path = format!(
-            "/api/apps/{app_id}/environments/{environment}/deployment-plans/{}",
+        // Spelled under whichever prefix the mutation itself went out on,
+        // which `dispatch` has settled by now: a control plane that knows
+        // the versioned prefix points at it, and one that was fallen back
+        // to points at the legacy tree.
+        let route = format!(
+            "/apps/{app_id}/environments/{environment}/deployment-plans/{}",
             plan.id
         );
+        let path = format!("{}{route}", self.product_prefix());
         let location = headers
             .get(reqwest::header::LOCATION)
             .ok_or_else(|| anyhow::anyhow!("{what}: accepted plan {} has no Location", plan.id))?
@@ -1160,13 +1428,17 @@ impl Control {
                 plan.id
             );
         }
-        self.wait_for_deployment_plan(&path, &plan.id, what)
+        self.wait_for_deployment_plan(&route, &path, &plan.id, what)
             .await
             .map(Some)
     }
 
+    /// Poll a plan's status at `route` until it settles. `path` is the same
+    /// resource with its prefix, for the message that names where the
+    /// status stays when this gives up.
     async fn wait_for_deployment_plan(
         &self,
+        route: &str,
         path: &str,
         expected_plan_id: &str,
         what: &str,
@@ -1175,7 +1447,7 @@ impl Control {
         loop {
             let response: DeploymentPlanStatusResponse = self
                 .send(
-                    self.request(Method::GET, path),
+                    self.request(Method::GET, route),
                     &format!("reconciling deployment plan {expected_plan_id}"),
                 )
                 .await?;
@@ -1222,34 +1494,29 @@ impl Control {
         app_id: &str,
         environment: &str,
     ) -> Result<EnvironmentView> {
-        let response = self
-            .request(
+        let reply = self
+            .dispatch(self.request(
                 Method::GET,
-                &format!("/api/apps/{app_id}/environments/{environment}/deployment"),
-            )
-            .send()
-            .await
-            .map_err(|e| self.transport_error(e))?;
-        if response.status() == StatusCode::NOT_FOUND {
+                &format!("/apps/{app_id}/environments/{environment}/deployment"),
+            ))
+            .await?;
+        if reply.status == StatusCode::NOT_FOUND {
             return Ok(EnvironmentView::NeverDeployed);
         }
         // Not an error: a credential scoped to one environment is *meant* to
         // be refused the others, and a command that walks every environment
         // of an application must be able to say so rather than stop.
-        if response.status() == StatusCode::FORBIDDEN {
+        if reply.status == StatusCode::FORBIDDEN {
             return Ok(EnvironmentView::NotPermitted);
         }
-        let status = response.status();
-        let body = response.bytes().await.unwrap_or_default();
-        if !status.is_success() {
+        if !reply.status.is_success() {
             bail!(self.http_error(
-                status,
-                &body,
+                &reply,
                 &format!("reading what {environment} of app {app_id} runs")
             ));
         }
         Ok(EnvironmentView::Running(Box::new(
-            serde_json::from_slice(&body)
+            serde_json::from_slice(&reply.body)
                 .with_context(|| format!("reading what {environment} of app {app_id} runs"))?,
         )))
     }
@@ -1269,8 +1536,7 @@ impl Control {
     ) -> Result<DeploymentHistory> {
         let what = format!("listing the deployments of {environment} of app {app_id}");
         let limit = bounded_page_limit(limit, &what);
-        let path =
-            format!("/api/apps/{app_id}/environments/{environment}/deployments?limit={limit}");
+        let path = format!("/apps/{app_id}/environments/{environment}/deployments?limit={limit}");
         let page: ListPage<Deployment> = self.list_first_page(&path, &what).await?;
         if page.page.next_cursor.is_some() {
             tracing::debug!(
@@ -1299,7 +1565,7 @@ impl Control {
     /// deployment history, a routing table is small by construction.
     pub async fn list_routes(&self, app_id: &str, environment: &str) -> Result<Vec<Route>> {
         self.list_all(
-            &format!("/api/apps/{app_id}/environments/{environment}/routes"),
+            &format!("/apps/{app_id}/environments/{environment}/routes"),
             &format!("listing the routes of {environment} of app {app_id}"),
         )
         .await
@@ -1313,8 +1579,7 @@ impl Control {
     /// Platform-wide, and read with `admin:*/*`: a hostname belongs to
     /// nobody's application, which is the whole reason the registry exists.
     pub async fn list_domain_grants(&self) -> Result<Vec<DomainGrant>> {
-        self.list_all("/api/domains", "listing the domain grants")
-            .await
+        self.list_all("/domains", "listing the domain grants").await
     }
 
     // ---- secrets ------------------------------------------------------
@@ -1331,7 +1596,7 @@ impl Control {
             .send_with_metadata::<SecretChangeResponse>(
                 self.request(
                     Method::PUT,
-                    &format!("/api/apps/{app_id}/environments/{environment}/secrets/{name}"),
+                    &format!("/apps/{app_id}/environments/{environment}/secrets/{name}"),
                 )
                 .json(&serde_json::json!({ "value": value })),
                 &what,
@@ -1361,7 +1626,7 @@ impl Control {
     /// travel on this route; see the control plane's secret endpoints.
     pub async fn list_secrets(&self, app_id: &str, environment: &str) -> Result<Vec<SecretMeta>> {
         self.list_all(
-            &format!("/api/apps/{app_id}/environments/{environment}/secrets"),
+            &format!("/apps/{app_id}/environments/{environment}/secrets"),
             &format!("listing the secrets of {environment} of app {app_id}"),
         )
         .await
@@ -1378,7 +1643,7 @@ impl Control {
             .send_with_metadata::<SecretDeletedResponse>(
                 self.request(
                     Method::DELETE,
-                    &format!("/api/apps/{app_id}/environments/{environment}/secrets/{name}"),
+                    &format!("/apps/{app_id}/environments/{environment}/secrets/{name}"),
                 ),
                 &what,
             )
@@ -1430,7 +1695,7 @@ impl Control {
         self.send(
             self.request(
                 Method::GET,
-                &format!("/api/apps/{app_id}/environments/{environment}/storage-token"),
+                &format!("/apps/{app_id}/environments/{environment}/storage-token"),
             ),
             &format!("obtaining a storage capability token for {environment} of app {app_id}"),
         )
@@ -1440,12 +1705,12 @@ impl Control {
     // ---- accounts, tokens and the audit log ---------------------------
 
     pub async fn list_accounts(&self) -> Result<Vec<Account>> {
-        self.list_all("/api/accounts", "listing the accounts").await
+        self.list_all("/accounts", "listing the accounts").await
     }
 
     pub async fn create_account(&self, name: &str, role: &str) -> Result<Account> {
         self.send(
-            self.request(Method::POST, "/api/accounts")
+            self.request(Method::POST, "/accounts")
                 .json(&serde_json::json!({ "name": name, "role": role })),
             &format!("creating account {name}"),
         )
@@ -1468,7 +1733,7 @@ impl Control {
             body.insert("disabled".to_string(), serde_json::json!(disabled));
         }
         self.send(
-            self.request(Method::PATCH, &format!("/api/accounts/{name}"))
+            self.request(Method::PATCH, &format!("/accounts/{name}"))
                 .json(&serde_json::Value::Object(body)),
             &format!("updating account {name}"),
         )
@@ -1496,7 +1761,7 @@ impl Control {
             body.insert("scopes".to_string(), serde_json::json!(scopes));
         }
         self.send(
-            self.request(Method::POST, &format!("/api/accounts/{account}/tokens"))
+            self.request(Method::POST, &format!("/accounts/{account}/tokens"))
                 .json(&serde_json::Value::Object(body)),
             &format!("minting a token for account {account}"),
         )
@@ -1520,7 +1785,7 @@ impl Control {
             .unwrap_or_default();
         let tokens = self
             .list_all(
-                &format!("/api/tokens?include_revoked={include_revoked}&scope=all{account_query}"),
+                &format!("/tokens?include_revoked={include_revoked}&scope=all{account_query}"),
                 "listing the tokens",
             )
             .await?;
@@ -1528,9 +1793,7 @@ impl Control {
             .send(
                 self.request(
                     Method::GET,
-                    &format!(
-                        "/api/tokens?include_revoked=false&scope=unscoped&limit=1{account_query}"
-                    ),
+                    &format!("/tokens?include_revoked=false&scope=unscoped&limit=1{account_query}"),
                 ),
                 "counting the unscoped tokens",
             )
@@ -1543,7 +1806,7 @@ impl Control {
 
     pub async fn revoke_token(&self, id: &str) -> Result<ApiToken> {
         self.send(
-            self.request(Method::DELETE, &format!("/api/tokens/{id}")),
+            self.request(Method::DELETE, &format!("/tokens/{id}")),
             &format!("revoking token {id}"),
         )
         .await
@@ -1570,9 +1833,9 @@ impl Control {
         }
 
         let path = if query.is_empty() {
-            "/api/audit".to_string()
+            "/audit".to_string()
         } else {
-            format!("/api/audit?{}", query.join("&"))
+            format!("/audit?{}", query.join("&"))
         };
         // One page, newest first: `deis audit` prints "the latest N", not
         // the whole log, so the cursor is read for the log line only.
@@ -1594,7 +1857,7 @@ impl Control {
     pub async fn list_nodes(&self) -> Result<Vec<Node>> {
         let response: NodesResponse = self
             .send(
-                self.request(Method::GET, "/api/runtime"),
+                self.platform_request(Method::GET, "/runtime"),
                 "listing the runtime nodes",
             )
             .await?;
@@ -1607,22 +1870,18 @@ impl Control {
     /// reached: a fleet report is more useful with a hole in it than not at
     /// all, and the hole is printed.
     pub async fn node_status(&self, node: &str) -> Result<Option<Vec<NodeAppStatus>>> {
-        let response = self
-            .request(
-                Method::GET,
-                &format!("/api/runtime/{node}/status?apps=true"),
+        let Ok(reply) = self
+            .dispatch(
+                self.platform_request(Method::GET, &format!("/runtime/{node}/status?apps=true")),
             )
-            .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(_) => return Ok(None),
+            .await
+        else {
+            return Ok(None);
         };
-        if !response.status().is_success() {
+        if !reply.status.is_success() {
             return Ok(None);
         }
-        let body = response.bytes().await.unwrap_or_default();
-        match serde_json::from_slice::<NodeStatusResponse>(&body) {
+        match serde_json::from_slice::<NodeStatusResponse>(&reply.body) {
             Ok(status) => Ok(Some(status.apps)),
             Err(_) => Ok(None),
         }
@@ -1667,7 +1926,7 @@ mod deployment_plan_tests {
 
     const PLAN_ID: &str = "018f2518-7e38-7f80-8000-000000000001";
     const GENERATION: &str = "018f2518-7e38-7f80-8000-000000000002";
-    const PLAN_PATH: &str = "/api/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001";
+    const PLAN_PATH: &str = "/api/v1/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001";
 
     fn version() -> serde_json::Value {
         serde_json::json!({
@@ -1752,12 +2011,12 @@ mod deployment_plan_tests {
     async fn accepted_deploy_waits_for_the_exact_plan_and_pointer() {
         let router = Router::new()
             .route(
-                "/api/apps/demo/environments/production/deployments",
+                "/api/v1/apps/demo/environments/production/deployments",
                 axum::routing::post(accepted_deploy),
             )
             .route(PLAN_PATH, get(active_plan))
             .route(
-                "/api/apps/demo/environments/production/deployment",
+                "/api/v1/apps/demo/environments/production/deployment",
                 get(current_deployment),
             );
         let (control, shutdown) = control_for(router).await;
@@ -1777,10 +2036,57 @@ mod deployment_plan_tests {
         let _ = shutdown.send(());
     }
 
+    /// A control plane from before the versioned prefixes points at its
+    /// plan under `/api/...`, and the CLI - having fallen back for the
+    /// mutation itself - expects exactly that spelling and polls it there.
+    async fn accepted_deploy_on_the_legacy_tree() -> impl IntoResponse {
+        (
+            StatusCode::ACCEPTED,
+            [(LOCATION, LEGACY_PLAN_PATH)],
+            Json(serde_json::json!({
+                "environment": "production",
+                "version": version(),
+                "delivery": delivery("prepare"),
+                "plan": plan("prepared")
+            })),
+        )
+    }
+
+    const LEGACY_PLAN_PATH: &str = "/api/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001";
+
+    #[tokio::test]
+    async fn an_accepted_plan_on_an_older_control_plane_is_polled_under_the_legacy_prefix() {
+        let router = Router::new()
+            .route(
+                "/api/apps/demo/environments/production/deployments",
+                axum::routing::post(accepted_deploy_on_the_legacy_tree),
+            )
+            .route(LEGACY_PLAN_PATH, get(active_plan))
+            .route(
+                "/api/apps/demo/environments/production/deployment",
+                get(current_deployment),
+            );
+        let (control, shutdown) = control_for(router).await;
+        let response = control
+            .deploy(
+                "demo",
+                "production",
+                "version-1",
+                None,
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(control.speaks_legacy());
+        assert_eq!(response.deployment.id, PLAN_ID);
+        assert_eq!(response.plan.unwrap().state, "active");
+        let _ = shutdown.send(());
+    }
+
     #[tokio::test]
     async fn accepted_deploy_without_location_is_not_reported_as_success() {
         let router = Router::new().route(
-            "/api/apps/demo/environments/production/deployments",
+            "/api/v1/apps/demo/environments/production/deployments",
             axum::routing::post(accepted_without_location),
         );
         let (control, shutdown) = control_for(router).await;
@@ -1905,19 +2211,22 @@ mod list_page_tests {
 
     #[test]
     fn a_cursor_is_appended_and_percent_encoded() {
-        let url = append_cursor("/api/apps/demo/versions", CURSOR);
-        assert!(url.starts_with("/api/apps/demo/versions?cursor="), "{url}");
+        let url = append_cursor("/api/v1/apps/demo/versions", CURSOR);
+        assert!(
+            url.starts_with("/api/v1/apps/demo/versions?cursor="),
+            "{url}"
+        );
         assert!(!url.contains(' '), "{url}");
         assert!(url.contains("%2C"), "{url}");
         assert!(url.contains("%3D"), "{url}");
 
-        let with_query = append_cursor("/api/apps/demo/versions?limit=1000", CURSOR);
+        let with_query = append_cursor("/api/v1/apps/demo/versions?limit=1000", CURSOR);
         assert!(with_query.contains("?limit=1000&cursor="), "{with_query}");
     }
 
     #[tokio::test]
     async fn every_page_is_followed_until_the_cursor_runs_out() {
-        let router = Router::new().route("/api/apps/demo/versions", get(versions_page));
+        let router = Router::new().route("/api/v1/apps/demo/versions", get(versions_page));
         let (control, shutdown) = control_for(router).await;
         let versions = control.list_versions("demo").await.unwrap();
         let ids: Vec<&str> = versions.iter().map(|v| v.id.as_str()).collect();
@@ -1950,7 +2259,7 @@ mod list_page_tests {
     #[tokio::test]
     async fn secret_names_are_read_through_the_unified_envelope() {
         let router = Router::new().route(
-            "/api/apps/demo/environments/production/secrets",
+            "/api/v1/apps/demo/environments/production/secrets",
             get(secrets_page),
         );
         let (control, shutdown) = control_for(router).await;
@@ -1989,7 +2298,7 @@ mod list_page_tests {
 
     #[tokio::test]
     async fn accounts_are_read_through_the_unified_envelope() {
-        let router = Router::new().route("/api/accounts", get(accounts_page));
+        let router = Router::new().route("/api/v1/accounts", get(accounts_page));
         let (control, shutdown) = control_for(router).await;
         let accounts = control.list_accounts().await.unwrap();
         let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
@@ -2047,7 +2356,7 @@ mod list_page_tests {
 
     #[tokio::test]
     async fn tokens_are_listed_to_the_end_and_the_unscoped_count_is_the_filtered_total() {
-        let router = Router::new().route("/api/tokens", get(tokens_page));
+        let router = Router::new().route("/api/v1/tokens", get(tokens_page));
         let (control, shutdown) = control_for(router).await;
         let listing = control.list_tokens(None, true).await.unwrap();
         let names: Vec<&str> = listing.tokens.iter().map(|t| t.name.as_str()).collect();
@@ -2071,7 +2380,7 @@ mod list_page_tests {
                 "action": action,
                 "app_id": "demo",
                 "method": "POST",
-                "path": "/api/apps",
+                "path": "/api/v1/apps",
                 "outcome": "accepted",
                 "status": 200
             })
@@ -2086,7 +2395,7 @@ mod list_page_tests {
 
     #[tokio::test]
     async fn the_audit_log_is_read_as_one_bounded_page() {
-        let router = Router::new().route("/api/audit", get(audit_page));
+        let router = Router::new().route("/api/v1/audit", get(audit_page));
         let (control, shutdown) = control_for(router).await;
         let entries = control
             .read_audit(&AuditFilter {
@@ -2133,7 +2442,7 @@ mod list_page_tests {
     #[tokio::test]
     async fn a_deployment_history_is_one_bounded_page_and_says_how_deep_it_goes() {
         let router = Router::new().route(
-            "/api/apps/demo/environments/production/deployments",
+            "/api/v1/apps/demo/environments/production/deployments",
             get(deployments_page),
         );
         let (control, shutdown) = control_for(router).await;
@@ -2190,7 +2499,7 @@ mod list_page_tests {
     #[tokio::test]
     async fn routes_are_read_through_the_unified_envelope_in_the_servers_order() {
         let router = Router::new().route(
-            "/api/apps/demo/environments/production/routes",
+            "/api/v1/apps/demo/environments/production/routes",
             get(routes_page),
         );
         let (control, shutdown) = control_for(router).await;
@@ -2241,7 +2550,7 @@ mod list_page_tests {
 
     #[tokio::test]
     async fn domain_grants_are_read_through_the_unified_envelope() {
-        let router = Router::new().route("/api/domains", get(domains_page));
+        let router = Router::new().route("/api/v1/domains", get(domains_page));
         let (control, shutdown) = control_for(router).await;
         let grants = control.list_domain_grants().await.unwrap();
         let patterns: Vec<&str> = grants.iter().map(|g| g.pattern.as_str()).collect();
@@ -2277,7 +2586,7 @@ mod list_page_tests {
 
     #[tokio::test]
     async fn an_empty_page_that_still_offers_another_is_refused() {
-        let router = Router::new().route("/api/apps/demo/environments", get(endless_empty_page));
+        let router = Router::new().route("/api/v1/apps/demo/environments", get(endless_empty_page));
         let (control, shutdown) = control_for(router).await;
         let error = control
             .list_environments("demo")
@@ -2285,6 +2594,305 @@ mod list_page_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("empty page"), "{error}");
+        let _ = shutdown.send(());
+    }
+}
+
+/// The two prefixes, the deprecation window, and the two error shapes.
+#[cfg(test)]
+mod surface_tests {
+    use super::test_server::control_for;
+    use super::*;
+    use axum::{
+        Json, Router,
+        extract::Path,
+        http::header::CONTENT_TYPE,
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const REQUEST: &str = "018f2518-7e38-7f80-8000-0000000000aa";
+    /// What `deis-control`'s route fallback answers, byte for byte, for a
+    /// path it has no route for - on every control plane there has been.
+    const ROUTE_FALLBACK: &str = r#"{"error":"Not Found","details":"No such endpoint. The API surface is listed in the component's API_DOCUMENTATION.md."}"#;
+
+    fn page(items: Vec<serde_json::Value>) -> serde_json::Value {
+        let count = items.len();
+        serde_json::json!({
+            "schemaVersion": 1,
+            "items": items,
+            "page": {"limit": 100, "count": count, "total": count, "nextCursor": null}
+        })
+    }
+
+    fn version(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "app_id": "demo",
+            "number": 1,
+            "bundle_sha": "sha256",
+            "created_at": 1
+        })
+    }
+
+    /// A control plane from before the versioned prefixes: every route it
+    /// has lives under `/api`, and anything else gets the route fallback.
+    /// `probes` counts how often the fallback was reached.
+    fn older_control_plane(probes: Arc<AtomicUsize>) -> Router {
+        Router::new()
+            .route(
+                "/api/apps/demo/versions",
+                get(|| async { Json(page(vec![version("version-1")])) }),
+            )
+            .route(
+                "/api/accounts",
+                get(|| async {
+                    Json(page(vec![serde_json::json!({
+                        "id": "id-alice", "name": "alice", "role": "viewer", "created_at": 1
+                    })]))
+                }),
+            )
+            .route(
+                "/api/apps",
+                post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": "app demo already exists"})),
+                    )
+                }),
+            )
+            .fallback(move || {
+                let probes = probes.clone();
+                async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::NOT_FOUND,
+                        [(CONTENT_TYPE, "application/json")],
+                        ROUTE_FALLBACK,
+                    )
+                        .into_response()
+                }
+            })
+    }
+
+    #[test]
+    fn a_versioned_path_has_exactly_one_legacy_spelling() {
+        assert_eq!(
+            legacy_spelling("/api/v1/apps/demo?limit=1").as_deref(),
+            Some("/api/apps/demo?limit=1")
+        );
+        assert_eq!(
+            legacy_spelling("/api/platform/runtime").as_deref(),
+            Some("/api/runtime")
+        );
+        // Already the legacy spelling, or a lookalike: nothing to fall back to.
+        assert_eq!(legacy_spelling("/api/apps"), None);
+        assert_eq!(legacy_spelling("/api/v10/apps"), None);
+        assert_eq!(legacy_spelling("/api/platformer"), None);
+    }
+
+    #[test]
+    fn a_refusal_is_read_in_either_shape() {
+        match Refusal::parse(br#"{"error":"plain"}"#) {
+            Some(Refusal::Plain(message)) => assert_eq!(message, "plain"),
+            other => panic!("{other:?}"),
+        }
+        match Refusal::parse(
+            br#"{"error":{"code":"not-found","message":"no app demo","requestId":"r","violations":[],"retryable":false}}"#,
+        ) {
+            Some(Refusal::Structured(error)) => {
+                assert_eq!(error.code, "not-found");
+                assert_eq!(error.request_id.as_deref(), Some("r"));
+                assert!(error.violations.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        // An envelope missing a required member is not one; nor is a body
+        // whose `error` is neither shape, nor a body that is not JSON.
+        assert!(Refusal::parse(br#"{"error":{"message":"no code"}}"#).is_none());
+        assert!(Refusal::parse(br#"{"error":7}"#).is_none());
+        assert!(Refusal::parse(b"<html>gateway</html>").is_none());
+        assert!(!Refusal::is_structured(ROUTE_FALLBACK.as_bytes()));
+    }
+
+    #[test]
+    fn an_audit_line_reads_its_request_id_by_the_wire_name() {
+        let line: AuditEntry = serde_json::from_value(serde_json::json!({
+            "id": 1, "at": 1, "actor_kind": "account", "action": "deploy",
+            "method": "POST", "path": "/api/v1/apps", "outcome": "accepted", "status": 200,
+            "requestId": REQUEST
+        }))
+        .unwrap();
+        assert_eq!(line.request_id.as_deref(), Some(REQUEST));
+        let older: AuditEntry = serde_json::from_value(serde_json::json!({
+            "id": 1, "at": 1, "actor_kind": "account", "action": "deploy",
+            "method": "POST", "path": "/api/apps", "outcome": "accepted", "status": 200,
+            "requestId": null
+        }))
+        .unwrap();
+        assert!(older.request_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_older_control_plane_is_probed_once_and_then_driven_through_the_legacy_tree() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (control, shutdown) = control_for(older_control_plane(probes.clone())).await;
+        assert!(!control.speaks_legacy());
+
+        let versions = control.list_versions("demo").await.unwrap();
+        assert_eq!(versions[0].id, "version-1");
+        assert!(control.speaks_legacy());
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        // The second call is built for the legacy tree outright: no probe.
+        let accounts = control.list_accounts().await.unwrap();
+        assert_eq!(accounts[0].name, "alice");
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        // And its flat refusal is still read as the string it is, with no
+        // request id invented for it.
+        let error = control.create_app("demo").await.unwrap_err().to_string();
+        assert!(error.contains("409"), "{error}");
+        assert!(error.contains("app demo already exists"), "{error}");
+        assert!(!error.contains("[request"), "{error}");
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        let _ = shutdown.send(());
+    }
+
+    /// A 404 that carries the envelope is the control plane saying "no such
+    /// record" on a surface it does know; the legacy tree is not consulted.
+    #[tokio::test]
+    async fn a_versioned_404_about_a_record_is_an_answer_not_a_missing_surface() {
+        let router = Router::new()
+            .route(
+                "/api/v1/apps/:id",
+                get(|Path(id): Path<String>| async move {
+                    (
+                        StatusCode::NOT_FOUND,
+                        [(REQUEST_ID_HEADER, REQUEST)],
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "not-found",
+                                "message": format!("no app {id}"),
+                                "requestId": REQUEST,
+                                "violations": [],
+                                "retryable": false
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/api/apps/:id",
+                get(|| async { Json(serde_json::json!({"id": "demo", "created_at": 1})) }),
+            );
+        let (control, shutdown) = control_for(router).await;
+        assert!(control.get_app("demo").await.unwrap().is_none());
+        assert!(!control.speaks_legacy());
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn a_structured_refusal_prints_its_code_its_fields_and_its_request_id() {
+        async fn refuse() -> Response {
+            (
+                StatusCode::BAD_REQUEST,
+                [(REQUEST_ID_HEADER, REQUEST)],
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "invalid-argument",
+                        "message": "the request names no application",
+                        "requestId": REQUEST,
+                        "target": {"resource": "app", "field": "id"},
+                        "violations": [
+                            {"field": "id", "code": "required", "message": "must be given"}
+                        ],
+                        "retryable": false
+                    }
+                })),
+            )
+                .into_response()
+        }
+        let router = Router::new().route("/api/v1/apps", post(refuse));
+        let (control, shutdown) = control_for(router).await;
+        let error = control.create_app("demo").await.unwrap_err().to_string();
+        assert!(
+            error.contains("400 Bad Request: invalid-argument: the request names no application"),
+            "{error}"
+        );
+        assert!(
+            error.contains("\n  - id: must be given (required)"),
+            "{error}"
+        );
+        assert!(error.contains(&format!("[request {REQUEST}]")), "{error}");
+        assert!(!error.contains("tried again"), "{error}");
+        let _ = shutdown.send(());
+    }
+
+    /// A refusal whose envelope names no request id still prints the one
+    /// from the header, and a retryable one says so.
+    #[tokio::test]
+    async fn a_retryable_refusal_says_when_to_try_again() {
+        async fn refuse() -> Response {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(REQUEST_ID_HEADER, REQUEST)],
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "backend-unavailable",
+                        "message": "the runtime fleet is not answering",
+                        "retryable": true,
+                        "retryAfterSeconds": 30
+                    }
+                })),
+            )
+                .into_response()
+        }
+        let router = Router::new().route("/api/v1/accounts", post(refuse));
+        let (control, shutdown) = control_for(router).await;
+        let error = control
+            .create_account("alice", "viewer")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("backend-unavailable: the runtime fleet"),
+            "{error}"
+        );
+        assert!(error.contains(&format!("[request {REQUEST}]")), "{error}");
+        assert!(error.contains("try again in 30 seconds"), "{error}");
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn the_fleet_is_read_from_the_platform_surface() {
+        let router = Router::new()
+            .route(
+                "/api/platform/runtime",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "nodes": [{"id": "n1", "addr": "10.0.0.1:50051", "healthy": true}]
+                    }))
+                }),
+            )
+            .route(
+                "/api/platform/runtime/n1/status",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "apps": [{"app_id": "demo", "environment": "production", "state": "running"}]
+                    }))
+                }),
+            );
+        let (control, shutdown) = control_for(router).await;
+        let nodes = control.list_nodes().await.unwrap();
+        assert_eq!(nodes[0].id, "n1");
+        let apps = control.node_status("n1").await.unwrap().unwrap();
+        assert_eq!(apps[0].app_id, "demo");
+        assert!(!control.speaks_legacy());
         let _ = shutdown.send(());
     }
 }

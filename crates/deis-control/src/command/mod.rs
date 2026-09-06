@@ -6,16 +6,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, oneshot};
 use tokio::time::timeout;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::database::{CommandEntry, CommandEvent, CommandStatus, Database};
+use crate::catalog::{CatalogPage, PageCursorStore};
+use crate::database::{CommandEntry, CommandEvent, CommandStatus, Database, KeysetAfter};
 use crate::session::SessionManager;
 use deis_wire::pb::{
     CommandRequest as ProtoCommandRequest, ControlMessage, control_message::Payload,
 };
 
 /// Command type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandType {
     Shutdown,
@@ -90,6 +92,34 @@ impl CommandTracker {
                  nothing follows that",
                 status.as_str()
             ),
+        }
+    }
+}
+
+/// One command as the history lists it: what was asked of which node, how
+/// far it got and when. The payload and the answer are not here; the status
+/// route serves those one command at a time.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CommandSummary {
+    pub id: String,
+    pub node_id: String,
+    pub command_type: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl From<CommandEntry> for CommandSummary {
+    fn from(entry: CommandEntry) -> Self {
+        Self {
+            id: entry.id,
+            node_id: entry.node_id,
+            command_type: entry.command_type,
+            status: entry.status.as_str().to_string(),
+            created_at: entry.created_at,
+            sent_at: entry.sent_at,
+            completed_at: entry.completed_at,
         }
     }
 }
@@ -492,46 +522,31 @@ impl CommandExecutor {
         }
     }
 
-    /// List all commands
-    pub async fn list_commands(&self) -> Vec<serde_json::Value> {
-        self.database
-            .list_commands(None)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| {
-                serde_json::json!({
-                    "id": entry.id,
-                    "node_id": entry.node_id,
-                    "command_type": entry.command_type,
-                    "status": entry.status.as_str(),
-                    "created_at": entry.created_at,
-                    "sent_at": entry.sent_at,
-                    "completed_at": entry.completed_at,
-                })
-            })
-            .collect()
+    /// Opaque list-cursor persistence for the command history, backed by
+    /// the same table every other Control list pages through.
+    pub fn page_cursors(&self) -> PageCursorStore {
+        PageCursorStore::new(Arc::clone(&self.database))
     }
 
-    /// List commands for a specific node
-    pub async fn list_node_commands(&self, node_id: &str) -> Vec<serde_json::Value> {
-        self.database
-            .list_commands(Some(node_id))
+    /// One page of the command history, newest first, optionally narrowed
+    /// to one node. `after` is where the previous page stopped; `total` is
+    /// the exact count of matching commands at the moment the page was read.
+    pub async fn list_commands(
+        &self,
+        node_id: Option<&str>,
+        limit: usize,
+        after: Option<KeysetAfter<String>>,
+    ) -> Result<CatalogPage<CommandSummary>, ExecuteError> {
+        let page = self
+            .database
+            .list_commands_page(node_id, limit, after)
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| {
-                serde_json::json!({
-                    "id": entry.id,
-                    "node_id": entry.node_id,
-                    "command_type": entry.command_type,
-                    "status": entry.status.as_str(),
-                    "created_at": entry.created_at,
-                    "sent_at": entry.sent_at,
-                    "completed_at": entry.completed_at,
-                })
-            })
-            .collect()
+            .map_err(|e| ExecuteError::DatabaseError(e.to_string()))?;
+        Ok(CatalogPage {
+            items: page.items.into_iter().map(CommandSummary::from).collect(),
+            total: page.total,
+            has_more: page.has_more,
+        })
     }
 
     /// Cancel command

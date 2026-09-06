@@ -30,14 +30,17 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::IntoParams;
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, list_page};
 use crate::catalog::domains::EVERY_ENVIRONMENT;
 use crate::catalog::{DomainGrant, PagePosition, domain_grant_cursor_secondary};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GrantRequest {
     /// `example.com`, `*.example.com` (every name strictly under the zone,
     /// exactly as a wildcard route matches), `(no-host)` (the route that
@@ -54,7 +57,7 @@ pub struct GrantRequest {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GrantResponse {
     pub grant: DomainGrant,
 }
@@ -62,9 +65,13 @@ pub struct GrantResponse {
 /// Which grant a `DELETE` is about. The pattern is in the path; a grant is
 /// identified by all three columns, because two applications can hold the
 /// same pattern.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GrantSelector {
+    /// The application that holds the grant.
     pub app_id: String,
+    /// The environment the grant was made for. Absent means the grant that
+    /// covers every environment (`*`).
     #[serde(default)]
     pub environment: Option<String>,
 }
@@ -74,6 +81,19 @@ pub struct GrantSelector {
 /// The whole registry in `(pattern, app_id, environment)` order. The scope
 /// is global: a hostname belongs to nobody's application, which is the
 /// whole point of the table.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains",
+    operation_id = "listDomainGrants",
+    tag = "product",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "One page of hostname grants.", body = ControlListPage<DomainGrant>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_grants(
     State(state): State<CatalogState>,
     Query(query): Query<ListQuery>,
@@ -105,6 +125,21 @@ pub async fn list_grants(
 }
 
 /// POST /api/domains
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains",
+    operation_id = "createDomainGrant",
+    tag = "product",
+    request_body = GrantRequest,
+    responses(
+        (status = 201, description = "The grant as created.", body = GrantResponse),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn create_grant(
     State(state): State<CatalogState>,
     Json(request): Json<GrantRequest>,
@@ -131,11 +166,25 @@ pub async fn create_grant(
 /// The pattern travels in the path because that is what it is - the name of
 /// the thing - and the grantee in the query because a pattern can be held by
 /// more than one application and a delete has to say which one it means.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/domains/{pattern}",
+    operation_id = "deleteDomainGrant",
+    tag = "product",
+    params(("pattern" = String, Path, description = "The hostname pattern the grant holds."), GrantSelector),
+    responses(
+        (status = 200, description = "The grant was withdrawn.", body = GrantWithdrawn),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn delete_grant(
     State(state): State<CatalogState>,
     Path(pattern): Path<String>,
     Query(selector): Query<GrantSelector>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<GrantWithdrawn>> {
     if selector.app_id.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "name which grant to withdraw: a pattern can be held by more than one application, \
@@ -153,9 +202,19 @@ pub async fn delete_grant(
         .store
         .delete_domain_grant(&pattern, &selector.app_id, &environment)
         .await?;
-    Ok(Json(serde_json::json!({
-        "withdrawn": pattern,
-        "app_id": selector.app_id,
-        "environment": environment,
-    })))
+    Ok(Json(GrantWithdrawn {
+        withdrawn: pattern,
+        app_id: selector.app_id,
+        environment,
+    }))
+}
+
+/// A grant was withdrawn.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GrantWithdrawn {
+    /// The pattern the grant held.
+    pub withdrawn: String,
+    pub app_id: String,
+    /// The environment the grant was scoped to, or `*` for every one.
+    pub environment: String,
 }

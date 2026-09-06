@@ -55,6 +55,7 @@ use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
+use utoipa::ToSchema;
 
 use crate::config::RuntimeNodeConfig;
 use crate::node_key::NodeKeyFingerprint;
@@ -189,7 +190,7 @@ struct ConfiguredNodeKey {
 /// values, and an address that proved the retiring one would otherwise be
 /// handed its replacement on the next poll - which is how a leaked value
 /// would turn into the new one instead of being rotated out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKeyStatus {
     /// The node registered with a key that is in the list, and that is the
@@ -257,7 +258,7 @@ fn reported_error(
 }
 
 /// Last observed health of one deis-runtime node.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct NodeHealth {
     pub healthy: bool,
     pub version: Option<String>,
@@ -284,7 +285,7 @@ impl Default for NodeHealth {
 /// made and has to keep making; when it stops, the entry is dropped, because
 /// otherwise a decommissioned machine keeps collecting deployment pushes and
 /// cron fires that silently go nowhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeSource {
     /// Listed in `deis_runtime_nodes`. Never expires.
@@ -316,7 +317,7 @@ impl NodeSource {
 ///
 /// The record is cleared when the node registers again, or when somebody says
 /// the machine is really gone with `DELETE /api/nodes/{id}/registration`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DepartedNode {
     pub id: String,
     /// Where it was last known to answer.
@@ -387,7 +388,7 @@ pub struct NodeIdentity {
 /// which is what happens when whichever machine was wrong is corrected or shut
 /// down - or when an operator says the machine is gone with
 /// `DELETE /api/nodes/{id}/registration`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ContestedNodeId {
     pub id: String,
     /// The address that holds the id, and the only one anything is sent to.
@@ -467,7 +468,7 @@ struct NodeEntry {
     key: Option<NodeKeyFingerprint>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct NodeView {
     pub id: String,
     pub addr: String,
@@ -483,6 +484,7 @@ pub struct NodeView {
     pub key_status: NodeKeyStatus,
     /// Prefix of the SHA-256 of the key the node proved, so an operator can
     /// tell which value of a rotating list a node is on. Never the value.
+    #[schema(value_type = Option<String>)]
     pub key_fingerprint: Option<NodeKeyFingerprint>,
     #[serde(flatten)]
     pub health: NodeHealth,

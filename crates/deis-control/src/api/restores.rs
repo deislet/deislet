@@ -17,8 +17,11 @@ use axum::{
 use deis_wire::{BackendRestoreSet, CanonicalId, ProductOperation};
 use serde::Serialize;
 use tracing::{error, info, warn};
+use utoipa::ToSchema;
 
+use super::openapi;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::paths::ApiPaths;
 use crate::catalog::{
     BackendRestoreCoordinator, BackendRestorePlan, CatalogStore, OperationRequestContext,
     ProductInstallation,
@@ -138,30 +141,67 @@ impl RestoreApiState {
     }
 }
 
-pub fn router(state: RestoreApiState) -> Router {
+/// `prefix` is where the routes are mounted: `"/api"` for the legacy flat
+/// tree, `""` inside a `/api/v1` nest.
+pub fn router(prefix: &str, state: RestoreApiState) -> Router {
     Router::new()
-        .route("/api/installation", get(get_installation))
-        .route("/api/backend-restores", post(start_restore))
-        .route("/api/backend-restores/:restore_id", get(get_restore))
+        .route(&format!("{prefix}/installation"), get(get_installation))
+        .route(&format!("{prefix}/backend-restores"), post(start_restore))
+        .route(
+            &format!("{prefix}/backend-restores/:restore_id"),
+            get(get_restore),
+        )
         .with_state(state)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendRestoreStatus {
     pub plan: BackendRestorePlan,
+    #[schema(value_type = crate::api::openapi::ProductOperationDocument)]
     pub operation: ProductOperation,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/installation",
+    operation_id = "getProductInstallation",
+    tag = "product",
+    responses(
+        (status = 200, description = "This control plane's installation record.", body = ProductInstallation),
+        (status = 500, response = openapi::Internal),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_installation(
     State(state): State<RestoreApiState>,
 ) -> ApiResult<Json<ProductInstallation>> {
     Ok(Json(state.store.product_installation().await?))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/backend-restores",
+    operation_id = "startBackendRestore",
+    tag = "product",
+    params(("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation.")),
+    request_body(content = openapi::BackendRestoreSetDocument, description = "The restore set to apply."),
+    responses(
+        (status = 202, description = "The restore was planned; poll `Location`.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 409, response = openapi::Conflict),
+        (status = 422, response = openapi::UnprocessableEntity),
+        (status = 428, response = openapi::PreconditionRequired),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn start_restore(
     State(state): State<RestoreApiState>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Extension(principal): Extension<Principal>,
     Json(restore_set): Json<BackendRestoreSet>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
@@ -178,16 +218,31 @@ pub async fn start_restore(
         .ok_or_else(|| {
             ApiError::InternalError(format!("operation {} is missing", plan.operation_id))
         })?;
-    let response_headers = operation_headers(&operation)?;
+    let response_headers = operation_headers(paths, &operation)?;
     if !operation.state.terminal() {
         state.launch(coordinator, plan.operation_id);
     }
     Ok((StatusCode::ACCEPTED, response_headers, Json(operation)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/backend-restores/{restore_id}",
+    operation_id = "getBackendRestore",
+    tag = "product",
+    params(("restore_id" = String, Path, description = "The restore's canonical UUIDv7.")),
+    responses(
+        (status = 200, description = "The plan and its operation.", body = BackendRestoreStatus, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn get_restore(
     State(state): State<RestoreApiState>,
     Path(restore_id): Path<String>,
+    paths: ApiPaths,
 ) -> ApiResult<(HeaderMap, Json<BackendRestoreStatus>)> {
     let restore_id = parse_id(&restore_id, "restore")?;
     let plan = state
@@ -202,7 +257,7 @@ pub async fn get_restore(
         .ok_or_else(|| {
             ApiError::InternalError(format!("operation {} is missing", plan.operation_id))
         })?;
-    let headers = operation_headers(&operation)?;
+    let headers = operation_headers(paths, &operation)?;
     Ok((headers, Json(BackendRestoreStatus { plan, operation })))
 }
 
@@ -235,12 +290,11 @@ fn operation_context(
     .map_err(Into::into)
 }
 
-fn operation_headers(operation: &ProductOperation) -> ApiResult<HeaderMap> {
+fn operation_headers(paths: ApiPaths, operation: &ProductOperation) -> ApiResult<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::LOCATION,
-        HeaderValue::from_str(&format!("/api/operations/{}", operation.operation_id))
-            .map_err(|error| ApiError::InternalError(error.to_string()))?,
+        paths.location(&format!("/operations/{}", operation.operation_id))?,
     );
     headers.insert(
         header::ETAG,
@@ -341,7 +395,8 @@ mod tests {
         if let RestoreCoordinatorAvailability::Unavailable(reason) = &restore_state.coordinator {
             panic!("test restore coordinator is unavailable: {reason}");
         }
-        let api = router(restore_state);
+        // Legacy prefix on purpose: the flat tree's regression coverage.
+        let api = router("/api", restore_state);
 
         let installation_response = api
             .clone()

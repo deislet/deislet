@@ -39,6 +39,7 @@ use std::sync::Arc;
 use axum::http::HeaderMap;
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
+use utoipa::ToSchema;
 
 use crate::catalog::secrets::{secret_aad, secret_revision_aad};
 use crate::catalog::{
@@ -378,7 +379,7 @@ impl StorageWiring {
 /// Why a delivery is happening. Only used for logs and for the answer the
 /// API gives, but it is the difference between "someone deployed" and "a
 /// secret changed under a version that did not move".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryReason {
     Deployment,
@@ -740,7 +741,7 @@ fn limits_to_wire(limits: &DeclaredLimits) -> proto::ResourceLimits {
 }
 
 /// One node that did not take the deployment.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct NodeFailure {
     pub node: String,
     /// Transport error or the node's own rejection message. Never carries
@@ -750,7 +751,7 @@ pub struct NodeFailure {
 
 /// What came of one delivery. Returned to the API caller so a deploy says
 /// where it actually landed instead of only that a row was written.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeliveryReport {
     pub reason: DeliveryReason,
     /// Wire phase this report actually observed. This prevents a successful
@@ -797,7 +798,7 @@ impl DeliveryReport {
 /// mention the app again, while a node that was not reached keeps serving
 /// it - with its code, its secrets in memory and its queue consumers still
 /// polling - until that process restarts.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RemovalReport {
     pub app_id: String,
     /// Environment names the catalog had for this app when it was deleted.

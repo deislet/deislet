@@ -1,116 +1,25 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '@/lib/api'
-import type { Command } from '@/lib/api'
+import type { Command, Event, FleetNode, MetricsSummary, SessionSummary } from '@/lib/api'
 
-// Every request below goes through `api.request` rather than a bare `fetch`.
-// These hooks used to call `fetch` directly, which meant they sent no
-// `X-API-Key`: with `api_auth_enabled = true` the whole dashboard answered 401
-// on every poll. One request layer, one place that carries the key and handles
-// a 401.
+// Every request below goes through `api` rather than a bare `fetch`. These
+// hooks used to call `fetch` directly, which meant they sent no `X-API-Key`:
+// with `api_auth_enabled = true` the whole console answered 401 on every
+// poll. One request layer, one place that carries the key, handles a 401,
+// reads the control plane's error envelope and puts the `/api/platform`
+// prefix on - every route these hooks read lives there.
 //
 // These hooks never mount without a credential the control plane has already
 // accepted: App.tsx asks one question before it renders them and shows the key
 // screen instead when the answer is 401 (see `Access` there). That is what
 // stops the five intervals below from polling a control plane that is refusing
 // all of them.
-
-/**
- * Read a list out of a response that may be either `{ <key>: [...] }` or a
- * bare array. Both shapes are in use across these endpoints, and a mismatch
- * used to surface as an empty page rather than an error.
- */
-function listFrom<T>(data: unknown, key: string): T[] {
-  if (Array.isArray(data)) return data as T[]
-  if (data && typeof data === 'object') {
-    const value = (data as Record<string, unknown>)[key]
-    if (Array.isArray(value)) return value as T[]
-  }
-  return []
-}
-
-/**
- * Same idea for an object-valued response: `{ <key>: {...} }` or the object
- * itself.
- */
-function objectFrom(data: unknown, key: string): Record<string, unknown> {
-  if (data && typeof data === 'object' && !Array.isArray(data)) {
-    const record = data as Record<string, unknown>
-    const value = record[key]
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      return value as Record<string, unknown>
-    }
-    return record
-  }
-  return {}
-}
-
-/**
- * One node holding a control channel open to the control plane, as
- * `/api/sessions` reports it.
- *
- * A heartbeat on this channel says the node is there and nothing else, which
- * is why there is no load figure here: the wire's heartbeat message is a
- * status string.
- */
-interface SessionSummary {
-  id: string
-  instance_id: string
-  node_role: string
-  host: string
-  ports: number[]
-  state: string
-  connected_at: string
-  last_heartbeat: string
-}
-
-
-/**
- * One deis-runtime node, as `/api/runtime` reports it.
- *
- * These are not the same objects as `SessionSummary` above: those are the
- * processes holding a deis-wire control channel open, while these are the
- * runtime nodes the control plane dials over gRPC to deploy versions, probe
- * health and fire cron. A node gets on this list either because it is named
- * in the control plane's configuration file or because it registered itself,
- * which is what `source` says.
- */
-interface FleetNode {
-  id: string
-  addr: string
-  source: 'configured' | 'registered'
-  registered_at: string | null
-  last_registered_at: string | null
-  healthy: boolean
-  version: string | null
-  last_checked: string | null
-  last_error: string | null
-}
-
-interface Event {
-  event_type: string
-  node_id?: string
-  severity: string
-  message: string
-  metadata?: Record<string, unknown>
-  timestamp: string
-}
-
-interface MetricsSummary {
-  nodes: {
-    total: number
-    active: number
-    connected: number
-    registered: number
-    disconnected: number
-    by_type: Record<string, number>
-  }
-  system: {
-    uptime_seconds: number
-    total_events: number
-    total_commands: number
-    total_heartbeats: number
-  }
-}
+//
+// The two list hooks (`useCommands`, `useEvents`) read the first page of the
+// unified list envelope on every tick and stop there: the newest rows are
+// what a live view shows, and walking a history with no ceiling every few
+// seconds is what `page.nextCursor` exists to spare the control plane. A
+// view that needs the rest reads it once through `listAll` in `@/lib/api`.
 
 export function useMetrics() {
   const [metrics, setMetrics] = useState<MetricsSummary | null>(null)
@@ -123,8 +32,8 @@ export function useMetrics() {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const data = await api.request<unknown>('/api/metrics/summary')
-      setMetrics(objectFrom(data, 'metrics') as unknown as MetricsSummary)
+      const data = await api.getMetricsSummary()
+      setMetrics(data.metrics)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch metrics')
@@ -166,8 +75,8 @@ export function useSessions() {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const data = await api.request<unknown>('/api/sessions')
-      setSessions(listFrom<SessionSummary>(data, 'sessions'))
+      const data = await api.getSessions()
+      setSessions(data.sessions)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch control channels')
@@ -207,8 +116,8 @@ export function useFleet() {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const data = await api.request<unknown>('/api/runtime')
-      setNodes(listFrom<FleetNode>(data, 'nodes'))
+      const data = await api.getFleet()
+      setNodes(data.nodes)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch the runtime fleet')
@@ -232,8 +141,14 @@ export function useFleet() {
   return { fleet: nodes, loading, error, refetch: fetchNodes }
 }
 
+/**
+ * The newest page of the command history - the whole fleet's, or one
+ * node's - re-read every few seconds. `total` is how many the history holds
+ * behind this page, counted by the control plane in the same read.
+ */
 export function useCommands(nodeId?: string) {
   const [commands, setCommands] = useState<Command[]>([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const initialLoadRef = useRef(true)
@@ -243,9 +158,9 @@ export function useCommands(nodeId?: string) {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const url = nodeId ? `/api/commands/node/${nodeId}` : '/api/commands'
-      const data = await api.request<unknown>(url)
-      setCommands(listFrom<Command>(data, 'commands'))
+      const page = nodeId ? await api.getNodeCommands(nodeId) : await api.getCommands()
+      setCommands(page.items)
+      setTotal(page.page.total)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch commands')
@@ -278,26 +193,30 @@ export function useCommands(nodeId?: string) {
       'get_status',
       'get_metrics',
       'execute_scheduled',
-    ]
-    const command_type = named.includes(commandType) ? commandType : { custom: commandType }
-    const result = await api.request<unknown>(`/api/commands/execute/${nodeId}`, {
-      method: 'POST',
-      body: JSON.stringify({ command_type, data }),
-    })
+    ] as const
+    const isNamed = (name: string): name is (typeof named)[number] =>
+      (named as readonly string[]).includes(name)
+    const command_type = isNamed(commandType) ? commandType : { custom: commandType }
+    const result = await api.executeCommand(nodeId, { command_type, data })
     await fetchCommands()
     return result
   }
 
   const cancelCommand = async (commandId: string) => {
-    await api.request(`/api/commands/cancel/${commandId}`, { method: 'POST' })
+    await api.cancelCommand(commandId)
     await fetchCommands()
   }
 
-  return { commands, loading, error, refetch: fetchCommands, executeCommand, cancelCommand }
+  return { commands, total, loading, error, refetch: fetchCommands, executeCommand, cancelCommand }
 }
 
+/**
+ * The newest page of the event log, re-read every few seconds. `total` is
+ * how many events the log holds behind this page.
+ */
 export function useEvents() {
   const [events, setEvents] = useState<Event[]>([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const initialLoadRef = useRef(true)
@@ -307,8 +226,9 @@ export function useEvents() {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const data = await api.request<unknown>('/api/events')
-      setEvents(listFrom<Event>(data, 'events'))
+      const page = await api.getEvents()
+      setEvents(page.items)
+      setTotal(page.page.total)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch events')
@@ -329,7 +249,7 @@ export function useEvents() {
     }
   }, [fetchEvents])
 
-  return { events, loading, error, refetch: fetchEvents }
+  return { events, total, loading, error, refetch: fetchEvents }
 }
 
 export function useConfigs(nodeId?: string) {
@@ -343,9 +263,8 @@ export function useConfigs(nodeId?: string) {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const url = nodeId ? `/api/configs/${nodeId}` : '/api/configs'
-      const data = await api.request<unknown>(url)
-      setConfigs(objectFrom(data, 'data'))
+      const data = nodeId ? await api.getNodeConfig(nodeId) : await api.getConfigs()
+      setConfigs(data.data)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch configs')
@@ -364,10 +283,7 @@ export function useConfigs(nodeId?: string) {
   }, [fetchConfigs])
 
   const updateConfig = async (nodeId: string, configs: Record<string, unknown>) => {
-    await api.request(`/api/configs/${nodeId}`, {
-      method: 'POST',
-      body: JSON.stringify({ configs }),
-    })
+    await api.updateNodeConfig(nodeId, configs)
     await fetchConfigs()
   }
 

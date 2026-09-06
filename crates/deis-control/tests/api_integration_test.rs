@@ -224,8 +224,11 @@ async fn test_api_events_endpoint() {
 
     assert_eq!(response.status(), 200);
 
+    // The event log answers in the unified list envelope.
     let json: serde_json::Value = response.json().await.unwrap();
-    assert!(json.get("events").is_some());
+    assert_eq!(json["schemaVersion"], 1, "{json}");
+    assert!(json["items"].is_array(), "{json}");
+    assert_eq!(json["page"]["total"], 0, "{json}");
 }
 
 /// Bounded probe for the opposite of `wait_for_server_ready`: the accept

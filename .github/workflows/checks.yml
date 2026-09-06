@@ -60,6 +60,16 @@ jobs:
         run: python3 scripts/check-product-governance.py
       - name: Execute shared product contract fixtures
         run: python3 scripts/check-shared-contracts.py
+      # The OpenAPI document is generated from the control plane's code and
+      # committed; the drift test in the deis-control shard keeps the two
+      # equal. This step holds the committed file to its invariants and
+      # refuses a change that would break a client written against the
+      # document on main unless its major version bumps. The full history
+      # is needed because the baseline is read off origin/main.
+      - name: Hold the Control API OpenAPI document to its compatibility promise
+        run: |
+          git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main
+          python3 scripts/check-openapi-compat.py
       - name: Validate official provider tool source pins
         run: python3 scripts/check-provider-tool-lock.py
       - name: Reject target status drift from the locked registry

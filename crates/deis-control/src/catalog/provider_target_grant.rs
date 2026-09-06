@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use deis_wire::CanonicalId;
 use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
@@ -172,13 +173,18 @@ impl ProviderTargetGrantHistoryFilter {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderTargetGrant {
+    #[schema(value_type = String, format = Uuid)]
     pub grant_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub organization_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub application_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub environment_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub provider_target_id: CanonicalId,
     pub backend_id: String,
     pub target_name: String,
@@ -188,22 +194,30 @@ pub struct ProviderTargetGrant {
     pub status: String,
     pub revision: u64,
     pub note: Option<String>,
+    #[schema(value_type = String, format = Uuid)]
     pub granted_by_actor_id: CanonicalId,
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub revoked_by_actor_id: Option<CanonicalId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderTargetGrantAuditEvent {
+    #[schema(value_type = String, format = Uuid)]
     pub event_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub grant_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub application_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub environment_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub provider_target_id: CanonicalId,
     pub grant_revision: u64,
+    #[schema(value_type = String, format = Uuid)]
     pub actor_id: CanonicalId,
     pub event_type: String,
     /// Present on `revoked` events written since revocation reasons exist;

@@ -154,7 +154,7 @@ function ExecuteCommandDialog({ nodes, onExecute }: ExecuteCommandDialogProps) {
 
 export function Commands() {
   const { sessions } = useSessions()
-  const { commands, loading, error, refetch, executeCommand, cancelCommand } = useCommands()
+  const { commands, total, loading, error, refetch, executeCommand, cancelCommand } = useCommands()
   const [cancelling, setCancelling] = useState<string | null>(null)
 
   const handleExecuteCommand = async (nodeId: string, commandType: string, data?: unknown) => {
@@ -177,7 +177,10 @@ export function Commands() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold">Commands</h1>
-          <p className="text-muted-foreground">Execute and monitor node commands</p>
+          <p className="text-muted-foreground">
+            Execute and monitor node commands
+            {total > commands.length ? ` - newest ${commands.length} of ${total}` : ''}
+          </p>
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={refetch} disabled={loading}>
@@ -252,11 +255,11 @@ export function Commands() {
                   )}
                 </div>
 
-                {/* `GET /api/commands` and `.../node/:id` do not carry the
-                    command's payload, its result or an error message - see
-                    the `Command` type in `@/lib/api`. There is nothing to
-                    show here until the control plane's list endpoints answer
-                    with more than id/type/status/timestamps. */}
+                {/* `GET /api/platform/commands` and `.../node/:id` do not
+                    carry the command's payload, its result or an error
+                    message - see the `Command` type in `@/lib/api`. There is
+                    nothing to show here until the control plane's list
+                    endpoints answer with more than id/type/status/timestamps. */}
               </CardContent>
             </Card>
           ))}

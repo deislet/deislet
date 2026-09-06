@@ -18,6 +18,7 @@ use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params,
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
+use utoipa::ToSchema;
 
 use super::model::now_secs;
 use super::operation::{
@@ -32,7 +33,7 @@ const MIGRATION_COLUMNS: &str = "migration_id, operation_id, app_id, \
     fence_token, catalog_inventory, error_code, created_at, updated_at";
 
 /// The states persisted by the identity-migration contract.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum IdentityMigrationState {
     Planned,

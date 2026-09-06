@@ -19,11 +19,14 @@ use std::sync::{
 };
 use std::time::Duration;
 use tracing::{info, warn};
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use super::versions::VersionView;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, environment_scope, list_page};
+use crate::api::paths::ApiPaths;
 use crate::catalog::{
     CatalogError, CatalogStore, Deployment, DeploymentDrainObservation, DeploymentEvent,
     DeploymentGenerationDrain, DeploymentPlan, DeploymentPlanSpec, DeploymentProxyObservation,
@@ -146,7 +149,7 @@ impl DeploymentPlanLease {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct DeployRequest {
     /// Target version by id. Takes precedence over `version_number`.
     #[serde(default)]
@@ -162,7 +165,7 @@ pub struct DeployRequest {
     pub config_values: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, ToSchema)]
 pub struct RollbackRequest {
     /// Explicit target. When omitted, the previous distinct version this
     /// environment ran is used.
@@ -174,7 +177,7 @@ pub struct RollbackRequest {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DeploymentResponse {
     /// Absent while an accepted plan is still draining its pre-commit queue
     /// barrier. No production pointer exists for that plan yet.
@@ -190,7 +193,7 @@ pub struct DeploymentResponse {
     pub plan: Option<DeploymentPlan>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DeploymentPlanResponse {
     pub plan: DeploymentPlan,
     pub targets: Vec<DeploymentTargetObservation>,
@@ -210,10 +213,29 @@ pub struct DeploymentPlanResponse {
 /// environment whose secrets cannot be decrypted is refused before the plan
 /// or pointer exists; a plan still draining its pre-commit barrier is returned
 /// as `202 Accepted` and remains queryable through `Location`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/deployments",
+    operation_id = "deploy",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name.")),
+    request_body = DeployRequest,
+    responses(
+        (status = 201, description = "The deployment was recorded and delivered.", body = DeploymentResponse),
+        (status = 202, description = "The deployment was planned and is being coordinated; poll `Location`.", body = DeploymentResponse, headers(("Location" = String, description = "Where to poll the deployment plan."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn deploy(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
     headers: HeaderMap,
+    paths: ApiPaths,
     Json(request): Json<DeployRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<DeploymentResponse>)> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
@@ -257,7 +279,7 @@ pub async fn deploy(
 
     Ok((
         status,
-        deployment_plan_location(&app_id, &env_name, &plan.id),
+        deployment_plan_location(paths, &app_id, &env_name, &plan.id),
         Json(response(
             &env,
             deployment,
@@ -274,10 +296,29 @@ pub async fn deploy(
 /// historical binding snapshot. The current pointer is changed only after
 /// the same strict prepare barrier used by a forward deployment, so rollback
 /// remains reversible and never silently rebinds secrets by name.
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/rollback",
+    operation_id = "rollback",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name.")),
+    request_body(content = RollbackRequest, description = "Optional. Absent means the previous deployment."),
+    responses(
+        (status = 201, description = "The rollback was recorded and delivered.", body = DeploymentResponse),
+        (status = 202, description = "The rollback was planned and is being coordinated; poll `Location`.", body = DeploymentResponse, headers(("Location" = String, description = "Where to poll the deployment plan."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn rollback(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
     headers: HeaderMap,
+    paths: ApiPaths,
     body: Bytes,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<DeploymentResponse>)> {
     let request = parse_rollback_body(&body).map_err(|detail| {
@@ -372,7 +413,7 @@ pub async fn rollback(
         } else {
             StatusCode::ACCEPTED
         },
-        deployment_plan_location(&app_id, &env_name, &plan.id),
+        deployment_plan_location(paths, &app_id, &env_name, &plan.id),
         Json(response(
             &env,
             deployment,
@@ -383,14 +424,18 @@ pub async fn rollback(
     ))
 }
 
+/// The `Location` of the durable plan a mutation produced, spelled for the
+/// surface the caller used.
 pub(super) fn deployment_plan_location(
+    paths: ApiPaths,
     app_id: &str,
     environment: &str,
     plan_id: &str,
 ) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    let location =
-        format!("/api/apps/{app_id}/environments/{environment}/deployment-plans/{plan_id}");
+    let location = paths.absolute(&format!(
+        "/apps/{app_id}/environments/{environment}/deployment-plans/{plan_id}"
+    ));
     headers.insert(
         LOCATION,
         HeaderValue::from_str(&location)
@@ -402,6 +447,19 @@ pub(super) fn deployment_plan_location(
 /// GET /api/apps/:app_id/environments/:env/deployment
 ///
 /// The current version of an environment: the newest pointer row.
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/deployment",
+    operation_id = "getCurrentDeployment",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name.")),
+    responses(
+        (status = 200, description = "The deployment the environment points at.", body = DeploymentResponse),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn current_deployment(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
@@ -425,6 +483,19 @@ pub async fn current_deployment(
 }
 
 /// GET /api/deployment-plans/:id
+#[utoipa::path(
+    get,
+    path = "/api/v1/deployment-plans/{id}",
+    operation_id = "getDeploymentPlan",
+    tag = "product",
+    params(("id" = String, Path, description = "The plan's id.")),
+    responses(
+        (status = 200, description = "The plan and what every node and proxy observed of it.", body = DeploymentPlanResponse),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn deployment_plan(
     State(state): State<CatalogState>,
     Path(id): Path<String>,
@@ -435,6 +506,19 @@ pub async fn deployment_plan(
 /// Scoped form used by deployment credentials. The path's environment is
 /// resolved and compared with the plan, so a caller cannot put an authorised
 /// prefix around another environment's opaque plan id.
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/deployment-plans/{id}",
+    operation_id = "getEnvironmentDeploymentPlan",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("id" = String, Path, description = "The plan's id.")),
+    responses(
+        (status = 200, description = "The plan and what every node and proxy observed of it.", body = DeploymentPlanResponse),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn deployment_plan_for_environment(
     State(state): State<CatalogState>,
     Path((app_id, env_name, id)): Path<(String, String, String)>,
@@ -476,6 +560,20 @@ async fn deployment_plan_response(
 /// The pointer history of one environment, newest first. Every row is a
 /// deployment or a rollback; nothing is ever rewritten, so paging through
 /// it is a stable walk backwards in time.
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/deployments",
+    operation_id = "listDeployments",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ListQuery),
+    responses(
+        (status = 200, description = "One page of deployments, newest first.", body = ControlListPage<Deployment>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_deployments(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
@@ -1687,23 +1785,117 @@ mod tests {
     };
     use super::{deployment_plan_location, reconcile_plan};
     use crate::api::catalog::MAX_BUNDLE_BYTES;
+    use crate::api::paths::ApiPaths;
+    use crate::api::versioning::ApiSurface;
     use crate::catalog::DeploymentPlanSpec;
     use crate::catalog::bundle::tests::{bundle_with_manifest, sample_bundle};
 
+    use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header::LOCATION};
+    use axum::middleware::from_fn_with_state;
     use deis_wire::CanonicalId;
     use serde_json::Value;
     use tower::ServiceExt;
 
     #[test]
     fn mutation_location_identifies_the_durable_plan_status_resource() {
+        let plan = "018f2518-7e38-7f80-8000-000000000001";
         let headers =
-            deployment_plan_location("demo", "production", "018f2518-7e38-7f80-8000-000000000001");
+            deployment_plan_location(ApiPaths::on(ApiSurface::Legacy), "demo", "production", plan);
         assert_eq!(
             headers.get(LOCATION).unwrap(),
             "/api/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001"
         );
+        let headers =
+            deployment_plan_location(ApiPaths::on(ApiSurface::V1), "demo", "production", plan);
+        assert_eq!(
+            headers.get(LOCATION).unwrap(),
+            "/api/v1/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001"
+        );
+    }
+
+    /// The same deployment route, reached through the legacy tree and
+    /// through `/api/v1`, points the caller at the plan under the prefix it
+    /// used: a v1 client is never sent back to a deprecated path.
+    #[tokio::test]
+    async fn a_plan_location_is_spelled_for_the_surface_the_caller_used() {
+        let h = harness(true).await;
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let (_, uploaded) = call(
+            &h.router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(sample_bundle("demo")),
+            "application/zip",
+        )
+        .await;
+        let version_id = uploaded["version"]["id"].as_str().unwrap().to_string();
+        json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+
+        // The versioned mount as the router builds it: the product routes
+        // nested under the prefix, with the request context that names the
+        // surface layered over the mount.
+        let v1 = Router::new()
+            .nest("/api/v1", super::super::router("", h.state.clone()))
+            .layer(from_fn_with_state(
+                ApiSurface::V1,
+                crate::api::versioning::attach_request_context,
+            ));
+
+        for (router, uri, expected_prefix) in [
+            (
+                &h.router,
+                "/api/apps/demo/environments/production/deployments",
+                "/api/apps/demo/environments/production/deployment-plans/",
+            ),
+            (
+                &v1,
+                "/api/v1/apps/demo/environments/production/deployments",
+                "/api/v1/apps/demo/environments/production/deployment-plans/",
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"version_id": version_id}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "{uri}: {}",
+                response.status()
+            );
+            let location = response.headers()[LOCATION].to_str().unwrap().to_string();
+            let body: Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), MAX_BUNDLE_BYTES)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let plan_id = body["plan"]["id"].as_str().unwrap();
+            assert_eq!(location, format!("{expected_prefix}{plan_id}"), "{uri}");
+        }
     }
 
     #[tokio::test]

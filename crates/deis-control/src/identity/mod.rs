@@ -36,6 +36,7 @@ pub mod token;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 pub use scope::{Demand, Scope, ScopeError, Selector, Verb};
 pub use store::{Account, ApiToken, IdentityError, IdentityStore, TokenOrigin};
@@ -48,7 +49,7 @@ pub use store::{Account, ApiToken, IdentityError, IdentityStore, TokenOrigin};
 /// moving an account from `owner` to `viewer` reduces every token it already
 /// holds to reading, at the next request, without anybody having to hunt
 /// those tokens down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// The platform. Accounts, tokens, the audit log, node configuration and

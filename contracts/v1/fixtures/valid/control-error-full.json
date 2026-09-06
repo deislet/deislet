@@ -1,0 +1,32 @@
+{
+  "error": {
+    "code": "invalid-argument",
+    "message": "The provider target configuration was rejected before any provider resource was created",
+    "requestId": "0199b603-4a10-70b2-8c53-1d2e3f405162",
+    "target": {
+      "resource": "provider-target",
+      "field": "config.zoneId"
+    },
+    "violations": [
+      {
+        "field": "config.accountId",
+        "code": "required",
+        "message": "The account owning the zone must be declared explicitly"
+      },
+      {
+        "field": "config.zoneId",
+        "code": "unknown-reference",
+        "message": "The zone is not visible to the bound provider installation credential"
+      }
+    ],
+    "retryable": false,
+    "docs": "https://deislet.dev/docs/api/v1/errors#invalid-argument",
+    "provider": {
+      "backendId": "cloudflare-workers-pages",
+      "category": "configuration",
+      "code": "ZONE_NOT_VISIBLE",
+      "sideEffect": "none",
+      "requestId": "0cb2a4e1-4f2a-4c47-9e3b-4a2d0c5f7ab1"
+    }
+  }
+}

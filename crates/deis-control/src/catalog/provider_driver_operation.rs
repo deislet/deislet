@@ -24,6 +24,7 @@ use deis_wire::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
@@ -48,14 +49,17 @@ pub struct ProviderInstallationSpec {
     pub credential_binding_id: CanonicalId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderInstallation {
+    #[schema(value_type = String, format = Uuid)]
     pub installation_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub organization_id: CanonicalId,
     pub backend_id: String,
     pub account_reference: String,
     pub region: Option<String>,
+    #[schema(value_type = String, format = Uuid)]
     pub credential_binding_id: CanonicalId,
     pub status: String,
     pub revision: u64,
@@ -75,21 +79,28 @@ pub struct ProviderTargetSpec {
     pub driver_manifest: ValidatedProviderDriverManifest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderTarget {
+    #[schema(value_type = String, format = Uuid)]
     pub target_id: CanonicalId,
+    #[schema(value_type = String, format = Uuid)]
     pub installation_id: CanonicalId,
     pub backend_id: String,
     pub name: String,
     pub standard_contract_id: String,
     pub standard_version: String,
+    #[schema(value_type = String)]
     pub standard_contract_digest: Sha256Digest,
+    #[schema(value_type = String)]
     pub target_config_digest: Sha256Digest,
     pub driver_id: String,
     pub driver_version: String,
+    #[schema(value_type = String)]
     pub driver_distribution_digest: Sha256Digest,
+    #[schema(value_type = String)]
     pub driver_release_digest: Sha256Digest,
+    #[schema(value_type = String)]
     pub driver_manifest_digest: Sha256Digest,
     pub status: String,
     /// The owning installation's status. A target only accepts new work when
@@ -149,28 +160,37 @@ pub struct ProviderDeploymentSpec {
     pub plan: ProviderNeutralPlan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDeploymentStep {
     pub sequence: usize,
+    #[schema(value_type = String)]
     pub operation: DriverOperation,
+    #[schema(value_type = String, format = Uuid)]
     pub child_operation_id: CanonicalId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDeploymentWorkflow {
+    #[schema(value_type = crate::api::openapi::ProductOperationDocument)]
     pub operation: ProductOperation,
+    #[schema(value_type = String, format = Uuid)]
     pub provider_target_id: CanonicalId,
     pub target_revision: u64,
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub provider_target_grant_id: Option<CanonicalId>,
     pub target_grant_revision: Option<u64>,
+    #[schema(value_type = String)]
     pub desired_state_digest: Sha256Digest,
+    #[schema(value_type = crate::api::openapi::ArtifactVersionRefDocument)]
     pub artifact: ArtifactVersionRef,
+    #[schema(value_type = crate::api::openapi::ProviderNeutralPlanDocument)]
     pub plan: ProviderNeutralPlan,
     pub next_step_index: usize,
     pub dispatch_not_before: Option<DateTime<Utc>>,
     pub dispatch_failure_count: u64,
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub dispatch_failure_child_operation_id: Option<CanonicalId>,
     pub last_dispatch_error_code: Option<String>,
     pub last_dispatch_error_message: Option<String>,

@@ -15,13 +15,15 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::CatalogState;
 use crate::api::error::ApiResult;
+use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, environment_scope, list_page};
 use crate::catalog::{PagePosition, Route};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RouteRequest {
     /// Omit or null to match any domain - which is the *widest* claim on
     /// this platform, not the mildest, and needs the widest grant.
@@ -35,7 +37,7 @@ pub struct RouteRequest {
     pub priority: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RouteResponse {
     pub route: Route,
 }
@@ -45,13 +47,29 @@ pub struct RouteResponse {
 /// This is deliberately not the unified list envelope: the endpoint is a
 /// platform-wide edge diagnostic whose paging is still a pending product
 /// decision, and the per-environment list no longer shares this shape.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GlobalRoutesResponse {
     pub routes: Vec<Route>,
     pub total: usize,
 }
 
 /// POST /api/apps/:app_id/environments/:env/routes
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/routes",
+    operation_id = "createRoute",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name.")),
+    request_body = RouteRequest,
+    responses(
+        (status = 201, description = "The route as created.", body = RouteResponse),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn create_route(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
@@ -70,6 +88,20 @@ pub async fn create_route(
 /// One environment's routes in the order the matcher applies them: highest
 /// priority first, then by path prefix, with the route id as the
 /// tie-breaker so paging across two routes on one prefix is stable.
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/routes",
+    operation_id = "listRoutes",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ListQuery),
+    responses(
+        (status = 200, description = "One page of routes.", body = ControlListPage<Route>),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_routes(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
@@ -107,6 +139,18 @@ pub async fn list_routes(
 /// Every route the platform knows, highest priority first. This is the
 /// whole routing table an edge needs in one call, and it stays unpaginated
 /// until the product decides how an edge should read a table in pieces.
+#[utoipa::path(
+    get,
+    path = "/api/platform/routes",
+    operation_id = "listAllRoutes",
+    tag = "platform",
+    responses(
+        (status = 200, description = "Every route of every application.", body = GlobalRoutesResponse),
+        (status = 500, response = openapi::Internal),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn list_all_routes(
     State(state): State<CatalogState>,
 ) -> ApiResult<Json<GlobalRoutesResponse>> {
@@ -121,6 +165,22 @@ pub async fn list_all_routes(
 ///
 /// Replaces the route's fields wholesale, so an omitted `host` clears it
 /// back to "any domain" rather than keeping the old value.
+#[utoipa::path(
+    put,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/routes/{route_id}",
+    operation_id = "updateRoute",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("route_id" = String, Path, description = "The route's id.")),
+    request_body = RouteRequest,
+    responses(
+        (status = 200, description = "The route after the change.", body = RouteResponse),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn update_route(
     State(state): State<CatalogState>,
     Path((app_id, env_name, route_id)): Path<(String, String, String)>,
@@ -141,11 +201,31 @@ pub async fn update_route(
 }
 
 /// DELETE /api/apps/:app_id/environments/:env/routes/:route_id
+#[utoipa::path(
+    delete,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/routes/{route_id}",
+    operation_id = "deleteRoute",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("route_id" = String, Path, description = "The route's id.")),
+    responses(
+        (status = 200, description = "The route was removed.", body = RouteDeleted),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn delete_route(
     State(state): State<CatalogState>,
     Path((app_id, env_name, route_id)): Path<(String, String, String)>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<RouteDeleted>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
     state.store.delete_route(&env.id, &route_id).await?;
-    Ok(Json(serde_json::json!({ "deleted": route_id })))
+    Ok(Json(RouteDeleted { deleted: route_id }))
+}
+
+/// A route was removed.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RouteDeleted {
+    /// The id of the route that was removed.
+    pub deleted: String,
 }

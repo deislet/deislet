@@ -16,15 +16,17 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::Arc;
 use tracing::{error, warn};
+use utoipa::{IntoParams, ToSchema};
 
+use super::error::{ApiError, ApiResult};
+use super::openapi;
 use crate::catalog::CatalogStore;
-use crate::runtime_client::{NodeError, RuntimeNodeManager};
+use crate::runtime_client::{ContestedNodeId, DepartedNode, NodeView, RuntimeNodeManager};
 
 #[derive(Clone)]
 pub struct AppsState {
@@ -39,26 +41,26 @@ pub struct AppsState {
     pub catalog: Arc<CatalogStore>,
 }
 
-fn node_error_response(e: &NodeError) -> (StatusCode, Json<serde_json::Value>) {
-    let status = match e {
-        NodeError::UnknownNode => StatusCode::NOT_FOUND,
-        NodeError::Transport(_) => StatusCode::BAD_GATEWAY,
-        NodeError::Rpc { .. } => StatusCode::BAD_GATEWAY,
-        // Nothing was dialled: the node is on the list but the key it
-        // proved is no longer one this control plane holds. Not the caller's
-        // fault and not a gateway failure - the node has to register again.
-        NodeError::KeyRetired { .. } => StatusCode::CONFLICT,
-    };
-    (status, Json(json!({ "error": e.to_string() })))
+/// The runtime fleet as `GET /api/platform/runtime` reports it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FleetResponse {
+    /// Nodes that can be handed work, with the health last probed.
+    pub nodes: Vec<NodeView>,
+    /// Nodes that stopped refreshing their registration and are presumed
+    /// to still run what they last received.
+    pub lost: Vec<DepartedNode>,
+    /// Machines refused a node id another machine was answering for.
+    pub contested: Vec<ContestedNodeId>,
 }
 
-/// GET /api/runtime — the runtime fleet: every node that can be handed a
-/// deployment or a cron occurrence, with the health last probed for it.
+/// GET /api/platform/runtime - the runtime fleet: every node that can be
+/// handed a deployment or a cron occurrence, with the health last probed
+/// for it.
 ///
 /// A node is on this list because the control plane's configuration file
-/// names it or because it registered itself; holding a gRPC control channel
-/// open has nothing to do with it, and the nodes that do that are a
-/// different list at `GET /api/sessions` ([`crate::api::nodes`]).
+/// names it or because it registered itself; whether it holds a control
+/// channel open has nothing to do with it, and the nodes that do that are a
+/// different list at `GET /api/platform/sessions` ([`crate::api::nodes`]).
 ///
 /// `lost` is the other half of the same question, and the reason it is served
 /// here rather than only appearing inside a deployment's answer: these are
@@ -73,15 +75,27 @@ fn node_error_response(e: &NodeError) -> (StatusCode, Json<serde_json::Value>) {
 /// this platform's code, nothing can be sent to them, and they are on no other
 /// list - so this is where an operator finds out that two machines were given
 /// one name. See `crate::runtime_client::ContestedNodeId`.
-pub async fn list_fleet(State(state): State<AppsState>) -> impl IntoResponse {
-    Json(json!({
-        "nodes": state.deis_runtime.list(),
-        "lost": state.deis_runtime.departed(),
-        "contested": state.deis_runtime.contested(),
-    }))
+#[utoipa::path(
+    get,
+    path = "/api/platform/runtime",
+    operation_id = "listRuntimeFleet",
+    tag = "platform",
+    responses(
+        (status = 200, description = "The fleet, the lost nodes and the contested ids.", body = FleetResponse),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
+pub async fn list_fleet(State(state): State<AppsState>) -> Json<FleetResponse> {
+    Json(FleetResponse {
+        nodes: state.deis_runtime.list(),
+        lost: state.deis_runtime.departed(),
+        contested: state.deis_runtime.contested(),
+    })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct StatusParams {
     /// Include per-app details (default true).
     #[serde(default = "default_true")]
@@ -92,73 +106,121 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Serialize)]
-struct AppStatusView {
-    app_id: String,
+/// One application on a node, as the node reports it.
+#[derive(Serialize, ToSchema)]
+pub struct AppStatusView {
+    pub app_id: String,
     /// Which environment of that application this line is about. A node
     /// runs production and every preview side by side, each with its own
     /// version and counters, so the pair is what names one of them.
-    environment: String,
-    state: String,
-    request_count: i64,
-    error_count: i64,
-    error_message: String,
+    pub environment: String,
+    /// `loading`, `running`, `stopped`, `error` or `unknown`.
+    pub state: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub error_message: String,
 }
 
-/// GET /api/runtime/:node/status — live status straight from the node.
+/// What a node says about itself. Every member is absent when the node
+/// did not report it.
+#[derive(Serialize, ToSchema)]
+pub struct NodeInfoView {
+    #[schema(required)]
+    pub node_id: Option<String>,
+    #[schema(required)]
+    pub version: Option<String>,
+    #[schema(required)]
+    pub uptime_seconds: Option<i64>,
+    #[schema(required)]
+    pub hostname: Option<String>,
+}
+
+/// The node's own resource reading.
+#[derive(Serialize, ToSchema)]
+pub struct ResourceUsageView {
+    pub cpu_percent: f64,
+    pub memory_bytes: i64,
+}
+
+/// Live status straight from one node.
+#[derive(Serialize, ToSchema)]
+pub struct NodeStatusResponse {
+    /// The node id as asked for.
+    pub node: String,
+    pub node_info: NodeInfoView,
+    /// Empty when `apps=false` was asked for.
+    pub apps: Vec<AppStatusView>,
+    #[schema(required)]
+    pub resource_usage: Option<ResourceUsageView>,
+}
+
+/// GET /api/platform/runtime/{node}/status - live status straight from the
+/// node.
+#[utoipa::path(
+    get,
+    path = "/api/platform/runtime/{node}/status",
+    operation_id = "getRuntimeNodeStatus",
+    tag = "platform",
+    params(("node" = String, Path, description = "The node's id in the fleet."), StatusParams),
+    responses(
+        (status = 200, description = "What the node reported.", body = NodeStatusResponse),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 502, response = openapi::BadGateway),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn node_status(
     State(state): State<AppsState>,
     Path(node): Path<String>,
     Query(params): Query<StatusParams>,
-) -> impl IntoResponse {
-    match state.deis_runtime.get_status(&node, params.apps).await {
-        Ok(status) => {
-            let apps: Vec<AppStatusView> = status
-                .apps
-                .iter()
-                .map(|a| AppStatusView {
-                    app_id: a.app_id.clone(),
-                    environment: a.environment.clone(),
-                    state: match a.state {
-                        1 => "loading",
-                        2 => "running",
-                        3 => "stopped",
-                        4 => "error",
-                        _ => "unknown",
-                    }
-                    .to_string(),
-                    request_count: a.request_count,
-                    error_count: a.error_count,
-                    error_message: a.error_message.clone(),
-                })
-                .collect();
-            let info = status.node_info.as_ref();
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "node": node,
-                    "node_info": {
-                        "node_id": info.map(|i| i.node_id.clone()),
-                        "version": info.map(|i| i.version.clone()),
-                        "uptime_seconds": info.map(|i| i.uptime_seconds),
-                        "hostname": info.map(|i| i.hostname.clone()),
-                    },
-                    "apps": apps,
-                    "resource_usage": status.resource_usage.as_ref().map(|r| json!({
-                        "cpu_percent": r.cpu_percent,
-                        "memory_bytes": r.memory_bytes,
-                    })),
-                })),
-            )
-        }
+) -> ApiResult<Json<NodeStatusResponse>> {
+    let status = match state.deis_runtime.get_status(&node, params.apps).await {
+        Ok(status) => status,
         Err(e) => {
             warn!(node = %node, error = %e, "Status query failed");
-            node_error_response(&e)
+            return Err(ApiError::from(e));
         }
-    }
+    };
+    let apps: Vec<AppStatusView> = status
+        .apps
+        .iter()
+        .map(|a| AppStatusView {
+            app_id: a.app_id.clone(),
+            environment: a.environment.clone(),
+            state: match a.state {
+                1 => "loading",
+                2 => "running",
+                3 => "stopped",
+                4 => "error",
+                _ => "unknown",
+            }
+            .to_string(),
+            request_count: a.request_count,
+            error_count: a.error_count,
+            error_message: a.error_message.clone(),
+        })
+        .collect();
+    let info = status.node_info.as_ref();
+    Ok(Json(NodeStatusResponse {
+        node,
+        node_info: NodeInfoView {
+            node_id: info.map(|i| i.node_id.clone()),
+            version: info.map(|i| i.version.clone()),
+            uptime_seconds: info.map(|i| i.uptime_seconds),
+            hostname: info.map(|i| i.hostname.clone()),
+        },
+        apps,
+        resource_usage: status.resource_usage.as_ref().map(|r| ResourceUsageView {
+            cpu_percent: r.cpu_percent,
+            memory_bytes: r.memory_bytes,
+        }),
+    }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct UnloadParams {
     /// Which environment of the application to take off this node. Omitted
     /// means every environment of it.
@@ -171,7 +233,42 @@ pub struct UnloadParams {
     pub environment: Option<String>,
 }
 
-/// DELETE /api/runtime/:node/apps/:app_id[?environment=NAME] — unload an app.
+/// The node took the application off.
+#[derive(Serialize, ToSchema)]
+pub struct AppUnloaded {
+    pub success: bool,
+    /// What the node said.
+    pub message: String,
+    /// The environments that were unloaded.
+    pub environments: Vec<String>,
+}
+
+/// The node answered but did not unload.
+#[derive(Serialize, ToSchema)]
+pub struct AppNotUnloaded {
+    pub success: bool,
+    /// What the node said.
+    pub message: String,
+}
+
+/// The unload was not sent, and why. Not the `ErrorBody` envelope: this
+/// answer predates it and is kept byte for byte on every prefix.
+#[derive(Serialize, ToSchema)]
+pub struct UnloadRefused {
+    pub success: bool,
+    /// Why nothing was sent, and what to do instead.
+    pub error: String,
+    /// On 409: the environments the catalog still deploys to this node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_environments: Option<Vec<String>>,
+    /// On 409: how often the node reconciles its assignment list, in
+    /// seconds - the time within which the application would be back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_refresh_seconds: Option<u64>,
+}
+
+/// DELETE /api/platform/runtime/{node}/apps/{app_id}[?environment=NAME] -
+/// unload an app.
 ///
 /// This is a node-local operation and changes nothing in the catalog, which
 /// is why it is **refused** while the catalog still deploys the application:
@@ -189,11 +286,32 @@ pub struct UnloadParams {
 /// is still running - a node that was unreachable when the application was
 /// deleted, or one that has drifted. That case is the one where the unload
 /// sticks, because the next assignment list will not contain it either.
+#[utoipa::path(
+    delete,
+    path = "/api/platform/runtime/{node}/apps/{app_id}",
+    operation_id = "unloadRuntimeApp",
+    tag = "platform",
+    params(
+        ("node" = String, Path, description = "The node's id in the fleet."),
+        ("app_id" = String, Path, description = "The application's id."),
+        UnloadParams,
+    ),
+    responses(
+        (status = 200, description = "The node took the application off.", body = AppUnloaded),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, description = "The catalog still deploys the application to this node, or the node's key is retired; nothing was sent.", body = UnloadRefused),
+        (status = 422, description = "The node answered but did not unload.", body = AppNotUnloaded),
+        (status = 502, response = openapi::BadGateway),
+        (status = 503, description = "The catalog could not be read, so nothing was sent.", body = UnloadRefused),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
 pub async fn unload_app(
     State(state): State<AppsState>,
     Path((node, app_id)): Path<(String, String)>,
     Query(params): Query<UnloadParams>,
-) -> impl IntoResponse {
+) -> ApiResult<Response> {
     let environment = params.environment.unwrap_or_default();
 
     let assigned = match assigned_environments(&state, &app_id, &environment).await {
@@ -208,15 +326,18 @@ pub async fn unload_app(
                 error = %e,
                 "Could not read the catalog, so it is not known whether this node would load the application straight back; the unload was not sent and this node is still serving it"
             );
-            return (
+            return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "success": false,
-                    "error": format!(
+                Json(UnloadRefused {
+                    success: false,
+                    error: format!(
                         "cannot read the catalog to check whether {app_id} would be reassigned to this node: {e}. Nothing was sent to the node"
                     ),
-                })),
-            );
+                    assigned_environments: None,
+                    assignment_refresh_seconds: None,
+                }),
+            )
+                .into_response());
         }
     };
 
@@ -233,18 +354,19 @@ pub async fn unload_app(
             assignment_refresh_seconds = refresh_secs,
             "Refused to unload an application the catalog still deploys; the node reconciles its assignment list every {refresh_secs}s and would load it straight back, so the unload was not sent"
         );
-        return (
+        return Ok((
             StatusCode::CONFLICT,
-            Json(json!({
-                "success": false,
-                "error": format!(
+            Json(UnloadRefused {
+                success: false,
+                error: format!(
                     "the catalog still deploys {app_id} ({}), and this node reconciles its assignment list every {refresh_secs}s, so it would be serving it again within that time. Nothing was sent to the node. Take the application off the fleet with DELETE /api/apps/{app_id}, which removes it from the catalog and unloads it everywhere at once",
                     assigned.join(", ")
                 ),
-                "assigned_environments": assigned,
-                "assignment_refresh_seconds": refresh_secs,
-            })),
-        );
+                assigned_environments: Some(assigned),
+                assignment_refresh_seconds: Some(refresh_secs),
+            }),
+        )
+            .into_response());
     }
 
     match state
@@ -252,18 +374,23 @@ pub async fn unload_app(
         .unload_app(&node, &app_id, &environment)
         .await
     {
-        Ok(resp) if resp.success => (
+        Ok(resp) if resp.success => Ok((
             StatusCode::OK,
-            Json(json!({
-                "success": true,
-                "message": resp.message,
-                "environments": resp.environments,
-            })),
-        ),
-        Ok(resp) => (
+            Json(AppUnloaded {
+                success: true,
+                message: resp.message,
+                environments: resp.environments,
+            }),
+        )
+            .into_response()),
+        Ok(resp) => Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "success": false, "message": resp.message })),
-        ),
+            Json(AppNotUnloaded {
+                success: false,
+                message: resp.message,
+            }),
+        )
+            .into_response()),
         Err(e) => {
             warn!(
                 node = %node,
@@ -272,7 +399,7 @@ pub async fn unload_app(
                 error = %e,
                 "Unload failed; this node is still serving the application"
             );
-            node_error_response(&e)
+            Err(ApiError::from(e))
         }
     }
 }
