@@ -221,6 +221,21 @@ pub struct ControlConfig {
     /// to the same Unix ownership/mode or Windows service-DACL policy.
     #[serde(default)]
     pub provider_driver_trust_root_rotation: Option<PathBuf>,
+    /// Seconds between scans for durable provider deployments that can make
+    /// progress (default: 2, clamped to 1..=300). A scan never bypasses the
+    /// operation's owner/epoch lease.
+    #[serde(default = "default_provider_deployment_dispatch_interval_secs")]
+    pub provider_deployment_dispatch_interval_secs: u64,
+    /// Minimum durable delay before retrying or reconciling a provider result
+    /// that explicitly asked for another attempt (default: 30, clamped to the
+    /// dispatch interval..=3600). Fresh work is not delayed.
+    #[serde(default = "default_provider_deployment_retry_delay_secs")]
+    pub provider_deployment_retry_delay_secs: u64,
+    /// Maximum provider deployment children executed concurrently by one
+    /// Control process (default: 4, clamped to 1..=64). Other Control
+    /// processes remain fenced by the same durable child leases.
+    #[serde(default = "default_provider_deployment_max_concurrency")]
+    pub provider_deployment_max_concurrency: usize,
     /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).
     ///
     /// A tick does two things: it rebuilds the task list from the catalog,
@@ -256,6 +271,18 @@ pub fn default_node_registration_ttl() -> u64 {
 
 fn default_cron_tick_seconds() -> u64 {
     60
+}
+
+fn default_provider_deployment_dispatch_interval_secs() -> u64 {
+    2
+}
+
+fn default_provider_deployment_retry_delay_secs() -> u64 {
+    30
+}
+
+fn default_provider_deployment_max_concurrency() -> usize {
+    4
 }
 
 fn default_deis_runtime_poll_interval() -> u64 {
@@ -320,6 +347,10 @@ impl Default for ControlConfig {
             provider_driver_installation_root: None,
             provider_driver_trust_root: None,
             provider_driver_trust_root_rotation: None,
+            provider_deployment_dispatch_interval_secs:
+                default_provider_deployment_dispatch_interval_secs(),
+            provider_deployment_retry_delay_secs: default_provider_deployment_retry_delay_secs(),
+            provider_deployment_max_concurrency: default_provider_deployment_max_concurrency(),
             cron_tick_seconds: default_cron_tick_seconds(),
             node_registration_ttl_secs: default_node_registration_ttl(),
         }
@@ -404,6 +435,18 @@ impl std::fmt::Debug for ControlConfig {
             .field(
                 "provider_driver_trust_root_rotation",
                 &self.provider_driver_trust_root_rotation,
+            )
+            .field(
+                "provider_deployment_dispatch_interval_secs",
+                &self.provider_deployment_dispatch_interval_secs,
+            )
+            .field(
+                "provider_deployment_retry_delay_secs",
+                &self.provider_deployment_retry_delay_secs,
+            )
+            .field(
+                "provider_deployment_max_concurrency",
+                &self.provider_deployment_max_concurrency,
             )
             .field("cron_tick_seconds", &self.cron_tick_seconds)
             .field(

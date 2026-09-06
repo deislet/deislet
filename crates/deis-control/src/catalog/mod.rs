@@ -39,6 +39,7 @@ pub mod limits;
 pub mod model;
 pub mod operation;
 pub mod provider_credential;
+pub mod provider_deployment_reconciler;
 pub mod provider_driver_operation;
 pub mod provider_driver_release;
 pub mod secrets;
@@ -73,6 +74,9 @@ pub use operation::OperationRequestContext;
 pub use provider_credential::{
     CatalogProviderCredentialVault, ProviderCredentialAuditEvent, ProviderCredentialBinding,
     ProviderCredentialBindingSpec,
+};
+pub use provider_deployment_reconciler::{
+    ProviderDeploymentReconciler, ProviderDeploymentReconcilerConfig,
 };
 pub use provider_driver_operation::{
     PROVIDER_DEPLOYMENT_STEPS, ProviderDeploymentDriveOutcome, ProviderDeploymentSpec,

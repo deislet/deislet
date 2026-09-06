@@ -574,6 +574,82 @@ impl CatalogStore {
             .await
     }
 
+    /// Return only workflows for which a background dispatcher can make a
+    /// useful attempt now. Fresh work and a child whose terminal result has
+    /// not yet been folded into its parent are immediate. A live lease is
+    /// left alone, while provider-directed retry/reconciliation observes a
+    /// durable minimum delay based on the child's persisted `updated_at`.
+    pub(crate) async fn provider_deployments_ready_for_dispatch(
+        &self,
+        now: DateTime<Utc>,
+        retry_delay: Duration,
+        limit: usize,
+    ) -> CatalogResult<Vec<CanonicalId>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CatalogError::invalid(
+                "provider deployment dispatch limit must be between 1 and 1000",
+            ));
+        }
+        let retry_seconds = i64::try_from(retry_delay.as_secs()).map_err(|_| {
+            CatalogError::invalid("provider deployment retry delay exceeds timestamp range")
+        })?;
+        let now = now.timestamp();
+        self.database()
+            .with_connection(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT operation_id FROM provider_deployment_workflows
+                      WHERE state NOT IN ('succeeded', 'failed')
+                      ORDER BY updated_at, operation_id LIMIT 1000",
+                )?;
+                let ids = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut ready = Vec::with_capacity(limit);
+                for id in ids {
+                    let operation_id = parse_id(&id, "provider deployment operation")?;
+                    let workflow = load_provider_deployment_workflow(connection, operation_id)?
+                        .ok_or_else(|| {
+                            CatalogError::not_found(format!(
+                                "provider deployment operation {operation_id}"
+                            ))
+                        })?;
+                    let child_id = workflow
+                        .steps
+                        .get(workflow.next_step_index)
+                        .ok_or_else(|| {
+                            CatalogError::invalid(format!(
+                                "provider deployment {operation_id} has no current child"
+                            ))
+                        })?
+                        .child_operation_id;
+                    let child = load_claim_row(connection, child_id)?.ok_or_else(|| {
+                        CatalogError::not_found(format!("provider operation {child_id}"))
+                    })?;
+                    let execution = claim_execution_operation(&child, now)?;
+                    let due = match (child.state, execution) {
+                        (ProviderOperationState::Running, None) => false,
+                        (
+                            ProviderOperationState::Failed | ProviderOperationState::Unknown,
+                            Some(_),
+                        ) => child.updated_at.saturating_add(retry_seconds) <= now,
+                        // Pending and expired-running work can run immediately.
+                        // A succeeded or terminally failed child is also ready:
+                        // the drive call folds that durable result into the parent
+                        // without invoking a provider.
+                        _ => true,
+                    };
+                    if due {
+                        ready.push(operation_id);
+                        if ready.len() == limit {
+                            break;
+                        }
+                    }
+                }
+                Ok(ready)
+            })
+            .await
+    }
+
     /// Execute at most one durable provider child. Repeated calls, concurrent
     /// coordinators and restart recovery all converge through the child
     /// operation's owner/epoch fence and this parent's immutable step table.
@@ -1643,6 +1719,7 @@ struct ClaimRow {
     owner_id: Option<CanonicalId>,
     claim_epoch: u64,
     lease_expires_at: Option<i64>,
+    updated_at: i64,
     revision: u64,
     driver_id: String,
     driver_pin: ProviderDriverPin,
@@ -1658,7 +1735,7 @@ fn load_claim_row(
             "SELECT d.provider_target_id, d.original_operation, d.request_json, d.state,
                     d.driver_error_json, d.side_effect,
                     d.next_action, d.owner_id, d.claim_epoch, d.lease_expires_at,
-                    d.revision, d.driver_id, d.driver_version,
+                    d.updated_at, d.revision, d.driver_id, d.driver_version,
                     d.driver_distribution_sha256, d.driver_manifest_sha256, p.state
                FROM provider_driver_operations d
                JOIN product_operations p ON p.operation_id = d.operation_id
@@ -1674,8 +1751,8 @@ fn load_claim_row(
                 let next_action_text: Option<String> = row.get(6)?;
                 let owner_text: Option<String> = row.get(7)?;
                 let claim_epoch: i64 = row.get(8)?;
-                let revision: i64 = row.get(10)?;
-                let product_state_text: String = row.get(15)?;
+                let revision: i64 = row.get(11)?;
+                let product_state_text: String = row.get(16)?;
                 Ok((
                     target_text,
                     original_text,
@@ -1687,11 +1764,12 @@ fn load_claim_row(
                     owner_text,
                     claim_epoch,
                     row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
                     revision,
-                    row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
                     row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
                     product_state_text,
                 ))
             },
@@ -1717,22 +1795,23 @@ fn load_claim_row(
                     .transpose()?,
                 claim_epoch: to_u64(row.8, "provider operation claim epoch")?,
                 lease_expires_at: row.9,
-                revision: to_u64(row.10, "provider operation revision")?,
-                driver_id: row.11.clone(),
+                updated_at: row.10,
+                revision: to_u64(row.11, "provider operation revision")?,
+                driver_id: row.12.clone(),
                 driver_pin: ProviderDriverPin {
-                    driver_id: row.11,
-                    driver_version: row.12,
-                    distribution_digest: row.13.parse().map_err(|error| {
+                    driver_id: row.12,
+                    driver_version: row.13,
+                    distribution_digest: row.14.parse().map_err(|error| {
                         CatalogError::invalid(format!(
                             "invalid driver distribution digest: {error}"
                         ))
                     })?,
-                    manifest_digest: row.14.parse().map_err(|error| {
+                    manifest_digest: row.15.parse().map_err(|error| {
                         CatalogError::invalid(format!("invalid driver manifest digest: {error}"))
                     })?,
                 },
-                product_state: OperationState::parse(&row.15).ok_or_else(|| {
-                    CatalogError::invalid(format!("unknown product operation state {:?}", row.15))
+                product_state: OperationState::parse(&row.16).ok_or_else(|| {
+                    CatalogError::invalid(format!("unknown product operation state {:?}", row.16))
                 })?,
             })
         })
@@ -1757,12 +1836,12 @@ fn claim_execution_operation(row: &ClaimRow, now: i64) -> CatalogResult<Option<D
         }
         ProviderOperationState::Unknown => Ok(Some(DriverOperation::Reconcile)),
         ProviderOperationState::Failed => {
-            let Some(error) = row.driver_error.as_ref() else {
-                return Ok(None);
-            };
-            if error.retryable
-                && row.side_effect == Some(SideEffect::None)
+            if row.side_effect == Some(SideEffect::None)
                 && row.next_action == Some(DriverNextAction::Retry)
+                && row
+                    .driver_error
+                    .as_ref()
+                    .is_none_or(|error| error.retryable)
             {
                 Ok(Some(row.original_operation))
             } else if matches!(
@@ -3772,6 +3851,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_dispatch_readiness_honours_live_leases_and_retry_delay() {
+        let harness = harness().await;
+        let parent = harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: attach_cloudflare_artifact(&harness).await,
+                    plan: ProviderNeutralPlan::default(),
+                },
+                context("provider-deployment-background-readiness"),
+            )
+            .await
+            .unwrap();
+        let now = DateTime::from_timestamp(now_secs(), 0).unwrap();
+        assert_eq!(
+            harness
+                .store
+                .provider_deployments_ready_for_dispatch(now, Duration::from_secs(30), 10)
+                .await
+                .unwrap(),
+            [parent.operation_id]
+        );
+
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(parent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let child_id = workflow.steps[0].child_operation_id;
+        let claim = harness
+            .store
+            .claim(child_id, CanonicalId::new_v7(), Duration::from_secs(30))
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        assert!(
+            harness
+                .store
+                .provider_deployments_ready_for_dispatch(now, Duration::from_secs(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let failed = DriverReceipt {
+            state: DriverStepState::Failed,
+            side_effect: SideEffect::None,
+            next_action: DriverNextAction::Retry,
+            diagnostic: Some("provider asked the dispatcher to retry later".to_owned()),
+            ..succeeded_receipt(&claim)
+        };
+        harness.store.record_receipt(&claim, &failed).await.unwrap();
+        let settled_at = harness
+            .store
+            .provider_driver_operation(child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+        assert!(
+            harness
+                .store
+                .provider_deployments_ready_for_dispatch(
+                    settled_at + chrono::TimeDelta::seconds(29),
+                    Duration::from_secs(30),
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            harness
+                .store
+                .provider_deployments_ready_for_dispatch(
+                    settled_at + chrono::TimeDelta::seconds(30),
+                    Duration::from_secs(30),
+                    10,
+                )
+                .await
+                .unwrap(),
+            [parent.operation_id]
+        );
+    }
+
+    #[tokio::test]
     async fn deployment_recovery_advances_a_child_settled_before_parent_refresh() {
         let harness = harness().await;
         let parent = harness
@@ -3872,6 +4042,51 @@ mod tests {
             .record_driver_error(&first, &error)
             .await
             .unwrap();
+        let product = harness
+            .store
+            .product_operation(operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(product.state, OperationState::Waiting);
+        assert!(product.retryable);
+        let second = harness
+            .store
+            .claim(operation_id, CanonicalId::new_v7(), Duration::from_secs(30))
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        assert_eq!(second.request.operation, DriverOperation::Preflight);
+        assert_eq!(second.claim_epoch, first.claim_epoch + 1);
+    }
+
+    #[tokio::test]
+    async fn retryable_failed_receipt_reclaims_the_original_operation() {
+        let harness = harness().await;
+        let request = request(&harness);
+        let operation_id = request.operation_id;
+        harness
+            .store
+            .begin_provider_driver_operation(request, context("provider-receipt-retry-key"))
+            .await
+            .unwrap();
+        let first = harness
+            .store
+            .claim(operation_id, CanonicalId::new_v7(), Duration::from_secs(30))
+            .await
+            .unwrap()
+            .into_claim()
+            .unwrap();
+        let failed = DriverReceipt {
+            state: DriverStepState::Failed,
+            side_effect: SideEffect::None,
+            next_action: DriverNextAction::Retry,
+            diagnostic: Some("provider asked the caller to retry later".to_owned()),
+            ..succeeded_receipt(&first)
+        };
+        harness.store.record_receipt(&first, &failed).await.unwrap();
+
         let product = harness
             .store
             .product_operation(operation_id)

@@ -338,6 +338,14 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # both the previously durable root role and the new root role.
 # provider_driver_trust_root_rotation = "/etc/deis-control/provider-driver-trust-root-rotation.json"
 
+# Durable provider deployments are scanned independently of HTTP requests.
+# Fresh work starts on the next scan; provider-directed retry/reconciliation
+# waits at least this delay. One process runs at most this many driver children
+# concurrently, while durable owner/epoch leases fence multiple Control nodes.
+# provider_deployment_dispatch_interval_secs = 2
+# provider_deployment_retry_delay_secs = 30
+# provider_deployment_max_concurrency = 4
+
 # Seconds between cron scheduler ticks (1..=60). A tick rebuilds the task
 # list from the catalog and fires whatever came due, so the default means a
 # newly deployed schedule is noticed within a minute and fires within a

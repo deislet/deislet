@@ -30,7 +30,9 @@ use tracing::{error, info, warn};
 
 use crate::{
     audit::AuditStore,
-    catalog::{ArtifactStore, BundleStore, CatalogStore, SecretsBackend},
+    catalog::{
+        ArtifactStore, BundleStore, CatalogStore, ProviderDeploymentReconciler, SecretsBackend,
+    },
     command::CommandExecutor,
     config::ControlConfig,
     config_manager::ConfigManager,
@@ -50,6 +52,11 @@ pub struct AppState {
 
 pub struct ApiRouter {
     pub router: Router,
+    /// Process-owned worker for external provider deployments. Entry points
+    /// start it with the same shutdown edge as the servers and retain its task
+    /// handle through the bounded drain. Absent when verified driver execution
+    /// is disabled.
+    pub provider_deployment_reconciler: Option<ProviderDeploymentReconciler>,
     pub auth_config: middleware::AuthConfig,
     /// Accounts, scopes and the audit log, as the gate in front of the human
     /// API sees them. Handed back so the binary can complete the startup that
@@ -116,6 +123,19 @@ pub async fn build_api_router(
         &config,
     )
     .await;
+    let provider_deployment_reconciler =
+        catalog_state
+            .provider_driver_dispatcher
+            .as_ref()
+            .map(|dispatcher| {
+                ProviderDeploymentReconciler::new(
+                    Arc::clone(&catalog_state.store),
+                    Arc::clone(dispatcher),
+                    config.provider_deployment_dispatch_interval_secs,
+                    config.provider_deployment_retry_delay_secs,
+                    config.provider_deployment_max_concurrency,
+                )
+            });
     catalog::deployments::resume_on_start(catalog_state.clone());
 
     // Built after the catalog and sharing its store, not beside it with a
@@ -296,6 +316,7 @@ pub async fn build_api_router(
 
     ApiRouter {
         router: app,
+        provider_deployment_reconciler,
         auth_config,
         authz: authz_state,
         node_auth,
@@ -810,6 +831,10 @@ pub async fn start_api_server(
         config,
     )
     .await;
+    let provider_background = api
+        .provider_deployment_reconciler
+        .clone()
+        .map(|reconciler| tokio::spawn(reconciler.run(shutdown.clone())));
 
     let addr = format!("0.0.0.0:{}", port);
     announce_authorization(&api.authz).await;
@@ -834,13 +859,25 @@ pub async fn start_api_server(
     };
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    serve(
-        listener,
-        api.router,
-        tls,
-        async move { shutdown.wait().await },
-    )
-    .await?;
+    let server_shutdown = shutdown.clone();
+    let served = serve(listener, api.router, tls, async move {
+        server_shutdown.wait().await
+    })
+    .await;
+    shutdown.trigger();
+    if let Some(mut task) = provider_background
+        && tokio::time::timeout(crate::shutdown::DRAIN_GRACE, &mut task)
+            .await
+            .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+        warn!(
+            grace_secs = crate::shutdown::DRAIN_GRACE.as_secs(),
+            "A provider deployment was still inside a driver call when the API drain expired; its durable lease will expire and the next Control instance must reconcile provider state before retrying"
+        );
+    }
+    served?;
 
     Ok(())
 }

@@ -262,6 +262,10 @@ async fn main() -> Result<(), anyhow::Error> {
         Arc::clone(&api_config),
     )
     .await;
+    let provider_background = api
+        .provider_deployment_reconciler
+        .clone()
+        .map(|reconciler| tokio::spawn(reconciler.run(shutdown.clone())));
 
     let grpc_service = server.build_grpc_service();
     let grpc_routes = Routes::default().add_service(grpc_service);
@@ -323,12 +327,31 @@ async fn main() -> Result<(), anyhow::Error> {
     // The background loops were told to stop by the same signal and have had
     // the whole drain to do it; this is where the process learns whether they
     // managed it.
-    if let Err(e) = background.await {
-        warn!(
-            error = %e,
-            "The task supervising the background loops did not finish; whether the cron scheduler recorded its last trigger is unknown"
-        );
-    }
+    let ordinary_background_drain = async move {
+        if let Err(e) = background.await {
+            warn!(
+                error = %e,
+                "The task supervising the background loops did not finish; whether the cron scheduler recorded its last trigger is unknown"
+            );
+        }
+    };
+    let provider_background_drain = async move {
+        let Some(mut task) = provider_background else {
+            return;
+        };
+        if tokio::time::timeout(deis_control::shutdown::DRAIN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+            warn!(
+                grace_secs = deis_control::shutdown::DRAIN_GRACE.as_secs(),
+                "A provider deployment was still inside a driver call when the drain expired; its durable lease will expire and the next Control instance must reconcile provider state before retrying"
+            );
+        }
+    };
+    tokio::join!(ordinary_background_drain, provider_background_drain);
 
     served?;
     info!("Control stopped");
