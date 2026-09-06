@@ -52,6 +52,28 @@
         "priorDeploymentId": {"anyOf": [{"$ref": "#/$defs/canonicalId"}, {"type": "null"}]}
       }
     },
+    "rollbackTarget": {
+      "description": "The provider deployment a rollback restores, copied from the succeeded activate receipt of the deployment being rolled back to. The Control sends it on every rollback request; a driver may ignore it and locate the deployment by desiredStateDigest as before.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceOperationId", "activationOperationId", "activationReceiptSha256"],
+      "properties": {
+        "sourceOperationId": {"$ref": "#/$defs/canonicalId"},
+        "activationOperationId": {"$ref": "#/$defs/canonicalId"},
+        "activationReceiptSha256": {
+          "description": "SHA-256 of the RFC 8785 canonical JSON of the activate receipt the native identities below were copied from.",
+          "$ref": "#/$defs/sha256"
+        },
+        "providerDeploymentId": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+        "providerVersionId": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+        "providerResourceIds": {
+          "type": "object",
+          "maxProperties": 1024,
+          "propertyNames": {"pattern": "^[a-z][a-z0-9-]{0,127}$"},
+          "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 512}
+        }
+      }
+    },
     "driverRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -68,8 +90,16 @@
         "environmentId": {"$ref": "#/$defs/canonicalId"},
         "target": {"$ref": "#/$defs/target"},
         "artifact": {"anyOf": [{"$ref": "#/$defs/artifact"}, {"type": "null"}]},
-        "plan": {"$ref": "#/$defs/plan"}
-      }
+        "plan": {"$ref": "#/$defs/plan"},
+        "rollbackTarget": {"anyOf": [{"$ref": "#/$defs/rollbackTarget"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"operation": {"const": "rollback"}}, "required": ["operation"]},
+          "then": {},
+          "else": {"properties": {"rollbackTarget": {"type": "null"}}}
+        }
+      ]
     },
     "receipt": {
       "type": "object",

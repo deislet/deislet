@@ -32,8 +32,9 @@ use utoipa::IntoParams;
 use utoipa::ToSchema;
 
 use super::{CatalogState, actor_subject};
-use crate::api::headers::{optional_header, required_header, single_header};
+use crate::api::headers::{IDEMPOTENCY_KEY, optional_header, required_header, single_header};
 use crate::api::openapi;
+use crate::api::operations::{ProviderWorkflowCancel, cancel_provider_workflow};
 use crate::{
     api::{
         error::{ApiError, ApiResult},
@@ -42,10 +43,10 @@ use crate::{
     },
     catalog::{
         CatalogError, IdempotencyDigestKey, IdempotencyOutcome, IdempotencyScope, IdempotencyStore,
-        IdempotentRequest, IdempotentResource, OperationRequestContext, PagePosition,
-        PendingIdempotencyRecord, ProviderCredentialAuditEvent, ProviderCredentialBinding,
-        ProviderCredentialBindingSpec, ProviderCredentialMutationContext,
-        ProviderDeploymentCancellation, ProviderDeploymentSpec, ProviderDeploymentWorkflow,
+        IdempotentRequest, IdempotentResource, OperationRequestContext, OperationScopeNames,
+        PagePosition, PendingIdempotencyRecord, ProviderCredentialAuditEvent,
+        ProviderCredentialBinding, ProviderCredentialBindingSpec,
+        ProviderCredentialMutationContext, ProviderDeploymentSpec, ProviderDeploymentWorkflow,
         ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
         ProviderDriverReleaseRegistry, ProviderInstallation, ProviderInstallationSpec,
         ProviderLifecycleAuditEvent, ProviderLifecycleMutationContext,
@@ -57,7 +58,6 @@ use crate::{
     identity::Principal,
 };
 
-const IDEMPOTENCY_KEY: &str = "idempotency-key";
 const REQUEST_ID: &str = "x-request-id";
 const CORRELATION_ID: &str = "x-correlation-id";
 const IF_MATCH: &str = "if-match";
@@ -2199,22 +2199,27 @@ pub async fn cancel_provider_deployment(
     let route = format!(
         "/api/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/cancel"
     );
-    let replay = optional_header(&headers, IDEMPOTENCY_KEY)?
-        .map(|key| keyed_operation_context(&headers, &principal, &route, key))
-        .transpose()?;
-    let operation = state
-        .store
-        .request_provider_deployment_cancellation(ProviderDeploymentCancellation {
-            application_id: app.canonical_id,
-            environment_id: environment.canonical_id,
+    // The generic `POST /operations/{id}/cancel` stops a provider workflow
+    // through the same helper, so the two routes cannot drift apart.
+    let scope = OperationScopeNames {
+        application_id: app.canonical_id,
+        environment_id: environment.canonical_id,
+        application_name: app_name,
+        environment_name,
+    };
+    cancel_provider_workflow(
+        &state.store,
+        &principal,
+        &headers,
+        paths,
+        ProviderWorkflowCancel {
+            scope: &scope,
             operation_id,
             expected_revision,
-            actor_subject: actor_subject(&principal),
-            replay,
-        })
-        .await?;
-    let headers = operation_headers(paths, &operation, &app_name, &environment_name)?;
-    Ok((StatusCode::ACCEPTED, headers, Json(operation)))
+            fingerprint_route: &route,
+        },
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -2547,7 +2552,7 @@ fn operation_context(
     keyed_operation_context(headers, principal, route, idempotency_key)
 }
 
-fn keyed_operation_context(
+pub(in crate::api) fn keyed_operation_context(
     headers: &HeaderMap,
     principal: &Principal,
     route: &str,
@@ -2566,7 +2571,7 @@ fn keyed_operation_context(
     .map_err(Into::into)
 }
 
-fn operation_headers(
+pub(in crate::api) fn operation_headers(
     paths: ApiPaths,
     operation: &ProductOperation,
     app_name: &str,
@@ -2664,7 +2669,7 @@ fn required_if_match(headers: &HeaderMap) -> ApiResult<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{fs, sync::Arc};
 
     use axum::{
@@ -4404,15 +4409,15 @@ mod tests {
     /// A verified release, a credential, an installation, one target and a
     /// grant to `demo/production`, all created through the public API. Every
     /// lifecycle test below starts from this platform.
-    struct ProviderFixture {
-        harness: crate::api::catalog::tests::Harness,
-        router: axum::Router,
-        installation_id: String,
-        target_id: String,
-        grant_id: String,
+    pub(crate) struct ProviderFixture {
+        pub(crate) harness: crate::api::catalog::tests::Harness,
+        pub(crate) router: axum::Router,
+        pub(crate) installation_id: String,
+        pub(crate) target_id: String,
+        pub(crate) grant_id: String,
     }
 
-    async fn provider_fixture(fixture: &ReleaseFixture) -> ProviderFixture {
+    pub(crate) async fn provider_fixture(fixture: &ReleaseFixture) -> ProviderFixture {
         let (harness, router) = release_router(fixture).await;
         harness.state.store.create_app("demo").await.unwrap();
         for environment in ["production", "preview"] {
@@ -4523,7 +4528,7 @@ mod tests {
 
     /// One canonical artifact with a Cloudflare derivation and a version
     /// pointing at it, so a provider deployment passes lineage validation.
-    async fn attach_artifact(harness: &crate::api::catalog::tests::Harness) -> Value {
+    pub(crate) async fn attach_artifact(harness: &crate::api::catalog::tests::Harness) -> Value {
         let artifact_id = CanonicalId::new_v7();
         let artifact_version_id = CanonicalId::new_v7();
         let standard_version = deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION.to_owned();
@@ -4596,7 +4601,7 @@ mod tests {
         })
     }
 
-    async fn begin_deployment(
+    pub(crate) async fn begin_deployment(
         router: &axum::Router,
         target_id: &str,
         artifact: &Value,
@@ -4616,7 +4621,9 @@ mod tests {
         (status, response_json(response).await)
     }
 
-    async fn ready_for_dispatch(harness: &crate::api::catalog::tests::Harness) -> Vec<String> {
+    pub(crate) async fn ready_for_dispatch(
+        harness: &crate::api::catalog::tests::Harness,
+    ) -> Vec<String> {
         harness
             .state
             .store
@@ -4634,7 +4641,7 @@ mod tests {
 
     /// A GET whose body may not be JSON: an extractor rejection (an unknown
     /// query field, say) answers in plain text, which reads as `Null` here.
-    async fn get(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    pub(crate) async fn get(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
         let response = router
             .clone()
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -5308,9 +5315,9 @@ mod tests {
 
     /// A driver that answers every step with a successful receipt, pinned
     /// to the fixture's manifest so the target's durable pin accepts it.
-    struct HttpTestDriver {
-        manifest: ValidatedProviderDriverManifest,
-        calls: std::sync::Mutex<Vec<deis_provider_driver::DriverOperation>>,
+    pub(crate) struct HttpTestDriver {
+        pub(crate) manifest: ValidatedProviderDriverManifest,
+        pub(crate) calls: std::sync::Mutex<Vec<deis_provider_driver::DriverOperation>>,
     }
 
     #[async_trait::async_trait]
@@ -5329,6 +5336,20 @@ mod tests {
             };
             let request = context.request();
             self.calls.lock().unwrap().push(request.operation);
+            if request.operation == DriverOperation::Rollback && request.rollback_target.is_none() {
+                return Err(deis_provider_driver::DriverError {
+                    operation_id: request.operation_id,
+                    operation: request.operation,
+                    desired_state_digest: request.desired_state_digest.clone(),
+                    category: deis_provider_driver::DriverErrorCategory::Configuration,
+                    code: "ROLLBACK_TARGET_MISSING".to_owned(),
+                    message: "rollback request names no activation to restore".to_owned(),
+                    retryable: false,
+                    side_effect: SideEffect::None,
+                    next_action: DriverNextAction::ManualIntervention,
+                    provider_request_id: None,
+                });
+            }
             let side_effecting = matches!(
                 request.operation,
                 DriverOperation::Upload
@@ -5366,7 +5387,11 @@ mod tests {
         }
     }
 
-    async fn drive_once(seeded: &ProviderFixture, driver: &HttpTestDriver, operation_id: &str) {
+    pub(crate) async fn drive_once(
+        seeded: &ProviderFixture,
+        driver: &HttpTestDriver,
+        operation_id: &str,
+    ) {
         seeded
             .harness
             .state
@@ -5381,7 +5406,7 @@ mod tests {
             .unwrap();
     }
 
-    fn error_code(response: &axum::response::Response) -> &'static str {
+    pub(crate) fn error_code(response: &axum::response::Response) -> &'static str {
         response
             .extensions()
             .get::<crate::api::error::ErrorDetail>()

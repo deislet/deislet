@@ -258,6 +258,18 @@ enum Commands {
         limit: usize,
     },
 
+    /// Inspect and intervene in an environment's provider deployments.
+    ///
+    /// A provider deployment is the durable workflow that drives a provider's
+    /// own cloud - not the pointer move `deis deployments` lists. It runs for
+    /// as long as that cloud takes, so unlike a pointer move it can be asked
+    /// to stop, and once finished it can be undone.
+    #[command(name = "provider-deployments")]
+    ProviderDeployments {
+        #[command(subcommand)]
+        action: ProviderDeploymentsAction,
+    },
+
     /// Move an environment's pointer back to an earlier version.
     Rollback {
         #[command(flatten)]
@@ -523,6 +535,72 @@ enum Commands {
         /// Most lines to print, newest first.
         #[arg(long, default_value = "50")]
         limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProviderDeploymentsAction {
+    /// List one environment's provider deployments, newest first.
+    List {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Show at most this many, newest first. At most 1000: that is one
+        /// page, and this reads one page.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Read one provider deployment whole, steps included.
+    Get {
+        /// The operation id, as the OPERATION column of `list` prints it.
+        operation_id: String,
+
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+    },
+
+    /// Ask a provider deployment that is still running to stop.
+    ///
+    /// Steps that have not run do not run, and what is reversible is cleaned
+    /// up; steps that already took effect stay in effect. Undoing those is
+    /// `rollback`, which is a different operation and does more work rather
+    /// than less. A deployment that has already finished is refused.
+    Cancel {
+        /// The operation id to stop.
+        operation_id: String,
+
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+    },
+
+    /// Drive the provider back to what a succeeded deployment left behind.
+    ///
+    /// This records a new operation rather than undoing the named one, so the
+    /// id it prints is a different one - that is what to follow afterwards.
+    Rollback {
+        /// The succeeded deployment whose provider state is restored.
+        operation_id: String,
+
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Follow the new operation until it finishes instead of returning
+        /// as soon as the control plane has accepted it.
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -1216,6 +1294,66 @@ async fn run(cli: Cli) -> Result<()> {
             commands::deployments::execute(target.app, target.environment, limit, format.into())
                 .await
         }
+
+        Commands::ProviderDeployments { action } => match action {
+            ProviderDeploymentsAction::List {
+                target,
+                format,
+                limit,
+            } => {
+                commands::provider_deployments::list(
+                    target.app,
+                    target.environment,
+                    limit,
+                    format.into(),
+                )
+                .await
+            }
+
+            ProviderDeploymentsAction::Get {
+                operation_id,
+                target,
+                format,
+            } => {
+                commands::provider_deployments::get(
+                    target.app,
+                    target.environment,
+                    &operation_id,
+                    format.into(),
+                )
+                .await
+            }
+
+            ProviderDeploymentsAction::Cancel {
+                operation_id,
+                target,
+                format,
+            } => {
+                commands::provider_deployments::cancel(
+                    target.app,
+                    target.environment,
+                    &operation_id,
+                    format.into(),
+                )
+                .await
+            }
+
+            ProviderDeploymentsAction::Rollback {
+                operation_id,
+                target,
+                format,
+                wait,
+            } => {
+                commands::provider_deployments::rollback(
+                    target.app,
+                    target.environment,
+                    &operation_id,
+                    wait,
+                    format.into(),
+                )
+                .await
+            }
+        },
 
         Commands::Rollback {
             target,

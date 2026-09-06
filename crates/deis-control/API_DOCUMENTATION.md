@@ -286,7 +286,8 @@ them with the same name or with `*`.
 | Deploy, roll back, create/update/delete a route | `deploy:<app>/<env>` |
 | Write or delete a secret | `secrets:<app>/<env>` |
 | Mint a storage token | `storage:<app>/<env>`, exactly named |
-| Accounts, tokens, audit, hostname grants, providers, operations, identity migration, backend restores, retired apps, `DELETE /api/v1/apps/{app_id}`, `GET /api/v1/deployment-plans/{id}` | `admin:*/*` |
+| Cancel a provider deployment or rollback, through its scoped route or through `POST /api/v1/operations/{operation_id}/cancel` | `deploy:<app>/<env>` - for the generic route, read from the operation's record |
+| Accounts, tokens, audit, hostname grants, providers, operation reads and every other operation cancel, identity migration, backend restores, retired apps, `DELETE /api/v1/apps/{app_id}`, `GET /api/v1/deployment-plans/{id}` | `admin:*/*` |
 | Platform: sessions, events, metrics, node configuration and commands, `GET /api/platform/routes`, `GET /api/platform/runtime/{node}/status` | `read:*/*`, and `admin:*/*` for the writes (configuration, commands) |
 | `GET /api/platform/runtime` | any scope at all - it is the fleet's health, which `deis status` prints |
 | `DELETE /api/platform/runtime/{node}/apps/{app_id}` | `deploy:<app>/<env>` with `?environment=<env>`; without it the call takes *every* environment off the node, so it demands `deploy:<app>/*` |
@@ -588,11 +589,13 @@ not interchangeable.
 deployment, operation cancellation. The answer is a `ProductOperation`
 (schema:
 [`contracts/v1/operation.schema.json`](../../contracts/v1/operation.schema.json)),
-`Location` points at `/api/v1/operations/{operation_id}`, and the record
+`Location` points at `/api/v1/operations/{operation_id}` (at the scoped
+provider deployment for a provider deploy or rollback), and the record
 carries a `state`, a `revision` (its `ETag`), `progress`, whether it is
 `cancellable`, and an `error` that is set exactly when the state is `failed`.
 Cancel with `POST /api/v1/operations/{operation_id}/cancel`, which needs both
-an `Idempotency-Key` and an `If-Match`.
+an `Idempotency-Key` and an `If-Match`; it dispatches on the operation's
+kind and demands the scope the record says the operation belongs to.
 
 **Deployment plans** - deploy, rollback, and a secret write or delete that
 has to re-plan the running deployment. The answer is the normal deployment
@@ -2460,11 +2463,28 @@ Example answer (`200`, `ProductInstallation`):
 
 `operationId: cancelOperation`. Legacy spelling `POST /api/operations/{operation_id}/cancel`, deprecated.
 
+The route dispatches on the operation's `kind`, and what it demands of the
+caller is read from the operation's record rather than from the path:
+
+| `kind` | Scope | What happens |
+|---|---|---|
+| `deploy`, `rollback` (a provider workflow) | `deploy:<app>/<env>` of the application and environment in the record | Exactly what `cancelProviderDeployment` does: `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). `Location` is the scoped provider deployment, which the same credential can read. Terminal or already cancelling: `409` `operation-not-cancellable`. |
+| `migrate`, `restore` | `admin:*/*` | The operation's own controller stops it; `Location` is this operation. |
+| anything else | `admin:*/*` | `409`: this route has no cancellation controller for it. |
+
+A caller whose scope does not cover the operation is refused with `403`
+`insufficient-scope` whether or not the operation exists, and with the same
+body either way: the refusal names the scope template of each kind
+(`deploy:<app>/<env>`, `admin:*/*`), never the application, environment or
+kind in the record, so a credential over one environment learns nothing about
+ids it may not see. The exact demand is written to the server log with the
+request id.
+
 - **Path** `operation_id` (string, required) - The operation's canonical UUIDv7.
-- **Header** `Idempotency-Key` (string, required) - Replays of the same key return the same operation.
+- **Header** `Idempotency-Key` (string, required) - For a provider `deploy` or `rollback` a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; an identity migration or backend restore cancel is fenced by `If-Match` alone.
 - **Header** `If-Match` (string, required) - The operation revision the caller expects.
-- **202** `ProductOperation` with `Location` - Cancellation was requested; poll `Location`.
-- **Refusals** `400`, `401`, `403`, `404`, `409`, `412`, `428`, `503` - see [Errors](#errors).
+- **202** `ProductOperation` with `Location` - Cancellation was requested; poll `Location` (the scoped provider deployment for a provider `deploy` or `rollback`, this operation otherwise).
+- **Refusals** `400`, `401`, `403`, `404`, `409`, `412`, `428`, `503` - see [Errors](#errors). A terminal or already-cancelling provider operation answers `409` `operation-not-cancellable`.
 
 ---
 

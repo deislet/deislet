@@ -2744,3 +2744,28 @@ Application/framework source + versioned build plan
   Clippy；Linux 另通过 18 份 Schema/57 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为
   `evidence/provider-driver-dispatcher-portability-b45a611.json`；它证明这些控制路径的三平台代码可移植性，不证明真实
   provider 部署或 Edge Canon 合规。
+
+## 95. Rollback 原生身份契约、通用 cancel 路由与 CLI provider-deployments 命令
+
+- Driver 契约增量（ADR-006）：`DriverRequest` 新增可选成员 `rollbackTarget`（源 operation、activate operation、activate receipt
+  的 RFC 8785 规范化 SHA-256，以及 receipt 上报的 providerDeploymentId/providerVersionId/providerResourceIds），`None` 时序列化
+  逐字节不变，拒绝未知成员的旧 driver 对非 rollback 请求继续可解析；`validate_driver_request` 在 Control 落库与 orchestrator
+  每次 claim 后都要求 rollback 必带、其它操作必不带。共享 Schema 以 if/else 约束仅 rollback 可带；新增正向 fixture 与 5 组用例
+  （契约现为 18 份 Schema/62 组 fixture），checker 校验 rollbackTarget 必填集合恰为三项身份 pin、原生身份成员与 receipt 定义一致。
+  Control 从源 workflow 的 activate 步骤 receipt 派生目标，源部署无 succeeded activate receipt 时在写入任何行之前以
+  `operation-not-rollbackable` 拒绝；升级前已排队且无目标的 rollback 行按既有「request 与 pin 不可变」触发器保持不可改写，
+  首次 claim 时以 DRIVER_CONTRACT_VIOLATION 失败并提示重新发起。第 94 节记录的审查 minor 由此解决，原记录保留。
+- 通用 `POST /operations/:id/cancel` 按 operation 记录的 kind 分派：deploy/rollback 走与专用路由相同的 catalog 取消函数，
+  授权要求从记录读出（`deploy:<app>/<env>`），identity migration 与 backend restore 沿用各自控制器。审查发现 403 会向任意
+  已认证调用者泄露 operation 的 app/env 与存在性，已改为与记录无关的固定文案（不存在的 id 与越权 id 的响应体去掉 requestId
+  后完全相等），精确要求只进 warn 日志。`Idempotency-Key` 在通用路由仍必填（契约不能增量放宽），专用路由为可选；
+  `GET /operations/:id` 仍为 admin-only，因此 provider 类 cancel 的 Location 指向 scoped 的 provider-deployment 路径。
+- CLI 新增 `deis provider-deployments list/get/cancel/rollback [--wait]`：cancel 先 GET 取 ETag 再带 If-Match POST；rollback
+  必带 `Idempotency-Key`；`--wait` 复用既有等待助手按有界 interval 轮询；mirror 类型以字符串读 kind/state，未知状态返回
+  `None` 而非报错。CLI README 补入该命令组。
+- 门禁：fmt、`deis-control`/`deis`/`deis-provider-driver` 严格 Clippy、Control 647/647（加 1 ignore）、CLI 190/190、driver 64/64、
+  共享契约 18/62、治理、OpenAPI 兼容（113 个 operation 仅增量）、文档路径、`git diff --check`、web 构建全部通过；两视角审查
+  7 项全部处置（`required_if_match` 在 migrations.rs 与 providers.rs 的两份副本文案不同，保留）。
+- 未完成：`GET /operations/:id` 对 deploy scope 放开读取；通用路由 `Idempotency-Key` 与专用路由一致化需 major；
+  `scripts/demo.sh` 切 v1；旧库两代索引清退；Web 主线；ADR-006 真实签署 release、透明日志、三家完整 driver 与真实账户
+  evidence。本节为本机工作节点，尚无提交后精确归档或三平台 evidence。

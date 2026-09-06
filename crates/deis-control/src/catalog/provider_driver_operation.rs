@@ -13,8 +13,8 @@ use deis_provider_driver::{
     ArtifactVersionRef, DriverError, DriverNextAction, DriverOperation, DriverOperationClaim,
     DriverOperationClaimOutcome, DriverOperationStore, DriverOrchestrationOutcome,
     DriverOrchestrator, DriverOrchestratorConfig, DriverOrchestratorError, DriverReceipt,
-    DriverRequest, DriverStepState, ProviderDriver, ProviderDriverPin, ProviderNeutralPlan,
-    ProviderTargetRef, Sha256Digest, SideEffect, SupportedStandard,
+    DriverRequest, DriverRollbackTarget, DriverStepState, ProviderDriver, ProviderDriverPin,
+    ProviderNeutralPlan, ProviderTargetRef, Sha256Digest, SideEffect, SupportedStandard,
     ValidatedProviderDriverManifest, validate_driver_error, validate_driver_request,
     validate_driver_response,
 };
@@ -774,6 +774,7 @@ impl CatalogStore {
                     target: target_ref.clone(),
                     artifact: Some(spec.artifact.clone()),
                     plan: spec.plan.clone(),
+                    rollback_target: None,
                 };
                 validate_operation_target(&target, &validation_request)?;
                 resolve_application_environment(&transaction, &validation_request)?;
@@ -801,6 +802,7 @@ impl CatalogStore {
                         operation_id,
                         kind: ProviderWorkflowKind::Deploy,
                         rolled_back_from_operation_id: None,
+                        rollback_target: None,
                         organization_id: target.organization_id,
                         desired: &desired,
                         desired_state_json: &desired_state_json,
@@ -820,7 +822,11 @@ impl CatalogStore {
     /// The new `rollback` operation re-asserts that deployment's exact
     /// desired state, target pin and grant pin: the driver receives the
     /// same `desiredStateDigest`, artifact and plan its receipts were bound
-    /// to, which is how it identifies the provider deployment to restore.
+    /// to, plus a [`DriverRollbackTarget`] copied from the deployment's
+    /// succeeded `activate` receipt, which names the provider deployment to
+    /// restore by the native identity the driver itself reported. A
+    /// deployment whose `activate` receipt is missing is refused with
+    /// [`OPERATION_NOT_ROLLBACKABLE`] rather than sent to the driver blind.
     /// The target, its installation and the pinned grant must all still be
     /// active, exactly as for a new deployment; a grant that has since been
     /// revoked and re-issued cannot re-sign a desired state that embeds the
@@ -898,6 +904,7 @@ impl CatalogStore {
                         ))
                     },
                 )?;
+                let rollback_target = load_rollback_target_tx(&transaction, &source)?;
                 let validation_request = DriverRequest {
                     schema_version: 1,
                     operation_id: CanonicalId::new_v7(),
@@ -908,6 +915,7 @@ impl CatalogStore {
                     target: provider_target_ref(&target),
                     artifact: Some(source.artifact.clone()),
                     plan: source.plan.clone(),
+                    rollback_target: Some(rollback_target.clone()),
                 };
                 validate_operation_target(&target, &validation_request)?;
                 resolve_application_environment(&transaction, &validation_request)?;
@@ -926,6 +934,7 @@ impl CatalogStore {
                         operation_id,
                         kind: ProviderWorkflowKind::Rollback,
                         rolled_back_from_operation_id: Some(source_id),
+                        rollback_target: Some(&rollback_target),
                         organization_id: target.organization_id,
                         desired: &desired,
                         desired_state_json: &desired_state_json,
@@ -937,6 +946,9 @@ impl CatalogStore {
                 info!(
                     %operation_id,
                     rolled_back_from_operation_id = %source_id,
+                    activation_operation_id = %rollback_target.activation_operation_id,
+                    provider_deployment_id = ?rollback_target.provider_deployment_id,
+                    provider_version_id = ?rollback_target.provider_version_id,
                     provider_target_id = %source.provider_target_id,
                     "Provider rollback recorded; the dispatcher will drive it"
                 );
@@ -1766,6 +1778,84 @@ fn provider_target_ref(target: &StoredTarget) -> ProviderTargetRef {
     }
 }
 
+/// Build the [`DriverRollbackTarget`] a rollback of `source` carries from
+/// the receipt of `source`'s `activate` step.
+///
+/// The receipt is the driver's own account of which provider deployment it
+/// activated, so its native identities are copied verbatim and the receipt
+/// is pinned by the digest of its canonical JSON, the same bytes the step
+/// row stores. A source with no `activate` step, or whose activation has no
+/// succeeded receipt on record, cannot be rolled back to: the driver would
+/// have nothing but the desired-state digest to search by, and the Control
+/// refuses to dispatch such a rollback.
+fn load_rollback_target_tx(
+    connection: &Connection,
+    source: &ProviderDeploymentWorkflow,
+) -> CatalogResult<DriverRollbackTarget> {
+    let source_id = source.operation.operation_id;
+    let not_rollbackable = |reason: &str| {
+        CatalogError::conflict(format!(
+            "{OPERATION_NOT_ROLLBACKABLE}: deployment {source_id} {reason}; its activation cannot be named to the driver"
+        ))
+    };
+    let activation = source
+        .steps
+        .iter()
+        .find(|step| step.operation == DriverOperation::Activate)
+        .ok_or_else(|| not_rollbackable("has no activate step"))?;
+    let record = load_driver_operation(connection, activation.child_operation_id)?
+        .ok_or_else(|| not_rollbackable("is missing its activate operation record"))?;
+    let receipt = match (&record.state, &record.receipt) {
+        (ProviderOperationState::Succeeded, Some(receipt))
+            if receipt.state == DriverStepState::Succeeded
+                && receipt.operation == DriverOperation::Activate =>
+        {
+            receipt
+        }
+        _ => return Err(not_rollbackable("has no succeeded activate receipt")),
+    };
+    let receipt_json = canonical_json(receipt, "provider activate receipt")?;
+    let activation_receipt_sha256: Sha256Digest = sha256_hex(receipt_json.as_bytes())
+        .parse()
+        .map_err(|error| {
+            CatalogError::invalid(format!("invalid activate receipt digest: {error}"))
+        })?;
+    let target = DriverRollbackTarget {
+        source_operation_id: source_id,
+        activation_operation_id: receipt.operation_id,
+        activation_receipt_sha256,
+        provider_deployment_id: receipt.provider_deployment_id.clone(),
+        provider_version_id: receipt.provider_version_id.clone(),
+        provider_resource_ids: receipt.provider_resource_ids.clone(),
+    };
+    if !target.has_native_identity() {
+        warn!(
+            source_operation_id = %source_id,
+            activation_operation_id = %receipt.operation_id,
+            "Activate receipt reported no provider deployment, version or resource identity; the driver can only locate the deployment to restore by desired-state digest"
+        );
+    }
+    Ok(target)
+}
+
+/// The activation a rollback workflow's `rollback` step restores, read from
+/// the source deployment the workflow names.
+fn workflow_rollback_target_tx(
+    connection: &Connection,
+    workflow: &ProviderDeploymentWorkflow,
+) -> CatalogResult<DriverRollbackTarget> {
+    let operation_id = workflow.operation.operation_id;
+    let source_id = workflow.rolled_back_from_operation_id.ok_or_else(|| {
+        CatalogError::invalid(format!(
+            "provider workflow {operation_id} runs a rollback step but names no source deployment"
+        ))
+    })?;
+    let source = load_provider_deployment_workflow(connection, source_id)?.ok_or_else(|| {
+        CatalogError::not_found(format!("provider deployment operation {source_id}"))
+    })?;
+    load_rollback_target_tx(connection, &source)
+}
+
 /// The facts one workflow row and its parent product operation are written
 /// from. A deploy and a rollback differ only in `kind`, the step list that
 /// implies, and the source a rollback names.
@@ -1773,6 +1863,9 @@ struct ProviderWorkflowInsert<'a> {
     operation_id: CanonicalId,
     kind: ProviderWorkflowKind,
     rolled_back_from_operation_id: Option<CanonicalId>,
+    /// For a rollback, the activation its first step restores; `None` for
+    /// a deploy.
+    rollback_target: Option<&'a DriverRollbackTarget>,
     organization_id: CanonicalId,
     desired: &'a ProviderDeploymentDesiredState,
     desired_state_json: &'a str,
@@ -1884,23 +1977,54 @@ fn insert_provider_workflow_tx(
         operation_id,
         0,
         first_step,
-        desired,
-        insert.desired_state_digest,
+        &ProviderStepFacts {
+            desired,
+            desired_state_digest: insert.desired_state_digest,
+            rollback_target: insert.rollback_target,
+        },
         context,
     )?;
     load_operation_tx(transaction, operation_id)?
         .ok_or_else(|| CatalogError::not_found(format!("operation {operation_id}")))
 }
 
+/// The workflow facts every step request of one workflow is built from.
+struct ProviderStepFacts<'a> {
+    desired: &'a ProviderDeploymentDesiredState,
+    desired_state_digest: &'a Sha256Digest,
+    /// The activation a `rollback` step restores; ignored by other steps.
+    rollback_target: Option<&'a DriverRollbackTarget>,
+}
+
+/// Record step `sequence` of a workflow as a durable driver operation.
+///
+/// A `rollback` step carries `facts.rollback_target` and is refused here,
+/// before any row exists for the dispatcher to claim, when the caller has
+/// none; every other step leaves the member out of its request.
 fn create_provider_deployment_step_tx(
     connection: &Connection,
     parent_operation_id: CanonicalId,
     sequence: usize,
     operation: DriverOperation,
-    desired: &ProviderDeploymentDesiredState,
-    desired_state_digest: &Sha256Digest,
+    facts: &ProviderStepFacts<'_>,
     parent_context: &OperationRequestContext,
 ) -> CatalogResult<CanonicalId> {
+    let desired = facts.desired;
+    let desired_state_digest = facts.desired_state_digest;
+    let rollback_target = if operation == DriverOperation::Rollback {
+        Some(
+            facts
+                .rollback_target
+                .ok_or_else(|| {
+                    CatalogError::invalid(format!(
+                        "provider workflow {parent_operation_id} rollback step must name the activation it restores"
+                    ))
+                })?
+                .clone(),
+        )
+    } else {
+        None
+    };
     let child_operation_id = CanonicalId::new_v7();
     let request = DriverRequest {
         schema_version: 1,
@@ -1912,6 +2036,7 @@ fn create_provider_deployment_step_tx(
         target: desired.target.clone(),
         artifact: Some(desired.artifact.clone()),
         plan: desired.plan.clone(),
+        rollback_target,
     };
     let child_context = OperationRequestContext::new(
         &format!("provider-deployment:{parent_operation_id}:{sequence}"),
@@ -2746,13 +2871,21 @@ fn append_provider_deployment_step_tx(
         request_id: workflow.operation.request_id,
         correlation_id: workflow.operation.correlation_id,
     };
+    let rollback_target = if operation == DriverOperation::Rollback {
+        Some(workflow_rollback_target_tx(connection, workflow)?)
+    } else {
+        None
+    };
     create_provider_deployment_step_tx(
         connection,
         operation_id,
         sequence,
         operation,
-        &desired,
-        &workflow.desired_state_digest,
+        &ProviderStepFacts {
+            desired: &desired,
+            desired_state_digest: &workflow.desired_state_digest,
+            rollback_target: rollback_target.as_ref(),
+        },
         &parent_context,
     )
 }
@@ -4653,6 +4786,7 @@ mod tests {
             },
             artifact: None,
             plan: ProviderNeutralPlan::default(),
+            rollback_target: None,
         }
     }
 
@@ -4786,8 +4920,29 @@ mod tests {
         ) -> Result<DriverReceipt, DriverError> {
             let request = context.request();
             self.calls.lock().unwrap().push(request.operation);
+            refuse_blind_rollback(request)?;
             Ok(success_driver_receipt(request))
         }
+    }
+
+    /// What a real driver does with a rollback that names no activation:
+    /// refuse it rather than guess which provider deployment to restore.
+    fn refuse_blind_rollback(request: &DriverRequest) -> Result<(), DriverError> {
+        if request.operation == DriverOperation::Rollback && request.rollback_target.is_none() {
+            return Err(DriverError {
+                operation_id: request.operation_id,
+                operation: request.operation,
+                desired_state_digest: request.desired_state_digest.clone(),
+                category: deis_provider_driver::DriverErrorCategory::Configuration,
+                code: "ROLLBACK_TARGET_MISSING".to_owned(),
+                message: "rollback request names no activation to restore".to_owned(),
+                retryable: false,
+                side_effect: SideEffect::None,
+                next_action: DriverNextAction::ManualIntervention,
+                provider_request_id: None,
+            });
+        }
+        Ok(())
     }
 
     fn success_driver_receipt(request: &DriverRequest) -> DriverReceipt {
@@ -4835,7 +4990,36 @@ mod tests {
                     | DriverOperation::Rollback
             )
             .then(|| "provider-deployment-1".to_owned()),
-            provider_resource_ids: Default::default(),
+            // A rollback echoes the activation it was told to restore, so
+            // tests can see exactly what the driver received.
+            provider_resource_ids: request
+                .rollback_target
+                .as_ref()
+                .map(|target| {
+                    [
+                        (
+                            "rollback-source-operation".to_owned(),
+                            target.source_operation_id.to_string(),
+                        ),
+                        (
+                            "rollback-activation-operation".to_owned(),
+                            target.activation_operation_id.to_string(),
+                        ),
+                        (
+                            "rollback-activation-receipt-sha256".to_owned(),
+                            target.activation_receipt_sha256.as_str().to_owned(),
+                        ),
+                    ]
+                    .into_iter()
+                    .chain(
+                        target
+                            .provider_deployment_id
+                            .clone()
+                            .map(|id| ("rollback-provider-deployment".to_owned(), id)),
+                    )
+                    .collect()
+                })
+                .unwrap_or_default(),
             observed_at: Utc::now(),
             next_action: DriverNextAction::None,
             diagnostic: None,
@@ -7079,6 +7263,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_refuses_a_source_whose_activate_receipt_is_missing() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let deployment =
+            begin_test_deployment(&harness, &artifact, "provider-rollback-no-receipt").await;
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        for _ in 0..PROVIDER_DEPLOYMENT_STEPS.len() {
+            drive(&harness, deployment.operation_id, &driver).await;
+        }
+        let source = harness
+            .store
+            .provider_deployment_workflow(deployment.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.operation.state, OperationState::Succeeded);
+        let activation_id = source
+            .steps
+            .iter()
+            .find(|step| step.operation == DriverOperation::Activate)
+            .unwrap()
+            .child_operation_id;
+        // The activation succeeded but its receipt is gone: there is no
+        // native identity to hand the driver, so the rollback is refused
+        // instead of being dispatched blind.
+        harness
+            .database
+            .with_connection(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE provider_driver_operations SET receipt_json = NULL
+                      WHERE operation_id = ?1",
+                    [activation_id.to_string()],
+                )?;
+                assert_eq!(changed, 1);
+                Ok::<(), CatalogError>(())
+            })
+            .await
+            .unwrap();
+        let spec = ProviderRollbackSpec {
+            application_id: harness.application_id,
+            environment_id: harness.environment_id,
+            rolled_back_from_operation_id: deployment.operation_id,
+        };
+        let refused = harness
+            .store
+            .begin_provider_rollback(spec, context("provider-rollback-no-receipt-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, CatalogError::Conflict(_)), "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .starts_with(&format!("{OPERATION_NOT_ROLLBACKABLE}: ")),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("activate"), "{refused}");
+        // Nothing was recorded: the deployment has no rollback linked and
+        // the driver was never asked to roll back.
+        let linked = harness
+            .store
+            .provider_deployment_workflow(deployment.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(linked.rollback_operation_ids.is_empty());
+        assert_eq!(
+            driver.calls.lock().unwrap().len(),
+            PROVIDER_DEPLOYMENT_STEPS.len()
+        );
+    }
+
+    /// A queued `rollback` child as the Control recorded it before requests
+    /// carried `rollbackTarget`: the member is computed once, when the step
+    /// is written, so an upgrade finds such rows with none. The request
+    /// column is immutable by trigger, so the test writes the row the way the
+    /// old code did rather than editing one written today.
+    async fn persisted_request_json(harness: &Harness, operation_id: CanonicalId) -> String {
+        harness
+            .database
+            .with_connection(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT request_json FROM provider_driver_operations
+                          WHERE operation_id = ?1",
+                        [operation_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(CatalogError::from)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Replace a queued rollback child with the row the Control wrote before
+    /// `rollbackTarget` existed: the same request without the member, under
+    /// the same operation id, pins and parent step.
+    async fn strip_rollback_target(harness: &Harness, child_operation_id: CanonicalId) {
+        harness
+            .database
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let request_json: String = transaction.query_row(
+                    "SELECT request_json FROM provider_driver_operations WHERE operation_id = ?1",
+                    [child_operation_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let mut request: serde_json::Value = serde_json::from_str(&request_json).unwrap();
+                assert!(
+                    request
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("rollbackTarget")
+                        .is_some()
+                );
+                // The request column is immutable while the row exists, which
+                // is the invariant that rules out completing it in place; the
+                // legacy row is reproduced by re-inserting it.
+                transaction.execute(
+                    "CREATE TEMP TABLE legacy_child AS
+                     SELECT * FROM provider_driver_operations WHERE operation_id = ?1",
+                    [child_operation_id.to_string()],
+                )?;
+                transaction.execute(
+                    "UPDATE legacy_child SET request_json = ?1",
+                    [request.to_string()],
+                )?;
+                transaction.execute("PRAGMA defer_foreign_keys = ON", [])?;
+                transaction.execute(
+                    "DELETE FROM provider_driver_operations WHERE operation_id = ?1",
+                    [child_operation_id.to_string()],
+                )?;
+                transaction.execute(
+                    "INSERT INTO provider_driver_operations SELECT * FROM legacy_child",
+                    [],
+                )?;
+                transaction.execute("DROP TABLE legacy_child", [])?;
+                transaction.commit()?;
+                Ok::<(), CatalogError>(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A rollback queued before the Control named activations to drivers
+    /// cannot be completed in place - the request on record is immutable, and
+    /// it is the record of what the driver was told - so it fails on its
+    /// first dispatch, before any driver runs, with a diagnostic that tells
+    /// the operator to issue the rollback again.
+    #[tokio::test]
+    async fn a_rollback_recorded_without_a_target_fails_before_dispatch_asking_for_a_new_one() {
+        let harness = harness().await;
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let deployment =
+            begin_test_deployment(&harness, &artifact, "provider-rollback-legacy-source").await;
+        for _ in 0..PROVIDER_DEPLOYMENT_STEPS.len() {
+            drive(&harness, deployment.operation_id, &driver).await;
+        }
+        let rollback = harness
+            .store
+            .begin_provider_rollback(
+                ProviderRollbackSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    rolled_back_from_operation_id: deployment.operation_id,
+                },
+                context("provider-rollback-legacy"),
+            )
+            .await
+            .unwrap();
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(rollback.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workflow.steps[0].operation, DriverOperation::Rollback);
+        let child_operation_id = workflow.steps[0].child_operation_id;
+        strip_rollback_target(&harness, child_operation_id).await;
+        assert!(
+            !persisted_request_json(&harness, child_operation_id)
+                .await
+                .contains("rollbackTarget")
+        );
+
+        let outcome = drive(&harness, rollback.operation_id, &driver).await;
+        assert!(
+            matches!(outcome, ProviderDeploymentDriveOutcome::Failed(_)),
+            "{outcome:?}"
+        );
+        let child = harness
+            .store
+            .provider_driver_operation(child_operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.state, ProviderOperationState::Failed, "{child:?}");
+        let diagnostic = child.contract_failure.unwrap();
+        assert!(
+            diagnostic.contains("name the activation it restores"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("issued again"), "{diagnostic}");
+        let product = harness
+            .store
+            .product_operation(rollback.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(product.state, OperationState::Failed);
+        assert_eq!(product.error.unwrap().code, "DRIVER_CONTRACT_VIOLATION");
+        // The driver was never asked to roll back blind ...
+        assert_eq!(
+            driver.calls.lock().unwrap().len(),
+            PROVIDER_DEPLOYMENT_STEPS.len()
+        );
+        // ... and a fresh rollback of the same deployment is the way out.
+        let again = harness
+            .store
+            .begin_provider_rollback(
+                ProviderRollbackSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    rolled_back_from_operation_id: deployment.operation_id,
+                },
+                context("provider-rollback-legacy-again"),
+            )
+            .await
+            .unwrap();
+        assert_ne!(again.operation_id, rollback.operation_id);
+        assert!(matches!(
+            drive(&harness, again.operation_id, &driver).await,
+            ProviderDeploymentDriveOutcome::Advanced(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn rollback_runs_the_driver_rollback_against_the_deployments_desired_state() {
         let harness = harness().await;
         let artifact = attach_cloudflare_artifact(&harness).await;
@@ -7232,13 +7659,51 @@ mod tests {
             rollback_child.desired_state_digest,
             source.desired_state_digest
         );
+        let rollback_receipt = rollback_child.receipt.unwrap();
         assert_eq!(
-            rollback_child
-                .receipt
-                .unwrap()
-                .provider_deployment_id
-                .as_deref(),
+            rollback_receipt.provider_deployment_id.as_deref(),
             Some("provider-deployment-1")
+        );
+        // The driver was told exactly which activation to restore: the
+        // source's activate receipt, by operation, canonical digest and the
+        // native identity that receipt reported.
+        let activation_step = source
+            .steps
+            .iter()
+            .find(|step| step.operation == DriverOperation::Activate)
+            .unwrap();
+        let activation = harness
+            .store
+            .provider_driver_operation(activation_step.child_operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let activation_receipt = activation.receipt.unwrap();
+        let activation_digest = sha256_hex(
+            canonical_json(&activation_receipt, "receipt")
+                .unwrap()
+                .as_bytes(),
+        );
+        let echoed = &rollback_receipt.provider_resource_ids;
+        assert_eq!(
+            echoed.get("rollback-source-operation").map(String::as_str),
+            Some(deployment.operation_id.to_string().as_str())
+        );
+        assert_eq!(
+            echoed
+                .get("rollback-activation-operation")
+                .map(String::as_str),
+            Some(activation_step.child_operation_id.to_string().as_str())
+        );
+        assert_eq!(
+            echoed
+                .get("rollback-activation-receipt-sha256")
+                .map(String::as_str),
+            Some(activation_digest.as_str())
+        );
+        assert_eq!(
+            echoed.get("rollback-provider-deployment").cloned(),
+            activation_receipt.provider_deployment_id
         );
         // Once finished the same deployment can be rolled back to again.
         let again = harness

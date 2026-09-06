@@ -11,6 +11,11 @@ use axum::http::{HeaderMap, HeaderValue};
 
 use crate::api::error::{ApiError, ApiResult};
 
+/// The `Idempotency-Key` request header, as every route that reads it names
+/// it: the one spelling the shared idempotency records and the header's own
+/// error code are keyed on.
+pub(crate) const IDEMPOTENCY_KEY: &str = "idempotency-key";
+
 /// The header's value as visible ASCII; absent or repeated is refused.
 pub(crate) fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> ApiResult<&'a str> {
     single_header(headers, name)?

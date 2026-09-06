@@ -11,6 +11,7 @@ pub mod domains;
 pub mod init;
 pub mod kv;
 pub mod logs;
+pub mod provider_deployments;
 pub mod queue;
 pub mod rollback;
 pub mod routes;

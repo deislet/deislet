@@ -696,6 +696,40 @@ def validate_cross_document_invariants(registry: dict) -> None:
         require(environment["canonicalTenantKey"] == expected_key, "canonical tenant key is not ID-based")
         require(environment["legacyTenantKey"] != expected_key, "legacy and canonical tenant keys unexpectedly match")
 
+    # The driver request grew `rollbackTarget` after drivers were already
+    # parsing v1 requests with unknown members rejected, so it must stay an
+    # optional member, and the identity it copies from the activate receipt
+    # must keep the receipt's own vocabulary.
+    process_schema = load_json("contracts/v1/provider-driver-process.schema.json")
+    driver_request = process_schema["$defs"]["driverRequest"]
+    require(
+        "rollbackTarget" in driver_request["properties"]
+        and "rollbackTarget" not in driver_request["required"],
+        "driver request rollbackTarget must exist and remain optional",
+    )
+    rollback_target = process_schema["$defs"]["rollbackTarget"]
+    require(
+        rollback_target.get("additionalProperties") is False
+        and set(rollback_target["required"])
+        == {"sourceOperationId", "activationOperationId", "activationReceiptSha256"},
+        "driver rollback target must pin the source operation and activation receipt only",
+    )
+    receipt_properties = process_schema["$defs"]["receipt"]["properties"]
+    for member in ("providerDeploymentId", "providerVersionId", "providerResourceIds"):
+        require(
+            rollback_target["properties"].get(member) == receipt_properties.get(member),
+            f"driver rollback target {member} must match the receipt member it is copied from",
+        )
+    rollback_request = load_json(
+        "contracts/v1/fixtures/valid/provider-driver-process-rollback-request.json"
+    )["request"]
+    require(
+        rollback_request["operation"] == "rollback"
+        and rollback_request["rollbackTarget"]["sourceOperationId"] != rollback_request["operationId"]
+        and rollback_request["rollbackTarget"]["activationOperationId"] != rollback_request["operationId"],
+        "rollback request fixture must name a different source deployment and activation",
+    )
+
 
 def main() -> int:
     try:

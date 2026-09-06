@@ -567,6 +567,7 @@ mod tests {
             },
             artifact: None,
             plan: ProviderNeutralPlan::default(),
+            rollback_target: None,
         }
     }
 

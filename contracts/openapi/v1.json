@@ -11912,7 +11912,7 @@
             }
           },
           {
-            "description": "Required. Replays of the same key return the same operation.",
+            "description": "Required. For a provider `deploy` or `rollback` operation a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; an identity migration or backend restore cancel is fenced by `If-Match` alone.",
             "in": "header",
             "name": "Idempotency-Key",
             "required": true,
@@ -11939,10 +11939,10 @@
                 }
               }
             },
-            "description": "Cancellation was requested; poll `Location`.",
+            "description": "Cancellation was requested; poll `Location`. The route dispatches on the operation's `kind`. A provider `deploy` or `rollback` is stopped exactly as `cancelProviderDeployment` stops it - `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic) - and `Location` is the scoped provider deployment, which the same credential can read; it answers to `deploy:<app>/<env>` of the application and environment in the operation's record, and `409` `operation-not-cancellable` once terminal or already cancelling. A `migrate` or `restore` operation answers to `admin:*/*`, is stopped by its own controller, and `Location` is this operation. Any other kind is refused with `409`: this route has no cancellation controller for it.",
             "headers": {
               "Location": {
-                "description": "Where to poll the operation.",
+                "description": "Where to poll the operation: the scoped provider deployment for a provider `deploy` or `rollback`, this operation otherwise.",
                 "schema": {
                   "type": "string"
                 }

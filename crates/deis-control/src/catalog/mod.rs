@@ -81,7 +81,7 @@ pub use model::{
     DeploymentProxyObservation, DeploymentQueueObservation, DeploymentTargetObservation,
     Environment, ProviderDerivation, RetiredAppName, Route, SecretMeta, Version, now_secs,
 };
-pub use operation::OperationRequestContext;
+pub use operation::{OperationRequestContext, OperationScopeNames};
 pub use pagination::{
     CatalogPage, INVALID_CURSOR_MESSAGE, PageCursorStatistics, PageCursorStore, PagePosition,
 };

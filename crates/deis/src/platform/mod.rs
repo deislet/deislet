@@ -9,7 +9,8 @@ pub mod storage;
 pub mod telemetry;
 
 use anyhow::{Context, Result, bail};
-use deis_wire::CanonicalId;
+use chrono::{DateTime, Utc};
+use deis_wire::{CanonicalId, OperationState};
 use reqwest::{
     Method, StatusCode,
     header::{ACCEPT, HeaderMap},
@@ -27,6 +28,23 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 /// when Control returns a durable `202 Accepted` plan while queues drain.
 const DEPLOYMENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const DEPLOYMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long `--wait` follows one provider deployment before handing the
+/// operator back their shell.
+///
+/// Far longer than a deployment plan's window because the work is different
+/// in kind: a plan pushes a bundle to nodes this platform runs, while a
+/// provider workflow runs seven driver steps against somebody else's cloud
+/// and waits for that cloud to converge. Giving up is not cancelling - the
+/// operation keeps running and the message says where its status lives.
+const PROVIDER_DEPLOYMENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+/// How often `--wait` reads the workflow. Slower than a plan's poll because
+/// a provider step takes seconds at best, and every read is a request an
+/// operator's credential is spending on the control plane.
+const PROVIDER_DEPLOYMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// The header that makes a repeated mutation answer the first one rather
+/// than start a second. Spelled once here; both provider-deployment
+/// mutations send it.
+const IDEMPOTENCY_KEY: &str = "idempotency-key";
 
 /// The version of the control plane's list envelope this build reads.
 const LIST_SCHEMA_VERSION: u8 = 1;
@@ -346,6 +364,208 @@ struct DeploymentMutationResponse {
 #[derive(Debug, Deserialize)]
 struct DeploymentPlanStatusResponse {
     plan: DeploymentPlanSummary,
+}
+
+/// One durable operation, as every provider-deployment answer carries it.
+///
+/// `kind` and `state` are read as strings rather than as the `deis_wire`
+/// enums they mirror, and that is deliberate: a control plane newer than this
+/// build may name a state this build has never heard of, and an operator
+/// staring at an unfinished deployment needs to be *shown* that name. Refusing
+/// the whole document instead would turn "your CLI is older than the platform"
+/// into "the deployment cannot be read at all". [`Self::settled`] is where the
+/// contract's own state machine is consulted, so nothing here second-guesses
+/// which states are terminal.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderOperationSummary {
+    pub operation_id: CanonicalId,
+    pub kind: String,
+    pub state: String,
+    #[serde(default)]
+    pub phase: String,
+    /// The revision `If-Match` names. Every conditional call sends the one
+    /// the ETag of the read that produced it carried, not this number; it is
+    /// here so `--json` can show what the caller acted on.
+    #[serde(default)]
+    pub revision: u64,
+    /// Basis points, or `None` when the control plane has no honest
+    /// denominator to divide by.
+    #[serde(default)]
+    pub progress: Option<u16>,
+    #[serde(default)]
+    pub cancellable: bool,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub error: Option<OperationFailure>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl ProviderOperationSummary {
+    /// Whether the operation has stopped moving, or `None` when this build
+    /// does not know the state the control plane named.
+    ///
+    /// `None` is not "still running": a waiter that treated an unknown state
+    /// as unfinished would poll a settled operation until it timed out, and
+    /// one that treated it as finished would report a running deployment as
+    /// done. The caller has to say which of those is safe for what it is
+    /// doing, so this hands the ignorance back rather than picking.
+    #[must_use]
+    pub fn settled(&self) -> Option<bool> {
+        OperationState::parse(&self.state).map(OperationState::terminal)
+    }
+}
+
+/// Why an operation ended badly, as the control plane records it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationFailure {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub retry_after_seconds: Option<u64>,
+    #[serde(default)]
+    pub remediation: Option<String>,
+}
+
+/// One step of a provider workflow and the child operation that ran it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDeploymentStep {
+    pub sequence: usize,
+    /// The driver call this step makes: `validate`, `plan`, `apply`,
+    /// `observe`, `rollback` and so on. A string, because the set belongs to
+    /// the driver contract and grows there, not here.
+    pub operation: String,
+    pub child_operation_id: CanonicalId,
+}
+
+/// One provider deployment or rollback workflow, as the catalog records it.
+///
+/// Mirrors `ProviderDeploymentWorkflow` in `deis-control`. Every field this
+/// CLI prints is read straight off the answer and everything optional is
+/// defaulted, so a control plane that grows a field does not stop an older
+/// CLI from printing the ones it already knows.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDeployment {
+    pub operation: ProviderOperationSummary,
+    /// `deploy` runs the driver's standard steps; `rollback` restores the
+    /// deployment named by `rolled_back_from_operation_id`.
+    pub kind: String,
+    /// For a rollback workflow, the succeeded deployment it restores.
+    #[serde(default)]
+    pub rolled_back_from_operation_id: Option<CanonicalId>,
+    /// Every rollback that names this workflow as its source, oldest first,
+    /// whatever state each reached.
+    #[serde(default)]
+    pub rollback_operation_ids: Vec<CanonicalId>,
+    /// When a cancel was accepted. Set once; the operation's state says how
+    /// far the cancel then got.
+    #[serde(default)]
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+    pub provider_target_id: CanonicalId,
+    #[serde(default)]
+    pub target_revision: u64,
+    #[serde(default)]
+    pub provider_target_grant_id: Option<CanonicalId>,
+    #[serde(default)]
+    pub target_grant_revision: Option<u64>,
+    #[serde(default)]
+    pub desired_state_digest: Option<String>,
+    #[serde(default)]
+    pub next_step_index: usize,
+    #[serde(default)]
+    pub dispatch_failure_count: u64,
+    #[serde(default)]
+    pub last_dispatch_error_code: Option<String>,
+    #[serde(default)]
+    pub last_dispatch_error_message: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<ProviderDeploymentStep>,
+}
+
+/// One workflow and the exact revision the read of it observed.
+///
+/// The two travel together because a cancel is only correct against the
+/// revision the caller actually saw: sending back a revision recomputed from
+/// the body would defeat the fence the moment the body and the ETag disagree.
+#[derive(Debug, Clone)]
+pub struct ProviderDeploymentRead {
+    pub workflow: ProviderDeployment,
+    /// The `ETag` of the read, verbatim, ready to be an `If-Match`.
+    pub etag: String,
+}
+
+/// What a cancel request did: what the fence was taken against, and what the
+/// control plane answered.
+///
+/// Both halves are printed. `observed` is the state the operator's cancel was
+/// aimed at, `operation` is where the operation stands now - `cancelling`
+/// while in-flight provider work settles, `cancelled` once it has. Showing
+/// only the second would leave "cancelled a deployment that had already
+/// finished" and "cancelled one that was still running" looking identical.
+#[derive(Debug, Clone)]
+pub struct ProviderDeploymentCancel {
+    /// The workflow as it was read to fence the cancel.
+    pub observed: ProviderDeployment,
+    /// The operation as the control plane answered the cancel.
+    pub operation: ProviderOperationSummary,
+}
+
+/// A fresh `Idempotency-Key`.
+///
+/// A UUIDv7, which comfortably clears the control plane's rule of 8 to 255
+/// non-control bytes and carries its own creation time, so a replayed key can
+/// be dated from the key itself when a record is being chased. One per call
+/// site invocation, never reused across attempts of *different* requests: the
+/// whole point is that one operator action has one key.
+fn new_idempotency_key() -> String {
+    CanonicalId::new_v7().to_string()
+}
+
+/// The revision an answer was read at, spelled as an `If-Match` value.
+///
+/// The `ETag` header is preferred over the revision in the body because the
+/// header is what the control plane's own precondition check compares
+/// against; recomputing the value from the body would quietly paper over a
+/// control plane whose two answers disagree, and the fence exists to catch
+/// exactly that class of disagreement. The body is the fallback for a control
+/// plane that answers without the header at all, which is said at debug
+/// because the fence is then weaker than it looks.
+fn read_etag(headers: &HeaderMap, operation: &ProviderOperationSummary) -> String {
+    match headers
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(etag) => etag.to_string(),
+        None => {
+            tracing::debug!(
+                operation_id = %operation.operation_id,
+                revision = operation.revision,
+                "the control plane answered a provider deployment without an ETag; fencing on \
+                 the revision in the body instead"
+            );
+            format!("\"{}\"", operation.revision)
+        }
+    }
+}
+
+/// The top of one environment's provider-deployment history, and how deep it
+/// goes - the same shape, and the same one-page rule, as
+/// [`DeploymentHistory`].
+#[derive(Debug, Clone)]
+pub struct ProviderDeploymentHistory {
+    /// Newest first, as the route serves them.
+    pub deployments: Vec<ProviderDeployment>,
+    pub total: usize,
 }
 
 #[cfg(test)]
@@ -1552,6 +1772,279 @@ impl Control {
             deployments: page.items,
             total: page.page.total,
         })
+    }
+
+    // ---- provider deployments -----------------------------------------
+
+    /// The path of one workflow below the product prefix.
+    ///
+    /// `operation_id` is a [`CanonicalId`] rather than a string precisely
+    /// because this becomes a URL path: an identity that has already been
+    /// parsed cannot carry a slash, a `..` or a query string into it, so no
+    /// call site has to remember to check.
+    fn provider_deployment_route(
+        app_id: &str,
+        environment: &str,
+        operation_id: CanonicalId,
+    ) -> String {
+        format!("/apps/{app_id}/environments/{environment}/provider-deployments/{operation_id}")
+    }
+
+    /// The newest `limit` provider deployments of one environment, and how
+    /// many the environment has behind them.
+    ///
+    /// One page, for the same reason [`Self::list_deployments`] reads one: an
+    /// environment gains a workflow on every provider deploy, cancel and
+    /// rollback, so the history has no ceiling and the newest rows are the
+    /// answer.
+    pub async fn list_provider_deployments(
+        &self,
+        app_id: &str,
+        environment: &str,
+        limit: usize,
+    ) -> Result<ProviderDeploymentHistory> {
+        let what = format!("listing the provider deployments of {environment} of app {app_id}");
+        let limit = bounded_page_limit(limit, &what);
+        let path =
+            format!("/apps/{app_id}/environments/{environment}/provider-deployments?limit={limit}");
+        let page: ListPage<ProviderDeployment> = self.list_first_page(&path, &what).await?;
+        if page.page.next_cursor.is_some() {
+            tracing::debug!(
+                app_id,
+                environment,
+                shown = page.items.len(),
+                total = page.page.total,
+                "this environment has more provider deployments than one page holds; raise \
+                 --limit to read further back"
+            );
+        }
+        Ok(ProviderDeploymentHistory {
+            deployments: page.items,
+            total: page.page.total,
+        })
+    }
+
+    /// One provider deployment workflow, and the revision this exact read
+    /// observed.
+    pub async fn get_provider_deployment(
+        &self,
+        app_id: &str,
+        environment: &str,
+        operation_id: CanonicalId,
+    ) -> Result<ProviderDeploymentRead> {
+        let what =
+            format!("reading provider deployment {operation_id} of {environment} of app {app_id}");
+        let route = Self::provider_deployment_route(app_id, environment, operation_id);
+        let (_, headers, workflow) = self
+            .send_with_metadata::<ProviderDeployment>(self.request(Method::GET, &route), &what)
+            .await?;
+        if workflow.operation.operation_id != operation_id {
+            bail!(
+                "{what}: the control plane answered with operation {}, which is not the one that \
+                 was asked for",
+                workflow.operation.operation_id
+            );
+        }
+        let etag = read_etag(&headers, &workflow.operation);
+        Ok(ProviderDeploymentRead { workflow, etag })
+    }
+
+    /// Ask one provider workflow to stop.
+    ///
+    /// Two calls on purpose, and they cannot be folded into one. The route is
+    /// fenced on the revision the caller *saw*, so the workflow is read first
+    /// and that read's `ETag` goes back as `If-Match`. If the operation moved
+    /// in between - it succeeded, it failed, somebody else cancelled it - the
+    /// control plane answers 412 and this call has changed nothing, which is
+    /// the fence working rather than a call to repeat blindly.
+    ///
+    /// The route makes an `Idempotency-Key` optional; one is sent anyway. It
+    /// covers the case the fence does not: a request that reached the control
+    /// plane and whose *answer* did not come back - a reset connection, a
+    /// proxy that resends - is one set of bytes delivered twice, and the key
+    /// is what makes the second delivery replay the first cancel rather than
+    /// record a second one. A fresh key per invocation is deliberate: two
+    /// deliveries of one command share a key, two commands do not.
+    pub async fn cancel_provider_deployment(
+        &self,
+        app_id: &str,
+        environment: &str,
+        operation_id: CanonicalId,
+    ) -> Result<ProviderDeploymentCancel> {
+        let read = self
+            .get_provider_deployment(app_id, environment, operation_id)
+            .await?;
+        let what = format!(
+            "cancelling provider deployment {operation_id} of {environment} of app {app_id}"
+        );
+        let route = format!(
+            "{}/cancel",
+            Self::provider_deployment_route(app_id, environment, operation_id)
+        );
+        tracing::info!(
+            app_id,
+            environment,
+            %operation_id,
+            observed_state = %read.workflow.operation.state,
+            if_match = %read.etag,
+            "requesting cancellation of a provider deployment"
+        );
+        let (_, _, operation) = self
+            .send_with_metadata::<ProviderOperationSummary>(
+                self.request(Method::POST, &route)
+                    .header(reqwest::header::IF_MATCH, &read.etag)
+                    .header(IDEMPOTENCY_KEY, new_idempotency_key()),
+                &what,
+            )
+            .await?;
+        if operation.operation_id != operation_id {
+            bail!(
+                "{what}: the control plane answered with operation {}, which is not the one that \
+                 was cancelled",
+                operation.operation_id
+            );
+        }
+        Ok(ProviderDeploymentCancel {
+            observed: read.workflow,
+            operation,
+        })
+    }
+
+    /// Restore the provider deployment one succeeded workflow left behind.
+    ///
+    /// This does not undo the named operation; it records a *new* rollback
+    /// operation that drives the driver back to that deployment's exact
+    /// desired state. The answer is therefore a different operation id from
+    /// the one that was asked about, and that id is what the caller polls.
+    ///
+    /// The `Idempotency-Key` is required by the route, and a fresh one is
+    /// minted per invocation. That is the right grain: a redelivery of these
+    /// exact bytes replays the one rollback, while an operator who runs the
+    /// command twice has asked for two rollbacks and gets two - a second
+    /// rollback of an unchanged deployment is harmless, and silently
+    /// answering the first would hide a control plane that never started it.
+    pub async fn rollback_provider_deployment(
+        &self,
+        app_id: &str,
+        environment: &str,
+        operation_id: CanonicalId,
+    ) -> Result<ProviderOperationSummary> {
+        let what = format!(
+            "rolling provider deployment {operation_id} of {environment} of app {app_id} back"
+        );
+        let route = format!(
+            "{}/rollback",
+            Self::provider_deployment_route(app_id, environment, operation_id)
+        );
+        tracing::info!(
+            app_id,
+            environment,
+            rolled_back_from = %operation_id,
+            "requesting a provider deployment rollback"
+        );
+        let (_, headers, operation) = self
+            .send_with_metadata::<ProviderOperationSummary>(
+                self.request(Method::POST, &route)
+                    .header(IDEMPOTENCY_KEY, new_idempotency_key()),
+                &what,
+            )
+            .await?;
+        if operation.operation_id == operation_id {
+            bail!(
+                "{what}: the control plane answered with the operation that was rolled back \
+                 rather than the new rollback operation"
+            );
+        }
+        // The `Location` is checked against the path this CLI would have
+        // built rather than followed as an arbitrary URL, exactly as an
+        // accepted deployment plan is: a control plane that is compromised or
+        // simply incompatible must not be able to redirect a credential-
+        // bearing client somewhere of its choosing.
+        let expected = format!(
+            "{}{}",
+            self.product_prefix(),
+            Self::provider_deployment_route(app_id, environment, operation.operation_id)
+        );
+        let location = headers
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{what}: rollback operation {} was accepted without a Location to poll",
+                    operation.operation_id
+                )
+            })?
+            .to_str()
+            .context("reading the rollback operation Location")?;
+        if location != expected {
+            bail!(
+                "{what}: rollback operation {} returned Location {location:?}, expected the \
+                 scoped path {expected:?}",
+                operation.operation_id
+            );
+        }
+        Ok(operation)
+    }
+
+    /// Poll one provider workflow until its operation stops moving.
+    ///
+    /// Paced by a [`tokio::time::interval`] rather than by sleeping for the
+    /// gap after each read, so a control plane that answers slowly does not
+    /// silently stretch the polling period, and a burst of missed ticks does
+    /// not turn into a burst of requests ([`MissedTickBehavior::Delay`]).
+    ///
+    /// A state this build does not know is *not* treated as finished. The
+    /// wait then ends at the timeout with a message naming that state, which
+    /// is a slow honest answer; calling it finished would be a fast wrong one
+    /// that reports a running deployment as done.
+    pub async fn wait_for_provider_deployment(
+        &self,
+        app_id: &str,
+        environment: &str,
+        operation_id: CanonicalId,
+    ) -> Result<ProviderDeployment> {
+        let what = format!(
+            "waiting for provider deployment {operation_id} of {environment} of app {app_id}"
+        );
+        let path = format!(
+            "{}{}",
+            self.product_prefix(),
+            Self::provider_deployment_route(app_id, environment, operation_id)
+        );
+        let deadline = tokio::time::Instant::now() + PROVIDER_DEPLOYMENT_WAIT_TIMEOUT;
+        let mut ticker = tokio::time::interval(PROVIDER_DEPLOYMENT_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut warned_about_unknown_state = false;
+        loop {
+            // The first tick completes immediately, so the workflow is read
+            // once before any waiting happens.
+            ticker.tick().await;
+            let read = self
+                .get_provider_deployment(app_id, environment, operation_id)
+                .await?;
+            match read.workflow.operation.settled() {
+                Some(true) => return Ok(read.workflow),
+                Some(false) => {}
+                None if !warned_about_unknown_state => {
+                    warned_about_unknown_state = true;
+                    tracing::warn!(
+                        %operation_id,
+                        state = %read.workflow.operation.state,
+                        cli_version = env!("CARGO_PKG_VERSION"),
+                        "the control plane reports a provider operation state this CLI does not \
+                         know; waiting on it as unfinished, which will end at the timeout even if \
+                         it is in fact a settled state - upgrade this CLI"
+                    );
+                }
+                None => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "{what}: it is still {} after {} seconds; its durable status remains at {path}",
+                    read.workflow.operation.state,
+                    PROVIDER_DEPLOYMENT_WAIT_TIMEOUT.as_secs()
+                );
+            }
+        }
     }
 
     // ---- routes -------------------------------------------------------
@@ -2894,5 +3387,416 @@ mod surface_tests {
         assert_eq!(apps[0].app_id, "demo");
         assert!(!control.speaks_legacy());
         let _ = shutdown.send(());
+    }
+}
+
+/// The provider-deployment surface: what one workflow reads as, and the two
+/// round trips - a fenced cancel and a refusal - that a stub control plane is
+/// the only honest way to exercise.
+#[cfg(test)]
+mod provider_deployment_tests {
+    use super::test_server::control_for;
+    use super::*;
+    use axum::http::HeaderMap as AxumHeaderMap;
+    use axum::{
+        Json, Router,
+        http::header::{ETAG, IF_MATCH, LOCATION},
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
+
+    const DEPLOYMENT_ID: &str = "018f2518-7e38-7f80-8000-0000000000a1";
+    const ROLLBACK_ID: &str = "018f2518-7e38-7f80-8000-0000000000a2";
+    const TARGET_ID: &str = "018f2518-7e38-7f80-8000-0000000000b1";
+    const GRANT_ID: &str = "018f2518-7e38-7f80-8000-0000000000b2";
+    const CHILD_ID: &str = "018f2518-7e38-7f80-8000-0000000000c1";
+    const WORKFLOW_PATH: &str = "/api/v1/apps/demo/environments/production/provider-deployments/018f2518-7e38-7f80-8000-0000000000a1";
+    const ROLLBACK_PATH: &str = "/api/v1/apps/demo/environments/production/provider-deployments/018f2518-7e38-7f80-8000-0000000000a2";
+
+    fn id(text: &str) -> CanonicalId {
+        text.parse().expect("test id is a canonical identity")
+    }
+
+    /// One operation exactly as `contracts/v1/operation.schema.json` puts it
+    /// on the wire, fields this CLI does not read included: they are the
+    /// point of the fixture, since dropping one of them must not be what
+    /// makes a document readable.
+    fn operation(operation_id: &str, kind: &str, state: &str, revision: u64) -> serde_json::Value {
+        serde_json::json!({
+            "$schema": "https://github.com/deislet/deislet/contracts/v1/operation.schema.json",
+            "schemaVersion": 1,
+            "operationId": operation_id,
+            "kind": kind,
+            "scope": {
+                "organizationId": "018f2518-7e38-7f80-8000-0000000000f1",
+                "applicationId": "018f2518-7e38-7f80-8000-0000000000f2",
+                "environmentId": "018f2518-7e38-7f80-8000-0000000000f3"
+            },
+            "target": {
+                "kind": "provider-deployment",
+                "id": TARGET_ID,
+                "expectedRevision": 3
+            },
+            "state": state,
+            "phase": "apply",
+            "revision": revision,
+            "idempotencyKeyDigest": {"algorithm": "sha256", "value": "00"},
+            "actorId": "018f2518-7e38-7f80-8000-0000000000f4",
+            "requestId": "018f2518-7e38-7f80-8000-0000000000f5",
+            "correlationId": "018f2518-7e38-7f80-8000-0000000000f6",
+            "progress": 4200,
+            "cancellable": true,
+            "retryable": false,
+            "childOperationIds": [CHILD_ID],
+            "providerOperations": [],
+            "error": null,
+            "createdAt": "2026-09-06T10:00:00Z",
+            "startedAt": "2026-09-06T10:00:01Z",
+            "updatedAt": "2026-09-06T10:04:00Z",
+            "finishedAt": null
+        })
+    }
+
+    fn workflow(state: &str, revision: u64) -> serde_json::Value {
+        serde_json::json!({
+            "operation": operation(DEPLOYMENT_ID, "deploy", state, revision),
+            "kind": "deploy",
+            "rolledBackFromOperationId": null,
+            "rollbackOperationIds": [ROLLBACK_ID],
+            "cancelRequestedAt": null,
+            "providerTargetId": TARGET_ID,
+            "targetRevision": 3,
+            "providerTargetGrantId": GRANT_ID,
+            "targetGrantRevision": 2,
+            "desiredStateDigest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "artifact": {"artifactId": "018f2518-7e38-7f80-8000-0000000000d1"},
+            "plan": {"schemaVersion": 1},
+            "nextStepIndex": 2,
+            "dispatchNotBefore": null,
+            "dispatchFailureCount": 1,
+            "dispatchFailureChildOperationId": CHILD_ID,
+            "lastDispatchErrorCode": "driver-unreachable",
+            "lastDispatchErrorMessage": "the driver did not answer",
+            "steps": [
+                {"sequence": 0, "operation": "validate", "childOperationId": CHILD_ID},
+                {"sequence": 1, "operation": "plan", "childOperationId": CHILD_ID},
+                {"sequence": 2, "operation": "apply", "childOperationId": CHILD_ID}
+            ]
+        })
+    }
+
+    #[test]
+    fn a_workflow_reads_as_every_field_this_cli_prints() {
+        let read: ProviderDeployment = serde_json::from_value(workflow("running", 7)).unwrap();
+        assert_eq!(read.kind, "deploy");
+        assert_eq!(read.operation.operation_id, id(DEPLOYMENT_ID));
+        assert_eq!(read.operation.state, "running");
+        assert_eq!(read.operation.phase, "apply");
+        assert_eq!(read.operation.revision, 7);
+        assert_eq!(read.operation.progress, Some(4200));
+        assert!(read.operation.cancellable);
+        assert_eq!(read.operation.finished_at, None);
+        assert_eq!(read.cancel_requested_at, None);
+        assert_eq!(read.rolled_back_from_operation_id, None);
+        assert_eq!(read.rollback_operation_ids, vec![id(ROLLBACK_ID)]);
+        assert_eq!(read.provider_target_id, id(TARGET_ID));
+        assert_eq!(read.provider_target_grant_id, Some(id(GRANT_ID)));
+        assert_eq!(read.target_grant_revision, Some(2));
+        assert_eq!(read.next_step_index, 2);
+        assert_eq!(read.dispatch_failure_count, 1);
+        assert_eq!(
+            read.last_dispatch_error_code.as_deref(),
+            Some("driver-unreachable")
+        );
+        assert_eq!(read.steps.len(), 3);
+        assert_eq!(read.steps[2].operation, "apply");
+        assert_eq!(read.steps[2].child_operation_id, id(CHILD_ID));
+        assert_eq!(read.operation.settled(), Some(false));
+    }
+
+    /// A rollback workflow is the same document with the two link fields the
+    /// other way round, and that is the only thing that says which deployment
+    /// an operator is actually looking at.
+    #[test]
+    fn a_rollback_workflow_names_the_deployment_it_restores() {
+        let mut document = workflow("succeeded", 9);
+        document["kind"] = serde_json::json!("rollback");
+        document["operation"]["kind"] = serde_json::json!("rollback");
+        document["operation"]["operationId"] = serde_json::json!(ROLLBACK_ID);
+        document["rolledBackFromOperationId"] = serde_json::json!(DEPLOYMENT_ID);
+        document["rollbackOperationIds"] = serde_json::json!([]);
+        document["cancelRequestedAt"] = serde_json::json!("2026-09-06T10:03:00Z");
+
+        let read: ProviderDeployment = serde_json::from_value(document).unwrap();
+        assert_eq!(read.kind, "rollback");
+        assert_eq!(read.rolled_back_from_operation_id, Some(id(DEPLOYMENT_ID)));
+        assert!(read.rollback_operation_ids.is_empty());
+        assert!(read.cancel_requested_at.is_some());
+        assert_eq!(read.operation.settled(), Some(true));
+    }
+
+    /// A control plane newer than this build stays readable: an added field
+    /// is ignored, and a state this build has never heard of is carried
+    /// through as text so it can be *printed*, with `settled` admitting it
+    /// does not know rather than guessing.
+    #[test]
+    fn a_newer_control_plane_stays_readable_and_its_unknown_state_is_not_guessed() {
+        let mut document = workflow("reconciling", 11);
+        document["quarantinedAt"] = serde_json::json!("2026-09-06T10:05:00Z");
+        document["operation"]["escalation"] = serde_json::json!({"tier": 2});
+
+        let read: ProviderDeployment = serde_json::from_value(document).unwrap();
+        assert_eq!(read.operation.state, "reconciling");
+        assert_eq!(read.operation.settled(), None);
+    }
+
+    /// The workflow, its ETag, and a cancel that must arrive carrying that
+    /// exact ETag as `If-Match` and an `Idempotency-Key` of its own.
+    async fn serve_workflow() -> Response {
+        let mut headers = AxumHeaderMap::new();
+        headers.insert(ETAG, "\"7\"".parse().unwrap());
+        (headers, Json(workflow("running", 7))).into_response()
+    }
+
+    async fn serve_cancel(headers: AxumHeaderMap) -> Response {
+        let if_match = headers.get(IF_MATCH).and_then(|value| value.to_str().ok());
+        if if_match != Some("\"7\"") {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "precondition-failed",
+                        "message": format!("If-Match arrived as {if_match:?}")
+                    }
+                })),
+            )
+                .into_response();
+        }
+        let key = headers
+            .get(IDEMPOTENCY_KEY)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if key.parse::<CanonicalId>().is_err() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "idempotency-key-invalid",
+                        "message": format!("Idempotency-Key arrived as {key:?}")
+                    }
+                })),
+            )
+                .into_response();
+        }
+        let mut answer = AxumHeaderMap::new();
+        answer.insert(ETAG, "\"8\"".parse().unwrap());
+        answer.insert(LOCATION, WORKFLOW_PATH.parse().unwrap());
+        (
+            StatusCode::ACCEPTED,
+            answer,
+            Json(operation(DEPLOYMENT_ID, "deploy", "cancelling", 8)),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn a_cancel_fences_on_the_etag_of_the_read_that_preceded_it() {
+        let router = Router::new()
+            .route(WORKFLOW_PATH, get(serve_workflow))
+            .route(&format!("{WORKFLOW_PATH}/cancel"), post(serve_cancel));
+        let (control, shutdown) = control_for(router).await;
+
+        let cancelled = control
+            .cancel_provider_deployment("demo", "production", id(DEPLOYMENT_ID))
+            .await
+            .unwrap();
+
+        assert_eq!(cancelled.observed.operation.state, "running");
+        assert_eq!(cancelled.observed.operation.revision, 7);
+        assert_eq!(cancelled.operation.state, "cancelling");
+        assert_eq!(cancelled.operation.revision, 8);
+        assert_eq!(cancelled.operation.operation_id, id(DEPLOYMENT_ID));
+        let _ = shutdown.send(());
+    }
+
+    /// A workflow that has already finished is refused, and the refusal is
+    /// what reaches the operator: the control plane's own code, sentence and
+    /// request id, not a reworded summary of them.
+    #[tokio::test]
+    async fn a_refused_cancel_is_reported_as_the_control_planes_own_error() {
+        async fn refuse() -> Response {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "operation-not-cancellable",
+                        "message": "provider deployment already succeeded",
+                        "requestId": "018f2518-7e38-7f80-8000-0000000000e1"
+                    }
+                })),
+            )
+                .into_response()
+        }
+
+        let router = Router::new()
+            .route(WORKFLOW_PATH, get(serve_workflow))
+            .route(&format!("{WORKFLOW_PATH}/cancel"), post(refuse));
+        let (control, shutdown) = control_for(router).await;
+
+        let error = control
+            .cancel_provider_deployment("demo", "production", id(DEPLOYMENT_ID))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("409"), "{error}");
+        assert!(error.contains("operation-not-cancellable"), "{error}");
+        assert!(error.contains("already succeeded"), "{error}");
+        assert!(
+            error.contains("018f2518-7e38-7f80-8000-0000000000e1"),
+            "{error}"
+        );
+        let _ = shutdown.send(());
+    }
+
+    /// A rollback answers a *different* operation, and its `Location` is
+    /// checked against the path this CLI would have built for that new id
+    /// rather than followed wherever it points.
+    #[tokio::test]
+    async fn a_rollback_answers_the_new_operation_at_its_own_scoped_location() {
+        async fn accept(headers: AxumHeaderMap) -> Response {
+            assert!(headers.contains_key(IDEMPOTENCY_KEY));
+            let mut answer = AxumHeaderMap::new();
+            answer.insert(LOCATION, ROLLBACK_PATH.parse().unwrap());
+            (
+                StatusCode::ACCEPTED,
+                answer,
+                Json(operation(ROLLBACK_ID, "rollback", "queued", 1)),
+            )
+                .into_response()
+        }
+
+        let router = Router::new().route(&format!("{WORKFLOW_PATH}/rollback"), post(accept));
+        let (control, shutdown) = control_for(router).await;
+
+        let accepted = control
+            .rollback_provider_deployment("demo", "production", id(DEPLOYMENT_ID))
+            .await
+            .unwrap();
+
+        assert_eq!(accepted.operation_id, id(ROLLBACK_ID));
+        assert_eq!(accepted.kind, "rollback");
+        assert_eq!(accepted.state, "queued");
+        let _ = shutdown.send(());
+    }
+
+    /// The check that keeps this CLI from becoming a credential-bearing
+    /// redirect client: a `Location` that is not the new operation's own
+    /// scoped path is refused rather than polled.
+    #[tokio::test]
+    async fn a_rollback_pointing_somewhere_else_is_refused() {
+        async fn misdirect() -> Response {
+            let mut answer = AxumHeaderMap::new();
+            answer.insert(LOCATION, "https://elsewhere.invalid/steal".parse().unwrap());
+            (
+                StatusCode::ACCEPTED,
+                answer,
+                Json(operation(ROLLBACK_ID, "rollback", "queued", 1)),
+            )
+                .into_response()
+        }
+
+        let router = Router::new().route(&format!("{WORKFLOW_PATH}/rollback"), post(misdirect));
+        let (control, shutdown) = control_for(router).await;
+
+        let error = control
+            .rollback_provider_deployment("demo", "production", id(DEPLOYMENT_ID))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("expected the scoped path"), "{error}");
+        let _ = shutdown.send(());
+    }
+
+    /// One page, newest first, read the same way `deis deployments` reads
+    /// one - and the total behind it kept apart from the rows shown.
+    #[tokio::test]
+    async fn one_page_of_workflows_is_read_through_the_unified_envelope() {
+        async fn page() -> Response {
+            Json(serde_json::json!({
+                "schemaVersion": 1,
+                "items": [workflow("running", 7)],
+                "page": {"limit": 20, "count": 1, "total": 4, "nextCursor": "more"}
+            }))
+            .into_response()
+        }
+
+        let router = Router::new().route(
+            "/api/v1/apps/demo/environments/production/provider-deployments",
+            get(page),
+        );
+        let (control, shutdown) = control_for(router).await;
+
+        let history = control
+            .list_provider_deployments("demo", "production", 20)
+            .await
+            .unwrap();
+
+        assert_eq!(history.deployments.len(), 1);
+        assert_eq!(history.total, 4);
+        assert_eq!(history.deployments[0].operation.state, "running");
+        let _ = shutdown.send(());
+    }
+
+    /// A control plane that answers a read with a different operation than
+    /// the one asked for is refused, rather than being allowed to become the
+    /// workflow a cancel is then fenced against.
+    #[tokio::test]
+    async fn a_read_that_answers_about_another_operation_is_refused() {
+        async fn wrong_operation() -> Response {
+            Json(workflow("running", 7)).into_response()
+        }
+
+        let router = Router::new().route(ROLLBACK_PATH, get(wrong_operation));
+        let (control, shutdown) = control_for(router).await;
+
+        let error = control
+            .get_provider_deployment("demo", "production", id(ROLLBACK_ID))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("is not the one that was asked for"),
+            "{error}"
+        );
+        let _ = shutdown.send(());
+    }
+
+    /// The revision the fence is taken against comes from the `ETag` of the
+    /// read, and falls back to the body only when the control plane sent no
+    /// `ETag` at all.
+    #[test]
+    fn the_fence_prefers_the_etag_over_the_revision_in_the_body() {
+        let read: ProviderDeployment = serde_json::from_value(workflow("running", 7)).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::ETAG, "\"9\"".parse().unwrap());
+        assert_eq!(read_etag(&headers, &read.operation), "\"9\"");
+
+        assert_eq!(read_etag(&HeaderMap::new(), &read.operation), "\"7\"");
+    }
+
+    /// Every key is a fresh canonical identity, and no two calls share one:
+    /// a key reused across two different operator actions would make the
+    /// second one silently answer the first.
+    #[test]
+    fn each_idempotency_key_is_a_fresh_canonical_identity() {
+        let first = new_idempotency_key();
+        let second = new_idempotency_key();
+        assert!(first.parse::<CanonicalId>().is_ok(), "{first}");
+        assert_ne!(first, second);
+        assert!((8..=255).contains(&first.len()), "{first}");
     }
 }

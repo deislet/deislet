@@ -103,6 +103,18 @@ impl OperationRequestContext {
     }
 }
 
+/// The names an operation's scope resolves to: what a credential scope can be
+/// checked against and what a scoped path can be spelled with. Canonical ids
+/// are what the operation record stores; names are what `deploy:<app>/<env>`
+/// and `/apps/{app}/environments/{env}/...` are written in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationScopeNames {
+    pub application_id: CanonicalId,
+    pub environment_id: CanonicalId,
+    pub application_name: String,
+    pub environment_name: String,
+}
+
 impl CatalogStore {
     pub async fn product_operation(
         &self,
@@ -110,6 +122,45 @@ impl CatalogStore {
     ) -> CatalogResult<Option<ProductOperation>> {
         self.database()
             .with_connection(move |connection| load_operation(connection, operation_id))
+            .await
+    }
+
+    /// Resolve the application and environment an operation is scoped to.
+    ///
+    /// `None` when the scope names no environment (a platform-wide operation
+    /// such as a backend restore) or when the application or environment it
+    /// names no longer exists; a caller then has nothing narrower than an
+    /// administrator to check against.
+    pub async fn operation_scope_names(
+        &self,
+        scope: &OperationScope,
+    ) -> CatalogResult<Option<OperationScopeNames>> {
+        let (Some(application_id), Some(environment_id)) =
+            (scope.application_id, scope.environment_id)
+        else {
+            return Ok(None);
+        };
+        self.database()
+            .with_connection(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT a.id, e.name
+                           FROM apps a
+                           JOIN environments e ON e.app_id = a.id
+                          WHERE a.canonical_id = ?1 AND e.canonical_id = ?2",
+                        params![application_id.to_string(), environment_id.to_string()],
+                        |row| {
+                            Ok(OperationScopeNames {
+                                application_id,
+                                environment_id,
+                                application_name: row.get(0)?,
+                                environment_name: row.get(1)?,
+                            })
+                        },
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
             .await
     }
 

@@ -115,6 +115,19 @@ pub fn validate_driver_request(
             "artifact-dependent driver operation needs exact artifact lineage",
         ));
     }
+    match (request.operation, request.rollback_target.as_ref()) {
+        (DriverOperation::Rollback, None) => {
+            return Err(DriverContractError(
+                "rollback driver request must name the activation it restores; a rollback recorded without one has to be issued again",
+            ));
+        }
+        (DriverOperation::Rollback, Some(_)) | (_, None) => {}
+        (_, Some(_)) => {
+            return Err(DriverContractError(
+                "only a rollback driver request may carry a rollback target",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -306,6 +319,7 @@ mod tests {
             },
             artifact: None,
             plan: ProviderNeutralPlan::default(),
+            rollback_target: None,
         }
     }
 
@@ -361,6 +375,45 @@ mod tests {
         assert_eq!(validate_driver_request(&manifest, &request), Ok(()));
         request.target.backend_id = "deislet".to_owned();
         assert!(validate_driver_request(&manifest, &request).is_err());
+    }
+
+    #[test]
+    fn rollback_requests_carry_their_activation_and_nothing_else_does() {
+        let manifest = ValidatedProviderDriverManifest::parse_json(include_bytes!(
+            "../../../contracts/v1/fixtures/valid/provider-driver.json"
+        ))
+        .unwrap();
+        let target = crate::DriverRollbackTarget {
+            source_operation_id: CanonicalId::new_v7(),
+            activation_operation_id: CanonicalId::new_v7(),
+            activation_receipt_sha256: "c".repeat(64).parse().unwrap(),
+            provider_deployment_id: Some("provider-deployment-1".to_owned()),
+            provider_version_id: None,
+            provider_resource_ids: BTreeMap::new(),
+        };
+        let mut request = request();
+        request.operation = DriverOperation::Rollback;
+        let missing = validate_driver_request(&manifest, &request).unwrap_err();
+        assert!(missing.to_string().contains("activation"), "{missing}");
+        request.rollback_target = Some(target.clone());
+        assert_eq!(validate_driver_request(&manifest, &request), Ok(()));
+        // The target is meaningful only for a rollback.
+        request.operation = DriverOperation::Observe;
+        let misplaced = validate_driver_request(&manifest, &request).unwrap_err();
+        assert!(
+            misplaced.to_string().contains("only a rollback"),
+            "{misplaced}"
+        );
+        request.rollback_target = None;
+        assert_eq!(validate_driver_request(&manifest, &request), Ok(()));
+        // A target without native identity is still a valid target; the
+        // driver falls back to the digest it already had.
+        assert!(target.has_native_identity());
+        let digest_only = crate::DriverRollbackTarget {
+            provider_deployment_id: None,
+            ..target
+        };
+        assert!(!digest_only.has_native_identity());
     }
 
     #[test]

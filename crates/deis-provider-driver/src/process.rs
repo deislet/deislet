@@ -605,6 +605,7 @@ mod tests {
             },
             artifact: None,
             plan: ProviderNeutralPlan::default(),
+            rollback_target: None,
         }
     }
 
@@ -653,6 +654,41 @@ mod tests {
         ))
         .unwrap();
         assert!(fixture.validate().is_ok());
+    }
+
+    #[test]
+    fn rollback_target_is_present_only_when_set_and_round_trips_the_fixture() {
+        // A request without a target serializes exactly as the original v1
+        // envelope did, so drivers that reject unknown members keep parsing.
+        let plain = DriverProcessRequest::new(request(DriverOperation::Observe));
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json["request"].get("rollbackTarget").is_none(), "{json}");
+        assert_eq!(
+            serde_json::from_value::<DriverProcessRequest>(json).unwrap(),
+            plain
+        );
+
+        let fixture: DriverProcessRequest = serde_json::from_slice(include_bytes!(
+            "../../../contracts/v1/fixtures/valid/provider-driver-process-rollback-request.json"
+        ))
+        .unwrap();
+        assert!(fixture.clone().validate().is_ok());
+        assert_eq!(fixture.request.operation, DriverOperation::Rollback);
+        let target = fixture.request.rollback_target.as_ref().unwrap();
+        assert_eq!(
+            target.provider_deployment_id.as_deref(),
+            Some("provider-deployment-1")
+        );
+        assert!(target.has_native_identity());
+        let json = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(
+            json["request"]["rollbackTarget"]["activationReceiptSha256"],
+            target.activation_receipt_sha256.as_str()
+        );
+        assert_eq!(
+            serde_json::from_value::<DriverProcessRequest>(json).unwrap(),
+            fixture
+        );
     }
 
     #[test]

@@ -151,6 +151,47 @@ pub struct ProviderNeutralPlan {
     pub prior_deployment_id: Option<CanonicalId>,
 }
 
+/// The provider deployment a `rollback` restores, copied from the succeeded
+/// `activate` receipt of the deployment being rolled back to.
+///
+/// The desired state digest, artifact and plan of a rollback request already
+/// equal the source deployment's; this names the activation itself so a
+/// driver addresses the provider deployment by the identity it reported
+/// rather than searching for one that matches the digest. Only `rollback`
+/// requests carry it, and it is omitted from the JSON otherwise, so drivers
+/// built against the original v1 request still parse every other operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DriverRollbackTarget {
+    /// The product operation of the succeeded deployment being restored.
+    pub source_operation_id: CanonicalId,
+    /// The `activate` step's operation id: the `operationId` of the receipt
+    /// the remaining members are copied from.
+    pub activation_operation_id: CanonicalId,
+    /// SHA-256 of the RFC 8785 canonical JSON of that `activate` receipt.
+    pub activation_receipt_sha256: Sha256Digest,
+    /// `providerDeploymentId` the `activate` receipt reported.
+    pub provider_deployment_id: Option<String>,
+    /// `providerVersionId` the `activate` receipt reported.
+    pub provider_version_id: Option<String>,
+    /// `providerResourceIds` the `activate` receipt reported.
+    #[serde(default)]
+    pub provider_resource_ids: BTreeMap<String, String>,
+}
+
+impl DriverRollbackTarget {
+    /// Whether the activation reported any native provider identity. A driver
+    /// receiving a target without one can only locate the deployment by
+    /// digest, exactly as before this member existed.
+    #[must_use]
+    pub fn has_native_identity(&self) -> bool {
+        self.provider_deployment_id.is_some()
+            || self.provider_version_id.is_some()
+            || !self.provider_resource_ids.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -164,6 +205,10 @@ pub struct DriverRequest {
     pub target: ProviderTargetRef,
     pub artifact: Option<ArtifactVersionRef>,
     pub plan: ProviderNeutralPlan,
+    /// Present on every `rollback` request the Control dispatches and on no
+    /// other operation; absent from the JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_target: Option<DriverRollbackTarget>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

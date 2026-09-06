@@ -21,7 +21,7 @@ use utoipa::ToSchema;
 
 use super::openapi;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::headers::{required_header, single_header};
+use crate::api::headers::{IDEMPOTENCY_KEY, required_header, single_header};
 use crate::api::paths::ApiPaths;
 use crate::catalog::{
     BackendRestoreCoordinator, BackendRestorePlan, CatalogStore, OperationRequestContext,
@@ -30,7 +30,6 @@ use crate::catalog::{
 use crate::config::ControlConfig;
 use crate::identity::{Principal, PrincipalKind};
 
-const IDEMPOTENCY_KEY: &str = "idempotency-key";
 const REQUEST_ID: &str = "x-request-id";
 const CORRELATION_ID: &str = "x-correlation-id";
 const RECONCILE_INTERVAL_SECONDS: u64 = 10;

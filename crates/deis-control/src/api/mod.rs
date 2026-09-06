@@ -16,6 +16,7 @@ pub mod middleware;
 pub mod migrations;
 pub mod nodes;
 pub mod openapi;
+pub mod operations;
 pub mod pagination;
 pub mod paths;
 pub mod registration;

@@ -12,7 +12,8 @@ apart is the point:
   generated target-status JSON as the product documentation and Web console;
   it does not infer support from an adapter being present.
 - **A Deislet platform.** `deis deploy`, `deis versions`, `deis deployments`,
-  `deis rollback`, `deis status`, `deis routes`, `deis domains`,
+  `deis provider-deployments`, `deis rollback`, `deis status`, `deis routes`,
+  `deis domains`,
   `deis secret`, `deis logs`, `deis tail`, `deis trace`,
   `deis kv`, `deis db` and `deis blob` talk to a `deis-control`; for logs and
   traces, also to a `deis-telemetry`; and for the last three, to a
@@ -189,6 +190,33 @@ when a particular environment changed, which is where an incident starts.
 One request, so `--limit` is capped at 1000 — that is one page of the list
 route. The line under the table says how many rows are behind the ones
 printed, and where to look when they are further back than one page reaches.
+
+### `deis provider-deployments list|get|cancel|rollback [--wait]`
+
+One environment's provider deployments: the durable workflows that drive a
+provider's own cloud, not the pointer moves `deis deployments` lists. A
+provider deployment runs for as long as that cloud takes, so unlike a pointer
+move it can be asked to stop, and once finished it can be undone.
+
+- `list [--limit N]` prints them newest first: operation id, kind (`deploy` or
+  `rollback`), state, phase, progress, what a rollback was rolled back from,
+  and when a cancel was requested. One request, so `--limit` is capped at
+  1000 - one page of the list route - and the line under the table says how
+  many rows are behind the ones printed, exactly as `deis deployments` does.
+- `get <operation-id>` prints one workflow whole: the operation, what it is
+  bound to, and every step with the child operation that ran it.
+- `cancel <operation-id>` asks a running workflow to stop. Steps that have not
+  run do not run and what is reversible is cleaned up; steps that already took
+  effect stay in effect - undoing those is `rollback`. A finished workflow is
+  refused.
+- `rollback <operation-id>` drives the provider back to what a succeeded
+  deployment left behind. It records a **new** operation rather than undoing
+  the named one, so the id it prints is a different one; `--wait` follows that
+  new operation to a terminal state instead of returning as soon as the
+  control plane has accepted it.
+
+The operation id is the OPERATION column of `list`; anything that is not a
+canonical UUIDv7 is refused before a request is sent.
 
 ### `deis rollback [--to N]`
 
