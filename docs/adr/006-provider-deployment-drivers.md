@@ -461,6 +461,13 @@ transparency 与 archive；四份签名文档分别限制为 1 MiB，并在创�
 Clippy；正式 evidence 为 `../product/evidence/provider-driver-dispatcher-portability-dae492a.json`。该结果只证明合成发行的
 HTTP 安装边界可移植，不证明真实 driver 发行、公共透明服务、真实 provider 部署或 Edge Canon 合规。
 
+target grant 的精确提交 `69f1343e91058726da340cb3f55f261528f634d9` 也已由同一个 15,779,840-byte archive
+（SHA-256 `b5a18434e4983ebed7f5409c01384522885f18d777a674dd7219843b18d06a86`）在 Linux、macOS、Windows
+复核。Linux/macOS 通过 provider-driver 62/62、Control provider 48/48、authz 32/32、grant 3/3、协调器 3/3、
+四项 migration 与严格 Clippy；Windows 除 provider-driver 54/54 外相同。正式 evidence 为
+`../product/evidence/provider-driver-dispatcher-portability-69f1343.json`。它关闭 target grant 控制路径的代码可移植性，
+不等于真实账户授权或 live deployment 证据。
+
 这只是公共管理面的后续一段，并不满足本 ADR 的完整验收。installation/target 还没有 disable/delete 生命周期；列表只有有界 limit、没有 cursor；credential provision、grant create 和其他非 operation
 资源创建还没有统一幂等 replay；grant 在 application 删除后的生命周期收敛与全局历史查询也仍需并入统一数据生命周期；
 CLI 与 Web 尚未接线。更关键的是尚无真实签署 release、真实透明日志/独立 witness、

@@ -2483,8 +2483,13 @@ Application/framework source + versioned build plan
 - 本机首次全量运行 479/480：跨页公平性测试另建的两个 environment 没有新契约要求的 target grant，产品按设计返回
   `Forbidden`；测试夹具随后为两个 canonical environment 显式建立授权，专项复跑通过。最终本机门禁为 Control 480/480、
   API integration 14/14、architecture 2/2、docs witness 6/6、fleet credential 2/2，以及严格
-  `cargo clippy -p deis-control --all-targets -- -D warnings`。这是未提交工作树证据；精确提交的 Linux/macOS/Windows archive
-  复验尚未登记，不能提前宣称跨平台完成。
+  `cargo clippy -p deis-control --all-targets -- -D warnings`。
+- 精确提交 `69f1343e91058726da340cb3f55f261528f634d9` 的 15,779,840-byte `git archive`（SHA-256
+  `b5a18434e4983ebed7f5409c01384522885f18d777a674dd7219843b18d06a86`）在三端复核相同摘要。Linux/macOS
+  通过 provider-driver 62/62、Control provider 48/48、authz 32/32、target grant 3/3、协调器 3/3、四项 migration
+  4/4 与五 crate 严格 Clippy；Windows 除平台适用的 provider-driver 为 54/54 外其余计数相同并通过严格 Clippy。Linux
+  另通过 16 份 Schema/48 组 fixture；macOS 缺 Python `jsonschema` 被如实登记为环境未执行。正式 evidence 为
+  `evidence/provider-driver-dispatcher-portability-69f1343.json`，且不声称真实 provider 部署或 Edge Canon 合规。
 - target grant 这一阻断项已关闭，但 `P1-DEPLOY-001` 仍保持 active：列表 cursor/真实 total、grant create 等通用 mutation
   幂等、installation/target disable/delete、application 删除时 grant 生命周期收敛与全局历史查询、provider deployment
   cancel/rollback 公共操作、CLI/Web、真实签署 release/透明服务、三个完整 driver、真实账户与 live conformance 均未完成。

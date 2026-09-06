@@ -1,0 +1,173 @@
+{
+  "$schema": "./provider-driver-dispatcher-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-provider-target-grant-portability-69f1343-2026-09-06",
+  "collectedAt": "2026-09-06T12:44:25+08:00",
+  "outcome": "passed",
+  "scope": "The exact source archive passes the platform-applicable provider driver, provider control, authorization, target-grant lifecycle, durable reconciler, additive migration, and strict deployment-control lint checks on Linux, macOS, and Windows.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "69f1343e91058726da340cb3f55f261528f634d9",
+    "tree": "676680c97b8a65920dda31ee830e46c5cbf605ce",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "b5a18434e4983ebed7f5409c01384522885f18d777a674dd7219843b18d06a86",
+      "sizeBytes": 15779840
+    }
+  },
+  "buildEnvironment": {"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_TEST_DEBUG": "0"},
+  "commands": [
+    {"id": "provider-driver-tests", "command": "cargo +1.96.0 test -p deis-provider-driver"},
+    {"id": "provider-control-tests", "command": "cargo +1.96.0 test -p deis-control provider"},
+    {"id": "provider-authz-tests", "command": "cargo +1.96.0 test -p deis-control api::authz::"},
+    {"id": "provider-target-grant-tests", "command": "cargo +1.96.0 test -p deis-control target_grant"},
+    {"id": "provider-deployment-reconciler-tests", "command": "cargo +1.96.0 test -p deis-control catalog::provider_deployment_reconciler::tests::"},
+    {"id": "legacy-target-migration-test", "command": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"},
+    {"id": "transparency-target-migration-test", "command": "cargo +1.96.0 test -p deis-control database::schema::tests::signed_but_unlogged_provider_targets_are_disabled_and_cannot_reactivate -- --exact"},
+    {"id": "provider-dispatch-backoff-migration-test", "command": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent -- --exact"},
+    {"id": "provider-target-grant-migration-test", "command": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_target_grant_pins_upgrade_additively_and_fail_closed_for_new_work -- --exact"},
+    {"id": "strict-clippy", "command": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"}
+  ],
+  "sharedContractCheck": {
+    "hostAlias": "s17",
+    "command": "python3 scripts/check-shared-contracts.py",
+    "outcome": "passed",
+    "exitCode": 0,
+    "schemas": 16,
+    "fixtures": 48
+  },
+  "requiredOperatingSystems": ["linux", "macos", "windows"],
+  "observations": [
+    {
+      "id": "s17-linux-x86_64",
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "69f1343e91058726da340cb3f55f261528f634d9",
+      "archiveSha256": "b5a18434e4983ebed7f5409c01384522885f18d777a674dd7219843b18d06a86",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 62, "failed": 0, "ignored": 0},
+        {"id": "provider-control-tests", "outcome": "passed", "exitCode": 0, "passed": 48, "failed": 0, "ignored": 0},
+        {"id": "provider-authz-tests", "outcome": "passed", "exitCode": 0, "passed": 32, "failed": 0, "ignored": 0},
+        {"id": "provider-target-grant-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "transparency-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "provider-dispatch-backoff-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "provider-target-grant-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s67-macos-arm64",
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "69f1343e91058726da340cb3f55f261528f634d9",
+      "archiveSha256": "b5a18434e4983ebed7f5409c01384522885f18d777a674dd7219843b18d06a86",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 62, "failed": 0, "ignored": 0},
+        {"id": "provider-control-tests", "outcome": "passed", "exitCode": 0, "passed": 48, "failed": 0, "ignored": 0},
+        {"id": "provider-authz-tests", "outcome": "passed", "exitCode": 0, "passed": 32, "failed": 0, "ignored": 0},
+        {"id": "provider-target-grant-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "transparency-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "provider-dispatch-backoff-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "provider-target-grant-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    },
+    {
+      "id": "s69-windows-amd64",
+      "hostAlias": "s69",
+      "hostName": "Serv69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows NT 10.0.26100.0",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "commit": "69f1343e91058726da340cb3f55f261528f634d9",
+      "archiveSha256": "b5a18434e4983ebed7f5409c01384522885f18d777a674dd7219843b18d06a86",
+      "checks": [
+        {"id": "provider-driver-tests", "outcome": "passed", "exitCode": 0, "passed": 54, "failed": 0, "ignored": 0},
+        {"id": "provider-control-tests", "outcome": "passed", "exitCode": 0, "passed": 48, "failed": 0, "ignored": 0},
+        {"id": "provider-authz-tests", "outcome": "passed", "exitCode": 0, "passed": 32, "failed": 0, "ignored": 0},
+        {"id": "provider-target-grant-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "provider-deployment-reconciler-tests", "outcome": "passed", "exitCode": 0, "passed": 3, "failed": 0, "ignored": 0},
+        {"id": "legacy-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "transparency-target-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "provider-dispatch-backoff-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "provider-target-grant-migration-test", "outcome": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0},
+        {"id": "strict-clippy", "outcome": "passed", "exitCode": 0}
+      ]
+    }
+  ],
+  "priorFailedAttempts": [],
+  "collectionObservations": [
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "69f1343e91058726da340cb3f55f261528f634d9",
+        "tree": "676680c97b8a65920dda31ee830e46c5cbf605ce",
+        "archive": {"format": "git-archive-tar", "sha256": "b5a18434e4983ebed7f5409c01384522885f18d777a674dd7219843b18d06a86", "sizeBytes": 15779840}
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "classification": "environment",
+      "outcome": "inconclusive",
+      "description": "The exact-archive macOS host did not have the Python jsonschema package, so the shared-contract validator stopped before validation.",
+      "resolution": "The shared-contract validator is a source-level gate and passed on s17 against the same verified archive. The macOS observation is retained as environment-unavailable and is not counted as a contract pass. All Rust checks remained mandatory and passed on macOS."
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": true,
+    "exactArchiveVerifiedOnEveryHost": true,
+    "windowsAsyncSendRegressionClosed": true,
+    "sharedProcessProtocolValidated": true,
+    "signedReleaseAuthorizationValidated": true,
+    "trustRootLoaderCompiledOnWindows": true,
+    "rootRotationValidated": true,
+    "legacyTrustRootMigrationValidated": true,
+    "transientSpawnRetryBoundaryValidated": true,
+    "offlineTransparencyProofValidated": true,
+    "independentWitnessThresholdValidated": true,
+    "signedButUnloggedTargetMigrationValidated": true,
+    "windowsServiceIdentityDaclPolicyValidated": true,
+    "backgroundDispatcherLoopValidated": true,
+    "retryableReceiptRecoveryValidated": true,
+    "crossPageDispatchFairnessValidated": true,
+    "durableSelectionBackoffValidated": true,
+    "selectionBackoffMigrationValidated": true,
+    "selectionBackoffRaceFenceValidated": true,
+    "providerReleaseHttpInstallValidated": true,
+    "providerTargetGrantValidated": true,
+    "deployScopeAuthorizationValidated": true,
+    "providerTargetGrantMigrationValidated": true,
+    "noLiveProviderClaim": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "The checks use synthetic signed releases, deterministic keys, a synthetic transparency checkpoint, and in-process API routers. They do not install a real Wrangler, EdgeOne, or Deislet driver release and do not deploy to a real provider account.",
+    "Target grants prove exact application/environment/account authorization, immutable workflow pins, revocation fencing, and replay behavior. They do not provide deployment cancellation or rollback.",
+    "Cursor pagination, true collection totals, generic mutation idempotency, installation and target lifecycle, and application-deletion grant convergence remain incomplete.",
+    "No public transparency log or independent witness service is operated by this evidence, and no backend is certified against Edge Canon.",
+    "The Windows checks use an elevated interactive token rather than a virtual, managed, or domain Windows Service account.",
+    "CLI and Web clients are not wired to the provider management API, and no complete Cloudflare, EdgeOne, or Deislet backend driver is proven by these checks.",
+    "The exact archive does not contain generated Control dashboard assets, so the existing build warning and dashboard 404 remain outside this Rust control-path record."
+  ]
+}

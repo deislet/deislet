@@ -271,6 +271,11 @@ target grant 已成为 application/environment-scoped HTTP 资源：管理员创
 target ID 执行第二层 exact active-grant 校验；接受后把 grant ID/revision 固定进 durable workflow。撤销只阻断新操作，
 不会把可能已产生外部副作用的既有 operation 抹掉；同一幂等请求仍返回原 operation。
 
+上述 grant 与 deploy-scope 路径的精确提交 `69f1343e91058726da340cb3f55f261528f634d9` 已用同一 archive 在
+Linux、macOS、Windows 通过平台适用的 provider、authz、grant、协调器、迁移与严格 Clippy 门禁；受 Schema 约束的
+记录为 `../product/evidence/provider-driver-dispatcher-portability-69f1343.json`。它证明这一 API 控制路径的代码可移植性，
+不证明 CLI/Web 已接线或真实 provider 账户可用。
+
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；列表没有 cursor，`total` 目前只代表本次返回数；
 installation/target 生命周期尚不完整；credential provision、grant create 等非 operation 资源创建尚未统一幂等 replay；
 grant 在 application 删除后的生命周期收敛与全局历史查询尚未完成；CLI/Web 也没有生成 client 或交互入口。
