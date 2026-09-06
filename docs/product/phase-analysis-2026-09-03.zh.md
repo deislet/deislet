@@ -2441,3 +2441,23 @@ Application/framework source + versioned build plan
   credential/installation/target 等 mutation 的 `Idempotency-Key` 契约。target grant、cursor 与真实 total、
   installation/target disable/delete、CLI/Web、真实签署 materialized release、公共透明日志/独立 witness、三家完整 driver、
   真实账户 lifecycle/live conformance 仍未完成；`P1-DEPLOY-001` 保持 active，backend 支持状态不变。
+
+## 87. Release HTTP 安装边界的三平台精确证据
+
+- 实现提交 `dae492a0c266297c94263d8afd44a56eca452654`（tree
+  `97ab47787488748fdaf4a6932f4ff45a5d95734d`）生成 15,697,920-byte `git archive --format=tar`，SHA-256 为
+  `7598758b9d4bda37034f3c6f5d41135f08dc55a75b06234da6a8d994f0532b2d`。s17 Linux、s67 macOS 与 s69 Windows
+  都先复核同一摘要，再只从新目录解包，使用 Rust/Cargo/Clippy 1.96.0、`CARGO_INCREMENTAL=0` 和
+  `CARGO_PROFILE_TEST_DEBUG=0` 运行门禁。
+- Linux/macOS provider-driver 为 62/62、Windows 为 54/54；三端 Control provider 26/26、release API 3/3、后台协调器
+  3/3、target migration 2/2、dispatch-backoff migration 1/1，五个相关 crate 的严格 all-target Clippy 全部通过。
+  Linux 同一 archive 另通过 16 份 Schema/48 组正反 fixture。新增 release API 测试在三端真实覆盖 exact archive、短/长
+  archive staging 清理、content-addressed replay/audit，以及缺 verified registry 时显式关闭。
+- s69 首次只做环境探测的直接 `powershell -Command` 因 SSH 引号删除字符串终止符而在任何 archive transfer、解包或产品命令
+  前失败；最终 collector 使用 PowerShell 5.1 UTF-16LE `-EncodedCommand`，并只按每个 native command 的
+  `$LASTEXITCODE` 判定。该 harness inconclusive observation 保留在正式 evidence
+  `docs/product/evidence/provider-driver-dispatcher-portability-dae492a.json`，没有伪装成代码失败，也没有被最终绿灯删除。
+- 这项证据关闭第 86 节代码切片的三平台可移植性阻断，不关闭生产容量或供应链运营：测试仍是合成 release/key/log/witness
+  和 in-process router，没有经真实反向代理传输多 GiB archive，没有真实签署官方工具安装树、公共透明日志、独立 witness、
+  Windows Service 身份或真实 provider 账户。target grant、cursor/真实 total、通用 mutation 幂等、完整生命周期、CLI/Web、
+  三家 driver 与 live conformance 仍是明确欠缺，`P1-DEPLOY-001` 保持 active。

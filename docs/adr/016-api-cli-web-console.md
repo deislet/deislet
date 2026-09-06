@@ -263,6 +263,8 @@ deployment 都通过同一 Control router、集中 authz/audit gate 与既有 do
 受信 provider release 也已具备 admin-only HTTP install/list/get/audit：签名文档先做有界解析和 DSSE/透明证明验证，随后
 按 release 对当前 host 声明的精确大小把 archive 流入受控 staging，由原 installer 复核摘要、完整树并原子发布；错误和
 成功路径都清理 staging，内容寻址重放返回同一 release 并追加验证审计。未配置受验证 registry 时该功能显式 disabled。
+精确提交 `dae492a0c266297c94263d8afd44a56eca452654` 的同一 archive 已在 Linux/macOS/Windows 通过 release API
+3/3、相关 provider/协调器/迁移门禁与严格 Clippy，并登记受 Schema 约束的 evidence；这不改变 CLI/Web 尚未接线的事实。
 
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：路由尚无显式 API major；列表没有 cursor，`total` 目前只代表本次返回数；
 target grant 与 installation/target 生命周期尚无 HTTP 资源；credential provision 等资源创建尚未统一

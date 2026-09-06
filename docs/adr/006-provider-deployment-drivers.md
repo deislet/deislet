@@ -444,6 +444,12 @@ transparency 与 archive；四份签名文档分别限制为 1 MiB，并在创�
 201，已存在的 content-addressed release 在重新验证并追加审计后返回 200。list/get/audit 只暴露当前 host registry；没有
 可信 registry 的 Control 明确返回 disabled，而不是接受未验证发行。
 
+精确提交 `dae492a0c266297c94263d8afd44a56eca452654` 的 15,697,920-byte `git archive`（SHA-256
+`7598758b9d4bda37034f3c6f5d41135f08dc55a75b06234da6a8d994f0532b2d`）已在 Linux、macOS、Windows
+复核同一摘要并通过平台适用的 provider-driver、Control provider、release API、协调器、两类 migration 和五 crate 严格
+Clippy；正式 evidence 为 `../product/evidence/provider-driver-dispatcher-portability-dae492a.json`。该结果只证明合成发行的
+HTTP 安装边界可移植，不证明真实 driver 发行、公共透明服务、真实 provider 部署或 Edge Canon 合规。
+
 这只是公共管理面的后续一段，并不满足本 ADR 的完整验收。installation/target 还没有 disable/delete 生命周期；列表只有有界 limit、没有 cursor；credential provision 和非 operation
 资源创建还没有统一幂等 replay；CLI 与 Web 尚未接线。更关键的是尚无真实签署 release、真实透明日志/独立 witness、
 三个完整 backend driver 或真实账户 lifecycle/conformance evidence。因此所有 backend 的 supported/compliant 状态保持不变。
