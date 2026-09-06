@@ -335,7 +335,9 @@ Linux、macOS、Windows 通过 provider 61/61、pagination 20/20、authz 38/38�
 Linux、macOS、Windows 通过 provider 77/77、pagination 21/21、authz 38/38、协调器 4/4、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
 `../product/evidence/provider-driver-dispatcher-portability-b45a611.json`。
 
-随后通用 `POST /operations/:id/cancel` 按记录 kind 分派到 provider workflow（拒绝文案与记录无关，不泄露存在性），CLI 增加 `deis provider-deployments list/get/cancel/rollback`。
+随后通用 `POST /operations/:id/cancel` 按记录 kind 分派到 provider workflow（拒绝文案与记录无关，不泄露存在性），CLI 增加 `deis provider-deployments list/get/cancel/rollback`。精确提交 `1ebe13b0c1b74a33c9fb95fb7f1e09c2c04da886` 的同一 SHA-256 校验归档已在
+Linux、macOS、Windows 通过 provider 80/80、pagination 21/21、authz 39/39、协调器 4/4、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
+`../product/evidence/provider-driver-dispatcher-portability-1ebe13b.json`。
 
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：generated client 仍以示例反序列化校验替代；`GET /operations/:id` 仍 admin-only；Web 尚无 organization/application/environment 主线；旧前缀尚在弃用窗口内。
 

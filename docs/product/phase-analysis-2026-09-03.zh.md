@@ -2768,4 +2768,11 @@ Application/framework source + versioned build plan
   7 项全部处置（`required_if_match` 在 migrations.rs 与 providers.rs 的两份副本文案不同，保留）。
 - 未完成：`GET /operations/:id` 对 deploy scope 放开读取；通用路由 `Idempotency-Key` 与专用路由一致化需 major；
   `scripts/demo.sh` 切 v1；旧库两代索引清退；Web 主线；ADR-006 真实签署 release、透明日志、三家完整 driver 与真实账户
-  evidence。本节为本机工作节点，尚无提交后精确归档或三平台 evidence。
+  evidence。
+- 精确源码提交 `1ebe13b0c1b74a33c9fb95fb7f1e09c2c04da886`（tree `f34829d3d235c2267af5b0effb975f7ff63fd6bf`）生成
+  17,797,120-byte git archive，SHA-256 为 `ff2fc4fb860d5262dd7c9fdeb2aa5added6e236e55a31c6fff93afdca33bdd0c`。同一归档在
+  Linux/macOS 通过 provider-driver 64/64、Windows 56/56（含 rollbackTarget 契约回归）；三端通过 Control provider 80/80、
+  pagination 21/21、authz 39/39（含通用 cancel 的记录级要求）、grant 3/3、协调器 4/4、五项 migration 各 1/1 与严格五 crate
+  all-target Clippy；Linux 另通过 18 份 Schema/62 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为
+  `evidence/provider-driver-dispatcher-portability-1ebe13b.json`；它证明这些控制路径与 driver 契约的三平台代码可移植性，
+  不证明真实 provider 部署或 Edge Canon 合规。
