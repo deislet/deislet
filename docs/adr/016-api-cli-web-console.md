@@ -295,8 +295,11 @@ Provider 管理面的 10 条 list/audit 路由（9 个集合契约）已迁入�
 
 应用目录的 applications、retired applications、artifacts、versions、environments 五类列表随后也迁入同一 envelope。
 它们按不可变名称或带 canonical identity tie-breaker 的稳定 keyset 排序；应用内 cursor 绑定 canonical application ID，
-跨应用复用失败关闭。专项回归覆盖跨页、改页大小、跨集合/跨 scope 拒绝和五类响应形状；本切片仅有本机门禁，尚无新的
-提交后精确归档或三平台 portability evidence。
+跨应用复用失败关闭。专项回归覆盖跨页、改页大小、跨集合/跨 scope 拒绝和五类响应形状。精确提交
+`3ebe108a5a0fb2d8c0441b5af8ebc395a30660dd` 的同一 SHA-256 校验归档已在 Linux、macOS、Windows 通过 provider、
+pagination 3/3、authz、grant、协调器、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
+`../product/evidence/provider-driver-dispatcher-portability-3ebe108.json`。该证据同样不证明 CLI/Web 接线、真实 provider
+部署或标准合规。
 
 该分页切片的精确提交 `dc9a19a65f34fd6dda6a5fc9992842a8f5ca75ae` 已用同一 SHA-256 校验归档在 Linux、macOS、
 Windows 通过平台适用的 provider、pagination、authz、grant、协调器、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为

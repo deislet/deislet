@@ -2542,8 +2542,16 @@ Application/framework source + versioned build plan
   专项 HTTP 回归覆盖应用跨页且下一页改变 limit、token 不泄漏名称、跨集合拒绝、environment 跨应用拒绝、version 降序跨页、
   retired-name 分页以及 artifact 统一 envelope。
 - 本机最终通过 Control lib 485/485、API integration 14/14、architecture 2/2、docs witness 6/6、fleet credential 2/2；
-  目录 API 专项为 14/14，格式与严格 Clippy 通过。这里记录的是本机工作节点：尚未从提交后精确 archive 在 Linux、macOS、
-  Windows 复验，也未登记新的 portability evidence，不能沿用 `dc9a19a` 的旧归档为本切片背书。
+  目录 API 专项为 14/14，格式与严格 Clippy 通过。推送时这只是本机工作节点，交接文档如实注明不能沿用 `dc9a19a` 的
+  旧归档为本切片背书。
+- 随后精确源码提交 `3ebe108a5a0fb2d8c0441b5af8ebc395a30660dd`（tree `1120e4427fb76d99a8b3d1e034db570becd011d6`）
+  生成 15,892,480-byte git archive，SHA-256 为 `df03cedc398d91908b9b0748f4f0951b3351fbe6e809f817c75a93e1064f2cd0`。
+  同一归档在 Linux/macOS 通过 provider-driver 62/62、Windows 54/54；三端通过 Control provider 49/49、pagination 3/3
+  （provider cursor 两项加应用目录统一契约一项）、authz 32/32、grant 3/3、协调器 3/3、五项 migration 各 1/1 与严格五
+  crate all-target Clippy。Linux 另通过 17 份 Schema/50 组 fixture；macOS 缺 Python `jsonschema` 仍记为环境未执行，
+  Windows 脚本不含共享契约步骤。正式记录为 `evidence/provider-driver-dispatcher-portability-3ebe108.json`。首轮由
+  工作流子代理发起的三台复验在编译完成前被强制收尾、进程随之终止，远端确认无残留后由主会话以后台任务重跑得到本结果；
+  该证据证明应用目录分页控制路径的三平台代码可移植性，不证明 CLI/Web 接线、真实 provider 部署或 Edge Canon 合规。
 - 仍未迁移的公共列表至少包括 deployment history、application/global routes、secrets、domain grants，以及 identity、fleet、
   config/command/event/audit 等控制面集合；必须先完成公共/内部边界盘点，再逐组使用同一契约。显式 API major、OpenAPI/generated
   client、breaking-change gate、通用 mutation 幂等、完整 lifecycle、CLI/Web 与真实 driver/account/conformance 也仍未完成。
