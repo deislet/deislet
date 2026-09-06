@@ -4339,7 +4339,7 @@ mod tests {
             .unwrap();
         assert_eq!(ordered.len(), 3);
 
-        let mut latest_settlement = 0;
+        let mut earliest_settlement = i64::MAX;
         for parent_id in &ordered[..2] {
             let workflow = harness
                 .store
@@ -4369,7 +4369,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            latest_settlement = latest_settlement.max(
+            earliest_settlement = earliest_settlement.min(
                 harness
                     .store
                     .provider_driver_operation(child_id)
@@ -4384,7 +4384,7 @@ mod tests {
         let ready = harness
             .store
             .provider_deployments_ready_for_dispatch_with_page_size(
-                DateTime::from_timestamp(latest_settlement + 29, 0).unwrap(),
+                DateTime::from_timestamp(earliest_settlement + 29, 0).unwrap(),
                 Duration::from_secs(30),
                 1,
                 2,
