@@ -8,7 +8,35 @@
  * - the two path prefixes the control plane serves: `API_V1` for the
  *   product API and `API_PLATFORM` for platform diagnostics, which is every
  *   route this console reads today
+ *
+ * Every shape the control plane answers is taken from
+ * `@/generated/control-api`, which `scripts/generate-openapi-types.py`
+ * renders from `contracts/openapi/v1.json`, and nothing below restates one.
+ * The names this module used to define by hand (`SessionSummary`,
+ * `FleetNode`, `Command`, ...) are kept as aliases of the generated types so
+ * that the hooks and pages read as before; what they name is now what the
+ * document says, and a page that disagrees with the document fails to
+ * compile rather than failing at runtime. The request side - the prefixes,
+ * `PageQuery`, `paged`, `send` - is the thin wrapper the ADR allows.
  */
+
+import type { components, operations } from "@/generated/control-api";
+
+/** The document's schemas by name; `Schemas["FleetResponse"]` and so on. */
+type Schemas = components["schemas"];
+
+/**
+ * What one operation answers with one status:
+ * `Answer<"listRuntimeFleet", 200>` is
+ * `operations["listRuntimeFleet"]["responses"][200]`, spelled shorter.
+ * Naming the operation and the status here is what ties each method below
+ * to the document, so a route whose answer changes shape changes the
+ * method's return type with it.
+ */
+type Answer<
+  Id extends keyof operations,
+  Status extends keyof operations[Id]["responses"],
+> = operations[Id]["responses"][Status];
 
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 
@@ -36,11 +64,7 @@ const REQUEST_ID_HEADER = "x-request-id";
  * One field a request got wrong, as the control plane names it in the
  * envelope's `violations`.
  */
-export interface Violation {
-  field: string;
-  code: string;
-  message: string;
-}
+export type Violation = Schemas["ErrorViolation"];
 
 /**
  * A refused call.
@@ -78,22 +102,15 @@ interface RefusalDetail {
 
 /**
  * The body of a refusal on `/api/v1` and `/api/platform` -
- * `contracts/v1/control-error.schema.json`. Read leniently: the members the
- * console shows are the code, the message, the request id and the
- * violations, and a member added there later must not stop them from being
- * read.
+ * `contracts/v1/control-error.schema.json`, which the document renders as
+ * `ErrorBody` around `ErrorEnvelope`. Read leniently: the guard asks only
+ * for the code and the message, which is what the console shows, so a
+ * member the document promises but an older control plane leaves out does
+ * not stop those two from being read.
  */
-interface ErrorEnvelope {
-  error: {
-    code: string;
-    message: string;
-    requestId?: string;
-    violations?: Violation[];
-    retryable?: boolean;
-  };
-}
+type ErrorBody = Schemas["ErrorBody"];
 
-function isErrorEnvelope(value: unknown): value is ErrorEnvelope {
+function isErrorBody(value: unknown): value is ErrorBody {
   const error = asPlainObject(asPlainObject(value)?.error);
   return typeof error?.code === "string" && typeof error?.message === "string";
 }
@@ -111,7 +128,7 @@ function refusal(res: Response, text: string): ApiError {
   } catch {
     parsed = undefined;
   }
-  if (isErrorEnvelope(parsed)) {
+  if (isErrorBody(parsed)) {
     const { code, message, requestId, violations, retryable } = parsed.error;
     return new ApiError(res.status, message, {
       code,
@@ -129,23 +146,19 @@ function refusal(res: Response, text: string): ApiError {
  * One page of the control plane's unified list envelope -
  * `contracts/v1/control-list-page.schema.json`. Every paginated route on
  * both prefixes answers this exact shape.
+ *
+ * The document renders the envelope once per item type
+ * (`ControlListPage_CommandSummary`, `ControlListPage_EventItem`, ...),
+ * all of them the same three members around a different `items`. This is
+ * that envelope with the item type abstracted, built from one of the
+ * rendered ones so that `schemaVersion` and `page` stay what the document
+ * says; every `ControlListPage_*` is assignable to it, which is what lets
+ * `listAll` walk any of them.
  */
-export interface ListPage<T> {
-  schemaVersion: number;
-  items: T[];
-  page: PageMeta;
-}
+export type ListPage<T> = Omit<Schemas["ControlListPage_EventItem"], "items"> & { items: T[] };
 
-export interface PageMeta {
-  /** The page size actually applied - the server's default when the request named none. */
-  limit: number;
-  /** How many rows this page carries; equal to `items.length`. */
-  count: number;
-  /** How many rows the same query has in total, counted in the same read. */
-  total: number;
-  /** The token that reads the page after this one; `null` on the last. */
-  nextCursor: string | null;
-}
+/** How much of the collection one page covers. */
+export type PageMeta = Schemas["PageMetadata"];
 
 /** What a caller may say about which page of a list it wants. */
 export interface PageQuery {
@@ -345,29 +358,32 @@ export const api = {
    * List the nodes currently holding a control channel open to the control
    * plane. This is not the runtime fleet - see `getFleet`.
    */
-  getSessions: () =>
-    api.platformRequest<{ sessions: SessionSummary[]; total: number }>("/sessions"),
+  getSessions: () => api.platformRequest<Answer<"listSessions", 200>>("/sessions"),
 
   /**
    * Fetch one open control channel.
    */
-  getSession: (id: string) => api.platformRequest<SessionSummary>(`/sessions/${id}`),
+  getSession: (id: string) => api.platformRequest<Answer<"getSession", 200>>(`/sessions/${id}`),
 
   /**
    * One page of a node's heartbeat history, newest first. Follow
    * `page.nextCursor` (or use `listAll`) for the rest.
    */
   getSessionHeartbeats: (id: string, query: PageQuery = {}) =>
-    api.platformRequest<ListPage<Heartbeat>>(paged(`/sessions/${id}/heartbeats`, query)),
+    api.platformRequest<Answer<"listSessionHeartbeats", 200>>(
+      paged(`/sessions/${id}/heartbeats`, query)
+    ),
 
   // ==================== Runtime fleet ====================
 
   /**
    * List the runtime nodes that receive deployments and run cron
    * occurrences, whether they came from the control plane's configuration
-   * file or registered themselves.
+   * file or registered themselves. The answer also carries `lost` (nodes
+   * that stopped refreshing their registration) and `contested` (node ids
+   * two machines claimed); the fleet a page shows is `nodes`.
    */
-  getFleet: () => api.platformRequest<{ nodes: FleetNode[] }>("/runtime"),
+  getFleet: () => api.platformRequest<Answer<"listRuntimeFleet", 200>>("/runtime"),
 
   // ==================== Configs API ====================
   //
@@ -382,115 +398,92 @@ export const api = {
   /**
    * List every configuration, for every node.
    */
-  getConfigs: () =>
-    api.platformRequest<{
-      success: boolean;
-      data: { [nodeId: string]: NodeConfigMap };
-      count: number;
-    }>("/configs"),
+  getConfigs: () => api.platformRequest<Answer<"listNodeConfigs", 200>>("/configs"),
 
   /**
    * Configuration counts.
    */
-  getConfigStats: () =>
-    api.platformRequest<{ success: boolean; node_count: number; total_configs: number }>(
-      "/configs/stats"
-    ),
+  getConfigStats: () => api.platformRequest<Answer<"getNodeConfigStats", 200>>("/configs/stats"),
 
   /**
    * Fetch one node's configuration.
    */
   getNodeConfig: (nodeId: string) =>
-    api.platformRequest<{ success: boolean; node_id: string; data: NodeConfigMap; count: number }>(
-      `/configs/${nodeId}`
-    ),
+    api.platformRequest<Answer<"getNodeConfigs", 200>>(`/configs/${nodeId}`),
 
   /**
    * Update one node's configuration.
    */
-  updateNodeConfig: (nodeId: string, configs: NodeConfigMap) =>
-    api.platformRequest<{
-      success: boolean;
-      node_id: string;
-      version_timestamp: string;
-      updated_keys: string[];
-      message: string;
-    }>(`/configs/${nodeId}`, {
+  updateNodeConfig: (nodeId: string, configs: NodeConfigMap) => {
+    const body: operations["updateNodeConfigs"]["requestBody"] = { configs };
+    return api.platformRequest<Answer<"updateNodeConfigs", 200>>(`/configs/${nodeId}`, {
       method: "POST",
-      body: JSON.stringify({ configs }),
-    }),
+      body: JSON.stringify(body),
+    });
+  },
 
   /**
    * Delete a node's whole configuration.
    */
   deleteNodeConfig: (nodeId: string) =>
-    api.platformRequest<{ success: boolean; node_id: string; message: string }>(
-      `/configs/${nodeId}`,
-      { method: "DELETE" }
-    ),
+    api.platformRequest<Answer<"deleteNodeConfigs", 200>>(`/configs/${nodeId}`, {
+      method: "DELETE",
+    }),
 
   /**
    * Delete a single configuration key.
    */
   deleteConfigKey: (nodeId: string, key: string) =>
-    api.platformRequest<{ success: boolean; node_id: string; config_key: string; message: string }>(
-      `/configs/${nodeId}/${key}`,
-      { method: "DELETE" }
-    ),
+    api.platformRequest<Answer<"deleteNodeConfigValue", 200>>(`/configs/${nodeId}/${key}`, {
+      method: "DELETE",
+    }),
 
   /**
    * One page of a node's configuration change history, newest first.
    */
   getConfigHistory: (nodeId: string, query: PageQuery = {}) =>
-    api.platformRequest<ListPage<ConfigHistory>>(paged(`/configs/${nodeId}/history`, query)),
+    api.platformRequest<Answer<"listNodeConfigHistory", 200>>(
+      paged(`/configs/${nodeId}/history`, query)
+    ),
 
   /**
    * One page of the change history of one configuration key, newest first.
    */
   getConfigKeyHistory: (nodeId: string, key: string, query: PageQuery = {}) =>
-    api.platformRequest<ListPage<ConfigHistory>>(
+    api.platformRequest<Answer<"listNodeConfigKeyHistory", 200>>(
       paged(`/configs/${nodeId}/${key}/history`, query)
     ),
 
   /**
    * Roll a configuration back to an earlier version.
    */
-  rollbackConfig: (nodeId: string, key: string, versionTimestamp: string) =>
-    api.platformRequest<{
-      success: boolean;
-      node_id: string;
-      config_key: string;
-      rolled_back_to: string;
-      new_version: string;
-      value: ConfigValue;
-      message: string;
-    }>(`/configs/${nodeId}/${key}/rollback`, {
-      method: "POST",
-      body: JSON.stringify({ version_timestamp: versionTimestamp }),
-    }),
+  rollbackConfig: (nodeId: string, key: string, versionTimestamp: string) => {
+    const body: operations["rollbackNodeConfigValue"]["requestBody"] = {
+      version_timestamp: versionTimestamp,
+    };
+    return api.platformRequest<Answer<"rollbackNodeConfigValue", 200>>(
+      `/configs/${nodeId}/${key}/rollback`,
+      { method: "POST", body: JSON.stringify(body) }
+    );
+  },
 
   /**
    * Push a configuration to a node.
    *
-   * One key hits `push_config` (`{ ..., config_key, message }`); the whole
-   * node hits `push_all_configs` (`{ ..., pushed_count, message }`) - two
+   * One key is `pushNodeConfigValue` (`{ ..., config_key, message }`); the
+   * whole node is `pushNodeConfigs` (`{ ..., pushed_count, message }`) - two
    * different handlers, so two different shapes back.
    */
   pushConfig: (nodeId: string, key?: string) => {
     if (key) {
-      return api.platformRequest<{
-        success: boolean;
-        node_id: string;
-        config_key: string;
-        message: string;
-      }>(`/configs/push/${nodeId}/${key}`, { method: "POST" });
+      return api.platformRequest<Answer<"pushNodeConfigValue", 200>>(
+        `/configs/push/${nodeId}/${key}`,
+        { method: "POST" }
+      );
     }
-    return api.platformRequest<{
-      success: boolean;
-      node_id: string;
-      pushed_count: number;
-      message: string;
-    }>(`/configs/push/${nodeId}`, { method: "POST" });
+    return api.platformRequest<Answer<"pushNodeConfigs", 200>>(`/configs/push/${nodeId}`, {
+      method: "POST",
+    });
   },
 
   // ==================== Commands API ====================
@@ -499,34 +492,30 @@ export const api = {
    * One page of the whole fleet's command history, newest first.
    */
   getCommands: (query: PageQuery = {}) =>
-    api.platformRequest<ListPage<Command>>(paged("/commands", query)),
+    api.platformRequest<Answer<"listNodeCommands", 200>>(paged("/commands", query)),
 
   /**
    * One page of the commands issued to one node, newest first.
    */
   getNodeCommands: (nodeId: string, query: PageQuery = {}) =>
-    api.platformRequest<ListPage<Command>>(paged(`/commands/node/${nodeId}`, query)),
+    api.platformRequest<Answer<"listNodeCommandsOfNode", 200>>(
+      paged(`/commands/node/${nodeId}`, query)
+    ),
 
   /**
    * Fetch a command's status - just the status string, not the command
    * itself (`crates/deis-control/src/command/mod.rs::get_status`).
    */
   getCommandStatus: (commandId: string) =>
-    api.platformRequest<{ success: boolean; command_id: string; status: string }>(
-      `/commands/status/${commandId}`
-    ),
+    api.platformRequest<Answer<"getNodeCommandStatus", 200>>(`/commands/status/${commandId}`),
 
   /**
-   * Issue a command.
+   * Issue a command. The control plane answers 202: the command is queued
+   * for the node, not carried out, and `command_id` is the handle for the
+   * status and cancel routes.
    */
   executeCommand: (nodeId: string, command: ExecuteCommandRequest) =>
-    api.platformRequest<{
-      success: boolean;
-      command_id: string;
-      node_id: string;
-      command_type: string;
-      message: string;
-    }>(`/commands/execute/${nodeId}`, {
+    api.platformRequest<Answer<"executeNodeCommand", 202>>(`/commands/execute/${nodeId}`, {
       method: "POST",
       body: JSON.stringify(command),
     }),
@@ -535,10 +524,9 @@ export const api = {
    * Cancel a command.
    */
   cancelCommand: (commandId: string) =>
-    api.platformRequest<{ success: boolean; command_id: string; message: string }>(
-      `/commands/cancel/${commandId}`,
-      { method: "POST" }
-    ),
+    api.platformRequest<Answer<"cancelNodeCommand", 200>>(`/commands/cancel/${commandId}`, {
+      method: "POST",
+    }),
 
   // ==================== Events API ====================
 
@@ -552,7 +540,7 @@ export const api = {
     if (params.node_id) query.set("node_id", params.node_id);
     if (params.severity) query.set("severity", params.severity);
     const filter = query.toString();
-    return api.platformRequest<ListPage<Event>>(
+    return api.platformRequest<Answer<"listEvents", 200>>(
       paged(`/events${filter ? `?${filter}` : ""}`, params)
     );
   },
@@ -560,8 +548,7 @@ export const api = {
   /**
    * Event counts.
    */
-  getEventStats: () =>
-    api.platformRequest<{ success: boolean; stats: EventStats }>("/events/stats"),
+  getEventStats: () => api.platformRequest<Answer<"getEventStats", 200>>("/events/stats"),
 
   // ==================== Metrics API ====================
 
@@ -569,20 +556,27 @@ export const api = {
    * Metrics summary.
    */
   getMetricsSummary: () =>
-    api.platformRequest<{ success: boolean; metrics: MetricsSummary }>("/metrics/summary"),
+    api.platformRequest<Answer<"getMetricsSummary", 200>>("/metrics/summary"),
 };
 
 // ==================== Types ====================
+//
+// Every name here is an alias of a type in `@/generated/control-api`, kept
+// under the name the hooks and pages have always imported. None of them
+// restates a shape: what a page can read off a `FleetNode` is exactly what
+// `contracts/openapi/v1.json` says a `NodeView` carries, and the comments
+// here add what the document does not say about how the console uses it.
 
 /**
  * A value with no fixed shape on the wire - `serde_json::Value` on the
- * control plane. `unknown`, not `any`: a caller has to narrow it (see
- * `asPlainObject` below) before it can read a field out of one.
+ * control plane, `Value` in the document. `unknown`, not `any`: a caller
+ * has to narrow it (see `asPlainObject` below) before it can read a field
+ * out of one.
  */
-export type ConfigValue = unknown;
+export type ConfigValue = Schemas["Value"];
 
 /** One node's configuration: config key -> whatever value is stored for it. */
-export type NodeConfigMap = { [key: string]: ConfigValue };
+export type NodeConfigMap = Schemas["NodeConfigs"]["data"];
 
 /**
  * Narrow a `ConfigValue` (or any other `serde_json::Value`-shaped field, such
@@ -601,147 +595,83 @@ export function asPlainObject(value: unknown): Record<string, unknown> | undefin
 /**
  * One node holding a control channel open to the control plane, as
  * `/api/platform/sessions` reports it.
+ *
+ * `state` is one of `Connected`, `Registered`, `Active`, `Unresponsive` and
+ * `Disconnected`, which the document leaves as a string. `Unresponsive` is a
+ * node that is still holding its control channel open but has not been
+ * heard from within `heartbeat_timeout`. It is not the same as
+ * `Disconnected`: that node hung up and is presumably restarting, while this
+ * one is still connected and its host or its network has stopped answering.
  */
-export interface SessionSummary {
-  id: string;
-  instance_id: string;
-  node_role: string;
-  host: string;
-  ports: number[];
-  /**
-   * `Unresponsive` is a node that is still holding its control channel open
-   * but has not been heard from within `heartbeat_timeout`. It is not the
-   * same as `Disconnected`: that node hung up and is presumably restarting,
-   * while this one is still connected and its host or its network has stopped
-   * answering.
-   */
-  state: "Connected" | "Registered" | "Active" | "Unresponsive" | "Disconnected";
-  connected_at: string;
-  last_heartbeat: string;
-}
+export type SessionSummary = Schemas["SessionView"];
 
 /**
  * One member of the runtime fleet, as `/api/platform/runtime` reports it. A
  * node is here because the control plane's configuration names it or because
  * it registered itself, which is what `source` says - holding a control
- * channel open has nothing to do with it.
+ * channel open has nothing to do with it. The health members (`healthy`,
+ * `version`, `last_checked`, `last_error`) are the last probe's answer, and
+ * every one but `healthy` may be absent as well as null.
  */
-export interface FleetNode {
-  id: string;
-  addr: string;
-  source: "configured" | "registered";
-  registered_at: string | null;
-  last_registered_at: string | null;
-  healthy: boolean;
-  version: string | null;
-  last_checked: string | null;
-  last_error: string | null;
-}
+export type FleetNode = Schemas["NodeView"];
 
 /**
  * One recorded heartbeat, as `/api/platform/sessions/:id/heartbeats` lists
  * it. It carries no load figure: the wire's heartbeat message is a status
  * string, so there is nothing else to report.
  */
-export interface Heartbeat {
-  id: number;
-  /** RFC 3339, as recorded. */
-  timestamp: string;
-  latency_ms: number | null;
-}
+export type Heartbeat = Schemas["HeartbeatView"];
 
-export interface ConfigStats {
-  node_count: number;
-  total_configs: number;
-}
+/** How much configuration the control plane holds, with the `success` flag. */
+export type ConfigStats = Schemas["ConfigStatsResponse"];
 
-export interface ConfigHistory {
-  id: number;
-  config_key: string;
-  config_value: ConfigValue;
-  version_timestamp: string;
-  operation: "create" | "update" | "delete";
-  created_at: string;
-}
+/**
+ * One recorded configuration change. `operation` is `create`, `update` or
+ * `delete`, which the document leaves as a string.
+ */
+export type ConfigHistory = Schemas["ConfigHistoryItem"];
 
 /**
  * One command, as `/api/platform/commands` and `.../commands/node/:id` list
  * it - `crates/deis-control/src/command/mod.rs::CommandSummary`. The
  * summary lists exactly these fields, so a payload, a result, a timeout or
  * an error message is not part of this type - nothing in this API returns
- * them today.
+ * them today. `status` is `Pending`, `Sent`, `Acknowledged`, `Completed`,
+ * `Failed`, `Timeout` or `Cancelled`, which the document leaves as a string.
  */
-export interface Command {
-  id: string;
-  node_id: string;
-  command_type: string;
-  status: "Pending" | "Sent" | "Acknowledged" | "Completed" | "Failed" | "Timeout";
-  created_at: string;
-  sent_at?: string | null;
-  completed_at?: string | null;
-}
+export type Command = Schemas["CommandSummary"];
 
 /**
- * Exactly the body `POST /api/platform/commands/execute/:node_id`
- * deserializes.
+ * The command a node is asked to run, as `POST
+ * /api/platform/commands/execute/:node_id` deserializes it.
  *
  * `command_type` is a tagged enum: the named commands are plain strings, and
  * anything else is `{ custom: "<name>" }`. The payload field is `data`, not
  * `command_data` - the server rejects the whole request with 422 if it is
  * spelled any other way, which is what used to happen to the Restart button.
  */
-export type CommandType =
-  | "shutdown"
-  | "restart"
-  | "reload"
-  | "get_status"
-  | "get_metrics"
-  | "execute_scheduled"
-  | { custom: string };
+export type CommandType = Schemas["CommandType"];
 
-export interface ExecuteCommandRequest {
-  command_type: CommandType;
-  data?: unknown;
-}
+export type ExecuteCommandRequest = Schemas["ExecuteCommandRequest"];
 
-/** One line of the event log, as `/api/platform/events` lists it. */
-export interface Event {
-  id: number;
-  event_type: string;
-  node_id?: string | null;
-  severity: "Info" | "Warning" | "Error";
-  message: string;
-  metadata?: ConfigValue;
-  timestamp: string;
-}
+/**
+ * One line of the event log, as `/api/platform/events` lists it.
+ * `severity` is `Info`, `Warning` or `Error`, which the document leaves as
+ * a string.
+ */
+export type Event = Schemas["EventItem"];
 
-export interface EventsParams extends PageQuery {
-  node_id?: string;
-  /** Exactly `Info`, `Warning` or `Error`; anything else is refused. */
-  severity?: string;
-}
+/**
+ * What `getEvents` takes: the page to read, plus the two filters the route
+ * accepts, spelled as the document spells them. `severity` is exactly
+ * `Info`, `Warning` or `Error`; anything else is refused.
+ */
+export type EventsParams = PageQuery & Pick<operations["listEvents"]["query"], "node_id" | "severity">;
 
-export interface EventStats {
-  total: number;
-  by_severity: { [key: string]: number };
-  by_type: { [key: string]: number };
-}
+export type EventStats = Schemas["EventStats"];
 
-export interface MetricsSummary {
-  nodes: {
-    total: number;
-    active: number;
-    connected: number;
-    registered: number;
-    /** Still connected, but silent past `heartbeat_timeout`. */
-    unresponsive: number;
-    disconnected: number;
-    by_type: { [key: string]: number };
-  };
-  system: {
-    uptime_seconds: number;
-    total_events: number;
-    total_commands: number;
-    total_heartbeats: number;
-  };
-}
+/**
+ * What `/api/platform/metrics/summary` carries: the control channels by
+ * state, the process-wide counters and the health of the cursor table.
+ */
+export type MetricsSummary = Schemas["MetricsSummaryView"];

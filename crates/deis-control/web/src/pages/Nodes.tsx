@@ -19,7 +19,10 @@ function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleString()
 }
 
-function formatOptionalDate(dateStr: string | null) {
+// The fleet's health instants are optional as well as nullable in the
+// document (`NodeHealth`): a node the control plane has not probed yet has
+// no `last_checked` at all, and the page shows the same dash either way.
+function formatOptionalDate(dateStr: string | null | undefined) {
   return dateStr ? formatDate(dateStr) : '—'
 }
 

@@ -23,6 +23,13 @@
 //! test in `tests/openapi_drift.rs` keeps it equal to what this module
 //! renders, and `scripts/check-openapi-compat.py` refuses a change that
 //! breaks a client without a major version bump.
+//!
+//! The web console reads the document too: `scripts/generate-openapi-types.py`
+//! renders it as `crates/deis-control/web/src/generated/control-api.ts`,
+//! the only place the console's response types come from, and CI runs the
+//! script with `--check`. So a change here is three commits' worth of
+//! files in one: this module, the regenerated document, and the
+//! regenerated TypeScript module.
 
 use std::borrow::Cow;
 

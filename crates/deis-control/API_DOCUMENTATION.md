@@ -286,8 +286,9 @@ them with the same name or with `*`.
 | Deploy, roll back, create/update/delete a route | `deploy:<app>/<env>` |
 | Write or delete a secret | `secrets:<app>/<env>` |
 | Mint a storage token | `storage:<app>/<env>`, exactly named |
+| Read a provider deployment or rollback operation through `GET /api/v1/operations/{operation_id}` | `read:<app>/<env>` - read from the operation's record, as the scoped `getProviderDeployment` demands |
 | Cancel a provider deployment or rollback, through its scoped route or through `POST /api/v1/operations/{operation_id}/cancel` | `deploy:<app>/<env>` - for the generic route, read from the operation's record |
-| Accounts, tokens, audit, hostname grants, providers, operation reads and every other operation cancel, identity migration, backend restores, retired apps, `DELETE /api/v1/apps/{app_id}`, `GET /api/v1/deployment-plans/{id}` | `admin:*/*` |
+| Accounts, tokens, audit, hostname grants, providers, every other operation read and cancel, identity migration, backend restores, retired apps, `DELETE /api/v1/apps/{app_id}`, `GET /api/v1/deployment-plans/{id}` | `admin:*/*` |
 | Platform: sessions, events, metrics, node configuration and commands, `GET /api/platform/routes`, `GET /api/platform/runtime/{node}/status` | `read:*/*`, and `admin:*/*` for the writes (configuration, commands) |
 | `GET /api/platform/runtime` | any scope at all - it is the fleet's health, which `deis status` prints |
 | `DELETE /api/platform/runtime/{node}/apps/{app_id}` | `deploy:<app>/<env>` with `?environment=<env>`; without it the call takes *every* environment off the node, so it demands `deploy:<app>/*` |
@@ -593,9 +594,12 @@ deployment, operation cancellation. The answer is a `ProductOperation`
 provider deployment for a provider deploy or rollback), and the record
 carries a `state`, a `revision` (its `ETag`), `progress`, whether it is
 `cancellable`, and an `error` that is set exactly when the state is `failed`.
-Cancel with `POST /api/v1/operations/{operation_id}/cancel`, which needs both
-an `Idempotency-Key` and an `If-Match`; it dispatches on the operation's
-kind and demands the scope the record says the operation belongs to.
+Cancel with `POST /api/v1/operations/{operation_id}/cancel`, which needs an
+`If-Match` and takes an `Idempotency-Key` as optional, exactly as the scoped
+provider-deployment cancel does; it dispatches on the operation's kind and
+demands the scope the record says the operation belongs to. Reading an
+operation demands the same record's scope: `read:<app>/<env>` for a
+provider deploy or rollback, `admin:*/*` for everything else.
 
 **Deployment plans** - deploy, rollback, and a secret write or delete that
 has to re-plan the running deployment. The answer is the normal deployment
@@ -2455,6 +2459,21 @@ Example answer (`200`, `ProductInstallation`):
 
 `operationId: getOperation`. Legacy spelling `GET /api/operations/{operation_id}`, deprecated.
 
+What the route demands of the caller is read from the operation's record
+rather than from the path, exactly as the cancel below reads it:
+
+| `kind` | Scope |
+|---|---|
+| `deploy`, `rollback` (a provider workflow) | `read:<app>/<env>` of the application and environment in the record - what `getProviderDeployment` demands for the same workflow |
+| `migrate`, `restore`, anything else | `admin:*/*` |
+
+A caller whose scope does not cover the operation is refused with `403`
+`insufficient-scope` whether or not the operation exists, and with the same
+body either way - the same fixed body the cancel gives - so a credential over
+one environment learns nothing about ids it may not see. Only an
+administrator is told `404` for an id that does not exist. The refusal is in
+the audit log under `operation.get`; a successful read is not.
+
 - **Path** `operation_id` (string, required) - The operation's canonical UUIDv7.
 - **200** `ProductOperation` with `ETag` - The operation.
 - **Refusals** `400`, `401`, `403`, `404` - see [Errors](#errors).
@@ -2481,7 +2500,7 @@ ids it may not see. The exact demand is written to the server log with the
 request id.
 
 - **Path** `operation_id` (string, required) - The operation's canonical UUIDv7.
-- **Header** `Idempotency-Key` (string, required) - For a provider `deploy` or `rollback` a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; an identity migration or backend restore cancel is fenced by `If-Match` alone.
+- **Header** `Idempotency-Key` (string, optional) - For a provider `deploy` or `rollback` a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; without one a redelivered cancel finds nothing left to cancel and answers `409`. An identity migration or backend restore cancel is fenced by `If-Match` alone.
 - **Header** `If-Match` (string, required) - The operation revision the caller expects.
 - **202** `ProductOperation` with `Location` - Cancellation was requested; poll `Location` (the scoped provider deployment for a provider `deploy` or `rollback`, this operation otherwise).
 - **Refusals** `400`, `401`, `403`, `404`, `409`, `412`, `428`, `503` - see [Errors](#errors). A terminal or already-cancelling provider operation answers `409` `operation-not-cancellable`.
@@ -3178,6 +3197,14 @@ from `GET /api/platform/events`, and the console polls the platform lists and
   a removed path, operation, response property or enum value, a response
   property that stopped being required, a request property or parameter that
   started being required, a changed type, a new security requirement.
+- `python3 scripts/generate-openapi-types.py` renders the document as the
+  web console's TypeScript client,
+  [`crates/deis-control/web/src/generated/control-api.ts`](web/src/generated/control-api.ts):
+  one type per schema, and an `operations` interface keyed by `operationId`
+  with the parameters, the request body and the responses by status. The
+  console's own `lib/api.ts` only aliases those types; it restates no
+  response model. `--check` is what CI runs, and it refuses a document whose
+  client was not regenerated.
 - Every list operation answers a `ControlListPage_*` schema, and every
   operation declares the shared error responses, so a generated client gets
   the envelopes for free.

@@ -808,7 +808,7 @@ acme_ca_stats() {
 # Nothing here is a shortcut. The same five steps a person takes:
 #
 #   1. `deis build --vendor deislet`  -> dist/providers/deislet/<digest>/bundle.zip
-#   2. POST /api/apps                 -> the application exists
+#   2. POST /api/v1/apps              -> the application exists
 #   3. POST .../versions              -> the bundle becomes an immutable version
 #   4. POST .../environments          -> production exists
 #   5. POST .../deployments           -> the environment points at the version
@@ -818,6 +818,26 @@ acme_ca_stats() {
 # itself never travels inside a gRPC message.
 
 # Print the control plane's base URL.
+#
+# Every path this file appends to it is spelled under one of the two versioned
+# surfaces, never the flat `/api/...` tree the control plane still serves for
+# callers written before them: `/api/v1/...` for the product API - what a
+# developer's application, its versions, environments, deployments, secrets,
+# hostname grants, credentials and audit log are - and `/api/platform/...` for
+# the operator diagnostics, which here are the fleet view, the global routing
+# table and taking an application off a node. The flat tree carries
+# `Deprecation` and `Sunset` on every answer, so a demo that kept spelling it
+# would be quoting the surface the platform is asking people to leave.
+#
+# The two versioned surfaces also answer differently, and the checks below are
+# written for those answers rather than the flat tree's: a list comes back as
+# {schemaVersion, items, page} and a refusal as {"error":{code, message,
+# requestId, violations, ...}}, so a list is read at `.items[]` and a refusal
+# at `.error.message`.
+#
+# `PUT /api/nodes/<id>/registration` is the one path here that is none of
+# this. It is the channel a node itself calls, it is not part of the Control
+# API, and it is not versioned; see check_the_node_channel_needs_the_node_key.
 control_url() {
   echo "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 }
@@ -830,6 +850,29 @@ control_url() {
 # a caller that forgets it gets 401 rather than an answer.
 control_api() {
   curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)$1" || true
+}
+
+# Every item of one Control API list, whatever its size, as one JSON array.
+#
+# A list route answers one page at a time - at most 1000 items, 100 when no
+# limit is named - and says where the next one starts in `page.nextCursor`.
+# A check that reads only the first page is a check against a small demo,
+# not against the catalog it is really run on: an item on the second page is
+# invisible to it. So this walks the cursor until the route says there is no
+# more, and a caller that wants "is X already there" gets to ask the whole
+# collection. The path must carry no query string of its own.
+control_list_all() {
+  local path=$1
+  local page cursor items='[]'
+  page=$(control_api "${path}?limit=1000")
+  items=$(jq -c --argjson page "${page:-null}" '. + ($page.items // [])' <<<"$items")
+  cursor=$(jq -r '.page.nextCursor // empty' <<<"${page:-null}" 2>/dev/null)
+  while [ -n "$cursor" ]; do
+    page=$(control_api "${path}?limit=1000&cursor=${cursor}")
+    items=$(jq -c --argjson page "${page:-null}" '. + ($page.items // [])' <<<"$items")
+    cursor=$(jq -r '.page.nextCursor // empty' <<<"${page:-null}" 2>/dev/null)
+  done
+  printf '%s\n' "$items"
 }
 
 # Run the developer CLI the way a developer would.
@@ -2798,11 +2841,20 @@ ROUTED_NEAR_MISS="/verifyx"
 ensure_domain_grant() {
   local pattern=$1 app=$2
   local existing
-  existing=$(curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)/api/domains"     | jq -r --arg pattern "$pattern" --arg app "$app"       '[.grants[] | select(.pattern == $pattern and .app_id == $app)] | length'     2>/dev/null || echo 0)
+  # The whole registry, not its first page: a grant that sits past the
+  # hundredth row would otherwise be granted again, and the 409 that answers
+  # a duplicate would be read by the routing checks as a refusal.
+  existing=$(control_list_all /api/v1/domains \
+    | jq -r --arg pattern "$pattern" --arg app "$app" \
+      '[.[] | select(.pattern == $pattern and .app_id == $app)] | length' \
+    2>/dev/null || echo 0)
   if [ "${existing:-0}" -ge 1 ]; then
     return 0
   fi
-  curl -s -o /dev/null -w '%{http_code}' -X POST     -H "Authorization: Bearer ${API_KEY}" -H 'content-type: application/json'     -d "{\"pattern\":\"${pattern}\",\"app_id\":\"${app}\"}"     "$(control_url)/api/domains" || true
+  curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${API_KEY}" -H 'content-type: application/json' \
+    -d "{\"pattern\":\"${pattern}\",\"app_id\":\"${app}\"}" \
+    "$(control_url)/api/v1/domains" || true
 }
 
 # Create one route unless the catalog already has it.
@@ -2813,7 +2865,7 @@ ensure_domain_grant() {
 ensure_catalog_route() {
   local app=$1 environment=$2 host=$3 prefix=$4
   local existing
-  existing=$(curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)/api/routes" \
+  existing=$(curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)/api/platform/routes" \
     | jq -r --arg app "$app" --arg host "$host" --arg prefix "$prefix" \
       '[.routes[] | select(.app_id == $app and .host == $host and .path_prefix == $prefix)] | length' \
     2>/dev/null || echo 0)
@@ -2823,7 +2875,7 @@ ensure_catalog_route() {
   curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer ${API_KEY}" -H 'content-type: application/json' \
     -d "{\"host\":\"${host}\",\"path_prefix\":\"${prefix}\",\"priority\":0}" \
-    "$(control_url)/api/apps/${app}/environments/${environment}/routes" || true
+    "$(control_url)/api/v1/apps/${app}/environments/${environment}/routes" || true
 }
 
 # One request through deis-proxy for a host the catalog claims, with no
@@ -4338,9 +4390,9 @@ check_storage_capability_token() {
 # it presents. A deployment already carries one, which is how an application
 # reaches its own data; a person has none, which is why the control plane
 # mints one on
-# GET /api/apps/:app_id/environments/:env/storage-token. Without that route
-# the three data commands have nothing to authenticate with and every one of
-# them fails at the first call.
+# GET /api/v1/apps/:app_id/environments/:env/storage-token. Without that
+# route the three data commands have nothing to authenticate with and every
+# one of them fails at the first call.
 
 check_data_cli_reads_the_apps_write() {
   local title="deis kv reads back the value the application wrote"
@@ -4394,7 +4446,7 @@ check_data_cli_reads_the_apps_write() {
 # check in this file would pass unchanged.
 check_storage_token_requires_the_api_key() {
   local title="the storage-token route refuses a caller with no API key"
-  local route="/api/apps/${APP_ID}/environments/${ENV_NAME}/storage-token"
+  local route="/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/storage-token"
   local minted="${LOG_DIR}/verify-storage-token.json"
 
   local anonymous authorised
@@ -5995,14 +6047,14 @@ ALTER
     -H "Authorization: Bearer ${API_KEY}" \
     -H "Content-Type: application/zip" \
     --data-binary "@${patched}" \
-    "$(control_url)/api/apps/${APP_ID}/versions"
+    "$(control_url)/api/v1/apps/${APP_ID}/versions"
 }
 
 # Read whatever the control plane said about a refused upload.
 refusal_message() {
   local file=$1
   local message
-  message=$(jq -r '.error // .message // empty' < "$file" 2>/dev/null || true)
+  message=$(jq -r '.error.message // empty' < "$file" 2>/dev/null || true)
   if [ -z "$message" ]; then
     message=$(head -c 300 "$file" 2>/dev/null || true)
   fi
@@ -6024,7 +6076,7 @@ check_a_date_this_platform_cannot_honour_is_refused() {
 
   if [ "$status" = "400" ] && echo "$message" | grep -q "2099-01-01"; then
     pass_check "$title" \
-      "POST /api/apps/${APP_ID}/versions with a manifest naming 2099-01-01 answered HTTP ${status}: \"$(echo "$message" | cut -c1-220)\". No version row was written, so no node was ever asked for semantics this build does not have"
+      "POST /api/v1/apps/${APP_ID}/versions with a manifest naming 2099-01-01 answered HTTP ${status}: \"$(echo "$message" | cut -c1-220)\". No version row was written, so no node was ever asked for semantics this build does not have"
   else
     fail_check "$title" \
       "expected HTTP 400 naming 2099-01-01, got HTTP ${status} and message '${message:-<empty>}'"
@@ -6063,7 +6115,7 @@ check_an_unknown_compatibility_flag_is_carried_not_refused() {
 
   if [ "$status" = "201" ] && [ "$stored_date" = "2026-09-01" ]; then
     pass_check "$title" \
-      "POST /api/apps/${APP_ID}/versions with the flag \"cookies_but_faster\" answered HTTP ${status} and stored the version with its date 2026-09-01 intact. The flag names a behaviour this build does not have in either direction, so it is ignored and named at warn rather than costing the whole version - which is what a control plane one release behind a builder has to be able to do"
+      "POST /api/v1/apps/${APP_ID}/versions with the flag \"cookies_but_faster\" answered HTTP ${status} and stored the version with its date 2026-09-01 intact. The flag names a behaviour this build does not have in either direction, so it is ignored and named at warn rather than costing the whole version - which is what a control plane one release behind a builder has to be able to do"
   else
     fail_check "$title" \
       "expected HTTP 201 with the compatibility date carried through, got HTTP ${status}, date '${stored_date:-<none>}' and message '${message:-<empty>}'"
@@ -6380,8 +6432,8 @@ check_a_redirect_hop_to_a_refused_host_is_stopped() {
   # Where the hop lands. The control plane rather than deis-store, so that
   # this check and check_app_fetch_refused leave one node log line each and
   # neither can be read as the other's.
-  local refused_hop="http://127.0.0.1:${DEIS_CONTROL_PORT}/api/apps"
-  local refused_encoded="http%3A%2F%2F127.0.0.1%3A${DEIS_CONTROL_PORT}%2Fapi%2Fapps"
+  local refused_hop="http://127.0.0.1:${DEIS_CONTROL_PORT}/api/v1/apps"
+  local refused_encoded="http%3A%2F%2F127.0.0.1%3A${DEIS_CONTROL_PORT}%2Fapi%2Fv1%2Fapps"
   local allowed_encoded="http%3A%2F%2F127.0.0.1%3A${DEIS_ORIGIN_PORT}%2Fpayload.txt"
   local origin="http://127.0.0.1:${DEIS_ORIGIN_PORT}/redirect-to?url="
 
@@ -7665,21 +7717,25 @@ check_a_scoped_token_reaches_one_environment_and_no_other() {
 
   local allowed refused_env refused_secret refused_platform refused_token
   allowed=$(control_status POST \
-    "/api/apps/${APP_ID}/environments/${PREVIEW_ENV_NAME}/deployments" "$token" \
+    "/api/v1/apps/${APP_ID}/environments/${PREVIEW_ENV_NAME}/deployments" "$token" \
     "{\"version_id\":\"${preview_version}\",\"note\":\"deployed by a scoped token\"}")
   refused_env=$(control_status POST \
-    "/api/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "$token" \
+    "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "$token" \
     "{\"version_id\":\"${preview_version}\"}")
   refused_secret=$(control_status PUT \
-    "/api/apps/${APP_ID}/environments/${PREVIEW_ENV_NAME}/secrets/CI_ATTEMPT" "$token" \
+    "/api/v1/apps/${APP_ID}/environments/${PREVIEW_ENV_NAME}/secrets/CI_ATTEMPT" "$token" \
     '{"value":"this must never be stored"}')
-  refused_platform=$(control_status GET "/api/audit" "$token")
-  refused_token=$(control_status GET "/api/tokens" "$token")
+  refused_platform=$(control_status GET "/api/v1/audit" "$token")
+  refused_token=$(control_status GET "/api/v1/tokens" "$token")
 
+  # `/api/v1` answers a refusal in the structured envelope, so the sentence
+  # the caller is shown is `.error.message` - which is the legacy `error`
+  # and `details` strings joined, and still the one that names the scope
+  # that would have worked.
   local told
   told=$(control_answer POST \
-    "/api/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "$token" \
-    | jq -r '.details // .error // empty')
+    "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "$token" \
+    | jq -r '.error.message // empty')
 
   # Narrow has to stay usable. `deis status` walks every environment of the
   # application, so a credential that reaches one of them would break the
@@ -7743,11 +7799,11 @@ check_a_credential_cannot_wire_an_app_to_one_it_cannot_see() {
   local refused told
   refused=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer ${token}" -H "Content-Type: application/zip" \
-    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions" || true)
+    --data-binary "@${bundle}" "$(control_url)/api/v1/apps/${APP_ID}/versions" || true)
   told=$(curl -s -X POST \
     -H "Authorization: Bearer ${token}" -H "Content-Type: application/zip" \
-    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions" \
-    | jq -r '.error // empty' 2>/dev/null || true)
+    --data-binary "@${bundle}" "$(control_url)/api/v1/apps/${APP_ID}/versions" \
+    | jq -r '.error.message // empty' 2>/dev/null || true)
 
   # The same bundle, with the same account, once it may also *see* the callee.
   # Read is the weakest verb in the grammar, which is the point: this is a
@@ -7759,7 +7815,7 @@ check_a_credential_cannot_wire_an_app_to_one_it_cannot_see() {
   widened_token=$(echo "$widened" | jq -r '.secret // empty')
   accepted=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer ${widened_token}" -H "Content-Type: application/zip" \
-    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions" || true)
+    --data-binary "@${bundle}" "$(control_url)/api/v1/apps/${APP_ID}/versions" || true)
 
   # And it is written down, like every other refusal on the human API.
   local audited
@@ -7784,12 +7840,12 @@ check_a_scoped_token_cannot_unload_an_application_from_a_node() {
 
   # Exactly the credential a preview pipeline holds, and the same one the
   # scoped-token check proves can deploy to ${PREVIEW_ENV_NAME} and nowhere
-  # else. `DELETE /api/runtime/<node>/apps/<app>` stops the application on the
-  # node; without ?environment= it stops every environment of it, so it is a
-  # real outage of ${ENV_NAME} made with a credential that may not deploy
-  # there. It used to be allowed, because the route named no environment in
-  # its path and the authorisation table asked for "any environment the caller
-  # holds" - which one preview scope answers.
+  # else. `DELETE /api/platform/runtime/<node>/apps/<app>` stops the
+  # application on the node; without ?environment= it stops every environment
+  # of it, so it is a real outage of ${ENV_NAME} made with a credential that
+  # may not deploy there. It used to be allowed, because the route named no
+  # environment in its path and the authorisation table asked for "any
+  # environment the caller holds" - which one preview scope answers.
   #
   # Every call below is one that has to be refused, so nothing on the node is
   # actually unloaded and the checks after this one still have an application
@@ -7804,12 +7860,17 @@ check_a_scoped_token_cannot_unload_an_application_from_a_node() {
   fi
 
   local whole named other told
-  whole=$(control_status DELETE "/api/runtime/${NODE_ID}/apps/${APP_ID}" "$token")
+  whole=$(control_status DELETE \
+    "/api/platform/runtime/${NODE_ID}/apps/${APP_ID}" "$token")
   named=$(control_status DELETE \
-    "/api/runtime/${NODE_ID}/apps/${APP_ID}?environment=${ENV_NAME}" "$token")
-  other=$(control_status DELETE "/api/runtime/${NODE_ID}/apps/${CALLEE_APP_ID}" "$token")
-  told=$(control_answer DELETE "/api/runtime/${NODE_ID}/apps/${APP_ID}" "$token" \
-    | jq -r '.details // .error // empty')
+    "/api/platform/runtime/${NODE_ID}/apps/${APP_ID}?environment=${ENV_NAME}" "$token")
+  other=$(control_status DELETE \
+    "/api/platform/runtime/${NODE_ID}/apps/${CALLEE_APP_ID}" "$token")
+  # As above: `/api/platform` refuses in the structured envelope, and the
+  # sentence naming the scope that would have worked is `.error.message`.
+  told=$(control_answer DELETE \
+    "/api/platform/runtime/${NODE_ID}/apps/${APP_ID}" "$token" \
+    | jq -r '.error.message // empty')
 
   # The application is still being served, which is the claim that matters:
   # a refusal that had nonetheless unloaded something would be no refusal.
@@ -7826,7 +7887,7 @@ check_a_scoped_token_cannot_unload_an_application_from_a_node() {
     && [ "$still_serving" = "200" ] && [ "${audited:-0}" -ge 3 ] \
     && echo "$told" | grep -q "deploy:${APP_ID}/\*"; then
     pass_check "$title" \
-      "carrying only deploy:${APP_ID}/${PREVIEW_ENV_NAME}, the token was refused DELETE /api/runtime/${NODE_ID}/apps/${APP_ID} (HTTP ${whole}), the same call naming ${ENV_NAME} (${named}) and the one against ${CALLEE_APP_ID} (${other}). The refusal asks for the whole application - \"$(printf '%s' "$told" | head -c 120)\" - because a call that names no environment stops every one of them. ${APP_ID} is still served (HTTP ${still_serving}) and ${audited} refused node.app.unload row(s) are on the record"
+      "carrying only deploy:${APP_ID}/${PREVIEW_ENV_NAME}, the token was refused DELETE /api/platform/runtime/${NODE_ID}/apps/${APP_ID} (HTTP ${whole}), the same call naming ${ENV_NAME} (${named}) and the one against ${CALLEE_APP_ID} (${other}). The refusal asks for the whole application - \"$(printf '%s' "$told" | head -c 120)\" - because a call that names no environment stops every one of them. ${APP_ID} is still served (HTTP ${still_serving}) and ${audited} refused node.app.unload row(s) are on the record"
   else
     fail_check "$title" \
       "expected 403 for the whole application (got ${whole}), for ${ENV_NAME} (got ${named}) and for ${CALLEE_APP_ID} (got ${other}), naming deploy:${APP_ID}/* -- it said \"$(printf '%s' "${told:-nothing}" | head -c 160)\". ${APP_ID} answered ${still_serving} (expected 200) and the audit log holds ${audited:-0} refused node.app.unload row(s)"
@@ -7894,7 +7955,7 @@ check_the_node_management_plane_needs_the_node_key() {
 
   local fleet healthy
   fleet="${LOG_DIR}/verify-node-management-auth-fleet.json"
-  control_api /api/runtime > "$fleet" 2>/dev/null || true
+  control_api /api/platform/runtime > "$fleet" 2>/dev/null || true
   healthy=$(jq -r --arg id "$NODE_ID" \
     '.nodes[] | select(.id == $id) | .healthy' < "$fleet" 2>/dev/null || true)
 
@@ -7927,7 +7988,7 @@ check_a_wide_credential_cannot_mint_a_storage_token() {
   deis_cli token create --account data-team --scope 'storage:*/*' blanket --json \
     >/dev/null 2>&1 || blanket_status=$?
 
-  local route="/api/apps/${APP_ID}/environments/${ENV_NAME}/storage-token"
+  local route="/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/storage-token"
   local refused allowed tenant
   refused=$(control_status GET "$route" "$wide")
   allowed=$(control_status GET "$route" "$narrow")
@@ -7957,14 +8018,24 @@ check_a_revoked_token_stops_at_its_next_call() {
     return
   fi
 
-  local route="/api/apps/${APP_ID}/environments/${ENV_NAME}/deployment"
+  local route="/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/deployment"
   local before after unknown revoked_body unknown_body
   before=$(control_status GET "$route" "$token")
   deis_cli token revoke "$id" --json >/dev/null 2>&1 || true
   after=$(control_status GET "$route" "$token")
   unknown=$(control_status GET "$route" "$NEVER_MINTED_TOKEN")
-  revoked_body=$(control_answer GET "$route" "$token")
-  unknown_body=$(control_answer GET "$route" "$NEVER_MINTED_TOKEN")
+  # `/api/v1` answers a refusal in the structured envelope, and every
+  # envelope carries the `requestId` of the request it answers - a fresh
+  # UUIDv7 each time, which two answers can never share. It says nothing
+  # about the credential, so it is dropped here and everything else - the
+  # code, the sentence, the violations - is what the two answers are
+  # compared on. Comparing the raw bytes instead would report the two
+  # credentials as distinguishable on every run, which is the opposite of
+  # what this check is about.
+  revoked_body=$(control_answer GET "$route" "$token" \
+    | jq -S 'del(.error.requestId)' 2>/dev/null || true)
+  unknown_body=$(control_answer GET "$route" "$NEVER_MINTED_TOKEN" \
+    | jq -S 'del(.error.requestId)' 2>/dev/null || true)
 
   # The control plane's own log does tell the two apart, which is the point:
   # "a revoked token was presented" means a credential is still deployed
@@ -7975,7 +8046,7 @@ check_a_revoked_token_stops_at_its_next_call() {
   if [ "$before" = "200" ] && [ "$after" = "401" ] && [ "$unknown" = "401" ] \
     && [ "$revoked_body" = "$unknown_body" ] && [ "${said:-0}" -ge 1 ]; then
     pass_check "$title" \
-      "the token read ${route} (HTTP ${before}); after \`deis token revoke ${id}\` the very next request answered ${after}, byte-for-byte the same answer a token that was never minted gets (${unknown}). No cache had to expire: every request looks the row up. The control plane's log says \"the token presented was revoked\" ${said} time(s), which a stolen credential cannot see"
+      "the token read ${route} (HTTP ${before}); after \`deis token revoke ${id}\` the very next request answered ${after}, and apart from the per-request \`requestId\` every byte of it is the answer a token that was never minted gets (${unknown}). No cache had to expire: every request looks the row up. The control plane's log says \"the token presented was revoked\" ${said} time(s), which a stolen credential cannot see"
   else
     fail_check "$title" \
       "before revoking ${before} (expected 200), after ${after} and an unknown token ${unknown} (expected 401 each); the two answers were $( [ "$revoked_body" = "$unknown_body" ] && echo identical || echo different ), and the log named a revoked token ${said:-0} time(s)"
@@ -8067,13 +8138,13 @@ check_the_audit_log_has_no_way_to_be_erased() {
   # The flat api_keys entry is the most powerful credential this control
   # plane has - it is unscoped, so it passes every scope check there is. If
   # anything could delete a line, this would.
-  removed=$(control_status DELETE "/api/audit" "$API_KEY")
-  created=$(control_status POST "/api/audit" "$API_KEY" '{"action":"forged"}')
+  removed=$(control_status DELETE "/api/v1/audit" "$API_KEY")
+  created=$(control_status POST "/api/v1/audit" "$API_KEY" '{"action":"forged"}')
   after=$(deis_cli audit --limit 500 --json 2>/dev/null | jq -r '.total // 0')
 
   if [ "$removed" = "405" ] && [ "$created" = "405" ] && [ "${after:-0}" -ge "${before:-0}" ]; then
     pass_check "$title" \
-      "DELETE /api/audit answered ${removed} and POST answered ${created} to the unscoped api_keys credential - the route is a read and there is no writing or deleting endpoint behind it. The log went from ${before} to ${after} line(s) across both attempts; removing one means holding the database file, which is the same access that holds the secret master key"
+      "DELETE /api/v1/audit answered ${removed} and POST answered ${created} to the unscoped api_keys credential - the route is a read and there is no writing or deleting endpoint behind it. The log went from ${before} to ${after} line(s) across both attempts; removing one means holding the database file, which is the same access that holds the secret master key"
     else
     fail_check "$title" \
       "DELETE answered ${removed} and POST answered ${created} (expected 405 for both), and the log went from ${before:-?} to ${after:-?} lines"
@@ -8086,7 +8157,7 @@ check_node_registration() {
 
   # No CLI command covers the fleet, so this reads the control plane's own
   # view of it. That is an operator question, not a deployment step.
-  control_api /api/runtime > "$fleet" 2>/dev/null || true
+  control_api /api/platform/runtime > "$fleet" 2>/dev/null || true
 
   local registered addr configured_addr
   registered=$(jq -r --arg id "$NODE_ID" \
@@ -8157,7 +8228,7 @@ check_dynamic_node_registration() {
     return
   fi
 
-  control_api /api/runtime > "$fleet" 2>/dev/null || true
+  control_api /api/platform/runtime > "$fleet" 2>/dev/null || true
 
   local source registered_at
   source=$(jq -r --arg id "$dynamic_id" \
@@ -8185,7 +8256,7 @@ check_dynamic_node_registration() {
   removed_status=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
     -H "Authorization: Bearer ${SECRET}" \
     "$(control_url)/api/nodes/${dynamic_id}/registration" || true)
-  control_api /api/runtime > "$fleet" 2>/dev/null || true
+  control_api /api/platform/runtime > "$fleet" 2>/dev/null || true
   still_listed=$(jq -r --arg id "$dynamic_id" \
     '[.nodes[] | select(.id == $id)] | length' < "$fleet" 2>/dev/null || echo "?")
 
@@ -8244,7 +8315,7 @@ check_the_node_channel_needs_the_node_key() {
 
   # And the fleet, which is where a caller that got through would show up.
   local fleet="${LOG_DIR}/verify-node-channel-fleet.json"
-  control_api /api/runtime > "$fleet" 2>/dev/null || true
+  control_api /api/platform/runtime > "$fleet" 2>/dev/null || true
   local joined healthy
   joined=$(jq -r --arg id "$invented" \
     '[.nodes[] | select(.id == $id)] | length' < "$fleet" 2>/dev/null || echo "?")

@@ -304,8 +304,8 @@ for pair in \
   'env_request|env_request preview "${LOG_DIR}/h" /' \
   'routed_request|routed_request example.test / "${LOG_DIR}/h"' \
   'app_fetch|app_fetch probe http://127.0.0.1:9/' \
-  'control_api|control_api /api/runtime' \
-  'control_status|control_status GET /api/runtime ""'
+  'control_api|control_api /api/platform/runtime' \
+  'control_status|control_status GET /api/platform/runtime ""'
 do
   helper=${pair%%|*}
   call=${pair#*|}

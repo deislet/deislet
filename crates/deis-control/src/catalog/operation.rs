@@ -125,37 +125,71 @@ impl CatalogStore {
             .await
     }
 
-    /// Resolve the application and environment an operation is scoped to.
+    /// The operation together with the application and environment names
+    /// its scope resolves to, read in one query.
     ///
-    /// `None` when the scope names no environment (a platform-wide operation
-    /// such as a backend restore) or when the application or environment it
-    /// names no longer exists; a caller then has nothing narrower than an
-    /// administrator to check against.
-    pub async fn operation_scope_names(
+    /// The names are `None` when the scope names no environment (a
+    /// platform-wide operation such as a backend restore) or when the
+    /// application or environment it names no longer exists; a caller then
+    /// has nothing narrower than an administrator to check against.
+    ///
+    /// One query rather than a lookup after the load, on purpose: the
+    /// generic operation routes decide from this whether a caller may see
+    /// an id at all, and refuse every id they may not see with one fixed
+    /// body. A second query issued only for a provider workflow in a live
+    /// environment would make such a record's existence measurable in the
+    /// time the refusal took; here an unknown id, a migration and a
+    /// workflow all cost the same single point read.
+    pub async fn product_operation_with_scope_names(
         &self,
-        scope: &OperationScope,
-    ) -> CatalogResult<Option<OperationScopeNames>> {
-        let (Some(application_id), Some(environment_id)) =
-            (scope.application_id, scope.environment_id)
-        else {
-            return Ok(None);
-        };
+        operation_id: CanonicalId,
+    ) -> CatalogResult<Option<(ProductOperation, Option<OperationScopeNames>)>> {
+        let columns = OPERATION_COLUMNS
+            .split(',')
+            .map(|column| format!("o.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
         self.database()
             .with_connection(move |connection| {
                 connection
                     .query_row(
-                        "SELECT a.id, e.name
-                           FROM apps a
-                           JOIN environments e ON e.app_id = a.id
-                          WHERE a.canonical_id = ?1 AND e.canonical_id = ?2",
-                        params![application_id.to_string(), environment_id.to_string()],
+                        &format!(
+                            "SELECT {columns},
+                                    a.id AS scope_application_name,
+                                    e.name AS scope_environment_name
+                               FROM product_operations o
+                               LEFT JOIN apps a ON a.canonical_id = o.application_id
+                               LEFT JOIN environments e
+                                      ON e.app_id = a.id AND e.canonical_id = o.environment_id
+                              WHERE o.operation_id = ?1"
+                        ),
+                        [operation_id.to_string()],
                         |row| {
-                            Ok(OperationScopeNames {
-                                application_id,
-                                environment_id,
-                                application_name: row.get(0)?,
-                                environment_name: row.get(1)?,
-                            })
+                            let operation = map_operation(row)?;
+                            let application_name: Option<String> =
+                                row.get("scope_application_name")?;
+                            let environment_name: Option<String> =
+                                row.get("scope_environment_name")?;
+                            let names = match (
+                                operation.scope.application_id,
+                                operation.scope.environment_id,
+                                application_name,
+                                environment_name,
+                            ) {
+                                (
+                                    Some(application_id),
+                                    Some(environment_id),
+                                    Some(application_name),
+                                    Some(environment_name),
+                                ) => Some(OperationScopeNames {
+                                    application_id,
+                                    environment_id,
+                                    application_name,
+                                    environment_name,
+                                }),
+                                _ => None,
+                            };
+                            Ok((operation, names))
                         },
                     )
                     .optional()
@@ -820,6 +854,110 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("not the expected revision")
+        );
+    }
+
+    /// The joined read resolves names only when the scope names an
+    /// application and an environment that both still exist; a scope
+    /// without an environment, or one whose environment is gone, reads as
+    /// the record alone, and an unknown id as nothing.
+    #[tokio::test]
+    async fn operation_scope_names_resolve_in_the_same_read_as_the_record() {
+        let directory = TempDir::new().unwrap();
+        let database = Arc::new(
+            Database::init(directory.path().join("control.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let store = CatalogStore::new(database);
+        store.create_app("shop").await.unwrap();
+        let production = store
+            .create_environment("shop", "production")
+            .await
+            .unwrap()
+            .canonical_id;
+        let plan = store.plan_identity_migration("shop").await.unwrap();
+
+        // A migration is scoped to the application alone.
+        let (operation, names) = store
+            .product_operation_with_scope_names(plan.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.kind, OperationKind::Migrate);
+        assert_eq!(operation.scope.environment_id, None);
+        assert_eq!(names, None);
+
+        // The same record copied under a new id with an environment in its
+        // scope - a record's identity columns are immutable, so a copy is
+        // how a differently scoped one is made - resolves both names when
+        // the environment is live, and none when it no longer exists.
+        async fn copy_scoped_to(
+            store: &CatalogStore,
+            original: CanonicalId,
+            environment_id: String,
+        ) -> CanonicalId {
+            let copy = CanonicalId::new_v7();
+            let ids = [copy.to_string(), environment_id, original.to_string()];
+            store
+                .database()
+                .with_connection(move |connection| {
+                    connection.execute(
+                        "INSERT INTO product_operations
+                            (operation_id, kind, organization_id, application_id, environment_id,
+                             target_kind, target_id, expected_revision, state, phase, revision,
+                             idempotency_key_sha256, request_fingerprint_sha256, actor_id,
+                             request_id, correlation_id, progress, cancellable, retryable,
+                             child_operation_ids, provider_operations, error_json, created_at,
+                             started_at, updated_at, finished_at)
+                         SELECT ?1, kind, organization_id, application_id, ?2,
+                                target_kind, target_id, expected_revision, state, phase, revision,
+                                lower(hex(randomblob(32))), request_fingerprint_sha256, actor_id,
+                                request_id, correlation_id, progress, cancellable, retryable,
+                                child_operation_ids, provider_operations, error_json, created_at,
+                                started_at, updated_at, finished_at
+                           FROM product_operations WHERE operation_id = ?3",
+                        ids,
+                    )?;
+                    Ok::<_, CatalogError>(())
+                })
+                .await
+                .unwrap();
+            copy
+        }
+        let live = copy_scoped_to(&store, plan.operation_id, production.to_string()).await;
+        let (operation, names) = store
+            .product_operation_with_scope_names(live)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            names,
+            Some(OperationScopeNames {
+                application_id: plan.canonical_application_id,
+                environment_id: production,
+                application_name: "shop".to_string(),
+                environment_name: "production".to_string(),
+            })
+        );
+        assert_eq!(operation.operation_id, live);
+        assert_eq!(operation.scope.environment_id, Some(production));
+
+        let gone =
+            copy_scoped_to(&store, plan.operation_id, CanonicalId::new_v7().to_string()).await;
+        let (_, names) = store
+            .product_operation_with_scope_names(gone)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(names, None);
+
+        assert!(
+            store
+                .product_operation_with_scope_names(CanonicalId::new_v7())
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

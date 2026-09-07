@@ -70,6 +70,11 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main
           python3 scripts/check-openapi-compat.py
+      # The web console's TypeScript client is rendered from the same
+      # document and committed; a document that changed without the client
+      # being regenerated is a console typed against the old contract.
+      - name: Reject web client drift from the Control API OpenAPI document
+        run: python3 scripts/generate-openapi-types.py --check
       - name: Validate official provider tool source pins
         run: python3 scripts/check-provider-tool-lock.py
       - name: Reject target status drift from the locked registry

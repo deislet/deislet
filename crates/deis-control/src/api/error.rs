@@ -249,6 +249,12 @@ pub struct ErrorDetail {
     /// describe with [`OPAQUE_MESSAGE`]. For the server log only, where the
     /// request id finds it; never serialised into the envelope.
     pub diagnostic: Option<String>,
+    /// What the audit record of this answer says, when the handler that
+    /// produced it knows more than the status: a refusal whose exact demand
+    /// was read from a record the body must not describe. The authorization
+    /// gate copies it into the record's `detail` and nothing else reads it;
+    /// never serialised into either body.
+    pub audit_detail: Option<String>,
     pub target: Option<ErrorTarget>,
     pub violations: Vec<Violation>,
     /// A property of the code, as the contract says: set from
@@ -273,6 +279,7 @@ impl ErrorDetail {
             legacy_message,
             legacy_details: None,
             diagnostic: None,
+            audit_detail: None,
             target: None,
             violations: Vec::new(),
             retryable: codes::is_retryable(code),
@@ -657,6 +664,17 @@ impl ApiError {
             Some((token, _)) => (status, token),
             None => (status, code),
         }
+    }
+
+    /// The same answer, with `detail` written into its audit record. The
+    /// bodies do not change: this is for a handler whose refusal must stay
+    /// silent about *why* to the caller (see [`Self::insufficient_scope`]
+    /// on the generic operation routes) and still say so in the audit log,
+    /// exactly as the gate's own refusals do.
+    pub fn audited_as(self, detail: impl Into<String>) -> Self {
+        let mut error = self.into_detail();
+        error.audit_detail = Some(detail.into());
+        ApiError::Detailed(Box::new(error))
     }
 
     /// Resolve into the full detail both bodies are rendered from.

@@ -315,7 +315,7 @@ Node.js 兼容（4.9）另算：它是要先拍板的产品问题，不是排期
 
 **没做的**：`api_auth_enabled` 仍然是总开关，关着的时候人这一侧的 API 和以前一样是敞开的（升级不能把没开认证的装机打死），审计日志照记、作者记成 `anonymous`，启动时报一行 warn 说清楚。审计表没有留存期，不会自己清。控制台里没有账号和审计的页面。作用域按 `(应用, 环境)` 划，划不到更细（比如「只能改这一个密钥」）。token 也还没有有效期，只有吊销。
 
-`scripts/demo.sh verify` 里有七条盯着它：配置文件里那把 key 被列出来并标成无作用域；一把 `deploy:demo/preview` 的 token 能把 preview 部署到它正在跑的那一版，而对 production、对自己环境的密钥、对审计日志、对凭证列表全是 403；`deploy:*/* secrets:*/*` 签不出存储令牌而 `storage:demo/production` 能签，并且 `storage:*/*` 在创建时就被拒；吊销后的下一个请求就是 401，和一把从没铸过的 token 的回答一模一样；审计里那条密钥写入记着密钥名字而不是值；被拒的调用连原因一起记着；`DELETE /api/audit` 拿最强的那把无作用域凭证也只有 405，行数一条没少。
+`scripts/demo.sh verify` 里有七条盯着它：配置文件里那把 key 被列出来并标成无作用域；一把 `deploy:demo/preview` 的 token 能把 preview 部署到它正在跑的那一版，而对 production、对自己环境的密钥、对审计日志、对凭证列表全是 403；`deploy:*/* secrets:*/*` 签不出存储令牌而 `storage:demo/production` 能签，并且 `storage:*/*` 在创建时就被拒；吊销后的下一个请求就是 401，和一把从没铸过的 token 的回答一模一样；审计里那条密钥写入记着密钥名字而不是值；被拒的调用连原因一起记着；`DELETE /api/v1/audit` 和 `POST /api/v1/audit` 拿最强的那把无作用域凭证也只有 405，行数一条没少。
 
 ### 4.6 没有按次调用的轨迹，延迟没有分位数 —— 已关闭
 

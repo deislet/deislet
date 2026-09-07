@@ -2776,3 +2776,39 @@ Application/framework source + versioned build plan
   all-target Clippy；Linux 另通过 18 份 Schema/62 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为
   `evidence/provider-driver-dispatcher-portability-1ebe13b.json`；它证明这些控制路径与 driver 契约的三平台代码可移植性，
   不证明真实 provider 部署或 Edge Canon 合规。
+
+## 96. 通用 operation 读取按记录授权、旧索引清退、demo 切 v1 与生成式 Web 客户端
+
+- `GET /operations/:id` 不再 admin-only：authz 表与通用 cancel 一样标为 `settled_from_record(OperationScope)`，门禁只要求
+  持有任意 scope，handler 以一条 `LEFT JOIN apps/environments` 查询同时读出记录与 app/env 名（不存在的 id、migrate、restore
+  与 provider workflow 都只花一次点查，去掉了审查指出的第二次查询时间差），deploy/rollback 要求 `read:<app>/<env>`，
+  其余 kind、scope 已失效或不存在的 id 一律要求 `admin:*/*`，未满足时先于 404 以固定文案 403（`insufficient-scope`）
+  拒绝：同一路由内任意被拒 id 的响应体逐字节相同、不含 app/env/kind，读路由文案指向 `read:`，cancel 路由指向 `deploy:`。
+  handler 侧 403 经 `ErrorDetail.audit_detail`（不进任何响应体）把精确 denial 写入审计 `detail`，与门禁自身的拒绝一致。
+  第 95 节记录的「通用 cancel `Idempotency-Key` 必填需 major」经复核撤回：请求参数由必填改可选按
+  `check-openapi-compat.py` 规则与通用兼容性判定均为增量（旧客户端继续带 key 仍有效），OpenAPI 以 `Option<String>` 且
+  `nullable = false` 声明，参数 schema 保持 `string`，兼容门禁报告 113 个 operation 仅增量；无 key 的通用 cancel 与专用路由
+  行为完全一致，带 key 的重放语义不变。第 95 节原文保留。
+- 旧库两代索引收口：`idx_api_tokens_account`、`idx_audit_app/account/outcome` 由 `create_tables` 改为 `DROP INDEX IF EXISTS`，
+  旧库下次启动即清退；`*_page_v1` 与它们共享前导列，`pagination_plans` 全部用例在索引删除后仍命中 `_page_v1`，schema 新增
+  三条测试（新库只含 keyset 索引、旧库升级清退且行不变、`create_tables` 幂等）。第 91 节「旧库同时持有两代索引」由此解决，
+  原文保留。
+- `scripts/demo.sh` 与 `test-demo-witnesses.sh` 全部控制面调用改为 `/api/v1`（apps、versions、deployments、secrets、
+  storage-token、domains、audit、tokens）与 `/api/platform`（runtime、全局 routes），节点注册通道 `/api/nodes/*` 与示例应用
+  自身的 `/api/kv` 等路由不动；列表读 `.items[]`、拒绝读 `.error.message`；新增 `control_list_all` 沿 `nextCursor` 走完整个集合，
+  domain grant 去重不再只看第一页（审查发现）。`docs/cloudflare-comparison.zh.md` 中描述 demo 检查的路径同步。
+- 生成式 Web 客户端（ADR-016「Schema 与客户端生成」）：`scripts/generate-openapi-types.py`（仅标准库、确定性输出、自检）
+  把 `contracts/openapi/v1.json` 渲染为 `web/src/generated/control-api.ts`（170 个 schema 类型、113 个 operation 的
+  method/path/params/requestBody/responses 表），未知 JSON Schema 结构直接失败；`--check` 进 CI product-governance；
+  `web/src/lib/api.ts` 不再手写任何响应模型，全部改为生成类型的别名，每个方法按 operationId 与状态码取返回类型。
+  由此暴露手写类型漂移：`MetricsSummary.nodes.unresponsive` 服务端不存在、缺 `pagination`；`FleetNode` 缺 `key_status`/
+  `key_fingerprint` 且若干可空字段必填性写反；`Heartbeat.latency_ms`、`ConfigStats` 形状不符；`executeCommand` 实为 202；
+  `Command.status` 漏 `Cancelled`。文档把 session/command/event/config history 的 state/status/severity 记为普通字符串，
+  控制台因此失去字面量收窄，需服务端补 enum（未完成）。审查发现生成器对 `allOf` 内的 `oneOf` 未加括号（现有文档未触发），
+  已改为按顶层运算符扫描加括号并入自检。
+- 门禁：fmt、四 crate 严格 Clippy、Control 655/655（加 1 ignore）、CLI 190/190、driver 64/64、OpenAPI 兼容（113 个 operation 仅增量）、
+  TS 类型无漂移、治理、共享契约 18/62、文档路径、demo witness 82/82、web 构建与 lint、`git diff --check` 全部通过；三视角审查
+  8 项：6 项修复（含上述括号、分页去重、审计 detail、时间差、读路由文案与 cloudflare-comparison 路径），1 项重复，
+  1 项为本节记录。
+- 未完成：Web organization/application/environment 主线；state/status/severity 服务端 enum；README 与 architecture 文档中的
+  路由表仍以旧前缀拼写（旧前缀在 2027-06-30 前有效，待深度审查统一处理）；总 Goal 需外部资源的项不变。

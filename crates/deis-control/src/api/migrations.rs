@@ -36,18 +36,6 @@ use crate::identity::{Demand, Principal, PrincipalKind, Selector, Verb};
 
 const IF_MATCH: &str = "if-match";
 
-/// What the generic cancel's `403` names as the scope that would have been
-/// enough, for every operation it refuses: a template, not the record's
-/// values. The record's application and environment, or its absence, must
-/// not be readable from the refusal (see `cancel_operation`).
-const CANCEL_REFUSAL_SCOPE: &str = "deploy:<app>/<env>";
-/// The fixed detail beside it. It says what the route demands of each kind
-/// without saying which kind, or whether any operation, is behind this id.
-const CANCEL_REFUSAL_DETAIL: &str = "this credential holds no scope over the operation named, if \
-                                     there is one: a provider deploy or rollback answers to \
-                                     deploy:<app>/<env> of the application and environment in its \
-                                     record, an identity migration or backend restore to admin:*/*";
-
 #[derive(Clone)]
 enum CoordinatorAvailability {
     Ready(Arc<IdentityMigrationCoordinator>),
@@ -418,7 +406,7 @@ pub async fn start_migration(
     tag = "product",
     params(("operation_id" = String, Path, description = "The operation's canonical UUIDv7.")),
     responses(
-        (status = 200, description = "The operation.", body = openapi::ProductOperationDocument, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
+        (status = 200, description = "The operation. What the route demands is read from the operation's record, not from the path: a provider `deploy` or `rollback` answers to `read:<app>/<env>` of the application and environment in its record, exactly as `getProviderDeployment` does; a `migrate` or `restore` operation, and any other kind, answers to `admin:*/*`. A caller whose scope does not cover the operation is refused with `403` `insufficient-scope` whether or not the operation exists, and with the same body either way.", body = openapi::ProductOperationDocument, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 401, response = openapi::Unauthenticated),
@@ -428,15 +416,18 @@ pub async fn start_migration(
 pub async fn get_operation(
     State(state): State<MigrationApiState>,
     Path(operation_id): Path<String>,
+    Extension(principal): Extension<Principal>,
 ) -> ApiResult<(HeaderMap, Json<ProductOperation>)> {
-    let operation_id = operation_id.parse().map_err(|error| {
+    let operation_id: CanonicalId = operation_id.parse().map_err(|error| {
         ApiError::BadRequest(format!("operation ID must be a canonical UUIDv7: {error}"))
     })?;
-    let operation = state
-        .store
-        .product_operation(operation_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("operation {operation_id} not found")))?;
+    // The gate admitted any scope at all (see `authz::RecordClaim`); what
+    // this operation actually answers to is in its record, and the caller
+    // is checked against it before the answer says whether the id exists.
+    let (current, _) =
+        settle_operation_access(&state, &principal, operation_id, OperationAccess::Read).await?;
+    let operation =
+        current.ok_or_else(|| ApiError::NotFound(format!("operation {operation_id} not found")))?;
     let mut headers = HeaderMap::new();
     headers.insert(
         header::ETAG,
@@ -457,38 +448,123 @@ pub async fn get_operation(
     Ok((headers, Json(operation)))
 }
 
-/// Which controller a cancel is dispatched to, and what it demands of the
+/// Which controller an operation belongs to, and what it demands of the
 /// caller. Decided from the operation record, never from the path: the id in
 /// the path says nothing about the operation's application or environment.
-enum CancelController {
-    /// A provider `deploy` or `rollback` workflow: stopped exactly as the
+/// The generic read and the generic cancel settle it the same way; they
+/// differ only in the verb a provider workflow answers to.
+enum OperationController {
+    /// A provider `deploy` or `rollback` workflow in a live application and
+    /// environment: read by whoever may read them, stopped exactly as the
     /// scoped `cancelProviderDeployment` route stops it, by whoever may
-    /// deploy into the application and environment it is scoped to.
+    /// deploy into them.
     ProviderWorkflow(OperationScopeNames),
     /// An identity migration: the coordinator releases its backend fences.
     IdentityMigration,
     /// A planned backend restore: cancelled in the catalog.
     BackendRestore,
-    /// A kind this route has no controller for. Refused with `409`, but only
-    /// to an administrator, so an operation's existence is not told to a
-    /// caller who may not see it.
+    /// A kind these routes have no controller for, a provider workflow whose
+    /// application or environment no longer resolves, or no operation at
+    /// all. An administrator's: the read answers `404` or the record, the
+    /// cancel `409`, and a narrower credential is not told which.
     None,
 }
 
-impl CancelController {
-    /// The exact scope this cancel needs. Everything that is not a provider
-    /// workflow in a live application/environment is an administrator's, as
-    /// the whole route was before provider workflows were dispatched here.
-    fn demand(&self) -> Demand<'_> {
+/// What a caller wants of an operation, which decides the verb a provider
+/// workflow answers to. Everything else answers to `admin:*/*` either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationAccess {
+    /// `GET /operations/{id}`: `read:<app>/<env>`, as the scoped
+    /// `getProviderDeployment` route demands.
+    Read,
+    /// `POST /operations/{id}/cancel`: `deploy:<app>/<env>`, as the scoped
+    /// `cancelProviderDeployment` route demands.
+    Cancel,
+}
+
+impl OperationAccess {
+    fn workflow_verb(self) -> Verb {
         match self {
-            CancelController::ProviderWorkflow(scope) => Demand {
-                verb: Verb::Deploy,
+            OperationAccess::Read => Verb::Read,
+            OperationAccess::Cancel => Verb::Deploy,
+        }
+    }
+
+    fn route_name(self) -> &'static str {
+        match self {
+            OperationAccess::Read => "generic operation read",
+            OperationAccess::Cancel => "generic operation cancel",
+        }
+    }
+
+    /// What this route's `403` names as the scope that would have been
+    /// enough, for every operation it refuses: a template in the route's
+    /// own verb, not the record's values. The record's application and
+    /// environment, or its absence, must not be readable from the refusal
+    /// (see [`settle_operation_access`]), so the body is one fixed sentence
+    /// per route - the minimal scope the route demands of a provider
+    /// workflow, which is what a caller refused here should go and ask for.
+    fn refusal_scope(self) -> &'static str {
+        match self {
+            OperationAccess::Read => "read:<app>/<env>",
+            OperationAccess::Cancel => "deploy:<app>/<env>",
+        }
+    }
+
+    /// The fixed detail beside it. It says what the route demands of each
+    /// kind without saying which kind, or whether any operation, is behind
+    /// this id.
+    fn refusal_detail(self) -> &'static str {
+        match self {
+            OperationAccess::Read => {
+                "this credential holds no scope over the operation named, if there is one: a \
+                 provider deploy or rollback answers to read:<app>/<env> of the application and \
+                 environment in its record, an identity migration or backend restore to admin:*/*"
+            }
+            OperationAccess::Cancel => {
+                "this credential holds no scope over the operation named, if there is one: a \
+                 provider deploy or rollback answers to deploy:<app>/<env> of the application \
+                 and environment in its record, an identity migration or backend restore to \
+                 admin:*/*"
+            }
+        }
+    }
+}
+
+impl OperationController {
+    /// Settle the controller from the record and the application and
+    /// environment names its scope resolved to, both read by the one query
+    /// in [`CatalogStore::product_operation_with_scope_names`]. A workflow
+    /// whose scope no longer resolves - its environment was deleted under
+    /// it - has nobody but an administrator left to answer to.
+    fn of(current: Option<&(ProductOperation, Option<OperationScopeNames>)>) -> Self {
+        match current {
+            Some((operation, names)) => match operation.kind {
+                OperationKind::Deploy | OperationKind::Rollback => names
+                    .clone()
+                    .map(OperationController::ProviderWorkflow)
+                    .unwrap_or(OperationController::None),
+                OperationKind::Migrate => OperationController::IdentityMigration,
+                OperationKind::Restore => OperationController::BackendRestore,
+                _ => OperationController::None,
+            },
+            None => OperationController::None,
+        }
+    }
+
+    /// The exact scope this access needs. Everything that is not a provider
+    /// workflow in a live application/environment is an administrator's, as
+    /// both routes were before provider workflows were dispatched here.
+    fn demand(&self, access: OperationAccess) -> Demand<'_> {
+        match self {
+            OperationController::ProviderWorkflow(scope) => Demand {
+                verb: access.workflow_verb(),
                 app: Selector::One(&scope.application_name),
                 environment: Selector::One(&scope.environment_name),
             },
-            CancelController::IdentityMigration
-            | CancelController::BackendRestore
-            | CancelController::None => Demand {
+            OperationController::IdentityMigration
+            | OperationController::BackendRestore
+            | OperationController::None => Demand {
                 verb: Verb::Admin,
                 app: Selector::Every,
                 environment: Selector::Every,
@@ -497,12 +573,62 @@ impl CancelController {
     }
 }
 
+/// Load the operation and check the caller against what its record says
+/// it answers to, before either generic route looks at the request any
+/// further. The one check both routes share, so that a scope which may read
+/// an operation and a scope which may cancel it are decided in one place.
+///
+/// A missing operation is an administrator's question too: a narrower
+/// credential learns nothing about which ids exist. The refusal is the same
+/// fixed `insufficient-scope` body for every refused id, present or not,
+/// and every id costs the same single database read whatever is behind it,
+/// so the time a refusal takes says nothing either.
+async fn settle_operation_access(
+    state: &MigrationApiState,
+    principal: &Principal,
+    operation_id: CanonicalId,
+    access: OperationAccess,
+) -> ApiResult<(Option<ProductOperation>, OperationController)> {
+    let current = state
+        .store
+        .product_operation_with_scope_names(operation_id)
+        .await?;
+    let controller = OperationController::of(current.as_ref());
+    let current = current.map(|(operation, _)| operation);
+    let demand = controller.demand(access);
+    if let Err(denial) = principal.permits(&demand) {
+        // The exact demand, and the denial that names it, stay in the log
+        // and the audit record: both were read from the record, so a body
+        // carrying either would tell a caller which application and
+        // environment an id they may not see belongs to, and that it
+        // exists at all.
+        warn!(
+            %operation_id,
+            route = access.route_name(),
+            kind = current.as_ref().map(|operation| operation.kind.as_str()),
+            caller = %principal.label(),
+            needed = %demand.required_scope(),
+            %denial,
+            "Refused a generic operation route: the caller authenticated and holds no scope over the operation's application and environment; nothing was changed and the answer does not say whether the operation exists"
+        );
+        return Err(
+            ApiError::insufficient_scope(access.refusal_scope(), access.refusal_detail())
+                .audited_as(denial.to_string()),
+        );
+    }
+    Ok((current, controller))
+}
+
+// `Idempotency-Key` is `Option<String>` so the document renders it
+// `required: false`, and `nullable = false` so its schema stays the plain
+// `string` the baseline promised: a header is present or absent, never null,
+// and the compatibility gate reads a type that grew `null` as a change.
 #[utoipa::path(
     post,
     path = "/api/v1/operations/{operation_id}/cancel",
     operation_id = "cancelOperation",
     tag = "product",
-    params(("operation_id" = String, Path, description = "The operation's canonical UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. For a provider `deploy` or `rollback` operation a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; an identity migration or backend restore cancel is fenced by `If-Match` alone."), ("If-Match" = String, Header, description = "The operation revision the caller expects.")),
+    params(("operation_id" = String, Path, description = "The operation's canonical UUIDv7."), ("Idempotency-Key" = Option<String>, Header, nullable = false, description = "Optional. For a provider `deploy` or `rollback` operation a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; without one a redelivered cancel finds nothing left to cancel and answers `409`. An identity migration or backend restore cancel is fenced by `If-Match` alone."), ("If-Match" = String, Header, description = "The operation revision the caller expects.")),
     responses(
         (status = 202, description = "Cancellation was requested; poll `Location`. The route dispatches on the operation's `kind`. A provider `deploy` or `rollback` is stopped exactly as `cancelProviderDeployment` stops it - `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic) - and `Location` is the scoped provider deployment, which the same credential can read; it answers to `deploy:<app>/<env>` of the application and environment in the operation's record, and `409` `operation-not-cancellable` once terminal or already cancelling. A `migrate` or `restore` operation answers to `admin:*/*`, is stopped by its own controller, and `Location` is this operation. Any other kind is refused with `409`: this route has no cancellation controller for it.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation: the scoped provider deployment for a provider `deploy` or `rollback`, this operation otherwise."))),
         (status = 400, response = openapi::BadRequest),
@@ -527,54 +653,20 @@ pub async fn cancel_operation(
     })?;
     // The gate admitted any scope at all (see `authz::RecordClaim`); what
     // this operation actually answers to is in its record, so that is read
-    // and checked before the request is looked at any further. A missing
-    // operation is an administrator's question too: a narrower credential
-    // learns nothing about which ids exist.
-    let current = state.store.product_operation(operation_id).await?;
-    let controller = match &current {
-        Some(operation) => match operation.kind {
-            OperationKind::Deploy | OperationKind::Rollback => state
-                .store
-                .operation_scope_names(&operation.scope)
-                .await?
-                .map(CancelController::ProviderWorkflow)
-                .unwrap_or(CancelController::None),
-            OperationKind::Migrate => CancelController::IdentityMigration,
-            OperationKind::Restore => CancelController::BackendRestore,
-            _ => CancelController::None,
-        },
-        None => CancelController::None,
-    };
-    let demand = controller.demand();
-    if let Err(denial) = principal.permits(&demand) {
-        // The exact demand, and the denial that names it, stay in the log:
-        // both were read from the record, so a body carrying either would
-        // tell a caller which application and environment an id they may
-        // not see belongs to, and that it exists at all. The body is the
-        // same fixed sentence for every refused id, present or not.
-        warn!(
-            %operation_id,
-            kind = current.as_ref().map(|operation| operation.kind.as_str()),
-            caller = %principal.label(),
-            needed = %demand.required_scope(),
-            %denial,
-            "Refused a generic operation cancel: the caller authenticated and holds no scope over the operation's application and environment; nothing was changed"
-        );
-        return Err(ApiError::insufficient_scope(
-            CANCEL_REFUSAL_SCOPE,
-            CANCEL_REFUSAL_DETAIL,
-        ));
-    }
+    // and checked before the request is looked at any further.
+    let (current, controller) =
+        settle_operation_access(&state, &principal, operation_id, OperationAccess::Cancel).await?;
     let current =
         current.ok_or_else(|| ApiError::NotFound(format!("operation {operation_id} not found")))?;
     let expected_revision = required_if_match(&headers)?;
     let operation = match controller {
-        CancelController::ProviderWorkflow(scope) => {
-            // This route has always declared the key required, and the
-            // contract cannot relax it without a major version; the scoped
-            // route takes it as optional. With a key present the replay
-            // semantics are the shared helper's, identical on both routes.
-            required_header(&headers, IDEMPOTENCY_KEY)?;
+        OperationController::ProviderWorkflow(scope) => {
+            // The `Idempotency-Key` is optional here exactly as it is on the
+            // scoped route: `If-Match` is the fence, and the key only makes
+            // a redelivered request replay the first answer. With a key
+            // present the replay semantics are the shared helper's,
+            // identical on both routes; without one, a second cancel finds
+            // nothing left to cancel and is told so with `409`.
             let route = format!("/api/operations/{operation_id}/cancel");
             return cancel_provider_workflow(
                 &state.store,
@@ -590,7 +682,7 @@ pub async fn cancel_operation(
             )
             .await;
         }
-        CancelController::IdentityMigration => {
+        OperationController::IdentityMigration => {
             let coordinator = state.ready()?;
             let plan = state
                 .store
@@ -606,13 +698,13 @@ pub async fn cancel_operation(
             state.launch_abort(coordinator, plan.migration_id);
             operation
         }
-        CancelController::BackendRestore => {
+        OperationController::BackendRestore => {
             state
                 .store
                 .cancel_planned_backend_restore(operation_id, expected_revision)
                 .await?
         }
-        CancelController::None => {
+        OperationController::None => {
             return Err(ApiError::Conflict(format!(
                 "{} operation {operation_id} has no cancellation controller",
                 current.kind.as_str()
@@ -895,6 +987,10 @@ mod tests {
                 Request::builder()
                     .uri(location)
                     .body(Body::empty())
+                    .map(|mut request| {
+                        request.extensions_mut().insert(Principal::anonymous());
+                        request
+                    })
                     .unwrap(),
             )
             .await
@@ -1209,31 +1305,22 @@ mod tests {
         assert!(workflow["cancelRequestedAt"].is_string());
 
         // A terminal operation refuses a fresh cancel with the stable code,
-        // and this route holds to the Idempotency-Key its contract declares.
+        // with a key and without one alike: the key is optional here as on
+        // the scoped route, so its absence is not a `400` of its own.
         let terminal_etag = etag(workflow["operation"]["revision"].as_u64().unwrap());
-        let response = api
-            .clone()
-            .oneshot(cancel_request(
-                &cancel_uri,
-                Some("generic-cancel-003"),
-                &terminal_etag,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            error_code(&response),
-            crate::api::error::codes::OPERATION_NOT_CANCELLABLE
-        );
-        let response = api
-            .oneshot(cancel_request(&cancel_uri, None, &terminal_etag))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error_code(&response),
-            crate::api::error::codes::IDEMPOTENCY_KEY_REQUIRED
-        );
+        for key in [Some("generic-cancel-003"), None] {
+            let response = api
+                .clone()
+                .oneshot(cancel_request(&cancel_uri, key, &terminal_etag))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{key:?}");
+            assert_eq!(
+                error_code(&response),
+                crate::api::error::codes::OPERATION_NOT_CANCELLABLE,
+                "{key:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1420,5 +1507,425 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The `Idempotency-Key` is optional on the generic cancel exactly as it
+    /// is on the scoped route: a cancel without one is accepted, and a
+    /// second cancel without one finds nothing left to cancel rather than a
+    /// replay. The keyed replay is proved beside it in
+    /// `generic_cancel_stops_a_queued_provider_deployment_exactly_as_the_scoped_route_does`.
+    #[tokio::test]
+    async fn generic_cancel_takes_the_idempotency_key_as_optional_like_the_scoped_route() {
+        use crate::api::catalog::providers::tests::{
+            attach_artifact, begin_deployment, error_code, get, provider_fixture,
+        };
+        let fixture = crate::catalog::provider_driver_release::tests::Fixture::new();
+        let seeded = provider_fixture(&fixture).await;
+        let artifact = attach_artifact(&seeded.harness).await;
+        let (status, operation) = begin_deployment(
+            &seeded.router,
+            &seeded.target_id,
+            &artifact,
+            "deploy-unkeyed-cancel",
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+        let operation_id = operation["operationId"].as_str().unwrap().to_owned();
+        let revision = operation["revision"].as_u64().unwrap();
+        let etag = |revision: u64| format!("\"{revision}\"");
+        let cancel_uri = format!("/api/operations/{operation_id}/cancel");
+        let api = generic_router(
+            Arc::clone(&seeded.harness.state.store),
+            scoped_principal("deploy:demo/production"),
+        );
+
+        let response = api
+            .clone()
+            .oneshot(cancel_request(&cancel_uri, None, &etag(revision)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            format!("/api/apps/demo/environments/production/provider-deployments/{operation_id}")
+        );
+        assert_eq!(response.headers()[header::ETAG], etag(revision + 1));
+        let cancelling = json(response).await;
+        assert_eq!(cancelling["state"], "cancelling");
+        let (status, workflow) = get(
+            &seeded.router,
+            &format!("/api/apps/demo/environments/production/provider-deployments/{operation_id}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(workflow["operation"]["state"], "cancelling");
+        assert!(workflow["cancelRequestedAt"].is_string());
+
+        // Without a key there is nothing to replay: the second request is a
+        // fresh cancel of an operation already cancelling, and is refused as
+        // one, with the revision it saw.
+        let response = api
+            .oneshot(cancel_request(&cancel_uri, None, &etag(revision + 1)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error_code(&response),
+            crate::api::error::codes::OPERATION_NOT_CANCELLABLE
+        );
+    }
+}
+
+/// The generic operation routes behind the real gate, the way the human API
+/// mounts them: the legacy `/api` spelling and the versioned `/api/v1`
+/// spelling, each under its own request context and error rendering, with
+/// the authorization gate outside both. Everything below asserts on what a
+/// credential is answered and on what the audit log then holds.
+#[cfg(test)]
+mod gated_tests {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
+    use axum::response::IntoResponse;
+    use axum::{Router, middleware::from_fn_with_state};
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use super::{CoordinatorAvailability, MigrationApiState, OperationAccess, REQUEST_ID, router};
+    use crate::api::authz::{AuthzState, authorize};
+    use crate::api::catalog::providers::tests::{
+        attach_artifact, begin_deployment, provider_fixture,
+    };
+    use crate::api::error::{ApiError, codes};
+    use crate::api::versioning::{ApiSurface, attach_request_context, render_errors};
+    use crate::audit::{AuditQuery, AuditStore, Outcome};
+    use crate::catalog::CatalogStore;
+    use crate::identity::{Authority, Denial, IdentityStore, Role, Scope, Verb};
+    use deis_wire::CanonicalId;
+
+    const ROOT_KEY: &str = "the-operators-root-key";
+
+    struct Gated {
+        router: Router,
+        audit: Arc<AuditStore>,
+        /// The secret of a token scoped to `deploy:demo/production`.
+        deploy_secret: String,
+    }
+
+    async fn gated(store: Arc<CatalogStore>) -> Gated {
+        let database = store.database();
+        let identity = Arc::new(IdentityStore::new(Arc::clone(&database)));
+        let audit = Arc::new(AuditStore::new(database));
+        let config_keys = vec![ROOT_KEY.to_string()];
+        identity.sync_config_keys(&config_keys).await.unwrap();
+        identity.create_account("ci", Role::Deployer).await.unwrap();
+        let (_, deploy_secret) = identity
+            .create_token(
+                "ci",
+                "production-pipeline",
+                Authority::Scoped(Scope::parse_list("deploy:demo/production").unwrap()),
+            )
+            .await
+            .unwrap();
+        let authz = AuthzState {
+            enforced: true,
+            config_keys: Arc::new(config_keys),
+            identity,
+            audit: Arc::clone(&audit),
+        };
+        let state = MigrationApiState {
+            store,
+            coordinator: CoordinatorAvailability::Unavailable(Arc::from("not configured")),
+            running: Arc::new(Mutex::new(BTreeSet::new())),
+            cancelling: Arc::new(Mutex::new(BTreeSet::new())),
+        };
+        let surfaced = |surface: ApiSurface, mount: Router| {
+            mount
+                .layer(from_fn_with_state(surface, render_errors))
+                .layer(from_fn_with_state(surface, attach_request_context))
+        };
+        let router = surfaced(ApiSurface::Legacy, router("/api", state.clone()))
+            .merge(surfaced(
+                ApiSurface::V1,
+                Router::new().nest("/api/v1", router("", state)),
+            ))
+            .layer(from_fn_with_state(authz, authorize));
+        Gated {
+            router,
+            audit,
+            deploy_secret,
+        }
+    }
+
+    /// One request id for every call, so two answers that must say the
+    /// same thing can be compared byte for byte.
+    const REQUEST: &str = "01990f44-1000-7000-8000-00000000abcd";
+
+    async fn get(gated: &Gated, uri: &str, secret: &str) -> (StatusCode, HeaderMapAndBody) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("host", "localhost:8080")
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .header(REQUEST_ID, REQUEST)
+            .body(Body::empty())
+            .unwrap();
+        let response = gated.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            HeaderMapAndBody {
+                headers,
+                bytes: bytes.to_vec(),
+            },
+        )
+    }
+
+    struct HeaderMapAndBody {
+        headers: axum::http::HeaderMap,
+        bytes: Vec<u8>,
+    }
+
+    impl HeaderMapAndBody {
+        fn json(&self) -> Value {
+            serde_json::from_slice(&self.bytes).unwrap_or(Value::Null)
+        }
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.bytes).into_owned()
+        }
+    }
+
+    /// A deploy credential over one environment reads its own provider
+    /// workflow through the generic route and is refused, with one fixed
+    /// body, everything else - a migration, a workflow in another
+    /// environment, an id that does not exist - while an administrator reads
+    /// everything and is told when an id is missing. Every refusal is in the
+    /// audit log under the route's action; the successful reads are not.
+    #[tokio::test]
+    async fn generic_operation_read_answers_to_the_scope_in_the_record() {
+        let fixture = crate::catalog::provider_driver_release::tests::Fixture::new();
+        let seeded = provider_fixture(&fixture).await;
+        let artifact = attach_artifact(&seeded.harness).await;
+        let (status, operation) =
+            begin_deployment(&seeded.router, &seeded.target_id, &artifact, "deploy-read").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+        let own = operation["operationId"].as_str().unwrap().to_owned();
+        let revision = operation["revision"].as_u64().unwrap();
+        let store = Arc::clone(&seeded.harness.state.store);
+
+        // The same workflow again, in the application's other environment:
+        // the record is copied under a new id with `preview`'s canonical id,
+        // which is what the scope names resolve from, and under a key digest
+        // of its own, since one actor may hold one key per kind.
+        let preview = store
+            .get_environment("demo", "preview")
+            .await
+            .unwrap()
+            .canonical_id
+            .to_string();
+        let elsewhere = CanonicalId::new_v7();
+        {
+            let own = own.clone();
+            let elsewhere = elsewhere.to_string();
+            store
+                .database()
+                .with_connection(move |connection| {
+                    connection.execute(
+                        "INSERT INTO product_operations
+                            (operation_id, kind, organization_id, application_id, environment_id,
+                             target_kind, target_id, expected_revision, state, phase, revision,
+                             idempotency_key_sha256, request_fingerprint_sha256, actor_id,
+                             request_id, correlation_id, progress, cancellable, retryable,
+                             child_operation_ids, provider_operations, error_json, created_at,
+                             started_at, updated_at, finished_at)
+                         SELECT ?1, kind, organization_id, application_id, ?2,
+                                target_kind, target_id, expected_revision, state, phase, revision,
+                                lower(hex(randomblob(32))), request_fingerprint_sha256, actor_id,
+                                request_id, correlation_id, progress, cancellable, retryable,
+                                child_operation_ids, provider_operations, error_json, created_at,
+                                started_at, updated_at, finished_at
+                           FROM product_operations WHERE operation_id = ?3",
+                        [elsewhere, preview, own],
+                    )?;
+                    Ok::<_, crate::catalog::CatalogError>(())
+                })
+                .await
+                .unwrap();
+        }
+        // An identity migration, on an application of its own: the provider
+        // fixture's versions carry placeholder manifests the migration
+        // inventory would refuse to read.
+        store.create_app("shop").await.unwrap();
+        store
+            .create_environment("shop", "production")
+            .await
+            .unwrap();
+        let migration = store
+            .plan_identity_migration("shop")
+            .await
+            .unwrap()
+            .operation_id
+            .to_string();
+        let unknown = CanonicalId::new_v7().to_string();
+
+        let gated = gated(store).await;
+        let deploy = gated.deploy_secret.clone();
+
+        // (a) The credential reads its own workflow, with the revision as
+        // the ETag and the answer uncached, on the versioned spelling.
+        let (status, answer) = get(&gated, &format!("/api/v1/operations/{own}"), &deploy).await;
+        assert_eq!(status, StatusCode::OK, "{}", answer.text());
+        assert_eq!(answer.headers[header::ETAG], format!("\"{revision}\""));
+        assert_eq!(answer.headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(answer.headers[REQUEST_ID], REQUEST);
+        let body = answer.json();
+        assert_eq!(body["operationId"], own);
+        assert_eq!(body["kind"], "deploy");
+
+        // (b) The migration, the workflow in the other environment and an
+        // id that does not exist are all refused with `insufficient-scope`,
+        // and - under one request id - with exactly the same bytes: the
+        // body names neither the record nor whether there is one.
+        let mut refusals = Vec::new();
+        for id in [&migration, &elsewhere.to_string(), &unknown] {
+            let (status, answer) = get(&gated, &format!("/api/v1/operations/{id}"), &deploy).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{id}: {}", answer.text());
+            let body = answer.json();
+            assert_eq!(body["error"]["code"], codes::INSUFFICIENT_SCOPE, "{id}");
+            assert_eq!(body["error"]["requestId"], REQUEST, "{id}");
+            let text = answer.text();
+            for secret in [
+                "demo",
+                "shop",
+                "production",
+                "preview",
+                "migrate",
+                id.as_str(),
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "the refusal of {id} must not carry {secret:?}: {text}"
+                );
+            }
+            // The read asks the caller for the minimal scope the read
+            // demands, not the cancel's wider one.
+            assert!(text.contains("read:<app>/<env>"), "{text}");
+            assert!(!text.contains("deploy:<app>/<env>"), "{text}");
+            refusals.push(answer.bytes);
+        }
+        assert_eq!(
+            refusals[0], refusals[1],
+            "a migration and a workflow in another environment must be refused identically"
+        );
+        assert_eq!(
+            refusals[1], refusals[2],
+            "a workflow the caller may not see and an id that does not exist must be refused \
+             identically"
+        );
+
+        // (c) An administrator reads every one of them and is told when an
+        // id is missing: the 404 is an administrator's answer.
+        for (id, kind) in [
+            (&own, "deploy"),
+            (&elsewhere.to_string(), "deploy"),
+            (&migration, "migrate"),
+        ] {
+            let (status, answer) = get(&gated, &format!("/api/v1/operations/{id}"), ROOT_KEY).await;
+            assert_eq!(status, StatusCode::OK, "{id}: {}", answer.text());
+            assert_eq!(answer.json()["kind"], kind, "{id}");
+            assert!(answer.headers.contains_key(header::ETAG), "{id}");
+        }
+        let (status, answer) =
+            get(&gated, &format!("/api/v1/operations/{unknown}"), ROOT_KEY).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}", answer.text());
+        assert_eq!(answer.json()["error"]["code"], codes::NOT_FOUND);
+
+        // (e) The legacy spelling refuses with the legacy body, byte for
+        // byte what `insufficient_scope` has always rendered there: two
+        // strings and nothing structured.
+        let (status, answer) = get(&gated, &format!("/api/operations/{migration}"), &deploy).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{}", answer.text());
+        let expected = ApiError::insufficient_scope(
+            OperationAccess::Read.refusal_scope(),
+            OperationAccess::Read.refusal_detail(),
+        )
+        .into_response();
+        let expected = to_bytes(expected.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(answer.bytes, expected.to_vec());
+        let text = answer.text();
+        assert!(
+            text.starts_with(r#"{"error":"This credential may not do that: "#),
+            "{text}"
+        );
+        assert!(
+            !text.contains("requestId") && !text.contains("\"code\""),
+            "{text}"
+        );
+        let (status, answer) = get(&gated, &format!("/api/operations/{own}"), &deploy).await;
+        assert_eq!(status, StatusCode::OK, "{}", answer.text());
+
+        // The gate records the handler's refusals from the status the answer
+        // had - four of them, under the route's action, naming the id the
+        // caller asked about and, in `detail`, the denial the handler
+        // settled, exactly as its own refusals do - and none of the
+        // successful reads. The denial is the record's, which the body kept
+        // quiet about: the token's scope not covering `read:demo/preview`
+        // for the workflow in the other environment, and the deployer role
+        // not reaching `admin` for the migration and the unknown id.
+        let lines = gated
+            .audit
+            .query_page(AuditQuery::default(), 100, None)
+            .await
+            .unwrap()
+            .items;
+        let reads: Vec<_> = lines
+            .iter()
+            .filter(|line| line.action == "operation.get")
+            .collect();
+        assert_eq!(reads.len(), 4, "{reads:#?}");
+        let mut refused_ids: Vec<String> = reads
+            .iter()
+            .map(|line| {
+                assert_eq!(line.outcome, Outcome::Refused, "{line:?}");
+                assert_eq!(line.status, 403, "{line:?}");
+                assert_eq!(line.actor_account.as_deref(), Some("ci"), "{line:?}");
+                assert_eq!(line.request_id.as_deref(), Some(REQUEST), "{line:?}");
+                let target = line.target.clone().unwrap();
+                let denial = if target == elsewhere.to_string() {
+                    Denial::Scope {
+                        required: "read:demo/preview".to_string(),
+                        held: "deploy:demo/production".to_string(),
+                    }
+                } else {
+                    Denial::Role {
+                        role: Role::Deployer,
+                        verb: Verb::Admin,
+                    }
+                };
+                assert_eq!(
+                    line.detail.as_deref(),
+                    Some(denial.to_string().as_str()),
+                    "the audit line of {target} must name the denial: {line:?}"
+                );
+                target
+            })
+            .collect();
+        refused_ids.sort();
+        let mut expected_ids = vec![
+            migration.clone(),
+            elsewhere.to_string(),
+            unknown.clone(),
+            migration.clone(),
+        ];
+        expected_ids.sort();
+        assert_eq!(refused_ids, expected_ids);
+        assert!(
+            lines.iter().all(|line| line.status == 403),
+            "a successful read is not an event: {lines:#?}"
+        );
     }
 }

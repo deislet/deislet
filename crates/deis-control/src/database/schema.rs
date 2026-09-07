@@ -1107,10 +1107,13 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_api_tokens_account ON api_tokens(account_id)",
-        [],
-    )?;
+    // Superseded by `idx_api_tokens_account_page_v1` below, whose leading
+    // column is the same `account_id`: any plan that could seek this index
+    // seeks that one too, so keeping both bought nothing but a second
+    // b-tree for every insert, revoke and touch of `last_used_at` to
+    // maintain. A database that still carries it from before the v1
+    // indexes existed sheds it on its next start.
+    conn.execute("DROP INDEX IF EXISTS idx_api_tokens_account", [])?;
 
     // Keyset paging over the account list: `created_at` then the unique
     // name, which is the tie-breaker the cursor carries. New names so an
@@ -1158,22 +1161,19 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // The three questions an operator asks after an incident: what happened
-    // to this application, what did this person do, and what was refused.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_audit_app ON audit_log(app_id, id DESC)",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_audit_account ON audit_log(actor_account, id DESC)",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_audit_outcome ON audit_log(outcome, id DESC)",
-        [],
-    )?;
+    // The three questions an operator asks after an incident - what
+    // happened to this application, what did this person do, what was
+    // refused - are now answered by `idx_audit_app_page_v1`,
+    // `idx_audit_account_page_v1` and `idx_audit_outcome_page_v1` below,
+    // each leading on the same column (`app_id`, `actor_account`,
+    // `outcome`) these three did. A plan that could seek one of these could
+    // seek the matching v1 index instead, so the three bought nothing but
+    // a second b-tree for every line the log appends. A database that still
+    // carries them from before the v1 indexes existed sheds them on its
+    // next start.
+    conn.execute("DROP INDEX IF EXISTS idx_audit_app", [])?;
+    conn.execute("DROP INDEX IF EXISTS idx_audit_account", [])?;
+    conn.execute("DROP INDEX IF EXISTS idx_audit_outcome", [])?;
 
     // The audit list pages by `(at DESC, id DESC)`: the wall clock first,
     // because that is what an operator reads, and the insertion id to make
@@ -6267,6 +6267,167 @@ mod tests {
             stored.as_deref(),
             Some("018f2518-7e38-7f80-8000-000000000001")
         );
+    }
+
+    /// The names SQLite reports for a table's indexes, sorted for a stable
+    /// comparison. Includes the autoindexes SQLite creates for a UNIQUE
+    /// constraint (`sqlite_autoindex_*`), which every assertion below has to
+    /// allow for rather than mistake for a leftover.
+    fn index_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut names: Vec<String> = conn
+            .prepare(&format!("PRAGMA index_list({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        names.sort();
+        names
+    }
+
+    /// A fresh database never sees the pre-pagination indexes at all: only
+    /// the keyset indexes this schema now creates, plus whatever autoindex
+    /// SQLite derives from a UNIQUE column.
+    #[test]
+    fn a_fresh_database_carries_only_the_keyset_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let token_indexes = index_names(&conn, "api_tokens");
+        assert_eq!(
+            token_indexes,
+            vec![
+                "idx_api_tokens_account_page_v1",
+                "idx_api_tokens_page_v1",
+                // SQLite's own enforcement of the TEXT primary key, not an
+                // index this schema created.
+                "sqlite_autoindex_api_tokens_1",
+            ],
+            "{token_indexes:?}"
+        );
+
+        let audit_indexes = index_names(&conn, "audit_log");
+        assert_eq!(
+            audit_indexes,
+            vec![
+                "idx_audit_account_page_v1",
+                "idx_audit_app_page_v1",
+                "idx_audit_outcome_page_v1",
+                "idx_audit_page_v1",
+            ],
+            "{audit_indexes:?}"
+        );
+    }
+
+    /// A database that started before the keyset indexes existed carries
+    /// the four single-column indexes this slice retires. The next start
+    /// has to shed them - they cost a write on every token and audit line
+    /// and answer no query the matching `*_page_v1` index does not already
+    /// seek - without losing a row underneath them.
+    #[test]
+    fn an_older_database_sheds_the_pre_pagination_indexes_on_upgrade() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_api_tokens_account_page_v1;
+             DROP INDEX idx_audit_app_page_v1;
+             DROP INDEX idx_audit_account_page_v1;
+             DROP INDEX idx_audit_outcome_page_v1;
+             CREATE INDEX idx_api_tokens_account ON api_tokens(account_id);
+             CREATE INDEX idx_audit_app ON audit_log(app_id, id DESC);
+             CREATE INDEX idx_audit_account ON audit_log(actor_account, id DESC);
+             CREATE INDEX idx_audit_outcome ON audit_log(outcome, id DESC);",
+        )
+        .unwrap();
+
+        let account_id = "acct-upgrade";
+        conn.execute(
+            "INSERT INTO accounts (id, name, role, created_at, disabled_at)
+                 VALUES (?1, 'upgrade-owner', 'owner', 1, NULL)",
+            [account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO api_tokens
+                (id, account_id, name, origin, secret_hash, scopes, unscoped, created_at,
+                 last_used_at, revoked_at)
+                VALUES ('tok-1', ?1, 'laptop', 'minted', 'deadbeef', '', 0, 1, NULL, NULL)",
+            [account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO audit_log
+                (at, actor_kind, actor_account, actor_credential, action, app_id,
+                 environment, target, method, path, peer, outcome, status, detail, request_id)
+                VALUES (1700000000, 'account', 'upgrade-owner', 'tok-1', 'deploy', 'demo',
+                        'production', NULL, 'POST',
+                        '/api/apps/demo/environments/production/deployments',
+                        '10.0.0.4:51234', 'accepted', 201, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+
+        let token_indexes = index_names(&conn, "api_tokens");
+        assert_eq!(
+            token_indexes,
+            vec![
+                "idx_api_tokens_account_page_v1",
+                "idx_api_tokens_page_v1",
+                // SQLite's own enforcement of the TEXT primary key, not an
+                // index this schema created.
+                "sqlite_autoindex_api_tokens_1",
+            ],
+            "{token_indexes:?}"
+        );
+        let audit_indexes = index_names(&conn, "audit_log");
+        assert_eq!(
+            audit_indexes,
+            vec![
+                "idx_audit_account_page_v1",
+                "idx_audit_app_page_v1",
+                "idx_audit_outcome_page_v1",
+                "idx_audit_page_v1",
+            ],
+            "{audit_indexes:?}"
+        );
+
+        // The rows the retired indexes used to serve are exactly as an
+        // upgrade must leave them: untouched.
+        let token_name: String = conn
+            .query_row(
+                "SELECT name FROM api_tokens WHERE id = 'tok-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_name, "laptop");
+        let audit_action: String = conn
+            .query_row(
+                "SELECT action FROM audit_log WHERE actor_account = 'upgrade-owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_action, "deploy");
+    }
+
+    /// Every start runs `create_tables`, so it has to leave the same schema
+    /// behind the second time it sees a database it already brought up to
+    /// date - no error, no index recreated with a different definition.
+    #[test]
+    fn create_tables_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let token_indexes_first = index_names(&conn, "api_tokens");
+        let audit_indexes_first = index_names(&conn, "audit_log");
+
+        create_tables(&conn).unwrap();
+        create_tables(&conn).unwrap();
+
+        assert_eq!(index_names(&conn, "api_tokens"), token_indexes_first);
+        assert_eq!(index_names(&conn, "audit_log"), audit_indexes_first);
     }
 
     /// The first identity migration is an additive rolling upgrade: rows

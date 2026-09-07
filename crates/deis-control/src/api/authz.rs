@@ -84,22 +84,27 @@
 //! secret is on that list, which is what keeps a value out of the audit log
 //! by construction rather than by care.
 //!
-//! # One route's demand is settled from a record
+//! # Two routes' demands are settled from a record
 //!
-//! `POST /api/operations/:id/cancel` names an operation by an id that
-//! carries no application or environment, and which application and
-//! environment it is about - and therefore which scope may cancel it - is
-//! written in the operation record: `deploy:<app>/<env>` for a provider
-//! `deploy` or `rollback`, `admin:*/*` for an identity migration or a
-//! backend restore. This gate holds no catalog handle and reads no record,
-//! so the table marks the route [`RecordClaim::OperationScope`], demands
-//! only that the caller hold *some* scope, and the handler
-//! (`api::migrations::cancel_operation`) loads the record and checks the
-//! caller against the exact demand before anything else, refusing with the
-//! same `insufficient-scope` 403 this gate would give. The 403 is audited
-//! here like every other refusal. The marker is what keeps this table the one
-//! place that says what the route is: a route so marked and a handler that
-//! forgot the check would be visible as a pair, not as a line that is present.
+//! `GET /api/operations/:id` and `POST /api/operations/:id/cancel` name an
+//! operation by an id that carries no application or environment, and which
+//! application and environment it is about - and therefore which scope may
+//! read or cancel it - is written in the operation record: the application
+//! and environment of a provider `deploy` or `rollback` (`read:<app>/<env>`
+//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for an
+//! identity migration, a backend restore, and every other kind. This gate
+//! holds no catalog handle and reads no record, so the table marks both
+//! routes [`RecordClaim::OperationScope`], demands only that the caller hold
+//! *some* scope, and the handlers (`api::migrations::get_operation` and
+//! `api::migrations::cancel_operation`, through one shared check) load the
+//! record and check the caller against the exact demand before anything
+//! else, refusing with the same `insufficient-scope` 403 this gate would
+//! give and with one fixed body whether or not the id exists. The 403 is
+//! audited here like every other refusal: the audit line is written from the
+//! status the response actually had, so a handler's refusal is recorded the
+//! way the gate's own is. The marker is what keeps this table the one place
+//! that says what a route is: a route so marked and a handler that forgot
+//! the check would be visible as a pair, not as a line that is present.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -113,7 +118,7 @@ use axum::{
 use deis_wire::CanonicalId;
 use tracing::{info, warn};
 
-use crate::api::error::ApiError;
+use crate::api::error::{ApiError, ErrorDetail};
 use crate::api::versioning::{ApiSurface, REQUEST_ID_HEADER, RequestId, inbound_canonical_id};
 use crate::audit::{AuditRecord, AuditStore, Outcome};
 use crate::identity::store::Resolution;
@@ -216,6 +221,9 @@ pub enum BodyClaim {
 pub enum RecordClaim {
     /// The application and environment an operation is scoped to, and the
     /// verb its kind answers to, read from the `ProductOperation` record.
+    /// Carried by the generic operation read and the generic operation
+    /// cancel; the two differ only in the verb a provider workflow answers
+    /// to (`Read` to read it, `Deploy` to cancel it).
     OperationScope,
 }
 
@@ -781,25 +789,24 @@ fn classify_canonical(
         )
         .about(grant_id),
 
-        // Operation IDs are globally unique, but the path alone does not
-        // reveal their application/environment scope to this pure route
-        // classifier. Until authorization can load that scope before the
-        // handler, reading one remains a platform-administrator operation.
-        ["api", "operations", _operation_id] if !writing => Requirement::new(
-            "operation.get",
-            Verb::Admin,
-            Resource::Every,
-            Resource::Every,
-        ),
-        // Cancelling one is not an administrator's alone: a provider
-        // `deploy` or `rollback` answers to the deploy scope of the
-        // application and environment in its record, exactly as its scoped
-        // `provider_deployment.cancel` route does, and only a migration or a
-        // restore answers to `admin:*/*`. Which it is can only be read from
-        // the record, so the gate asks for some scope - `Read` is what every
-        // scope grants - and `api::migrations::cancel_operation` loads the
-        // record and refuses with `insufficient-scope` before it acts. See
-        // the module header.
+        // Neither reading an operation nor cancelling one is an
+        // administrator's alone: a provider `deploy` or `rollback` answers
+        // to the scope of the application and environment in its record -
+        // `read:<app>/<env>` to read it, exactly as its scoped
+        // `provider_deployment.get` route does, and `deploy:<app>/<env>` to
+        // cancel it, exactly as `provider_deployment.cancel` does - and only
+        // a migration, a restore or a kind with no scope of its own answers
+        // to `admin:*/*`. Which it is can only be read from the record, so
+        // the gate asks for some scope - `Read` is what every scope grants -
+        // and the handlers in `api::migrations` load the record and refuse
+        // with `insufficient-scope` before they answer or act. See the
+        // module header. The read changes nothing, so it is recorded only
+        // when refused, like every other read.
+        ["api", "operations", operation_id] if !writing => {
+            Requirement::new("operation.get", Verb::Read, Resource::Any, Resource::Any)
+                .about(operation_id)
+                .settled_from_record(RecordClaim::OperationScope)
+        }
         ["api", "operations", operation_id, "cancel"] => {
             Requirement::new("operation.cancel", Verb::Read, Resource::Any, Resource::Any)
                 .about(operation_id)
@@ -1500,22 +1507,28 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
     let refused = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
     if requirement.audit == AuditWhen::Always || refused {
         let outcome = Outcome::from_status(status.as_u16());
-        state
-            .audit
-            .record(
-                AuditRecord::by(&principal)
-                    .action(requirement.action)
-                    .request(method.as_str(), &path)
-                    .resource(requirement.app.name(), requirement.environment.name())
-                    .target(requirement.target)
-                    .peer(peer)
-                    .outcome(outcome, status.as_u16())
-                    // What the answer echoes is what the caller will quote:
-                    // the id the mount settled, which may be one it minted.
-                    .request_id(echoed_request_id(&response).or(Some(request_id.to_string())))
-                    .build(),
-            )
-            .await;
+        let mut record = AuditRecord::by(&principal)
+            .action(requirement.action)
+            .request(method.as_str(), &path)
+            .resource(requirement.app.name(), requirement.environment.name())
+            .target(requirement.target)
+            .peer(peer)
+            .outcome(outcome, status.as_u16())
+            // What the answer echoes is what the caller will quote:
+            // the id the mount settled, which may be one it minted.
+            .request_id(echoed_request_id(&response).or(Some(request_id.to_string())));
+        // A handler that refused on a demand it read from a record - one
+        // the body must not describe - leaves the demand on the answer's
+        // error detail, so this line says what was unmet exactly as the
+        // gate's own refusals above do, while the caller is told nothing.
+        if let Some(detail) = response
+            .extensions()
+            .get::<ErrorDetail>()
+            .and_then(|detail| detail.audit_detail.clone())
+        {
+            record = record.detail(detail);
+        }
+        state.audit.record(record.build()).await;
     }
 
     response
@@ -2014,7 +2027,7 @@ mod tests {
                 "GET",
                 "/api/operations/01990f44-1000-7000-8000-000000000040",
                 "operation.get",
-                Verb::Admin,
+                Verb::Read,
             ),
             ("GET", "/api/retired-apps", "retired_app.list", Verb::Admin),
             (
@@ -2464,22 +2477,52 @@ mod tests {
         }
     }
 
-    /// The generic operation cancel is the one route whose exact demand is
-    /// in a record: the gate asks only that the caller hold some scope, marks
-    /// the route so, and the handler settles `deploy:<app>/<env>` or
-    /// `admin:*/*` from the operation. Nothing else is marked, and the mark
-    /// never travels with a demand narrower than "some scope" - a route that
-    /// already names its resource has nothing left to settle.
+    /// The generic operation read and the generic operation cancel are the
+    /// two routes whose exact demand is in a record: the gate asks only that
+    /// the caller hold some scope, marks the route so, and the handler
+    /// settles the application and environment - or `admin:*/*` - from the
+    /// operation. Nothing else is marked, and the mark never travels with a
+    /// demand narrower than "some scope" - a route that already names its
+    /// resource has nothing left to settle.
     #[test]
-    fn the_generic_operation_cancel_is_settled_from_the_operation_record() {
-        let cancel = requirement(
-            "POST",
-            "/api/operations/01990f44-1000-7000-8000-000000000040/cancel",
-        );
-        assert_eq!(cancel.from_record, Some(RecordClaim::OperationScope));
-        assert_eq!(cancel.verb, Verb::Read);
-        assert_eq!(cancel.app, Resource::Any);
-        assert_eq!(cancel.environment, Resource::Any);
+    fn the_generic_operation_routes_are_settled_from_the_operation_record() {
+        const OPERATION: &str = "01990f44-1000-7000-8000-000000000040";
+        let read = requirement("GET", &format!("/api/operations/{OPERATION}"));
+        let cancel = requirement("POST", &format!("/api/operations/{OPERATION}/cancel"));
+        for (requirement, action) in [(&read, "operation.get"), (&cancel, "operation.cancel")] {
+            assert_eq!(requirement.action, action);
+            assert_eq!(
+                requirement.from_record,
+                Some(RecordClaim::OperationScope),
+                "{action} settles its exact demand from the operation record"
+            );
+            assert_eq!(requirement.verb, Verb::Read, "{action}");
+            assert_eq!(requirement.app, Resource::Any, "{action}");
+            assert_eq!(requirement.environment, Resource::Any, "{action}");
+            assert_eq!(requirement.target.as_deref(), Some(OPERATION), "{action}");
+            // Every scope answers the gate's coarse demand; a token with no
+            // scope at all does not.
+            let demand = Demand {
+                verb: requirement.verb,
+                app: requirement.app.selector(),
+                environment: requirement.environment.selector(),
+            };
+            for held in ["deploy:demo/production", "read:other/preview", "admin:*/*"] {
+                let scope = crate::identity::Scope::parse(held).unwrap();
+                assert!(
+                    scope.grants(&demand),
+                    "{held} must reach the {action} handler's check"
+                );
+            }
+            let parked = Principal {
+                kind: crate::identity::PrincipalKind::Account,
+                account: Some("parked".to_string()),
+                role: Some(crate::identity::Role::Deployer),
+                credential_id: Some("0011223344556677".to_string()),
+                authority: crate::identity::Authority::Scoped(Vec::new()),
+            };
+            assert!(parked.permits(&demand).is_err(), "{action}");
+        }
         assert_eq!(
             cancel.audit,
             AuditWhen::Always,
@@ -2487,51 +2530,23 @@ mod tests {
              handler's own 403"
         );
         assert_eq!(
-            cancel.target.as_deref(),
-            Some("01990f44-1000-7000-8000-000000000040")
+            read.audit,
+            AuditWhen::OnRefusal,
+            "a read changes nothing and is recorded only when refused - which covers the \
+             handler's own 403, because the gate records from the status the answer had"
         );
-        // Every scope answers the gate's coarse demand; a token with no
-        // scope at all does not.
-        let demand = Demand {
-            verb: cancel.verb,
-            app: cancel.app.selector(),
-            environment: cancel.environment.selector(),
-        };
-        for held in ["deploy:demo/production", "read:other/preview", "admin:*/*"] {
-            let scope = crate::identity::Scope::parse(held).unwrap();
-            assert!(
-                scope.grants(&demand),
-                "{held} must reach the handler's check"
-            );
-        }
-        let parked = Principal {
-            kind: crate::identity::PrincipalKind::Account,
-            account: Some("parked".to_string()),
-            role: Some(crate::identity::Role::Deployer),
-            credential_id: Some("0011223344556677".to_string()),
-            authority: crate::identity::Authority::Scoped(Vec::new()),
-        };
-        assert!(parked.permits(&demand).is_err());
 
         for (method, path, _, _) in mounted_routes() {
             let requirement = requirement(method, path);
-            if requirement.action == "operation.cancel" {
+            if matches!(requirement.action, "operation.get" | "operation.cancel") {
                 continue;
             }
             assert_eq!(
                 requirement.from_record, None,
                 "{method} {path} names what it is about in its URL or body; only the generic \
-                 operation cancel settles its demand from a record"
+                 operation read and cancel settle their demand from a record"
             );
         }
-        // The reading counterpart is still an administrator's: the record
-        // check exists for the cancel handler and no other handler performs it.
-        let read = requirement(
-            "GET",
-            "/api/operations/01990f44-1000-7000-8000-000000000040",
-        );
-        assert_eq!(read.verb, Verb::Admin);
-        assert_eq!(read.from_record, None);
     }
 
     /// The actions served under `/api/platform`, and nothing else: the whole

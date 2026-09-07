@@ -44,9 +44,13 @@ pub(crate) struct ProviderWorkflowCancel<'a> {
 /// Ask a provider workflow to stop and answer the way the scoped route does.
 ///
 /// `Location` names the scoped provider deployment rather than the generic
-/// operation, whichever route the request came in on: the credential that
-/// may cancel a deployment is the one that may read it there, while the
-/// generic operation read is an administrator's.
+/// operation, whichever route the request came in on: it is the workflow
+/// view - the operation together with `cancelRequestedAt` and the provider
+/// side of it - that the credential which may cancel a deployment can read,
+/// and it is what the scoped route has always answered. The generic
+/// operation read answers to the same record's scope and would also serve
+/// the caller; keeping one `Location` for both routes keeps their answers
+/// identical.
 pub(crate) async fn cancel_provider_workflow(
     store: &CatalogStore,
     principal: &Principal,

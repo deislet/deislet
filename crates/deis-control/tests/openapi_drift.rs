@@ -8,6 +8,11 @@
 //! the file did not, and with `UPDATE_OPENAPI=1` it rewrites the file and
 //! still fails, so the regeneration is a deliberate step and not a silent
 //! side effect of running the suite.
+//!
+//! The web console's types are rendered from the same file by
+//! `scripts/generate-openapi-types.py`, and CI holds that rendering to the
+//! document as well; every message below names that step, because a
+//! regenerated document with a stale client is the next failure along.
 
 use std::path::PathBuf;
 
@@ -62,15 +67,17 @@ fn the_committed_document_is_what_the_code_renders() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &rendered).unwrap();
         panic!(
-            "{} regenerated from the code, commit it (and run scripts/check-openapi-compat.py \
-             to see whether the change is breaking)",
+            "{} regenerated from the code. Run `python3 scripts/generate-openapi-types.py` to \
+             regenerate the web console's client from it, run scripts/check-openapi-compat.py \
+             to see whether the change is breaking, then commit both files.",
             openapi::CONTRACT_PATH
         );
     }
     panic!(
         "{} does not match what deis_control::api::openapi renders.\n{}\nRun \
          `UPDATE_OPENAPI=1 cargo test -p deis-control --test openapi_drift` to regenerate it, \
-         then commit the file.",
+         then `python3 scripts/generate-openapi-types.py` to regenerate the web console's \
+         client from it, then commit both files.",
         openapi::CONTRACT_PATH,
         first_difference(&committed, &rendered)
     );
