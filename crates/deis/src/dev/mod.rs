@@ -470,36 +470,7 @@ async fn load_secret_values(
     from_stdin: bool,
 ) -> Result<BTreeMap<String, String>> {
     let bytes = if let Some(path) = path {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("reading local secret file metadata at {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!(
-                "local secret path {} must be a regular, non-symlink file",
-                path.display()
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                bail!(
-                    "local secret file {} is readable or writable by group/others; run chmod 600 on it",
-                    path.display()
-                );
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            bail!(
-                "--secrets-file cannot verify this platform's ACL yet; use --secrets-stdin so secret plaintext stays on a protected channel"
-            );
-        }
-        if metadata.len() > MAX_LOCAL_SECRET_DOCUMENT_BYTES as u64 {
-            bail!("local secret document exceeds the supported size limit");
-        }
-        tokio::fs::read(path)
-            .await
-            .with_context(|| format!("reading local secret file {}", path.display()))?
+        read_secret_file(path).await?
     } else if from_stdin {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
@@ -517,6 +488,62 @@ async fn load_secret_values(
     }
     let document = std::str::from_utf8(&bytes).context("local secret document must be UTF-8")?;
     parse_secret_document(document)
+}
+
+/// Read `--secrets-file` on a platform whose access control this can prove.
+///
+/// Every check runs before the plaintext is opened, because a secret staged in
+/// a file anyone can read has already leaked by the time this process gets to
+/// it: a symlink could point the read somewhere the developer did not intend,
+/// a mode with any group or other bit set means the value is readable by
+/// another account on the machine, and an oversized file is rejected from its
+/// metadata so that a mistargeted flag costs a `stat` instead of the memory to
+/// hold whatever it was pointed at. None of these messages repeat the file's
+/// contents, so a failure cannot become the leak it is guarding against.
+#[cfg(unix)]
+async fn read_secret_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading local secret file metadata at {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "local secret path {} must be a regular, non-symlink file",
+            path.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "local secret file {} is readable or writable by group/others; run chmod 600 on it",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_LOCAL_SECRET_DOCUMENT_BYTES as u64 {
+        bail!("local secret document exceeds the supported size limit");
+    }
+    tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading local secret file {}", path.display()))
+}
+
+/// Refuse `--secrets-file` on a platform whose access control this cannot yet
+/// inspect.
+///
+/// Windows expresses "only the owner may read this" as an ACL rather than as
+/// the permission bits the standard library exposes, so there is no check here
+/// that could stand in for the Unix one. Running the rest of the reads anyway
+/// would be worse than refusing: it would accept a file that any other account
+/// on the machine can read while looking like it had been vetted. The whole
+/// body is therefore the refusal, and it names the flag that does work, so the
+/// developer is not left guessing how to pass a secret on this platform.
+/// Because the refusal is the entire function rather than a branch inside the
+/// shared one, the checks above stay compiled only where they can be enforced
+/// and nothing downstream of them becomes dead code here.
+#[cfg(not(unix))]
+async fn read_secret_file(_path: &std::path::Path) -> Result<Vec<u8>> {
+    bail!(
+        "--secrets-file cannot verify this platform's ACL yet; use --secrets-stdin so secret plaintext stays on a protected channel"
+    )
 }
 
 fn parse_secret_document(document: &str) -> Result<BTreeMap<String, String>> {

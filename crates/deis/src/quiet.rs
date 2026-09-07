@@ -14,8 +14,6 @@
 //! The right long-term fix is for `deis-build` to write its progress to
 //! stderr itself; this guard is what keeps `--json` honest until it does.
 
-use std::io::Write;
-
 /// Redirects this process's stdout to stderr until it is dropped.
 pub struct StdoutToStderr {
     #[cfg(unix)]
@@ -28,6 +26,11 @@ impl StdoutToStderr {
     /// out because the JSON it prints will have a build log in front of it.
     #[cfg(unix)]
     pub fn start() -> Self {
+        // Both of these are descriptor work, and neither exists off Unix, so
+        // they are pulled in beside the code that needs them rather than at
+        // the top of the file - a file-level `use std::io::Write` is an
+        // unused import on Windows, where the whole redirection is a no-op.
+        use std::io::Write;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
         // Anything already buffered belongs on the real stdout.
@@ -74,6 +77,7 @@ impl Drop for StdoutToStderr {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
+            use std::io::Write;
             use std::os::fd::AsRawFd;
 
             // Whatever the wrapped code printed went to stderr; flush it
