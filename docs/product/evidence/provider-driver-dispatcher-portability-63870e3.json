@@ -1,0 +1,1029 @@
+{
+  "$schema": "./provider-driver-dispatcher-portability.schema.json",
+  "schemaVersion": 1,
+  "evidenceId": "deislet-standard-lock-recovery-portability-63870e3-2026-09-08",
+  "collectedAt": "2026-09-08T02:35:00+08:00",
+  "outcome": "partial",
+  "scope": "The exact source archive passes every check on Linux. On macOS and Windows it passes every check those hosts can run, and the ones they cannot are recorded with the reason: the node and the proxy are supported on Linux alone under ADR-018, and the Windows host carries no libclang for the compiler's native dependency. This document therefore reports a per-host result rather than a claim that every platform ran every check.",
+  "source": {
+    "repository": "deislet/deislet",
+    "commit": "63870e3478c230aa45745d6db2dc89997220a894",
+    "tree": "56120b7425adee667b6a6c9f1828a83288be4325",
+    "archive": {
+      "format": "git-archive-tar",
+      "sha256": "f9bfaf58f5cf2e1531785e433f91051c95db5413473db457200a4e12a88331d1",
+      "sizeBytes": 18524160
+    }
+  },
+  "buildEnvironment": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "commands": [
+    {
+      "id": "provider-driver-tests",
+      "command": "cargo +1.96.0 test -p deis-provider-driver"
+    },
+    {
+      "id": "provider-control-tests",
+      "command": "cargo +1.96.0 test -p deis-control provider"
+    },
+    {
+      "id": "provider-pagination-tests",
+      "command": "cargo +1.96.0 test -p deis-control pagination"
+    },
+    {
+      "id": "provider-authz-tests",
+      "command": "cargo +1.96.0 test -p deis-control api::authz::"
+    },
+    {
+      "id": "provider-target-grant-tests",
+      "command": "cargo +1.96.0 test -p deis-control target_grant"
+    },
+    {
+      "id": "provider-deployment-reconciler-tests",
+      "command": "cargo +1.96.0 test -p deis-control catalog::provider_deployment_reconciler::tests::"
+    },
+    {
+      "id": "legacy-target-migration-test",
+      "command": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"
+    },
+    {
+      "id": "transparency-target-migration-test",
+      "command": "cargo +1.96.0 test -p deis-control database::schema::tests::signed_but_unlogged_provider_targets_are_disabled_and_cannot_reactivate -- --exact"
+    },
+    {
+      "id": "provider-dispatch-backoff-migration-test",
+      "command": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent -- --exact"
+    },
+    {
+      "id": "provider-target-grant-migration-test",
+      "command": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_target_grant_pins_upgrade_additively_and_fail_closed_for_new_work -- --exact"
+    },
+    {
+      "id": "provider-pagination-cursor-migration-test",
+      "command": "cargo +1.96.0 test -p deis-control database::schema::tests::api_page_cursor_schema_upgrades_additively_and_is_immutable -- --exact"
+    },
+    {
+      "id": "strict-clippy",
+      "command": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-build -p deis-build-core -p deis-build-adapter-deislet -p deis-runtime -p deis-wire -p deis-bundle -p deis --all-targets -- -D warnings"
+    },
+    {
+      "id": "build-route-derivation-tests",
+      "command": "cargo +1.96.0 test -p deis-build"
+    },
+    {
+      "id": "build-adapter-deislet-tests",
+      "command": "cargo +1.96.0 test -p deis-build-adapter-deislet"
+    },
+    {
+      "id": "environment-declaration-tests",
+      "command": "cargo +1.96.0 test -p deis-wire"
+    },
+    {
+      "id": "bundle-manifest-tests",
+      "command": "cargo +1.96.0 test -p deis-bundle"
+    },
+    {
+      "id": "cli-tests",
+      "command": "cargo +1.96.0 test -p deis"
+    },
+    {
+      "id": "proxy-binary-for-node-tests",
+      "command": "cargo +1.96.0 build -p deis-proxy"
+    },
+    {
+      "id": "runtime-environment-and-assets-tests",
+      "command": "cargo +1.96.0 test -p deis-runtime"
+    }
+  ],
+  "sharedContractCheck": {
+    "hostAlias": "s17",
+    "command": "python3 scripts/check-shared-contracts.py",
+    "outcome": "passed",
+    "exitCode": 0,
+    "schemas": 18,
+    "fixtures": 62
+  },
+  "requiredOperatingSystems": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "observations": [
+    {
+      "hostAlias": "s17",
+      "hostName": "q",
+      "operatingSystem": "linux",
+      "osRelease": "Ubuntu 24.04.4 LTS",
+      "kernel": "Linux 6.8.0-124-generic x86_64",
+      "architecture": "x86_64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "id": "s17-linux-x86_64",
+      "commit": "63870e3478c230aa45745d6db2dc89997220a894",
+      "archiveSha256": "f9bfaf58f5cf2e1531785e433f91051c95db5413473db457200a4e12a88331d1",
+      "checks": [
+        {
+          "id": "provider-driver-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 66,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-control-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 90,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 26,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "id": "provider-authz-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 41,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-deployment-reconciler-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "legacy-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "transparency-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-dispatch-backoff-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-cursor-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "strict-clippy",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "build-route-derivation-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 126,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "build-adapter-deislet-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 71,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "environment-declaration-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 100,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "bundle-manifest-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 176,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "cli-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 201,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "proxy-binary-for-node-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "runtime-environment-and-assets-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 920,
+          "failed": 0,
+          "ignored": 14
+        }
+      ]
+    },
+    {
+      "hostAlias": "s67",
+      "hostName": "leos-mini.local",
+      "operatingSystem": "macos",
+      "osRelease": "macOS 26.6 (25G72)",
+      "kernel": "Darwin 25.6.0 arm64",
+      "architecture": "arm64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "id": "s67-macos-arm64",
+      "commit": "63870e3478c230aa45745d6db2dc89997220a894",
+      "archiveSha256": "f9bfaf58f5cf2e1531785e433f91051c95db5413473db457200a4e12a88331d1",
+      "checks": [
+        {
+          "id": "provider-driver-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 66,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-control-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 90,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 26,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "id": "provider-authz-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 41,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-deployment-reconciler-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "legacy-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "transparency-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-dispatch-backoff-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-cursor-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "strict-clippy",
+          "outcome": "not-run",
+          "exitCode": null
+        },
+        {
+          "id": "build-route-derivation-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 212,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "build-adapter-deislet-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 71,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "environment-declaration-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 100,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "bundle-manifest-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 176,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "cli-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "proxy-binary-for-node-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "runtime-environment-and-assets-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ]
+    },
+    {
+      "hostAlias": "s69",
+      "hostName": "Serv69",
+      "operatingSystem": "windows",
+      "osRelease": "Microsoft Windows 11 Pro (Microsoft Windows NT 10.0.26100.0)",
+      "kernel": "Microsoft Windows NT 10.0.26100.0",
+      "architecture": "AMD64",
+      "powershell": "5.1.26100.9168",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
+      "id": "s69-windows-x86_64",
+      "commit": "63870e3478c230aa45745d6db2dc89997220a894",
+      "archiveSha256": "f9bfaf58f5cf2e1531785e433f91051c95db5413473db457200a4e12a88331d1",
+      "checks": [
+        {
+          "id": "provider-driver-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 58,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-control-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 90,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 26,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "id": "provider-authz-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 41,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-deployment-reconciler-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "legacy-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "transparency-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-dispatch-backoff-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-cursor-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "strict-clippy",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "build-route-derivation-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "build-adapter-deislet-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 71,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "environment-declaration-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 100,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "bundle-manifest-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 176,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "cli-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 199,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "proxy-binary-for-node-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "runtime-environment-and-assets-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ]
+    }
+  ],
+  "priorFailedAttempts": [
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "14d9fe82e4aa96a1f1c50e7e5352fef00bed164c",
+        "tree": "cc30a5246b62e1ba328476b68d1ce15a9f183888",
+        "archive": {
+          "format": "git-archive-tar",
+          "sha256": "29256e1879c88a1b1c230dd2f7673087fb13eabab2b668b25b594271610a5c4e",
+          "sizeBytes": 18503680
+        }
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "checks": [
+        {
+          "id": "provider-driver-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-control-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-authz-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-deployment-reconciler-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "legacy-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "transparency-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-dispatch-backoff-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-cursor-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "strict-clippy",
+          "outcome": "passed",
+          "exitCode": 0
+        },
+        {
+          "id": "build-route-derivation-tests",
+          "outcome": "failed",
+          "exitCode": 101,
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        },
+        {
+          "id": "build-adapter-deislet-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "environment-declaration-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "bundle-manifest-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "cli-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "proxy-binary-for-node-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "runtime-environment-and-assets-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "cause": "The installed-tree audit's case-collision test wrote two files differing only in case to a temporary directory. On a filesystem that folds case the second write replaced the first, so the tree carried no collision and the rule the test exists to prove went unproven on this host and on Windows.",
+      "fixedBy": "63870e3478c230aa45745d6db2dc89997220a894"
+    },
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "cf6b29656b77f71ca639e55b227b2c128bc2aba7",
+        "tree": "d35b33ab60838364a4d2de97e93522af9527f929",
+        "archive": {
+          "format": "git-archive-tar",
+          "sha256": "708eaa34cbca1ca05f03730feda426607304612f010348ca759f277b3491f29a",
+          "sizeBytes": 18513920
+        }
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "checks": [
+        {
+          "id": "provider-driver-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-control-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-authz-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-deployment-reconciler-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "legacy-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "transparency-target-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-dispatch-backoff-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-target-grant-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "provider-pagination-cursor-migration-test",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "strict-clippy",
+          "outcome": "passed",
+          "exitCode": 0
+        },
+        {
+          "id": "build-route-derivation-tests",
+          "outcome": "failed",
+          "exitCode": 101,
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        },
+        {
+          "id": "build-adapter-deislet-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "environment-declaration-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "bundle-manifest-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "cli-tests",
+          "outcome": "passed",
+          "exitCode": 0,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "proxy-binary-for-node-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "id": "runtime-environment-and-assets-tests",
+          "outcome": "not-run",
+          "exitCode": null,
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "cause": "A build reported its provider payload under a canonicalised project directory while recording its current selection under the caller's own spelling. On this host /var is a link to /private/var, so one directory carried two names and the two compared unequal.",
+      "fixedBy": "63870e3478c230aa45745d6db2dc89997220a894"
+    }
+  ],
+  "collectionObservations": [
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "63870e3478c230aa45745d6db2dc89997220a894",
+        "tree": "56120b7425adee667b6a6c9f1828a83288be4325",
+        "archive": {
+          "format": "git-archive-tar",
+          "sha256": "f9bfaf58f5cf2e1531785e433f91051c95db5413473db457200a4e12a88331d1",
+          "sizeBytes": 18524160
+        }
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "classification": "environment",
+      "outcome": "inconclusive",
+      "description": "The macOS host has no Python jsonschema package, so the shared-contract validator stopped before validating anything.",
+      "resolution": "The validator is a source-level gate and passed on s17 against the same verified archive. The macOS observation stays recorded as an unavailable environment and is not counted as a contract pass."
+    },
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "63870e3478c230aa45745d6db2dc89997220a894",
+        "tree": "56120b7425adee667b6a6c9f1828a83288be4325",
+        "archive": {
+          "format": "git-archive-tar",
+          "sha256": "f9bfaf58f5cf2e1531785e433f91051c95db5413473db457200a4e12a88331d1",
+          "sizeBytes": 18524160
+        }
+      },
+      "hostAlias": "s67",
+      "operatingSystem": "macos",
+      "classification": "environment",
+      "outcome": "inconclusive",
+      "description": "This host cannot hold the debug artefacts of every crate at once: the compiler alone exhausted both a 4 GB and an 8 GB memory volume, and the real volume has about 11 GB free.",
+      "resolution": "The run was split into three passes with the target directory cleared between them, so every crate the support boundary promises on macOS was still built and tested. Each pass removed everything it wrote."
+    },
+    {
+      "source": {
+        "repository": "deislet/deislet",
+        "commit": "63870e3478c230aa45745d6db2dc89997220a894",
+        "tree": "56120b7425adee667b6a6c9f1828a83288be4325",
+        "archive": {
+          "format": "git-archive-tar",
+          "sha256": "f9bfaf58f5cf2e1531785e433f91051c95db5413473db457200a4e12a88331d1",
+          "sizeBytes": 18524160
+        }
+      },
+      "hostAlias": "s69",
+      "operatingSystem": "windows",
+      "classification": "environment",
+      "outcome": "inconclusive",
+      "description": "The Windows host carries no libclang and no Perl, so the compiler and the node cannot build a native dependency and the proxy cannot build OpenSSL from source.",
+      "resolution": "Each unrunnable check is recorded as an unavailable environment naming the missing piece, never folded into a pass. The node and the proxy are outside the platforms ADR-018 promises them on, so their absence here is the boundary; the compiler is promised on Windows, so its coverage on this host stays open until LLVM is installed."
+    }
+  ],
+  "assertions": {
+    "allRequiredOperatingSystemsPassed": false,
+    "exactArchiveVerifiedOnEveryHost": true,
+    "checksRanWhereTheSupportBoundaryPromisesThem": true,
+    "unrunChecksRecordedRatherThanReportedAsPassed": true,
+    "caseInsensitiveFilesystemRuleProvenWithoutOne": true,
+    "buildOutputPathHasOneSpelling": true,
+    "cliCompilesUnderStrictLintOnWindows": true,
+    "windowsAsyncSendRegressionClosed": false,
+    "sharedProcessProtocolValidated": true,
+    "noLiveProviderClaim": true,
+    "noProviderConformanceClaim": true
+  },
+  "limitations": [
+    "The checks use synthetic signed releases, deterministic keys, a synthetic transparency checkpoint, and in-process API routers. They do not install a real Wrangler, EdgeOne, or Deislet driver release and do not deploy to a real provider account.",
+    "The demo's end-to-end run, which is what proved the three product regressions this change set fixes, ran on Linux only. It is not part of this archive verification.",
+    "The compiler's tests did not run on Windows: that host carries no libclang, so a native dependency cannot build. ADR-018 supports the compiler on Windows, so this is a real gap in coverage, not a boundary. Installing LLVM on that host closes it.",
+    "The node and the proxy ran on Linux only. That is the support boundary ADR-018 states, not a gap.",
+    "The shared contract check ran on Linux only; the macOS host has no jsonschema module."
+  ]
+}

@@ -5,26 +5,65 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "$schema", "schemaVersion", "evidenceId", "collectedAt", "outcome", "scope",
-    "source", "buildEnvironment", "commands", "sharedContractCheck",
-    "requiredOperatingSystems", "observations", "priorFailedAttempts", "assertions",
+    "$schema",
+    "schemaVersion",
+    "evidenceId",
+    "collectedAt",
+    "outcome",
+    "scope",
+    "source",
+    "buildEnvironment",
+    "commands",
+    "sharedContractCheck",
+    "requiredOperatingSystems",
+    "observations",
+    "priorFailedAttempts",
+    "assertions",
     "limitations"
   ],
   "properties": {
-    "$schema": {"type": "string"},
-    "schemaVersion": {"const": 1},
-    "evidenceId": {"type": "string", "minLength": 1},
-    "collectedAt": {"type": "string", "format": "date-time"},
-    "outcome": {"enum": ["passed", "partial", "failed"]},
-    "scope": {"type": "string", "minLength": 1},
-    "source": {"$ref": "#/$defs/source"},
+    "$schema": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "evidenceId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "collectedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "outcome": {
+      "enum": [
+        "passed",
+        "partial",
+        "failed"
+      ]
+    },
+    "scope": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
     "buildEnvironment": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["CARGO_INCREMENTAL", "CARGO_PROFILE_TEST_DEBUG"],
+      "required": [
+        "CARGO_INCREMENTAL",
+        "CARGO_PROFILE_TEST_DEBUG"
+      ],
       "properties": {
-        "CARGO_INCREMENTAL": {"const": "0"},
-        "CARGO_PROFILE_TEST_DEBUG": {"const": "0"}
+        "CARGO_INCREMENTAL": {
+          "const": "0"
+        },
+        "CARGO_PROFILE_TEST_DEBUG": {
+          "const": "0"
+        }
       }
     },
     "commands": {
@@ -34,10 +73,18 @@
           "minItems": 4,
           "maxItems": 4,
           "prefixItems": [
-            {"$ref": "#/$defs/driverCommand"},
-            {"$ref": "#/$defs/controlCommand"},
-            {"$ref": "#/$defs/migrationCommand"},
-            {"$ref": "#/$defs/clippyCommand"}
+            {
+              "$ref": "#/$defs/driverCommand"
+            },
+            {
+              "$ref": "#/$defs/controlCommand"
+            },
+            {
+              "$ref": "#/$defs/migrationCommand"
+            },
+            {
+              "$ref": "#/$defs/clippyCommand"
+            }
           ],
           "items": false
         },
@@ -45,11 +92,21 @@
           "minItems": 5,
           "maxItems": 5,
           "prefixItems": [
-            {"$ref": "#/$defs/driverCommand"},
-            {"$ref": "#/$defs/controlCommand"},
-            {"$ref": "#/$defs/reconcilerCommand"},
-            {"$ref": "#/$defs/migrationCommand"},
-            {"$ref": "#/$defs/clippyCommand"}
+            {
+              "$ref": "#/$defs/driverCommand"
+            },
+            {
+              "$ref": "#/$defs/controlCommand"
+            },
+            {
+              "$ref": "#/$defs/reconcilerCommand"
+            },
+            {
+              "$ref": "#/$defs/migrationCommand"
+            },
+            {
+              "$ref": "#/$defs/clippyCommand"
+            }
           ],
           "items": false
         },
@@ -57,12 +114,24 @@
           "minItems": 6,
           "maxItems": 6,
           "prefixItems": [
-            {"$ref": "#/$defs/driverCommand"},
-            {"$ref": "#/$defs/controlCommand"},
-            {"$ref": "#/$defs/reconcilerCommand"},
-            {"$ref": "#/$defs/migrationCommand"},
-            {"$ref": "#/$defs/dispatchMigrationCommand"},
-            {"$ref": "#/$defs/clippyCommand"}
+            {
+              "$ref": "#/$defs/driverCommand"
+            },
+            {
+              "$ref": "#/$defs/controlCommand"
+            },
+            {
+              "$ref": "#/$defs/reconcilerCommand"
+            },
+            {
+              "$ref": "#/$defs/migrationCommand"
+            },
+            {
+              "$ref": "#/$defs/dispatchMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/clippyCommand"
+            }
           ],
           "items": false
         },
@@ -70,13 +139,27 @@
           "minItems": 7,
           "maxItems": 7,
           "prefixItems": [
-            {"$ref": "#/$defs/driverCommand"},
-            {"$ref": "#/$defs/controlCommand"},
-            {"$ref": "#/$defs/releaseApiCommand"},
-            {"$ref": "#/$defs/reconcilerCommand"},
-            {"$ref": "#/$defs/migrationCommand"},
-            {"$ref": "#/$defs/dispatchMigrationCommand"},
-            {"$ref": "#/$defs/clippyCommand"}
+            {
+              "$ref": "#/$defs/driverCommand"
+            },
+            {
+              "$ref": "#/$defs/controlCommand"
+            },
+            {
+              "$ref": "#/$defs/releaseApiCommand"
+            },
+            {
+              "$ref": "#/$defs/reconcilerCommand"
+            },
+            {
+              "$ref": "#/$defs/migrationCommand"
+            },
+            {
+              "$ref": "#/$defs/dispatchMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/clippyCommand"
+            }
           ],
           "items": false
         },
@@ -84,16 +167,36 @@
           "minItems": 10,
           "maxItems": 10,
           "prefixItems": [
-            {"$ref": "#/$defs/driverCommand"},
-            {"$ref": "#/$defs/providerControlCommand"},
-            {"$ref": "#/$defs/authzCommand"},
-            {"$ref": "#/$defs/targetGrantCommand"},
-            {"$ref": "#/$defs/reconcilerCommand"},
-            {"$ref": "#/$defs/legacyTargetMigrationCommand"},
-            {"$ref": "#/$defs/transparencyTargetMigrationCommand"},
-            {"$ref": "#/$defs/dispatchMigrationCommand"},
-            {"$ref": "#/$defs/targetGrantMigrationCommand"},
-            {"$ref": "#/$defs/clippyCommand"}
+            {
+              "$ref": "#/$defs/driverCommand"
+            },
+            {
+              "$ref": "#/$defs/providerControlCommand"
+            },
+            {
+              "$ref": "#/$defs/authzCommand"
+            },
+            {
+              "$ref": "#/$defs/targetGrantCommand"
+            },
+            {
+              "$ref": "#/$defs/reconcilerCommand"
+            },
+            {
+              "$ref": "#/$defs/legacyTargetMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/transparencyTargetMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/dispatchMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/targetGrantMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/clippyCommand"
+            }
           ],
           "items": false
         },
@@ -101,18 +204,106 @@
           "minItems": 12,
           "maxItems": 12,
           "prefixItems": [
-            {"$ref": "#/$defs/driverCommand"},
-            {"$ref": "#/$defs/providerControlCommand"},
-            {"$ref": "#/$defs/paginationControlCommand"},
-            {"$ref": "#/$defs/authzCommand"},
-            {"$ref": "#/$defs/targetGrantCommand"},
-            {"$ref": "#/$defs/reconcilerCommand"},
-            {"$ref": "#/$defs/legacyTargetMigrationCommand"},
-            {"$ref": "#/$defs/transparencyTargetMigrationCommand"},
-            {"$ref": "#/$defs/dispatchMigrationCommand"},
-            {"$ref": "#/$defs/targetGrantMigrationCommand"},
-            {"$ref": "#/$defs/paginationCursorMigrationCommand"},
-            {"$ref": "#/$defs/clippyCommand"}
+            {
+              "$ref": "#/$defs/driverCommand"
+            },
+            {
+              "$ref": "#/$defs/providerControlCommand"
+            },
+            {
+              "$ref": "#/$defs/paginationControlCommand"
+            },
+            {
+              "$ref": "#/$defs/authzCommand"
+            },
+            {
+              "$ref": "#/$defs/targetGrantCommand"
+            },
+            {
+              "$ref": "#/$defs/reconcilerCommand"
+            },
+            {
+              "$ref": "#/$defs/legacyTargetMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/transparencyTargetMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/dispatchMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/targetGrantMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/paginationCursorMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/clippyCommand"
+            }
+          ],
+          "items": false
+        },
+        {
+          "minItems": 19,
+          "maxItems": 19,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/driverCommand"
+            },
+            {
+              "$ref": "#/$defs/providerControlCommand"
+            },
+            {
+              "$ref": "#/$defs/paginationControlCommand"
+            },
+            {
+              "$ref": "#/$defs/authzCommand"
+            },
+            {
+              "$ref": "#/$defs/targetGrantCommand"
+            },
+            {
+              "$ref": "#/$defs/reconcilerCommand"
+            },
+            {
+              "$ref": "#/$defs/legacyTargetMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/transparencyTargetMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/dispatchMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/targetGrantMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/paginationCursorMigrationCommand"
+            },
+            {
+              "$ref": "#/$defs/standardLockClippyCommand"
+            },
+            {
+              "$ref": "#/$defs/buildRouteDerivationCommand"
+            },
+            {
+              "$ref": "#/$defs/buildAdapterDeisletCommand"
+            },
+            {
+              "$ref": "#/$defs/environmentDeclarationCommand"
+            },
+            {
+              "$ref": "#/$defs/bundleManifestCommand"
+            },
+            {
+              "$ref": "#/$defs/cliCommand"
+            },
+            {
+              "$ref": "#/$defs/proxyBinaryCommand"
+            },
+            {
+              "$ref": "#/$defs/runtimeEnvironmentCommand"
+            }
           ],
           "items": false
         }
@@ -121,104 +312,266 @@
     "sharedContractCheck": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["hostAlias", "command", "outcome", "exitCode", "schemas", "fixtures"],
+      "required": [
+        "hostAlias",
+        "command",
+        "outcome",
+        "exitCode",
+        "schemas",
+        "fixtures"
+      ],
       "properties": {
-        "hostAlias": {"const": "s17"},
-        "command": {"const": "python3 scripts/check-shared-contracts.py"},
-        "outcome": {"const": "passed"},
-        "exitCode": {"const": 0},
-        "schemas": {"enum": [11, 14, 15, 16, 17, 18]},
-        "fixtures": {"enum": [29, 37, 42, 48, 50, 57, 62]}
+        "hostAlias": {
+          "const": "s17"
+        },
+        "command": {
+          "const": "python3 scripts/check-shared-contracts.py"
+        },
+        "outcome": {
+          "const": "passed"
+        },
+        "exitCode": {
+          "const": 0
+        },
+        "schemas": {
+          "enum": [
+            11,
+            14,
+            15,
+            16,
+            17,
+            18
+          ]
+        },
+        "fixtures": {
+          "enum": [
+            29,
+            37,
+            42,
+            48,
+            50,
+            57,
+            62
+          ]
+        }
       }
     },
     "requiredOperatingSystems": {
       "type": "array",
       "minItems": 3,
       "maxItems": 3,
-      "prefixItems": [{"const": "linux"}, {"const": "macos"}, {"const": "windows"}],
+      "prefixItems": [
+        {
+          "const": "linux"
+        },
+        {
+          "const": "macos"
+        },
+        {
+          "const": "windows"
+        }
+      ],
       "items": false
     },
     "observations": {
       "type": "array",
       "minItems": 3,
       "maxItems": 3,
-      "items": {"$ref": "#/$defs/observation"}
+      "items": {
+        "$ref": "#/$defs/observation"
+      }
     },
     "priorFailedAttempts": {
       "type": "array",
       "minItems": 0,
-      "items": {"$ref": "#/$defs/priorFailedAttempt"}
+      "items": {
+        "$ref": "#/$defs/priorFailedAttempt"
+      }
     },
     "collectionObservations": {
       "type": "array",
       "minItems": 1,
-      "items": {"$ref": "#/$defs/collectionObservation"}
+      "items": {
+        "$ref": "#/$defs/collectionObservation"
+      }
     },
     "assertions": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "allRequiredOperatingSystemsPassed", "exactArchiveVerifiedOnEveryHost",
-        "windowsAsyncSendRegressionClosed", "sharedProcessProtocolValidated",
-        "noLiveProviderClaim", "noProviderConformanceClaim"
+        "allRequiredOperatingSystemsPassed",
+        "exactArchiveVerifiedOnEveryHost",
+        "windowsAsyncSendRegressionClosed",
+        "sharedProcessProtocolValidated",
+        "noLiveProviderClaim",
+        "noProviderConformanceClaim"
       ],
       "properties": {
-        "allRequiredOperatingSystemsPassed": {"type": "boolean"},
-        "exactArchiveVerifiedOnEveryHost": {"type": "boolean"},
-        "windowsAsyncSendRegressionClosed": {"type": "boolean"},
-        "sharedProcessProtocolValidated": {"const": true},
-        "noLiveProviderClaim": {"const": true},
-        "noProviderConformanceClaim": {"const": true},
-        "signedReleaseAuthorizationValidated": {"const": true},
-        "trustRootLoaderCompiledOnWindows": {"const": true},
-        "rootRotationValidated": {"const": true},
-        "legacyTrustRootMigrationValidated": {"const": true},
-        "transientSpawnRetryBoundaryValidated": {"const": true},
-        "offlineTransparencyProofValidated": {"const": true},
-        "independentWitnessThresholdValidated": {"const": true},
-        "signedButUnloggedTargetMigrationValidated": {"const": true},
-        "windowsServiceIdentityDaclPolicyValidated": {"const": true},
-        "backgroundDispatcherLoopValidated": {"const": true},
-        "retryableReceiptRecoveryValidated": {"const": true},
-        "crossPageDispatchFairnessValidated": {"const": true},
-        "durableSelectionBackoffValidated": {"const": true},
-        "selectionBackoffMigrationValidated": {"const": true},
-        "selectionBackoffRaceFenceValidated": {"const": true},
-        "providerReleaseHttpInstallValidated": {"const": true},
-        "providerTargetGrantValidated": {"const": true},
-        "deployScopeAuthorizationValidated": {"const": true},
-        "providerTargetGrantMigrationValidated": {"const": true},
-        "providerListPaginationValidated": {"const": true},
-        "queryBoundOpaqueCursorValidated": {"const": true},
-        "exactCollectionTotalValidated": {"const": true},
-        "paginationCursorMigrationValidated": {"const": true}
+        "allRequiredOperatingSystemsPassed": {
+          "type": "boolean"
+        },
+        "exactArchiveVerifiedOnEveryHost": {
+          "type": "boolean"
+        },
+        "windowsAsyncSendRegressionClosed": {
+          "type": "boolean"
+        },
+        "sharedProcessProtocolValidated": {
+          "const": true
+        },
+        "noLiveProviderClaim": {
+          "const": true
+        },
+        "noProviderConformanceClaim": {
+          "const": true
+        },
+        "signedReleaseAuthorizationValidated": {
+          "const": true
+        },
+        "trustRootLoaderCompiledOnWindows": {
+          "const": true
+        },
+        "rootRotationValidated": {
+          "const": true
+        },
+        "legacyTrustRootMigrationValidated": {
+          "const": true
+        },
+        "transientSpawnRetryBoundaryValidated": {
+          "const": true
+        },
+        "offlineTransparencyProofValidated": {
+          "const": true
+        },
+        "independentWitnessThresholdValidated": {
+          "const": true
+        },
+        "signedButUnloggedTargetMigrationValidated": {
+          "const": true
+        },
+        "windowsServiceIdentityDaclPolicyValidated": {
+          "const": true
+        },
+        "backgroundDispatcherLoopValidated": {
+          "const": true
+        },
+        "retryableReceiptRecoveryValidated": {
+          "const": true
+        },
+        "crossPageDispatchFairnessValidated": {
+          "const": true
+        },
+        "durableSelectionBackoffValidated": {
+          "const": true
+        },
+        "selectionBackoffMigrationValidated": {
+          "const": true
+        },
+        "selectionBackoffRaceFenceValidated": {
+          "const": true
+        },
+        "providerReleaseHttpInstallValidated": {
+          "const": true
+        },
+        "providerTargetGrantValidated": {
+          "const": true
+        },
+        "deployScopeAuthorizationValidated": {
+          "const": true
+        },
+        "providerTargetGrantMigrationValidated": {
+          "const": true
+        },
+        "providerListPaginationValidated": {
+          "const": true
+        },
+        "queryBoundOpaqueCursorValidated": {
+          "const": true
+        },
+        "exactCollectionTotalValidated": {
+          "const": true
+        },
+        "paginationCursorMigrationValidated": {
+          "const": true
+        },
+        "checksRanWhereTheSupportBoundaryPromisesThem": {
+          "type": "boolean",
+          "description": "Every check ran on the platforms ADR-018 supports the component on, and the ones outside that boundary are recorded as such rather than attempted."
+        },
+        "unrunChecksRecordedRatherThanReportedAsPassed": {
+          "type": "boolean",
+          "description": "A check a host could not run is recorded with the reason it could not run; it is never folded into a pass."
+        },
+        "caseInsensitiveFilesystemRuleProvenWithoutOne": {
+          "type": "boolean",
+          "description": "The installed-tree path collision rule is proven by a value-level test, so a filesystem that folds case cannot hide it."
+        },
+        "buildOutputPathHasOneSpelling": {
+          "type": "boolean",
+          "description": "A build reports its output directory and records its current selection under one spelling, verified through a symlink the test creates."
+        },
+        "cliCompilesUnderStrictLintOnWindows": {
+          "type": "boolean",
+          "description": "The official CLI passes clippy with warnings denied when compiled for Windows."
+        }
       }
     },
     "limitations": {
       "type": "array",
       "minItems": 1,
-      "items": {"type": "string", "minLength": 1}
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     }
   },
   "$defs": {
-    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "commit", "tree", "archive"],
+      "required": [
+        "repository",
+        "commit",
+        "tree",
+        "archive"
+      ],
       "properties": {
-        "repository": {"const": "deislet/deislet"},
-        "commit": {"$ref": "#/$defs/gitSha"},
-        "tree": {"$ref": "#/$defs/gitSha"},
+        "repository": {
+          "const": "deislet/deislet"
+        },
+        "commit": {
+          "$ref": "#/$defs/gitSha"
+        },
+        "tree": {
+          "$ref": "#/$defs/gitSha"
+        },
         "archive": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["format", "sha256", "sizeBytes"],
+          "required": [
+            "format",
+            "sha256",
+            "sizeBytes"
+          ],
           "properties": {
-            "format": {"const": "git-archive-tar"},
-            "sha256": {"$ref": "#/$defs/sha256"},
-            "sizeBytes": {"type": "integer", "minimum": 1}
+            "format": {
+              "const": "git-archive-tar"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         }
       }
@@ -226,184 +579,720 @@
     "commandBase": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "command"],
-      "properties": {"id": {"type": "string"}, "command": {"type": "string"}}
+      "required": [
+        "id",
+        "command"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        }
+      }
     },
     "driverCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-driver-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-provider-driver"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-driver-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-provider-driver"
+            }
+          }
+        }
       ]
     },
     "controlCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-driver-control-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control provider_driver -- --nocapture"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-driver-control-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control provider_driver -- --nocapture"
+            }
+          }
+        }
       ]
     },
     "releaseApiCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-release-api-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control release_api -- --nocapture"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-release-api-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control release_api -- --nocapture"
+            }
+          }
+        }
       ]
     },
     "providerControlCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-control-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control provider"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-control-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control provider"
+            }
+          }
+        }
       ]
     },
     "paginationControlCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-pagination-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control pagination"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-pagination-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control pagination"
+            }
+          }
+        }
       ]
     },
     "authzCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-authz-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control api::authz::"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-authz-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control api::authz::"
+            }
+          }
+        }
       ]
     },
     "targetGrantCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-target-grant-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control target_grant"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-target-grant-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control target_grant"
+            }
+          }
+        }
       ]
     },
     "migrationCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
+        {
+          "$ref": "#/$defs/commandBase"
+        },
         {
           "oneOf": [
-            {"properties": {"id": {"const": "legacy-target-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"}}},
-            {"properties": {"id": {"const": "provider-target-migration-tests"}, "command": {"const": "cargo +1.96.0 test -p deis-control provider_targets -- --nocapture"}}}
+            {
+              "properties": {
+                "id": {
+                  "const": "legacy-target-migration-test"
+                },
+                "command": {
+                  "const": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"
+                }
+              }
+            },
+            {
+              "properties": {
+                "id": {
+                  "const": "provider-target-migration-tests"
+                },
+                "command": {
+                  "const": "cargo +1.96.0 test -p deis-control provider_targets -- --nocapture"
+                }
+              }
+            }
           ]
         }
       ]
     },
     "reconcilerCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
         {
-          "properties": {"id": {"const": "provider-deployment-reconciler-tests"}},
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-deployment-reconciler-tests"
+            }
+          },
           "oneOf": [
-            {"properties": {"command": {"const": "cargo +1.96.0 test -p deis-control provider_deployment_reconciler -- --nocapture"}}},
-            {"properties": {"command": {"const": "cargo +1.96.0 test -p deis-control catalog::provider_deployment_reconciler::tests::"}}}
+            {
+              "properties": {
+                "command": {
+                  "const": "cargo +1.96.0 test -p deis-control provider_deployment_reconciler -- --nocapture"
+                }
+              }
+            },
+            {
+              "properties": {
+                "command": {
+                  "const": "cargo +1.96.0 test -p deis-control catalog::provider_deployment_reconciler::tests::"
+                }
+              }
+            }
           ]
         }
       ]
     },
     "legacyTargetMigrationCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "legacy-target-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "legacy-target-migration-test"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control database::schema::tests::legacy_active_provider_targets_without_a_verified_release_are_disabled -- --exact"
+            }
+          }
+        }
       ]
     },
     "transparencyTargetMigrationCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "transparency-target-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::signed_but_unlogged_provider_targets_are_disabled_and_cannot_reactivate -- --exact"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "transparency-target-migration-test"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control database::schema::tests::signed_but_unlogged_provider_targets_are_disabled_and_cannot_reactivate -- --exact"
+            }
+          }
+        }
       ]
     },
     "dispatchMigrationCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
         {
-          "properties": {"id": {"const": "provider-dispatch-backoff-migration-test"}},
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-dispatch-backoff-migration-test"
+            }
+          },
           "oneOf": [
-            {"properties": {"command": {"const": "cargo +1.96.0 test -p deis-control provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent -- --nocapture"}}},
-            {"properties": {"command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent -- --exact"}}}
+            {
+              "properties": {
+                "command": {
+                  "const": "cargo +1.96.0 test -p deis-control provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent -- --nocapture"
+                }
+              }
+            },
+            {
+              "properties": {
+                "command": {
+                  "const": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_dispatch_backoff_columns_upgrade_additively_and_remain_coherent -- --exact"
+                }
+              }
+            }
           ]
         }
       ]
     },
     "targetGrantMigrationCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-target-grant-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_target_grant_pins_upgrade_additively_and_fail_closed_for_new_work -- --exact"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-target-grant-migration-test"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control database::schema::tests::provider_target_grant_pins_upgrade_additively_and_fail_closed_for_new_work -- --exact"
+            }
+          }
+        }
       ]
     },
     "paginationCursorMigrationCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "provider-pagination-cursor-migration-test"}, "command": {"const": "cargo +1.96.0 test -p deis-control database::schema::tests::api_page_cursor_schema_upgrades_additively_and_is_immutable -- --exact"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "provider-pagination-cursor-migration-test"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-control database::schema::tests::api_page_cursor_schema_upgrades_additively_and_is_immutable -- --exact"
+            }
+          }
+        }
       ]
     },
     "clippyCommand": {
       "allOf": [
-        {"$ref": "#/$defs/commandBase"},
-        {"properties": {"id": {"const": "strict-clippy"}, "command": {"const": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"}}}
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "strict-clippy"
+            },
+            "command": {
+              "const": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-queue -p deis-store -p deis-telemetry --all-targets -- -D warnings"
+            }
+          }
+        }
       ]
     },
     "checkResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "outcome", "exitCode"],
+      "required": [
+        "id",
+        "outcome",
+        "exitCode"
+      ],
       "properties": {
-        "id": {"enum": ["provider-driver-tests", "provider-driver-control-tests", "provider-control-tests", "provider-pagination-tests", "provider-authz-tests", "provider-target-grant-tests", "provider-release-api-tests", "provider-deployment-reconciler-tests", "legacy-target-migration-test", "transparency-target-migration-test", "provider-target-migration-tests", "provider-dispatch-backoff-migration-test", "provider-target-grant-migration-test", "provider-pagination-cursor-migration-test", "strict-clippy"]},
-        "outcome": {"enum": ["passed", "failed", "not-run"]},
-        "exitCode": {"type": ["integer", "null"], "minimum": 0},
-        "passed": {"type": "integer", "minimum": 0},
-        "failed": {"type": "integer", "minimum": 0},
-        "ignored": {"type": "integer", "minimum": 0},
-        "note": {"type": "string", "minLength": 1}
+        "id": {
+          "enum": [
+            "provider-driver-tests",
+            "provider-driver-control-tests",
+            "provider-control-tests",
+            "provider-pagination-tests",
+            "provider-authz-tests",
+            "provider-target-grant-tests",
+            "provider-release-api-tests",
+            "provider-deployment-reconciler-tests",
+            "legacy-target-migration-test",
+            "transparency-target-migration-test",
+            "provider-target-migration-tests",
+            "provider-dispatch-backoff-migration-test",
+            "provider-target-grant-migration-test",
+            "provider-pagination-cursor-migration-test",
+            "strict-clippy",
+            "build-route-derivation-tests",
+            "build-adapter-deislet-tests",
+            "environment-declaration-tests",
+            "bundle-manifest-tests",
+            "cli-tests",
+            "proxy-binary-for-node-tests",
+            "runtime-environment-and-assets-tests"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "passed",
+            "failed",
+            "not-run"
+          ]
+        },
+        "exitCode": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ignored": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1
+        }
       },
       "allOf": [
-        {"if": {"properties": {"outcome": {"const": "passed"}}}, "then": {"properties": {"exitCode": {"const": 0}}}},
-        {"if": {"properties": {"outcome": {"const": "not-run"}}}, "then": {"properties": {"exitCode": {"const": null}}}}
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "passed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "exitCode": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-run"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "exitCode": {
+                "const": null
+              }
+            }
+          }
+        }
       ]
     },
     "observation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "hostAlias", "hostName", "operatingSystem", "osRelease", "architecture", "rustc", "cargo", "clippy", "commit", "archiveSha256", "checks"],
+      "required": [
+        "id",
+        "hostAlias",
+        "hostName",
+        "operatingSystem",
+        "osRelease",
+        "architecture",
+        "rustc",
+        "cargo",
+        "clippy",
+        "commit",
+        "archiveSha256",
+        "checks"
+      ],
       "properties": {
-        "id": {"type": "string", "minLength": 1},
-        "hostAlias": {"type": "string", "minLength": 1},
-        "hostName": {"type": "string", "minLength": 1},
-        "operatingSystem": {"enum": ["linux", "macos", "windows"]},
-        "osRelease": {"type": "string", "minLength": 1},
-        "kernel": {"type": "string", "minLength": 1},
-        "architecture": {"type": "string", "minLength": 1},
-        "powershell": {"type": "string", "minLength": 1},
-        "rustc": {"type": "string", "minLength": 1},
-        "cargo": {"type": "string", "minLength": 1},
-        "clippy": {"type": "string", "minLength": 1},
-        "commit": {"$ref": "#/$defs/gitSha"},
-        "archiveSha256": {"$ref": "#/$defs/sha256"},
-        "checks": {"type": "array", "minItems": 4, "maxItems": 12, "items": {"$ref": "#/$defs/checkResult"}}
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hostAlias": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hostName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operatingSystem": {
+          "enum": [
+            "linux",
+            "macos",
+            "windows"
+          ]
+        },
+        "osRelease": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kernel": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "powershell": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rustc": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cargo": {
+          "type": "string",
+          "minLength": 1
+        },
+        "clippy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit": {
+          "$ref": "#/$defs/gitSha"
+        },
+        "archiveSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 24,
+          "items": {
+            "$ref": "#/$defs/checkResult"
+          }
+        }
       }
     },
     "priorFailedAttempt": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["source", "hostAlias", "operatingSystem", "checks", "cause", "fixedBy"],
+      "required": [
+        "source",
+        "hostAlias",
+        "operatingSystem",
+        "checks",
+        "cause",
+        "fixedBy"
+      ],
       "properties": {
-        "source": {"$ref": "#/$defs/source"},
-        "hostAlias": {"type": "string", "minLength": 1},
-        "operatingSystem": {"enum": ["linux", "macos", "windows"]},
-        "checks": {"type": "array", "minItems": 4, "maxItems": 12, "items": {"$ref": "#/$defs/checkResult"}},
-        "cause": {"type": "string", "minLength": 1},
-        "fixedBy": {"$ref": "#/$defs/gitSha"}
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "hostAlias": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operatingSystem": {
+          "enum": [
+            "linux",
+            "macos",
+            "windows"
+          ]
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 24,
+          "items": {
+            "$ref": "#/$defs/checkResult"
+          }
+        },
+        "cause": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fixedBy": {
+          "$ref": "#/$defs/gitSha"
+        }
       }
     },
     "collectionObservation": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "source", "hostAlias", "operatingSystem", "classification", "outcome",
-        "description", "resolution"
+        "source",
+        "hostAlias",
+        "operatingSystem",
+        "classification",
+        "outcome",
+        "description",
+        "resolution"
       ],
       "properties": {
-        "source": {"$ref": "#/$defs/source"},
-        "hostAlias": {"type": "string", "minLength": 1},
-        "operatingSystem": {"enum": ["linux", "macos", "windows"]},
-        "classification": {"enum": ["harness", "environment"]},
-        "outcome": {"const": "inconclusive"},
-        "description": {"type": "string", "minLength": 1},
-        "resolution": {"type": "string", "minLength": 1}
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "hostAlias": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operatingSystem": {
+          "enum": [
+            "linux",
+            "macos",
+            "windows"
+          ]
+        },
+        "classification": {
+          "enum": [
+            "harness",
+            "environment"
+          ]
+        },
+        "outcome": {
+          "const": "inconclusive"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution": {
+          "type": "string",
+          "minLength": 1
+        }
       }
+    },
+    "buildRouteDerivationCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "build-route-derivation-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-build"
+            }
+          }
+        }
+      ]
+    },
+    "buildAdapterDeisletCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "build-adapter-deislet-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-build-adapter-deislet"
+            }
+          }
+        }
+      ]
+    },
+    "environmentDeclarationCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "environment-declaration-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-wire"
+            }
+          }
+        }
+      ]
+    },
+    "bundleManifestCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "bundle-manifest-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-bundle"
+            }
+          }
+        }
+      ]
+    },
+    "cliCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "cli-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis"
+            }
+          }
+        }
+      ]
+    },
+    "proxyBinaryCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "proxy-binary-for-node-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 build -p deis-proxy"
+            }
+          }
+        }
+      ]
+    },
+    "runtimeEnvironmentCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "runtime-environment-and-assets-tests"
+            },
+            "command": {
+              "const": "cargo +1.96.0 test -p deis-runtime"
+            }
+          }
+        }
+      ]
+    },
+    "standardLockClippyCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commandBase"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "strict-clippy"
+            },
+            "command": {
+              "const": "cargo +1.96.0 clippy -p deis-provider-driver -p deis-control -p deis-build -p deis-build-core -p deis-build-adapter-deislet -p deis-runtime -p deis-wire -p deis-bundle -p deis --all-targets -- -D warnings"
+            }
+          }
+        }
+      ]
     }
   }
 }

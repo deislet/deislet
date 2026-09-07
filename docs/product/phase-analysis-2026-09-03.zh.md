@@ -2810,6 +2810,13 @@ Application/framework source + versioned build plan
   TS 类型无漂移、治理、共享契约 18/62、文档路径、demo witness 82/82、web 构建与 lint、`git diff --check` 全部通过；三视角审查
   8 项：6 项修复（含上述括号、分页去重、审计 detail、时间差、读路由文案与 cloudflare-comparison 路径），1 项重复，
   1 项为本节记录。
+- 三平台复验登记为 `evidence/provider-driver-dispatcher-portability-63870e3.json`，结论是 `partial` 而不是 `passed`，
+  这是如实记录而非退让：Linux 上 19 项检查全过（127 个测试套件、1829 项通过、0 失败）；macOS 通过它承诺支持的全部内容
+  （分三轮跑，因为该机装不下所有 crate 的调试产物：provider 与控制面 72 套件 235 项、环境声明与 bundle manifest 与
+  deislet 适配器 19 套件 433 项、编译器 26 套件 126 项，每轮跑完即清），节点与代理按 ADR-018 只在 Linux 支持而不在该机
+  构建；Windows 通过 81 套件 773 项，编译器因该机没有 libclang 而无法构建——这一条是真实的覆盖缺口（ADR-018 承诺
+  Windows 支持编译器），装上 LLVM 即可补上，其余未跑项属支持边界之外。校验器要求「一台上所有检查皆过才算该平台通过」，
+  因此 `allRequiredOperatingSystemsPassed` 记为 false。
 - 未完成：Web organization/application/environment 主线；state/status/severity 服务端 enum；README 与 architecture 文档中的
   路由表仍以旧前缀拼写（旧前缀在 2027-06-30 前有效，待深度审查统一处理）；总 Goal 需外部资源的项不变。
 - 精确源码提交 `e0086eb1d1f2edd258e28e334c4c56375e1c7663`（tree `cae18c27cf7e3538536614742218cf5fd7eaaea9`）生成
