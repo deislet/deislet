@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-07T21:30:00+08:00",
+  "updatedAt": "2026-09-07T22:00:00+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -947,6 +947,22 @@
             }
           ],
           "verification": "四项各有明确结论并落到代码或文档：ProductOperation 可空成员如实标注（v1 大版本或显式兼容豁免）；api_page_cursors 容量上限的行为（拒绝列表请求或驱逐同一查询绑定的旧位置）与其索引代价；driver 重试次数上限及耗尽后父操作是否 failed；idx_events_page_v1 是否退役。四项均记于阶段分析第 97 节"
+        },
+        {
+          "id": "P1-CASE-001",
+          "title": "核实不区分大小写主机上的本地模块解析是否重复 stage",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": [
+            "P1-BUILD-001"
+          ],
+          "outputs": [
+            {
+              "type": "local-path",
+              "value": "crates/deis-build/src/compiler/mod.rs"
+            }
+          ],
+          "verification": "resolve_local_module 以字符串拼接构造候选路径、以 is_file() 判定命中且不做 canonicalize，命中结果按 PathBuf 进 staged_modules 去重。在不区分大小写的主机上 ./Util.js 与 ./util.js 会命中同一个真实文件却各 stage 一次，产物中同一份代码出现两遍，且该构建在 macOS 上成功、bundle 到区分大小写的运行时上会有一个 import 解析不到。此为静态推断，尚未复现：需先在开启 casefold 的卷上复现或证伪，再决定是否 canonicalize。同期修复的 npm 安装树大小写冲突测试见阶段分析第 97 节"
         }
       ]
     },

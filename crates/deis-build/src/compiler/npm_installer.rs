@@ -631,6 +631,39 @@ fn referenced_environment_names(config: &str) -> anyhow::Result<BTreeSet<String>
     Ok(names)
 }
 
+/// Collision detection is kept apart from the directory walk because the rule
+/// cannot otherwise be proven on every host we build on. A case-insensitive
+/// volume — APFS and NTFS by default — cannot even hold two paths that differ
+/// only in case, so a test that stages such a tree on disk quietly ends up with
+/// one file and stops exercising the rule it claims to cover. Folding the
+/// collected relative paths through this value-level accumulator lets the claim
+/// be asserted directly, on any filesystem, while the walk keeps using exactly
+/// the same code in production.
+#[derive(Debug, Default)]
+struct PortablePathSet {
+    seen: BTreeMap<String, PathBuf>,
+}
+
+impl PortablePathSet {
+    /// Record one installed path relative to `node_modules`, refusing the tree
+    /// as soon as two of them fold onto the same name. Such a tree cannot be
+    /// unpacked faithfully on a case-insensitive or Unicode-normalizing host:
+    /// the second file silently replaces the first, and the bundle then no
+    /// longer carries the contents the lock names.
+    fn record(&mut self, relative: &Path) -> anyhow::Result<()> {
+        let portable = relative.to_string_lossy().replace('\\', "/");
+        let collision_key = portable.nfc().collect::<String>().to_lowercase();
+        if let Some(previous) = self.seen.insert(collision_key, relative.to_path_buf()) {
+            anyhow::bail!(
+                "EC_NPM_ARCHIVE_PATH_COLLISION: installed paths {:?} and {:?} collide across supported filesystems",
+                previous,
+                relative
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeAudit {
     package_count: usize,
@@ -786,7 +819,7 @@ fn audit_installed_tree(staged_root: &Path, usage: &NodeNpmUsage) -> anyhow::Res
         }
     }
 
-    let mut normalized_paths = BTreeMap::<String, PathBuf>::new();
+    let mut portable_paths = PortablePathSet::default();
     let mut file_count = 0usize;
     let mut installed_octets = 0u64;
     let mut pending = vec![root.clone()];
@@ -798,15 +831,7 @@ fn audit_installed_tree(staged_root: &Path, usage: &NodeNpmUsage) -> anyhow::Res
             let metadata = fs::symlink_metadata(&path)?;
             let relative = path.strip_prefix(&root).expect("walk stays under root");
             validate_portable_relative_path(relative)?;
-            let portable = relative.to_string_lossy().replace('\\', "/");
-            let collision_key = portable.nfc().collect::<String>().to_lowercase();
-            if let Some(previous) = normalized_paths.insert(collision_key, relative.to_path_buf()) {
-                anyhow::bail!(
-                    "EC_NPM_ARCHIVE_PATH_COLLISION: installed paths {:?} and {:?} collide across supported filesystems",
-                    previous,
-                    relative
-                );
-            }
+            portable_paths.record(relative)?;
 
             if metadata.file_type().is_symlink() {
                 let target = fs::canonicalize(&path)?;
@@ -1090,8 +1115,11 @@ mod tests {
         assert!(validate_portable_relative_path(Path::new("@scope/pkg/index.js")).is_ok());
     }
 
-    #[test]
-    fn installed_tree_audit_rejects_hooks_native_files_and_case_collisions() {
+    /// A staged package tree, minus any file that would make the audit refuse it.
+    /// The audit reads the lock and the manifest as well as the files on disk,
+    /// so every refusal test needs all three in place before it can attribute a
+    /// failure to the one rule it is exercising.
+    fn staged_installed_tree() -> (tempfile::TempDir, NodeNpmUsage) {
         let project = tempfile::tempdir().expect("temp project");
         fs::create_dir_all(project.path().join("node_modules/pkg")).expect("package root");
         fs::write(
@@ -1099,21 +1127,89 @@ mod tests {
             r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/pkg":{"version":"1.0.0","resolved":"https://registry.example/pkg.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}"#,
         )
         .expect("lock");
+        fs::write(
+            project.path().join("node_modules/pkg/package.json"),
+            r#"{"name":"pkg","version":"1.0.0"}"#,
+        )
+        .expect("package manifest");
         let usage = NodeNpmUsage {
             registry_packages: BTreeSet::from(["pkg".to_string()]),
             locked_package_count: 1,
             ..Default::default()
         };
-        let package_json = project.path().join("node_modules/pkg/package.json");
-        fs::write(&package_json, r#"{"name":"pkg","version":"1.0.0"}"#).expect("package manifest");
-        fs::write(project.path().join("node_modules/pkg/A.js"), "a").expect("first file");
-        fs::write(project.path().join("node_modules/pkg/a.js"), "b").expect("second file");
-        let error = audit_installed_tree(project.path(), &usage)
-            .expect_err("case collision must fail")
+        (project, usage)
+    }
+
+    /// The collision rule asserted at the value level, which is the only way to
+    /// assert it everywhere: on a case-insensitive volume the two colliding
+    /// names cannot coexist on disk at all, so a filesystem-staged tree can
+    /// never present the audit with the input this rule exists to refuse.
+    #[test]
+    fn portable_path_set_rejects_paths_that_differ_only_in_case_or_normalization() {
+        let mut paths = PortablePathSet::default();
+        paths.record(Path::new("pkg/A.js")).expect("first path");
+        let error = paths
+            .record(Path::new("pkg/a.js"))
+            .expect_err("a case-only difference must fail")
+            .to_string();
+        assert!(error.contains("EC_NPM_ARCHIVE_PATH_COLLISION"), "{error}");
+        assert!(error.contains("A.js") && error.contains("a.js"), "{error}");
+
+        // Decomposed and precomposed spellings of the same accented name are
+        // distinct byte sequences that macOS folds together on the way to disk,
+        // so they collide for exactly the reason case-only differences do.
+        let mut paths = PortablePathSet::default();
+        paths
+            .record(Path::new("pkg/caf\u{e9}.js"))
+            .expect("precomposed path");
+        let error = paths
+            .record(Path::new("pkg/cafe\u{301}.js"))
+            .expect_err("a normalization-only difference must fail")
             .to_string();
         assert!(error.contains("EC_NPM_ARCHIVE_PATH_COLLISION"), "{error}");
 
-        fs::remove_file(project.path().join("node_modules/pkg/a.js")).expect("remove collision");
+        let mut paths = PortablePathSet::default();
+        paths.record(Path::new("pkg/index.js")).expect("first path");
+        paths
+            .record(Path::new("pkg/nested/index.js"))
+            .expect("distinct paths must be accepted");
+    }
+
+    /// The end-to-end half of the same claim: the audit must carry the refusal
+    /// out of the walk and not merely own the rule. Only a case-sensitive volume
+    /// can hold the offending tree, so on a case-insensitive one this asserts the
+    /// fold that makes the tree unstageable instead — the rule itself stays
+    /// covered unconditionally by the value-level test above.
+    #[test]
+    fn installed_tree_audit_refuses_a_case_colliding_tree_where_one_can_be_staged() {
+        let (project, usage) = staged_installed_tree();
+        fs::write(project.path().join("node_modules/pkg/A.js"), "a").expect("first file");
+        fs::write(project.path().join("node_modules/pkg/a.js"), "b").expect("second file");
+
+        let upper = fs::read(project.path().join("node_modules/pkg/A.js")).expect("read upper");
+        if upper == b"a" {
+            let error = audit_installed_tree(project.path(), &usage)
+                .expect_err("case collision must fail")
+                .to_string();
+            assert!(error.contains("EC_NPM_ARCHIVE_PATH_COLLISION"), "{error}");
+        } else {
+            assert_eq!(
+                upper, b"b",
+                "a case-insensitive volume must have folded the second write onto the first"
+            );
+            let audit = audit_installed_tree(project.path(), &usage)
+                .expect("a folded tree holds no collision to refuse");
+            assert_eq!(
+                audit.file_count, 2,
+                "the folded tree must hold only the manifest and one script"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_tree_audit_rejects_lifecycle_hooks_and_native_addons() {
+        let (project, usage) = staged_installed_tree();
+        let package_json = project.path().join("node_modules/pkg/package.json");
         fs::write(
             &package_json,
             r#"{"name":"pkg","version":"1.0.0","scripts":{"install":"node-gyp rebuild"}}"#,

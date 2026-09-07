@@ -76,6 +76,10 @@
   放宽（要 v1 大版本或显式兼容豁免）；`api_page_cursors` 的容量上限该是拒绝列表请求还是驱逐同一查询绑定的旧位置，以及
   为此付出的索引代价；driver 重试的次数上限与耗尽后父操作是否 `failed`；`idx_events_page_v1` 从未被规划器选中，是否退役。
   四项均记于阶段分析第 97 节。
+- `P1-CASE-001`（新增，queued）：`resolve_local_module` 用字符串拼接构造候选路径、用 `is_file()` 判定命中且不做
+  canonicalize，命中结果按 `PathBuf` 进 `staged_modules` 去重。在不区分大小写的主机上 `./Util.js` 与 `./util.js` 命中
+  同一个真实文件却各 stage 一次，产物里同一份代码出现两遍，而这样的构建在 macOS 上会成功、bundle 拿到区分大小写的
+  运行时上会有一个 import 解析不到。属静态推断，尚未复现，需先在开启 casefold 的卷上复现或证伪。
 
 ```bash
 python3 scripts/check-product-governance.py

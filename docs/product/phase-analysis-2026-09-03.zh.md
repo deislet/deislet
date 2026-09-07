@@ -2893,6 +2893,20 @@ Application/framework source + versioned build plan
   共享契约 18 Schema / 69 组 fixture / 12 条状态迁移、OpenAPI 兼容（113 个 operation 仅增量，1.0.0 → 1.0.0）、
   生成 TS 客户端与文档一致（170 个 schema、113 个 operation）、文档路径字面量 84 份、demo witness、Web 构建与 lint 全部通过；
   `./scripts/demo.sh verify` 94 通过 / 0 失败 / 点名 94 项齐全，退出码 0。
+- 三平台复验本身也抓出一条本机门禁看不见的缺陷：npm 安装树审计里「仅大小写不同的两个路径必须被拒」这条规则，其测试
+  把两个文件真写进临时目录，而 macOS 的 APFS 与 Windows 的 NTFS 默认不区分大小写，第二次写会折叠掉第一个文件，树里
+  根本没有冲突可查——于是这条规则在那两个平台上从未被验证过。缺陷来自更早的 `6aade86`，此前 macOS 与 Windows 的复验
+  只跑控制面与 provider 相关 crate，没跑到编译器，所以一直没暴露。规则本身没错，改的是证明方式：碰撞判定抽成不碰
+  文件系统的纯函数（`PortablePathSet::record`，生产路径走同一份代码），值层测试在任何主机上都能成立，端到端那半按卷
+  的真实行为分岔——区分大小写就断言审计报错，不区分就断言折叠确实发生且树里只剩一个文件，两条分支都是真断言，
+  没有 `#[ignore]` 也没有静默通过。修复方为此在 Linux 上造了一个开启 casefold 的回环卷复现 macOS/Windows 的折叠行为，
+  在删掉规则的状态下确认套件确实转红。另记一处静态推断但尚未复现的可疑点（`P1-CASE-001`）：`resolve_local_module`
+  不做 canonicalize，不区分大小写的主机上同一模块可能被 stage 两次，且这样的构建在 macOS 上成功、bundle 到区分大小写
+  的运行时上会有一个 import 解析不到。复验脚本自身也补了一处遗漏：节点的 websocket-through-proxy 集成测试要求先构建
+  `deis-proxy` 二进制（测试自己写明了这一点并拒绝假装通过），此前脚本只跑 `cargo test -p deis-runtime`。
+  `.github/workflows/checks.yml` 的七个 job 全在 `ubuntu-latest`，没有 macOS/Windows 矩阵，这类只在不区分大小写的卷上
+  才暴露的缺陷 CI 在结构上就看不见，三平台实测证据是唯一防线——而 ADR-018 第 82 行本就把 Windows 的大小写不敏感
+  列为必须覆盖项。
 - 未完成：Web organization/application/environment 主线；session/command/event/config history 的 state/status/severity
   服务端枚举；四条自成形状的平台诊断列表迁入 `ControlListPage`；EdgeOne Node Function 路由配置；README 与 architecture
   文档中仍以旧前缀拼写的路由表（旧前缀 2027-06-30 前有效）；上一条列出的四项开放决策；总 Goal 需外部资源的项不变。
