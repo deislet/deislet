@@ -339,7 +339,7 @@ Linux、macOS、Windows 通过 provider 77/77、pagination 21/21、authz 38/38�
 Linux、macOS、Windows 通过 provider 80/80、pagination 21/21、authz 39/39、协调器 4/4、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为
 `../product/evidence/provider-driver-dispatcher-portability-1ebe13b.json`。
 
-随后 `GET /operations/:id` 改为与通用 cancel 相同的记录级授权（deploy/rollback 由 `read:<app>/<env>` 读取，其余 kind 与不存在的 id 仍为 `admin:*/*`，拒绝文案与记录无关且单次点查），通用 cancel 的 `Idempotency-Key` 按兼容门禁判定为增量改为可选；TypeScript 客户端由 `scripts/generate-openapi-types.py` 从 `contracts/openapi/v1.json` 生成到 `web/src/generated/control-api.ts`，`--check` 进 CI，`web/src/lib/api.ts` 不再手写响应模型；`scripts/demo.sh` 全部控制面调用改用 `/api/v1` 与 `/api/platform`；旧库两代索引清退。见阶段分析第 96 节。
+随后 `GET /operations/:id` 改为与通用 cancel 相同的记录级授权（deploy/rollback 由 `read:<app>/<env>` 读取，其余 kind 与不存在的 id 仍为 `admin:*/*`，拒绝文案与记录无关且单次点查），通用 cancel 的 `Idempotency-Key` 按兼容门禁判定为增量改为可选；TypeScript 客户端由 `scripts/generate-openapi-types.py` 从 `contracts/openapi/v1.json` 生成到 `web/src/generated/control-api.ts`，`--check` 进 CI，`web/src/lib/api.ts` 不再手写响应模型；`scripts/demo.sh` 全部控制面调用改用 `/api/v1` 与 `/api/platform`；旧库两代索引清退。精确提交 `e0086eb1d1f2edd258e28e334c4c56375e1c7663` 的同一 SHA-256 校验归档已在 Linux、macOS、Windows 通过 provider 80/80、pagination 22/22、authz 39/39、协调器 4/4、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为 `../product/evidence/provider-driver-dispatcher-portability-e0086eb.json`。见阶段分析第 96 节。
 
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：Rust CLI client 仍以示例反序列化校验替代生成；state/status/severity 类字段在文档中仍是普通字符串而非 enum；Web 尚无 organization/application/environment 主线；旧前缀尚在弃用窗口内。
 

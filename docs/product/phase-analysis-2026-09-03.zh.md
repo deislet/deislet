@@ -2812,3 +2812,10 @@ Application/framework source + versioned build plan
   1 项为本节记录。
 - 未完成：Web organization/application/environment 主线；state/status/severity 服务端 enum；README 与 architecture 文档中的
   路由表仍以旧前缀拼写（旧前缀在 2027-06-30 前有效，待深度审查统一处理）；总 Goal 需外部资源的项不变。
+- 精确源码提交 `e0086eb1d1f2edd258e28e334c4c56375e1c7663`（tree `cae18c27cf7e3538536614742218cf5fd7eaaea9`）生成
+  18,083,840-byte git archive，SHA-256 为 `3a6665d013760598cb24c0c8669a8fcbca4e86c5ccfdb80b13b39166f9939fd8`。同一归档在
+  Linux/macOS 通过 provider-driver 64/64、Windows 56/56；三端通过 Control provider 80/80、pagination 22/22（含旧索引清退后的
+  查询计划）、authz 39/39（含记录级 operation 读取）、grant 3/3、协调器 4/4、五项 migration 各 1/1 与严格五 crate all-target
+  Clippy；Linux 另通过 18 份 Schema/62 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为
+  `evidence/provider-driver-dispatcher-portability-e0086eb.json`；生成式 TypeScript 客户端与 demo 切 v1 由仓内门禁而非三端
+  复验覆盖，它证明这些控制路径的三平台代码可移植性，不证明真实 provider 部署或 Edge Canon 合规。
