@@ -1491,6 +1491,17 @@ fn materialize_standard_environment(
                         .to_string(),
                 ));
             }
+            // This is also where the node refuses a declaration that took one
+            // of the platform's own names - `ASSETS`, or anything under the
+            // `DEIS_` wiring prefix. It matters here and not only at build
+            // because a bundle can reach a node without passing through a
+            // control plane of ours: a direct `ApplyDeployment`, or a bundle
+            // recovered from this node's own disk. The whole deployment is
+            // refused rather than the one name dropped, for the reason the
+            // rest of this document is refused whole - a declaration says a
+            // value is required, and installing a version whose required
+            // value can never be read would fail later, inside a handler,
+            // with nothing pointing back at the name.
             declarations
                 .validate(
                     deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,

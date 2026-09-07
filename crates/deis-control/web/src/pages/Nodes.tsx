@@ -2,6 +2,7 @@ import { useSessions, useFleet } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { RefusalNotice } from '@/components/RefusalNotice'
 import { RefreshCw, RotateCw } from 'lucide-react'
 import { useState } from 'react'
 import {
@@ -114,13 +115,7 @@ export function Nodes() {
         </Button>
       </div>
 
-      {error && (
-        <Card className="border-destructive">
-          <CardContent className="pt-6">
-            <p className="text-destructive">{error}</p>
-          </CardContent>
-        </Card>
-      )}
+      {error && <RefusalNotice refusal={error} onRetry={refetch} />}
 
       {/*
         Every node holding a control channel open to this control plane. A
@@ -218,13 +213,7 @@ export function Nodes() {
           </p>
         </div>
 
-        {fleetError && (
-          <Card className="border-destructive">
-            <CardContent className="pt-6">
-              <p className="text-destructive">{fleetError}</p>
-            </CardContent>
-          </Card>
-        )}
+        {fleetError && <RefusalNotice refusal={fleetError} onRetry={refetchFleet} />}
 
         {fleetLoading && fleet.length === 0 ? (
           <Card>

@@ -255,7 +255,13 @@ impl Compiler {
             build.out_dir = lifetime.path().to_string_lossy().into_owned();
         }
         let canonical = self
-            .build_from_project(project_dir, CANONICAL_TARGET, &canonical_config, minify)
+            .build_from_project(
+                project_dir,
+                CANONICAL_TARGET,
+                &canonical_config,
+                minify,
+                None,
+            )
             .await?;
         let summary = crate::canonical_artifact::validate(
             Path::new(&canonical.output_path),
@@ -1359,12 +1365,37 @@ impl Compiler {
             }
         }
 
+        // The application's own function table, taken from the canonical
+        // routing document rather than from the tree staged above.
+        //
+        // The staged tree carries one file, `functions/[[all]].js`, because
+        // the canonical entry module has already done the application's
+        // routing internally; recovering the table from that file name yields
+        // `/*`, which as a manifest statement says the isolate owns every path
+        // the application is served on. A node reads that statement to decide
+        // whether a request that names no file belongs to the function or to
+        // the site's not-found behaviour, so `/*` silently disabled the
+        // fallback: a request for a missing page reached the isolate, whose
+        // internal router matched nothing and answered an empty 404, and the
+        // `404.html` the application shipped was never served.
+        let declared_function_paths: Vec<String> = routing
+            .functions
+            .iter()
+            .map(|function| function.source.clone())
+            .collect();
+
         // The adapter sees only the reconstructed tree above. Calling the raw
         // builder here is deliberate: routing back through `build_for_vendor`
         // would ask for another canonical parent and create a second path from
         // application source to provider output.
         let mut build = self
-            .build_from_project(derived_source.path(), vendor, &derived_config, true)
+            .build_from_project(
+                derived_source.path(),
+                vendor,
+                &derived_config,
+                true,
+                Some(&declared_function_paths),
+            )
             .await?;
         if let Some(staging) = &provider_staging {
             let staged_output = Path::new(&build.output_path);
@@ -1645,12 +1676,22 @@ impl Compiler {
     /// project that was reconstructed from one. Provider builds never call
     /// this with the author's project directory directly; that boundary is
     /// enforced by [`Self::build_for_vendor`].
+    ///
+    /// `declared_function_paths` is the application's real function table, and
+    /// it is only ever `Some` for a bundle derived from a canonical artifact.
+    /// That derivation stages the application's already-routed entry module as
+    /// a single catch-all file, so the paths recovered from the staged tree
+    /// say `/*` and nothing more; the manifest a node reads has to keep saying
+    /// which paths are the isolate's, so the canonical routing document's
+    /// function table is carried down here rather than re-derived from the
+    /// file names. See `emit_bundle`.
     async fn build_from_project(
         &self,
         project_dir: &Path,
         vendor: &str,
         config: &ProjectConfig,
         minify: bool,
+        declared_function_paths: Option<&[String]>,
     ) -> anyhow::Result<VendorBuild> {
         use deis_build_core::types::BuildArtifacts;
 
@@ -2305,7 +2346,14 @@ impl Compiler {
 
         // Pack the deislet target's real artefact.
         if vendor == deis_build_adapter_deislet::VENDOR {
-            let bundle = self.emit_bundle(project_dir, &build_dir, config, &entry_code, &routes)?;
+            let bundle = self.emit_bundle(
+                project_dir,
+                &build_dir,
+                config,
+                &entry_code,
+                &routes,
+                declared_function_paths,
+            )?;
             total_size = bundle.size;
             files.push(bundle.path.to_string_lossy().to_string());
             warnings.extend(bundle.warnings);
@@ -3050,12 +3098,30 @@ impl Compiler {
         config: &ProjectConfig,
         worker_js: &str,
         routes: &[(String, String)],
+        declared_function_paths: Option<&[String]>,
     ) -> anyhow::Result<BundleOutcome> {
         // The same planner the entry module was generated from. It is a pure
-        // function of the route list, so the manifest describes exactly the
-        // table that ended up in the bundled code.
+        // function of the route list, so the entry module and the warnings
+        // below describe exactly the table that ended up in the bundled code.
         let plan = deis_build_adapter_deislet::plan_routes(routes);
         let mut warnings = plan.warnings.clone();
+
+        // What the manifest states, which is a different question from what
+        // the entry module dispatches on. The entry module's table is the one
+        // planned from the staged files; the manifest's table is the set of
+        // paths a node must hand to the isolate instead of answering from the
+        // site. For a bundle derived from a canonical artifact those are not
+        // the same set, because the derivation stages one already-routed
+        // module: see `package_canonical_for_vendor`, which passes the
+        // application's real table down.
+        let function_paths: Vec<String> = match declared_function_paths {
+            Some(declared) => declared.to_vec(),
+            None => plan
+                .routes
+                .iter()
+                .map(|route| route.pattern.clone())
+                .collect(),
+        };
 
         // A queue declared with nothing to handle it is the expensive kind of
         // mistake: deis-runtime starts a poller, leases every message, finds
@@ -3093,7 +3159,7 @@ impl Compiler {
             deis_build_core::resolve_environment_declarations(config, &standard_version)?;
         let manifest = deis_build_adapter_deislet::build_manifest_with_environment(
             config,
-            &plan.routes,
+            &function_paths,
             &assets,
             environment,
         )?;
@@ -3384,7 +3450,7 @@ mod output_mode_tests {
             .load_config(project.path())
             .expect("load the project config");
         let raw_parent = compiler
-            .build_from_project(project.path(), CANONICAL_TARGET, &config, false)
+            .build_from_project(project.path(), CANONICAL_TARGET, &config, false, None)
             .await
             .expect("build the canonical parent");
         let summary = crate::canonical_artifact::validate(

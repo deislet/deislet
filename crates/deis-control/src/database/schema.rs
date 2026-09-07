@@ -227,7 +227,13 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
 
     // Keyset pages of the event log, `(timestamp DESC, id DESC)`: unfiltered,
     // under one node, and under one severity. A request filtering on both
-    // walks the node index, which is the more selective of the two.
+    // is seeked through the severity index and has its node compared row by
+    // row: Control never runs ANALYZE, so the planner has no statistics to
+    // tell it which of the two partitions is smaller and simply takes the
+    // later index. That costs a walk of one severity partition instead of
+    // one node partition on a large log, which is why no fourth index pairs
+    // the two columns - the event log is written on every node report, and
+    // a diagnostic filter is not worth a b-tree on that write path.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_page_v1 ON events(timestamp DESC, id DESC)",
         [],
@@ -2910,9 +2916,6 @@ fn ensure_provider_driver_schema(conn: &Connection) -> Result<()> {
             ON provider_target_grants(application_id, environment_id, status,
                                       created_at DESC, grant_id DESC);
 
-        CREATE INDEX IF NOT EXISTS idx_provider_target_grants_target_v1
-            ON provider_target_grants(provider_target_id, status, grant_id);
-
         CREATE TABLE IF NOT EXISTS api_page_cursors (
             token_sha256  TEXT PRIMARY KEY,
             collection    TEXT NOT NULL,
@@ -3548,9 +3551,15 @@ fn ensure_provider_lifecycle_schema(conn: &Connection) -> Result<()> {
             UNIQUE(resource_kind, resource_id, resource_revision)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_provider_lifecycle_audit_resource_v1
-            ON provider_lifecycle_audit_events(resource_kind, resource_id,
-                                               resource_revision, event_id);
+        -- The lifecycle audit page seeks `(resource_kind, resource_id)` and
+        -- orders by `(resource_revision, event_id)`. The table's own
+        -- `UNIQUE(resource_kind, resource_id, resource_revision)` autoindex
+        -- answers exactly that: the triple is unique, so `event_id` can only
+        -- ever be a tie-breaker for a tie that cannot happen. An explicit
+        -- index over the same columns would be a second b-tree written on
+        -- every disable, enable and delete for nothing, so a database that
+        -- created one before this was noticed sheds it here.
+        DROP INDEX IF EXISTS idx_provider_lifecycle_audit_resource_v1;
 
         CREATE TRIGGER IF NOT EXISTS trg_provider_lifecycle_audit_scope_v1
         BEFORE INSERT ON provider_lifecycle_audit_events
@@ -3593,6 +3602,16 @@ fn ensure_provider_lifecycle_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_target_grants_environment_page_v1
             ON provider_target_grants(application_id, environment_id,
                                       created_at DESC, grant_id DESC);
+
+        -- `idx_provider_target_grants_target_v1(provider_target_id, status,
+        -- grant_id)` was the index the revocation paths seeked before the
+        -- history pages existed. `idx_provider_target_grants_target_history_v1`
+        -- leads on the same two columns and still carries `grant_id`, so it
+        -- covers those seeks unchanged; keeping both would write a second
+        -- b-tree on every grant created and every grant revoked - including
+        -- the cascade a target or installation delete triggers. A database
+        -- that carries the older index sheds it on its next start.
+        DROP INDEX IF EXISTS idx_provider_target_grants_target_v1;
         "#,
     )?;
     converge_retired_application_provider_target_grants(conn)
@@ -6317,6 +6336,38 @@ mod tests {
             ],
             "{audit_indexes:?}"
         );
+
+        // The grant table keeps one index per page shape and the partial
+        // unique index that enforces one active grant; the older
+        // `idx_provider_target_grants_target_v1` is not among them, because
+        // the target history index leads on the same columns.
+        let grant_indexes = index_names(&conn, "provider_target_grants");
+        assert_eq!(
+            grant_indexes,
+            vec![
+                "idx_provider_target_grants_environment_page_v1",
+                "idx_provider_target_grants_environment_v1",
+                "idx_provider_target_grants_history_v1",
+                "idx_provider_target_grants_one_active_v1",
+                "idx_provider_target_grants_status_history_v1",
+                "idx_provider_target_grants_target_history_v1",
+                "idx_provider_target_grants_target_page_v1",
+                "sqlite_autoindex_provider_target_grants_1",
+            ],
+            "{grant_indexes:?}"
+        );
+
+        // The lifecycle audit carries no explicit index at all: its own
+        // UNIQUE triple is the index its page seeks.
+        let lifecycle_indexes = index_names(&conn, "provider_lifecycle_audit_events");
+        assert_eq!(
+            lifecycle_indexes,
+            vec![
+                "sqlite_autoindex_provider_lifecycle_audit_events_1",
+                "sqlite_autoindex_provider_lifecycle_audit_events_2",
+            ],
+            "{lifecycle_indexes:?}"
+        );
     }
 
     /// A database that started before the keyset indexes existed carries
@@ -6336,7 +6387,12 @@ mod tests {
              CREATE INDEX idx_api_tokens_account ON api_tokens(account_id);
              CREATE INDEX idx_audit_app ON audit_log(app_id, id DESC);
              CREATE INDEX idx_audit_account ON audit_log(actor_account, id DESC);
-             CREATE INDEX idx_audit_outcome ON audit_log(outcome, id DESC);",
+             CREATE INDEX idx_audit_outcome ON audit_log(outcome, id DESC);
+             CREATE INDEX idx_provider_target_grants_target_v1
+                 ON provider_target_grants(provider_target_id, status, grant_id);
+             CREATE INDEX idx_provider_lifecycle_audit_resource_v1
+                 ON provider_lifecycle_audit_events(resource_kind, resource_id,
+                                                    resource_revision, event_id);",
         )
         .unwrap();
 
@@ -6392,6 +6448,28 @@ mod tests {
             ],
             "{audit_indexes:?}"
         );
+        // Both provider indexes this slice retires are index-only changes:
+        // the grant seek moves to the target history index and the lifecycle
+        // audit page to the table's own UNIQUE triple, so an upgrade drops
+        // them and creates nothing in their place.
+        let grant_indexes = index_names(&conn, "provider_target_grants");
+        assert!(
+            !grant_indexes.contains(&"idx_provider_target_grants_target_v1".to_string()),
+            "{grant_indexes:?}"
+        );
+        assert!(
+            grant_indexes.contains(&"idx_provider_target_grants_target_history_v1".to_string()),
+            "{grant_indexes:?}"
+        );
+        let lifecycle_indexes = index_names(&conn, "provider_lifecycle_audit_events");
+        assert_eq!(
+            lifecycle_indexes,
+            vec![
+                "sqlite_autoindex_provider_lifecycle_audit_events_1",
+                "sqlite_autoindex_provider_lifecycle_audit_events_2",
+            ],
+            "{lifecycle_indexes:?}"
+        );
 
         // The rows the retired indexes used to serve are exactly as an
         // upgrade must leave them: untouched.
@@ -6422,12 +6500,22 @@ mod tests {
         create_tables(&conn).unwrap();
         let token_indexes_first = index_names(&conn, "api_tokens");
         let audit_indexes_first = index_names(&conn, "audit_log");
+        let grant_indexes_first = index_names(&conn, "provider_target_grants");
+        let lifecycle_indexes_first = index_names(&conn, "provider_lifecycle_audit_events");
 
         create_tables(&conn).unwrap();
         create_tables(&conn).unwrap();
 
         assert_eq!(index_names(&conn, "api_tokens"), token_indexes_first);
         assert_eq!(index_names(&conn, "audit_log"), audit_indexes_first);
+        assert_eq!(
+            index_names(&conn, "provider_target_grants"),
+            grant_indexes_first
+        );
+        assert_eq!(
+            index_names(&conn, "provider_lifecycle_audit_events"),
+            lifecycle_indexes_first
+        );
     }
 
     /// The first identity migration is an additive rolling upgrade: rows

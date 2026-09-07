@@ -338,8 +338,45 @@ export function createEdgeCanonContext(request, environment, params, nativeWaitU
   };
 }
 
-function edgeCanonLifecycleResponse(response, lifecycle) {
+// Whether the provider has already settled this response's body as whole bytes.
+//
+// The lifecycle has to close when the response is finished, and for a body the
+// application is still producing there is no way to learn that moment except by
+// reading the body to its end, which is what the wrapper below exists to do. A
+// body that is already whole has no such moment: it is finished the instant the
+// handler hands it over, so re-reading it through a stream of ours buys nothing
+// and costs a great deal. It costs the framing: a response the provider would
+// have sent with a Content-Length leaves as a chunked one instead, for every
+// answer of every application built here, which is visible to every client,
+// disables length-based proxies and progress reporting, and erases the one
+// difference an operator has between an answer that was ready and an answer
+// that is still being produced.
+//
+// So a provider that can tell the two apart is asked, and only its own word is
+// taken: a missing hook, a hook that throws, or any answer other than exactly
+// `true` leaves the response on the wrapper's road. That road is correct for
+// every body and merely more expensive for some, which is the right way round
+// for a fallback.
+function edgeCanonProviderSettledBody(responseBodyIsWhole, response) {
+  if (typeof responseBodyIsWhole !== 'function') return false;
+  try {
+    return responseBodyIsWhole(response) === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function edgeCanonLifecycleResponse(response, lifecycle, responseBodyIsWhole) {
   if (response.body === null) {
+    lifecycle.close();
+    return response;
+  }
+  if (edgeCanonProviderSettledBody(responseBodyIsWhole, response)) {
+    // Nothing is left to observe, so the response goes to the provider exactly
+    // as the handler built it and the lifecycle closes here. A `waitUntil`
+    // captured out of this invocation and called afterwards therefore still
+    // fails with EC_WAIT_UNTIL_CLOSED, which is the rule the wrapper enforces
+    // for the bodies that do have a later ending.
     lifecycle.close();
     return response;
   }
@@ -393,7 +430,7 @@ function edgeCanonLifecycleResponse(response, lifecycle) {
   });
 }
 
-export async function invokeEdgeCanonHandler(lifecycle, invoke) {
+export async function invokeEdgeCanonHandler(lifecycle, invoke, responseBodyIsWhole) {
   let result;
   try {
     result = await invoke();
@@ -406,7 +443,7 @@ export async function invokeEdgeCanonHandler(lifecycle, invoke) {
     result = edgeCanonFailureResponse();
   }
   try {
-    return edgeCanonLifecycleResponse(result, lifecycle);
+    return edgeCanonLifecycleResponse(result, lifecycle, responseBodyIsWhole);
   } catch (error) {
     const failureCode = error && error.code === 'EC_STREAM_RUNTIME_INCOMPATIBLE'
       ? 'EC_STREAM_RUNTIME_INCOMPATIBLE'

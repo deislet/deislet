@@ -28,16 +28,16 @@ use std::sync::{Arc, LazyLock};
 
 use axum::{
     extract::{MatchedPath, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, header},
+    http::{Extensions, HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use deis_wire::CanonicalId;
 use tracing::{Instrument, error, info_span, warn};
 
-use crate::api::error::ErrorDetail;
+use crate::api::error::{ApiError, ErrorDetail, codes};
 
 /// Header naming the request; echoed on every response.
 ///
@@ -148,6 +148,48 @@ impl fmt::Display for CorrelationId {
     }
 }
 
+/// The two ids one answer is found by, for a producer that builds its
+/// response outside a surface mount.
+///
+/// Both are echoed on every answer, refusals included: an operator who is
+/// handed a 401 or a 403 by the gate has to be able to tie it to the same
+/// trace as the calls around it, and a client that sent an
+/// `x-correlation-id` gets it back rather than silently losing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestContext {
+    pub request_id: RequestId,
+    pub correlation_id: CorrelationId,
+}
+
+impl RequestContext {
+    /// What [`attach_request_context`] settled, when it ran; otherwise the
+    /// caller's own headers under the same rule it applies; otherwise a
+    /// fresh request id, which the correlation id then follows.
+    pub fn resolve(extensions: &Extensions, headers: &HeaderMap) -> Self {
+        let request_id = RequestId::of(extensions)
+            .or_else(|| inbound_canonical_id(headers, REQUEST_ID_HEADER).map(RequestId))
+            .unwrap_or_else(|| RequestId(CanonicalId::new_v7()));
+        let correlation_id = extensions
+            .get::<CorrelationId>()
+            .copied()
+            .or_else(|| inbound_canonical_id(headers, CORRELATION_ID_HEADER).map(CorrelationId))
+            .unwrap_or(CorrelationId(request_id.0));
+        Self {
+            request_id,
+            correlation_id,
+        }
+    }
+
+    /// The context of an answer whose request id is already known and whose
+    /// caller sent no correlation id of its own.
+    pub fn of(request_id: RequestId) -> Self {
+        Self {
+            request_id,
+            correlation_id: CorrelationId(request_id.0),
+        }
+    }
+}
+
 /// A single inbound header value that parses as a canonical id. Two values,
 /// a non-ASCII value or a value that is not a lowercase UUIDv7 all count as
 /// absent - they are replaced, never echoed.
@@ -236,10 +278,72 @@ pub async fn render_errors(
     request: Request,
     next: Next,
 ) -> Response {
-    let request_id =
-        RequestId::of(request.extensions()).unwrap_or_else(|| RequestId(CanonicalId::new_v7()));
+    let context = RequestContext::resolve(request.extensions(), request.headers());
     let response = next.run(request).await;
-    finish_error_response(surface, request_id, response)
+    let response = envelope_rejection(surface, response).await;
+    finish_error_response(surface, context, response)
+}
+
+/// How much of a rejection's own sentence is kept. Axum's rejections are one
+/// short line about what the caller sent; anything longer than this is not
+/// one of them and is passed through untouched.
+const MAX_REJECTION_BYTES: usize = 4 * 1024;
+
+/// Turn an extractor's refusal into the envelope the surface promises.
+///
+/// A handler never sees a request whose query, path or body did not
+/// deserialise: axum's own extractor answers first, with `text/plain` and no
+/// [`ErrorDetail`], and until this ran that answer went out as it was. So
+/// `GET /api/v1/audit?before=3` came back as a bare sentence with no `code`
+/// and no `requestId` - on exactly the failure where a client most needs the
+/// code, because the request as written can never succeed.
+///
+/// Recognised by the content type: every body this API writes on purpose is
+/// JSON, including the few that are not the error envelope, so a `text/plain`
+/// 4xx that carries no `ErrorDetail` came from an extractor and nowhere else.
+/// The sentence is kept as the message - it is about what the caller sent,
+/// never about this control plane's insides - and the legacy tree is left
+/// exactly as it was, plain text and all.
+async fn envelope_rejection(surface: ApiSurface, response: Response) -> Response {
+    if !surface.structured_errors()
+        || !response.status().is_client_error()
+        || response.extensions().get::<ErrorDetail>().is_some()
+    {
+        return response;
+    }
+    let is_plain_text = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/plain"));
+    if !is_plain_text {
+        return response;
+    }
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_REJECTION_BYTES).await else {
+        // Longer than any of axum's rejections, or gone before it could be
+        // read. The body cannot be put back, so the answer is the envelope
+        // with what is still true of it: the caller sent something this
+        // route could not take.
+        let _ = parts;
+        return ApiError::coded(
+            status,
+            codes::INVALID_ARGUMENT,
+            "The request could not be read as this route requires.".to_string(),
+        )
+        .into_response();
+    };
+    let message = String::from_utf8_lossy(&bytes).trim().to_string();
+    if message.is_empty() {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        codes::PAYLOAD_TOO_LARGE
+    } else {
+        codes::INVALID_ARGUMENT
+    };
+    ApiError::coded(status, code, message).into_response()
 }
 
 /// The rendering step of [`render_errors`], for producers that build their
@@ -250,15 +354,20 @@ pub async fn render_errors(
 /// text has to carry the same id, and this is the one place that holds both.
 pub fn finish_error_response(
     surface: ApiSurface,
-    request_id: RequestId,
+    context: RequestContext,
     mut response: Response,
 ) -> Response {
+    let RequestContext {
+        request_id,
+        correlation_id,
+    } = context;
     let Some(detail) = response.extensions().get::<ErrorDetail>().cloned() else {
         return response;
     };
     if let Some(diagnostic) = &detail.diagnostic {
         error!(
             request_id = %request_id,
+            correlation_id = %correlation_id,
             surface = %surface,
             status = detail.status.as_u16(),
             code = detail.code,
@@ -266,9 +375,13 @@ pub fn finish_error_response(
             "A request failed on the control plane's own side; the caller was given the request id and this line has what the backend said"
         );
     }
-    response
-        .headers_mut()
-        .insert(REQUEST_ID_HEADER, header_value(request_id.0));
+    // Both ids, because a refusal built outside every mount - the gate's
+    // 401 and 403, the route fallback's 404 - never passes through
+    // `attach_request_context`, and an answer that carried only one of them
+    // would drop the correlation id the caller sent.
+    let headers = response.headers_mut();
+    headers.insert(REQUEST_ID_HEADER, header_value(request_id.0));
+    headers.insert(CORRELATION_ID_HEADER, header_value(correlation_id.0));
     if !surface.structured_errors() {
         return response;
     }
@@ -670,6 +783,105 @@ mod tests {
             &bytes[..],
             br#"{"error":"Database error: SQLite error: database is locked"}"#
         );
+    }
+
+    /// A query, path or body that does not deserialise is refused by axum
+    /// before any handler runs, in `text/plain` and with no code. On the
+    /// structured surfaces that answer is the envelope like every other
+    /// 4xx - it is the failure a client most needs a code for, because the
+    /// request as written can never succeed - and the legacy tree keeps the
+    /// bare sentence it has always sent.
+    #[tokio::test]
+    async fn an_extractor_refusal_is_the_envelope_on_the_structured_surfaces() {
+        use axum::extract::Query;
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Filter {
+            #[allow(dead_code)]
+            limit: Option<usize>,
+        }
+        async fn listing(Query(_filter): Query<Filter>) -> &'static str {
+            "OK"
+        }
+
+        for surface in [ApiSurface::V1, ApiSurface::Platform] {
+            let app = surfaced(surface, Router::new().route("/list", get(listing)));
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/list?before=3")
+                        .header(REQUEST_ID_HEADER, VALID)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{surface}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json",
+                "{surface}"
+            );
+            let body = body_json(response).await;
+            assert_eq!(body["error"]["code"], "invalid-argument", "{surface}");
+            assert_eq!(body["error"]["requestId"], VALID, "{surface}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("before"),
+                "the caller still has to be told what it sent: {body}"
+            );
+        }
+
+        // The legacy tree answers exactly what it always has.
+        let app = surfaced(
+            ApiSurface::Legacy,
+            Router::new().route("/list", get(listing)),
+        );
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/list?before=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
+
+        // A body a handler wrote by hand is not a rejection and is not
+        // touched, whatever its status.
+        async fn refused() -> Response {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({"success": false, "error": "still deployed"})),
+            )
+                .into_response()
+        }
+        let app = surfaced(
+            ApiSurface::Platform,
+            Router::new().route("/x", get(refused)),
+        );
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["error"], "still deployed");
     }
 
     #[tokio::test]

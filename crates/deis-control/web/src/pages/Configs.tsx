@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useSessions, useConfigs } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { RefusalNotice } from '@/components/RefusalNotice'
 
 import { RefreshCw, Save } from 'lucide-react'
 
@@ -84,7 +85,11 @@ export function Configs() {
             )}
           </CardHeader>
           <CardContent>
-            {error && <p className="text-destructive mb-4">{error}</p>}
+            {error && (
+              <div className="mb-4">
+                <RefusalNotice refusal={error} onRetry={refetch} />
+              </div>
+            )}
             
             {!selectedNode ? (
               <p className="text-muted-foreground">Select a node to view its configuration</p>

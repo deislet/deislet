@@ -37,13 +37,14 @@
 
 use std::sync::Arc;
 
+use rusqlite::types::Value;
 use rusqlite::{Row, params};
 use serde::Serialize;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 use crate::catalog::model::now_secs;
-use crate::catalog::pagination::{finish_page, sqlite_fetch_limit};
+use crate::catalog::pagination::{KeysetBound, KeysetResume, finish_page, sqlite_fetch_limit};
 use crate::catalog::{CatalogError, CatalogPage, CatalogResult, PageCursorStore, PagePosition};
 use crate::database::{Database, DatabaseError};
 use crate::identity::{Principal, PrincipalKind};
@@ -302,7 +303,7 @@ impl AuditQuery {
     /// The `WHERE` clauses and their bound values, in order. Shared by the
     /// count and the row read so the two can never disagree about which
     /// lines they are talking about.
-    fn clauses(self) -> (Vec<String>, Vec<Box<dyn rusqlite::ToSql + Send>>) {
+    pub(crate) fn clauses(self) -> (Vec<String>, Vec<Box<dyn rusqlite::ToSql + Send>>) {
         let mut clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Box<dyn rusqlite::ToSql + Send>> = Vec::new();
         let mut push = |clause: &str, value: Box<dyn rusqlite::ToSql + Send>| {
@@ -337,17 +338,38 @@ impl AuditQuery {
 /// Decode an audit cursor into `(at, id)`. The line id is an integer
 /// column, so it travels as text in the position and is parsed back here;
 /// anything else is a cursor that was never issued for this list.
-fn audit_cursor(cursor: Option<PagePosition>) -> CatalogResult<(Option<i64>, i64)> {
+fn audit_cursor(cursor: Option<PagePosition>) -> CatalogResult<Option<(i64, i64)>> {
     match cursor {
         Some(position) => {
             let id = position
                 .identity
                 .parse::<i64>()
                 .map_err(|_| CatalogError::invalid("audit cursor position is malformed"))?;
-            Ok((Some(position.sort_value), id))
+            Ok(Some((position.sort_value, id)))
         }
-        None => Ok((None, 0)),
+        None => Ok(None),
     }
+}
+
+/// The log's page statement for the filters a query carries.
+///
+/// The filters are equalities and ranges the planner can seek; the cursor
+/// half is written only when the request resumes from one, because a
+/// predicate guarded by `?n IS NULL` is not a range SQLite can seek and
+/// every page would then walk the whole filtered scope in sort order.
+/// `catalog::pagination_plans` explains this statement for each filter
+/// shape, in both forms.
+pub(crate) fn audit_page_sql(filters: &[String], resume: &KeysetResume) -> String {
+    let where_clause = if filters.is_empty() {
+        resume.where_clause()
+    } else {
+        format!(" WHERE {}{}", filters.join(" AND "), resume.and_clause())
+    };
+    format!(
+        "SELECT {AUDIT_COLUMNS} FROM audit_log{where_clause} \
+         ORDER BY at DESC, id DESC LIMIT ?{limit}",
+        limit = resume.limit_index(),
+    )
 }
 
 pub struct AuditStore {
@@ -441,11 +463,11 @@ impl AuditStore {
         cursor: Option<PagePosition>,
     ) -> CatalogResult<CatalogPage<AuditEntry>> {
         let fetch_limit = sqlite_fetch_limit(limit, "audit entries")?;
-        let (before_at, before_id) = audit_cursor(cursor)?;
+        let after = audit_cursor(cursor)?;
         self.db
             .with_connection(move |conn| {
                 let transaction = conn.unchecked_transaction()?;
-                let (mut clauses, mut binds) = query.clauses();
+                let (clauses, mut binds) = query.clauses();
                 let filter = if clauses.is_empty() {
                     String::new()
                 } else {
@@ -457,21 +479,22 @@ impl AuditStore {
                     |row| row.get::<_, i64>(0),
                 )?;
 
-                binds.push(Box::new(before_at));
-                let at_index = binds.len();
-                binds.push(Box::new(before_id));
-                let id_index = binds.len();
-                clauses.push(format!(
-                    "(?{at_index} IS NULL OR at < ?{at_index} \
-                       OR (at = ?{at_index} AND id < ?{id_index}))"
-                ));
+                let first_cursor_param = binds.len() + 1;
+                let resume = match after {
+                    Some((at, id)) => KeysetResume::after(
+                        first_cursor_param,
+                        vec![
+                            KeysetBound::descending("at", Value::from(at)),
+                            KeysetBound::descending("id", Value::from(id)),
+                        ],
+                    ),
+                    None => KeysetResume::first_page(first_cursor_param),
+                };
+                let sql = audit_page_sql(&clauses, &resume);
+                for value in resume.values() {
+                    binds.push(Box::new(value.clone()));
+                }
                 binds.push(Box::new(fetch_limit));
-                let limit_index = binds.len();
-                let sql = format!(
-                    "SELECT {AUDIT_COLUMNS} FROM audit_log WHERE {} \
-                     ORDER BY at DESC, id DESC LIMIT ?{limit_index}",
-                    clauses.join(" AND ")
-                );
                 let mut stmt = transaction.prepare(&sql)?;
                 let rows = stmt
                     .query_map(

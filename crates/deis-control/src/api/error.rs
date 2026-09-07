@@ -37,7 +37,7 @@ use axum::{
 use deis_provider_driver::{DriverErrorCategory, SideEffect};
 use serde::Serialize;
 
-use crate::api::versioning::{ApiSurface, RequestId, finish_error_response};
+use crate::api::versioning::{ApiSurface, RequestContext, finish_error_response};
 
 /// What a structured surface says about a failure whose real text belongs
 /// in the log: fixed, so no backend detail can travel with it.
@@ -710,11 +710,11 @@ impl ApiError {
     }
 
     /// Render for a producer that runs outside any surface mount, choosing
-    /// the body by `surface` and filling the request id when the context
-    /// middleware has run.
-    pub fn into_response_for(self, surface: ApiSurface, request_id: Option<RequestId>) -> Response {
-        let request_id = request_id.unwrap_or_else(|| RequestId(deis_wire::CanonicalId::new_v7()));
-        finish_error_response(surface, request_id, self.into_response())
+    /// the body by `surface` and echoing the request and correlation ids
+    /// the caller is to quote. [`RequestContext::resolve`] settles both,
+    /// whether or not the context middleware has run.
+    pub fn into_response_for(self, surface: ApiSurface, context: RequestContext) -> Response {
+        finish_error_response(surface, context, self.into_response())
     }
 }
 
@@ -773,7 +773,16 @@ impl From<crate::catalog::CatalogError> for ApiError {
             CatalogError::Invalid(_) => ApiError::BadRequest(message),
             CatalogError::Forbidden(_) => ApiError::Forbidden(message),
             CatalogError::BundleStorage(_) => ApiError::InternalError(message),
-            CatalogError::SecretsUnavailable(_) => ApiError::ServiceUnavailable(message),
+            // The secret store's own text names the master key file by its
+            // absolute path, and a caller holding one environment's secret
+            // scope must not learn where an operator keeps it. Opaque like
+            // every other 5xx: the path goes to the log under the request
+            // id, the legacy body keeps the sentence it always sent.
+            CatalogError::SecretsUnavailable(_) => ApiError::opaque(
+                StatusCode::SERVICE_UNAVAILABLE,
+                codes::SERVICE_UNAVAILABLE,
+                message,
+            ),
             CatalogError::Database(_) | CatalogError::Backend(_) => {
                 ApiError::DatabaseError(message)
             }
@@ -838,7 +847,13 @@ impl From<crate::config_manager::PushError> for ApiError {
             PushError::ConfigNotFound(_) => ApiError::NotFound(message),
             // The channel was there when the send began and went away
             // underneath; the caller can retry, this instance cannot fix it.
-            PushError::SendError(_) => ApiError::ServiceUnavailable(message),
+            // What the channel said is about this process's own plumbing, so
+            // it goes to the log and not into the envelope.
+            PushError::SendError(_) => ApiError::opaque(
+                StatusCode::SERVICE_UNAVAILABLE,
+                codes::SERVICE_UNAVAILABLE,
+                message,
+            ),
             PushError::SerializationError(_) => ApiError::InternalError(message),
         }
     }
@@ -865,9 +880,11 @@ impl From<crate::command::ExecuteError> for ApiError {
             // The node was there when the send began and its channel went
             // away underneath: the caller can retry, this instance cannot
             // fix it.
-            ExecuteError::SendError(_) | ExecuteError::ChannelClosed => {
-                ApiError::ServiceUnavailable(message)
-            }
+            ExecuteError::SendError(_) | ExecuteError::ChannelClosed => ApiError::opaque(
+                StatusCode::SERVICE_UNAVAILABLE,
+                codes::SERVICE_UNAVAILABLE,
+                message,
+            ),
             ExecuteError::SerializationError(_) | ExecuteError::Timeout => {
                 ApiError::InternalError(message)
             }
@@ -1049,6 +1066,89 @@ mod tests {
                 codes::IDEMPOTENCY_REQUEST_IN_PROGRESS,
             ])
         );
+    }
+
+    /// Every failure a backend hands one of the `From` impls answers 5xx
+    /// with the fixed message and keeps the backend's own sentence in
+    /// `diagnostic`, where `finish_error_response` logs it under the
+    /// request id. The secret store is the one this test was written for:
+    /// its text names the master key file by absolute path, and a caller
+    /// holding one environment's secret scope must not read it out of a
+    /// 503. The legacy body still carries the sentence, byte for byte.
+    #[test]
+    fn every_backend_failure_is_opaque_and_keeps_its_text_for_the_log() {
+        use crate::catalog::{
+            BackendRestoreCoordinatorError, CatalogError, MigrationCoordinatorError,
+        };
+        use crate::command::ExecuteError;
+        use crate::config_manager::PushError;
+
+        let key_path = "cannot read secret_key_file /etc/deislet/master.key: No such file";
+        let cases: Vec<(ApiError, &str)> = vec![
+            (
+                CatalogError::SecretsUnavailable(key_path.to_string()).into(),
+                key_path,
+            ),
+            (
+                CatalogError::Database(rusqlite::Error::QueryReturnedNoRows).into(),
+                "Query returned no rows",
+            ),
+            (
+                MigrationCoordinatorError::Backend {
+                    backend: "postgres".to_string(),
+                    tenant: "demo".to_string(),
+                    message: "dial tcp 10.0.0.7:5432: connection refused".to_string(),
+                }
+                .into(),
+                "10.0.0.7:5432",
+            ),
+            (
+                BackendRestoreCoordinatorError::Unknown(
+                    "dial tcp 10.0.0.9:9443: i/o timeout".to_string(),
+                )
+                .into(),
+                "10.0.0.9:9443",
+            ),
+            (
+                PushError::SendError("channel closed while sending to node-a".to_string()).into(),
+                "node-a",
+            ),
+            (
+                ExecuteError::SendError("channel closed while sending to node-a".to_string())
+                    .into(),
+                "node-a",
+            ),
+        ];
+        for (error, backend_text) in cases {
+            let detail = error.into_detail();
+            assert!(
+                detail.status.is_server_error(),
+                "{backend_text}: {} is not a 5xx",
+                detail.status
+            );
+            assert_eq!(
+                detail.message, OPAQUE_MESSAGE,
+                "the envelope message carries backend text for {backend_text}"
+            );
+            let diagnostic = detail
+                .diagnostic
+                .as_deref()
+                .unwrap_or_else(|| panic!("{backend_text}: nothing left for the log"));
+            assert!(
+                diagnostic.contains(backend_text),
+                "the log line lost {backend_text}: {diagnostic}"
+            );
+            assert!(
+                detail.legacy_message.contains(backend_text),
+                "the legacy body lost {backend_text}: {}",
+                detail.legacy_message
+            );
+            let body = String::from_utf8(detail.structured_body(REQUEST)).unwrap();
+            assert!(
+                !body.contains(backend_text),
+                "the structured envelope carries {backend_text}: {body}"
+            );
+        }
     }
 
     #[test]
@@ -1452,18 +1552,25 @@ mod tests {
 
     #[tokio::test]
     async fn into_response_for_picks_the_body_by_surface() {
-        let request_id = RequestId(REQUEST.parse().unwrap());
+        use crate::api::versioning::RequestId;
+        let context = RequestContext::of(RequestId(REQUEST.parse().unwrap()));
         let response = ApiError::unauthenticated("x")
-            .into_response_for(ApiSurface::of_path("/api/apps"), Some(request_id));
+            .into_response_for(ApiSurface::of_path("/api/apps"), context);
         assert_eq!(
             response.headers()[crate::api::versioning::REQUEST_ID_HEADER],
+            REQUEST
+        );
+        // A producer outside every mount echoes both ids, so a refusal can
+        // be tied to the calls the caller sent around it.
+        assert_eq!(
+            response.headers()[crate::api::versioning::CORRELATION_ID_HEADER],
             REQUEST
         );
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&bytes[..], br#"{"error":"Unauthorized","details":"x"}"#);
 
         let response = ApiError::unauthenticated("x")
-            .into_response_for(ApiSurface::of_path("/api/v1/apps"), Some(request_id));
+            .into_response_for(ApiSurface::of_path("/api/v1/apps"), context);
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
@@ -1471,8 +1578,13 @@ mod tests {
         assert_eq!(body["error"]["code"], codes::UNAUTHENTICATED);
         assert_eq!(body["error"]["requestId"], REQUEST);
 
-        let response = ApiError::route_not_found()
-            .into_response_for(ApiSurface::of_path("/api/platform/nope"), None);
+        let response = ApiError::route_not_found().into_response_for(
+            ApiSurface::of_path("/api/platform/nope"),
+            RequestContext::resolve(
+                &axum::http::Extensions::new(),
+                &axum::http::HeaderMap::new(),
+            ),
+        );
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();

@@ -804,16 +804,6 @@ fn op_deis_get_env(state: &mut OpState) -> std::collections::BTreeMap<String, se
     environment
 }
 
-/// Whether this isolate was built from the standard declaration/snapshot
-/// path. The bootstrap uses the answer to keep legacy convenience bindings
-/// out of the standard declared-only namespace.
-#[op2(fast)]
-fn op_deis_environment_is_standard(state: &mut OpState) -> bool {
-    state
-        .try_borrow::<StandardEnvStore>()
-        .is_some_and(|store| store.borrow().is_some())
-}
-
 // Define extension
 extension!(
     deis_runtime_ops,
@@ -827,8 +817,7 @@ extension!(
         op_set_response,
         op_deis_take_request_body,
         op_deis_set_response_body,
-        op_deis_get_env,
-        op_deis_environment_is_standard
+        op_deis_get_env
     ],
 );
 

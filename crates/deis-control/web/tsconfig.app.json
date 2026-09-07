@@ -25,5 +25,8 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // The tests are a project of their own - tsconfig.test.json - because they
+  // are Node code and this project is browser code.
+  "exclude": ["src/**/*.test.ts"]
 }

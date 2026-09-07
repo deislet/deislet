@@ -341,6 +341,23 @@ Linux、macOS、Windows 通过 provider 80/80、pagination 21/21、authz 39/39�
 
 随后 `GET /operations/:id` 改为与通用 cancel 相同的记录级授权（deploy/rollback 由 `read:<app>/<env>` 读取，其余 kind 与不存在的 id 仍为 `admin:*/*`，拒绝文案与记录无关且单次点查），通用 cancel 的 `Idempotency-Key` 按兼容门禁判定为增量改为可选；TypeScript 客户端由 `scripts/generate-openapi-types.py` 从 `contracts/openapi/v1.json` 生成到 `web/src/generated/control-api.ts`，`--check` 进 CI，`web/src/lib/api.ts` 不再手写响应模型；`scripts/demo.sh` 全部控制面调用改用 `/api/v1` 与 `/api/platform`；旧库两代索引清退。精确提交 `e0086eb1d1f2edd258e28e334c4c56375e1c7663` 的同一 SHA-256 校验归档已在 Linux、macOS、Windows 通过 provider 80/80、pagination 22/22、authz 39/39、协调器 4/4、五项迁移与严格 Clippy 门禁；受 Schema 约束的记录为 `../product/evidence/provider-driver-dispatcher-portability-e0086eb.json`。见阶段分析第 96 节。
 
+随后一轮把 `3ebe108..e0086eb` 交给十视角深度审查并逐条对抗式验证，确认 51 条、修复 45 条，同时修好标准锁定后一直存在
+而 CI 停摆期间无人发现的两处产品回归（所有 schema-2 应用的 `env.ASSETS` 为 undefined；编译器为观察响应结束重新包装每个
+响应体，导致所有应用应答丢失 `Content-Length`）。与本 ADR 直接相关的落点：`GET /api/platform/runtime`（fleet 列表）改为
+要求 `read:*/*`，因为它的行携带节点管理地址、密钥状态与指纹，本 ADR「Fleet scope 仅平台操作者可见」此前并未在授权表上
+成立；`POST /api/v1/apps/{app}/identity-migration` 真正读取它一直声明为必填的 `If-Match`（缺失 428、畸形 400、过期 412）；
+每个 operation 记录 500、每个带 JSON body 的 operation 记录 415，从不发出 422 的六条路由删除该记录；`ProductOperation`
+的 state 与 kind 从 `deis_wire` 渲染以杜绝漂移，`progress` 明确为 0..=10000 的基点；axum extractor 的拒绝在 v1 与 platform
+也走结构化信封；每个后端故障构成的 5xx 一律不透明；跨作用域与不存在的 provider id 返回逐字节相同的 404。
+CLI 侧：`provider-deployments rollback --json` 在 `--wait` 失败时仍输出文档（始终给出已受理的 operation id，
+`providerDeployment` 为 null，另有 `waitError`），`list` 补上 PHASE 与 PROGRESS 两列，客户端翻页拒绝与刚发出的相同的
+`nextCursor`。Web 侧：`web/src/lib/refusal.ts` 统一归类拒绝（offline / unauthorized / forbidden / missing / conflict /
+rate-limited / server），信封的 `retryAfterSeconds` 真正参与轮询节奏，控制台首次有了自己的单元测试
+（`web/src/lib/refusal.test.ts`，Node 内置 test runner，无新增依赖）。「Rust CLI client 仍以示例反序列化校验替代生成」
+这句此前没有任何东西兜底——`crates/deis` 里没有一个测试读过 `contracts/openapi/v1-examples.json`；现在捕获的 48 个响应
+schema 中，21 个映射到 CLI 镜像类型、27 个写明由 Web 消费，新增路由因此必须就「CLI 是否该读它」作出决定。
+兼容门禁补齐范围、长度与 pattern 约束的判定：请求侧收紧下界/长度/条目数、响应侧放宽，都算破坏性。见阶段分析第 97 节。
+
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：Rust CLI client 仍以示例反序列化校验替代生成；state/status/severity 类字段在文档中仍是普通字符串而非 enum；Web 尚无 organization/application/environment 主线；旧前缀尚在弃用窗口内。
 
 1. 建立 versioned API/error/operation/schema 基础与安全 Web session。

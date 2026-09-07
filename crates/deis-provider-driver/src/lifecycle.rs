@@ -102,8 +102,35 @@ pub fn validate_driver_request(
             "driver request target backend does not match the selected driver",
         ));
     }
+    // A `reconcile` is a takeover of another operation, so every rule below
+    // is about the operation actually being settled, not about the word
+    // `reconcile`. Reconciling an `upload` still needs the artifact lineage,
+    // and reconciling a `rollback` still needs the activation it restores;
+    // rejecting either would leave the ambiguous attempt - the one case the
+    // whole query-before-retry design exists for - permanently unrunnable.
+    let effective_operation = match (request.operation, request.reconciles.as_ref()) {
+        (DriverOperation::Reconcile, None) => {
+            return Err(DriverContractError(
+                "reconcile driver request must name the operation whose outcome it is querying",
+            ));
+        }
+        (DriverOperation::Reconcile, Some(reconciles))
+            if reconciles.operation == DriverOperation::Reconcile =>
+        {
+            return Err(DriverContractError(
+                "reconcile driver request cannot reconcile another reconcile",
+            ));
+        }
+        (DriverOperation::Reconcile, Some(reconciles)) => reconciles.operation,
+        (_, Some(_)) => {
+            return Err(DriverContractError(
+                "only a reconcile driver request may name a reconciled operation",
+            ));
+        }
+        (operation, None) => operation,
+    };
     if matches!(
-        request.operation,
+        effective_operation,
         DriverOperation::Plan
             | DriverOperation::Prepare
             | DriverOperation::Upload
@@ -115,7 +142,7 @@ pub fn validate_driver_request(
             "artifact-dependent driver operation needs exact artifact lineage",
         ));
     }
-    match (request.operation, request.rollback_target.as_ref()) {
+    match (effective_operation, request.rollback_target.as_ref()) {
         (DriverOperation::Rollback, None) => {
             return Err(DriverContractError(
                 "rollback driver request must name the activation it restores; a rollback recorded without one has to be issued again",
@@ -320,6 +347,7 @@ mod tests {
             artifact: None,
             plan: ProviderNeutralPlan::default(),
             rollback_target: None,
+            reconciles: None,
         }
     }
 
@@ -414,6 +442,81 @@ mod tests {
             ..target
         };
         assert!(!digest_only.has_native_identity());
+    }
+
+    /// The takeover of a lost attempt keeps every fact of the original
+    /// request and only names it differently. A rollback taken over this way
+    /// still carries the activation it restores, and rejecting that pairing
+    /// would make the ambiguous rollback - the one case query-before-retry
+    /// exists for - permanently unrunnable.
+    #[test]
+    fn a_reconcile_names_the_operation_it_took_over_and_keeps_its_facts() {
+        let manifest = ValidatedProviderDriverManifest::parse_json(include_bytes!(
+            "../../../contracts/v1/fixtures/valid/provider-driver.json"
+        ))
+        .unwrap();
+        let mut request = request();
+        request.operation = DriverOperation::Reconcile;
+        let anonymous = validate_driver_request(&manifest, &request).unwrap_err();
+        assert!(
+            anonymous
+                .to_string()
+                .contains("whose outcome it is querying"),
+            "{anonymous}"
+        );
+        request.reconciles = Some(crate::DriverReconcileContext {
+            operation: DriverOperation::Reconcile,
+        });
+        let circular = validate_driver_request(&manifest, &request).unwrap_err();
+        assert!(
+            circular.to_string().contains("another reconcile"),
+            "{circular}"
+        );
+        // Reconciling an artifact-dependent operation still needs the exact
+        // lineage that operation was dispatched with.
+        request.reconciles = Some(crate::DriverReconcileContext {
+            operation: DriverOperation::Upload,
+        });
+        let anonymous_artifact = validate_driver_request(&manifest, &request).unwrap_err();
+        assert!(
+            anonymous_artifact.to_string().contains("artifact lineage"),
+            "{anonymous_artifact}"
+        );
+        request.reconciles = Some(crate::DriverReconcileContext {
+            operation: DriverOperation::Cleanup,
+        });
+        assert_eq!(validate_driver_request(&manifest, &request), Ok(()));
+        // Reconciling a rollback keeps the rollback target, and a reconcile of
+        // anything else may not carry one.
+        request.rollback_target = Some(crate::DriverRollbackTarget {
+            source_operation_id: CanonicalId::new_v7(),
+            activation_operation_id: CanonicalId::new_v7(),
+            activation_receipt_sha256: "c".repeat(64).parse().unwrap(),
+            provider_deployment_id: Some("provider-deployment-1".to_owned()),
+            provider_version_id: None,
+            provider_resource_ids: BTreeMap::new(),
+        });
+        let misplaced = validate_driver_request(&manifest, &request).unwrap_err();
+        assert!(
+            misplaced.to_string().contains("only a rollback"),
+            "{misplaced}"
+        );
+        request.reconciles = Some(crate::DriverReconcileContext {
+            operation: DriverOperation::Rollback,
+        });
+        assert_eq!(validate_driver_request(&manifest, &request), Ok(()));
+        request.rollback_target = None;
+        let blind = validate_driver_request(&manifest, &request).unwrap_err();
+        assert!(blind.to_string().contains("activation"), "{blind}");
+        // Only a reconcile explains what it took over.
+        request.operation = DriverOperation::Observe;
+        let unexpected = validate_driver_request(&manifest, &request).unwrap_err();
+        assert!(
+            unexpected
+                .to_string()
+                .contains("only a reconcile driver request"),
+            "{unexpected}"
+        );
     }
 
     #[test]

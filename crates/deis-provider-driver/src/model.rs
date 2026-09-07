@@ -192,6 +192,29 @@ impl DriverRollbackTarget {
     }
 }
 
+/// Why a `reconcile` request exists: the durable operation whose outcome was
+/// lost and is now being queried.
+///
+/// A reconcile is never a workflow step of its own. The Control substitutes it
+/// for the operation the driver was already asked to run when the answer never
+/// arrived - a timed-out `cleanup`, a rollback whose lease expired - keeping
+/// the operation id, desired state and plan exact. Without this member the
+/// driver process, which sees only the request, cannot tell a reconcile of a
+/// `cleanup` (is the uploaded version gone?) from a reconcile of an `activate`
+/// (is the new version serving?), and the two have opposite answers for the
+/// same provider state. The orchestrator treats a `succeeded` reconcile
+/// receipt as proof that the reconciled operation reached its intended state,
+/// so answering the wrong question ends the workflow on evidence that was
+/// never collected.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DriverReconcileContext {
+    /// The operation originally requested for this durable operation id. It is
+    /// never `reconcile`; a reconcile cannot reconcile itself.
+    pub operation: DriverOperation,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -205,10 +228,16 @@ pub struct DriverRequest {
     pub target: ProviderTargetRef,
     pub artifact: Option<ArtifactVersionRef>,
     pub plan: ProviderNeutralPlan,
-    /// Present on every `rollback` request the Control dispatches and on no
-    /// other operation; absent from the JSON when `None`.
+    /// Present on every `rollback` request the Control dispatches and on every
+    /// `reconcile` that takes one over, and on no other operation; absent from
+    /// the JSON when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_target: Option<DriverRollbackTarget>,
+    /// Present on every `reconcile` request and on no other operation; absent
+    /// from the JSON when `None`, so drivers built against the original v1
+    /// request still parse every operation they are asked to run directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciles: Option<DriverReconcileContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

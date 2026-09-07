@@ -76,8 +76,8 @@ pub use manifest::{
 };
 pub use model::{
     ALL_DRIVER_OPERATIONS, ArtifactVersionRef, DeploymentState, DriverError, DriverErrorCategory,
-    DriverNextAction, DriverOperation, DriverReceipt, DriverRequest, DriverRollbackTarget,
-    DriverStepState, ProviderNeutralPlan, ProviderTargetRef, SideEffect,
+    DriverNextAction, DriverOperation, DriverReceipt, DriverReconcileContext, DriverRequest,
+    DriverRollbackTarget, DriverStepState, ProviderNeutralPlan, ProviderTargetRef, SideEffect,
 };
 pub use orchestrator::{
     DriverOperationClaim, DriverOperationClaimOutcome, DriverOperationStore,

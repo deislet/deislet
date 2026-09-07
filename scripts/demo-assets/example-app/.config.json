@@ -8,11 +8,15 @@
   "environment": {
     "variables": {
       "BUILD_LABEL": "v1",
-      "LOG_LEVEL": "info",
-      "ASSETS": "an-application-cannot-take-this-name"
+      "LOG_LEVEL": "info"
     },
-    "secrets": [
-      "DEMO_SECRET"
+    "declarations": [
+      {
+        "name": "DEMO_SECRET",
+        "kind": "secret",
+        "valueType": "string",
+        "required": false
+      }
     ]
   },
   "bindings": {

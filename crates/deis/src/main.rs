@@ -1851,6 +1851,101 @@ mod tests {
     /// The environment is `-e/--environment` on every command that has one.
     /// `--env` must not be accepted anywhere: it reads as the application's
     /// variables, which is a different thing entirely.
+    /// Follow one `### ` heading of the CLI README down to the command it
+    /// names, so a heading that has drifted from the command line fails here
+    /// rather than in somebody's terminal.
+    fn readme_command<'a>(root: &'a clap::Command, path: &[&str]) -> Option<&'a clap::Command> {
+        let mut command = root;
+        for segment in path {
+            command = command.find_subcommand(segment)?;
+        }
+        Some(command)
+    }
+
+    /// Every flag a README heading advertises is a flag that command really
+    /// defines, and every command a heading names still exists.
+    ///
+    /// A heading is what somebody skims before typing, so a flag printed in
+    /// one is a promise: the provider-deployments heading read
+    /// `list|get|cancel|rollback [--wait]` while only `rollback` took
+    /// `--wait`, and the first thing to say otherwise was a clap error in
+    /// front of an operator. The check reads the declared command line rather
+    /// than parsing an argv, so it asks whether the flag exists and is not
+    /// distracted by the positional arguments a subcommand also wants.
+    #[test]
+    fn every_flag_a_readme_heading_advertises_exists_on_that_command() {
+        let readme = include_str!("../README.md");
+        let root = Cli::command();
+        let mut headings = 0usize;
+        let mut flags_checked = 0usize;
+
+        for line in readme.lines() {
+            let Some(heading) = line.strip_prefix("### ") else {
+                continue;
+            };
+            // Headings that name two commands in two pairs of backticks -
+            // "`deis logs` and `deis tail`" - carry no flags between them,
+            // and splitting them would be more machinery than they are worth.
+            if heading.matches('`').count() != 2 {
+                continue;
+            }
+            let Some(rest) = heading.trim().trim_matches('`').strip_prefix("deis ") else {
+                continue;
+            };
+
+            let mut path: Vec<&str> = Vec::new();
+            let mut flags: Vec<&str> = Vec::new();
+            for token in rest.split_whitespace() {
+                if let Some(flag) = token.strip_prefix("[--") {
+                    flags.push(flag.trim_end_matches(']'));
+                } else if token
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '-' || c == '|')
+                {
+                    // Anything else in a heading is a placeholder for a
+                    // value - `[NAME]`, `<operation-id>`, `…` - which names
+                    // nothing this can look up.
+                    path.push(token);
+                }
+            }
+            let Some((last, leading)) = path.split_last() else {
+                continue;
+            };
+            assert!(
+                leading.iter().all(|segment| !segment.contains('|')),
+                "{heading}: only the last segment of a heading may list alternatives"
+            );
+
+            headings += 1;
+            for alternative in last.split('|') {
+                let mut segments = leading.to_vec();
+                segments.push(alternative);
+                let command = readme_command(&root, &segments).unwrap_or_else(|| {
+                    panic!("{heading}: the README documents `deis {}`, which the command line does not define", segments.join(" "))
+                });
+                for flag in &flags {
+                    assert!(
+                        command
+                            .get_arguments()
+                            .any(|argument| argument.get_long() == Some(flag)),
+                        "{heading}: the README promises --{flag} on `deis {}`, which does not \
+                         take it",
+                        segments.join(" ")
+                    );
+                    flags_checked += 1;
+                }
+            }
+        }
+
+        // A parser that stopped matching the README would otherwise pass this
+        // test by checking nothing at all.
+        assert!(headings >= 10, "only {headings} README headings were read");
+        assert!(
+            flags_checked >= 5,
+            "only {flags_checked} README flag promises were checked"
+        );
+    }
+
     #[test]
     fn the_environment_flag_has_one_spelling_everywhere() {
         for argv in [

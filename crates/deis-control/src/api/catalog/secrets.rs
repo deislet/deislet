@@ -50,6 +50,7 @@ pub struct SecretChangeResponse {
     /// no version, so this is the only evidence it reached anything.
     pub delivery: DeliveryReport,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub plan: Option<DeploymentPlan>,
 }
 
@@ -59,6 +60,7 @@ pub struct SecretDeletedResponse {
     pub deleted: String,
     pub delivery: DeliveryReport,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub plan: Option<DeploymentPlan>,
 }
 

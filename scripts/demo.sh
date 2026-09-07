@@ -118,14 +118,16 @@ GREEDY_TIMEOUT_MS="${GREEDY_TIMEOUT_MS:-600000}"
 # name the same thing in one place.
 #
 # scripts/demo-assets/example-app/public/_redirects sends the first to the
-# second with a 301; public/_headers puts a year-long Cache-Control on
-# everything under /css/; and no file, no rule and no function route claims
+# second with a 301; public/_headers is one block, /css/*, that puts a
+# year-long Cache-Control and a Referrer-Policy on everything under /css/ and
+# on nothing else; and no file, no rule and no function route claims
 # SITE_MISSING_PATH, which is what makes it the path the app's not-found
 # behaviour answers.
 SITE_OLD_PATH="/old-home"
 SITE_REDIRECT_TARGET="/index.html"
 SITE_STYLESHEET="/css/app.css"
 SITE_STYLESHEET_CACHE_CONTROL="public, max-age=31536000, immutable"
+SITE_STYLESHEET_REFERRER_POLICY="strict-origin-when-cross-origin"
 SITE_MISSING_PATH="/no-such-page"
 # A marker only public/404.html carries, so a check cannot mistake any other
 # 404 - the node's own, a handler's - for the page the bundle ships.
@@ -362,7 +364,7 @@ wait_for_tcp() {
 # table refuses every request with 503 rather than forwarding it blind, and it
 # is listening the whole time it does so. So `start` used to return while the
 # front door was still turning traffic away, and the checks that go through it
-# - the WebSocket hop, every streaming check - failed on a demo that was
+# - every streaming check - failed on a demo that was
 # perfectly healthy a second later.
 #
 # The probe is therefore a real request for the application that was just
@@ -970,7 +972,6 @@ prepare_app_source() {
     fi
   fi
 
-  add_websocket_route "$dest"
   add_blob_route "$dest"
   add_stream_route "$dest"
   add_timers_route "$dest"
@@ -979,81 +980,14 @@ prepare_app_source() {
   echo "$dest"
 }
 
-# The route the WebSocket check talks to, derived from the handler's path in
-# the function tree the way every other route is.
-WS_ROUTE="/api/ws"
-
-# Give the staged copy a WebSocket handler if the example app does not carry
-# one.
-#
-# The check below needs an application that upgrades, and the example app has
-# no such handler today. Writing it into the staged copy keeps the check
-# self-contained instead of leaving the one hop nobody has ever exercised
-# unexercised; the moment `functions/api/ws.ts` appears in the example app's
-# own sources this stops writing anything and the app's version is what gets
-# deployed, so there is nothing here to remove by hand.
-#
-# The handler answers a binary frame with its length and its bytes in hex
-# rather than with the bytes. An application can be handed a binary frame -
-# the node base64s it across the boundary and the isolate sees an ArrayBuffer
-# - but it has no way to send one: `op_ws_server_send` takes a string and only
-# ever emits a text message. Describing the bytes is therefore the only way a
-# handler can prove which ones reached it.
-add_websocket_route() {
-  local dest=$1
-  local handler="${dest}/functions${WS_ROUTE}.ts"
-
-  if [ -f "$handler" ]; then
-    return 0
-  fi
-
-  mkdir -p "$(dirname "$handler")"
-  cat > "$handler" <<'TS'
-// A WebSocket echo endpoint, in the shape Edge Canon describes: make a
-// WebSocketPair, accept the server half, and answer 101 with the client half
-// attached to the Response.
-export default async function handler(context: any): Promise<Response> {
-  if (context.request.headers.get("upgrade") !== "websocket") {
-    return new Response("this path answers a WebSocket handshake\n", {
-      status: 426,
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
-  }
-
-  const pair = new WebSocketPair();
-  const client = pair[0];
-  const server = pair[1];
-  server.accept();
-
-  server.addEventListener("message", (event: any) => {
-    const data = event.data;
-    // Prefixed so an answer cannot be mistaken for the frame that caused it,
-    // and so the two frame kinds are told apart by the reply itself.
-    if (typeof data === "string") {
-      server.send("text:" + data);
-      return;
-    }
-    const bytes = new Uint8Array(data);
-    let hex = "";
-    for (let i = 0; i < bytes.length; i++) {
-      hex += bytes[i].toString(16).padStart(2, "0");
-    }
-    server.send("binary:" + bytes.length + ":" + hex);
-  });
-
-  return new Response(null, { status: 101, webSocket: client });
-}
-TS
-}
-
 # The route the streaming checks talk to.
 STREAM_ROUTE="/api/stream"
 
 # Give the staged copy a streaming handler if the example app does not carry
 # one.
 #
-# Written here for the same reason the WebSocket and object-storage handlers
-# are: the checks below need an application that actually returns a body it is
+# Written here for the same reason the object-storage handler is: the checks
+# below need an application that actually returns a body it is
 # still producing, and a feature nothing calls is a feature nobody has. The
 # moment `functions/api/stream.ts` appears in the example app's own sources
 # this stops writing anything.
@@ -1082,11 +1016,40 @@ add_stream_route() {
 //   endless  frames for as long as anyone reads. Used to watch a client hang
 //            up, and to watch the node close a stream that runs past its
 //            budget.
-//   throw    `after` frames and then an exception, which the client meets long
+//   throw    `after` frames and then a failure, which the client meets long
 //            after it was told 200.
 //   relay    `url` is fetched and its body handed straight on. Nothing here
 //            reads it, so nothing here holds it.
 //   report   not a stream at all: what became of the producers above.
+//
+// The producer below is a loop writing into the identity `new
+// TransformStream()`, rather than the underlying source of a `new
+// ReadableStream({ pull, cancel })`, because the identity transform and the
+// bodies of Request and Response are the whole of the stream surface Edge
+// Canon v1 defines. A direct `ReadableStream`/`WritableStream` constructor is
+// refused by the build (EC_STREAM_DIRECT_CONSTRUCTOR_NONPORTABLE), and so is a
+// `TransformStream` handed a transformer or a queuing strategy
+// (EC_STREAM_TRANSFORMER_NONPORTABLE) - the shapes that only some providers
+// have. So the three things the underlying source used to be told by being
+// called back are read off the writer instead:
+//
+//   backpressure  `writer.ready` and the promise `writer.write()` returns are
+//                 what `pull` was: the identity transform gives its readable
+//                 end a high water mark of zero, so neither settles until the
+//                 node's pump asks for the next chunk. That is what keeps the
+//                 frames from being produced in one burst before anyone reads
+//                 them, and it is what the gap below is measured against.
+//   cancellation  when the node cancels the readable - the client hung up, or
+//                 the stream ran past stream_timeout_ms - the transform errors
+//                 its writable end, so `writer.closed` rejects. That rejection
+//                 is this handler's `cancel` hook. It is watched rather than
+//                 waited for at the next write, because by the time it arrives
+//                 the stream's owner has been released and the timer this
+//                 producer is sitting on has been swept with it: a loop that
+//                 only noticed at its next write would never reach one.
+//   failure       `writer.abort(...)` errors the readable the node is
+//                 draining, which is what ends the body without its
+//                 terminating chunk.
 //
 // The two module-level values are deliberate. An isolate is reused across
 // requests for the same application, so a producer that was cancelled can say
@@ -1150,37 +1113,109 @@ export default async function handler(context: any): Promise<Response> {
     : -1;
 
   const encoder = new TextEncoder();
-  let sent = 0;
+  // The one stream shape every target defines: bytes written at one end come
+  // out of the other unchanged. The readable half becomes the response body,
+  // the writable half is this handler's.
+  const identity = new TransformStream();
+  const writer = identity.writable.getWriter();
 
-  const stream = new ReadableStream({
-    async pull(controller) {
+  let sent = 0;
+  // Set just before this producer ends its own stream, so that the rejection
+  // an abort causes is not mistaken for the node cancelling us. The
+  // distinction is the whole of what `mode=throw` and `mode=endless` are for:
+  // a stream this handler failed on purpose was not cancelled, and reporting
+  // it as one would make the hang-up evidence unreadable.
+  let ending = false;
+  let cancelled = false;
+
+  // The notice that there is nobody left to write to, and the promise the
+  // pause below races against so that a producer parked on a swept timer still
+  // returns. `writer.closed` rejects with the reason the node cancelled the
+  // readable with; it resolves, without rejecting, when this producer closes
+  // the stream itself.
+  const stopped = writer.closed.then(
+    () => {},
+    () => {
+      if (ending) return;
+      cancelled = true;
+      lastCancelled = tag;
+    },
+  );
+
+  const pause = (ms: number) =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Started and not awaited: the head has to reach the client before the node
+  // begins draining the readable, and nothing below can make progress until it
+  // does.
+  const produce = async () => {
+    for (;;) {
+      // The consumer asking for the next chunk. Everything after it is on the
+      // far side of a read, so nothing is produced for a client that is not
+      // there.
+      try {
+        await writer.ready;
+      } catch (_) {
+        return;
+      }
+      if (cancelled) return;
+
       // The gap is what makes "frame by frame" visible from outside: frames
       // produced in one burst would arrive in one burst no matter how they
       // crossed the boundary, and would prove nothing.
       if (gapMs > 0 && sent > 0) {
-        await new Promise((resolve) => setTimeout(resolve, gapMs));
+        await Promise.race([pause(gapMs), stopped]);
+        if (cancelled) return;
       }
+
       if (throwAfter > 0 && sent >= throwAfter) {
-        throw new Error(
-          "the demo handler failed this stream on purpose after " + sent + " frame(s)",
-        );
-      }
-      if (mode === "sse" && sent >= frames) {
-        controller.close();
+        ending = true;
+        try {
+          // Errors the readable the node is draining. Every frame written so
+          // far has already been taken by the pump -- that is what let the
+          // `writer.ready` above settle -- so none of them is discarded along
+          // with the queue, and what the client loses is only the terminating
+          // chunk.
+          await writer.abort(
+            new Error(
+              "the demo handler failed this stream on purpose after " + sent + " frame(s)",
+            ),
+          );
+        } catch (_) {
+          // The stream was already over. There is no second failure to report
+          // and no client left to report it to.
+        }
         return;
       }
+
+      if (mode === "sse" && sent >= frames) {
+        ending = true;
+        try {
+          await writer.close();
+        } catch (_) {
+          // As above: a stream the node ended first is ended either way.
+        }
+        return;
+      }
+
       sent += 1;
       framesProduced += 1;
-      controller.enqueue(encoder.encode("data: frame " + sent + " at " + Date.now() + "\n\n"));
-    },
-    cancel(_reason) {
-      // Reached when the node tells this producer to stop: the client hung up,
-      // or the stream ran past the node's stream_timeout_ms.
-      lastCancelled = tag;
-    },
-  });
+      try {
+        await writer.write(encoder.encode("data: frame " + sent + " at " + Date.now() + "\n\n"));
+      } catch (_) {
+        // Rejects for the same reason `writer.closed` does, and the handler
+        // attached to that has already recorded the tag.
+        return;
+      }
+    }
+  };
 
-  return new Response(stream, {
+  // Caught here rather than left to the isolate. An unhandled rejection is not
+  // a local failure: the runtime reports it against the event loop, which ends
+  // every other stream this application has open along with this one.
+  produce().catch(() => {});
+
+  return new Response(identity.readable, {
     headers: {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
@@ -1315,7 +1350,7 @@ COOKIE_ROUTE="/api/cookies"
 # and one came out, with nothing anywhere saying so.
 #
 # The handler is written here rather than in the example app for the same
-# reason the WebSocket and streaming handlers are: the moment
+# reason the streaming and object-storage handlers are: the moment
 # `functions/api/cookies.ts` appears in the app's own sources this stops
 # writing anything and the app's version is what gets deployed.
 add_cookie_route() {
@@ -1356,7 +1391,7 @@ BLOB_ROUTE="/api/objects"
 # Give the staged copy an object-storage handler if the example app does not
 # carry one.
 #
-# Written here for the same reason the WebSocket handler is: the checks below
+# Written here for the same reason the streaming handler is: the checks below
 # need an application that actually calls a declared blob binding, and a
 # feature nothing calls is a feature nobody has. The moment
 # `functions/api/objects.ts` appears in the example app's own sources this
@@ -1525,7 +1560,7 @@ report_field() {
 #
 # It exists because a service binding needs two applications, and because the
 # consenting half of one lives in the *callee's* own bundle. Written here
-# rather than kept in `demo-assets` for the same reason the WebSocket handler
+# rather than kept in `demo-assets` for the same reason the streaming handler
 # is written into the staged copy: it is scaffolding for a check, and the
 # moment a second example project appears this stops writing anything.
 #
@@ -1618,6 +1653,18 @@ deploy_example_app() {
   # bundle, so this produces no new version; the control plane re-delivers
   # the running one with the new environment attached, and `deis secret set`
   # fails if a node does not take that.
+  #
+  # This is why the example app declares DEMO_SECRET with "required": false
+  # (scripts/demo-assets/example-app/.config.json) rather than under the older
+  # "secrets": [...] spelling. Under the locked standard that spelling is
+  # shorthand for a required secret, and the control plane refuses to point an
+  # environment at a version whose required secret has no value yet
+  # (EC_ENV_REQUIRED_MISSING) - so a required secret has to be set before the
+  # deploy that needs it, and a secret can only be set on an environment that
+  # exists. The demo's story is the other order: deploy first, then add the
+  # secret and watch the running version be re-delivered with it. A secret
+  # that arrives after the deploy is, by the standard's own definition, not
+  # one the deploy required.
   if ! printf '%s' "$DEMO_SECRET_VALUE" \
     | deis_cli secret set DEMO_SECRET -e "$ENV_NAME" --json \
       > "${LOG_DIR}/cli-secret-set.json" 2> "${LOG_DIR}/cli-secret-set.log"; then
@@ -2032,6 +2079,15 @@ EOF
   report_service "Proxy" "$proxy_rc" "${LOG_DIR}/deis-proxy.log" \
     "the demo entry point is unreachable"
 
+  # Written here, before the deploy, and again at the end. Every process this
+  # run owns exists by now, and the state file is the only thing `stop` reads
+  # to find them: a deploy that is refused below ends this start with exit 1,
+  # and a start that had written nothing yet left eight processes holding
+  # their ports with no file naming their pids - the next `start` refused to
+  # run and `stop` had nothing to stop. The second write, at the end, adds
+  # what the deploy produced.
+  write_state
+
   deploy_example_app
 
   # Only now can the front door answer for this application: the routing table
@@ -2166,15 +2222,15 @@ CHECKS_FAILED=0
 # The summary is a tally of what happened to the checks that ran, and a tally
 # has nothing to say about a check that did not run. Delete a call from the
 # list in `verify_demo` -- by accident, in a merge, or because a check was
-# being skipped "for now" -- and the run goes from "95 passed, 0 failed" to
-# "94 passed, 0 failed", which reads as a slightly shorter green run and not
+# being skipped "for now" -- and the run goes from "94 passed, 0 failed" to
+# "93 passed, 0 failed", which reads as a slightly shorter green run and not
 # as one that stopped asking a question. The whole of the difference is a
 # digit nobody has the previous run in front of them to compare against.
 #
 # So the list has a length, it is written down, and a run that does not reach
 # it fails. Adding a check means changing this number, which is the point:
 # the number is the roll call.
-VERIFY_EXPECTED_CHECKS=95
+VERIFY_EXPECTED_CHECKS=94
 
 # Every claim a verdict has been printed for, one per line.
 #
@@ -2647,30 +2703,41 @@ check_site_redirect() {
 }
 
 check_site_headers() {
-  local title="a _headers block puts its header on the asset it names"
+  local title="a _headers block puts its headers on the asset it names and on nothing else"
   local styled="${LOG_DIR}/verify-site-headers-css.headers"
   local plain="${LOG_DIR}/verify-site-headers-root.headers"
 
   app_request "$styled" "$SITE_STYLESHEET" > /dev/null
   app_request "$plain" "/" > /dev/null
 
-  local styled_cache plain_cache referrer
+  local styled_cache styled_referrer plain_cache plain_referrer
   styled_cache=$(header_value "$styled" Cache-Control)
+  styled_referrer=$(header_value "$styled" Referrer-Policy)
   plain_cache=$(header_value "$plain" Cache-Control)
-  referrer=$(header_value "$styled" Referrer-Policy)
+  plain_referrer=$(header_value "$plain" Referrer-Policy)
 
-  # Two files, not one. A node that applied every block to every response
-  # would put the year-long Cache-Control on the HTML too, and asking only
-  # about the stylesheet could not tell that apart from the block matching the
-  # path it names.
+  # Two files, not one. A node that applied the block to every response would
+  # put the year-long Cache-Control and the Referrer-Policy on the HTML too,
+  # and asking only about the stylesheet could not tell that apart from the
+  # block matching the path it names.
+  #
+  # The file carries one block. It used to carry two - a `/*` block with the
+  # Referrer-Policy above the `/css/*` block - and this check used to read
+  # the Referrer-Policy on the stylesheet as proof that both matching blocks
+  # were composed. The locked Edge Canon standard lowers `_headers` with
+  # first-match semantics, and a file with more than one block is refused at
+  # build (EC_ROUTING_SOURCE_UNREPRESENTABLE), so composition is no longer
+  # something an application can be promised. What is promised is the block:
+  # both of its headers on the path it names, neither anywhere else.
   if [ "$styled_cache" = "$SITE_STYLESHEET_CACHE_CONTROL" ] \
-    && [ -n "$referrer" ] \
-    && [ "$plain_cache" != "$SITE_STYLESHEET_CACHE_CONTROL" ]; then
+    && [ "$styled_referrer" = "$SITE_STYLESHEET_REFERRER_POLICY" ] \
+    && [ "$plain_cache" != "$SITE_STYLESHEET_CACHE_CONTROL" ] \
+    && [ -z "$plain_referrer" ]; then
     pass_check "$title" \
-      "GET ${SITE_STYLESHEET} carries cache-control: ${styled_cache} from the /css/* block and referrer-policy: ${referrer} from the /* block above it; GET / matches only the second and keeps the node's own cache-control: ${plain_cache}"
+      "GET ${SITE_STYLESHEET} carries cache-control: ${styled_cache} and referrer-policy: ${styled_referrer}, both from the one /css/* block; GET / matches no block, so it carries no referrer-policy and keeps the node's own cache-control: ${plain_cache}. One block and not the /* block this file used to open with: the locked standard lowers _headers first-match, and a bundle with two blocks is refused at build (EC_ROUTING_SOURCE_UNREPRESENTABLE) rather than have one target compose them and another not"
   else
     fail_check "$title" \
-      "expected ${SITE_STYLESHEET} to carry cache-control: ${SITE_STYLESHEET_CACHE_CONTROL} and a referrer-policy, and / to keep the node's default; got '${styled_cache:-<none>}' and '${referrer:-<none>}' on the stylesheet, '${plain_cache:-<none>}' on /"
+      "expected ${SITE_STYLESHEET} to carry cache-control: ${SITE_STYLESHEET_CACHE_CONTROL} and referrer-policy: ${SITE_STYLESHEET_REFERRER_POLICY}, and / to carry no referrer-policy and keep the node's default cache-control; got '${styled_cache:-<none>}' and '${styled_referrer:-<none>}' on the stylesheet, '${plain_cache:-<none>}' and '${plain_referrer:-<none>}' on /"
   fi
 }
 
@@ -2746,36 +2813,112 @@ check_assets_binding() {
   fi
 }
 
-check_assets_binding_is_not_shadowable() {
-  local title="an application declaring ASSETS in its own env does not get its string"
-  local body
+# The application the check below tries, and fails, to deploy. A name of its
+# own, and a project of its own, so that the refusal cannot cost the example
+# app its deployment and nothing else in this run reads what it left behind.
+RESERVED_ENV_APP_ID="${RESERVED_ENV_APP_ID:-demo-reserved-env}"
+
+# Lay down a project that writes `ASSETS` into its own environment, and echo
+# the directory.
+#
+# Until the reserved-name rule reached the environment declarations, this was
+# the example app itself: it shipped a variable called ASSETS, the node lifted
+# it back out of the map, and the check below read the node's log to prove it
+# had. That was the weaker claim. A variable of that name is now refused where
+# it is written - the compiler will not mint a declaration for a name the
+# platform publishes - so an author is told before anything is built, and the
+# demo makes the earlier claim instead.
+#
+# Otherwise the smallest project the compiler accepts, so that nothing else in
+# it can be what was refused.
+prepare_reserved_env_source() {
+  local dest="${DEMO_DIR}/app-reserved-env"
+
+  rm -rf "$dest"
+  mkdir -p "${dest}/functions/api"
+
+  cat > "${dest}/.config.json" <<JSON
+{
+  "version": "1.0.0",
+  "name": "${RESERVED_ENV_APP_ID}",
+  "runtime": "standard-v1",
+  "language": "typescript",
+  "functionRoot": "./functions",
+  "compatibilityDate": "2026-09-01",
+  "environment": {
+    "variables": {
+      "ASSETS": "an-application-cannot-take-this-name"
+    }
+  },
+  "vendors": { "deislet": { "enabled": true } },
+  "build": { "outDir": "./dist" }
+}
+JSON
+
+  cat > "${dest}/functions/api/asset.ts" <<'TS'
+// A handler that reads the name it declared a value under. The value is the
+// point: if the project could be built, this would answer with the string,
+// and `env.ASSETS.fetch()` in any other handler of the same application would
+// throw "fetch is not a function" instead of reaching the version's files.
+export default async function handler(context: any): Promise<Response> {
+  return new Response(String(context.env.ASSETS) + "\n", {
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+TS
+
+  echo "$dest"
+}
+
+check_the_assets_name_cannot_be_declared_by_an_application() {
+  local title="an application declaring ASSETS in its own env is refused by the build, and a legal one gets the platform's binding"
+  local json="${LOG_DIR}/cli-deploy-reserved-env.json"
+  local errors="${LOG_DIR}/cli-deploy-reserved-env.log"
+
+  local dir
+  if ! dir=$(prepare_reserved_env_source); then
+    fail_check "$title" "the project could not be staged under ${DEMO_DIR}"
+    return
+  fi
+
+  # Through `deis deploy` and not `deis build`, for the reason the WebSocket
+  # refusal spells out: the claim is about what a person who tried to ship
+  # this would meet, and the deploy's first step is the build.
+  local status=0
+  (cd "$dir" && deis_cli deploy -e "$ENV_NAME" --app "$RESERVED_ENV_APP_ID" --json) \
+    > "$json" 2> "$errors" || status=$?
+
+  local message
+  message=$(grep -a -m 1 -o 'EC_ENV_NAMESPACE_COLLISION.*' "$errors" 2>/dev/null || true)
+
+  # What was left behind, on both sides: a bundle under the project, or an
+  # application in the catalog. The list is walked whole, so an application on
+  # a later page could not hide from this.
+  local built="no"
+  [ -e "${dir}/dist" ] && built="yes"
+  local listed
+  listed=$(control_list_all /api/v1/apps \
+    | jq -r --arg id "$RESERVED_ENV_APP_ID" '[.[] | select(.app_id == $id)] | length' 2>/dev/null || true)
+
+  # The other half of the same claim, from the application that *was* built:
+  # the name the refusal protects holds the platform's object, and no value of
+  # the application's is visible under it. Without this half the check would
+  # only say the platform refuses a name, not that it uses it.
+  local body kind callable leaked
   body=$(app_request "${LOG_DIR}/verify-assets-shadow.headers" "/api/asset")
   answered_json "$title" assets-shadow "$body" || return 0
-
-  local kind callable leaked
   kind=$(echo "$body" | jq -r '.bindingKind // empty' 2>/dev/null || true)
   callable=$(echo "$body" | jq -r '.bindingIsCallable // false' 2>/dev/null || true)
   leaked=$(echo "$body" | jq -r '.declaredValueVisible // empty' 2>/dev/null || true)
 
-  # The node's own account of what it did with the key, which is the half a
-  # response cannot show: an application that never declared ASSETS would
-  # produce the same JSON above.
-  # Deployment evidence: the node dropped the key while it was building the
-  # env map for this version, which was before this phase made a request. Read
-  # from the prefix that existed then, so a line an application echoed back
-  # while these checks ran cannot stand in for it.
-  local dropped
-  dropped=$(node_log_window "${DEMO_APP_DEPLOY_FROM:-0}" "${DEMO_APP_DEPLOY_TO:-0}" \
-    | grep -m 1 -F 'named like reserved platform keys' \
-    | grep -F 'ASSETS' || true)
-
-  if [ "$kind" = "object" ] && [ "$callable" = "true" ] && [ -z "$leaked" ] \
-    && [ -n "$dropped" ]; then
+  if [ "$status" -ne 0 ] && echo "$message" | grep -q "ASSETS" \
+    && [ "$built" = "no" ] && [ "${listed:-x}" = "0" ] \
+    && [ "$kind" = "object" ] && [ "$callable" = "true" ] && [ -z "$leaked" ]; then
     pass_check "$title" \
-      "the bundle's manifest declares an ordinary variable called ASSETS; the node dropped it before the map became context.env (keys=${dropped##*keys=}), and inside the isolate env.ASSETS is an ${kind} whose fetch() is a function, not the string the application shipped"
+      "deis deploy --app ${RESERVED_ENV_APP_ID} exited ${status} at its first step, the build: \"$(echo "$message" | cut -c1-200)\". No dist/ was written under the project and the control plane lists no application called ${RESERVED_ENV_APP_ID}. Meanwhile ${APP_ID}, which declares no such name, sees env.ASSETS as an ${kind} whose fetch() is a function. The platform owns this name at both ends: an application cannot take it, and what a handler finds under it is the platform's own binding"
   else
     fail_check "$title" \
-      "env.ASSETS is a ${kind:-<none>} (callable: ${callable}), the application's own value is $(if [ -n "$leaked" ]; then echo "visible as '${leaked}'"; else echo "not visible"; fi), and the node's log $(if [ -n "$dropped" ]; then echo "reports the key dropped"; else echo "never reports dropping a reserved key"; fi)"
+      "expected a non-zero exit naming EC_ENV_NAMESPACE_COLLISION and ASSETS, no dist/ and no application in the catalog, and env.ASSETS on ${APP_ID} an object with a callable fetch; got exit ${status}, message '${message:-<none>}', dist written: ${built}, applications called ${RESERVED_ENV_APP_ID}: ${listed:-<unreadable>}, env.ASSETS a ${kind:-<none>} (callable: ${callable}) with the application's own value $(if [ -n "$leaked" ]; then echo "visible as '${leaked}'"; else echo "not visible"; fi). The CLI said: $(tail -n 3 "$errors" | tr '\n' ' ' | head -c 300)"
   fi
 }
 
@@ -2973,224 +3116,6 @@ check_the_proxy_routes_by_host_and_path_prefix() {
 
   pass_check "$title" \
     "two routes on the one host ${ROUTED_HOST}: / to ${APP_ID}/${ENV_NAME} and ${ROUTED_PREFIX} to ${CALLEE_APP_ID}/${ENV_NAME}. With no x-deis-app-id on any of them, GET ${ROUTED_PREFIX} answered HTTP ${prefix_status} from ${CALLEE_APP_ID}'s own handler (handlerOf=${prefix_handler}), GET /hello/routed answered from ${APP_ID} version ${root_label}, GET ${ROUTED_NEAR_MISS} answered ${APP_ID}'s 404 page because a prefix covers whole path segments and not the letters they start with, and the same ${ROUTED_PREFIX} on a host nothing claims answered HTTP ${stranger_status}"
-}
-
-# ----------------------------------------------------------------------
-# The WebSocket hop
-# ----------------------------------------------------------------------
-#
-# One handshake and one frame of each kind, performed by hand against
-# deis-proxy.
-#
-# Through deis-proxy rather than straight at the node on purpose. An upgrade
-# is the one exchange a reverse proxy is most likely to ruin -- it can answer
-# the 101 itself, rewrite Sec-WebSocket-Accept, buffer the frames, or hold the
-# connection only as long as it holds an ordinary response -- and this hop had
-# never been exercised with a real handshake at all.
-#
-# By hand because of the evidence. A client library invents a fresh
-# Sec-WebSocket-Key on every run and checks the answer privately, which is
-# precisely the value worth printing here. RFC 6455 section 1.3 publishes one
-# key and the answer to it, so sending that key makes the correct
-# Sec-WebSocket-Accept a constant that can be shown and compared. The nonce is
-# only a handshake nonce; nothing about the connection depends on it being
-# unpredictable.
-#
-# python3 is used the same way `start_origin` uses it -- from the standard
-# library, nothing installed -- and its absence fails the check with the
-# reason rather than skipping it.
-WS_KEY="dGhlIHNhbXBsZSBub25jZQ=="
-WS_ACCEPT="s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-# Bytes no path that mistook the frame for text could carry through intact:
-# 0x00 ends a C string, 0xff and 0xfe never occur in UTF-8 at all, and 0x80 is
-# a continuation byte with no lead byte in front of it.
-WS_BINARY_HEX="00fffe807f41"
-WS_TEXT="demo-websocket-frame"
-
-websocket_exchange() {
-  local port=$1
-  python3 - "$port" "$APP_ID" "$WS_ROUTE" "$WS_KEY" "$WS_ACCEPT" "$WS_TEXT" "$WS_BINARY_HEX" <<'PY'
-import json
-import os
-import socket
-import struct
-import sys
-
-port, app, path, key, accept_expected, text, binary_hex = sys.argv[1:8]
-payload = bytes.fromhex(binary_hex)
-report = {"ok": False}
-
-
-def read_until_headers_end(sock):
-    # One byte at a time: a buffered read would pull whatever follows the
-    # header terminator out of the socket and into a buffer this function
-    # throws away, eating the first frames of a server that starts talking
-    # straight after the 101.
-    raw = b""
-    while not raw.endswith(b"\r\n\r\n"):
-        chunk = sock.recv(1)
-        if not chunk:
-            raise EOFError("closed after %d bytes of handshake response" % len(raw))
-        raw += chunk
-        if len(raw) > 8192:
-            raise ValueError("handshake response never ended")
-    return raw.decode("latin-1")
-
-
-def recv_exact(sock, count):
-    buf = b""
-    while len(buf) < count:
-        chunk = sock.recv(count - len(buf))
-        if not chunk:
-            raise EOFError("closed after %d of %d frame bytes" % (len(buf), count))
-        buf += chunk
-    return buf
-
-
-def send_frame(sock, opcode, body):
-    mask = os.urandom(4)
-    masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(body))
-    header = bytes([0x80 | opcode])
-    size = len(body)
-    if size < 126:
-        header += bytes([0x80 | size])
-    elif size < 65536:
-        header += bytes([0x80 | 126]) + struct.pack("!H", size)
-    else:
-        header += bytes([0x80 | 127]) + struct.pack("!Q", size)
-    sock.sendall(header + mask + masked)
-
-
-def read_frame(sock):
-    # Ping and pong are not the answer and are not a failure either; keep
-    # reading rather than deciding the check on frame order.
-    while True:
-        first, second = recv_exact(sock, 2)
-        opcode = first & 0x0F
-        size = second & 0x7F
-        if size == 126:
-            size = struct.unpack("!H", recv_exact(sock, 2))[0]
-        elif size == 127:
-            size = struct.unpack("!Q", recv_exact(sock, 8))[0]
-        if second & 0x80:
-            mask = recv_exact(sock, 4)
-            body = bytes(b ^ mask[i % 4] for i, b in enumerate(recv_exact(sock, size)))
-        else:
-            body = recv_exact(sock, size)
-        if opcode in (0x9, 0xA):
-            continue
-        if opcode == 0x8:
-            raise EOFError("the peer closed the connection instead of answering")
-        return opcode, body
-
-
-try:
-    sock = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
-    sock.settimeout(10)
-    request = (
-        "GET %s HTTP/1.1\r\n"
-        "Host: 127.0.0.1:%s\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: %s\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "x-deis-app-id: %s\r\n"
-        "\r\n" % (path, port, key, app)
-    )
-    sock.sendall(request.encode("ascii"))
-
-    head = read_until_headers_end(sock)
-    lines = head.split("\r\n")
-    report["status_line"] = lines[0]
-    headers = {}
-    for line in lines[1:]:
-        if ":" in line:
-            name, value = line.split(":", 1)
-            headers[name.strip().lower()] = value.strip()
-    report["accept"] = headers.get("sec-websocket-accept", "")
-    report["upgrade"] = headers.get("upgrade", "")
-    report["connection"] = headers.get("connection", "")
-    report["switched"] = (
-        report["status_line"].endswith("101 Switching Protocols")
-        and report["upgrade"].lower() == "websocket"
-        and report["connection"].lower() == "upgrade"
-        and report["accept"] == accept_expected
-    )
-
-    if report["switched"]:
-        send_frame(sock, 0x1, text.encode("utf-8"))
-        report["text_echo"] = read_frame(sock)[1].decode("utf-8", "replace")
-        send_frame(sock, 0x2, payload)
-        report["binary_echo"] = read_frame(sock)[1].decode("utf-8", "replace")
-        report["text_expected"] = "text:" + text
-        report["binary_expected"] = "binary:%d:%s" % (len(payload), binary_hex)
-        report["echoed"] = (
-            report["text_echo"] == report["text_expected"]
-            and report["binary_echo"] == report["binary_expected"]
-        )
-        # A close frame, so the node sees a closing handshake rather than a
-        # connection that vanished and logs an error about it.
-        send_frame(sock, 0x8, struct.pack("!H", 1000))
-    report["ok"] = report["switched"] and report.get("echoed", False)
-    sock.close()
-except Exception as failure:
-    report["error"] = "%s: %s" % (type(failure).__name__, failure)
-
-print(json.dumps(report))
-PY
-}
-
-# One field out of the exchange report, empty when it is not there.
-ws_field() {
-  jq -r "$2 // empty" < "$1" 2>/dev/null || true
-}
-
-check_websocket_through_proxy() {
-  local switched="a WebSocket handshake through deis-proxy switches protocols"
-  local echoed="a text frame and a binary frame survive the round trip through deis-proxy"
-  local report="${LOG_DIR}/verify-websocket.json"
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    fail_check "$switched" "python3 is not installed, so no handshake was made"
-    fail_check "$echoed" "python3 is not installed, so no frame was sent"
-    return
-  fi
-
-  websocket_exchange "$DEIS_PROXY_PORT" \
-    > "$report" 2> "${LOG_DIR}/verify-websocket.log" || true
-
-  local error
-  error=$(ws_field "$report" '.error')
-  if [ -n "$error" ]; then
-    fail_check "$switched" "127.0.0.1:${DEIS_PROXY_PORT}${WS_ROUTE} -> ${error}"
-    fail_check "$echoed" "there was no connection to send a frame over"
-    return
-  fi
-
-  if [ "$(ws_field "$report" '.switched')" = "true" ]; then
-    pass_check "$switched" \
-      "$(ws_field "$report" '.status_line'), Upgrade: $(ws_field "$report" '.upgrade'), Connection: $(ws_field "$report" '.connection'), Sec-WebSocket-Accept: $(ws_field "$report" '.accept') -- the RFC 6455 answer to the key that was sent, so the 101 came from the node and was relayed, not invented by the proxy"
-  else
-    local hint=""
-    # The handler is written into the staged sources at `start`, so a demo
-    # started before this check existed serves a 404 here and the reason is
-    # worth saying rather than leaving to be guessed.
-    case "$(ws_field "$report" '.status_line')" in
-      *404*) hint="; ${WS_ROUTE} is not in the deployed bundle, so this demo was started before the check existed - run \`demo.sh stop\` and \`demo.sh start\` again" ;;
-    esac
-    fail_check "$switched" \
-      "got \"$(ws_field "$report" '.status_line')\" with Sec-WebSocket-Accept \"$(ws_field "$report" '.accept')\", expected \"HTTP/1.1 101 Switching Protocols\" and \"${WS_ACCEPT}\"${hint}"
-    fail_check "$echoed" "the handshake did not complete, so no frame was sent"
-    return
-  fi
-
-  if [ "$(ws_field "$report" '.echoed')" = "true" ]; then
-    pass_check "$echoed" \
-      "text \"${WS_TEXT}\" -> \"$(ws_field "$report" '.text_echo')\"; binary ${WS_BINARY_HEX} ($(( ${#WS_BINARY_HEX} / 2 )) bytes that are not valid UTF-8: 0xff and 0xfe never occur in it and 0x80 has no lead byte in front of it) -> \"$(ws_field "$report" '.binary_echo')\""
-  else
-    fail_check "$echoed" \
-      "text -> \"$(ws_field "$report" '.text_echo')\", expected \"$(ws_field "$report" '.text_expected')\"; binary -> \"$(ws_field "$report" '.binary_echo')\", expected \"$(ws_field "$report" '.binary_expected')\""
-  fi
 }
 
 # Read a streaming response over a raw socket, recording when each piece of the
@@ -4925,25 +4850,47 @@ check_cli_blob_verbs() {
   local title="deis blob list, head and get --offset reach the same objects the app stored"
   local out="${LOG_DIR}/cli-blob"
 
-  if ! deis_cli blob list img/ --json > "${out}-list.json" 2> "${out}-list.log"; then
+  # `--binding BLOB` on every call, for the same reason `add_blob_route`
+  # declares the binding: the handler stores through `context.env.BLOB`, and a
+  # named binding is its own namespace inside the tenant. An operator who omits
+  # the name is not looking at the application's objects, so the CLI has to be
+  # given the name the application was given or this check would be comparing
+  # two different namespaces and calling the difference a bug.
+  if ! deis_cli blob list img/ --binding BLOB --json > "${out}-list.json" 2> "${out}-list.log"; then
     fail_check "$title" \
       "deis blob list failed: $(tail -n 3 "${out}-list.log" | tr '\n' ' ')"
     return
   fi
-  if ! deis_cli blob head index.html --json > "${out}-head.json" 2> "${out}-head.log"; then
+  if ! deis_cli blob head index.html --binding BLOB --json > "${out}-head.json" 2> "${out}-head.log"; then
     fail_check "$title" \
       "deis blob head failed: $(tail -n 3 "${out}-head.log" | tr '\n' ' ')"
     return
   fi
-  if ! deis_cli blob get index.html --offset 4 --length 6 --json > "${out}-get.json" 2> "${out}-get.log"; then
+  if ! deis_cli blob get index.html --offset 4 --length 6 --binding BLOB --json \
+    > "${out}-get.json" 2> "${out}-get.log"; then
     fail_check "$title" \
       "deis blob get --offset failed: $(tail -n 3 "${out}-get.log" | tr '\n' ' ')"
     return
   fi
 
+  # The same listing with no binding named. It has to come back empty: that is
+  # what makes the three answers above evidence that the CLI reached the
+  # application's namespace rather than evidence that every namespace answers
+  # the same. If this ever listed the seeded keys, a binding would not be an
+  # isolation boundary at all.
+  if ! deis_cli blob list img/ --json > "${out}-unnamed.json" 2> "${out}-unnamed.log"; then
+    fail_check "$title" \
+      "deis blob list without --binding failed: $(tail -n 3 "${out}-unnamed.log" | tr '\n' ' ')"
+    return
+  fi
+
   local listed folders headed_size headed_etag sliced offset length
+  local namespace unnamed_namespace unnamed_count
   listed=$(jq -r '[.objects[].key] | join(",")' < "${out}-list.json" 2>/dev/null || true)
   folders=$(jq -r '.prefixes | join(",")' < "${out}-list.json" 2>/dev/null || true)
+  # Read off the answer rather than assumed: the CLI prints the namespace it
+  # presented to deis-store, and that string is the whole claim here.
+  namespace=$(jq -r '.tenant // empty' < "${out}-list.json" 2>/dev/null || true)
   headed_size=$(jq -r '.size // empty' < "${out}-head.json" 2>/dev/null || true)
   headed_etag=$(jq -r '.sha256 // empty' < "${out}-head.json" 2>/dev/null || true)
   # A blob body is bytes, so --json carries it base64 for the reason
@@ -4952,15 +4899,19 @@ check_cli_blob_verbs() {
     | openssl base64 -d -A 2>/dev/null || true)
   offset=$(jq -r '.range.offset // empty' < "${out}-get.json" 2>/dev/null || true)
   length=$(jq -r '.range.length // empty' < "${out}-get.json" 2>/dev/null || true)
+  unnamed_namespace=$(jq -r '.tenant // empty' < "${out}-unnamed.json" 2>/dev/null || true)
+  unnamed_count=$(jq -r '.objects | length' < "${out}-unnamed.json" 2>/dev/null || true)
 
   if [ "$listed" = "img/hero.png,img/icons/star.svg,img/logo.png" ] \
+    && [ "$namespace" = "${APP_ID}.${ENV_NAME}@BLOB" ] \
     && [ "$headed_size" = "16" ] && [ -n "$headed_etag" ] \
-    && [ "$sliced" = "456789" ] && [ "$offset" = "4" ] && [ "$length" = "6" ]; then
+    && [ "$sliced" = "456789" ] && [ "$offset" = "4" ] && [ "$length" = "6" ] \
+    && [ "$unnamed_namespace" = "${APP_ID}.${ENV_NAME}" ] && [ "$unnamed_count" = "0" ]; then
     pass_check "$title" \
-      "\`deis blob list img/\` printed ${listed} (prefixes [${folders}]); \`deis blob head index.html\` reported 16 bytes and sha256 ${headed_etag:0:12}; \`deis blob get index.html --offset 4 --length 6\` returned '${sliced}' and reported range offset ${offset} length ${length}. Every one of these objects was stored by the application, not by the CLI"
+      "\`deis blob list img/ --binding BLOB\` printed ${listed} (prefixes [${folders}]) and reported the namespace as ${namespace} - the one \`context.env.BLOB\` writes into; \`deis blob head index.html --binding BLOB\` reported 16 bytes and sha256 ${headed_etag:0:12}; \`deis blob get index.html --offset 4 --length 6 --binding BLOB\` returned '${sliced}' and reported range offset ${offset} length ${length}. Every one of these objects was stored by the application, not by the CLI. The same listing without --binding looks at ${unnamed_namespace} and finds ${unnamed_count} objects there, so the named namespace sits beside the unnamed one rather than on top of it"
   else
     fail_check "$title" \
-      "expected the three img/ keys, a 16-byte head and the slice '456789' at offset 4 length 6; got list [${listed:-<none>}], head size '${headed_size:-<none>}', slice '${sliced:-<none>}' at offset '${offset:-<none>}' length '${length:-<none>}'"
+      "expected the three img/ keys in namespace ${APP_ID}.${ENV_NAME}@BLOB, a 16-byte head, the slice '456789' at offset 4 length 6, and nothing under img/ in ${APP_ID}.${ENV_NAME}; got list [${listed:-<none>}] in namespace '${namespace:-<none>}', head size '${headed_size:-<none>}', slice '${sliced:-<none>}' at offset '${offset:-<none>}' length '${length:-<none>}', and ${unnamed_count:-<none>} objects in '${unnamed_namespace:-<none>}'"
   fi
 }
 
@@ -7430,6 +7381,115 @@ BUNDLE
     "one \`deis build -v all\` over ${PORTABLE_SRC_DIR} published one canonical parent and four immutable payload directories under dist/providers/<vendor>/<digest>. Deislet carries bundle.zip, Cloudflare carries index.js plus the wrangler.toml naming \"portable\", Deno carries the reconstructed canonical module and its generated catch-all router, and EdgeOne carries edge-functions/index.js plus edgeone.json. Every entry carries the handler's own marker, and Cloudflare's and EdgeOne's differ from one another, so each packager built the shape its host expects from the same parent rather than copying one output four times. The files are this compiler's own work; what a vendor's tool said about them on this machine, from the build log: ${verified}. A target marked NOT verified was verified nowhere in this run"
 }
 
+# The application the check below tries, and fails, to deploy. A name of its
+# own so that the refusal is filed under nothing the rest of the run reads.
+WEBSOCKET_APP_ID="${WEBSOCKET_APP_ID:-demo-websocket}"
+
+# Lay down a project whose one handler is the WebSocket echo endpoint this
+# demo used to deploy, and echo the directory.
+#
+# Until the standard was locked the handler below was written into the staged
+# copy of the example app, and two checks drove a real RFC 6455 handshake
+# through deis-proxy and echoed a text frame and a binary frame over it. Edge
+# Canon v1 defines no WebSocket application API - no WebSocketPair, no
+# WebSocketServer, no 101 with a socket attached - because only some of the
+# providers it covers have one, and a handler that runs on those alone is not
+# portable. So what the platform promises about this handler changed: not
+# that it works, but that it is refused by the build, which is the first step
+# of `deis deploy`, before an application, an environment or a version exists
+# for it. The handler is staged in a project of its own so that the refusal
+# cannot cost the example app its deployment, and the project is otherwise
+# the smallest one the compiler accepts, so that nothing else in it can be
+# what was refused.
+prepare_websocket_source() {
+  local dest="${DEMO_DIR}/app-websocket"
+
+  rm -rf "$dest"
+  mkdir -p "${dest}/functions/api"
+
+  cat > "${dest}/.config.json" <<JSON
+{
+  "version": "1.0.0",
+  "name": "${WEBSOCKET_APP_ID}",
+  "runtime": "standard-v1",
+  "language": "typescript",
+  "functionRoot": "./functions",
+  "compatibilityDate": "2026-09-01",
+  "vendors": { "deislet": { "enabled": true } },
+  "build": { "outDir": "./dist" }
+}
+JSON
+
+  cat > "${dest}/functions/api/ws.ts" <<'TS'
+// A WebSocket echo endpoint in the shape some providers describe: make a
+// WebSocketPair, accept the server half, and answer 101 with the client half
+// attached to the Response. Edge Canon v1 has no portable form of any of it,
+// so the build refuses this file at the reference to WebSocketPair.
+export default async function handler(context: any): Promise<Response> {
+  if (context.request.headers.get("upgrade") !== "websocket") {
+    return new Response("this path answers a WebSocket handshake\n", {
+      status: 426,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
+  server.addEventListener("message", (event: any) => {
+    server.send("text:" + String(event.data));
+  });
+
+  return new Response(null, { status: 101, webSocket: client });
+}
+TS
+
+  echo "$dest"
+}
+
+check_a_websocket_handler_is_refused_by_the_build() {
+  local title="a handler that reaches for WebSocketPair is refused by the build, before anything is deployed"
+  local json="${LOG_DIR}/cli-deploy-websocket.json"
+  local errors="${LOG_DIR}/cli-deploy-websocket.log"
+
+  local dir
+  if ! dir=$(prepare_websocket_source); then
+    fail_check "$title" "the project could not be staged under ${DEMO_DIR}"
+    return
+  fi
+
+  # Through `deis deploy` and not `deis build`, because the claim is about
+  # what a person who tried to ship this would meet: the deploy's first step
+  # is the build, and a deploy that is refused there has nothing left to do.
+  # `--app` for the reason the callee's deploy spells it: DEIS_APP in the
+  # CLI's environment names the example app.
+  local status=0
+  (cd "$dir" && deis_cli deploy -e "$ENV_NAME" --app "$WEBSOCKET_APP_ID" --json) \
+    > "$json" 2> "$errors" || status=$?
+
+  local message
+  message=$(grep -a -m 1 -o 'EC_STREAM_WEBSOCKET_NONPORTABLE.*' "$errors" 2>/dev/null || true)
+
+  # What was left behind, on both sides: a bundle under the project, or an
+  # application in the catalog. The list is walked whole, so an application
+  # on a later page could not hide from this.
+  local built="no"
+  [ -e "${dir}/dist" ] && built="yes"
+  local listed
+  listed=$(control_list_all /api/v1/apps \
+    | jq -r --arg id "$WEBSOCKET_APP_ID" '[.[] | select(.app_id == $id)] | length' 2>/dev/null || true)
+
+  if [ "$status" -ne 0 ] && echo "$message" | grep -q "WebSocketPair" \
+    && [ "$built" = "no" ] && [ "${listed:-x}" = "0" ]; then
+    pass_check "$title" \
+      "deis deploy --app ${WEBSOCKET_APP_ID} exited ${status} at its first step, the build: \"$(echo "$message" | cut -c1-200)\". No dist/ was written under the project and the control plane lists no application called ${WEBSOCKET_APP_ID}. This handler used to be deployed by this demo and driven through deis-proxy with a real handshake; the locked standard removed the server-side WebSocket API rather than leave it to the providers that have one, so what an application is promised is this refusal, and not a 101"
+  else
+    fail_check "$title" \
+      "expected a non-zero exit naming EC_STREAM_WEBSOCKET_NONPORTABLE and WebSocketPair, no dist/ and no application in the catalog; got exit ${status}, message '${message:-<none>}', dist written: ${built}, applications called ${WEBSOCKET_APP_ID}: ${listed:-<unreadable>}. The CLI said: $(tail -n 3 "$errors" | tr '\n' ' ' | head -c 300)"
+  fi
+}
+
 check_cli_deploy() {
   local report="${LOG_DIR}/cli-deploy-v1.json"
   local title="deis deploy takes a project from source to serving"
@@ -7657,10 +7717,18 @@ control_status() {
 # The same, answering with the body, so a check can assert on what the caller
 # was told rather than only on the number.
 control_answer() {
-  local method=$1 path=$2 credential=$3
+  local method=$1 path=$2 credential=$3 body=${4:-}
   local args=(-s -X "$method" "$(control_url)${path}")
   if [ -n "$credential" ]; then
     args+=(-H "Authorization: Bearer ${credential}")
+  fi
+  # A body, on the same terms as `control_status`. A check that wants to read
+  # the sentence a refusal carries has to send the request the caller would
+  # really have sent: a write route validates its body, so a request that
+  # omits it is refused for the wrong reason and the sentence under test is
+  # never reached.
+  if [ -n "$body" ]; then
+    args+=(-H "Content-Type: application/json" --data "$body")
   fi
   curl "${args[@]}"
 }
@@ -7715,13 +7783,32 @@ check_a_scoped_token_reaches_one_environment_and_no_other() {
   local preview_version
   preview_version=$(deployed_version "$PREVIEW_ENV_NAME")
 
+  # A deploy carries the application's configuration with it. Under the
+  # locked environment standard a config value is deployment-time input: it
+  # is not in the bundle, not in the canonical artifact and not kept by the
+  # control plane between deploys, so every deploy request states the values
+  # its declarations ask for and a request that omits a required one is
+  # refused with EC_ENV_REQUIRED_MISSING before authority is ever the
+  # question. The CLI reads them from the project file; this check is a
+  # `curl` standing in for the CLI, so it reads them from the same place -
+  # the staged project - rather than repeating them here, which would go
+  # stale the first time the example app gains a variable.
+  # The values of the version being re-pointed at, not of some other build.
+  # `preview` runs the app-v2 project, whose BUILD_LABEL is what the earlier
+  # check on two environments serving at once reads back, so sending app-v1's
+  # values here would quietly relabel preview and break that claim one run
+  # later.
+  local config_values
+  config_values=$(jq -c '.environment.variables // {}' \
+    < "${DEMO_DIR}/app-v2/.config.json" 2>/dev/null || echo '{}')
+
   local allowed refused_env refused_secret refused_platform refused_token
   allowed=$(control_status POST \
     "/api/v1/apps/${APP_ID}/environments/${PREVIEW_ENV_NAME}/deployments" "$token" \
-    "{\"version_id\":\"${preview_version}\",\"note\":\"deployed by a scoped token\"}")
+    "{\"version_id\":\"${preview_version}\",\"note\":\"deployed by a scoped token\",\"config_values\":${config_values}}")
   refused_env=$(control_status POST \
     "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "$token" \
-    "{\"version_id\":\"${preview_version}\"}")
+    "{\"version_id\":\"${preview_version}\",\"config_values\":${config_values}}")
   refused_secret=$(control_status PUT \
     "/api/v1/apps/${APP_ID}/environments/${PREVIEW_ENV_NAME}/secrets/CI_ATTEMPT" "$token" \
     '{"value":"this must never be stored"}')
@@ -7735,6 +7822,7 @@ check_a_scoped_token_reaches_one_environment_and_no_other() {
   local told
   told=$(control_answer POST \
     "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "$token" \
+    "{\"version_id\":\"${preview_version}\",\"config_values\":${config_values}}" \
     | jq -r '.error.message // empty')
 
   # Narrow has to stay usable. `deis status` walks every environment of the
@@ -7755,15 +7843,23 @@ check_a_scoped_token_reaches_one_environment_and_no_other() {
     '[.environments[] | select(.name == $env) | .visible][0] | tostring' \
     < "$status_json" 2>/dev/null || true)
 
-  if [ "$allowed" = "201" ] && [ "$refused_env" = "403" ] && [ "$refused_secret" = "403" ] \
+  # 201 or 202, and the difference is not about authority. The route answers
+  # 201 when the pointer was moved and the node already has the version, and
+  # 202 when the delivery is being coordinated and the caller is given a
+  # `Location` to poll; which one a particular deploy gets depends on whether
+  # this environment's configuration snapshot is the one the node is already
+  # holding, not on what the credential was allowed to do. The claim under
+  # test is that this token may deploy here at all, so both answers satisfy
+  # it and the sentence below says which one arrived.
+  if { [ "$allowed" = "201" ] || [ "$allowed" = "202" ]; } && [ "$refused_env" = "403" ] && [ "$refused_secret" = "403" ] \
     && [ "$refused_platform" = "403" ] && [ "$refused_token" = "403" ] \
     && [ "$status_exit" = "0" ] && [ -n "$seen" ] && [ "$hidden" = "false" ] \
     && echo "$told" | grep -q "deploy:${APP_ID}/${ENV_NAME}"; then
     pass_check "$title" \
-      "carrying only deploy:${APP_ID}/${PREVIEW_ENV_NAME}, the token re-deployed ${PREVIEW_ENV_NAME} to ${preview_version} (HTTP ${allowed}); the same call against ${ENV_NAME} answered ${refused_env}, writing a secret on its own environment ${refused_secret}, reading the audit log ${refused_platform} and listing credentials ${refused_token}. The refusal names the scope that would have worked: \"${told}\". \`deis status\` still works for it: ${PREVIEW_ENV_NAME} shows version ${seen} and ${ENV_NAME} comes back visible=${hidden} rather than failing the command"
+      "carrying only deploy:${APP_ID}/${PREVIEW_ENV_NAME}, the token re-deployed ${PREVIEW_ENV_NAME} to ${preview_version} (HTTP ${allowed} - accepted, whether delivered outright or handed back a Location to poll), sending the project's own configuration ${config_values} with it because a deploy carries its configuration rather than finding it stored; the same call against ${ENV_NAME} answered ${refused_env}, writing a secret on its own environment ${refused_secret}, reading the audit log ${refused_platform} and listing credentials ${refused_token}. The refusal names the scope that would have worked: \"${told}\". \`deis status\` still works for it: ${PREVIEW_ENV_NAME} shows version ${seen} and ${ENV_NAME} comes back visible=${hidden} rather than failing the command"
   else
     fail_check "$title" \
-      "deploy to ${PREVIEW_ENV_NAME} answered ${allowed} (expected 201 Created); ${ENV_NAME} ${refused_env}, secret ${refused_secret}, audit ${refused_platform}, tokens ${refused_token} (expected 403 each). \`deis status\` exited ${status_exit} showing ${PREVIEW_ENV_NAME} version '${seen:-none}' and ${ENV_NAME} visible '${hidden:-none}'. The refusal said: ${told:-nothing}"
+      "deploy to ${PREVIEW_ENV_NAME} answered ${allowed} (expected 201 Created or 202 Accepted); ${ENV_NAME} ${refused_env}, secret ${refused_secret}, audit ${refused_platform}, tokens ${refused_token} (expected 403 each). \`deis status\` exited ${status_exit} showing ${PREVIEW_ENV_NAME} version '${seen:-none}' and ${ENV_NAME} visible '${hidden:-none}'. The refusal said: ${told:-nothing}"
   fi
 }
 
@@ -8734,6 +8830,10 @@ verify_demo() {
   # builds a second, much smaller project and deploys none of it: three of the
   # four targets are for platforms nothing here runs.
   check_every_compiler_target_is_built
+  # And the other half of what the compiler is for: a project the standard
+  # has no portable shape for is refused by the same command, at the same
+  # step, before an application, environment or version exists for it.
+  check_a_websocket_handler_is_refused_by_the_build
   echo "-- asset-first serving --"
   check_static_asset
   # The three files a static site configures itself with, and the way back
@@ -8744,22 +8844,17 @@ verify_demo() {
   check_site_headers
   check_site_not_found
   check_assets_binding
-  check_assets_binding_is_not_shadowable
+  check_the_assets_name_cannot_be_declared_by_an_application
   echo "-- routing --"
   check_route_parameter
   # Through deis-proxy and with no x-deis-app-id header, which is the only
   # arrangement in which a route decides anything. It leaves two rules in the
   # catalog on a host nothing else here uses.
   check_the_proxy_routes_by_host_and_path_prefix
-  echo "-- websockets --"
-  # Through deis-proxy, which is the only check here that goes through it.
-  # Everything else addresses the node directly, so a proxy that mangled an
-  # upgrade would have left every other check green.
-  check_websocket_through_proxy
   echo "-- streaming responses --"
-  # The first two go through deis-proxy for the same reason the WebSocket check
-  # does: it is the only hop that could quietly collect a body, and a proxy that
-  # buffered one would leave every other check here green.
+  # The first two go through deis-proxy, which is the only hop that could
+  # quietly collect a body: everything else addresses the node directly, so a
+  # proxy that buffered one would leave every other check here green.
   check_server_sent_events_reach_the_client_frame_by_frame
   check_a_streamed_response_is_chunked_and_left_uncompressed
   check_a_stream_fed_from_fetch_is_not_collected

@@ -713,6 +713,20 @@ pub struct StorageCredentials {
     pub token: Option<String>,
 }
 
+/// What this credential can see of the runtime fleet.
+///
+/// Fleet scope belongs to the platform operator, so a credential that only
+/// reaches one application is refused this list. That refusal is an answer
+/// a command can print, not a failure: `deis status` is about an
+/// application, and the node section is one part of its report.
+#[derive(Debug, Clone)]
+pub enum FleetView {
+    /// The nodes this control plane knows about.
+    Nodes(Vec<Node>),
+    /// The credential in hand does not hold fleet scope.
+    NotPermitted,
+}
+
 /// What this credential can see of one environment's current deployment.
 ///
 /// A token scoped to one environment of an application can list that
@@ -1172,8 +1186,8 @@ impl Control {
             check_list_envelope(path, page_number, &page);
             let empty = page.items.is_empty();
             items.extend(page.items);
-            cursor = page.page.next_cursor;
-            match cursor {
+            let next = page.page.next_cursor;
+            match &next {
                 None => return Ok(items),
                 Some(_) if empty => {
                     // Following this would ask for page after page of
@@ -1189,8 +1203,29 @@ impl Control {
                          another one; it is not paginating this list correctly"
                     );
                 }
+                Some(token) if cursor.as_deref() == Some(token.as_str()) => {
+                    // A cursor handed back unchanged points at the page that
+                    // was just read, so following it reads the same rows
+                    // again. Left alone that is not a hang but something
+                    // worse: the loop only stops at the page ceiling, and
+                    // what it returns by then is the same page repeated
+                    // thousands of times, which a caller has no way to tell
+                    // from a genuinely long history. Refuse on the second
+                    // sighting instead, while the answer is still small.
+                    tracing::error!(
+                        path,
+                        page_number,
+                        "control plane handed back the cursor it was sent"
+                    );
+                    bail!(
+                        "{what}: the control plane answered with the same cursor it was given, so \
+                         the page it offers next is the one just read; it is not paginating this \
+                         list correctly"
+                    );
+                }
                 Some(_) => {}
             }
+            cursor = next;
         }
         tracing::error!(
             path,
@@ -2346,15 +2381,28 @@ impl Control {
 
     // ---- nodes --------------------------------------------------------
 
-    /// Every runtime node this control plane knows about.
-    pub async fn list_nodes(&self) -> Result<Vec<Node>> {
-        let response: NodesResponse = self
-            .send(
-                self.platform_request(Method::GET, "/runtime"),
-                "listing the runtime nodes",
-            )
+    /// Every runtime node this control plane knows about, or the fact that
+    /// this credential may not see the fleet.
+    ///
+    /// The fleet list is a platform diagnostic: each row carries a node's
+    /// management address, its key status and its key fingerprint, and
+    /// `docs/adr/016-api-cli-web-console.md` keeps fleet scope with the
+    /// platform operator. An application credential is therefore *meant* to
+    /// be refused here, and `deis status` says so in its node section
+    /// rather than failing a command whose subject is an application.
+    pub async fn list_nodes(&self) -> Result<FleetView> {
+        let reply = self
+            .dispatch(self.platform_request(Method::GET, "/runtime"))
             .await?;
-        Ok(response.nodes)
+        if reply.status == StatusCode::FORBIDDEN {
+            return Ok(FleetView::NotPermitted);
+        }
+        if !reply.status.is_success() {
+            bail!(self.http_error(&reply, "listing the runtime nodes"));
+        }
+        let response: NodesResponse = serde_json::from_slice(&reply.body)
+            .with_context(|| "listing the runtime nodes".to_string())?;
+        Ok(FleetView::Nodes(response.nodes))
     }
 
     /// What one node reports it is running.
@@ -2610,6 +2658,10 @@ mod list_page_tests {
         routing::get,
     };
     use std::collections::HashMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     /// Deliberately full of characters a URL gives a meaning to, so a token
     /// that survives this round trip survives any the control plane mints.
@@ -3089,6 +3141,51 @@ mod list_page_tests {
         assert!(error.contains("empty page"), "{error}");
         let _ = shutdown.send(());
     }
+
+    /// A control plane that repeats its own cursor - a bug in its keyset
+    /// paging, or a cache in front of it replaying one answer - hands back a
+    /// page that is full, so the empty-page refusal above never fires. The
+    /// refusal has to happen on the second sighting of the token: waiting
+    /// for the page ceiling would mean ten thousand requests and a list of
+    /// duplicates the caller would print as though they were distinct rows.
+    #[tokio::test]
+    async fn a_cursor_the_control_plane_repeats_is_refused_on_its_second_use() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let router = Router::new().route(
+            "/api/v1/apps/demo/environments",
+            get(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "schemaVersion": 1,
+                        "items": [{
+                            "id": "env-1",
+                            "app_id": "demo",
+                            "name": "production",
+                            "created_at": 1
+                        }],
+                        "page": {"limit": 100, "count": 1, "total": 7, "nextCursor": "stuck"}
+                    }))
+                }
+            }),
+        );
+        let (control, shutdown) = control_for(router).await;
+        let error = control
+            .list_environments("demo")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("same cursor it was given"), "{error}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "the repeat must be caught on the request that came back with it, not at the page \
+             ceiling"
+        );
+        let _ = shutdown.send(());
+    }
 }
 
 /// The two prefixes, the deprecation window, and the two error shapes.
@@ -3361,6 +3458,35 @@ mod surface_tests {
         let _ = shutdown.send(());
     }
 
+    /// Fleet scope is the platform operator's, so an application
+    /// credential is refused this list. `deis status` reports that as a
+    /// section of its answer, so the client must hand it back as one
+    /// rather than as a failed command.
+    #[tokio::test]
+    async fn a_credential_without_fleet_scope_is_told_so_and_not_failed() {
+        let router = Router::new().route(
+            "/api/platform/runtime",
+            get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "insufficient-scope",
+                            "message": "this call needs read:*/*",
+                            "retryable": false
+                        }
+                    })),
+                )
+            }),
+        );
+        let (control, shutdown) = control_for(router).await;
+        assert!(matches!(
+            control.list_nodes().await.unwrap(),
+            FleetView::NotPermitted
+        ));
+        let _ = shutdown.send(());
+    }
+
     #[tokio::test]
     async fn the_fleet_is_read_from_the_platform_surface() {
         let router = Router::new()
@@ -3381,7 +3507,9 @@ mod surface_tests {
                 }),
             );
         let (control, shutdown) = control_for(router).await;
-        let nodes = control.list_nodes().await.unwrap();
+        let FleetView::Nodes(nodes) = control.list_nodes().await.unwrap() else {
+            panic!("the fleet is readable with this credential");
+        };
         assert_eq!(nodes[0].id, "n1");
         let apps = control.node_status("n1").await.unwrap().unwrap();
         assert_eq!(apps[0].app_id, "demo");
@@ -3798,5 +3926,515 @@ mod provider_deployment_tests {
         assert!(first.parse::<CanonicalId>().is_ok(), "{first}");
         assert_ne!(first, second);
         assert!((8..=255).contains(&first.len()), "{first}");
+    }
+}
+
+/// The control plane's own captured answers, read the way the commands read
+/// them.
+///
+/// `contracts/openapi/v1-examples.json` holds one real response body per
+/// schema, captured from `deis-control`'s handlers and regenerated with
+/// `UPDATE_OPENAPI=1`. `docs/adr/016-api-cli-web-console.md` records that this
+/// CLI's client stays hand-written and is held to those captures instead of
+/// being generated from the document - an arrangement that only means
+/// anything if something on this side actually reads them, and until these
+/// tests nothing did. The control plane's own gate compares the file against
+/// its handlers and is satisfied when the two agree, so renaming a member on
+/// the server and regenerating the file left every gate green while the CLI
+/// that still asked for the old name failed at runtime, in front of an
+/// operator, with a parse error naming a field nobody had touched. This is
+/// the missing half of the arrangement: the captures are read here as the
+/// commands read a live answer, so that rename fails in CI instead.
+///
+/// Two surfaces this CLI speaks have no capture to be held to yet, and both
+/// are gaps in `deis-control`'s capture rather than here: the provider
+/// deployment workflow (`ProviderDeployment`) and one node's status
+/// (`NodeStatusResponse`). Neither has an example in the file, so the
+/// classification below has nothing to name and the mirrors stay unguarded.
+#[cfg(test)]
+mod captured_example_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    /// Where the captured answers live, relative to this crate. Read from
+    /// the working tree rather than embedded, because the point is to fail
+    /// when the committed file moves under a CLI that was not changed with
+    /// it.
+    const EXAMPLES: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/openapi/v1-examples.json"
+    );
+
+    /// What this CLI does with one captured response schema.
+    enum Read {
+        /// Deserialised into the named mirror type by the function beside
+        /// it, which does exactly the `serde` work the command that reads
+        /// the route does.
+        Into(&'static str, fn(Value) -> serde_json::Result<()>),
+        /// Nothing in this CLI reads the route. The string says who does,
+        /// so that "the CLI ignores this" stays a decision on the record
+        /// rather than an omission.
+        NotRead(&'static str),
+    }
+
+    /// Every schema the capture carries, and this CLI's reading of it.
+    ///
+    /// Exhaustive on purpose. A route added to the control plane adds a
+    /// capture, and an unclassified capture fails
+    /// [`every_captured_answer_is_classified`] - which is the moment to
+    /// decide whether the CLI ought to be reading it, rather than a year
+    /// later when somebody notices the command was never written.
+    fn readings() -> Vec<(&'static str, Read)> {
+        vec![
+            (
+                "Account",
+                Read::Into("Account", |v| {
+                    serde_json::from_value::<Account>(v).map(drop)
+                }),
+            ),
+            (
+                "ApiToken",
+                Read::Into("ApiToken", |v| {
+                    serde_json::from_value::<ApiToken>(v).map(drop)
+                }),
+            ),
+            (
+                "App",
+                Read::Into("App", |v| serde_json::from_value::<App>(v).map(drop)),
+            ),
+            (
+                "ConfigKeyOutcome",
+                Read::NotRead("node configuration is a Web console surface"),
+            ),
+            (
+                "ConfigStatsResponse",
+                Read::NotRead("node configuration is a Web console surface"),
+            ),
+            (
+                "ConfigValue",
+                Read::NotRead("node configuration is a Web console surface"),
+            ),
+            (
+                "ConfigsListing",
+                Read::NotRead("node configuration is a Web console surface"),
+            ),
+            (
+                "ConfigsUpdated",
+                Read::NotRead("node configuration is a Web console surface"),
+            ),
+            (
+                "ControlListPage_Account",
+                Read::Into("ListPage<Account>", |v| {
+                    serde_json::from_value::<ListPage<Account>>(v).map(drop)
+                }),
+            ),
+            (
+                "ControlListPage_ApiToken",
+                Read::Into("ListPage<ApiToken>", |v| {
+                    serde_json::from_value::<ListPage<ApiToken>>(v).map(drop)
+                }),
+            ),
+            (
+                "ControlListPage_App",
+                Read::NotRead(
+                    "this CLI names the application it acts on; it has no catalog listing",
+                ),
+            ),
+            (
+                "ControlListPage_AuditEntry",
+                Read::Into("ListPage<AuditEntry>", |v| {
+                    serde_json::from_value::<ListPage<AuditEntry>>(v).map(drop)
+                }),
+            ),
+            (
+                "ControlListPage_CommandSummary",
+                Read::NotRead("node commands are a Web console surface"),
+            ),
+            (
+                "ControlListPage_ConfigHistoryItem",
+                Read::NotRead("node configuration is a Web console surface"),
+            ),
+            (
+                "ControlListPage_Deployment",
+                Read::Into("ListPage<Deployment>", |v| {
+                    serde_json::from_value::<ListPage<Deployment>>(v).map(drop)
+                }),
+            ),
+            (
+                "ControlListPage_DomainGrant",
+                Read::Into("ListPage<DomainGrant>", |v| {
+                    serde_json::from_value::<ListPage<DomainGrant>>(v).map(drop)
+                }),
+            ),
+            (
+                "ControlListPage_Environment",
+                Read::Into("ListPage<Environment>", |v| {
+                    serde_json::from_value::<ListPage<Environment>>(v).map(drop)
+                }),
+            ),
+            (
+                "ControlListPage_EventItem",
+                Read::NotRead("platform events are a Web console surface"),
+            ),
+            (
+                "ControlListPage_ProviderCredentialBinding",
+                Read::NotRead("provider credentials are administered through the Web console"),
+            ),
+            (
+                "ControlListPage_ProviderInstallation",
+                Read::NotRead("provider installations are administered through the Web console"),
+            ),
+            (
+                "ControlListPage_ProviderTarget",
+                Read::NotRead("provider targets are administered through the Web console"),
+            ),
+            (
+                "ControlListPage_ProviderTargetGrant",
+                Read::NotRead("target grant history is administered through the Web console"),
+            ),
+            (
+                "ControlListPage_RetiredAppName",
+                Read::NotRead("retired application names are administered through the Web console"),
+            ),
+            (
+                "ControlListPage_Route",
+                Read::Into("ListPage<Route>", |v| {
+                    serde_json::from_value::<ListPage<Route>>(v).map(drop)
+                }),
+            ),
+            (
+                "ControlListPage_SecretMeta",
+                Read::Into("ListPage<SecretMeta>", |v| {
+                    serde_json::from_value::<ListPage<SecretMeta>>(v).map(drop)
+                }),
+            ),
+            (
+                "ControlListPage_VersionView",
+                Read::Into("ListPage<Version>", |v| {
+                    serde_json::from_value::<ListPage<Version>>(v).map(drop)
+                }),
+            ),
+            (
+                "DeleteAppResponse",
+                Read::NotRead("this CLI does not delete applications"),
+            ),
+            (
+                "DeploymentPlanResponse",
+                Read::Into("DeploymentPlanStatusResponse", |v| {
+                    serde_json::from_value::<DeploymentPlanStatusResponse>(v).map(drop)
+                }),
+            ),
+            // One body, two mirrors: a synchronous answer is read as a
+            // `DeploymentResponse` with a pointer, an accepted one as the
+            // looser mutation shape. Both are held to it, because a member
+            // renamed on the server breaks whichever of the two an operator
+            // happens to hit.
+            (
+                "DeploymentResponse",
+                Read::Into("DeploymentResponse and DeploymentMutationResponse", |v| {
+                    serde_json::from_value::<DeploymentResponse>(v.clone())?;
+                    serde_json::from_value::<DeploymentMutationResponse>(v).map(drop)
+                }),
+            ),
+            (
+                "Environment",
+                Read::Into("Environment", |v| {
+                    serde_json::from_value::<Environment>(v).map(drop)
+                }),
+            ),
+            (
+                "ErrorBody",
+                Read::Into("ErrorEnvelope", |v| {
+                    serde_json::from_value::<ErrorEnvelope>(v).map(drop)
+                }),
+            ),
+            (
+                "EventStatsResponse",
+                Read::NotRead("platform events are a Web console surface"),
+            ),
+            (
+                "FleetResponse",
+                Read::Into("NodesResponse", |v| {
+                    serde_json::from_value::<NodesResponse>(v).map(drop)
+                }),
+            ),
+            (
+                "GlobalRoutesResponse",
+                Read::NotRead("`deis routes` lists one environment's routes, not the platform's"),
+            ),
+            (
+                "GrantResponse",
+                Read::NotRead("`deis domains` lists grants; it does not create them"),
+            ),
+            (
+                "GrantWithdrawn",
+                Read::NotRead("`deis domains` lists grants; it does not withdraw them"),
+            ),
+            (
+                "MetricsSummaryResponse",
+                Read::NotRead("metrics are a Web console surface"),
+            ),
+            (
+                "NodeConfigOutcome",
+                Read::NotRead("node configuration is a Web console surface"),
+            ),
+            (
+                "NodeConfigs",
+                Read::NotRead("node configuration is a Web console surface"),
+            ),
+            (
+                "ProductInstallation",
+                Read::NotRead("the installation record is a Web console surface"),
+            ),
+            (
+                "ReleaseRetiredAppResponse",
+                Read::NotRead("retired application names are administered through the Web console"),
+            ),
+            (
+                "RouteDeleted",
+                Read::NotRead("`deis routes` lists routes; it does not delete them"),
+            ),
+            (
+                "RouteResponse",
+                Read::NotRead("`deis routes` lists routes; it does not create them"),
+            ),
+            (
+                "SecretChangeResponse",
+                Read::Into("SecretChangeResponse", |v| {
+                    serde_json::from_value::<SecretChangeResponse>(v).map(drop)
+                }),
+            ),
+            (
+                "SecretDeletedResponse",
+                Read::Into("SecretDeletedResponse", |v| {
+                    serde_json::from_value::<SecretDeletedResponse>(v).map(drop)
+                }),
+            ),
+            (
+                "SessionsResponse",
+                Read::NotRead("browser sessions are a Web console surface"),
+            ),
+            (
+                "UploadResponse",
+                Read::Into("UploadResponse", |v| {
+                    serde_json::from_value::<UploadResponse>(v).map(drop)
+                }),
+            ),
+            (
+                "VersionView",
+                Read::Into("Version", |v| {
+                    serde_json::from_value::<Version>(v).map(drop)
+                }),
+            ),
+        ]
+    }
+
+    /// One captured answer: the body, and which operation produced it.
+    struct Captured {
+        body: Value,
+        operation_id: String,
+    }
+
+    fn captured() -> BTreeMap<String, Captured> {
+        let text = std::fs::read_to_string(EXAMPLES).expect(
+            "contracts/openapi/v1-examples.json is committed beside the document this CLI speaks",
+        );
+        let document: Value = serde_json::from_str(&text).expect("the capture is JSON");
+        document["examples"]
+            .as_object()
+            .expect("the capture holds an object of schemas")
+            .iter()
+            .map(|(schema, example)| {
+                (
+                    schema.clone(),
+                    Captured {
+                        body: example["body"].clone(),
+                        operation_id: example["operationId"]
+                            .as_str()
+                            .unwrap_or("<unnamed>")
+                            .to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_captured_answer_is_classified() {
+        let readings = readings();
+        for (schema, reading) in &readings {
+            if let Read::NotRead(reason) = reading {
+                assert!(
+                    !reason.is_empty(),
+                    "{schema} is classified as unread without saying who reads it instead"
+                );
+            }
+        }
+        let mut names: Vec<&str> = readings.iter().map(|(schema, _)| *schema).collect();
+        let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len(), "a schema is classified twice");
+        names.sort_unstable();
+        let captured: Vec<String> = captured().into_keys().collect();
+        let captured: Vec<&str> = captured.iter().map(String::as_str).collect();
+        assert_eq!(
+            names, captured,
+            "the captured answers and this CLI's reading of them have drifted. A schema the \
+             control plane captured and this CLI does not classify is a route nobody decided \
+             about; a schema classified here and no longer captured is a route that moved or \
+             went away under a CLI that still asks for it."
+        );
+    }
+
+    #[test]
+    fn every_captured_answer_this_cli_reads_deserialises_into_its_mirror() {
+        let captured = captured();
+        let mut checked = 0;
+        for (schema, reading) in readings() {
+            let Read::Into(mirror, parse) = reading else {
+                continue;
+            };
+            let example = captured
+                .get(schema)
+                .unwrap_or_else(|| panic!("{schema} is classified as read but was not captured"));
+            if let Err(error) = parse(example.body.clone()) {
+                panic!(
+                    "the control plane's own answer to {} no longer reads as {mirror}: {error}. \
+                     The capture in contracts/openapi/v1-examples.json is what the handlers \
+                     produce, so this is the CLI asking for a member the server has stopped \
+                     sending - fix the mirror in this file, do not regenerate around it.",
+                    example.operation_id
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 20,
+            "only {checked} captured answers were read; the classification has lost entries"
+        );
+    }
+
+    /// Walk one dotted path into a captured body. A numeric segment indexes
+    /// an array, so a list page's first item can be named.
+    fn member<'a>(body: &'a Value, path: &str) -> Option<&'a Value> {
+        path.split('.')
+            .try_fold(body, |cursor, segment| match cursor {
+                Value::Array(items) => items.get(segment.parse::<usize>().ok()?),
+                _ => cursor.get(segment),
+            })
+    }
+
+    /// The members this CLI reads leniently, and which the capture carries
+    /// today.
+    ///
+    /// Deserialisation alone cannot protect these. Every one of them is read
+    /// with a serde default so that a control plane too old to send it is
+    /// still usable, which means a control plane that *renames* it is
+    /// indistinguishable from one that never had it: the mirror quietly
+    /// takes the default and the command prints a blank column or "unknown"
+    /// for a value the server was in fact sending all along. Naming them
+    /// here turns that silence into a failure. A member the control plane
+    /// legitimately omits when it has nothing to say - a version with no
+    /// canonical parent, a plan that never errored - is simply absent from
+    /// this list.
+    const LENIENT_MEMBERS: &[(&str, &str)] = &[
+        ("Account", "disabled_at"),
+        ("ApiToken", "unscoped"),
+        ("ApiToken", "last_used_at"),
+        ("ApiToken", "revoked_at"),
+        ("App", "canonical_id"),
+        ("ControlListPage_Account", "items.0.disabled_at"),
+        ("ControlListPage_ApiToken", "items.0.unscoped"),
+        ("ControlListPage_ApiToken", "items.0.last_used_at"),
+        ("ControlListPage_ApiToken", "items.0.revoked_at"),
+        ("ControlListPage_AuditEntry", "items.0.actor_account"),
+        ("ControlListPage_AuditEntry", "items.0.actor_credential"),
+        ("ControlListPage_AuditEntry", "items.0.app_id"),
+        ("ControlListPage_AuditEntry", "items.0.environment"),
+        ("ControlListPage_AuditEntry", "items.0.target"),
+        ("ControlListPage_AuditEntry", "items.0.peer"),
+        ("ControlListPage_AuditEntry", "items.0.detail"),
+        ("ControlListPage_AuditEntry", "items.0.requestId"),
+        ("ControlListPage_Deployment", "items.0.canonical_id"),
+        ("ControlListPage_Deployment", "items.0.note"),
+        ("ControlListPage_DomainGrant", "items.0.note"),
+        ("ControlListPage_Environment", "items.0.canonical_id"),
+        ("ControlListPage_Route", "items.0.host"),
+        ("ControlListPage_SecretMeta", "items.0.revision"),
+        ("ControlListPage_VersionView", "items.0.canonical_id"),
+        ("ControlListPage_VersionView", "items.0.manifest"),
+        ("ControlListPage_VersionView", "items.0.compatibility"),
+        ("DeploymentPlanResponse", "plan.last_error"),
+        ("DeploymentResponse", "deployment.canonical_id"),
+        ("DeploymentResponse", "deployment.note"),
+        ("DeploymentResponse", "delivery"),
+        ("DeploymentResponse", "delivery.phase"),
+        ("DeploymentResponse", "delivery.delivered"),
+        ("DeploymentResponse", "delivery.failed"),
+        ("DeploymentResponse", "delivery.skipped"),
+        ("DeploymentResponse", "plan"),
+        ("DeploymentResponse", "plan.last_error"),
+        ("Environment", "canonical_id"),
+        ("ErrorBody", "error.requestId"),
+        ("ErrorBody", "error.violations"),
+        ("ErrorBody", "error.retryable"),
+        ("SecretChangeResponse", "secret.revision"),
+        ("SecretChangeResponse", "delivery.phase"),
+        ("SecretChangeResponse", "delivery.skipped"),
+        ("SecretDeletedResponse", "delivery.phase"),
+        ("UploadResponse", "version.canonical_id"),
+        ("VersionView", "canonical_id"),
+        ("VersionView", "manifest"),
+        ("VersionView", "compatibility"),
+    ];
+
+    #[test]
+    fn the_leniently_read_members_are_still_in_the_captured_answers() {
+        let captured = captured();
+        for (schema, path) in LENIENT_MEMBERS {
+            let example = captured
+                .get(*schema)
+                .unwrap_or_else(|| panic!("{schema} names a schema that is no longer captured"));
+            assert!(
+                member(&example.body, path).is_some(),
+                "the control plane's answer to {} no longer carries {path}, and this CLI reads \
+                 that member with a default - so it would print nothing there rather than fail. \
+                 Either the member was renamed, in which case the mirror in this file has to \
+                 follow, or the control plane genuinely stopped sending it, in which case drop \
+                 this line and say so where the mirror declares the member.",
+                example.operation_id
+            );
+        }
+    }
+
+    #[test]
+    fn every_captured_page_still_carries_the_cursor_this_cli_follows() {
+        let captured = captured();
+        let mut pages = 0;
+        for (schema, reading) in readings() {
+            if !matches!(reading, Read::Into(..)) || !schema.starts_with("ControlListPage_") {
+                continue;
+            }
+            let example = &captured[schema];
+            for path in ["schemaVersion", "page.limit", "page.count", "page.total"] {
+                assert!(
+                    member(&example.body, path).is_some(),
+                    "{} answered a page without {path}",
+                    example.operation_id
+                );
+            }
+            // Read with a default, and the one member that decides whether
+            // `list_all` asks for another page: a rename here would stop
+            // every paged listing at its first page and report the short
+            // answer as the whole catalog.
+            assert!(
+                member(&example.body, "page.nextCursor").is_some(),
+                "the page {} answered no longer names nextCursor; this CLI would read the first \
+                 page and report it as the whole list",
+                example.operation_id
+            );
+            pages += 1;
+        }
+        assert!(pages >= 8, "only {pages} list pages were checked");
     }
 }

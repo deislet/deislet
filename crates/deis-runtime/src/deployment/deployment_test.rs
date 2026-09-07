@@ -142,12 +142,34 @@ fn standard_bundle(
     code: &str,
     declarations: &deis_wire::EnvironmentDeclarations,
 ) -> TestBundle {
+    standard_bundle_with_assets(app, code, declarations, &[])
+}
+
+/// The same, for a schema-2 version that also ships static files - which
+/// every real one does, and which is what `env.ASSETS` reaches.
+fn standard_bundle_with_assets(
+    app: &str,
+    code: &str,
+    declarations: &deis_wire::EnvironmentDeclarations,
+    assets: &[(&str, &str)],
+) -> TestBundle {
+    let asset_entries: Vec<serde_json::Value> = assets
+        .iter()
+        .map(|(path, body)| {
+            serde_json::json!({
+                "path": path,
+                "sha256": sha256_hex(body.as_bytes()),
+                "size": body.len(),
+            })
+        })
+        .collect();
     let manifest = serde_json::json!({
         "schema": 2,
         "app": app,
         "entry": "worker/index.js",
         "runtime": "standard-v1",
         "environment": declarations,
+        "assets": asset_entries,
     });
     let declaration_document = String::from_utf8(declarations.canonical_json().unwrap()).unwrap();
     let mut buf = Vec::new();
@@ -164,6 +186,12 @@ fn standard_bundle(
             .start_file("documents/environment-secrets.json", options)
             .unwrap();
         writer.write_all(declaration_document.as_bytes()).unwrap();
+        for (path, body) in assets {
+            writer
+                .start_file(format!("assets/{path}"), options)
+                .unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
         writer.finish().unwrap();
     }
     let sha256 = sha256_hex(&buf);
@@ -583,6 +611,188 @@ async fn redelivering_the_same_version_reuses_the_bundle_already_on_disk() {
     );
 }
 
+/// `env.ASSETS` is the platform's, on the standard environment as much as
+/// anywhere else.
+///
+/// The binding is not declared by anybody and every version has one, so it
+/// does not travel in the declaration document and cannot be read off it.
+/// That is exactly how it went missing: an application built against the
+/// standard environment got an `env` assembled from the snapshot alone, and
+/// `env.ASSETS` was undefined for every one of them - so a handler ported from
+/// Cloudflare Pages, whose first line is `env.ASSETS.fetch(request)`, threw on
+/// this platform and nothing said why. This test would have caught that: it
+/// deploys a schema-2 version with a file in it and makes the handler reach
+/// for the file through the name.
+#[tokio::test]
+async fn a_standard_environment_application_still_reaches_its_own_files_through_env_assets() {
+    const HANDLER: &str = r#"
+export default async function handler(context) {
+  const binding = context.env.ASSETS;
+  const kind = binding === null ? "null" : typeof binding;
+  const callable = kind === "object" && typeof binding.fetch === "function";
+  let status = 0;
+  let body = "";
+  if (callable) {
+    const answer = await binding.fetch("/css/app.css");
+    status = answer.status;
+    body = await answer.text();
+  }
+  return new Response(JSON.stringify({
+    kind,
+    callable,
+    status,
+    body,
+    label: context.env.LABEL,
+    names: Object.keys(context.env).sort(),
+  }), { headers: { "content-type": "application/json" } });
+}
+"#;
+    const STYLESHEET: &str = "body { color: rebeccapurple }\n";
+
+    let declarations = deis_wire::EnvironmentDeclarations::new(
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        vec![deis_wire::EnvironmentDeclaration {
+            name: "LABEL".to_string(),
+            kind: deis_wire::EnvironmentKind::Config,
+            value_type: deis_wire::EnvironmentValueType::String,
+            required: true,
+        }],
+    );
+    let environment_id = deis_wire::CanonicalId::new_v7();
+    let application_id = deis_wire::CanonicalId::new_v7();
+    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        "v1",
+        environment_id.to_string(),
+        declarations.identity().unwrap(),
+        vec![deis_wire::EnvironmentBinding::Config(
+            deis_wire::EnvironmentConfigBinding::new(
+                "LABEL",
+                deis_wire::EnvironmentValueType::String,
+                serde_json::json!("edge"),
+            )
+            .unwrap(),
+        )],
+    );
+    let standard_environment = StandardEnvironmentOrder::new(
+        declarations.clone(),
+        snapshot.clone(),
+        snapshot.identity().unwrap(),
+        HashMap::new(),
+        "v1",
+        &environment_id.to_string(),
+    )
+    .unwrap();
+    let bundle = standard_bundle_with_assets(
+        "demo",
+        HANDLER,
+        &declarations,
+        &[("css/app.css", STYLESHEET)],
+    );
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+    let dir = tempfile::tempdir().unwrap();
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+
+    deployer
+        .apply(DeploymentOrder {
+            app_id: "demo".to_string(),
+            canonical_tenant: Some(deis_wire::CanonicalTenantId::new(
+                application_id,
+                environment_id,
+            )),
+            version_id: "v1".to_string(),
+            environment: "production".to_string(),
+            bundle_url: control.url("v1"),
+            bundle_sha: bundle.sha256.clone(),
+            env: HashMap::new(),
+            standard_environment: Some(standard_environment),
+            limits: None,
+            compatibility: None,
+            deployment_id: None,
+            routing_generation: None,
+        })
+        .await
+        .unwrap();
+
+    let (_status, _headers, body) = apps
+        .execute_app(
+            &demo(),
+            "http://localhost/api/asset".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let observed: serde_json::Value = serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
+    assert_eq!(observed["kind"], "object", "{observed}");
+    assert_eq!(observed["callable"], true, "{observed}");
+    assert_eq!(observed["status"], 200, "{observed}");
+    assert_eq!(observed["body"], STYLESHEET, "{observed}");
+    // The declared value is still there beside it: the binding is installed
+    // over the snapshot, not instead of it.
+    assert_eq!(observed["label"], "edge", "{observed}");
+    assert_eq!(
+        observed["names"],
+        serde_json::json!(["ASSETS", "LABEL"]),
+        "{observed}"
+    );
+}
+
+/// A deployment whose declaration document takes one of the platform's own
+/// names is refused, here, by the node.
+///
+/// The compiler refuses to write such a document and the control plane
+/// refuses to accept one, but a bundle can reach a node without passing
+/// through either - a direct `ApplyDeployment`, or one recovered from this
+/// node's own disk - so the node makes the call itself rather than trusting
+/// that somebody upstream did.
+#[tokio::test]
+async fn a_declaration_that_takes_a_platform_name_is_refused_by_the_node() {
+    for name in ["ASSETS", "DEIS_STORE_ENDPOINT"] {
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            vec![deis_wire::EnvironmentDeclaration {
+                name: name.to_string(),
+                kind: deis_wire::EnvironmentKind::Config,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        );
+        let environment_id = deis_wire::CanonicalId::new_v7();
+        let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+            declarations.standard_version.clone(),
+            "v1",
+            environment_id.to_string(),
+            declarations.identity().unwrap(),
+            vec![deis_wire::EnvironmentBinding::Config(
+                deis_wire::EnvironmentConfigBinding::new(
+                    name,
+                    deis_wire::EnvironmentValueType::String,
+                    serde_json::json!("an-application-cannot-take-this-name"),
+                )
+                .unwrap(),
+            )],
+        );
+        let snapshot_id = snapshot.identity().unwrap();
+        let refusal = StandardEnvironmentOrder::new(
+            declarations,
+            snapshot,
+            snapshot_id,
+            HashMap::new(),
+            "v1",
+            &environment_id.to_string(),
+        )
+        .unwrap_err();
+        assert!(
+            refusal.contains("EC_ENV_NAMESPACE_COLLISION"),
+            "a deployment declaring {name:?} was accepted: {refusal}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn standard_environment_is_typed_frozen_fresh_and_kept_out_of_process_env() {
     const HANDLER: &str = r#"
@@ -726,9 +936,14 @@ export default function handler(context) {
         assert_eq!(observed["nestedFrozen"], true);
         assert_eq!(observed["topMutationRejected"], true);
         assert_eq!(observed["nestedMutationRejected"], true);
+        // Exactly what this deployment declared, plus the one name the
+        // platform owns. `ASSETS` is on the list because every version has
+        // static files and none declares them; the claim being made here is
+        // that nothing *else* is - no host variable, no provider extra, no
+        // leftover from another environment.
         assert_eq!(
             observed["environmentNames"],
-            serde_json::json!(["LABEL", "OPTIONS", "TOKEN"])
+            serde_json::json!(["ASSETS", "LABEL", "OPTIONS", "TOKEN"])
         );
         assert_eq!(observed["label"], "edge");
         assert_eq!(observed["retries"], 2);

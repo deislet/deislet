@@ -447,6 +447,55 @@ const ReadableStreamCtor = globalThis.ReadableStream;
 // The responses whose bodies are already bytes. See the constructor below.
 const bufferedBodies = new NativeWeakSet();
 
+// Which road a response's body takes out of this isolate, asked once and
+// answered in one place.
+//
+// `__deis_runtime_invoke` needs it to decide whether to hand the node a buffer
+// or a producer, and the generated entry module needs the same answer to decide
+// whether the invocation's lifecycle is already over -- see
+// `__deis_runtime_response_is_whole` below. Both go through this function
+// so the two cannot drift: a build that was told "whole" and a node that then
+// streamed the body would close an application's lifecycle while its body was
+// still being produced, and a `waitUntil` its producer registered would be
+// refused for no reason the application could see.
+//
+// No body at all counts as whole: there is nothing left to produce, which is
+// what a 204, a 304 and a WebSocket upgrade all are.
+function bodyLeavesAsWholeBytes(response) {
+  return !response.body || bufferedBodies.has(response);
+}
+
+// The same answer, for the entry module the compiler generates around an
+// application.
+//
+// That module has to close the invocation's lifecycle when the response is
+// finished, so that a `waitUntil` captured out of the invocation is refused
+// afterwards. For a body the application is still producing, the only ending it
+// can observe is the body's own, and it observes it by reading the body through
+// a stream of its own. With nothing to tell it otherwise it does that to every
+// answer, including a plain string -- which turns a response this node would
+// have sent in one piece with a Content-Length into a chunked one, for every
+// answer of every application built for this platform. That is visible to every
+// client, it disables length-based proxies and progress reporting, and it
+// erases the difference between an answer that was ready and an answer still
+// being produced.
+//
+// A global rather than a field on the request context, because of where the
+// question has to be asked. The entry module that touches the application's own
+// response is the one inside the canonical artifact, and that one is called as
+// an ordinary handler by the provider entry wrapped around it -- so what it
+// receives is the standard's exact four-field context, which by the standard
+// carries nothing else. This name is reachable from both.
+//
+// Only an answer, never a choice: which road a body takes is decided by how the
+// response was built and by nothing said here, and an application that calls
+// this learns only what it already knows about its own response. It is sealed
+// with the rest of the runtime's names at the bottom of this file, so a
+// replacement cannot make the boundary above it close a lifecycle early.
+globalThis.__deis_runtime_response_is_whole = function(response) {
+  return response instanceof NativeResponse && bodyLeavesAsWholeBytes(response);
+};
+
 class Response extends NativeResponse {
   constructor(body = null, init = undefined) {
     // No init means no init. This read `init ?? {}`, and an empty object
@@ -3662,27 +3711,32 @@ function cloneEnvironmentJson(value) {
 }
 
 function createServiceContext() {
-  // The application's own variables, plus the bindings the platform adds.
-  // `ASSETS` is defined rather than assigned, and locked: an application that
-  // ships a variable of that name has already had it removed on the Rust side,
-  // and one that assigns over it here in strict mode -- which every ES module
-  // is -- gets a TypeError rather than a silently disconnected binding.
+  // The application's own values first, then the platform's bindings over
+  // them. The order is the rule: whatever an application managed to get into
+  // its own environment, a name the platform owns still means the platform's
+  // object here, so no declaration can decide what `env.ASSETS.fetch()`
+  // reaches. That an application cannot even ship such a name -- deis-wire
+  // refuses the declaration at build, at upload and at load -- is the earlier
+  // half of the same rule, and this is the half that holds whatever arrived.
   const rawEnv = DenoCore.ops.op_deis_get_env() || {};
-  const standardEnvironment = DenoCore.ops.op_deis_environment_is_standard();
   const env = ObjectCreate(null);
   for (const name of ObjectKeys(rawEnv)) {
     env[name] = cloneEnvironmentJson(rawEnv[name]);
   }
-  if (!standardEnvironment) {
-    ObjectDefineProperty(env, ASSETS_BINDING_NAME, {
-      value: assetsBinding,
-      enumerable: true,
-      writable: false,
-      configurable: false,
-    });
-  }
 
-  // Every named binding is published twice, on purpose, and they are the same
+  // `ASSETS` and every named binding are installed the same way, in the same
+  // place, because they are the same kind of thing: a property of the
+  // environment table that the platform owns. They are *defined* rather than
+  // assigned, and locked, so an application that assigns over one in strict
+  // mode -- which every ES module is -- gets a TypeError rather than a
+  // silently disconnected binding.
+  //
+  // `ASSETS` is not declared by anyone and every version has one, which is why
+  // it is unconditional: an application built against the standard
+  // environment reaches its own static files through exactly the same name a
+  // Cloudflare Pages handler does.
+  //
+  // The named bindings are published twice, on purpose, and they are the same
   // object either way:
   //
   //   context.bindings.HOT   the platform's table, and the honest place: only
@@ -3691,10 +3745,16 @@ function createServiceContext() {
   //   env.HOT                where code written for Cloudflare reaches for it,
   //                          so a project ported from there needs no rewrite.
   //
-  // On `env` they are defined and locked, exactly as `ASSETS` is: a variable
-  // or a secret of the same name is refused at build, at upload and at load
-  // (`Manifest::validate`), and if one somehow arrived it is overwritten here
-  // rather than allowed to decide what `env.HOT` means.
+  // A variable or a secret named after one of those is refused at build, at
+  // upload and at load (`Manifest::validate`) exactly as `ASSETS` is; if one
+  // somehow arrived it is overwritten here rather than allowed to decide what
+  // `env.HOT` means.
+  ObjectDefineProperty(env, ASSETS_BINDING_NAME, {
+    value: assetsBinding,
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
   const bindings = createBindings();
   for (const name of ObjectKeys(bindings)) {
     ObjectDefineProperty(env, name, {
@@ -4636,7 +4696,7 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     // the wait this avoids -- for server-sent events it never returns at all,
     // and for a large upstream it is the copy that gets the application killed
     // for its heap.
-    if (!webSocketId && resp.body && !bufferedBodies.has(resp)) {
+    if (!webSocketId && !bodyLeavesAsWholeBytes(resp)) {
       pendingStreamBody = resp.body;
       pendingStreamBodyStretch = stretchNow();
       return { status: resp.status, headers: headerPairs(headers), stream: true };
@@ -4849,6 +4909,11 @@ for (const name of [
   // claim to answer nothing, which is the permissive reading of the question
   // `Cache.put` asks.
   "__deis_runtime_answers_no_request",
+  // What the generated entry module asks before it decides whether to read a
+  // response body through a stream of its own. An application's own function
+  // in its place would have every ordinary answer reframed as chunked, or a
+  // lifecycle closed while a body was still being produced.
+  "__deis_runtime_response_is_whole",
 ]) {
   Object.defineProperty(globalThis, name, {
     value: globalThis[name],

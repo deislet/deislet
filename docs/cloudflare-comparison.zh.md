@@ -95,7 +95,7 @@ Node.js 兼容（4.9）另算：它是要先拍板的产品问题，不是排期
 | 路由参数进 `context.params` | ✅ | |
 | Cron 定时触发 | ✅ | |
 | 队列消费触发 | ✅ | |
-| WebSocket 服务端（`WebSocketPair` + 101） | ✅ | 评审那一轮首次端到端验证了经 deis-proxy 的那一跳 |
+| WebSocket 服务端（`WebSocketPair` + 101） | ✅ | 节点侧桥接仍在，经 deis-proxy 的那一跳有 `websocket_through_proxy_test.rs` 覆盖；但 Edge Canon v1 锁定后没有可移植的服务端 WebSocket 应用 API，应用源码里引用 `WebSocketPair` 会在构建期被 `EC_STREAM_WEBSOCKET_NONPORTABLE` 拒绝，`demo.sh verify` 现在证明的是这一步拒绝而不是握手 |
 | WebSocket 客户端（`new WebSocket()` 出站） | ✅ | 评审那一轮补齐，走的是和 `fetch` 同一个出站判定点 |
 | HTTP 路由（域名 / 路径前缀 → 应用） | ✅ | 控制面的路由表现在被 deis-proxy 读了：精确域名 → 通配域名 → 自动预览地址 → 不限域名，同一域名内按优先级、再按前缀长度，见 4.8 |
 | Email Workers | ❌ | |

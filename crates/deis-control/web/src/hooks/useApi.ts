@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '@/lib/api'
-import type { Command, Event, FleetNode, MetricsSummary, SessionSummary } from '@/lib/api'
+import type { Command, Event, FleetNode, SessionSummary } from '@/lib/api'
+import { describeRefusal, nextPollDelayMs, type RefusalState } from '@/lib/refusal'
 
 // Every request below goes through `api` rather than a bare `fetch`. These
 // hooks used to call `fetch` directly, which meant they sent no `X-API-Key`:
@@ -12,7 +13,7 @@ import type { Command, Event, FleetNode, MetricsSummary, SessionSummary } from '
 // These hooks never mount without a credential the control plane has already
 // accepted: App.tsx asks one question before it renders them and shows the key
 // screen instead when the answer is 401 (see `Access` there). That is what
-// stops the five intervals below from polling a control plane that is refusing
+// stops the five polls below from reading a control plane that is refusing
 // all of them.
 //
 // The two list hooks (`useCommands`, `useEvents`) read the first page of the
@@ -20,41 +21,120 @@ import type { Command, Event, FleetNode, MetricsSummary, SessionSummary } from '
 // what a live view shows, and walking a history with no ceiling every few
 // seconds is what `page.nextCursor` exists to spare the control plane. A
 // view that needs the rest reads it once through `listAll` in `@/lib/api`.
+//
+// What a refused read leaves behind is a `RefusalState`, not a sentence.
+// Every one of these hooks used to answer `err.message`, which flattened a
+// scope refusal, a conflict, a rate limit and a crashed control plane into
+// one red line and told the operator nothing about which of them they had.
+// `describeRefusal` in `@/lib/refusal` draws that distinction once and
+// `RefusalNotice` renders it; the rows already on screen are left alone,
+// because a stale list under an explicit "this stopped reading" banner is
+// more use than an empty page.
 
-export function useMetrics() {
-  const [metrics, setMetrics] = useState<MetricsSummary | null>(null)
+/**
+ * The empty lists a page renders before its first answer arrives. Module
+ * constants rather than fresh `[]` literals, so that a page holding one in a
+ * dependency array does not see a new list on every render.
+ */
+const NO_SESSIONS: SessionSummary[] = []
+const NO_NODES: FleetNode[] = []
+const NO_COMMANDS: Command[] = []
+const NO_EVENTS: Event[] = []
+const NO_CONFIGS: Record<string, unknown> = {}
+
+/** What every hook below answers, around whatever it read. */
+interface PolledRead<T> {
+  data: T | null
+  loading: boolean
+  error: RefusalState | null
+  refetch: () => Promise<void>
+}
+
+/**
+ * Read one route now, and keep re-reading it.
+ *
+ * `read` must be stable across renders - wrap it in `useCallback` - because
+ * it is what the polling effect is keyed on. `subject` names what is being
+ * read, as a noun phrase, so that a refusal can say which of a page's two
+ * lists went quiet. `intervalMs` of `null` reads once and stops.
+ *
+ * Each tick is scheduled after the previous one has finished rather than on
+ * a fixed interval. Two things follow, and both are the point: a control
+ * plane that is answering slowly is never asked twice concurrently, and a
+ * refusal can push the next attempt out - by exactly as long as the server
+ * asked for on a 429, and by doubling otherwise (`nextPollDelayMs`). A
+ * console that keeps knocking every two seconds through a rate limit is
+ * part of the problem it is displaying.
+ */
+function usePolledRead<T>(
+  read: () => Promise<T>,
+  subject: string,
+  intervalMs: number | null
+): PolledRead<T> {
+  const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<RefusalState | null>(null)
+  // Only the first read shows the loading state, so that a background
+  // refresh does not blank out rows the operator is reading.
   const initialLoadRef = useRef(true)
+  // How the next delay is chosen. Refs, not state: the scheduler reads them
+  // right after an attempt finishes, and neither belongs in a render.
+  const refusalsRef = useRef(0)
+  const lastRefusalRef = useRef<RefusalState | null>(null)
 
-  const fetchMetrics = useCallback(async () => {
+  const readOnce = useCallback(async () => {
     try {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const data = await api.getMetricsSummary()
-      setMetrics(data.metrics)
+      const value = await read()
+      setData(value)
       setError(null)
+      refusalsRef.current = 0
+      lastRefusalRef.current = null
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch metrics')
+      const refusal = describeRefusal(err, subject)
+      refusalsRef.current += 1
+      lastRefusalRef.current = refusal
+      setError(refusal)
     } finally {
       if (initialLoadRef.current) {
         setLoading(false)
         initialLoadRef.current = false
       }
     }
-  }, [])
+  }, [read, subject])
 
   useEffect(() => {
-    const initialFetch = window.setTimeout(fetchMetrics, 0)
-    const interval = window.setInterval(fetchMetrics, 2000)
-    return () => {
-      window.clearTimeout(initialFetch)
-      window.clearInterval(interval)
+    // A new `read` is a different question - another node's configuration,
+    // say - so its first answer gets the loading state again.
+    initialLoadRef.current = true
+    refusalsRef.current = 0
+    lastRefusalRef.current = null
+    let stopped = false
+    let timer = 0
+    const tick = () => {
+      void readOnce().then(() => {
+        if (stopped || intervalMs === null) return
+        const delay = nextPollDelayMs(intervalMs, refusalsRef.current, lastRefusalRef.current)
+        timer = window.setTimeout(tick, delay)
+      })
     }
-  }, [fetchMetrics])
+    timer = window.setTimeout(tick, 0)
+    return () => {
+      stopped = true
+      window.clearTimeout(timer)
+    }
+  }, [readOnce, intervalMs])
 
-  return { metrics, loading, error, refetch: fetchMetrics }
+  return { data, loading, error, refetch: readOnce }
+}
+
+/** The control plane's own counters, re-read every couple of seconds. */
+export function useMetrics() {
+  const read = useCallback(() => api.getMetricsSummary(), [])
+  const { data, loading, error, refetch } = usePolledRead(read, 'the metrics summary', 2000)
+  return { metrics: data?.metrics ?? null, loading, error, refetch }
 }
 
 /**
@@ -63,41 +143,9 @@ export function useMetrics() {
  * configuration pushes travel down these, and nothing else can receive one.
  */
 export function useSessions() {
-  const [sessions, setSessions] = useState<SessionSummary[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const initialLoadRef = useRef(true)
-
-  const fetchSessions = useCallback(async () => {
-    try {
-      // Only show the loading state on the first fetch, so background refreshes
-      // do not blank out data the user is already reading
-      if (initialLoadRef.current) {
-        setLoading(true)
-      }
-      const data = await api.getSessions()
-      setSessions(data.sessions)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch control channels')
-    } finally {
-      if (initialLoadRef.current) {
-        setLoading(false)
-        initialLoadRef.current = false
-      }
-    }
-  }, [])
-
-  useEffect(() => {
-    const initialFetch = window.setTimeout(fetchSessions, 0)
-    const interval = window.setInterval(fetchSessions, 5000)
-    return () => {
-      window.clearTimeout(initialFetch)
-      window.clearInterval(interval)
-    }
-  }, [fetchSessions])
-
-  return { sessions, loading, error, refetch: fetchSessions }
+  const read = useCallback(() => api.getSessions(), [])
+  const { data, loading, error, refetch } = usePolledRead(read, 'the control channels', 5000)
+  return { sessions: data?.sessions ?? NO_SESSIONS, loading, error, refetch }
 }
 
 /**
@@ -106,39 +154,9 @@ export function useSessions() {
  * itself.
  */
 export function useFleet() {
-  const [nodes, setNodes] = useState<FleetNode[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const initialLoadRef = useRef(true)
-
-  const fetchNodes = useCallback(async () => {
-    try {
-      if (initialLoadRef.current) {
-        setLoading(true)
-      }
-      const data = await api.getFleet()
-      setNodes(data.nodes)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch the runtime fleet')
-    } finally {
-      if (initialLoadRef.current) {
-        setLoading(false)
-        initialLoadRef.current = false
-      }
-    }
-  }, [])
-
-  useEffect(() => {
-    const initialFetch = window.setTimeout(fetchNodes, 0)
-    const interval = window.setInterval(fetchNodes, 5000)
-    return () => {
-      window.clearTimeout(initialFetch)
-      window.clearInterval(interval)
-    }
-  }, [fetchNodes])
-
-  return { fleet: nodes, loading, error, refetch: fetchNodes }
+  const read = useCallback(() => api.getFleet(), [])
+  const { data, loading, error, refetch } = usePolledRead(read, 'the runtime fleet', 5000)
+  return { fleet: data?.nodes ?? NO_NODES, loading, error, refetch }
 }
 
 /**
@@ -147,39 +165,11 @@ export function useFleet() {
  * behind this page, counted by the control plane in the same read.
  */
 export function useCommands(nodeId?: string) {
-  const [commands, setCommands] = useState<Command[]>([])
-  const [total, setTotal] = useState(0)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const initialLoadRef = useRef(true)
-
-  const fetchCommands = useCallback(async () => {
-    try {
-      if (initialLoadRef.current) {
-        setLoading(true)
-      }
-      const page = nodeId ? await api.getNodeCommands(nodeId) : await api.getCommands()
-      setCommands(page.items)
-      setTotal(page.page.total)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch commands')
-    } finally {
-      if (initialLoadRef.current) {
-        setLoading(false)
-        initialLoadRef.current = false
-      }
-    }
-  }, [nodeId])
-
-  useEffect(() => {
-    const initialFetch = window.setTimeout(fetchCommands, 0)
-    const interval = window.setInterval(fetchCommands, 3000)
-    return () => {
-      window.clearTimeout(initialFetch)
-      window.clearInterval(interval)
-    }
-  }, [fetchCommands])
+  const read = useCallback(
+    () => (nodeId ? api.getNodeCommands(nodeId) : api.getCommands()),
+    [nodeId]
+  )
+  const { data, loading, error, refetch } = usePolledRead(read, 'the command history', 3000)
 
   // The server's body is `{ command_type, data }`. `command_type` is a
   // tagged enum: the named commands are plain strings and anything else is
@@ -198,16 +188,24 @@ export function useCommands(nodeId?: string) {
       (named as readonly string[]).includes(name)
     const command_type = isNamed(commandType) ? commandType : { custom: commandType }
     const result = await api.executeCommand(nodeId, { command_type, data })
-    await fetchCommands()
+    await refetch()
     return result
   }
 
   const cancelCommand = async (commandId: string) => {
     await api.cancelCommand(commandId)
-    await fetchCommands()
+    await refetch()
   }
 
-  return { commands, total, loading, error, refetch: fetchCommands, executeCommand, cancelCommand }
+  return {
+    commands: data?.items ?? NO_COMMANDS,
+    total: data?.page.total ?? 0,
+    loading,
+    error,
+    refetch,
+    executeCommand,
+    cancelCommand,
+  }
 }
 
 /**
@@ -215,77 +213,39 @@ export function useCommands(nodeId?: string) {
  * how many events the log holds behind this page.
  */
 export function useEvents() {
-  const [events, setEvents] = useState<Event[]>([])
-  const [total, setTotal] = useState(0)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const initialLoadRef = useRef(true)
-
-  const fetchEvents = useCallback(async () => {
-    try {
-      if (initialLoadRef.current) {
-        setLoading(true)
-      }
-      const page = await api.getEvents()
-      setEvents(page.items)
-      setTotal(page.page.total)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch events')
-    } finally {
-      if (initialLoadRef.current) {
-        setLoading(false)
-        initialLoadRef.current = false
-      }
-    }
-  }, [])
-
-  useEffect(() => {
-    const initialFetch = window.setTimeout(fetchEvents, 0)
-    const interval = window.setInterval(fetchEvents, 5000)
-    return () => {
-      window.clearTimeout(initialFetch)
-      window.clearInterval(interval)
-    }
-  }, [fetchEvents])
-
-  return { events, total, loading, error, refetch: fetchEvents }
+  const read = useCallback(() => api.getEvents(), [])
+  const { data, loading, error, refetch } = usePolledRead(read, 'the event log', 5000)
+  return {
+    events: data?.items ?? NO_EVENTS,
+    total: data?.page.total ?? 0,
+    loading,
+    error,
+    refetch,
+  }
 }
 
+/**
+ * One node's configuration, or every node's. Read once when the selection
+ * changes rather than polled: an operator is editing this, and a poll that
+ * overwrote the editor under their hands would be worse than a stale read.
+ */
 export function useConfigs(nodeId?: string) {
-  const [configs, setConfigs] = useState<Record<string, unknown>>({})
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const initialLoadRef = useRef(true)
-
-  const fetchConfigs = useCallback(async () => {
-    try {
-      if (initialLoadRef.current) {
-        setLoading(true)
-      }
-      const data = nodeId ? await api.getNodeConfig(nodeId) : await api.getConfigs()
-      setConfigs(data.data)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch configs')
-    } finally {
-      if (initialLoadRef.current) {
-        setLoading(false)
-        initialLoadRef.current = false
-      }
-    }
-  }, [nodeId])
-
-  useEffect(() => {
-    initialLoadRef.current = true
-    const initialFetch = window.setTimeout(fetchConfigs, 0)
-    return () => window.clearTimeout(initialFetch)
-  }, [fetchConfigs])
+  // One node's configuration is keyed by config key, every node's is keyed
+  // by node id, and this page renders whichever it got as JSON. The return
+  // type is named rather than inferred so that the two answers meet in the
+  // one shape the page reads instead of the hook being fixed to whichever
+  // branch came first.
+  const read = useCallback(
+    (): Promise<{ data: Record<string, unknown> }> =>
+      nodeId ? api.getNodeConfig(nodeId) : api.getConfigs(),
+    [nodeId]
+  )
+  const { data, loading, error, refetch } = usePolledRead(read, 'the configuration', null)
 
   const updateConfig = async (nodeId: string, configs: Record<string, unknown>) => {
     await api.updateNodeConfig(nodeId, configs)
-    await fetchConfigs()
+    await refetch()
   }
 
-  return { configs, loading, error, refetch: fetchConfigs, updateConfig }
+  return { configs: data?.data ?? NO_CONFIGS, loading, error, refetch, updateConfig }
 }

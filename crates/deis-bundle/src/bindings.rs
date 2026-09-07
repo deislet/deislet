@@ -102,8 +102,15 @@ pub const MAX_BINDING_NAME_LEN: usize = 64;
 /// reaches. The `DEIS_` prefix is reserved for the same reason it is reserved
 /// among environment variables - those keys are platform wiring, and a binding
 /// spelled like one would be published beside them on `env`.
-const RESERVED_BINDING_NAME: &str = "ASSETS";
-const RESERVED_BINDING_PREFIX: &str = "DEIS_";
+///
+/// Taken from deis-wire rather than spelled again here, because the identical
+/// pair of names is refused on the other side of the same table: an
+/// environment declaration - a variable or a secret - may not take them
+/// either. Two copies that drifted apart would leave one of the two halves
+/// enforcing a different rule, and the half that was wrong would only be
+/// discovered by an author whose value was silently unreadable.
+const RESERVED_BINDING_NAME: &str = deis_wire::conventions::RESERVED_PLATFORM_BINDING_NAME;
+const RESERVED_BINDING_PREFIX: &str = deis_wire::conventions::RESERVED_PLATFORM_PREFIX;
 
 /// What one binding reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]

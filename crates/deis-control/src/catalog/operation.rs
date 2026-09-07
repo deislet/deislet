@@ -1124,7 +1124,7 @@ mod tests {
         )
         .unwrap();
         let planned = store
-            .plan_identity_migration_with_operation("shop", context.clone())
+            .plan_identity_migration_with_operation("shop", context.clone(), None)
             .await
             .unwrap();
         let cancelling = store
@@ -1162,7 +1162,7 @@ mod tests {
             .unwrap();
 
         let replayed = store
-            .plan_identity_migration_with_operation("shop", context.clone())
+            .plan_identity_migration_with_operation("shop", context.clone(), None)
             .await
             .unwrap();
         assert_eq!(replayed.migration_id, planned.migration_id);
@@ -1176,7 +1176,7 @@ mod tests {
             .await
             .unwrap();
         let error = store
-            .plan_identity_migration_with_operation("shop", context)
+            .plan_identity_migration_with_operation("shop", context, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("different request target"));

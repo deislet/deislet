@@ -1,10 +1,19 @@
-# Every response this site serves out of a file.
-/*
-  Referrer-Policy: strict-origin-when-cross-origin
-
-# The stylesheet only ever changes when the version does, and a version is a
-# whole new bundle, so a year is safe. This is the block that overrides the
-# node's own default for an asset, which is "ask me again every time" because
-# a bundle path is not content-addressed.
+# One block, not two.
+#
+# This file used to open with a `/*` block carrying the Referrer-Policy and
+# follow it with this one, and the node composed the two: every block whose
+# pattern matched was applied, the later ones over the earlier. The locked
+# Edge Canon standard lowers `_headers` with first-match semantics - one block
+# answers a path, the first whose pattern matches - and a file with more than
+# one block is refused at build (EC_ROUTING_SOURCE_UNREPRESENTABLE) rather
+# than have one target compose the blocks and another not. So the stylesheet
+# carries both headers from the one block that names it, and `/` carries
+# neither.
+#
+# The Cache-Control: the stylesheet only ever changes when the version does,
+# and a version is a whole new bundle, so a year is safe. This is what
+# overrides the node's own default for an asset, which is "ask me again every
+# time" because a bundle path is not content-addressed.
 /css/*
   Cache-Control: public, max-age=31536000, immutable
+  Referrer-Policy: strict-origin-when-cross-origin

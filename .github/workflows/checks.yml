@@ -175,6 +175,10 @@ jobs:
             sleep "$((attempt * 5))"
           done
           npm run build
+          # The console's own unit tests: what a refused read means to an
+          # operator is decided in `src/lib/refusal.ts`, and nothing on the
+          # Rust side would notice it regressing.
+          npm test
 
       # Keep the written exceptions in .cargo/audit.toml under review while
       # rejecting every advisory that has not been explicitly judged there.

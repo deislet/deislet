@@ -191,8 +191,6 @@ pub async fn get_installation(
         (status = 202, description = "The restore was planned; poll `Location`.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
         (status = 400, response = openapi::BadRequest),
         (status = 409, response = openapi::Conflict),
-        (status = 422, response = openapi::UnprocessableEntity),
-        (status = 428, response = openapi::PreconditionRequired),
         (status = 503, response = openapi::ServiceUnavailable),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),

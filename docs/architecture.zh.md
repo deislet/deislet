@@ -996,8 +996,11 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
   localhost:8000，没服务就打印 "Server not running, skipping test" 然后 return 当
   通过，而那个端点 dispatcher 早已不提供）。经 deis-proxy 的那一跳现在也有专门测试：
   `websocket_through_proxy_test.rs` 起一个真的 `deis-proxy` 二进制，走真实的
-  HTTP Upgrade 握手连过去，`scripts/demo.sh verify` 的「websockets」一组同样从这一跳
-  发起，而不是直接打节点端口。
+  HTTP Upgrade 握手连过去。`scripts/demo.sh verify` 不再从这一跳发起握手：Edge Canon
+  v1 锁定后没有可移植的服务端 WebSocket 应用 API，应用源码里引用 `WebSocketPair`
+  会在构建期被 `EC_STREAM_WEBSOCKET_NONPORTABLE` 拒绝，所以演示里原来那个 echo
+  handler 改由「the compiler」一组证明它在 `deis deploy` 的第一步就被拒绝、没有写出
+  包也没有建出应用；节点侧的桥接和上面几条测试仍在。
 - **deis-control 面板认证默认关闭**（`api_auth_enabled` 默认 false）。打开之后有账号、
   角色与作用域 token：作用域写成 `<动作>:<应用>/<环境>`（动作是 read / deploy /
   secrets / storage / admin），角色是账号上限并且每个请求重新读一遍，token 在库里只留

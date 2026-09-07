@@ -74,6 +74,15 @@
         }
       }
     },
+    "reconcileContext": {
+      "description": "Why a reconcile request exists: the durable operation whose outcome was lost. A reconcile is never a workflow step of its own - the Control substitutes it for the operation the driver was already asked to run, keeping the operation id, desired state and plan exact - and the driver process sees only the request, so without this member it cannot tell a reconcile of a cleanup (is the uploaded version gone?) from a reconcile of an activate (is the new version serving?), which have opposite answers for the same provider state.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation"],
+      "properties": {
+        "operation": {"$ref": "#/$defs/operation", "not": {"const": "reconcile"}}
+      }
+    },
     "driverRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -91,12 +100,49 @@
         "target": {"$ref": "#/$defs/target"},
         "artifact": {"anyOf": [{"$ref": "#/$defs/artifact"}, {"type": "null"}]},
         "plan": {"$ref": "#/$defs/plan"},
-        "rollbackTarget": {"anyOf": [{"$ref": "#/$defs/rollbackTarget"}, {"type": "null"}]}
+        "rollbackTarget": {"anyOf": [{"$ref": "#/$defs/rollbackTarget"}, {"type": "null"}]},
+        "reconciles": {"anyOf": [{"$ref": "#/$defs/reconcileContext"}, {"type": "null"}]}
       },
       "allOf": [
         {
           "if": {"properties": {"operation": {"const": "rollback"}}, "required": ["operation"]},
-          "then": {},
+          "then": {
+            "required": ["rollbackTarget"],
+            "properties": {"rollbackTarget": {"$ref": "#/$defs/rollbackTarget"}}
+          }
+        },
+        {
+          "if": {"properties": {"operation": {"const": "reconcile"}}, "required": ["operation"]},
+          "then": {
+            "required": ["reconciles"],
+            "properties": {"reconciles": {"$ref": "#/$defs/reconcileContext"}},
+            "allOf": [
+              {
+                "if": {
+                  "required": ["reconciles"],
+                  "properties": {
+                    "reconciles": {
+                      "required": ["operation"],
+                      "properties": {"operation": {"const": "rollback"}}
+                    }
+                  }
+                },
+                "then": {
+                  "required": ["rollbackTarget"],
+                  "properties": {"rollbackTarget": {"$ref": "#/$defs/rollbackTarget"}}
+                },
+                "else": {"properties": {"rollbackTarget": {"type": "null"}}}
+              }
+            ]
+          },
+          "else": {"properties": {"reconciles": {"type": "null"}}}
+        },
+        {
+          "if": {
+            "properties": {"operation": {"enum": ["rollback", "reconcile"]}},
+            "required": ["operation"]
+          },
+          "then": true,
           "else": {"properties": {"rollbackTarget": {"type": "null"}}}
         }
       ]

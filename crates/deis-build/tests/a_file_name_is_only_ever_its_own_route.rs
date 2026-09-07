@@ -120,10 +120,19 @@ async fn a_name_that_reads_as_a_pattern_is_escaped_and_reported() {
         vec!["/", "/api/%2A", "/api/health", "/users/%3Aid", "/users/:id",],
         "one route per file, and the placeholder is the one written [id]"
     );
+    // The bundle names the same routes, and it used to name only `/*`.
+    //
+    // The provider bundle still carries one transport entry - the canonical
+    // module keeps doing the application's routing inside itself - but the
+    // manifest is not that entry's import table. It is what a node reads to
+    // decide which paths belong to the isolate at all, and one `/*` claimed
+    // every path a site would otherwise have answered, including its own
+    // not-found page.
+    let mut bundled = manifest_patterns(&Path::new(&build.output_path).join("bundle.zip"));
+    bundled.sort();
     assert_eq!(
-        manifest_patterns(&Path::new(&build.output_path).join("bundle.zip")),
-        vec!["/*"],
-        "the provider bundle exposes one transport entry; application routing stays inside the canonical module"
+        bundled, patterns,
+        "an escaped file name has to reach the node under the route it was escaped into"
     );
 
     // Nothing was silently dropped as a duplicate, which is what used to

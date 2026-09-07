@@ -17,7 +17,6 @@ use deis_bundle::{
 };
 
 use crate::assets::StagedAsset;
-use crate::routing::RouteEntry;
 use crate::site::{build_site_config, is_site_file};
 
 /// Where the bundled entry module sits inside the archive.
@@ -43,9 +42,22 @@ pub const RUNTIME_PROFILE: &str = "standard-v1";
 const SERVICE_NAMES: [&str; 4] = ["kv", "database", "blob", "queue"];
 
 /// Assemble the manifest for one build.
+///
+/// `function_paths` is the set of URL paths the application's code answers,
+/// and it is passed in rather than read back off the staged file names on
+/// purpose. A bundle built from a canonical artifact stages the application's
+/// single already-routed entry module as one catch-all file, so the file names
+/// say `/*` and nothing else; taking the manifest's word from them told every
+/// node that the isolate owns every path, and the node then never reached the
+/// static fallback the application had configured - a request for a page that
+/// does not exist came back as an empty 404 instead of the bundle's own
+/// `404.html`. The caller therefore states the application's real function
+/// table, which for a derived build is the canonical routing document's, and
+/// the manifest keeps meaning what a node reads it to mean: these paths are
+/// the function's, everything else is the site's.
 pub fn build_manifest(
     config: &ProjectConfig,
-    routes: &[RouteEntry],
+    function_paths: &[String],
     assets: &[StagedAsset],
 ) -> Result<Manifest> {
     let app = config.name.trim();
@@ -70,10 +82,10 @@ pub fn build_manifest(
         env: environment(config),
         secrets: secret_names(config),
         environment: None,
-        routes: routes
+        routes: function_paths
             .iter()
-            .map(|route| Route {
-                pattern: route.pattern.clone(),
+            .map(|pattern| Route {
+                pattern: pattern.clone(),
                 // The file tree says which path a handler answers, not which
                 // methods: an edge-canon handler takes every method and
                 // decides for itself. An empty list is the manifest's way of
@@ -118,11 +130,11 @@ pub fn build_manifest(
 /// environment document. No deployment value is copied into the bundle.
 pub fn build_manifest_with_environment(
     config: &ProjectConfig,
-    routes: &[RouteEntry],
+    function_paths: &[String],
     assets: &[StagedAsset],
     environment: deis_wire::EnvironmentDeclarations,
 ) -> Result<Manifest> {
-    let mut manifest = build_manifest(config, routes, assets)?;
+    let mut manifest = build_manifest(config, function_paths, assets)?;
     manifest.schema = SUPPORTED_SCHEMA;
     manifest.env.clear();
     manifest.secrets.clear();
@@ -358,12 +370,8 @@ mod tests {
         serde_json::from_value(json).expect("config parses")
     }
 
-    fn route(pattern: &str) -> RouteEntry {
-        RouteEntry {
-            pattern: pattern.to_string(),
-            import_path: "../src/x.ts".to_string(),
-            wildcard: None,
-        }
+    fn route(pattern: &str) -> String {
+        pattern.to_string()
     }
 
     #[test]
@@ -593,6 +601,40 @@ mod tests {
         assert!(
             manifest.routes[0].methods.is_empty(),
             "an empty method list is the manifest's \"any method\""
+        );
+    }
+
+    /// The manifest says which paths are the function's, however many files
+    /// the build happened to stage them under.
+    ///
+    /// A bundle derived from a canonical artifact stages one already-routed
+    /// module, so the file names say `/*` and nothing else. The caller states
+    /// the application's real table instead, because a node reads this list to
+    /// decide whether a request that names no file belongs to the isolate or
+    /// to the site - and one `/*` took the site's own 404 page away from it.
+    #[test]
+    fn every_path_the_application_answers_is_named_in_the_manifest() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({})),
+            &[
+                route("/api/kv/:key"),
+                route("/api/asset"),
+                route("/hello/:name"),
+                route("/"),
+            ],
+            &[staged("404.html", "gone"), staged("index.html", "hi")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.route_patterns(),
+            vec!["/api/kv/:key", "/api/asset", "/hello/:name", "/"],
+            "the order the caller planned is the order a node ranks them in"
+        );
+        assert_eq!(
+            manifest.site.not_found,
+            deis_bundle::NotFound::Page,
+            "the fallback the isolate no longer swallows has to travel with it"
         );
     }
 

@@ -134,6 +134,33 @@ pub const BINDING_HEADER: &str = "x-deis-binding";
 /// deis-store turns a namespace id into a database file and a directory.
 pub const BINDING_SEPARATOR: char = '@';
 
+/// The one name on `context.env` the platform owns.
+///
+/// It holds the binding a version's own static files are reached through, and
+/// the platform installs it after everything the application declared has been
+/// copied, so a value under that name could never be read. Two components have
+/// to agree on the spelling and neither can see the other's copy: deis-bundle
+/// refuses a *logical resource* with this name, and deis-wire's environment
+/// declarations refuse a *variable or secret* with it. Spelled once, here,
+/// because two spellings that drifted apart would leave one of the two
+/// refusals silently unenforced.
+///
+/// Bare, not [`RESERVED_PLATFORM_PREFIX`]-prefixed, because it is the name an
+/// author writes; the spelling is Cloudflare's, so a Pages project's code
+/// reads the same here.
+pub const RESERVED_PLATFORM_BINDING_NAME: &str = "ASSETS";
+
+/// Prefix reserved for the platform's own wiring on `context.env`.
+///
+/// Every key the node carries a deployment's plumbing in begins with it - the
+/// storage endpoints, the storage token, the binding table, the queue
+/// consumers - and each of those is lifted back out before the map becomes
+/// `context.env`. A name an application chose that collided with one of them
+/// would either be dropped without the author ever learning why, or, worse,
+/// be read as the plumbing it is spelled like: an application naming the store
+/// endpoint would choose where its own data goes.
+pub const RESERVED_PLATFORM_PREFIX: &str = "DEIS_";
+
 /// Whether a string may name a binding.
 ///
 /// The same character set as [`is_valid_tenant_part`], for the same reason:

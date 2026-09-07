@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use deis_wire::EnvironmentBindingSnapshot;
 use deis_wire::{CanonicalId, CanonicalIdError};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -34,7 +35,8 @@ use super::model::{
     validate_environment_name, validate_path_prefix, validate_route_priority, validate_secret_name,
 };
 use super::pagination::{
-    CatalogPage, PageCursorStore, PagePosition, finish_page, sqlite_fetch_limit,
+    CatalogPage, KeysetBound, KeysetDirection, KeysetResume, PageCursorStore, PagePosition,
+    finish_page, sqlite_fetch_limit,
 };
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
@@ -300,17 +302,14 @@ impl CatalogStore {
     ) -> CatalogResult<CatalogPage<App>> {
         let fetch_limit = sqlite_fetch_limit(limit, "applications")?;
         let after_id = identity_only_cursor(cursor, "applications")?;
+        let resume = KeysetResume::identity_only(1, KeysetDirection::Ascending, "id", after_id);
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             let total = transaction
                 .query_row("SELECT COUNT(*) FROM apps", [], |row| row.get::<_, i64>(0))?;
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {APP_COLUMNS} FROM apps
-                  WHERE (?1 IS NULL OR id > ?1)
-                  ORDER BY id ASC LIMIT ?2"
-            ))?;
+            let mut statement = transaction.prepare(&apps_page_sql(&resume))?;
             let rows = statement
-                .query_map(params![after_id, fetch_limit], map_app)?
+                .query_map(params_from_iter(resume.bindings([], fetch_limit)), map_app)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             transaction.commit()?;
@@ -527,19 +526,19 @@ impl CatalogStore {
     ) -> CatalogResult<CatalogPage<RetiredAppName>> {
         let fetch_limit = sqlite_fetch_limit(limit, "retired application names")?;
         let after_id = identity_only_cursor(cursor, "retired application names")?;
+        let resume = KeysetResume::identity_only(1, KeysetDirection::Ascending, "app_id", after_id);
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             let total =
                 transaction.query_row("SELECT COUNT(*) FROM retired_app_names", [], |row| {
                     row.get::<_, i64>(0)
                 })?;
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {RETIRED_NAME_COLUMNS} FROM retired_app_names
-                  WHERE (?1 IS NULL OR app_id > ?1)
-                  ORDER BY app_id ASC LIMIT ?2"
-            ))?;
+            let mut statement = transaction.prepare(&retired_names_page_sql(&resume))?;
             let rows = statement
-                .query_map(params![after_id, fetch_limit], map_retired_name)?
+                .query_map(
+                    params_from_iter(resume.bindings([], fetch_limit)),
+                    map_retired_name,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             transaction.commit()?;
@@ -826,7 +825,13 @@ impl CatalogStore {
     ) -> CatalogResult<CatalogPage<CanonicalArtifact>> {
         let app_id = app_id.to_string();
         let fetch_limit = sqlite_fetch_limit(limit, "canonical artifacts")?;
-        let (before_created_at, before_id) = descending_cursor(cursor);
+        let resume = KeysetResume::value_and_identity(
+            2,
+            KeysetDirection::Descending,
+            "created_at",
+            "id",
+            cursor,
+        );
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             load_app(&transaction, &app_id)?;
@@ -835,16 +840,10 @@ impl CatalogStore {
                 [&app_id],
                 |row| row.get::<_, i64>(0),
             )?;
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {CANONICAL_ARTIFACT_COLUMNS} FROM canonical_artifacts
-                  WHERE app_id = ?1
-                    AND (?2 IS NULL OR created_at < ?2
-                         OR (created_at = ?2 AND id < ?3))
-                  ORDER BY created_at DESC, id DESC LIMIT ?4"
-            ))?;
+            let mut statement = transaction.prepare(&canonical_artifacts_page_sql(&resume))?;
             let rows = statement
                 .query_map(
-                    params![app_id, before_created_at, before_id, fetch_limit],
+                    params_from_iter(resume.bindings([Value::from(app_id)], fetch_limit)),
                     map_canonical_artifact,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1211,7 +1210,13 @@ impl CatalogStore {
     ) -> CatalogResult<CatalogPage<Version>> {
         let app_id = app_id.to_string();
         let fetch_limit = sqlite_fetch_limit(limit, "versions")?;
-        let (before_number, before_id) = descending_cursor(cursor);
+        let resume = KeysetResume::value_and_identity(
+            2,
+            KeysetDirection::Descending,
+            "number",
+            "id",
+            cursor,
+        );
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             load_app(&transaction, &app_id)?;
@@ -1220,16 +1225,10 @@ impl CatalogStore {
                 [&app_id],
                 |row| row.get::<_, i64>(0),
             )?;
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {VERSION_COLUMNS} FROM versions
-                  WHERE app_id = ?1
-                    AND (?2 IS NULL OR number < ?2
-                         OR (number = ?2 AND id < ?3))
-                  ORDER BY number DESC, id DESC LIMIT ?4"
-            ))?;
+            let mut statement = transaction.prepare(&versions_page_sql(&resume))?;
             let rows = statement
                 .query_map(
-                    params![app_id, before_number, before_id, fetch_limit],
+                    params_from_iter(resume.bindings([Value::from(app_id)], fetch_limit)),
                     map_version,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1347,6 +1346,7 @@ impl CatalogStore {
         let app_id = app_id.to_string();
         let fetch_limit = sqlite_fetch_limit(limit, "environments")?;
         let after_name = identity_only_cursor(cursor, "environments")?;
+        let resume = KeysetResume::identity_only(2, KeysetDirection::Ascending, "name", after_name);
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             load_app(&transaction, &app_id)?;
@@ -1355,13 +1355,12 @@ impl CatalogStore {
                 [&app_id],
                 |row| row.get::<_, i64>(0),
             )?;
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {ENVIRONMENT_COLUMNS} FROM environments
-                  WHERE app_id = ?1 AND (?2 IS NULL OR name > ?2)
-                  ORDER BY name ASC LIMIT ?3"
-            ))?;
+            let mut statement = transaction.prepare(&environments_page_sql(&resume))?;
             let rows = statement
-                .query_map(params![app_id, after_name, fetch_limit], map_environment)?
+                .query_map(
+                    params_from_iter(resume.bindings([Value::from(app_id)], fetch_limit)),
+                    map_environment,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             transaction.commit()?;
@@ -3101,7 +3100,13 @@ impl CatalogStore {
     ) -> CatalogResult<CatalogPage<Deployment>> {
         let env_id = env_id.to_string();
         let fetch_limit = sqlite_fetch_limit(limit, "deployments")?;
-        let (before_created_at, before_id) = descending_cursor(cursor);
+        let resume = KeysetResume::value_and_identity(
+            2,
+            KeysetDirection::Descending,
+            "created_at",
+            "canonical_id",
+            cursor,
+        );
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             let total = transaction.query_row(
@@ -3109,16 +3114,10 @@ impl CatalogStore {
                 [&env_id],
                 |row| row.get::<_, i64>(0),
             )?;
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {DEPLOYMENT_COLUMNS} FROM deployments
-                  WHERE env_id = ?1
-                    AND (?2 IS NULL OR created_at < ?2
-                         OR (created_at = ?2 AND canonical_id < ?3))
-                  ORDER BY created_at DESC, canonical_id DESC LIMIT ?4"
-            ))?;
+            let mut statement = transaction.prepare(&deployments_page_sql(&resume))?;
             let rows = statement
                 .query_map(
-                    params![env_id, before_created_at, before_id, fetch_limit],
+                    params_from_iter(resume.bindings([Value::from(env_id)], fetch_limit)),
                     map_deployment,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3278,7 +3277,17 @@ impl CatalogStore {
     ) -> CatalogResult<CatalogPage<Route>> {
         let env_id = env_id.to_string();
         let fetch_limit = sqlite_fetch_limit(limit, "routes")?;
-        let (after_priority, after_path_prefix, after_id) = route_cursor(cursor)?;
+        let resume = match route_cursor(cursor)? {
+            Some((priority, path_prefix, id)) => KeysetResume::after(
+                2,
+                vec![
+                    KeysetBound::descending("priority", Value::from(priority)),
+                    KeysetBound::ascending("path_prefix", Value::from(path_prefix)),
+                    KeysetBound::ascending("id", Value::from(id)),
+                ],
+            ),
+            None => KeysetResume::first_page(2),
+        };
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             let total = transaction.query_row(
@@ -3286,23 +3295,10 @@ impl CatalogStore {
                 [&env_id],
                 |row| row.get::<_, i64>(0),
             )?;
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {ROUTE_COLUMNS} FROM routes
-                  WHERE env_id = ?1
-                    AND (?2 IS NULL OR priority < ?2
-                         OR (priority = ?2 AND path_prefix > ?3)
-                         OR (priority = ?2 AND path_prefix = ?3 AND id > ?4))
-                  ORDER BY priority DESC, path_prefix ASC, id ASC LIMIT ?5"
-            ))?;
+            let mut statement = transaction.prepare(&routes_page_sql(&resume))?;
             let rows = statement
                 .query_map(
-                    params![
-                        env_id,
-                        after_priority,
-                        after_path_prefix,
-                        after_id,
-                        fetch_limit
-                    ],
+                    params_from_iter(resume.bindings([Value::from(env_id)], fetch_limit)),
                     map_route,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3483,28 +3479,26 @@ impl CatalogStore {
         cursor: Option<PagePosition>,
     ) -> CatalogResult<CatalogPage<DomainGrant>> {
         let fetch_limit = sqlite_fetch_limit(limit, "domain grants")?;
-        let after = domain_grant_cursor(cursor)?;
+        let resume = match domain_grant_cursor(cursor)? {
+            Some((pattern, app_id, environment)) => KeysetResume::after_row_value(
+                1,
+                vec![
+                    KeysetBound::ascending("pattern", Value::from(pattern)),
+                    KeysetBound::ascending("app_id", Value::from(app_id)),
+                    KeysetBound::ascending("environment", Value::from(environment)),
+                ],
+            ),
+            None => KeysetResume::first_page(1),
+        };
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             let total = transaction.query_row("SELECT COUNT(*) FROM domain_grants", [], |row| {
                 row.get::<_, i64>(0)
             })?;
-            let (after_pattern, after_app_id, after_environment) = match &after {
-                Some((pattern, app_id, environment)) => (
-                    Some(pattern.as_str()),
-                    Some(app_id.as_str()),
-                    Some(environment.as_str()),
-                ),
-                None => (None, None, None),
-            };
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {DOMAIN_GRANT_COLUMNS} FROM domain_grants
-                  WHERE (?1 IS NULL OR (pattern, app_id, environment) > (?1, ?2, ?3))
-                  ORDER BY pattern ASC, app_id ASC, environment ASC LIMIT ?4"
-            ))?;
+            let mut statement = transaction.prepare(&domain_grants_page_sql(&resume))?;
             let rows = statement
                 .query_map(
-                    params![after_pattern, after_app_id, after_environment, fetch_limit],
+                    params_from_iter(resume.bindings([], fetch_limit)),
                     map_domain_grant,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3950,6 +3944,7 @@ impl CatalogStore {
         let env_id = env_id.to_string();
         let fetch_limit = sqlite_fetch_limit(limit, "secrets")?;
         let after_name = identity_only_cursor(cursor, "secrets")?;
+        let resume = KeysetResume::identity_only(2, KeysetDirection::Ascending, "name", after_name);
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             let total = transaction.query_row(
@@ -3957,19 +3952,18 @@ impl CatalogStore {
                 [&env_id],
                 |row| row.get::<_, i64>(0),
             )?;
-            let mut statement = transaction.prepare(
-                "SELECT name, revision_id, updated_at FROM secret_heads
-                  WHERE env_id = ?1 AND (?2 IS NULL OR name > ?2)
-                  ORDER BY name ASC LIMIT ?3",
-            )?;
+            let mut statement = transaction.prepare(&secrets_page_sql(&resume))?;
             let rows = statement
-                .query_map(params![env_id, after_name, fetch_limit], |row| {
-                    Ok(SecretMeta {
-                        name: row.get(0)?,
-                        revision: row.get(1)?,
-                        updated_at: row.get(2)?,
-                    })
-                })?
+                .query_map(
+                    params_from_iter(resume.bindings([Value::from(env_id)], fetch_limit)),
+                    |row| {
+                        Ok(SecretMeta {
+                            name: row.get(0)?,
+                            revision: row.get(1)?,
+                            updated_at: row.get(2)?,
+                        })
+                    },
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             transaction.commit()?;
@@ -4242,6 +4236,104 @@ impl CatalogStore {
 }
 
 // --------------------------------------------------------------------
+// Page statements
+//
+// One builder per public list, each rendering the two forms a keyset page
+// has: with the cursor predicate when the request resumes from one and
+// without it otherwise, which is what lets SQLite seek the page index
+// instead of walking the scope (see `pagination::KeysetResume`). The
+// builders are what `pagination_plans` explains, so the plan evidence is
+// about the statement the store really prepares and cannot drift from it.
+// --------------------------------------------------------------------
+
+pub(crate) fn apps_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {APP_COLUMNS} FROM apps{resume_clause}
+          ORDER BY id ASC LIMIT ?{limit}",
+        resume_clause = resume.where_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn retired_names_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {RETIRED_NAME_COLUMNS} FROM retired_app_names{resume_clause}
+          ORDER BY app_id ASC LIMIT ?{limit}",
+        resume_clause = resume.where_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn canonical_artifacts_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {CANONICAL_ARTIFACT_COLUMNS} FROM canonical_artifacts
+          WHERE app_id = ?1{resume_clause}
+          ORDER BY created_at DESC, id DESC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn versions_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {VERSION_COLUMNS} FROM versions
+          WHERE app_id = ?1{resume_clause}
+          ORDER BY number DESC, id DESC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn environments_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {ENVIRONMENT_COLUMNS} FROM environments
+          WHERE app_id = ?1{resume_clause}
+          ORDER BY name ASC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn deployments_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {DEPLOYMENT_COLUMNS} FROM deployments
+          WHERE env_id = ?1{resume_clause}
+          ORDER BY created_at DESC, canonical_id DESC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn routes_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {ROUTE_COLUMNS} FROM routes
+          WHERE env_id = ?1{resume_clause}
+          ORDER BY priority DESC, path_prefix ASC, id ASC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn domain_grants_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {DOMAIN_GRANT_COLUMNS} FROM domain_grants{resume_clause}
+          ORDER BY pattern ASC, app_id ASC, environment ASC LIMIT ?{limit}",
+        resume_clause = resume.where_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn secrets_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT name, revision_id, updated_at FROM secret_heads
+          WHERE env_id = ?1{resume_clause}
+          ORDER BY name ASC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+// --------------------------------------------------------------------
 // Row mapping and lookup helpers
 // --------------------------------------------------------------------
 
@@ -4256,12 +4348,6 @@ fn identity_only_cursor(
         Some(position) => Ok(Some(position.identity)),
         None => Ok(None),
     }
-}
-
-fn descending_cursor(cursor: Option<PagePosition>) -> (Option<i64>, String) {
-    cursor
-        .map(|position| (Some(position.sort_value), position.identity))
-        .unwrap_or((None, String::new()))
 }
 
 /// Separator between the application id and the environment name inside a
@@ -4279,17 +4365,17 @@ pub fn domain_grant_cursor_secondary(app_id: &str, environment: &str) -> String 
 /// Routes have no timestamp, so the sort is `priority DESC, path_prefix ASC,
 /// id ASC` and the cursor carries all three: `sort_value` is the priority,
 /// `secondary` the path prefix, `identity` the route id.
-fn route_cursor(cursor: Option<PagePosition>) -> CatalogResult<(Option<i64>, String, String)> {
+fn route_cursor(cursor: Option<PagePosition>) -> CatalogResult<Option<(i64, String, String)>> {
     match cursor {
         Some(PagePosition {
             sort_value,
             identity,
             secondary: Some(path_prefix),
-        }) => Ok((Some(sort_value), path_prefix, identity)),
+        }) => Ok(Some((sort_value, path_prefix, identity))),
         Some(_) => Err(CatalogError::invalid(
             "routes cursor is missing its path prefix position",
         )),
-        None => Ok((None, String::new(), String::new())),
+        None => Ok(None),
     }
 }
 

@@ -19,6 +19,24 @@ parameter, one that becomes required or a new one that is required; a
 request body that appears as required or becomes required; a security
 requirement that is added. Other additions are not breaking.
 
+Range and length bounds are read the same way, and they are why a value the
+baseline accepted can start being refused without a single type changing:
+lowering `limit`'s `maximum` from 1000 to 500 leaves the parameter an
+optional integer, and every caller that asks for a thousand rows starts
+getting a 400. So on a *request* a raised `minimum`/`minLength`/`minItems`,
+a lowered `maximum`/`maxLength`/`maxItems`, a bound that appears where the
+baseline had none, and an added or changed `pattern` are all refused; on a
+*response* the mirror is refused, because a reader that sized itself to the
+baseline's ceiling is the one hurt when the ceiling rises or goes away.
+
+One kind of type change is deliberately not breaking: a *response* value
+whose set of types shrinks to a subset of what the baseline promised - in
+practice a member that stopped being nullable, either as `["string", "null"]`
+becoming `"string"` or as `oneOf: [null, X]` becoming `X`. A client written
+against the baseline already handles every value the new document allows, so
+nothing it does can fail; the same narrowing on a *request* is refused,
+because there a client may already be sending the value that is now gone.
+
 The comparison exercises itself on a table of small documents before
 looking at the real one (`self_check`), so a rule that stops firing is
 caught here and not by the client it would have failed.
@@ -242,6 +260,14 @@ def validate_invariants(document: dict) -> None:
 
 
 class Comparison:
+    # Keywords that carve a range out of a type. The first group raises the
+    # floor a value has to clear, the second lowers the ceiling it has to stay
+    # under; an absent keyword is the bound at infinity, so a keyword that
+    # appears where the baseline had none moves that bound just as surely as
+    # one that changes value.
+    LOWER_BOUNDS = ("minimum", "exclusiveMinimum", "minLength", "minItems", "minProperties")
+    UPPER_BOUNDS = ("maximum", "exclusiveMaximum", "maxLength", "maxItems", "maxProperties")
+
     def __init__(self, old: dict, new: dict) -> None:
         self.old = old
         self.new = new
@@ -250,6 +276,69 @@ class Comparison:
 
     def note(self, message: str) -> None:
         self.breaking.append(message)
+
+    @staticmethod
+    def _type_set(value) -> set:
+        return set(value) if isinstance(value, list) else {value}
+
+    @staticmethod
+    def _without_null(group: list) -> list:
+        return [member for member in group if member != {"type": "null"}]
+
+    def bounds(self, old: dict, new: dict, where: str, direction: str) -> None:
+        """Refuse a range a client written against the baseline falls outside
+        of: on a request the room to send shrinks, on a response the range to
+        read grows past what the reader sized itself for."""
+        for keyword in self.LOWER_BOUNDS + self.UPPER_BOUNDS:
+            raises_floor = keyword in self.LOWER_BOUNDS
+            old_value = old.get(keyword)
+            new_value = new.get(keyword)
+            if old_value == new_value:
+                continue
+            if direction == "request":
+                # Dropping a bound only ever gives the sender more room.
+                if new_value is None:
+                    continue
+                if old_value is None:
+                    self.note(f"{where}: {keyword} {new_value} added where the request had no bound")
+                    continue
+            else:
+                # A response bound the baseline never stated promised nothing.
+                if old_value is None:
+                    continue
+                if new_value is None:
+                    self.note(f"{where}: {keyword} {old_value} dropped from the response")
+                    continue
+            if not self._comparable(old_value, new_value):
+                # A bound spelled in some way this comparison cannot order
+                # (the 3.0 boolean `exclusiveMinimum` against the 3.1 number,
+                # say) is reported rather than assumed harmless.
+                self.note(f"{where}: {keyword} changed from {old_value!r} to {new_value!r}")
+                continue
+            if direction == "request":
+                if (new_value > old_value) if raises_floor else (new_value < old_value):
+                    self.note(f"{where}: {keyword} narrowed from {old_value} to {new_value}")
+            elif (new_value < old_value) if raises_floor else (new_value > old_value):
+                self.note(f"{where}: {keyword} widened from {old_value} to {new_value}")
+        old_pattern = old.get("pattern")
+        new_pattern = new.get("pattern")
+        if old_pattern != new_pattern:
+            # Whether one regex accepts everything another does is not a
+            # question this gate answers, so any pattern that appears or
+            # changes on a request, and any that changes or goes away on a
+            # response, counts against the promise.
+            if direction == "request" and new_pattern is not None:
+                self.note(f"{where}: request pattern changed from {old_pattern!r} to {new_pattern!r}")
+            elif direction == "response" and old_pattern is not None:
+                self.note(f"{where}: response pattern changed from {old_pattern!r} to {new_pattern!r}")
+
+    @staticmethod
+    def _comparable(old_value, new_value) -> bool:
+        """Both bounds are numbers this comparison can order."""
+        return all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in (old_value, new_value)
+        )
 
     def schema(self, old: dict, new: dict, where: str, direction: str) -> None:
         """`direction` is "request" or "response": what a client sends or
@@ -265,13 +354,24 @@ class Comparison:
         old_type = old.get("type")
         new_type = new.get("type")
         if old_type is not None and new_type != old_type:
-            self.note(f"{where}: type changed from {old_type} to {new_type}")
+            # A response that can no longer be null (or is otherwise a subset
+            # of what was promised) is read correctly by a client written
+            # against the wider baseline; the same change on a request takes
+            # away a value that client may be sending.
+            narrowed = (
+                direction == "response"
+                and new_type is not None
+                and self._type_set(new_type) <= self._type_set(old_type)
+            )
+            if not narrowed:
+                self.note(f"{where}: type changed from {old_type} to {new_type}")
         if old.get("format") is not None and new.get("format") != old.get("format"):
             self.note(f"{where}: format changed from {old.get('format')} to {new.get('format')}")
         if "enum" in old:
             removed = sorted(set(map(str, old["enum"])) - set(map(str, new.get("enum", []))))
             if removed:
                 self.note(f"{where}: enum values removed: {removed}")
+        self.bounds(old, new, where, direction)
         old_props = old.get("properties", {})
         new_props = new.get("properties", {})
         old_required = set(old.get("required", []))
@@ -293,6 +393,19 @@ class Comparison:
         for group in ("allOf", "oneOf", "anyOf"):
             old_group = old.get(group, [])
             new_group = new.get(group, [])
+            # `oneOf: [null, X]` for a response member that stopped being
+            # nullable renders as X itself, with no group left to walk. The
+            # one remaining member is compared against what took its place.
+            if (
+                direction == "response"
+                and group in ("oneOf", "anyOf")
+                and old_group
+                and not new_group
+            ):
+                remaining = self._without_null(old_group)
+                if len(remaining) == 1 and len(remaining) < len(old_group):
+                    self.schema(remaining[0], new, f"{where}.{group}[0]", direction)
+                    continue
             if old_group and len(new_group) < len(old_group):
                 self.note(f"{where}: {group} lost members")
                 continue
@@ -459,17 +572,172 @@ SELF_CHECK_CASES = [
 ]
 
 
+def _nullable(schema: dict) -> dict:
+    """The same schema, spelled as it is when the member may also be null."""
+    return {"type": [schema["type"], "null"]}
+
+
+def _response_property(document: dict, name: str) -> dict:
+    return document["paths"]["/api/v1/apps"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["properties"][name]
+
+
+def _request_property(document: dict, name: str) -> dict:
+    return document["paths"]["/api/v1/apps"]["post"]["requestBody"]["content"]["application/json"][
+        "schema"
+    ]["properties"][name]
+
+
+def _set_response_property(document: dict, name: str, schema: dict) -> None:
+    document["paths"]["/api/v1/apps"]["get"]["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]["properties"][name] = schema
+
+
+def _set_request_property(document: dict, name: str, schema: dict) -> None:
+    document["paths"]["/api/v1/apps"]["post"]["requestBody"]["content"]["application/json"][
+        "schema"
+    ]["properties"][name] = schema
+
+
+# Nullability, both ways round: the baseline is mutated too, because these
+# cases are about what a member *was*. A response that stops being nullable is
+# read by every client written against the baseline; a request that stops
+# accepting null takes away a value a client may already be sending, and a
+# response that starts being nullable hands a reader a value its types do not
+# admit.
+NULLABILITY_CASES = [
+    (
+        "a response member that stopped being nullable",
+        lambda d: _set_response_property(d, "total", _nullable(_response_property(d, "total"))),
+        lambda d: _set_response_property(d, "total", {"type": "integer"}),
+        None,
+    ),
+    (
+        "a response member that became nullable",
+        lambda d: None,
+        lambda d: _set_response_property(d, "total", {"type": ["integer", "null"]}),
+        "type changed from integer to ['integer', 'null']",
+    ),
+    (
+        "a request member that stopped being nullable",
+        lambda d: _set_request_property(d, "note", _nullable(_request_property(d, "note"))),
+        lambda d: _set_request_property(d, "note", {"type": "string"}),
+        "type changed from ['string', 'null'] to string",
+    ),
+    (
+        "a response oneOf that lost only its null",
+        lambda d: _set_response_property(
+            d, "total", {"oneOf": [{"type": "null"}, {"type": "integer"}]}
+        ),
+        lambda d: _set_response_property(d, "total", {"type": "integer"}),
+        None,
+    ),
+    (
+        "a response oneOf that lost the member carrying the value",
+        lambda d: _set_response_property(
+            d, "total", {"oneOf": [{"type": "null"}, {"type": "integer"}]}
+        ),
+        lambda d: _set_response_property(d, "total", {"type": "null"}),
+        "type changed from integer to null",
+    ),
+]
+
+
+def _parameter_schema(document: dict) -> dict:
+    return document["paths"]["/api/v1/apps"]["get"]["parameters"][0]["schema"]
+
+
+# Bounds, both ways round, on the same footing as nullability: the baseline is
+# mutated too, because these cases are about the room a value already had. The
+# first one is the change that prompted the rule - `limit` keeps its type and
+# its optionality, and every caller asking for a thousand rows starts getting
+# a 400 anyway.
+BOUNDS_CASES = [
+    (
+        "a request parameter whose maximum was lowered",
+        lambda d: _parameter_schema(d).update({"minimum": 1, "maximum": 1000}),
+        lambda d: _parameter_schema(d).__setitem__("maximum", 500),
+        "maximum narrowed from 1000 to 500",
+    ),
+    (
+        "a request parameter that gained a maximum",
+        lambda d: None,
+        lambda d: _parameter_schema(d).__setitem__("maximum", 500),
+        "maximum 500 added where the request had no bound",
+    ),
+    (
+        "a request parameter whose maximum was raised",
+        lambda d: _parameter_schema(d).__setitem__("maximum", 1000),
+        lambda d: _parameter_schema(d).__setitem__("maximum", 2000),
+        None,
+    ),
+    (
+        "a request parameter whose minimum was raised",
+        lambda d: _parameter_schema(d).__setitem__("minimum", 1),
+        lambda d: _parameter_schema(d).__setitem__("minimum", 2),
+        "minimum narrowed from 1 to 2",
+    ),
+    (
+        "a request parameter that dropped its minimum",
+        lambda d: _parameter_schema(d).__setitem__("minimum", 1),
+        lambda d: _parameter_schema(d).pop("minimum"),
+        None,
+    ),
+    (
+        "a request property whose maxLength shrank",
+        lambda d: _request_property(d, "note").__setitem__("maxLength", 64),
+        lambda d: _request_property(d, "note").__setitem__("maxLength", 32),
+        "maxLength narrowed from 64 to 32",
+    ),
+    (
+        "a request property that gained a pattern",
+        lambda d: None,
+        lambda d: _request_property(d, "note").__setitem__("pattern", "^[a-z]+$"),
+        "request pattern changed",
+    ),
+    (
+        "a response property whose maximum was raised",
+        lambda d: _response_property(d, "total").__setitem__("maximum", 100),
+        lambda d: _response_property(d, "total").__setitem__("maximum", 1000),
+        "maximum widened from 100 to 1000",
+    ),
+    (
+        "a response property that dropped its maxItems",
+        lambda d: _response_property(d, "items").__setitem__("maxItems", 100),
+        lambda d: _response_property(d, "items").pop("maxItems"),
+        "maxItems 100 dropped from the response",
+    ),
+    (
+        "a response property whose maximum was lowered",
+        lambda d: _response_property(d, "total").__setitem__("maximum", 100),
+        lambda d: _response_property(d, "total").__setitem__("maximum", 50),
+        None,
+    ),
+]
+
+
 def _optional_then_required(document: dict) -> None:
     """The baseline for this case takes an optional body; see `self_check`."""
     document["paths"]["/api/v1/apps"]["post"]["requestBody"]["required"] = True
 
 
 def self_check() -> None:
-    for label, mutate, expected in SELF_CHECK_CASES:
+    cases = [(label, None, mutate, expected) for label, mutate, expected in SELF_CHECK_CASES]
+    cases.extend(NULLABILITY_CASES)
+    cases.extend(BOUNDS_CASES)
+    for label, mutate_baseline, mutate, expected in cases:
         baseline = _minimal_document()
         if label == "a request body that became required":
             baseline["paths"]["/api/v1/apps"]["post"]["requestBody"]["required"] = False
-        comparison = Comparison(baseline, _mutated(mutate))
+        if mutate_baseline is not None:
+            mutate_baseline(baseline)
+        document = _minimal_document()
+        if mutate_baseline is not None:
+            mutate_baseline(document)
+        mutate(document)
+        comparison = Comparison(baseline, document)
         comparison.run()
         if expected is None:
             require(not comparison.breaking, f"self-check: {label} was reported as breaking: {comparison.breaking}")

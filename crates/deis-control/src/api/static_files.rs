@@ -7,7 +7,7 @@ use axum::{
 use rust_embed::Embed;
 
 use crate::api::error::ApiError;
-use crate::api::versioning::{ApiSurface, RequestId};
+use crate::api::versioning::{ApiSurface, RequestContext};
 
 #[derive(Embed)]
 #[folder = "web/dist"]
@@ -38,7 +38,8 @@ pub async fn serve_assets(Path(path): Path<String>) -> impl IntoResponse {
 /// The refusal is `route-not-found` in the shape of the surface the path
 /// names: the structured envelope under `/api/v1` and `/api/platform`, the
 /// two-key legacy body everywhere else under `/api`. The fallback runs
-/// outside every mount, so the request id is minted here.
+/// outside every mount, so the request and correlation ids the answer
+/// echoes are settled here, from what the caller sent.
 pub async fn serve_fallback<B>(req: Request<B>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
     if let Some(response) = try_serve_file(path) {
@@ -47,7 +48,7 @@ pub async fn serve_fallback<B>(req: Request<B>) -> impl IntoResponse {
     if is_api_path(path) {
         return ApiError::route_not_found().into_response_for(
             ApiSurface::of_path(req.uri().path()),
-            RequestId::of(req.extensions()),
+            RequestContext::resolve(req.extensions(), req.headers()),
         );
     }
     serve_embedded_file("index.html")

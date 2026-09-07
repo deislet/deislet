@@ -25,6 +25,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::error::{ApiError, ApiResult};
 use super::openapi;
+use super::paths::ApiPaths;
 use crate::catalog::CatalogStore;
 use crate::runtime_client::{ContestedNodeId, DepartedNode, NodeView, RuntimeNodeManager};
 
@@ -260,10 +261,12 @@ pub struct UnloadRefused {
     pub error: String,
     /// On 409: the environments the catalog still deploys to this node.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub assigned_environments: Option<Vec<String>>,
     /// On 409: how often the node reconciles its assignment list, in
     /// seconds - the time within which the application would be back.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub assignment_refresh_seconds: Option<u64>,
 }
 
@@ -309,6 +312,7 @@ pub struct UnloadRefused {
 )]
 pub async fn unload_app(
     State(state): State<AppsState>,
+    paths: ApiPaths,
     Path((node, app_id)): Path<(String, String)>,
     Query(params): Query<UnloadParams>,
 ) -> ApiResult<Response> {
@@ -326,13 +330,27 @@ pub async fn unload_app(
                 error = %e,
                 "Could not read the catalog, so it is not known whether this node would load the application straight back; the unload was not sent and this node is still serving it"
             );
+            // This body is not the error envelope, so nothing downstream
+            // makes it opaque: what the catalog said - an SQLite sentence
+            // naming a column, a file or a lock - would travel to a caller
+            // holding nothing but a deploy scope. The legacy tree is frozen
+            // and keeps it; `/api/v1` and `/api/platform` get the fixed
+            // sentence and the ids this answer already echoes, which is
+            // what the log line above is found by.
+            let reason = if paths.surface().structured_errors() {
+                format!(
+                    "cannot read the catalog to check whether {app_id} would be reassigned to this node; quote the x-request-id of this answer to an operator, whose log has why. Nothing was sent to the node"
+                )
+            } else {
+                format!(
+                    "cannot read the catalog to check whether {app_id} would be reassigned to this node: {e}. Nothing was sent to the node"
+                )
+            };
             return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(UnloadRefused {
                     success: false,
-                    error: format!(
-                        "cannot read the catalog to check whether {app_id} would be reassigned to this node: {e}. Nothing was sent to the node"
-                    ),
+                    error: reason,
                     assigned_environments: None,
                     assignment_refresh_seconds: None,
                 }),
@@ -442,6 +460,7 @@ async fn assigned_environments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::versioning::ApiSurface;
     use crate::database::Database;
     use axum::body::to_bytes;
 
@@ -481,8 +500,17 @@ mod tests {
     }
 
     async fn unload(state: &AppsState, environment: Option<&str>) -> (StatusCode, String) {
+        unload_on(state, ApiSurface::Legacy, environment).await
+    }
+
+    async fn unload_on(
+        state: &AppsState,
+        surface: ApiSurface,
+        environment: Option<&str>,
+    ) -> (StatusCode, String) {
         let response = unload_app(
             State(state.clone()),
+            ApiPaths::on(surface),
             Path(("node-a".to_string(), "demo".to_string())),
             Query(UnloadParams {
                 environment: environment.map(str::to_string),
@@ -525,6 +553,50 @@ mod tests {
                 .any(|assignment| assignment.app_id == "demo"),
             "the catalog would hand demo straight back to this node"
         );
+    }
+
+    /// The catalog read that decides this answer can fail, and what it
+    /// says is an SQLite sentence. A caller on a structured surface holds
+    /// nothing but a deploy scope and must not read it; the legacy tree is
+    /// frozen and keeps the sentence it has always sent.
+    #[tokio::test]
+    async fn a_catalog_failure_says_nothing_about_sqlite_on_the_structured_surfaces() {
+        let (state, _) = state_with_demo_deployed().await;
+        // The read the refusal stands on, broken the way a half-applied
+        // migration or a dropped table breaks it.
+        state
+            .catalog
+            .database()
+            .with_connection(|connection| {
+                connection.execute_batch("DROP TABLE deployments;")?;
+                Ok::<_, crate::catalog::CatalogError>(())
+            })
+            .await
+            .unwrap();
+
+        let (status, legacy) = unload_on(&state, ApiSurface::Legacy, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{legacy}");
+        assert!(
+            legacy.contains("no such table"),
+            "the legacy body is frozen and still carries what the catalog said: {legacy}"
+        );
+
+        for surface in [ApiSurface::V1, ApiSurface::Platform] {
+            let (status, body) = unload_on(&state, surface, None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(
+                !body.contains("no such table") && !body.contains("SQL"),
+                "{surface} carries the catalog's own text: {body}"
+            );
+            assert!(
+                body.contains("x-request-id"),
+                "{surface} has to say what to quote instead: {body}"
+            );
+            assert!(
+                body.contains("Nothing was sent to the node"),
+                "{surface} still has to say nothing was sent: {body}"
+            );
+        }
     }
 
     /// Naming an environment does not change the answer while that

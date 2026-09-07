@@ -1,20 +1,27 @@
 //! Opaque, query-bound cursors shared by every Control list API.
 //!
-//! The client token is 256 random bits. Only its SHA-256 digest is stored;
-//! sort positions and query bindings stay in the Control database. A token
-//! therefore cannot become an accidental public encoding of SQLite columns,
-//! and possession never grants access: the normal route authorization and
-//! the query binding are checked again on every request.
+//! The client token is 256 bits derived under a key this process draws at
+//! startup and never hands out ([`CURSOR_TOKEN_KEY`]), so it is as
+//! unguessable as a random one and, unlike a random one, the same page of
+//! the same query always yields the same token - which is what keeps a
+//! client polling one page from writing a row per poll. Only the token's
+//! SHA-256 digest is stored; sort positions and query bindings stay in the
+//! Control database. A token therefore cannot become an accidental public
+//! encoding of SQLite columns, and possession never grants access: the
+//! normal route authorization and the query binding are checked again on
+//! every request.
 //!
 //! Cursor persistence is deliberately independent of any one resource
 //! store: catalog, identity and audit lists all page through the same
 //! `api_page_cursors` table, so each of those stores hands out a
 //! [`PageCursorStore`] built on the database it already owns.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,10 +31,50 @@ use super::{CatalogError, CatalogResult, now_secs};
 use crate::database::Database;
 
 const TOKEN_BYTES: usize = 32;
+/// Domain separator for the token derivation, so a digest computed here can
+/// never coincide with one computed for anything else under the same key.
+const TOKEN_DOMAIN: &str = "deislet-control-list-cursor-v1";
 const TOKEN_TEXT_BYTES: usize = 43;
 /// How long an issued cursor stays resolvable. Public contract
 /// (docs/adr/016, list and query section): three days.
 pub const CURSOR_TTL_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+/// How many expired cursors one expiry statement removes.
+///
+/// Expiry runs on the process's single connection, the same one every list
+/// request and every heartbeat write needs, so the question is not how many
+/// rows a pass removes but how long the longest single statement holds that
+/// connection. An unbounded `DELETE` is free in the ordinary case, where it
+/// finds nothing - and unbounded in exactly the case the sweep exists for:
+/// a table that filled up and then went quiet for longer than a cursor
+/// lives. Its whole backlog would come out in one statement, with every
+/// request queued behind it, and the same statement runs inside a list
+/// request when that request is the first thing to touch the table. A fixed
+/// slice at a time costs a few more statements and gives the connection
+/// back between them, so the longest pause is the slice and not the
+/// backlog.
+const EXPIRY_BATCH: usize = 512;
+
+/// The expiry statement, in the one place both callers take it from: the
+/// oldest expired cursors first, at most [`EXPIRY_BATCH`] of them. The
+/// subquery is the seek - `idx_api_page_cursors_expiry_v1` is ordered by
+/// expiry, so it stops at the first live row - and the delete then removes
+/// those rows by their primary key.
+const EXPIRY_BATCH_SQL: &str = "DELETE FROM api_page_cursors
+                                 WHERE token_sha256 IN (
+                                       SELECT token_sha256 FROM api_page_cursors
+                                        WHERE expires_at <= ?1
+                                        ORDER BY expires_at ASC
+                                        LIMIT ?2)";
+
+/// Remove at most one slice of expired cursors; returns how many went, so a
+/// caller can tell a short slice (nothing left) from a full one.
+fn delete_expired_cursor_batch(
+    connection: &rusqlite::Connection,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    connection.execute(EXPIRY_BATCH_SQL, params![now, EXPIRY_BATCH as i64])
+}
 
 /// What every refusal of a cursor says, whichever way it failed: a token
 /// that is not one of ours, one that expired, and one issued for another
@@ -69,11 +116,14 @@ pub struct CatalogPage<T> {
 
 /// Capacity view of the cursor table at one instant.
 ///
-/// Every list request that has a further page writes one row, and a row
-/// lives for [`CURSOR_TTL_SECONDS`], so `live` is a direct reading of how
-/// many partial traversals clients are holding open. `expired_pending_removal`
-/// stays near zero while the liveness sweep runs; a growing value means the
-/// sweep is not reaching this table.
+/// One row per *page position* that has been handed out and not yet expired:
+/// [`PageCursorStore::issue`] derives a token from the page it resumes, so
+/// repeated answers about the same page share a row rather than each adding
+/// one. `live` is therefore how many distinct places in how many collections
+/// clients can still resume from - the number that grows with real
+/// traversals and not with polling. `expired_pending_removal` stays near
+/// zero while the liveness sweep runs; a growing value means the sweep is
+/// not reaching this table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PageCursorStatistics {
     /// Cursors a client can still resume from.
@@ -118,6 +168,259 @@ pub(crate) fn finish_page<T>(
         total,
         has_more,
     })
+}
+
+/// Which way a page walks one column of its sort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeysetDirection {
+    Ascending,
+    Descending,
+}
+
+impl KeysetDirection {
+    /// The comparison that means "strictly after the cursor" for this
+    /// direction.
+    const fn comparison(self) -> &'static str {
+        match self {
+            Self::Ascending => ">",
+            Self::Descending => "<",
+        }
+    }
+}
+
+/// One column of a keyset sort and the position value the page resumes
+/// after.
+pub(crate) struct KeysetBound {
+    column: String,
+    direction: KeysetDirection,
+    value: Value,
+}
+
+impl KeysetBound {
+    pub(crate) fn new(column: &str, direction: KeysetDirection, value: Value) -> Self {
+        Self {
+            column: column.to_owned(),
+            direction,
+            value,
+        }
+    }
+
+    pub(crate) fn ascending(column: &str, value: Value) -> Self {
+        Self::new(column, KeysetDirection::Ascending, value)
+    }
+
+    pub(crate) fn descending(column: &str, value: Value) -> Self {
+        Self::new(column, KeysetDirection::Descending, value)
+    }
+}
+
+/// The cursor half of a page statement: the predicate that resumes after a
+/// position, and the parameter index the statement's `LIMIT` takes once the
+/// cursor's own parameters are accounted for.
+///
+/// The predicate has to be *absent* from a first page's statement rather
+/// than switched off by a bound `NULL`. SQLite compiles one plan per
+/// statement text, and it cannot turn `(?n IS NULL OR sort < ?n OR (sort =
+/// ?n AND tie < ?m))` into an index range constraint: the whole disjunction
+/// becomes a row filter, the index supplies only the sort order, and
+/// resuming a page deep in a large collection walks every row of the scope
+/// that precedes the cursor - the ten-thousandth page reads the first
+/// million rows again. Written only when the request carries a cursor, the
+/// same predicate is what the index seeks to, and every page of a
+/// collection costs the same. `database::read_keyset_page`, which serves
+/// the diagnostic histories, builds its statements the same way, and
+/// `catalog::pagination_plans` explains both forms of every statement
+/// against the real schema.
+pub(crate) struct KeysetResume {
+    predicate: Option<String>,
+    values: Vec<Value>,
+    limit_index: usize,
+}
+
+impl KeysetResume {
+    /// A first page: no predicate and no cursor bindings, so `LIMIT` takes
+    /// the first free parameter itself.
+    pub(crate) fn first_page(first_param: usize) -> Self {
+        Self {
+            predicate: None,
+            values: Vec::new(),
+            limit_index: first_param,
+        }
+    }
+
+    /// Resume strictly after a position, comparing the sort columns in
+    /// order: the first column decides, and each further column only
+    /// breaks a tie among all the columns before it.
+    pub(crate) fn after(first_param: usize, bounds: Vec<KeysetBound>) -> Self {
+        debug_assert!(!bounds.is_empty(), "a keyset resume needs a sort column");
+        let mut alternatives: Vec<String> = Vec::with_capacity(bounds.len());
+        for (index, bound) in bounds.iter().enumerate() {
+            let mut terms: Vec<String> = bounds[..index]
+                .iter()
+                .enumerate()
+                .map(|(tie, earlier)| format!("{} = ?{}", earlier.column, first_param + tie))
+                .collect();
+            terms.push(format!(
+                "{} {} ?{}",
+                bound.column,
+                bound.direction.comparison(),
+                first_param + index
+            ));
+            alternatives.push(if terms.len() == 1 {
+                terms.remove(0)
+            } else {
+                format!("({})", terms.join(" AND "))
+            });
+        }
+        Self::from_parts(first_param, alternatives.join(" OR "), bounds)
+    }
+
+    /// Resume strictly after a position with one row-value comparison,
+    /// which SQLite seeks through a compound index as a single constraint.
+    /// Only usable when every column of the sort runs the same way.
+    pub(crate) fn after_row_value(first_param: usize, bounds: Vec<KeysetBound>) -> Self {
+        debug_assert!(!bounds.is_empty(), "a keyset resume needs a sort column");
+        let direction = bounds[0].direction;
+        debug_assert!(
+            bounds.iter().all(|bound| bound.direction == direction),
+            "a row-value comparison cannot mix sort directions"
+        );
+        let columns = bounds
+            .iter()
+            .map(|bound| bound.column.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (0..bounds.len())
+            .map(|index| format!("?{}", first_param + index))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let predicate = format!("({columns}) {} ({placeholders})", direction.comparison());
+        Self::from_parts(first_param, predicate, bounds)
+    }
+
+    fn from_parts(first_param: usize, predicate: String, bounds: Vec<KeysetBound>) -> Self {
+        let limit_index = first_param + bounds.len();
+        Self {
+            predicate: Some(predicate),
+            values: bounds.into_iter().map(|bound| bound.value).collect(),
+            limit_index,
+        }
+    }
+
+    /// The form every timestamped list uses: one value column with an
+    /// identity tie-breaker, both walked the same way, resumed from
+    /// `cursor` (or a first page when there is none).
+    pub(crate) fn value_and_identity(
+        first_param: usize,
+        direction: KeysetDirection,
+        value_column: &str,
+        identity_column: &str,
+        cursor: Option<PagePosition>,
+    ) -> Self {
+        match cursor {
+            Some(position) => Self::after(
+                first_param,
+                vec![
+                    KeysetBound::new(value_column, direction, Value::from(position.sort_value)),
+                    KeysetBound::new(identity_column, direction, Value::from(position.identity)),
+                ],
+            ),
+            None => Self::first_page(first_param),
+        }
+    }
+
+    /// A list whose sort is one column that is already unique, so the
+    /// cursor carries nothing but that position.
+    pub(crate) fn identity_only(
+        first_param: usize,
+        direction: KeysetDirection,
+        column: &str,
+        after: Option<String>,
+    ) -> Self {
+        match after {
+            Some(identity) => Self::after(
+                first_param,
+                vec![KeysetBound::new(column, direction, Value::from(identity))],
+            ),
+            None => Self::first_page(first_param),
+        }
+    }
+
+    /// The predicate as a further condition of a `WHERE` that already has
+    /// one, or nothing at all on a first page.
+    pub(crate) fn and_clause(&self) -> String {
+        match &self.predicate {
+            Some(predicate) => format!(" AND ({predicate})"),
+            None => String::new(),
+        }
+    }
+
+    /// The predicate as the whole `WHERE` of a statement that filters on
+    /// nothing else, or nothing at all on a first page.
+    pub(crate) fn where_clause(&self) -> String {
+        match &self.predicate {
+            Some(predicate) => format!(" WHERE {predicate}"),
+            None => String::new(),
+        }
+    }
+
+    /// The cursor's own bindings, for a statement that assembles its
+    /// parameter list itself.
+    pub(crate) fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    /// The parameter index the statement's `LIMIT` takes.
+    pub(crate) fn limit_index(&self) -> usize {
+        self.limit_index
+    }
+
+    /// The statement's bindings: the filters the caller names first, then
+    /// the cursor's own values, then the fetch limit - the order every page
+    /// statement numbers its parameters in.
+    pub(crate) fn bindings(
+        &self,
+        filters: impl IntoIterator<Item = Value>,
+        fetch_limit: i64,
+    ) -> Vec<Value> {
+        let mut bindings: Vec<Value> = filters.into_iter().collect();
+        bindings.extend(self.values.iter().cloned());
+        bindings.push(Value::from(fetch_limit));
+        bindings
+    }
+}
+
+/// The key every cursor token is derived under.
+///
+/// 256 random bits, drawn once per process. A token is
+/// `HMAC-SHA256(key, collection || binding || position)`, which gives the
+/// two properties this table needs at once: the same page yields the same
+/// token, so a client polling one page does not mint a row per poll; and no
+/// caller can compute or guess a token for a position it was not given,
+/// because the key never leaves this process.
+///
+/// Per process rather than persisted: a restart simply starts deriving
+/// under a new key, and the cursors handed out before it keep resolving,
+/// because resolution matches the digest of the token the client holds and
+/// not the key it was derived under. Nothing is invalidated and nothing is
+/// stored that would have to be protected.
+static CURSOR_TOKEN_KEY: LazyLock<[u8; TOKEN_BYTES]> = LazyLock::new(|| {
+    let mut key = [0_u8; TOKEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    key
+});
+
+fn derive_token(collection: &str, binding_sha256: &str, position_json: &str) -> [u8; TOKEN_BYTES] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(CURSOR_TOKEN_KEY.as_slice())
+        .expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(TOKEN_DOMAIN.as_bytes());
+    mac.update(b"\n");
+    mac.update(collection.as_bytes());
+    mac.update(b"\n");
+    mac.update(binding_sha256.as_bytes());
+    mac.update(b"\n");
+    mac.update(position_json.as_bytes());
+    mac.finalize().into_bytes().into()
 }
 
 /// Persistence for opaque list cursors, shared by every resource store that
@@ -174,8 +477,22 @@ impl PageCursorStore {
             .await
     }
 
-    /// Persist the next keyset position and return a random URL-safe token.
-    /// Expired cursors are opportunistically removed in the same transaction.
+    /// Persist the next keyset position and return the URL-safe token that
+    /// resumes from it. One slice of expired cursors is opportunistically
+    /// removed in the same transaction, bounded by [`EXPIRY_BATCH`] so that
+    /// a request never pays for a backlog the sweep has not reached yet.
+    ///
+    /// The same page of the same query issues the same token, and therefore
+    /// reuses its row. That matters because a cursor is minted by *reading*:
+    /// every answer that has a further page carries one, and the console
+    /// polls the events and commands lists every few seconds without ever
+    /// continuing the traversal. With a fresh random token per answer, one
+    /// idle browser tab turned two reads into a durable write every three
+    /// seconds - about 138,000 rows over a cursor's three-day life, each one
+    /// committed on the process's single connection - and
+    /// [`PageCursorStatistics::live`] counted them all as traversals a
+    /// client was holding open. Deriving the token instead means a poll that
+    /// asks the same question again gets the same answer and writes nothing.
     pub async fn issue(
         &self,
         collection: &str,
@@ -184,37 +501,69 @@ impl PageCursorStore {
     ) -> CatalogResult<String> {
         validate_collection(collection)?;
         validate_position(&position)?;
-        let mut raw_token = [0_u8; TOKEN_BYTES];
-        rand::rngs::OsRng.fill_bytes(&mut raw_token);
-        let token = URL_SAFE_NO_PAD.encode(raw_token);
-        debug_assert_eq!(token.len(), TOKEN_TEXT_BYTES);
-        let token_sha256 = sha256_hex(&raw_token);
         let binding_sha256 = binding_sha256(collection, query_binding);
         let position_json = serde_json::to_string(&position).map_err(|error| {
             CatalogError::invalid(format!("cannot encode pagination position: {error}"))
         })?;
+        let raw_token = derive_token(collection, &binding_sha256, &position_json);
+        let token = URL_SAFE_NO_PAD.encode(raw_token);
+        debug_assert_eq!(token.len(), TOKEN_TEXT_BYTES);
+        let token_sha256 = sha256_hex(&raw_token);
         let now = now_secs();
         let expires_at = now.saturating_add(CURSOR_TTL_SECONDS);
         let collection = collection.to_string();
         self.db
             .with_connection(move |connection| {
                 let transaction = connection.unchecked_transaction()?;
-                transaction
-                    .execute("DELETE FROM api_page_cursors WHERE expires_at <= ?1", [now])?;
-                transaction.execute(
-                    "INSERT INTO api_page_cursors
-                       (token_sha256, collection, query_sha256, position_json,
-                        created_at, expires_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        token_sha256,
-                        collection,
-                        binding_sha256,
-                        position_json,
-                        now,
-                        expires_at,
-                    ],
-                )?;
+                delete_expired_cursor_batch(&transaction, now)?;
+                let held: Option<i64> = transaction
+                    .query_row(
+                        "SELECT expires_at FROM api_page_cursors WHERE token_sha256 = ?1",
+                        [&token_sha256],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match held {
+                    // A row this token can still be resumed from for most of
+                    // a cursor's life: the caller is handed it again and
+                    // nothing is written.
+                    Some(held_until)
+                        if held_until.saturating_sub(now) >= CURSOR_TTL_SECONDS / 2 =>
+                    {
+                        debug!(
+                            collection,
+                            "list cursor reissued from the row it was first issued from"
+                        );
+                    }
+                    // Either nothing is stored for this page or what is
+                    // stored is close enough to expiry that a client given it
+                    // now could lose it mid-traversal. The row is replaced
+                    // rather than updated because the table refuses updates
+                    // on purpose; the token is a fingerprint of the position,
+                    // so a replacement cannot move a cursor somewhere else.
+                    held => {
+                        if held.is_some() {
+                            transaction.execute(
+                                "DELETE FROM api_page_cursors WHERE token_sha256 = ?1",
+                                [&token_sha256],
+                            )?;
+                        }
+                        transaction.execute(
+                            "INSERT INTO api_page_cursors
+                               (token_sha256, collection, query_sha256, position_json,
+                                created_at, expires_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                token_sha256,
+                                collection,
+                                binding_sha256,
+                                position_json,
+                                now,
+                                expires_at,
+                            ],
+                        )?;
+                    }
+                }
                 transaction.commit()?;
                 Ok(token)
             })
@@ -229,15 +578,26 @@ impl PageCursorStore {
     /// quiet period when no list request is issuing anything. Idempotent
     /// and safe to run on every tick: it walks the expiry index only as far
     /// as the first live row.
+    ///
+    /// A backlog comes out [`EXPIRY_BATCH`] rows at a time, and the
+    /// connection is taken again for each slice rather than held across all
+    /// of them, so a table that filled up while this process was stopped is
+    /// drained without any one statement blocking the requests that share
+    /// the connection.
     pub async fn expire(&self, now: i64) -> CatalogResult<usize> {
-        let removed = self
-            .db
-            .with_connection(move |connection| {
-                let removed = connection
-                    .execute("DELETE FROM api_page_cursors WHERE expires_at <= ?1", [now])?;
-                Ok::<_, CatalogError>(removed)
-            })
-            .await?;
+        let mut removed = 0_usize;
+        loop {
+            let batch = self
+                .db
+                .with_connection(move |connection| {
+                    Ok::<_, CatalogError>(delete_expired_cursor_batch(connection, now)?)
+                })
+                .await?;
+            removed = removed.saturating_add(batch);
+            if batch < EXPIRY_BATCH {
+                break;
+            }
+        }
         if removed == 0 {
             debug!("no expired list cursors to remove");
         } else {
@@ -429,6 +789,154 @@ mod tests {
                 .resolve(&token, "provider-targets", "installation=one")
                 .await
                 .is_err()
+        );
+    }
+
+    /// A cursor is minted by reading, and the console re-reads the same
+    /// first page of events and commands every few seconds without ever
+    /// continuing the traversal. Asking the same question again therefore
+    /// has to write nothing: the token is derived from the page it resumes,
+    /// so the second answer is the first answer and the table does not grow
+    /// a row per poll.
+    #[tokio::test]
+    async fn re_reading_the_same_page_reuses_its_cursor_row() {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let store = PageCursorStore::new(database.clone());
+        let position = PagePosition {
+            sort_value: 17,
+            identity: "0199b603-20bd-7342-9be3-cef10620d8bb".to_string(),
+            secondary: None,
+        };
+        let count = || {
+            let database = Arc::clone(&database);
+            async move {
+                database
+                    .with_connection(|connection| {
+                        let count = connection.query_row(
+                            "SELECT COUNT(*) FROM api_page_cursors",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?;
+                        Ok::<_, CatalogError>(count)
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = store
+            .issue("events", "scope=all;sort=v1", position.clone())
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            let again = store
+                .issue("events", "scope=all;sort=v1", position.clone())
+                .await
+                .unwrap();
+            assert_eq!(again, first, "the same page issued a different cursor");
+        }
+        assert_eq!(
+            count().await,
+            1,
+            "one page, one row, whatever the poll rate"
+        );
+        assert_eq!(
+            store
+                .resolve(&first, "events", "scope=all;sort=v1")
+                .await
+                .unwrap(),
+            position
+        );
+
+        // A different page, a different filter and a different collection
+        // are each their own traversal and their own row.
+        let further = PagePosition {
+            sort_value: 18,
+            identity: "0199b603-20bd-7342-9be3-cef10620d8bc".to_string(),
+            secondary: None,
+        };
+        store
+            .issue("events", "scope=all;sort=v1", further)
+            .await
+            .unwrap();
+        store
+            .issue("events", "scope=node-a;sort=v1", position.clone())
+            .await
+            .unwrap();
+        store
+            .issue("commands", "scope=all;sort=v1", position)
+            .await
+            .unwrap();
+        assert_eq!(count().await, 4);
+
+        let statistics = store.statistics(now_secs()).await.unwrap();
+        assert_eq!(statistics.live, 4);
+        assert_eq!(statistics.expired_pending_removal, 0);
+    }
+
+    /// A row that is close to expiring is replaced rather than handed out
+    /// again, so a client that receives a cursor always has most of its life
+    /// left in front of it.
+    #[tokio::test]
+    async fn a_cursor_close_to_expiry_is_reissued_with_a_full_life() {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let store = PageCursorStore::new(database.clone());
+        let position = PagePosition {
+            sort_value: 3,
+            identity: "0199b603-20bd-7342-9be3-cef10620d8bb".to_string(),
+            secondary: None,
+        };
+        let token = store
+            .issue("events", "scope=all;sort=v1", position.clone())
+            .await
+            .unwrap();
+        let token_sha256 = sha256_hex(&decode_token(&token).unwrap());
+        let binding = binding_sha256("events", "scope=all;sort=v1");
+        let position_json = serde_json::to_string(&position).unwrap();
+        let nearly_gone = now_secs() + 60;
+        database
+            .with_connection(move |connection| {
+                // The table refuses ordinary updates, so the row is rewritten.
+                connection.execute(
+                    "DELETE FROM api_page_cursors WHERE token_sha256 = ?1",
+                    [&token_sha256],
+                )?;
+                connection.execute(
+                    "INSERT INTO api_page_cursors
+                       (token_sha256, collection, query_sha256, position_json,
+                        created_at, expires_at)
+                     SELECT ?1, 'events', ?2, ?3, ?4, ?5",
+                    params![
+                        token_sha256,
+                        binding,
+                        position_json,
+                        nearly_gone - CURSOR_TTL_SECONDS,
+                        nearly_gone
+                    ],
+                )?;
+                Ok::<_, CatalogError>(())
+            })
+            .await
+            .unwrap();
+
+        let again = store
+            .issue("events", "scope=all;sort=v1", position.clone())
+            .await
+            .unwrap();
+        assert_eq!(again, token, "the token names the page, not the row");
+        let statistics = store.statistics(now_secs()).await.unwrap();
+        assert_eq!(statistics.live, 1, "still one row for one page");
+        assert_eq!(
+            statistics.oldest_live_age_seconds,
+            Some(0),
+            "the row was written again, so its life starts over"
+        );
+        assert_eq!(
+            store
+                .resolve(&again, "events", "scope=all;sort=v1")
+                .await
+                .unwrap(),
+            position
         );
     }
 
@@ -637,6 +1145,73 @@ mod tests {
         );
     }
 
+    /// A backlog deeper than one slice still comes out in full, and no
+    /// single statement removes more than a slice: the sweep is the only
+    /// thing that bounds this table, it runs on the connection every
+    /// request shares, and the pass it exists for is the one after a table
+    /// filled up and then went quiet. Draining it in one statement would
+    /// make the first request of the day wait for the whole backlog.
+    #[tokio::test]
+    async fn a_backlog_deeper_than_one_slice_is_drained_a_slice_at_a_time() {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let store = PageCursorStore::new(Arc::clone(&database));
+        let now = 3_000_000;
+        let expired = EXPIRY_BATCH * 2 + 7;
+        database
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let mut insert = transaction.prepare(
+                    "INSERT INTO api_page_cursors
+                       (token_sha256, collection, query_sha256, position_json,
+                        created_at, expires_at)
+                     VALUES (?1, 'accounts', ?2, '{\"sortValue\":1,\"identity\":\"one\"}',
+                             ?3, ?4)",
+                )?;
+                for index in 0..expired {
+                    insert.execute(params![
+                        format!("{index:064x}"),
+                        "b".repeat(64),
+                        now - 300_000,
+                        now - 40_000 + index as i64,
+                    ])?;
+                }
+                // One live row, so the sweep has a stopping point that is
+                // not the end of the table.
+                insert.execute(params![
+                    "f".repeat(64),
+                    "b".repeat(64),
+                    now - 10,
+                    now + 259_190,
+                ])?;
+                drop(insert);
+                transaction.commit()?;
+                Ok::<_, crate::database::DatabaseError>(())
+            })
+            .await
+            .unwrap();
+
+        // One statement takes a slice and stops.
+        let first_slice = database
+            .with_connection(move |connection| {
+                Ok::<_, CatalogError>(delete_expired_cursor_batch(connection, now)?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(first_slice, EXPIRY_BATCH);
+
+        // The sweep keeps taking slices until one comes back short.
+        assert_eq!(store.expire(now).await.unwrap(), expired - EXPIRY_BATCH);
+        assert_eq!(store.expire(now).await.unwrap(), 0);
+        assert_eq!(
+            store.statistics(now).await.unwrap(),
+            PageCursorStatistics {
+                live: 1,
+                expired_pending_removal: 0,
+                oldest_live_age_seconds: Some(10),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn statistics_separate_live_from_expired_and_age_the_oldest_live_row() {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
@@ -708,7 +1283,7 @@ mod tests {
             .with_connection(|connection| {
                 let mut plans = Vec::new();
                 for sql in [
-                    "DELETE FROM api_page_cursors WHERE expires_at <= ?1",
+                    EXPIRY_BATCH_SQL,
                     "SELECT COUNT(*) FROM api_page_cursors WHERE expires_at > ?1",
                     "SELECT created_at FROM api_page_cursors WHERE expires_at > ?1
                       ORDER BY expires_at ASC, token_sha256 ASC LIMIT 1",

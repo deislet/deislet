@@ -182,14 +182,17 @@ pub struct DeploymentResponse {
     /// Absent while an accepted plan is still draining its pre-commit queue
     /// barrier. No production pointer exists for that plan yet.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub deployment: Option<Deployment>,
     pub environment: String,
     pub version: VersionView,
     /// Which nodes took this version. Absent when the response only reads
     /// back an existing pointer, because then nothing was pushed.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub delivery: Option<DeliveryReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub plan: Option<DeploymentPlan>,
 }
 
@@ -199,9 +202,11 @@ pub struct DeploymentPlanResponse {
     pub targets: Vec<DeploymentTargetObservation>,
     pub proxies: Vec<DeploymentProxyObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub queue: Option<DeploymentQueueObservation>,
     pub events: Vec<DeploymentEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub drain: Option<DeploymentGenerationDrain>,
     pub drain_observations: Vec<DeploymentDrainObservation>,
 }

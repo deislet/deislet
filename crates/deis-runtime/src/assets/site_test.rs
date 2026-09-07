@@ -243,6 +243,57 @@ fn a_static_site_fallback_serves_its_own_page_with_a_four_oh_four() {
     assert_eq!(body_of(response), "not here");
 }
 
+/// A path no handler claims gets the application's own 404 page.
+///
+/// This is the platform's promise, not the application's code: the handler is
+/// never entered, so nothing it could return is involved. It failed for every
+/// bundle built from a canonical artifact, because the build wrote a single
+/// `/*` into the manifest's route table - the name of the file the derivation
+/// staged the already-routed module under - and that reads here as "the isolate
+/// owns every path". The fallback stood aside for all of them, the isolate's
+/// own router matched nothing, and the visitor got a 404 with an empty body
+/// while the 404.html in the same bundle was never opened.
+#[test]
+fn a_path_no_function_route_claims_falls_back_to_the_bundles_own_404_page() {
+    let bundle = Site::new()
+        .file("index.html", "home")
+        .file("404.html", "the-bundles-own-404-page")
+        .not_found(NotFound::Page)
+        .route("/api/asset")
+        .route("/hello/:name")
+        .route("/api/kv/:key")
+        .bundle();
+
+    let response = serve(&bundle, "/no-such-page");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_of(response), "the-bundles-own-404-page");
+
+    // The paths that are the function's still are: this must not be bought by
+    // handing the site paths the application answers.
+    for claimed in ["/api/asset", "/hello/world", "/api/kv/greeting"] {
+        assert!(
+            bundle.serve(claimed, &HeaderMap::new(), false).is_none(),
+            "{claimed} is a function route and belongs to the isolate"
+        );
+    }
+
+    // The shape the build used to produce, stated here so the reason the
+    // manifest carries the application's real table is visible from the node
+    // as well as from the build.
+    let swallowed = Site::new()
+        .file("index.html", "home")
+        .file("404.html", "the-bundles-own-404-page")
+        .not_found(NotFound::Page)
+        .route("/*")
+        .bundle();
+    assert!(
+        swallowed
+            .serve("/no-such-page", &HeaderMap::new(), false)
+            .is_none(),
+        "one catch-all route hands every path to the isolate and the 404 page is never served"
+    );
+}
+
 #[test]
 fn a_fallback_never_swallows_a_path_a_function_answers() {
     // The failure this prevents: an SPA shipping `/*` to index.html and its

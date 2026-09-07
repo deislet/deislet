@@ -696,6 +696,47 @@ mod tests {
         assert!(error.contains("schema 1 cannot carry"));
     }
 
+    /// The other half of the reserved-name rule, on the environment side.
+    ///
+    /// A logical resource called `ASSETS` has been refused since bindings
+    /// existed; an *environment declaration* of that name was not, and it
+    /// travels in a different field of the same manifest. A bundle carrying
+    /// one is refused here rather than only where it was built, because this
+    /// is the check the control plane makes when a bundle is uploaded and a
+    /// node makes when one is loaded - including a bundle that reached a node
+    /// without passing through a control plane of ours. Without it the
+    /// declaration would be minted as required, every layer would demand a
+    /// value for it, and the value would then be unreadable: the platform
+    /// installs `env.ASSETS` after the declared values are copied.
+    #[test]
+    fn rejects_an_environment_declaration_that_takes_a_platform_name() {
+        for name in ["ASSETS", "DEIS_STORE_ENDPOINT"] {
+            let declaration = serde_json::to_value(deis_wire::EnvironmentDeclarations::new(
+                "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
+                vec![deis_wire::EnvironmentDeclaration {
+                    name: name.into(),
+                    kind: deis_wire::EnvironmentKind::Config,
+                    value_type: deis_wire::EnvironmentValueType::String,
+                    required: true,
+                }],
+            ))
+            .unwrap();
+            let manifest = serde_json::json!({
+                "schema": 2,
+                "app": "demo",
+                "entry": "e.js",
+                "environment": declaration
+            });
+            let error = Manifest::parse(&manifest.to_string())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("EC_ENV_NAMESPACE_COLLISION"),
+                "a declaration called {name:?} was accepted into a bundle: {error}"
+            );
+        }
+    }
+
     #[test]
     fn rejects_an_asset_path_that_escapes_the_bundle() {
         let json = r#"{"schema":1,"app":"d","entry":"e.js","assets":[{"path":"../etc/passwd"}]}"#;

@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-07T10:58:00+08:00",
+  "updatedAt": "2026-09-07T21:30:00+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -40,8 +40,14 @@
           "status": "done",
           "dependsOn": [],
           "outputs": [
-            {"type": "local-path", "value": "docs/adr/README.md"},
-            {"type": "local-path", "value": "docs/product/phase-analysis-2026-09-03.zh.md"}
+            {
+              "type": "local-path",
+              "value": "docs/adr/README.md"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/phase-analysis-2026-09-03.zh.md"
+            }
           ],
           "verification": "python3 scripts/check-product-governance.py"
         },
@@ -50,10 +56,18 @@
           "title": "建立 Edge Canon next 统一标准 proposal 与机器契约",
           "owner": "edge-canon",
           "status": "done",
-          "dependsOn": ["P0-DEC-001"],
+          "dependsOn": [
+            "P0-DEC-001"
+          ],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/contract.json"}
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/contract.json"
+            }
           ],
           "verification": "在 Edge Canon commit a41a4caadeaf8e5751ebe57ef5be673d18384654 运行 python3 scripts/check-governance.py"
         },
@@ -62,10 +76,18 @@
           "title": "建立 conformance registry、认证状态约束与 schema",
           "owner": "edge-canon",
           "status": "done",
-          "dependsOn": ["P0-SPEC-001"],
+          "dependsOn": [
+            "P0-SPEC-001"
+          ],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/registry.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/conformance-registry.schema.json"}
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/registry.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/conformance-registry.schema.json"
+            }
           ],
           "verification": "registry 中 proposal 不能 compliant，supported 必须蕴含 compliant"
         },
@@ -74,12 +96,27 @@
           "title": "建立机器可读路线、标准锁定与 CI 门禁",
           "owner": "deislet",
           "status": "done",
-          "dependsOn": ["P0-SPEC-001", "P0-CONF-001"],
+          "dependsOn": [
+            "P0-SPEC-001",
+            "P0-CONF-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "docs/product/roadmap.json"},
-            {"type": "local-path", "value": "docs/product/roadmap.schema.json"},
-            {"type": "local-path", "value": "standards/edge-canon.lock.json"},
-            {"type": "local-path", "value": "scripts/check-product-governance.py"}
+            {
+              "type": "local-path",
+              "value": "docs/product/roadmap.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/roadmap.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "standards/edge-canon.lock.json"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/check-product-governance.py"
+            }
           ],
           "verification": "python3 scripts/check-product-governance.py"
         },
@@ -88,45 +125,158 @@
           "title": "逐能力族冻结 normative 语义、fixture 与 oracle",
           "owner": "edge-canon",
           "status": "active",
-          "dependsOn": ["P0-SPEC-001"],
+          "dependsOn": [
+            "P0-SPEC-001"
+          ],
           "outputs": [
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/web-fetch-events.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/evidence/web-fetch-events-resource-baseline.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/kit.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/provider-adapter-protocol.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/oracle.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/canonical-build-artifact.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/canonical-build-output.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/canonical-build-artifact/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/routing-static-assets.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/routing-static-assets.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/routing-static-assets/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/routing-static-assets-platforms-2026-09-04.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/web-platform-apis.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/web-platform-apis.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-platform-apis/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/web-platform-apis-platforms-2026-09-04.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/environment-secrets.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/environment-secrets.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/environment-binding-snapshot.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/environment-secrets/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/environment-secrets-platforms-2026-09-05.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/deployment-preview-rollback.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/deployment-plan.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/deployment-status.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/deployment-preview-rollback/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/deployment-preview-rollback-platforms-2026-09-05.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/streams-websockets-background-work.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/streams-websockets-background-work.schema.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-protocol.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-fixture.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-collect.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-oracle.mjs"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json"}
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/web-fetch-events.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/evidence/web-fetch-events-resource-baseline.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/kit.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/harness.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/provider-adapter-protocol.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-fetch-events/oracle.mjs"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/canonical-build-artifact.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/canonical-build-output.schema.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/canonical-build-artifact/harness.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/canonical-build-artifact-platforms-2026-09-04.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/routing-static-assets.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/routing-static-assets.schema.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/routing-static-assets/harness.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/routing-static-assets-platforms-2026-09-04.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/web-platform-apis.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/web-platform-apis.schema.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/web-platform-apis/harness.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/web-platform-apis-platforms-2026-09-04.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/environment-secrets.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/environment-secrets.schema.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/environment-binding-snapshot.schema.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/environment-secrets/harness.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/environment-secrets-platforms-2026-09-05.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/deployment-preview-rollback.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/deployment-plan.schema.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/deployment-status.schema.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/deployment-preview-rollback/harness.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/deployment-preview-rollback-platforms-2026-09-05.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/streams-websockets-background-work.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/schemas/streams-websockets-background-work.schema.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/harness.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-protocol.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-fixture.mjs"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-collect.mjs"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/streams-websockets-background-work/provider-runtime-oracle.mjs"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/evidence/streams-websockets-background-work-platforms-2026-09-04.json"
+            }
           ],
           "verification": "Edge Canon commit a41a4caadeaf8e5751ebe57ef5be673d18384654 已通过 Node 24.20.0 全库 127 项测试、223 条 Draft clause 治理和 python3 scripts/check-governance.py；最新远端 governance run 33920965672 对应旧提交 8a209c9a003fbbf9328f80fb77acf39b850d88fe，不作为当前提交的远端执行证据。EC-WEB T001–T015 的同源 fixture/oracle、artifact lineage、安全进程边界、身份绑定 deploy、at-most-once invoke 和 provider-neutral collect 已落地；Cloudflare/Deislet 另有精确单次 CPU、cleanup 与可恢复 run。EC-ARTIFACT、EC-ROUTING、EC-WEBAPI、EC-STREAM、EC-NODE、EC-ENV 与 EC-DEPLOY 均已有 Draft schema、case、reference harness 和 oracle。其中 EC-DEPLOY 的既有三平台 evidence 精确绑定旧 T001–T012；新增 T013/T014 尚只有本地 reference 结果。EC-DEPLOY 的 43 条条款固定完整 previous owner、统一 trigger barrier、T013/T014，以及 immutable version/plan/status、全 serving-set prepare、generation-addressed activate、proxy/target observed active、双版本 basis-point、稳定 affinity、签名 override、gate、drain、rollback、retention、CAS 与未知结果 reconcile；这些仍是 reference portability 证据，不是 provider conformance。EdgeOne collect/cleanup/run、三个真实账户 evidence、真实 framework/provider 集成、尚未冻结的资源/生命周期维度及其余 7 个能力族继续阻断完成"
         },
@@ -135,16 +285,42 @@
           "title": "把能力矩阵和支持文案迁移为 registry 派生视图",
           "owner": "joint",
           "status": "done",
-          "dependsOn": ["P0-CONF-001"],
+          "dependsOn": [
+            "P0-CONF-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "standards/edge-canon.conformance-registry.json"},
-            {"type": "local-path", "value": "docs/product/target-status.schema.json"},
-            {"type": "local-path", "value": "docs/product/target-status.json"},
-            {"type": "local-path", "value": "docs/product/target-status.zh.md"},
-            {"type": "local-path", "value": "scripts/generate-target-status.py"},
-            {"type": "local-path", "value": "crates/deis/src/commands/targets.rs"},
-            {"type": "local-path", "value": "crates/deis-control/web/src/pages/Targets.tsx"},
-            {"type": "local-path", "value": "crates/deis-build-core/src/target_artifact_coverage.rs"}
+            {
+              "type": "local-path",
+              "value": "standards/edge-canon.conformance-registry.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/target-status.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/target-status.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/target-status.zh.md"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/generate-target-status.py"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis/src/commands/targets.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/web/src/pages/Targets.tsx"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-build-core/src/target_artifact_coverage.rs"
+            }
           ],
           "verification": "python3 scripts/generate-target-status.py --check 保证文档、CLI 和 Web 的 JSON 字节一致并严格派生自 SHA-256 锁定的 Edge Canon registry，proposal、compliant、supported 与 evidence maturity 不变量失败关闭；CLI targets list/inspect 和 Web Target evidence 已消费生成视图，单目标 JSON/人类视图保留标准版本和 registry SHA-256；compiler 的旧 PlatformCapabilities/UnsupportedFeatureError 已替换为只覆盖配置中可声明项的 TargetArtifactCoverage/MissingTargetImplementationError，不可检测 API、跨平台替代建议、未固定版本的 adapter 对比表和手工绿色支持表已移除或明确降为非规范研究快照，三个 adapter 测试入口从 spec_compliance 改为 artifact_shape，当前支持声明统一指向 registry"
         },
@@ -153,45 +329,158 @@
           "title": "定义 canonical ID、operation、artifact、binding 与 driver 共享模型及迁移计划",
           "owner": "joint",
           "status": "active",
-          "dependsOn": ["P0-SPEC-001"],
+          "dependsOn": [
+            "P0-SPEC-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "contracts/v1/registry.json"},
-            {"type": "local-path", "value": "contracts/v1/README.zh.md"},
-            {"type": "local-path", "value": "scripts/check-shared-contracts.py"},
-            {"type": "local-path", "value": "crates/deis-wire/src/canonical_id.rs"},
-            {"type": "local-path", "value": "crates/deis-wire/src/canonical_tenant.rs"},
-            {"type": "local-path", "value": "crates/deis-wire/src/deislet_storage_key.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/model.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/artifact.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/artifacts.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/identity_migration.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"},
-            {"type": "local-path", "value": "crates/deis-runtime/proto/management.proto"},
-            {"type": "local-path", "value": "crates/deis-runtime/src/deployment/store.rs"},
-            {"type": "local-path", "value": "contracts/v1/backend-migration-evidence.schema.json"},
-            {"type": "local-path", "value": "crates/deis-backend-migration/proto/migration.proto"},
-            {"type": "local-path", "value": "crates/deis-backend-migration/src/lib.rs"},
-            {"type": "local-path", "value": "crates/deis-store/src/migration.rs"},
-            {"type": "local-path", "value": "crates/deis-store/src/snapshot.rs"},
-            {"type": "local-path", "value": "crates/deis-queue/src/migration.rs"},
-            {"type": "local-path", "value": "crates/deis-queue/src/snapshot.rs"},
-            {"type": "local-path", "value": "crates/deis-telemetry/src/migration.rs"},
-            {"type": "local-path", "value": "crates/deis-telemetry/src/identity.rs"},
-            {"type": "local-path", "value": "crates/deis-telemetry/src/snapshot.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/backend_migration.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/operation.rs"},
-            {"type": "local-path", "value": "crates/deis-wire/src/operation.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/migrations.rs"},
-            {"type": "local-path", "value": "contracts/v1/backend-restore-set.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/backend-restore-report.schema.json"},
-            {"type": "local-path", "value": "crates/deis-wire/src/backend_restore.rs"},
-            {"type": "local-path", "value": "crates/deis-backend-topology/src/lib.rs"},
-            {"type": "local-path", "value": "crates/deis-backend-topology/src/main.rs"},
-            {"type": "local-path", "value": "config/deis-backend-topology.example.toml"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/backend_restore.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/backend_restore_driver.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/restores.rs"},
-            {"type": "local-path", "value": "docs/adr/024-coordinated-embedded-backend-restore.md"}
+            {
+              "type": "local-path",
+              "value": "contracts/v1/registry.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/README.zh.md"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/check-shared-contracts.py"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-wire/src/canonical_id.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-wire/src/canonical_tenant.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-wire/src/deislet_storage_key.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/model.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/artifact.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/artifacts.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/identity_migration.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/database/schema.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-runtime/proto/management.proto"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-runtime/src/deployment/store.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/backend-migration-evidence.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-backend-migration/proto/migration.proto"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-backend-migration/src/lib.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-store/src/migration.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-store/src/snapshot.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-queue/src/migration.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-queue/src/snapshot.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-telemetry/src/migration.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-telemetry/src/identity.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-telemetry/src/snapshot.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/backend_migration.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/operation.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-wire/src/operation.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/migrations.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/backend-restore-set.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/backend-restore-report.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-wire/src/backend_restore.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-backend-topology/src/lib.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-backend-topology/src/main.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "config/deis-backend-topology.example.toml"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/backend_restore.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/backend_restore_driver.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/restores.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/adr/024-coordinated-embedded-backend-restore.md"
+            }
           ],
           "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-backend-migration -p deis-backend-topology -p deis-wire -p deis-store -p deis-queue -p deis-telemetry -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、catalog migration/restore plan 与 revision fence、Deislet 物理 canonical namespace、独立 backend 管理认证、持久 per-tenant writer fence、KV/SQL/blob/queue/telemetry inventory、三后端协调 evidence、backend incarnation discovery/receipt/retry/release，以及 operation.schema.json 全字段、唯一状态图、幂等、并发取消和旧记录接管。Control 现把共享 canonical artifact record 落为不可变 catalog 行，安全验证并内容寻址保存 Edge Canon directory，provider derivation 与 Deislet version 保存 exact lineage；旧 raw bundle 兼容记录保持空 lineage。store/queue/telemetry verified snapshot 现由正式 Restore ProductOperation 与 topology driver 在同一 outage barrier 下生成/恢复；覆盖 writer admission、全局锁、snapshot capture crash journal/recovery、受 snapshot_roots 约束的本地 artifact、staged tree digest、journal path 重新推导、持久目录 rename、switch/rollback 四个 crash window、status 对账、Control owner lease/接管和三端 live incarnation 原子完成。live request parser 仍故意拒绝 logical/physical canonical key；完成前仍须验证 stateful/provider inventory/fence/restore、其余 producer 复用 Operation、canonical-first 双读、copy/verify/cutover、旧 capability 撤销与 tombstone，并补齐无人值守 backup ProductOperation/scheduler、真实恢复演练、artifact 加密/异地复制/retention 与 RPO/RTO policy"
         },
@@ -200,9 +489,14 @@
           "title": "升级使用 Node 20 action runtime 的 GitHub Actions",
           "owner": "deislet",
           "status": "done",
-          "dependsOn": ["P0-ROAD-001"],
+          "dependsOn": [
+            "P0-ROAD-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": ".github/workflows/checks.yml"}
+            {
+              "type": "local-path",
+              "value": ".github/workflows/checks.yml"
+            }
           ],
           "verification": "python3 scripts/check-product-governance.py 固定 reviewed Node 24 majors、60 分钟 static workspace job、三组完整且互斥覆盖 package 的 90 分钟 test shard，以及 runtime shard 启动真实 deis-proxy 前的显式构建前置；commit cedb2a5 的完整 checks run 33797445803 于 2026-09-03T20:03:54Z 结束，8/8 jobs 成功；逐一读取 8 个 check run annotations 得到总数 0，因此 Node 20 runtime annotation 为零"
         }
@@ -212,7 +506,9 @@
       "id": "phase-1",
       "title": "统一构建、开发、预览与部署骨架",
       "status": "queued",
-      "dependsOn": ["phase-0"],
+      "dependsOn": [
+        "phase-0"
+      ],
       "exitCriteria": [
         "同一源码产生一个可验证 canonical digest，所有派生产物可追溯",
         "Deislet、Cloudflare 与 EdgeOne test account 至少达到 deployed，但仍明确非合规",
@@ -224,21 +520,63 @@
           "title": "实现 source/framework adapter 到 canonical artifact 的统一构建链",
           "owner": "deislet",
           "status": "active",
-          "dependsOn": ["P0-MODEL-001", "P0-SPEC-002"],
+          "dependsOn": [
+            "P0-MODEL-001",
+            "P0-SPEC-002"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "crates/deis-artifact/src/canonical_artifact.rs"},
-            {"type": "local-path", "value": "crates/deis-artifact/src/lib.rs"},
-            {"type": "local-path", "value": "crates/deis-build/src/canonical_routing.rs"},
-            {"type": "local-path", "value": "crates/deis-artifact/src/provider_derivation.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/artifact.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/artifacts.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/versions.rs"},
-            {"type": "local-path", "value": "crates/deis/src/commands/deploy.rs"},
-            {"type": "local-path", "value": "crates/deis-build/tests/canonical_build_output.rs"},
-            {"type": "local-path", "value": "crates/deis-build/tests/provider_resource_bindings.rs"},
-            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-ffb1591.json"},
-            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-94fb8fb.json"},
-            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-3eb581e.json"}
+            {
+              "type": "local-path",
+              "value": "crates/deis-artifact/src/canonical_artifact.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-artifact/src/lib.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-build/src/canonical_routing.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-artifact/src/provider_derivation.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/artifact.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/artifacts.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/versions.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis/src/commands/deploy.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-build/tests/canonical_build_output.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-build/tests/provider_resource_bindings.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/compiler-identity-ffb1591.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/compiler-identity-94fb8fb.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/compiler-identity-3eb581e.json"
+            }
           ],
           "verification": "Linux 本地已验证同输入跨目录 canonical identity 一致、源码不能绕过 parent、provider payload 按文件集摘要原子发布和复用、current selector 只在全构建成功后切换、payload/derivation tamper fail-closed、路由/资产语义文档及未实现事件/资源映射 fail-closed；Control 现把 zip 仅作传输，在隔离 staging 中限制大小/项数并拒绝 traversal/link/duplicate/non-regular entry，以锁定标准复核后原子保存 canonical directory 与共享 record；provider envelope 绑定 exact derivation/native payload，新 version 保存不可变 parent/derivation lineage，CLI 普通 build 与 --no-build 都走该路径，完全相同重放和删除回收已有端到端测试。纯 canonical artifact/provider derivation 真源已迁入 deis-artifact；Control 依赖树不再包含完整 compiler、build core 或 adapter，deis-build 以同名 re-export 保持调用兼容。三个锁定摘要建立编译期防漂移校验。protobuf 代码生成已固定并显式调用 vendored protoc 3.2.0，CI 不再安装系统 protoc；ffb1591 暴露 macOS /var 别名，94fb8fb 暴露 Windows verbatim-prefix，两次失败 observation 和根因均保留；修复提交 3eb581e 的同一 archive/fixture 已在 Linux x86_64、macOS arm64、Windows AMD64 产生相同 canonical identity 786f483d 与四个 provider identity，机器 evidence 通过治理重算；标准仍为 proposal，record 保持 deployable false/signatures empty；全部 semantic document schema、签名、受信 builder、远端 build/log/cache 和 framework/provider 集成继续阻断完成"
         },
@@ -247,77 +585,286 @@
           "title": "实现统一 provider driver API 与 CLI 生命周期",
           "owner": "deislet",
           "status": "active",
-          "dependsOn": ["P1-BUILD-001"],
+          "dependsOn": [
+            "P1-BUILD-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/lib.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/model.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/manifest.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/lifecycle.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/orchestrator.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/executor.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/credential.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/release.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/release_authorization.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/release_transparency.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/installer.rs"},
-            {"type": "local-path", "value": "crates/deis-provider-driver/src/process.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/provider_driver_operation.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/provider_target_grant.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/provider_credential.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/provider_driver_release.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/providers.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/authz.rs"},
-            {"type": "local-path", "value": "provider-drivers/official-tool-lock.json"},
-            {"type": "local-path", "value": "provider-drivers/official-tool-lock.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/provider-driver-release.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/provider-driver-trust-root.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/provider-driver-trust-root-envelope.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/provider-driver-release-authorization.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/provider-driver-release-envelope.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/provider-driver-transparency-proof.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/provider-driver-process.schema.json"},
-            {"type": "local-path", "value": "contracts/v1/control-list-page.schema.json"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/pagination.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/pagination.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/store.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/apps.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/artifacts.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/environments.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/versions.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/identity.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/audit.rs"},
-            {"type": "local-path", "value": "crates/deis/src/platform/mod.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/idempotency.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/provider_lifecycle.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/pagination_plans.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/versioning.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/api/openapi.rs"},
-            {"type": "local-path", "value": "contracts/openapi/v1.json"},
-            {"type": "local-path", "value": "contracts/v1/control-error.schema.json"},
-            {"type": "local-path", "value": "scripts/check-openapi-compat.py"},
-            {"type": "local-path", "value": "scripts/check-provider-tool-lock.py"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-portability-db10a9c.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-deployment-portability-80a4a35.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-release-portability-9c9d209.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-b185984.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-b574d58.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-a934ff5.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-05cbbf9.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-2f215a8.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-56c6584.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-518d3f8.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-dae492a.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-69f1343.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-dc9a19a.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-3ebe108.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-3013ae2.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-c8d4f72.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-5926363.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-b45a611.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-1ebe13b.json"},
-            {"type": "local-path", "value": "docs/product/evidence/provider-driver-dispatcher-portability-e0086eb.json"},
-            {"type": "planned-path", "value": "Cloudflare, EdgeOne and Deislet complete driver manifests and live evidence"}
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/lib.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/model.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/manifest.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/lifecycle.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/orchestrator.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/executor.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/credential.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/release.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/release_authorization.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/release_transparency.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/installer.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-provider-driver/src/process.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/provider_driver_operation.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/provider_target_grant.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/provider_credential.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/provider_driver_release.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/database/schema.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/providers.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/authz.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "provider-drivers/official-tool-lock.json"
+            },
+            {
+              "type": "local-path",
+              "value": "provider-drivers/official-tool-lock.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/provider-driver-release.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/provider-driver-trust-root.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/provider-driver-trust-root-envelope.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/provider-driver-release-authorization.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/provider-driver-release-envelope.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/provider-driver-transparency-proof.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/provider-driver-process.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/control-list-page.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/pagination.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/pagination.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/store.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/apps.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/artifacts.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/environments.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/versions.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/identity.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/audit.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis/src/platform/mod.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/idempotency.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/provider_lifecycle.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/pagination_plans.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/versioning.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/openapi.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/openapi/v1.json"
+            },
+            {
+              "type": "local-path",
+              "value": "contracts/v1/control-error.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/check-openapi-compat.py"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/check-provider-tool-lock.py"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-portability-db10a9c.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-deployment-portability-80a4a35.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-release-portability-9c9d209.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-b185984.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-b574d58.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-a934ff5.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-05cbbf9.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-2f215a8.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-56c6584.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-518d3f8.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-dae492a.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-69f1343.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-dc9a19a.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-3ebe108.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-3013ae2.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-c8d4f72.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-5926363.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-b45a611.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-1ebe13b.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/provider-driver-dispatcher-portability-e0086eb.json"
+            },
+            {
+              "type": "planned-path",
+              "value": "Cloudflare, EdgeOne and Deislet complete driver manifests and live evidence"
+            }
           ],
           "verification": "共享 crate 已执行 provider-driver schema 的 12 个固定操作，request/receipt/error exact identity、unknown result query-before-retry 和上传/激活 native identity 均 fail closed；统一 orchestrator 以 heartbeat 维持 owner/epoch lease，并在执行前核对 durable target 固定的 driver ID、version、distribution digest 与 JCS manifest digest。Control 已持久化 installation、不可变 target、driver operation 和逐 attempt journal；claim/renew/settle 与 ProductOperation 状态/summary 在同一 SQLite 事务中，过期或 unknown 接管只能 reconcile，旧 epoch 无法续租或落账。统一 deploy 父 Operation 以 JCS digest 固定 target revision、standard、artifact/derivation 与 provider-neutral plan，把调用者 artifact identity 查询到同应用、同标准、同 provider 的真实 catalog lineage，再按 preflight→plan→prepare→upload→verify→activate→observe 惰性创建七个不可变 child；父级聚合 child/provider identity 和真实 7 步进度，并由 current child fence 排除并发 coordinator、先 reconcile unknown activation、上卷终态错误和恢复 child-settle/parent-refresh 崩溃窗口。provider credential 现有独立 AES-256-GCM immutable revision vault；installation 只接受同 organization/backend 的 active binding。非序列化 execution context 将 owner/epoch 交给 driver，broker 只给当前 live claim 签发不超过 operation expiry 的短租约；轮换/吊销、last-use、release/expiry 和 stale denial 均进入无敏感值且不可更新/删除的 audit，Control reconciler 定期回收过期租约。官方工具只可由绝对路径、regular non-symlink executable digest、清空环境、非 shell 参数数组、非 argv 凭证、结构化输出、总 deadline、输出限额、脱敏及 Unix process group/Windows Job Object 边界执行。精确提交 db10a9c0afdc80145a1b4509532724324420cc36 已在固定 Rust 1.96.0 上通过 Linux 25 项、macOS 25 项、Windows 19 项全部平台适用测试与严格 Clippy，并登记 schema 校验的 portability evidence；该证据不等于任何 provider 的 live deployment 或 conformance。历史父流程提交 6003b12 在 macOS 目标测试/Clippy 通过，但 Windows 因 deis-queue 无条件 Unix signal import 在测试前编译失败；该失败 observation 继续保留。修复提交 80a4a35ae85abe484d0e899d16fd4eb2927b563c 已用同一 archive 在 Linux、macOS、Windows 通过共享 driver、credential、durable deployment 专项和五个相关 crate 的严格 all-target Clippy，并登记独立 schema 校验的 provider-deployment portability evidence；它只关闭控制层可移植性回归，不证明 provider live deployment 或 conformance。Credential 专项 6/6、共享 driver 27/27、Queue 103 项单测与 22 项 gRPC 集成通过。统一 provider-driver-release 已把一个 canonical release digest 映射到四种 host archive、完整 file/component tree 与 executable，Rust 安装器在锁内执行 archive/逐文件校验、只读 content-addressed 原子发布、既有树复验和崩溃 staging 清理；精确提交 9c9d20979e2e3ab5560e0b9f7b00dbdf8aa77169 的同一 archive 已在 Linux/macOS 各通过 39 项、Windows 通过 31 项平台适用测试，三端严格 Clippy 全过；受治理 evidence 同时保留 6d90ed1 的 Windows lint 失败与 439e0c9 的目标编译失败。Control 现有 host-specific installed-release registry、不可变审计、target release pin、篡改 quarantine 与唯一 executable dispatcher；每次 claim 后重新验证完整安装树，并以统一进程协议和短期凭据租约运行。首次 registry/dispatcher 提交 f4dc7d3 在 Linux/macOS 通过，但 Windows 因 Job Object 裸 HANDLE 跨 await 使 async future 非 Send 而在测试前编译失败；修复提交 b185984da354e59a199fe600726e454a9c4f3ef9 的同一 archive 已在 Linux/macOS 通过 driver 47/47、Windows 38/38，三端均通过 Control 专项 16/16、legacy migration 1/1 与五个相关 crate 的严格 Clippy，并登记独立 Schema 校验的 dispatcher portability evidence。共享契约在 s17 通过 11 份 Schema/29 组 fixture；macOS/Windows 未安装 jsonschema 的环境观察未被误记为契约运行。该证据仍不等于真实 provider deployment 或 conformance。当前共享契约已扩展为 17 份 Schema/50 组 fixture；DSSE/Ed25519 verifier 精确绑定 release+manifest，执行阈值、授权/密钥有效期和撤销，Control 在安装前和每次 executable selection 验证，并以不可变多 authorization 与单调 root history 拒绝 root rollback/跳号/同版本异内容及历史撤销 key 重新激活；失效授权只阻断执行，安装树篡改才 quarantine。信任根另以独立 root 角色和 canonical N+1 rotation envelope 实现旧/新根双阈值、参与 key 时效、最终新根 expiry、连续版本及历史 key/role 退休约束；Control 把新根与双方实际 signer 在同一事务中写入不可变轮换记录。离线 transparency proof 进一步绑定 canonical authorization、RFC 6962 inclusion、C2SP signed checkpoint 与 timestamped witness threshold；日志、见证、root 和 release 角色使用隔离密钥，日志与见证阈值按独立 operator 计数。Control 在安装前与每次选择时复验并持久化不可变 proof，旧签名但未透明记录的 active target 会被禁用。父提交 5f79e47 的同一 archive 在 Linux 首次 53/54 并保留为失败，Windows 首轮取证脚本为 inconclusive；修复提交 a934ff5003dc66745db2b0a08cdbd9050225700a 只对明确的未启动 transient spawn 做受原 deadline 约束的有界重试，其同一 archive 已在 Linux/macOS 分别通过 driver 55/55、Windows 45/45，三端 Control 专项 19/19、migration 1/1 和严格 Clippy 全过，并登记包含 root rotation、旧根迁移及历史 observation 的正式 evidence。精确提交 05cbbf98e719c084c8c6ea8085b2038396193dba 的同一 archive 又在 Linux/macOS 通过 driver 62/62、Windows 52/52，三端 Control provider 21/21、target migration 2/2 和严格 Clippy 全过；Linux 另通过 16 份 Schema/48 组 fixture，正式 evidence 同时保留远端 shell 引用与 macOS 非登录 PATH 的 inconclusive 观察。精确提交 2f215a8777549a570a65328df3e365db22badec5 的同一 archive 已在 Linux/macOS 通过 provider-driver 62/62、Windows 54/54，三端 Control provider 21/21、target migration 2/2 和严格 Clippy 全过；Windows 原生验证当前 token owner、protected DACL、非可信 writer 拒绝、trust file 校验与 installation-root handle pinning，并登记正式 evidence。测试使用提升的交互式 token，不冒充真实 Windows Service 安装验收。当前 v1 透明证明固定 C2SP Ed25519 分支，ML-DSA-44 尚需版本化统一契约演进。该机制仍以合成 release/key/checkpoint 验证。Wrangler 4.129.0 与 EdgeOne 1.6.33 npm tarball 已重算 SRI/SHA-256。Cloudflare 仍须逐命令 contract/live tests；EdgeOne CLI 因官方 CI token 必须进入 -t/--token 而禁止服务端使用，等待安全官方 API/SDK 或新 transport。精确提交 56c65844d471c956af893d7151a6ea261131a48b 的同一 archive 已在 Linux/macOS 通过 driver 62/62、Control provider 23/23、后台协调器 3/3、target migration 2/2，Windows 为 54/54、23/23、3/3、2/2，三端严格 Clippy 全过并登记正式 evidence；它关闭进程内后台发现、并发限制、重启恢复和 receipt-based retry 死路，不证明 live deployment。精确提交 b480b141ce15ac6b572c7742cc731f655fa6f4d5 的 Windows 测试保留 24/25 的失败事实：较晚 settle 秒数加 29 使较早任务恰好达到 retry 边界，产品返回正确而测试前提错误；修复提交 518d3f83760f577a31f117a739c37f0b240509d6 改用最早 settle 边界，其同一精确 archive 已在 Linux/macOS 通过 driver 62/62、Control provider 25/25、协调器 3/3、target migration 2/2、dispatch-backoff migration 1/1，Windows 为 54/54、25/25、3/3、2/2、1/1，三端严格 Clippy 全过并登记正式 evidence。ready scan 现以稳定读事务和 keyset 分页消除固定窗口饥饿；selection failure 以 exact child、类型化错误、失败次数和指数 dispatch_not_before 持久化，并由 live claim/settle/推进清除竞态过时状态。credential/installation/target/deployment 的公共 API 第一段现已落地：credential 明文不进入 response/operation/authz/audit，轮换/吊销要求强 If-Match，deployment 要求 Idempotency-Key 并返回 durable ProductOperation；target 必须同时匹配 Control 当前 standard registry 的 exact contractId@commit、contract digest 与 driver manifest 声明，旧缺声明 target 自动 disabled。provider release install/list/get/audit 进一步以固定 multipart 顺序先验证有界 signed documents，再按当前 host 声明大小流式写入受控 staging；原 installer 重验 archive/tree 并原子发布，过长、过短、错误与成功路径清理临时文件，内容寻址重放重新验证并追加审计。未配置 verified registry 时显式 disabled。精确提交 dae492a0c266297c94263d8afd44a56eca452654 的 15,697,920-byte archive（SHA-256 7598758b9d4bda37034f3c6f5d41135f08dc55a75b06234da6a8d994f0532b2d）已在 Linux/macOS 通过 provider-driver 62/62、Windows 54/54，三端通过 Control provider 26/26、release API 3/3、协调器 3/3、target migration 2/2、dispatch-backoff migration 1/1 与严格 all-target Clippy；Linux 另通过 16 份 Schema/48 组 fixture，并登记保留 Windows 初次 SSH/PowerShell 引号失败的正式 evidence。target grant 现由 admin-only create/revoke 与 scope 内 read/audit API 管理；deployment start 收窄到 deploy scope 后仍由 Catalog 同事务要求 exact active grant，并把 grant ID/revision 固定进不可变 workflow。撤销阻断新 key、保留 exact 幂等 replay 与既有 operation reconcile；旧库 additive migration 保留历史 workflow，新写入失败关闭。本机最终通过 Control 480/480、API integration 14/14 与严格 Clippy。精确提交 69f1343e91058726da340cb3f55f261528f634d9 的 15,779,840-byte archive（SHA-256 b5a18434e4983ebed7f5409c01384522885f18d777a674dd7219843b18d06a86）已在 Linux/macOS 通过 provider-driver 62/62、Windows 54/54，三端通过 Control provider 48/48、authz 32/32、grant 3/3、协调器 3/3、四项 migration 与严格 Clippy，并登记 provider-driver-dispatcher-portability-69f1343 evidence；Linux 另通过 16/48 共享契约，macOS 缺 jsonschema 如实记为环境未执行。Provider 管理面 10 条 list/audit 路由（9 个集合契约）现共享稳定 keyset、query-bound 256-bit opaque cursor 与同一读事务精确 total，旧库增量表、过期清理及索引有专项回归。精确提交 dc9a19a65f34fd6dda6a5fc9992842a8f5ca75ae 的 15,851,520-byte archive（SHA-256 e7b291238b22772e2da975f406b44b393f6342fe8c3e0bc58863b5d6b0c125df）已在 Linux/macOS 通过 provider-driver 62/62、Windows 54/54，三端通过 Control provider 49/49、pagination 2/2、authz 32/32、grant 3/3、协调器 3/3、五项 migration 与严格 Clippy；Linux 另通过 17/50 共享契约，并登记 provider-driver-dispatcher-portability-dc9a19a evidence；macOS 缺 jsonschema 如实记为环境未执行。随后五类应用目录列表迁入同一契约的精确提交 3ebe108 以 15,892,480-byte archive（SHA-256 df03cedc…2cd0）在三端通过同一组门禁，pagination 增为 3/3，登记 provider-driver-dispatcher-portability-3ebe108 evidence。该证据不证明跨请求冻结快照、真实 provider 部署或 Edge Canon 合规。随后 67 条 GET 路由完成边界盘点，environment deployments/routes/secrets、domain grants、accounts、tokens、audit 七条产品列表迁入同一契约，诊断路由收口无上限 limit，CLI 改用通用 ListPage 并修复 3ebe108 起 deis versions/deis status 的解析失败；本机通过 Control 525/525、CLI 150/150 与严格 Clippy；精确提交 3013ae2 以 16,015,360-byte archive（SHA-256 2d15f43f…fe85）在三端通过同一组门禁，pagination 增为 11/11，登记 provider-driver-dispatcher-portability-3013ae2 evidence。随后 credential/installation/target/grant mutation 接入共享幂等记录，installation/target 获得 disable/enable/软删除与级联 grant 撤销，application 删除收敛 grant 并新增全局 grant history，cursor 主动清理与容量 gauge、20 条分页查询计划证据与 50,000 行负载证据、CLI deployments/routes/domains 命令均已本机通过 Control 552/552、CLI 161/161；精确提交 c8d4f72 以 16,384,000-byte archive（SHA-256 d671c733…1ae76）在三端通过 provider 60/60、pagination 19/19 等门禁，登记 provider-driver-dispatcher-portability-c8d4f72 evidence。随后 /api/v1 显式 major、control-error 结构化 envelope、/api/platform 诊断命名空间（events/commands/heartbeats/config history 入统一分页）、utoipa 生成的 contracts/openapi/v1.json 与 check-openapi-compat.py 门禁、CLI/Web 接线均已本机通过 Control 616/616、CLI 171/171 与 web 构建；精确提交 5926363 以 17,418,240-byte archive（SHA-256 bea11cde…dee2）在三端通过 provider 61/61、pagination 20/20、authz 38/38 等门禁，登记 provider-driver-dispatcher-portability-5926363 evidence。随后细粒度错误码逐路由产出、provider deployment cancel/rollback、HKDF/HMAC 幂等摘要与三项查询计划收尾本机通过 Control 617/617、CLI 171/171、OpenAPI 113 operation 仅增量；精确提交 b45a611 以 17,633,280-byte archive（SHA-256 6dc3d12a…a831）在三端通过 provider 77/77、pagination 21/21、协调器 4/4 等门禁，登记 provider-driver-dispatcher-portability-b45a611 evidence。随后 rollbackTarget driver 契约增量（18 Schema/62 fixture）、通用 cancel 分派与 deis provider-deployments 命令本机通过 Control 647/647、CLI 190/190、driver 64/64；精确提交 1ebe13b 以 17,797,120-byte archive（SHA-256 ff2fc4fb…dd0c）在三端通过 provider 80/80、authz 39/39 等门禁，登记 provider-driver-dispatcher-portability-1ebe13b evidence。随后 GET /operations/:id 改为记录级授权、通用 cancel Idempotency-Key 改可选、旧索引清退、demo 切 /api/v1、TypeScript 客户端由 OpenAPI 生成并在 CI 校验漂移（阶段分析第 96 节）；精确提交 e0086eb 以 18,083,840-byte archive（SHA-256 3a6665d0…9fd8）在三端通过 provider 80/80、pagination 22/22、authz 39/39 等门禁，登记 provider-driver-dispatcher-portability-e0086eb evidence。Rust CLI generated client、真实签署 materialized release、真实透明日志/独立 witness、真实 Windows Service 安装、三个完整 backend driver、账户级生命周期和 live conformance 仍未完成；大 catalog 的负载证据和扫描指标也未完成，故保持 active"
         },
@@ -326,8 +873,15 @@
           "title": "实现不可变 version URL、环境/分支别名及安全 preview",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P1-DEPLOY-001"],
-          "outputs": [{"type": "planned-path", "value": "preview identity, auth and resource isolation"}],
+          "dependsOn": [
+            "P1-DEPLOY-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "preview identity, auth and resource isolation"
+            }
+          ],
           "verification": "promote 复用精确 artifact，version URL 永不移动"
         },
         {
@@ -335,15 +889,64 @@
           "title": "建立 Linux/macOS/Windows 开发工具 CI 与实机 determinism",
           "owner": "deislet",
           "status": "active",
-          "dependsOn": ["P1-BUILD-001"],
+          "dependsOn": [
+            "P1-BUILD-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "docs/product/evidence/compiler-identity.schema.json"},
-            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-ffb1591.json"},
-            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-94fb8fb.json"},
-            {"type": "local-path", "value": "docs/product/evidence/compiler-identity-3eb581e.json"},
-            {"type": "planned-path", "value": "Linux/macOS/Windows CI matrix"}
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/compiler-identity.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/compiler-identity-ffb1591.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/compiler-identity-94fb8fb.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/compiler-identity-3eb581e.json"
+            },
+            {
+              "type": "planned-path",
+              "value": "Linux/macOS/Windows CI matrix"
+            }
           ],
           "verification": "ffb1591 与 94fb8fb 的受治理实机失败证据分别保留 macOS /var alias 和 Windows verbatim-prefix 根因；修复提交 3eb581e 已在 s68 Linux、s67 macOS ARM64、s69 Windows 11 AMD64 使用固定 Rust/Cargo 1.96.0 对同一 archive/fixture 得到相同 canonical 与四个 provider identity。真实 compiler determinism 已完成；持续 GitHub Actions 三平台 matrix 及完整 CLI/dev 发布验证仍未完成，故保持 active"
+        },
+        {
+          "id": "P1-ROUTE-001",
+          "title": "EdgeOne Node Function 路由配置改用规范函数表",
+          "owner": "deislet",
+          "status": "queued",
+          "dependsOn": [
+            "P1-BUILD-001"
+          ],
+          "outputs": [
+            {
+              "type": "local-path",
+              "value": "crates/deis-build-adapter-tencent/src/lib.rs"
+            }
+          ],
+          "verification": "cloud-functions/api-node/config.json 写出 canonical routing document 的 functions[] 与 {\"handle\":\"filesystem\"} 分界，而不是单条 ^/(.*)$；有测试证明存在 node-runtime 函数时静态文件仍可达。deislet 目标的同类缺陷已于阶段分析第 97 节修复"
+        },
+        {
+          "id": "P1-API-002",
+          "title": "结清深度审查留下的四项 API 与运维开放决策",
+          "owner": "product",
+          "status": "queued",
+          "dependsOn": [
+            "P1-DEPLOY-001"
+          ],
+          "outputs": [
+            {
+              "type": "local-path",
+              "value": "docs/product/phase-analysis-2026-09-03.zh.md"
+            }
+          ],
+          "verification": "四项各有明确结论并落到代码或文档：ProductOperation 可空成员如实标注（v1 大版本或显式兼容豁免）；api_page_cursors 容量上限的行为（拒绝列表请求或驱逐同一查询绑定的旧位置）与其索引代价；driver 重试次数上限及耗尽后父操作是否 failed；idx_events_page_v1 是否退役。四项均记于阶段分析第 97 节"
         }
       ]
     },
@@ -351,7 +954,9 @@
       "id": "phase-2",
       "title": "完整统一运行与应用语义",
       "status": "queued",
-      "dependsOn": ["phase-1"],
+      "dependsOn": [
+        "phase-1"
+      ],
       "exitCriteria": [
         "三个首批后端实现全部应用层 mandatory semantics",
         "同一 black-box suite 在三个后端全绿且应用无 target-specific branch",
@@ -363,8 +968,16 @@
           "title": "统一 HTTP、路由、资产、stream、WebSocket 与后台任务语义",
           "owner": "joint",
           "status": "queued",
-          "dependsOn": ["P1-BUILD-001", "P0-SPEC-002"],
-          "outputs": [{"type": "planned-path", "value": "web event black-box conformance suites"}],
+          "dependsOn": [
+            "P1-BUILD-001",
+            "P0-SPEC-002"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "web event black-box conformance suites"
+            }
+          ],
           "verification": "行为、错误、取消、backpressure 与 deadline suites 全绿"
         },
         {
@@ -372,15 +985,39 @@
           "title": "实现 Node 24 LTS 版本化 subset 与 npm 构建解析",
           "owner": "joint",
           "status": "active",
-          "dependsOn": ["P1-BUILD-001", "P0-SPEC-002"],
+          "dependsOn": [
+            "P1-BUILD-001",
+            "P0-SPEC-002"
+          ],
           "outputs": [
-            {"type": "path", "value": "standards/edge-canon.lock.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/node-npm-subset.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/harness.json"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/provider-runtime-protocol.zh.md"},
-            {"type": "url", "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/provider-runtime-oracle.mjs"},
-            {"type": "path", "value": "crates/deis-build-core/src/node_npm.rs"},
-            {"type": "path", "value": "crates/deis-runtime/src/runtime/node_compat.rs"}
+            {
+              "type": "path",
+              "value": "standards/edge-canon.lock.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements/node-npm-subset.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/harness.json"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/provider-runtime-protocol.zh.md"
+            },
+            {
+              "type": "url",
+              "value": "https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/harness/node-npm-subset/provider-runtime-oracle.mjs"
+            },
+            {
+              "type": "path",
+              "value": "crates/deis-build-core/src/node_npm.rs"
+            },
+            {
+              "type": "path",
+              "value": "crates/deis-runtime/src/runtime/node_compat.rs"
+            }
           ],
           "verification": "标准 Node 24.20.0 逐 export lock 与 15 个 reference cases 已建立；生产 compiler 已统一拒绝清单外 builtin/export、namespace/default 扩张、动态解析和不合规 package-lock v3，四 target 负向回归通过。构建期固定 Node 24.20.0/npm 11.19.0，以隔离 npm ci 安装并复核 SHA-512 cache、lifecycle/native/path/link/跨文件系统冲突及资源上限；安装期间以独立观察器约束 cache、entry、file 与展开字节并在越界时终止、回收子进程，全部限制可在构建前由 node-npm-limits JSON 查询。共享契约固定 edge-canon/worker 条件集，Cloudflare、EdgeOne、Deno、Deislet 四个真实 bundler 路径均已证明选择同一 edge-canon package export。CommonJS/ESM package 完整内联。Cloudflare、EdgeOne、Deno 的 provider-neutral façade 把全部选定 builtin、Buffer/process/timer globals、逐 invocation env、getBuiltinModule 模块对象及虚拟 path/file URL 统一到固定 Node 24/Linux 身份；同一真实产物语义测试在官方 Node 24.20.0、EdgeOne 对应的 Node 20.20.2 和 Deno 2.9.6 均通过。共享 provider runtime fixture/oracle 已执行 T001-T007/T012；Wrangler 4.129.0 与 workerd 1.20260903.1 的真实本地运行发现 Cloudflare 不实现 AsyncLocalStorage enterWith/disable，标准按领先产品交集明确锁定 run/getStore/exit，修订后的两个并发调用 8/8 通过。Deislet 自建运行时由同一共享契约驱动实现 18 个标准模块、受限 process、Buffer、Node 调度函数、逐调用 process.env 隔离、虚拟路径/URL 和构建产物反向校验，并有真实 bundle、异步交错与启动快照恢复回归。完成仍要求共享 EC-NODE adapter 完成构建侧用例，并在 Cloudflare、EdgeOne、Deislet 三个一等后端远端运行、绑定部署身份及登记真实 provider evidence；本地 host/CLI/workerd 行为不能替代该证据"
         },
@@ -389,8 +1026,16 @@
           "title": "实现框架无关 SSR/streaming SSR/ISR 与官方框架适配器",
           "owner": "joint",
           "status": "queued",
-          "dependsOn": ["P2-WEB-001", "P2-NODE-001"],
-          "outputs": [{"type": "planned-path", "value": "SSR/ISR contract and Next/Nuxt/SvelteKit adapters"}],
+          "dependsOn": [
+            "P2-WEB-001",
+            "P2-NODE-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "SSR/ISR contract and Next/Nuxt/SvelteKit adapters"
+            }
+          ],
           "verification": "revalidation、single-flight、invalidation 和失败恢复跨后端一致"
         },
         {
@@ -398,17 +1043,47 @@
           "title": "统一 env/secrets/KV/cache/SQL/blob/queue/cron/service binding",
           "owner": "joint",
           "status": "active",
-          "dependsOn": ["P0-MODEL-001", "P1-DEPLOY-001"],
+          "dependsOn": [
+            "P0-MODEL-001",
+            "P1-DEPLOY-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "crates/deis-wire/src/environment.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/catalog/secrets.rs"},
-            {"type": "local-path", "value": "crates/deis-control/src/delivery/mod.rs"},
-            {"type": "local-path", "value": "crates/deis-runtime/src/deployment/mod.rs"},
-            {"type": "local-path", "value": "crates/deis-runtime/src/runtime/js/runtime.js"},
-            {"type": "local-path", "value": "crates/deis/src/commands/deploy.rs"},
-            {"type": "local-path", "value": "crates/deis/src/dev/mod.rs"},
-            {"type": "planned-path", "value": "resource semantic and lifecycle suites"}
+            {
+              "type": "local-path",
+              "value": "crates/deis-wire/src/environment.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/database/schema.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/secrets.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/delivery/mod.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-runtime/src/deployment/mod.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-runtime/src/runtime/js/runtime.js"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis/src/commands/deploy.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis/src/dev/mod.rs"
+            },
+            {
+              "type": "planned-path",
+              "value": "resource semantic and lifecycle suites"
+            }
           ],
           "verification": "EC-ENV Draft contract 已由 Deislet production path 实现：部署构造不可变 typed snapshot，secret revision/head、deployment/head CAS、同版本 rotation 与精确历史 rollback 均有 Control 回归；assignment/runtime 逐层校验标准版本、declaration、snapshot identity、revision/value map，schema-2 离线恢复失败关闭，context.env 与 process.env 逐 invocation 隔离；CLI 不接受 argv secret plaintext，并约束本地文件权限。Queue fence 已按 pre-commit PREPARE/drain、post-proxy ACTIVATE 和补偿 ABORT 拆分；响应和持久 observation 均携带 active/pending deployment/generation owner，Control 精确核验，exact abort tombstone 允许丢响应重试并拒绝错误 candidate。过期 lease 的旧 Ack/Nack 在重投前也按 stale 拒绝。未引用 staged secret 在补偿确认后立即销毁，orphan revision 由 24 小时 retention、每批 1000 条的 GC 清理，并写入不可变无值销毁 ledger。当前只关闭 env/secrets 与严格有序切换的 Deislet 实现切片；config 独立更新、可配置 revision/snapshot retention 与销毁查询、per-tenant envelope key、加密 node transport、逐边界故障注入、完整 cluster convergence、Cloudflare/EdgeOne live evidence，以及 KV/cache/SQL/blob/queue/cron/service binding mandatory suites 仍阻断完成"
         },
@@ -417,8 +1092,15 @@
           "title": "实现 Stateful Object identity、ownership、storage 与迁移",
           "owner": "joint",
           "status": "queued",
-          "dependsOn": ["P2-DATA-001"],
-          "outputs": [{"type": "planned-path", "value": "native/composed/companion implementations and failure suites"}],
+          "dependsOn": [
+            "P2-DATA-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "native/composed/companion implementations and failure suites"
+            }
+          ],
           "verification": "owner、fencing、alarm、RPC、WebSocket 与 migration suites 全绿"
         }
       ]
@@ -427,7 +1109,9 @@
       "id": "phase-3",
       "title": "自建后端生产化、安全与高可用",
       "status": "queued",
-      "dependsOn": ["phase-2"],
+      "dependsOn": [
+        "phase-2"
+      ],
       "exitCriteria": [
         "故障注入下发布、ownership 和回滚状态准确",
         "安全、容量、备份恢复与 RPO/RTO 有自动证据",
@@ -439,8 +1123,15 @@
           "title": "实现 isolate pool、同 isolate 多 in-flight 与实际队列并发",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P2-WEB-001"],
-          "outputs": [{"type": "planned-path", "value": "runtime scheduler and isolation tests"}],
+          "dependsOn": [
+            "P2-WEB-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "runtime scheduler and isolation tests"
+            }
+          ],
           "verification": "慢 I/O、stream 与 queue 压测下无跨 invocation 状态污染"
         },
         {
@@ -448,12 +1139,27 @@
           "title": "实现严格/渐进发布、亲和、drain 与可证明回滚",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P1-DEPLOY-001", "P3-RUNTIME-001"],
+          "dependsOn": [
+            "P1-DEPLOY-001",
+            "P3-RUNTIME-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "crates/deis-control/src/api/catalog/deployments.rs"},
-            {"type": "local-path", "value": "crates/deis-runtime/src/deployment/mod.rs"},
-            {"type": "local-path", "value": "crates/deis-proxy/src/catalog/table.rs"},
-            {"type": "local-path", "value": "crates/deis-queue/src/queue.rs"}
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/api/catalog/deployments.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-runtime/src/deployment/mod.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-proxy/src/catalog/table.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-queue/src/queue.rs"
+            }
           ],
           "verification": "严格模式已固定 runtime PREPARE → queue PREPARE/drain → pointer/head CAS → proxy ACK → queue ACTIVATE → runtime ACTIVATE；覆盖 pre-commit 202/scoped Location/空 deployment、CLI 等待精确 plan 并复核 current pointer、持久 aborting、target/proxy/queue owner observation、partial prepare 不移动 pointer、精确 generation routing、exact abort tombstone、错误 candidate 拒绝、历史 snapshot rollback、stream/WebSocket drain，以及过期 lease Ack/Nack stale 边界。API、后台 reconcile 和终态 generation drain 使用不同 UUIDv7 owner、30 秒持久 lease 与 10 秒 heartbeat；所有 runtime/queue 外部动作、observation、transition 和 pointer commit 均受 owner/expiry fence，覆盖单赢家、过期接管与 stale owner 拒绝。完成仍要求逐持久化边界进程故障/丢响应注入、snapshot 生命周期、渐进权重/亲和/gate/override、遥测、provider driver 与真实后端证据"
         },
@@ -462,10 +1168,18 @@
           "title": "实现默认安全 production、per-node identity 与短期 capability",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P0-MODEL-001"],
+          "dependsOn": [
+            "P0-MODEL-001"
+          ],
           "outputs": [
-            {"type": "local-path", "value": "docs/adr/025-machine-identity-and-capabilities.md"},
-            {"type": "planned-path", "value": "mTLS, RBAC, envelope secrets and security gates"}
+            {
+              "type": "local-path",
+              "value": "docs/adr/025-machine-identity-and-capabilities.md"
+            },
+            {
+              "type": "planned-path",
+              "value": "mTLS, RBAC, envelope secrets and security gates"
+            }
           ],
           "verification": "ADR-025 M1/M2 acceptance matrix 全绿；strict 模式移除 fleet PSK/shared HMAC/static backend bearer，非 dev 配置缺少身份、认证、密钥、撤销或隔离条件时 fail closed"
         },
@@ -474,8 +1188,16 @@
           "title": "实现 embedded 与 production HA 持久层、备份恢复和迁移",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P2-DATA-001", "P2-STATE-001"],
-          "outputs": [{"type": "planned-path", "value": "PostgreSQL/S3-compatible reference topology"}],
+          "dependsOn": [
+            "P2-DATA-001",
+            "P2-STATE-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "PostgreSQL/S3-compatible reference topology"
+            }
+          ],
           "verification": "单节点/存储/网络故障满足声明的 RPO/RTO"
         },
         {
@@ -483,8 +1205,15 @@
           "title": "实现内置遥测、OTLP/Prometheus、配额与关联",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P3-HA-001"],
-          "outputs": [{"type": "planned-path", "value": "telemetry ingest/query/export workers"}],
+          "dependsOn": [
+            "P3-HA-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "telemetry ingest/query/export workers"
+            }
+          ],
           "verification": "高基数、背压和 exporter 故障不拖垮请求路径"
         }
       ]
@@ -493,7 +1222,9 @@
       "id": "phase-4",
       "title": "完整产品生命周期与控制台",
       "status": "queued",
-      "dependsOn": ["phase-3"],
+      "dependsOn": [
+        "phase-3"
+      ],
       "exitCriteria": [
         "创建到部署、观测、回滚、导出、删除、恢复、清除由同一 API 通过 CLI/Web 完成",
         "长操作的断点、重试、权限和审计一致",
@@ -505,8 +1236,16 @@
           "title": "稳定 versioned Control API、错误、operation 与 OpenAPI",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P3-ROLL-001", "P3-SEC-001"],
-          "outputs": [{"type": "planned-path", "value": "versioned OpenAPI and generated clients"}],
+          "dependsOn": [
+            "P3-ROLL-001",
+            "P3-SEC-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "versioned OpenAPI and generated clients"
+            }
+          ],
           "verification": "CLI JSON 和 Web 只调用同一公开 API/state machine"
         },
         {
@@ -514,8 +1253,16 @@
           "title": "完成应用级 Web 控制台与三层 RBAC",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P4-API-001", "P3-OBS-001"],
-          "outputs": [{"type": "planned-path", "value": "organization/application/environment console"}],
+          "dependsOn": [
+            "P4-API-001",
+            "P3-OBS-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "organization/application/environment console"
+            }
+          ],
           "verification": "Web 无 API/CLI 不可调用的隐藏业务操作"
         },
         {
@@ -523,8 +1270,16 @@
           "title": "实现 Git/Webhook build、审批、domain、resource 与 trigger 管理",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P4-API-001", "P1-PREVIEW-001"],
-          "outputs": [{"type": "planned-path", "value": "integrated application delivery workflow"}],
+          "dependsOn": [
+            "P4-API-001",
+            "P1-PREVIEW-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "integrated application delivery workflow"
+            }
+          ],
           "verification": "Git 到 preview/promote 的 artifact identity 全程一致"
         },
         {
@@ -532,8 +1287,16 @@
           "title": "实现软删除、导出、恢复与跨 provider purge coordinator",
           "owner": "deislet",
           "status": "queued",
-          "dependsOn": ["P4-API-001", "P3-HA-001"],
-          "outputs": [{"type": "planned-path", "value": "data lifecycle coordinator and residual report"}],
+          "dependsOn": [
+            "P4-API-001",
+            "P3-HA-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "data lifecycle coordinator and residual report"
+            }
+          ],
           "verification": "失败可重试且不可清除的 provider/backup residual 明确报告"
         }
       ]
@@ -542,7 +1305,9 @@
       "id": "phase-5",
       "title": "三后端完整认证与产品 GA",
       "status": "queued",
-      "dependsOn": ["phase-4"],
+      "dependsOn": [
+        "phase-4"
+      ],
       "exitCriteria": [
         "三个首批后端均有未过期 conformance-passed 记录",
         "mandatory suites 无 skip、quarantine 或语义 waiver",
@@ -554,8 +1319,16 @@
           "title": "冻结完整标准版本与 conformance kit",
           "owner": "edge-canon",
           "status": "queued",
-          "dependsOn": ["P2-STATE-001", "P4-LIFE-001"],
-          "outputs": [{"type": "planned-path", "value": "immutable standard and signed test kit release"}],
+          "dependsOn": [
+            "P2-STATE-001",
+            "P4-LIFE-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "immutable standard and signed test kit release"
+            }
+          ],
           "verification": "normative sections 与 tests/fixtures/oracles 双向链接"
         },
         {
@@ -563,8 +1336,16 @@
           "title": "在精确 plan/region/config 上认证三个首批后端",
           "owner": "joint",
           "status": "queued",
-          "dependsOn": ["P5-KIT-001", "P3-HA-001"],
-          "outputs": [{"type": "planned-path", "value": "signed Cloudflare, EdgeOne and Deislet certification records"}],
+          "dependsOn": [
+            "P5-KIT-001",
+            "P3-HA-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "signed Cloudflare, EdgeOne and Deislet certification records"
+            }
+          ],
           "verification": "registry 三个 first-class backend 均 valid、compliant、未过期"
         },
         {
@@ -572,8 +1353,15 @@
           "title": "建立持续 canary、自动 stale/revoke 与部署 preflight",
           "owner": "joint",
           "status": "queued",
-          "dependsOn": ["P5-CERT-001"],
-          "outputs": [{"type": "planned-path", "value": "nightly evidence and provider change monitoring"}],
+          "dependsOn": [
+            "P5-CERT-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "nightly evidence and provider change monitoring"
+            }
+          ],
           "verification": "provider/runtime/driver 变化自动使旧认证待复验"
         },
         {
@@ -581,8 +1369,16 @@
           "title": "通过产品 GA 门槛并发布正式支持声明",
           "owner": "joint",
           "status": "queued",
-          "dependsOn": ["P5-CANARY-001", "P4-WEB-001"],
-          "outputs": [{"type": "planned-path", "value": "registry-derived GA release and support pages"}],
+          "dependsOn": [
+            "P5-CANARY-001",
+            "P4-WEB-001"
+          ],
+          "outputs": [
+            {
+              "type": "planned-path",
+              "value": "registry-derived GA release and support pages"
+            }
+          ],
           "verification": "支持声明只由未过期 valid certification 与维护状态派生"
         }
       ]

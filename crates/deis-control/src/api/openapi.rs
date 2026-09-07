@@ -72,8 +72,11 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         version = DOCUMENT_VERSION,
         description = "The human API of the Deislet control plane: the product API under \
                        `/api/v1` and the platform diagnostics under `/api/platform`. \
-                       Every list answers in the `ControlListPage` envelope with an opaque \
-                       cursor; every error answers with the `ErrorBody` envelope, whose \
+                       Every paginated collection answers in the `ControlListPage` envelope \
+                       with an opaque cursor; four platform diagnostics still answer a shape \
+                       of their own and take no cursor (`listAllRoutes`, `listSessions`, \
+                       `listNodeConfigs`, `listRuntimeFleet`). Every error answers with the \
+                       `ErrorBody` envelope, whose \
                        `code` is a closed set and whose `requestId` is echoed in the \
                        `x-request-id` header. Mutations that take time answer 202 with a \
                        `ProductOperation` and a `Location` to poll.",
@@ -90,7 +93,7 @@ pub const SECURITY_API_KEY: &str = "apiKey";
                                            summary, the runtime fleet and the global route \
                                            table. Served under `/api/platform`.")
     ),
-    modifiers(&Security),
+    modifiers(&Security, &EveryOperationCanFail, &EveryJsonBodyCanBeMisdeclared),
     paths(
         // Accounts and tokens.
         crate::api::identity::list_accounts,
@@ -282,6 +285,128 @@ pub fn sorted(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(items.into_iter().map(sorted).collect())
         }
         other => other,
+    }
+}
+
+/// The `state` values the document publishes for a product operation.
+///
+/// Rendered from [`deis_wire::OperationState`], which is the type the server
+/// writes, so the enum cannot drift from the wire. `pending` is appended
+/// because it was published here before the state was named `queued`, and a
+/// value is never withdrawn from a closed enum a client may already branch
+/// on; nothing has ever emitted it.
+pub const RETIRED_OPERATION_STATE: &str = "pending";
+
+fn operation_state_values() -> Vec<&'static str> {
+    let mut values: Vec<&'static str> = deis_wire::OperationState::ALL
+        .iter()
+        .map(|state| state.as_str())
+        .collect();
+    values.push(RETIRED_OPERATION_STATE);
+    values
+}
+
+/// A JSON body can arrive without its media type.
+///
+/// `Content-Type: application/json` is what makes axum's `Json` extractor
+/// read a body at all; anything else - or nothing - is refused with 415
+/// before the handler runs, on every route that takes a JSON body and on no
+/// other. The status is in the envelope like every other refusal (see
+/// `crate::api::versioning::render_errors`), and it is documented here so a
+/// generated client has an entry for it rather than an answer it cannot
+/// place.
+struct EveryJsonBodyCanBeMisdeclared;
+
+impl Modify for EveryJsonBodyCanBeMisdeclared {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::{Content, Ref, RefOr, Response, ResponseBuilder};
+
+        const NAME: &str = "UnsupportedMediaType";
+        let response: RefOr<Response> = RefOr::T(
+            ResponseBuilder::new()
+                .description(
+                    "The body is not in the media type this operation takes. A JSON body \
+                     needs `Content-Type: application/json` (`invalid-argument`).",
+                )
+                .content(
+                    "application/json",
+                    Content::new(Some(Ref::from_schema_name("ErrorBody"))),
+                )
+                .build(),
+        );
+        let mut used = false;
+        for item in openapi.paths.paths.values_mut() {
+            let operations = [
+                item.get.as_mut(),
+                item.put.as_mut(),
+                item.post.as_mut(),
+                item.delete.as_mut(),
+                item.options.as_mut(),
+                item.head.as_mut(),
+                item.patch.as_mut(),
+                item.trace.as_mut(),
+            ];
+            for operation in operations.into_iter().flatten() {
+                let takes_json = operation
+                    .request_body
+                    .as_ref()
+                    .is_some_and(|body| body.content.contains_key("application/json"));
+                if !takes_json {
+                    continue;
+                }
+                used = true;
+                operation
+                    .responses
+                    .responses
+                    .entry("415".to_string())
+                    .or_insert_with(|| RefOr::Ref(Ref::from_response_name(NAME)));
+            }
+        }
+        if used {
+            openapi
+                .components
+                .get_or_insert_default()
+                .responses
+                .insert(NAME.to_string(), response);
+        }
+    }
+}
+
+/// Every operation can fail on the control plane's own side.
+///
+/// A store read that hits a locked or corrupt database, a blocking task
+/// that panics, a bundle that cannot be written: all of them answer 500
+/// through `ApiError::DatabaseError` or `ApiError::InternalError`, on any
+/// route, and a client whose response table has no entry for the status it
+/// just received cannot tell a retryable failure from a bug in its own
+/// request. Writing `(status = 500, ...)` on 113 annotations by hand would
+/// be exactly as complete as whoever last remembered to; adding it here
+/// means an operation cannot be described without it. An operation that
+/// describes its own 500 keeps its wording.
+struct EveryOperationCanFail;
+
+impl Modify for EveryOperationCanFail {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::{Ref, RefOr};
+        for item in openapi.paths.paths.values_mut() {
+            let operations = [
+                item.get.as_mut(),
+                item.put.as_mut(),
+                item.post.as_mut(),
+                item.delete.as_mut(),
+                item.options.as_mut(),
+                item.head.as_mut(),
+                item.patch.as_mut(),
+                item.trace.as_mut(),
+            ];
+            for operation in operations.into_iter().flatten() {
+                operation
+                    .responses
+                    .responses
+                    .entry("500".to_string())
+                    .or_insert_with(|| RefOr::Ref(Ref::from_response_name("Internal")));
+            }
+        }
     }
 }
 
@@ -481,7 +606,12 @@ impl ToSchema for ProviderDiagnostic {}
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ErrorTarget {
     pub resource: String,
+    /// Absent when the error is about the resource as a whole. Never
+    /// `null`: `contracts/v1/control-error.schema.json` declares a plain
+    /// string, and `crate::api::error::ErrorTarget` omits the member
+    /// instead of writing one.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub field: Option<String>,
 }
 
@@ -551,8 +681,9 @@ error_response!(
 );
 error_response!(
     PreconditionRequired,
-    "The mutation needs an `If-Match` revision or an `Idempotency-Key` header and none was \
-     sent (`precondition-required`)."
+    "The mutation needs an `If-Match` revision and none was sent (`precondition-required`). \
+     A missing `Idempotency-Key` is not this answer: it is 400 `idempotency-key-required`, \
+     described under `BadRequest`."
 );
 error_response!(
     PreconditionFailed,
@@ -658,7 +789,14 @@ impl PartialSchema for ProductOperationDocument {
         .required("operationId")
         .property(
             "kind",
-            string_property("What the operation does: `identity-migration`, `backend-restore`, `provider-deployment`."),
+            string_property(
+                "What the operation does. The set is `deis_wire::OperationKind`, which is \
+                 `contracts/v1/operation.schema.json`'s: an identity migration is `migrate`, \
+                 a backend restore is `restore` and a provider deployment is `provider`.",
+            )
+            .enum_values(Some(
+                deis_wire::OperationKind::ALL.map(deis_wire::OperationKind::as_str),
+            )),
         )
         .required("kind")
         .property(
@@ -668,8 +806,22 @@ impl PartialSchema for ProductOperationDocument {
                 .description(Some("The organization, application and environment the operation acts in."))
                 .property("organizationId", uuid_property("Canonical UUIDv7."))
                 .required("organizationId")
-                .property("applicationId", uuid_property("Canonical UUIDv7, when scoped to one application."))
-                .property("environmentId", uuid_property("Canonical UUIDv7, when scoped to one environment.")),
+                .property(
+                    "applicationId",
+                    uuid_property(
+                        "Canonical UUIDv7 of the application the operation acts in; `null` \
+                         when it acts on the whole organization.",
+                    ),
+                )
+                .required("applicationId")
+                .property(
+                    "environmentId",
+                    uuid_property(
+                        "Canonical UUIDv7 of the environment the operation acts in; `null` \
+                         when it is not scoped to one.",
+                    ),
+                )
+                .required("environmentId"),
         )
         .required("scope")
         .property(
@@ -687,16 +839,16 @@ impl PartialSchema for ProductOperationDocument {
         .required("target")
         .property(
             "state",
-            string_property("`pending`, `running`, `waiting`, `succeeded`, `failed`, `cancelling` or `cancelled`.")
-                .enum_values(Some([
-                    "pending",
-                    "running",
-                    "waiting",
-                    "succeeded",
-                    "failed",
-                    "cancelling",
-                    "cancelled",
-                ])),
+            string_property(
+                "Where the operation is in the state machine of \
+                 `contracts/v1/operation-transitions.json`. The set is rendered from \
+                 `deis_wire::OperationState`, so it cannot drift from what the server \
+                 writes; a freshly accepted operation is `queued`. `pending` is listed \
+                 because it was published in this enum and a value is never withdrawn from \
+                 a closed one, and is emitted by nothing: it was the earlier spelling of \
+                 `queued` and no code path has ever written it.",
+            )
+            .enum_values(Some(operation_state_values())),
         )
         .required("state")
         .property("phase", string_property("The kind-specific step the operation is in."))
@@ -720,7 +872,18 @@ impl PartialSchema for ProductOperationDocument {
         .required("requestId")
         .property("correlationId", uuid_property("The correlation id that started it."))
         .required("correlationId")
-        .property("progress", integer_property("0..=100 when the kind reports progress."))
+        .property(
+            "progress",
+            integer_property(
+                "How far the operation has come, in basis points: 0..=10000, where 10000 is \
+                 the whole of it, as `contracts/v1/operation.schema.json` defines it. `null` \
+                 whenever the kind has no honest denominator to divide by, which includes \
+                 every operation that has not started.",
+            )
+            .minimum(Some(0))
+            .maximum(Some(10_000)),
+        )
+        .required("progress")
         .property("cancellable", ObjectBuilder::new().schema_type(SchemaType::Type(Type::Boolean)))
         .required("cancellable")
         .property("retryable", ObjectBuilder::new().schema_type(SchemaType::Type(Type::Boolean)))
@@ -743,22 +906,27 @@ impl PartialSchema for ProductOperationDocument {
             "error",
             ObjectBuilder::new()
                 .schema_type(SchemaType::Type(Type::Object))
-                .description(Some("Why the operation failed; present exactly when `state` is `failed`."))
+                .description(Some("Why the operation failed. The member is always written; its value is `null` unless `state` is `failed`."))
                 .property("code", string_property("A stable error class."))
                 .required("code")
                 .property("message", string_property("Human-readable detail."))
                 .required("message")
                 .property("retryable", ObjectBuilder::new().schema_type(SchemaType::Type(Type::Boolean)))
                 .required("retryable")
-                .property("retryAfterSeconds", integer_property("How long to wait before retrying."))
-                .property("remediation", string_property("What an operator can do about it.")),
+                .property("retryAfterSeconds", integer_property("How long to wait before retrying; `null` when the failure carries no hint."))
+                .required("retryAfterSeconds")
+                .property("remediation", string_property("What an operator can do about it; `null` when there is nothing to say."))
+                .required("remediation"),
         )
+        .required("error")
         .property("createdAt", date_time_property("RFC 3339."))
         .required("createdAt")
-        .property("startedAt", date_time_property("RFC 3339, once running."))
+        .property("startedAt", date_time_property("RFC 3339 once the operation started; `null` while it is `queued`."))
+        .required("startedAt")
         .property("updatedAt", date_time_property("RFC 3339."))
         .required("updatedAt")
-        .property("finishedAt", date_time_property("RFC 3339, once terminal."))
+        .property("finishedAt", date_time_property("RFC 3339 once the operation is terminal; `null` before that."))
+        .required("finishedAt")
         .into()
     }
 }
@@ -1006,34 +1174,238 @@ pub struct BinaryBody(pub Vec<u8>);
 /// A canonical artifact record, the answer of the artifact routes.
 pub struct CanonicalArtifactDocument;
 
+/// A `{algorithm, value}` digest, as the artifact record carries them.
+fn digest_property(description: &str) -> ObjectBuilder {
+    ObjectBuilder::new()
+        .schema_type(SchemaType::Type(Type::Object))
+        .description(Some(description))
+        .property("algorithm", string_property("`sha256`."))
+        .required("algorithm")
+        .property("value", string_property("64 lowercase hexadecimal digits."))
+        .required("value")
+}
+
+/// A document stored beside the artifact: its path and its digest.
+fn document_reference_property(description: &str) -> ObjectBuilder {
+    ObjectBuilder::new()
+        .schema_type(SchemaType::Type(Type::Object))
+        .description(Some(description))
+        .property(
+            "path",
+            string_property("Path inside the artifact's storage."),
+        )
+        .required("path")
+        .property("digest", digest_property("Digest of the document."))
+        .required("digest")
+}
+
+/// A top-level member the document published before the record's real shape
+/// was described here, which nothing has ever written.
+///
+/// Kept for the same reason `offset-out-of-range` stays in [`ErrorCode`]: a
+/// published member is not withdrawn from a document that promises
+/// compatibility. It is marked deprecated and says where the value it
+/// looked like actually lives, so a client reading it as anything but
+/// `undefined` learns why here rather than at runtime.
+fn never_written_property(description: &str) -> ObjectBuilder {
+    string_property(description).deprecated(Some(utoipa::openapi::Deprecated::True))
+}
+
 impl PartialSchema for CanonicalArtifactDocument {
     fn schema() -> RefOr<Schema> {
         contract_object(
             "A canonical artifact record",
             "canonical-artifact.schema.json",
-            "The verified provider-neutral Build Output of one upload: its content root \
-             digest, standard version and file inventory. Returned as stored.",
+            "The verified provider-neutral Build Output of one upload, returned exactly as \
+             `catalog::artifact::store` wrote it: the digests live under `canonicalOutput`, \
+             the standard the validator pinned under `standard`, and `state`/`deployable` \
+             say whether anything may be deployed from it.",
         )
         .property(
             "$schema",
             string_property("The `$id` of the schema the record conforms to."),
         )
         .property("schemaVersion", integer_property("Always 1."))
+        .required("schemaVersion")
+        .property(
+            "recordType",
+            string_property("Always `deislet.canonical-artifact-record/v1`."),
+        )
+        .required("recordType")
         .property(
             "artifactId",
             uuid_property("Canonical UUIDv7 of the artifact."),
         )
+        .required("artifactId")
+        .property(
+            "applicationId",
+            uuid_property("Canonical UUIDv7 of the application it belongs to."),
+        )
+        .required("applicationId")
+        .property(
+            "state",
+            string_property("Where the record stands: `draft`, `verified` or `published`.")
+                .enum_values(Some(["draft", "verified", "published"])),
+        )
+        .required("state")
+        .property(
+            "deployable",
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Type(Type::Boolean))
+                .description(Some(
+                    "Whether a version may be derived from this artifact yet.",
+                )),
+        )
+        .required("deployable")
+        .property("createdAt", date_time_property("RFC 3339."))
+        .required("createdAt")
+        .property(
+            "canonicalOutput",
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Type(Type::Object))
+                .description(Some("The Build Output this record was verified from."))
+                .property(
+                    "format",
+                    string_property("Always `edge-canon.build-output/v1`."),
+                )
+                .required("format")
+                .property(
+                    "manifestPath",
+                    string_property("Always `.edge-canon/output.json`."),
+                )
+                .required("manifestPath")
+                .property(
+                    "artifactSha256",
+                    string_property("64 lowercase hexadecimal digits over the archive."),
+                )
+                .required("artifactSha256")
+                .property(
+                    "contentRootSha256",
+                    string_property("64 lowercase hexadecimal digits over the content root."),
+                )
+                .required("contentRootSha256")
+                .property("fileCount", integer_property("How many files it holds."))
+                .required("fileCount")
+                .property(
+                    "storage",
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Type(Type::Object))
+                        .description(Some("Where the bytes are."))
+                        .property("kind", string_property("`directory` or `object`."))
+                        .required("kind")
+                        .property("locator", string_property("Where, in that store."))
+                        .required("locator"),
+                )
+                .required("storage"),
+        )
+        .required("canonicalOutput")
+        .property(
+            "standard",
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Type(Type::Object))
+                .description(Some(
+                    "The Build Output standard the validator was pinned to.",
+                ))
+                .property("contractId", string_property("Always `edge-canon.next`."))
+                .required("contractId")
+                .property(
+                    "version",
+                    string_property("`edge-canon.next@<40 hexadecimal digits>`."),
+                )
+                .required("version")
+                .property(
+                    "releaseStatus",
+                    string_property("`proposal`, `candidate`, `release-candidate` or `standard`."),
+                )
+                .required("releaseStatus")
+                .property("sourceCommit", string_property("40 hexadecimal digits."))
+                .required("sourceCommit")
+                .property("contractDigest", digest_property("Digest of the contract."))
+                .required("contractDigest")
+                .property(
+                    "artifactSchemaPath",
+                    string_property("Always `schemas/canonical-build-output.schema.json`."),
+                )
+                .required("artifactSchemaPath")
+                .property(
+                    "artifactSchemaDigest",
+                    digest_property("Digest of that schema."),
+                )
+                .required("artifactSchemaDigest"),
+        )
+        .required("standard")
+        .property(
+            "validation",
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Type(Type::Object))
+                .description(Some("What the validator found."))
+                .property(
+                    "status",
+                    string_property("`pending`, `passed` or `failed`."),
+                )
+                .required("status")
+                .property(
+                    "requirementsDigest",
+                    digest_property("Digest of the requirement set applied."),
+                )
+                .required("requirementsDigest")
+                .property("reportPath", string_property("Where the report is."))
+                .required("reportPath")
+                .property("reportDigest", digest_property("Digest of the report."))
+                .required("reportDigest"),
+        )
+        .required("validation")
+        .property(
+            "attestations",
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Type(Type::Object))
+                .description(Some("The documents that travel with the artifact."))
+                .property("sbom", document_reference_property("The SBOM."))
+                .required("sbom")
+                .property(
+                    "provenance",
+                    document_reference_property("The provenance document."),
+                )
+                .required("provenance"),
+        )
+        .required("attestations")
+        .property(
+            "signatures",
+            ArrayBuilder::new().items(
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::Object))
+                    .description(Some("One signature over a target of this record."))
+                    .property("target", string_property("What was signed."))
+                    .required("target")
+                    .property("keyId", string_property("Which key signed it."))
+                    .required("keyId")
+                    .property("algorithm", string_property("The signature algorithm."))
+                    .required("algorithm")
+                    .property("value", string_property("The signature."))
+                    .required("value"),
+            ),
+        )
+        .required("signatures")
+        // Published by an earlier draft of this document and written by
+        // nothing: the record has never carried a digest or a standard
+        // version at its top level.
         .property(
             "artifactSha256",
-            string_property("64 lowercase hexadecimal digits."),
+            never_written_property(
+                "Never written. The digest of the archive is \
+                 `canonicalOutput.artifactSha256`.",
+            ),
         )
         .property(
             "contentRootSha256",
-            string_property("64 lowercase hexadecimal digits."),
+            never_written_property(
+                "Never written. The digest of the content root is \
+                 `canonicalOutput.contentRootSha256`.",
+            ),
         )
         .property(
             "standardVersion",
-            string_property("The Build Output standard version."),
+            never_written_property("Never written. The standard version is `standard.version`."),
         )
         .into()
     }
@@ -1196,6 +1568,280 @@ mod tests {
         }
     }
 
+    /// The four list operations that answer a shape of their own, take no
+    /// cursor and read a whole table. The document's own description says
+    /// so, so that a reader is not told every list is paginated while these
+    /// four are not; they are listed here rather than exempted silently, and
+    /// the list may only get shorter.
+    const UNPAGINATED_LISTS: &[&str] = &[
+        "listAllRoutes",
+        "listNodeConfigs",
+        "listRuntimeFleet",
+        "listSessions",
+    ];
+
+    /// Every operation whose id says it lists something answers in the
+    /// envelope, unless it is one of the four that are known not to and are
+    /// named in the document's own description. Without this, an operation
+    /// that simply took no `cursor` parameter was skipped by the check
+    /// below and could answer any shape it liked.
+    #[test]
+    fn a_list_operation_either_pages_or_is_one_of_the_four_that_do_not() {
+        let document = rendered();
+        let mut unpaginated = BTreeSet::new();
+        for (path, method, operation) in paths(&document) {
+            let id = operation["operationId"].as_str().unwrap();
+            if method != "get" || !id.starts_with("list") {
+                continue;
+            }
+            let reference = operation["responses"]["200"]["content"]["application/json"]["schema"]
+                ["$ref"]
+                .as_str()
+                .unwrap_or_default();
+            if reference.starts_with("#/components/schemas/ControlListPage_") {
+                continue;
+            }
+            assert!(
+                UNPAGINATED_LISTS.contains(&id),
+                "{method} {path} ({id}) lists something and answers {reference}, which is not \
+                 the ControlListPage envelope and is not one of the four the document says are \
+                 not paginated"
+            );
+            unpaginated.insert(id.to_string());
+        }
+        assert_eq!(
+            unpaginated,
+            UNPAGINATED_LISTS
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<BTreeSet<_>>(),
+            "an operation on the unpaginated list now pages; take it off the list"
+        );
+        // And the document says out loud which four they are, so a reader of
+        // the description is not told something the operations contradict.
+        let description = document["info"]["description"].as_str().unwrap();
+        for id in UNPAGINATED_LISTS {
+            assert!(
+                description.contains(id),
+                "the document's description does not name {id} as unpaginated"
+            );
+        }
+    }
+
+    /// Every operation can fail on the control plane's own side, and every
+    /// operation that takes a JSON body can be sent one without its media
+    /// type. Both are answered on every route and neither was described.
+    #[test]
+    fn every_operation_documents_the_failures_every_route_can_have() {
+        let document = rendered();
+        for (path, method, operation) in paths(&document) {
+            let responses = operation["responses"].as_object().unwrap();
+            assert!(
+                responses.contains_key("500"),
+                "{method} {path} does not document the 500 any store read can answer"
+            );
+            let takes_json = operation["requestBody"]["content"]["application/json"].is_object();
+            assert_eq!(
+                takes_json,
+                responses.contains_key("415"),
+                "{method} {path}: a 415 is documented exactly on the routes that take a JSON body"
+            );
+        }
+    }
+
+    /// The `state` and `kind` sets are the wire type's, so the document
+    /// cannot describe a state the server never writes or miss one it does.
+    /// The one value that is listed and never written is the retired
+    /// `pending`, kept because a published enum value is not withdrawn.
+    #[test]
+    fn the_operation_enums_are_the_wire_enums() {
+        let document = rendered();
+        let operation = &document["components"]["schemas"]["ProductOperation"]["properties"];
+        let listed = |member: &str| -> BTreeSet<String> {
+            operation[member]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{member} lists no enum"))
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect()
+        };
+        let states: BTreeSet<String> = deis_wire::OperationState::ALL
+            .iter()
+            .map(|state| state.as_str().to_string())
+            .collect();
+        let mut expected = states.clone();
+        expected.insert(RETIRED_OPERATION_STATE.to_string());
+        assert_eq!(listed("state"), expected);
+        assert!(states.contains("queued"), "the accepted state is `queued`");
+        assert!(
+            !states.contains(RETIRED_OPERATION_STATE),
+            "{RETIRED_OPERATION_STATE} is retired and nothing writes it"
+        );
+        assert_eq!(
+            listed("kind"),
+            deis_wire::OperationKind::ALL
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect::<BTreeSet<_>>()
+        );
+
+        // The contract is the authority for both, and for the range of
+        // `progress`, which is basis points and not a percentage.
+        let contract = read_contract("operation.schema.json");
+        let contract_states: BTreeSet<String> = contract["properties"]["state"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(states, contract_states);
+        assert_eq!(operation["progress"]["minimum"], 0);
+        assert_eq!(
+            operation["progress"]["maximum"],
+            contract["properties"]["progress"]["anyOf"][0]["maximum"]
+        );
+    }
+
+    /// The artifact record the routes answer with is the one the contract
+    /// defines: every member it requires is described and required here.
+    /// The three top-level digests this document published before anyone
+    /// compared the two are still listed - a published member is not
+    /// withdrawn - and are marked deprecated, because nothing has ever
+    /// written them.
+    #[test]
+    fn the_canonical_artifact_is_the_contract_record() {
+        let document = rendered();
+        let artifact = &document["components"]["schemas"]["CanonicalArtifact"];
+        let contract = read_contract("canonical-artifact.schema.json");
+        let required: BTreeSet<&str> = artifact["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member.as_str().unwrap())
+            .collect();
+        let contract_required: BTreeSet<&str> = contract["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member.as_str().unwrap())
+            .collect();
+        assert_eq!(required, contract_required);
+        for member in &contract_required {
+            assert!(
+                artifact["properties"][member].is_object(),
+                "{member} is required by the contract and not described here"
+            );
+        }
+        // The fixture is a real record; every member of it is described.
+        let fixture: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                contracts_dir().join("fixtures/valid/canonical-artifact.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for member in fixture.as_object().unwrap().keys() {
+            assert!(
+                artifact["properties"][member].is_object(),
+                "a real record carries {member} and the document does not describe it"
+            );
+        }
+        for member in ["artifactSha256", "contentRootSha256", "standardVersion"] {
+            assert_eq!(
+                artifact["properties"][member]["deprecated"],
+                Value::Bool(true),
+                "{member} is written by nothing and has to say so"
+            );
+            assert!(!required.contains(member), "{member} is not written at all");
+        }
+    }
+
+    /// A member the server omits is not a member the server writes as
+    /// `null`, and utoipa cannot tell the two apart: `Option<T>` renders as
+    /// nullable whatever serde does with it. So every field that says
+    /// `skip_serializing_if = "Option::is_none"` in a type the document
+    /// describes has to say `nullable = false` as well, or the document
+    /// promises clients a `null` that no answer can carry and they write a
+    /// branch that never runs.
+    #[test]
+    fn an_omitted_member_is_never_documented_as_nullable() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut checked = 0;
+        let mut files = Vec::new();
+        collect_rust_files(&root, &mut files);
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            // Whether the struct being read derives `ToSchema`, which is what
+            // decides that its fields reach the document at all.
+            let mut described = false;
+            let mut inside = false;
+            for (index, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("#[derive") {
+                    described = line.contains("ToSchema");
+                }
+                if line.contains("struct ") && line.trim_end().ends_with('{') {
+                    inside = described;
+                    described = false;
+                    continue;
+                }
+                if line.starts_with('}') {
+                    inside = false;
+                }
+                let is_serde_attribute = line.trim_start().starts_with("#[serde(")
+                    && line.contains(r#"skip_serializing_if = "Option::is_none""#);
+                if !inside || !is_serde_attribute {
+                    continue;
+                }
+                checked += 1;
+                let mut cursor = index + 1;
+                let mut attributes = String::new();
+                while cursor < lines.len() && !lines[cursor].contains("pub ") {
+                    attributes.push_str(lines[cursor]);
+                    cursor += 1;
+                }
+                if !attributes.contains("nullable = false") {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        file.display(),
+                        index + 1,
+                        lines.get(cursor).unwrap_or(&"?").trim()
+                    ));
+                }
+            }
+        }
+        assert!(checked > 10, "the scan found almost nothing to check");
+        assert!(
+            offenders.is_empty(),
+            "these members are omitted when absent and documented as nullable; add \
+             `#[schema(nullable = false)]`: {offenders:#?}"
+        );
+    }
+
+    fn collect_rust_files(directory: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn contracts_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/v1")
+    }
+
+    fn read_contract(file: &str) -> Value {
+        let path = contracts_dir().join(file);
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("{}: {error}", path.display());
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn every_list_answers_in_the_envelope() {
         let document = rendered();
@@ -1283,6 +1929,61 @@ mod tests {
         for member in ["target", "retryAfterSeconds", "docs", "provider"] {
             let rendered = serde_json::to_string(&envelope[member]).unwrap();
             assert!(!rendered.contains("null"), "{member} is rendered nullable");
+        }
+
+        // `target` and `violations` are the contract's objects too, member
+        // for member: the envelope's own members were compared here from the
+        // start and these two were not, which is how `target.field` came to
+        // be nullable in one authority and a plain string in the other.
+        for (schema, contract_member) in [
+            (
+                "ErrorTarget",
+                &contract["properties"]["error"]["properties"]["target"],
+            ),
+            (
+                "ErrorViolation",
+                &contract["properties"]["error"]["properties"]["violations"]["items"],
+            ),
+        ] {
+            let rendered = &document["components"]["schemas"][schema];
+            let names = |value: &Value| -> BTreeSet<String> {
+                value
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{schema}: {value}"))
+                    .keys()
+                    .cloned()
+                    .collect()
+            };
+            assert_eq!(
+                names(&rendered["properties"]),
+                names(&contract_member["properties"]),
+                "{schema} and the contract describe different members"
+            );
+            let contract_required: BTreeSet<String> = contract_member["required"]
+                .as_array()
+                .map(|members| {
+                    members
+                        .iter()
+                        .map(|member| member.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let required: BTreeSet<String> = rendered["required"]
+                .as_array()
+                .map(|members| {
+                    members
+                        .iter()
+                        .map(|member| member.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(required, contract_required, "{schema}");
+            for (member, described) in rendered["properties"].as_object().unwrap() {
+                assert_eq!(
+                    described["type"], contract_member["properties"][member]["type"],
+                    "{schema}.{member} is one type here and another in the contract"
+                );
+            }
         }
         assert_eq!(envelope["retryAfterSeconds"]["maximum"], 86400);
         assert_eq!(envelope["docs"]["format"], "uri");
@@ -2096,6 +2797,13 @@ mod tests {
     /// `contracts/openapi/v1-examples.json` is one real answer per response
     /// schema the tests can produce, for the CLI to deserialise against.
     /// Regenerated with `UPDATE_OPENAPI=1`, and otherwise held equal.
+    ///
+    /// This test only holds the file equal to what the handlers answer, so
+    /// regenerating it after a member is renamed leaves it green while every
+    /// hand-written client that still asks for the old name breaks. The other
+    /// half is `platform::captured_example_tests` in the `deis` crate, which
+    /// reads this file into the CLI's mirror types; a regeneration that fails
+    /// there is a rename the CLI has not been taught yet, not a stale file.
     #[tokio::test]
     async fn the_committed_examples_are_what_the_handlers_answer() {
         let examples = capture_examples().await;

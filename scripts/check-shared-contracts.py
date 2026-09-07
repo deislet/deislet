@@ -696,16 +696,49 @@ def validate_cross_document_invariants(registry: dict) -> None:
         require(environment["canonicalTenantKey"] == expected_key, "canonical tenant key is not ID-based")
         require(environment["legacyTenantKey"] != expected_key, "legacy and canonical tenant keys unexpectedly match")
 
-    # The driver request grew `rollbackTarget` after drivers were already
-    # parsing v1 requests with unknown members rejected, so it must stay an
-    # optional member, and the identity it copies from the activate receipt
-    # must keep the receipt's own vocabulary.
+    # The driver request grew `rollbackTarget` and `reconciles` after drivers
+    # were already parsing v1 requests with unknown members rejected, so both
+    # stay optional at the top level - a driver asked to plan or upload keeps
+    # seeing the original document - and the identity `rollbackTarget` copies
+    # from the activate receipt must keep the receipt's own vocabulary.
     process_schema = load_json("contracts/v1/provider-driver-process.schema.json")
     driver_request = process_schema["$defs"]["driverRequest"]
     require(
         "rollbackTarget" in driver_request["properties"]
-        and "rollbackTarget" not in driver_request["required"],
-        "driver request rollbackTarget must exist and remain optional",
+        and "rollbackTarget" not in driver_request["required"]
+        and "reconciles" in driver_request["properties"]
+        and "reconciles" not in driver_request["required"],
+        "driver request rollbackTarget and reconciles must exist and remain optional",
+    )
+    # Optional at the top level is not tolerance per operation: the operation
+    # branches carry the invariants the Control enforces, so a driver written
+    # against the schema alone reaches the same verdict the Control does.
+    conditionals = {
+        branch["if"]["properties"]["operation"]["const"]: branch
+        for branch in driver_request["allOf"]
+        if "const" in branch["if"]["properties"]["operation"]
+    }
+    require(
+        "rollbackTarget" in conditionals["rollback"]["then"]["required"],
+        "schema must require the activation a rollback restores, not merely tolerate it",
+    )
+    require(
+        "reconciles" in conditionals["reconcile"]["then"]["required"]
+        and conditionals["reconcile"]["else"]["properties"]["reconciles"]["type"] == "null",
+        "a reconcile must name the operation it took over and no other operation may",
+    )
+    reconciled_rollback = conditionals["reconcile"]["then"]["allOf"][0]
+    require(
+        "rollbackTarget" in reconciled_rollback["then"]["required"]
+        and reconciled_rollback["else"]["properties"]["rollbackTarget"]["type"] == "null",
+        "a reconciled rollback keeps its activation and no other reconcile carries one",
+    )
+    reconcile_context = process_schema["$defs"]["reconcileContext"]
+    require(
+        reconcile_context.get("additionalProperties") is False
+        and reconcile_context["required"] == ["operation"]
+        and reconcile_context["properties"]["operation"].get("not") == {"const": "reconcile"},
+        "a reconcile driver request cannot reconcile another reconcile",
     )
     rollback_target = process_schema["$defs"]["rollbackTarget"]
     require(

@@ -46,12 +46,12 @@ pub struct ArtifactUploadResponse {
     params(("app_id" = String, Path, description = "The application's id."), ArtifactUploadQuery),
     request_body(content = openapi::BinaryBody, content_type = "application/octet-stream", description = "The canonical artifact archive."),
     responses(
-        (status = 201, description = "The artifact was verified and stored; `created` is false when it was already there.", body = ArtifactUploadResponse),
+        (status = 200, description = "The same artifact was already stored, byte for byte; `created` is false and nothing was written.", body = ArtifactUploadResponse),
+        (status = 201, description = "The artifact was verified and stored; `created` is true.", body = ArtifactUploadResponse),
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
         (status = 413, response = openapi::PayloadTooLarge),
-        (status = 422, response = openapi::UnprocessableEntity),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
     )
@@ -183,6 +183,7 @@ pub async fn list_artifacts(
     params(("app_id" = String, Path, description = "The application's id."), ("artifact_id" = String, Path, description = "The canonical artifact's UUIDv7.")),
     responses(
         (status = 200, description = "The canonical artifact record.", body = openapi::CanonicalArtifactDocument),
+        (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),

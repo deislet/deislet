@@ -236,7 +236,6 @@ pub struct CommandCancelled {
         (status = 200, description = "The command was cancelled.", body = CommandCancelled),
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
-        (status = 409, response = openapi::Conflict),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
     )

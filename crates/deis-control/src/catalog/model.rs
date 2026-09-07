@@ -119,6 +119,7 @@ pub struct Deployment {
     /// Immutable Edge Canon environment snapshot selected with this pointer.
     /// Absent only on deployments written by the legacy schema-1 path.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub snapshot_id: Option<String>,
 }
 
@@ -132,10 +133,13 @@ pub struct DeploymentPlan {
     pub env_id: String,
     pub version_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub snapshot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub previous_deployment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub previous_generation: Option<String>,
     pub expected_secret_heads: std::collections::BTreeMap<String, Option<String>>,
     /// Fresh deploys compare every selected head; historical rollback
@@ -147,15 +151,18 @@ pub struct DeploymentPlan {
     pub plan_sha256: String,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub last_error: Option<String>,
     /// Short-lived owner of the next coordinator action. This is mutable
     /// execution state and is deliberately outside `plan_sha256`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<String>, format = Uuid)]
+    #[schema(value_type = Option<String>, format = Uuid, nullable = false)]
     pub coordinator_id: Option<CanonicalId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub lease_expires_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -189,11 +196,14 @@ pub struct DeploymentQueueObservation {
     pub active_generation: String,
     pub active_deployment_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub pending_generation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub pending_deployment_id: Option<String>,
     pub outstanding_leases: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub message: Option<String>,
     pub observed_at: i64,
 }

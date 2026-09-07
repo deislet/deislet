@@ -666,7 +666,7 @@ impl Database {
                 conn,
                 KeysetListing {
                     table: "heartbeats",
-                    columns: "id, node_id, instance_id, timestamp, latency_ms",
+                    columns: HEARTBEAT_COLUMNS,
                     sort_column: "timestamp",
                     filters: vec![("node_id", Box::new(node_id))],
                 },
@@ -934,7 +934,7 @@ impl Database {
                 conn,
                 KeysetListing {
                     table: "config_history",
-                    columns: "id, node_id, config_key, config_value, version_timestamp, operation, created_at",
+                    columns: CONFIG_HISTORY_COLUMNS,
                     sort_column: "created_at",
                     filters,
                 },
@@ -1197,6 +1197,83 @@ impl Database {
     }
 }
 
+/// The columns one diagnostic history page is read through, with the
+/// equality filters the request narrowed it by.
+///
+/// Separate from [`KeysetListing`] because the plan evidence in
+/// `catalog::pagination_plans` explains the statement without any values to
+/// bind to it: the shape is what decides the query plan, and the values
+/// cannot change it.
+pub(crate) struct KeysetPageShape<'a> {
+    pub(crate) table: &'a str,
+    pub(crate) columns: &'a str,
+    pub(crate) sort_column: &'a str,
+    pub(crate) filter_columns: &'a [&'a str],
+}
+
+fn keyset_where_clause(clauses: &[String]) -> String {
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    }
+}
+
+/// The exact count of the filtered rows, which may legitimately scan the
+/// scope: it is the page's `total`, not the page.
+fn keyset_page_count_sql(table: &str, filter_columns: &[&str]) -> String {
+    let clauses: Vec<String> = filter_columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| format!("{column} = ?{}", index + 1))
+        .collect();
+    format!(
+        "SELECT COUNT(*) FROM {table}{}",
+        keyset_where_clause(&clauses)
+    )
+}
+
+/// The items statement of a diagnostic history page.
+///
+/// `resumed` says whether the request carried a cursor, and it decides
+/// whether the cursor predicate is written at all rather than switched off
+/// by a bound `NULL`. SQLite compiles one plan per statement text and
+/// cannot turn `(?n IS NULL OR sort < ?n OR ...)` into an index range
+/// constraint, so a statement carrying a disabled cursor guard walks every
+/// row of the scope that precedes the cursor - the deeper the page, the
+/// longer it takes. Written only when there is a cursor to resume from, the
+/// same predicate is what the index seeks to and every page costs the same.
+/// `catalog::pagination::KeysetResume` builds the product lists' statements
+/// on the same rule.
+pub(crate) fn keyset_page_sql(shape: KeysetPageShape<'_>, resumed: bool) -> String {
+    let KeysetPageShape {
+        table,
+        columns,
+        sort_column,
+        filter_columns,
+    } = shape;
+    let mut clauses: Vec<String> = filter_columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| format!("{column} = ?{}", index + 1))
+        .collect();
+    let mut limit_index = filter_columns.len() + 1;
+    if resumed {
+        let text_index = limit_index;
+        let id_index = limit_index + 1;
+        limit_index += 2;
+        clauses.push(format!(
+            "({sort_column} < ?{text_index} \
+              OR ({sort_column} = ?{text_index} AND id < ?{id_index}))"
+        ));
+    }
+    format!(
+        "SELECT {columns} FROM {table}{} \
+         ORDER BY {sort_column} DESC, id DESC LIMIT ?{limit_index}",
+        keyset_where_clause(&clauses)
+    )
+}
+
 /// Read one keyset page of a diagnostic history.
 ///
 /// `SELECT columns FROM table WHERE filters [AND after] ORDER BY sort DESC,
@@ -1223,47 +1300,32 @@ where
         })?;
 
     let transaction = conn.unchecked_transaction()?;
-    let mut clauses: Vec<String> = Vec::new();
     let mut binds: Vec<Box<dyn ToSql>> = Vec::new();
+    let mut filter_columns: Vec<&'static str> = Vec::new();
     for (column, value) in listing.filters {
         binds.push(value);
-        clauses.push(format!("{column} = ?{}", binds.len()));
+        filter_columns.push(column);
     }
-    let where_clause = |clauses: &[String]| {
-        if clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", clauses.join(" AND "))
-        }
-    };
     let total: i64 = transaction.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM {}{}",
-            listing.table,
-            where_clause(&clauses)
-        ),
+        &keyset_page_count_sql(listing.table, &filter_columns),
         params_from_iter(binds.iter().map(|bind| bind.as_ref())),
         |row| row.get(0),
     )?;
 
+    let resumed = after.is_some();
     if let Some(after) = after {
         binds.push(Box::new(after.sort_text));
-        let text_index = binds.len();
         binds.push(Box::new(after.id));
-        let id_index = binds.len();
-        clauses.push(format!(
-            "({sort} < ?{text_index} OR ({sort} = ?{text_index} AND id < ?{id_index}))",
-            sort = listing.sort_column
-        ));
     }
     binds.push(Box::new(fetch));
-    let limit_index = binds.len();
-    let sql = format!(
-        "SELECT {} FROM {}{} ORDER BY {sort} DESC, id DESC LIMIT ?{limit_index}",
-        listing.columns,
-        listing.table,
-        where_clause(&clauses),
-        sort = listing.sort_column
+    let sql = keyset_page_sql(
+        KeysetPageShape {
+            table: listing.table,
+            columns: listing.columns,
+            sort_column: listing.sort_column,
+            filter_columns: &filter_columns,
+        },
+        resumed,
     );
     let mut stmt = transaction.prepare(&sql)?;
     let mut items = stmt
@@ -1287,8 +1349,12 @@ where
     })
 }
 
-const EVENT_COLUMNS: &str = "id, event_type, node_id, severity, message, metadata, timestamp";
-const COMMAND_COLUMNS: &str = "id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message";
+pub(crate) const EVENT_COLUMNS: &str =
+    "id, event_type, node_id, severity, message, metadata, timestamp";
+pub(crate) const COMMAND_COLUMNS: &str = "id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message";
+pub(crate) const HEARTBEAT_COLUMNS: &str = "id, node_id, instance_id, timestamp, latency_ms";
+pub(crate) const CONFIG_HISTORY_COLUMNS: &str =
+    "id, node_id, config_key, config_value, version_timestamp, operation, created_at";
 
 /// Free functions, not methods: the row mappers run inside closures that are
 /// moved to a blocking thread, so anything they capture would have to be

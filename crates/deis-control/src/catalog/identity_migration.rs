@@ -235,17 +235,24 @@ impl CatalogStore {
         &self,
         app_id: &str,
     ) -> CatalogResult<IdentityMigrationPlan> {
-        self.plan_identity_migration_inner(app_id, None).await
+        self.plan_identity_migration_inner(app_id, None, None).await
     }
 
     /// Accept a public migration request with its durable operation context.
     /// The raw idempotency key has already been reduced to a digest.
+    ///
+    /// `expected_application_revision` is the caller's `If-Match`, when it
+    /// sent one: the application revision the inventory it is about to
+    /// freeze was read at. It is compared inside the same transaction that
+    /// reads the revision, so a change that lands between the caller's read
+    /// and this call is refused rather than silently snapshotted.
     pub async fn plan_identity_migration_with_operation(
         &self,
         app_id: &str,
         context: OperationRequestContext,
+        expected_application_revision: Option<u64>,
     ) -> CatalogResult<IdentityMigrationPlan> {
-        self.plan_identity_migration_inner(app_id, Some(context))
+        self.plan_identity_migration_inner(app_id, Some(context), expected_application_revision)
             .await
     }
 
@@ -253,12 +260,21 @@ impl CatalogStore {
         &self,
         app_id: &str,
         context: Option<OperationRequestContext>,
+        expected_application_revision: Option<u64>,
     ) -> CatalogResult<IdentityMigrationPlan> {
         let app_id = app_id.to_string();
         self.database()
             .with_connection(move |conn| {
                 let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
                 let (canonical_application_id, application_revision) = load_application(&tx, &app_id)?;
+                if let Some(expected) = expected_application_revision
+                    && i64::try_from(expected) != Ok(application_revision)
+                {
+                    return Err(CatalogError::revision_conflict(format!(
+                        "app {app_id} is at revision {application_revision}, not the revision {expected} the If-Match names; \
+                         re-read the application and start the migration against what it says now"
+                    )));
+                }
                 let context = context.map(|context| {
                     context.for_target("application", canonical_application_id)
                 });

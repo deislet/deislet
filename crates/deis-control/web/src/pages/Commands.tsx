@@ -3,6 +3,7 @@ import { useSessions, useCommands } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { RefusalNotice } from '@/components/RefusalNotice'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -191,13 +192,7 @@ export function Commands() {
         </div>
       </div>
 
-      {error && (
-        <Card className="border-destructive">
-          <CardContent className="pt-6">
-            <p className="text-destructive">{error}</p>
-          </CardContent>
-        </Card>
-      )}
+      {error && <RefusalNotice refusal={error} onRetry={refetch} />}
 
       {loading && commands.length === 0 ? (
         <div className="flex items-center justify-center h-64">

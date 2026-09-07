@@ -374,7 +374,39 @@ impl PendingIdempotencyRecord {
                 T::KIND
             ))
         })?;
+        // The row's CHECK requires `completed_at >= created_at`, and the
+        // two timestamps are read from the wall clock at two different
+        // moments: `begin` stamps `created_at` when the request arrives and
+        // this runs when the mutation is about to commit. An NTP step
+        // backwards in between would make the raw reading violate the
+        // CHECK, and that error would abort the mutation's own transaction -
+        // the client would lose an otherwise successful write to a 5xx.
+        // Clamping to the record's own `created_at` keeps the row monotonic
+        // the same way the lifecycle mutations clamp `updated_at`.
         let now = now_secs();
+        let created_at: Option<i64> = connection
+            .query_row(
+                "SELECT created_at FROM api_idempotency_records
+                  WHERE record_id = ?1 AND state = 'pending'",
+                [record_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let completed_at = match created_at {
+            Some(created_at) if created_at > now => {
+                warn!(
+                    route_id,
+                    %record_id,
+                    created_at,
+                    now,
+                    "The wall clock moved backwards while an idempotent mutation ran; the record is completed at its own creation time so the write is not lost"
+                );
+                created_at
+            }
+            // No pending row left: the UPDATE below matches nothing and
+            // takes the reaped-orphan path.
+            Some(_) | None => now,
+        };
         let changed = connection.execute(
             "UPDATE api_idempotency_records
                 SET state = 'completed', response_status = ?2,
@@ -387,8 +419,8 @@ impl PendingIdempotencyRecord {
                 T::KIND,
                 resource_id.to_string(),
                 resource_revision,
-                now,
-                now.saturating_add(COMPLETED_RECORD_TTL_SECONDS),
+                completed_at,
+                completed_at.saturating_add(COMPLETED_RECORD_TTL_SECONDS),
             ],
         )?;
         if changed != 1 {
@@ -945,6 +977,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scheme, DIGEST_SCHEME);
+    }
+
+    /// A clock that steps backwards between `begin` and the mutation's
+    /// commit must not cost the client the write it already made. The row
+    /// carries `CHECK(completed_at >= created_at)`, so completing it at the
+    /// raw reading would raise a constraint error inside the mutation's own
+    /// transaction and roll the resource back with it.
+    #[tokio::test]
+    async fn a_backwards_clock_step_completes_the_record_instead_of_aborting() {
+        let store = store().await;
+        let request =
+            keyed_request("provider_installation.register", "key-0009", b"{\"a\":1}").unwrap();
+        let guard = expect_fresh(&store, "account:alice", &request).await;
+        let record_id = guard.record_id();
+
+        // Rewrite the pending row as a clock five seconds ahead of this one
+        // would have written it. The row's own trigger refuses any update
+        // that is not the completion, so the test replaces it through a
+        // temporary copy rather than updating it in place.
+        store
+            .db
+            .with_connection(move |connection| {
+                let id = record_id.to_string();
+                connection.execute(
+                    "CREATE TEMP TABLE stepped_clock AS
+                       SELECT * FROM api_idempotency_records WHERE record_id = ?1",
+                    [&id],
+                )?;
+                connection.execute(
+                    "UPDATE stepped_clock SET created_at = created_at + 5, expires_at = expires_at + 5",
+                    [],
+                )?;
+                connection.execute(
+                    "DELETE FROM api_idempotency_records WHERE record_id = ?1",
+                    [&id],
+                )?;
+                connection.execute(
+                    "INSERT INTO api_idempotency_records SELECT * FROM stepped_clock",
+                    [],
+                )?;
+                connection.execute("DROP TABLE stepped_clock", [])?;
+                Ok::<_, CatalogError>(())
+            })
+            .await
+            .unwrap();
+
+        let resource = sample_resource(1);
+        complete_in_transaction(&store, &guard, 201, &resource, true).await;
+        assert_eq!(
+            record_state(&store, record_id).await.as_deref(),
+            Some("completed")
+        );
+
+        // Completed at its own creation time, and the replay window still
+        // starts there rather than in the past.
+        let (created_at, completed_at, expires_at) = store
+            .db
+            .with_connection(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT created_at, completed_at, expires_at
+                           FROM api_idempotency_records WHERE record_id = ?1",
+                        [record_id.to_string()],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .map_err(CatalogError::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(completed_at, created_at);
+        assert_eq!(expires_at, created_at + COMPLETED_RECORD_TTL_SECONDS);
+
+        match store.begin(scope("account:alice"), &request).await.unwrap() {
+            IdempotencyOutcome::Replay(stored) => {
+                assert_eq!(stored.resource_id, resource.installation_id);
+                assert_eq!(stored.response_status, 201);
+            }
+            IdempotencyOutcome::Fresh(_) => panic!("completed record was not replayed"),
+        }
     }
 
     #[tokio::test]

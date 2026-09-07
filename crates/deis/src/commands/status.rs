@@ -12,7 +12,7 @@ use anyhow::Result;
 use colored::Colorize;
 
 use crate::commands::{Session, escape_control, escaped};
-use crate::platform::EnvironmentView;
+use crate::platform::{EnvironmentView, FleetView};
 use crate::platform::{Node, NodeAppStatus};
 use crate::render::{Output, Table, age, short_digest, timestamp};
 use crate::settings::Overrides;
@@ -52,10 +52,17 @@ pub async fn execute(app: Option<String>, output: Output) -> Result<()> {
         deployed.push((environment.name.clone(), current));
     }
 
+    // The fleet is a platform-operator view; an application credential is
+    // refused it. That is a section of the report that says so, not the end
+    // of a command whose subject is the application.
+    let fleet = session.control.list_nodes().await?;
+    let fleet_visible = matches!(fleet, FleetView::Nodes(_));
     let mut reports = Vec::new();
-    for node in session.control.list_nodes().await? {
-        let apps = session.control.node_status(&node.id).await?;
-        reports.push(NodeReport { node, apps });
+    if let FleetView::Nodes(nodes) = fleet {
+        for node in nodes {
+            let apps = session.control.node_status(&node.id).await?;
+            reports.push(NodeReport { node, apps });
+        }
     }
 
     if output.json {
@@ -87,6 +94,11 @@ pub async fn execute(app: Option<String>, output: Output) -> Result<()> {
                     }),
                 })
                 .collect::<Vec<_>>(),
+            // Said as its own field for the same reason the environment
+            // rows are: "no nodes" and "I may not look" are different
+            // answers and a script must not act on the first when it got
+            // the second.
+            "fleet_visible": fleet_visible,
             "nodes": reports
                 .iter()
                 .map(|report| serde_json::json!({
@@ -117,7 +129,7 @@ pub async fn execute(app: Option<String>, output: Output) -> Result<()> {
     );
 
     print_environments(&deployed);
-    print_nodes(&app, &reports);
+    print_nodes(&app, &reports, fleet_visible);
     Ok(())
 }
 
@@ -186,8 +198,17 @@ fn print_environments(deployed: &[(String, EnvironmentView)]) {
     table.print();
 }
 
-fn print_nodes(app: &str, reports: &[NodeReport]) {
+fn print_nodes(app: &str, reports: &[NodeReport], fleet_visible: bool) {
     println!("\n{}", "Nodes".bold());
+    if !fleet_visible {
+        println!(
+            "  {}",
+            "the runtime fleet is a platform-operator view and this credential does not hold it; \
+             what runs where is above"
+                .yellow()
+        );
+        return;
+    }
     if reports.is_empty() {
         println!(
             "  {}",

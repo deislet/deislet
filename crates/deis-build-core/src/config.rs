@@ -719,4 +719,46 @@ mod tests {
             Some("EC_ENV_NAMESPACE_COLLISION")
         );
     }
+
+    /// The names the platform publishes on `context.env` itself are refused
+    /// where a project writes them, in both spellings a project can write
+    /// them in: the legacy `variables` shorthand and an explicit declaration.
+    ///
+    /// A build that accepted one would mint a *required* declaration for it,
+    /// so every layer after this - the manifest, the upload, the deployment -
+    /// would demand a value the application could never read back: the
+    /// platform installs `env.ASSETS` and the `DEIS_` wiring after the
+    /// declared values are copied, and its property wins. Refusing at the
+    /// build is the first moment a person can be told, and the only one where
+    /// nothing has been deployed yet.
+    #[test]
+    fn a_project_cannot_declare_a_name_the_platform_publishes() {
+        for name in ["ASSETS", "DEIS_STORE_ENDPOINT"] {
+            let mut shorthand = minimal();
+            shorthand["environment"] = serde_json::json!({
+                "variables": {name: "an-application-cannot-take-this-name"}
+            });
+            let error = resolve_environment_declarations(&parse(shorthand), STANDARD)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("EC_ENV_NAMESPACE_COLLISION"),
+                "variables.{name} was accepted: {error}"
+            );
+
+            let mut explicit = minimal();
+            explicit["environment"] = serde_json::json!({
+                "declarations": [
+                    {"name": name, "kind": "config", "valueType": "string", "required": true}
+                ]
+            });
+            let error = resolve_environment_declarations(&parse(explicit), STANDARD)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("EC_ENV_NAMESPACE_COLLISION"),
+                "an explicit declaration of {name} was accepted: {error}"
+            );
+        }
+    }
 }

@@ -32,8 +32,9 @@ pub struct DriverOperationClaim {
     /// The immutable operation originally requested by the product workflow.
     pub original_operation: crate::DriverOperation,
     /// The current execution request. After an expired/unknown attempt the
-    /// store changes only this operation to `reconcile`; identity and desired
-    /// state remain exact.
+    /// store changes this operation to `reconcile` and names the operation
+    /// being reconciled in `reconciles`; identity and desired state remain
+    /// exact.
     pub request: DriverRequest,
 }
 
@@ -221,6 +222,14 @@ where
             || claim.request.operation_id != operation_id
             || (claim.request.operation != claim.original_operation
                 && claim.request.operation != crate::DriverOperation::Reconcile)
+            // A reconcile substituted for another operation must say which
+            // one, or the driver process - which sees the request and nothing
+            // else - answers about the wrong operation and the receipt is
+            // taken as proof of work that was never inspected.
+            || (claim.request.operation == crate::DriverOperation::Reconcile
+                && claim.request.operation != claim.original_operation
+                && claim.request.reconciles.as_ref().map(|reconciles| reconciles.operation)
+                    != Some(claim.original_operation))
         {
             let error = DriverContractError::new(
                 "durable store returned a mismatched or non-reconciliation claim",
@@ -568,6 +577,7 @@ mod tests {
             artifact: None,
             plan: ProviderNeutralPlan::default(),
             rollback_target: None,
+            reconciles: None,
         }
     }
 

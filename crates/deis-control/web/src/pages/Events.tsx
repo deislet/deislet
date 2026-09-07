@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { RefreshCw } from 'lucide-react'
+import { RefusalNotice } from '@/components/RefusalNotice'
 
 function getSeverityBadgeVariant(severity: string) {
   switch (severity) {
@@ -35,13 +36,7 @@ export function Events() {
         </Button>
       </div>
 
-      {error && (
-        <Card className="border-destructive">
-          <CardContent className="pt-6">
-            <p className="text-destructive">{error}</p>
-          </CardContent>
-        </Card>
-      )}
+      {error && <RefusalNotice refusal={error} onRetry={refetch} />}
 
       <Card>
         <CardHeader>

@@ -119,7 +119,7 @@ use deis_wire::CanonicalId;
 use tracing::{info, warn};
 
 use crate::api::error::{ApiError, ErrorDetail};
-use crate::api::versioning::{ApiSurface, REQUEST_ID_HEADER, RequestId, inbound_canonical_id};
+use crate::api::versioning::{ApiSurface, REQUEST_ID_HEADER, RequestContext};
 use crate::audit::{AuditRecord, AuditStore, Outcome};
 use crate::identity::store::Resolution;
 use crate::identity::{Demand, IdentityStore, Principal, Selector, Verb};
@@ -1271,12 +1271,17 @@ fn classify_canonical(
         .changes_state()
         .operator(),
 
-        // The bare fleet list is which machines exist and whether they are
-        // healthy. Any credential with any scope may see it, because
-        // `deis status` prints it and a credential scoped to one environment
-        // still deploys onto those machines.
+        // The fleet list is not "which machines exist": every row carries a
+        // node's management address, its key status and its key
+        // fingerprint. `docs/adr/016-api-cli-web-console.md` puts fleet
+        // scope with the platform operator - an application user does not
+        // get node shells, global configuration or another tenant's
+        // telemetry by being able to deploy - so this demands the same
+        // `read:*/*` as every other diagnostic under `/api/platform`.
+        // `deis status` prints the fleet when the credential holds it and
+        // says it cannot see it when it does not, rather than failing.
         ["api", "runtime"] => {
-            Requirement::new("node.list", Verb::Read, Resource::Any, Resource::Any).operator()
+            Requirement::new("node.list", Verb::Read, Resource::Every, Resource::Every).operator()
         }
         // What one node is running names every application on it, which is
         // another tenant's business.
@@ -1368,7 +1373,8 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
     // this is the caller's own id when it sent a usable one and a fresh one
     // otherwise; an accepted call is re-read from the answer below, because
     // the mount it went on to settles its own.
-    let request_id = gate_request_id(&request);
+    let context = gate_request_context(&request);
+    let request_id = context.request_id;
     let surface = ApiSurface::of_path(&path);
     // The address this request was actually sent to, as the sender wrote it:
     // `:authority` over HTTP/2 and absolute-form URIs, the `Host` header over
@@ -1427,7 +1433,7 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
                 )
                 .await;
             return ApiError::unauthenticated(refusal.caller_detail)
-                .into_response_for(surface, Some(request_id));
+                .into_response_for(surface, context);
         }
     };
 
@@ -1487,7 +1493,7 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
             )
             .await;
         return ApiError::insufficient_scope(&demand.required_scope(), &detail)
-            .into_response_for(surface, Some(request_id));
+            .into_response_for(surface, context);
     }
 
     // Handlers that want to know who is calling read it from here. Inserted
@@ -1821,7 +1827,7 @@ async fn peek_body(request: Request) -> Result<(Request, Option<serde_json::Valu
             ))
             .into_response_for(
                 ApiSurface::of_path(parts.uri.path()),
-                RequestId::of(&parts.extensions),
+                RequestContext::resolve(&parts.extensions, &parts.headers),
             ));
         }
     };
@@ -1922,16 +1928,20 @@ fn describe_route_address(body: Option<&serde_json::Value>) -> String {
     format!("host={host} path_prefix={path_prefix} priority={priority}")
 }
 
-/// The request id a call can be found by before it is answered: the one the
+/// The ids a call can be found by before it is answered: the ones the
 /// surface's request context settled when the gate runs inside a mount,
-/// otherwise the inbound `x-request-id` when it is exactly one canonical id
-/// (the same rule the surfaces apply), otherwise one minted here. A refusal
-/// is audited and answered under this id, so what the caller quotes is what
-/// the log holds; anything a client sent that is not an id is never either.
-fn gate_request_id(request: &Request) -> RequestId {
-    RequestId::of(request.extensions())
-        .or_else(|| inbound_canonical_id(request.headers(), REQUEST_ID_HEADER).map(RequestId))
-        .unwrap_or_else(|| RequestId(CanonicalId::new_v7()))
+/// otherwise the inbound `x-request-id` and `x-correlation-id` when each is
+/// exactly one canonical id (the same rule the surfaces apply), otherwise
+/// one minted here. A refusal is audited and answered under these ids, so
+/// what the caller quotes is what the log holds; anything a client sent
+/// that is not an id is never either.
+///
+/// The gate is layered outside all three mounts, so this is the only place
+/// a refused call's ids come from: a 401 or a 403 that did not echo the
+/// correlation id would leave the caller unable to tie the refusal to the
+/// calls it sent around it.
+fn gate_request_context(request: &Request) -> RequestContext {
+    RequestContext::resolve(request.extensions(), request.headers())
 }
 
 /// The request id an answer carries, which is the one the caller holds.
@@ -2566,6 +2576,102 @@ mod tests {
         "node.app.unload",
     ];
 
+    /// The table above is written by hand and can only be as complete as
+    /// whoever last edited it. What says it is not short: the OpenAPI
+    /// document, which `openapi::tests::every_described_operation_is_mounted_under_its_prefix`
+    /// holds to what the routers actually serve. Every operation in it must
+    /// classify to something other than the closing arm - a route that fell
+    /// through would answer to `admin:*/*` under one prefix and to its own
+    /// narrower demand under another - and must classify identically under
+    /// its versioned and its legacy spelling.
+    #[test]
+    fn every_documented_operation_is_classified_the_same_under_both_prefixes() {
+        let document: serde_json::Value =
+            serde_json::from_str(&crate::api::openapi::render()).unwrap();
+        let unclassified = requirement("GET", "/api/nothing-of-the-kind").action;
+        let mut seen = 0;
+        for (path, item) in document["paths"].as_object().unwrap() {
+            for method in item.as_object().unwrap().keys() {
+                let method = method.to_ascii_uppercase();
+                // Every path parameter takes a canonical id: no arm of the
+                // table reads a segment's value, and an id is the spelling
+                // the routes that do parse one accept.
+                let filled = fill_path_parameters(path);
+                let versioned = requirement(&method, &filled);
+                assert_ne!(
+                    versioned.action, unclassified,
+                    "{method} {filled} is described in the OpenAPI document and the route table \
+                     does not know it, so it answers to the closing arm"
+                );
+                let legacy =
+                    filled
+                        .replacen("/api/v1/", "/api/", 1)
+                        .replacen("/api/platform/", "/api/", 1);
+                assert_eq!(
+                    requirement(&method, &legacy),
+                    versioned,
+                    "{method} {filled} and its legacy spelling {legacy} are classified differently"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen > 100, "only {seen} documented operations were checked");
+    }
+
+    /// `/api/v1/apps/{app_name}/versions/{version_id}` with every `{...}`
+    /// replaced by a canonical id, which every route that parses a segment
+    /// accepts and no route in the table reads.
+    fn fill_path_parameters(path: &str) -> String {
+        const VALUE: &str = "01990f44-1000-7000-8000-000000000040";
+        let mut out = String::with_capacity(path.len());
+        let mut rest = path;
+        while let Some(start) = rest.find('{') {
+            let end = rest
+                .find('}')
+                .expect("a path template closes its parameter");
+            out.push_str(&rest[..start]);
+            out.push_str(VALUE);
+            rest = &rest[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// A diagnostic under `/api/platform` is fleet scope, and fleet scope is
+    /// the platform operator's: `docs/adr/016-api-cli-web-console.md` says an
+    /// application user does not get node shells, global configuration or
+    /// another tenant's telemetry by being able to deploy. So every operator
+    /// read demands the whole platform, the bare node list included - its
+    /// rows carry each node's management address, key status and key
+    /// fingerprint, which is exactly the fleet detail the ADR withholds.
+    #[test]
+    fn every_platform_diagnostic_read_demands_the_whole_platform() {
+        let mut checked = 0;
+        for (method, path, action, _) in mounted_routes() {
+            let requirement = requirement(method, path);
+            if requirement.scope != RequirementScope::Operator || requirement.verb != Verb::Read {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                (&requirement.app, &requirement.environment),
+                (&Resource::Every, &Resource::Every),
+                "{action} ({method} {path}) is a platform diagnostic that a narrower scope reaches"
+            );
+            let demand = Demand {
+                verb: requirement.verb,
+                app: requirement.app.selector(),
+                environment: requirement.environment.selector(),
+            };
+            let narrow = crate::identity::Scope::parse("read:demo/preview").unwrap();
+            assert!(
+                !narrow.grants(&demand),
+                "{action} is readable by a credential scoped to one environment"
+            );
+        }
+        assert!(checked >= 6, "the platform reads are not being reached");
+    }
+
     /// The prefix a legacy route is served under once it has moved.
     fn successor_prefix(requirement: &Requirement) -> &'static str {
         match requirement.scope {
@@ -2890,7 +2996,62 @@ mod tests {
                 "/api/providers/targets/01990f44-1000-7000-8000-000000000040/enable",
                 AdministratorsAlready,
             ),
+            // No body: the application is in the path and the demand is
+            // `admin` over it and every environment of it.
+            (
+                "POST",
+                "/api/apps/demo/identity-migration",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            // The three that settle work already recorded. None of them
+            // takes a body at all: `api::operations::cancel_provider_workflow`
+            // and `api::catalog::providers::rollback_provider_deployment`
+            // have no `Json` extractor, and the generic cancel reads its
+            // demand from the operation record rather than from anything the
+            // caller wrote.
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-deployments/01990f44-1000-7000-8000-000000000040/cancel",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-deployments/01990f44-1000-7000-8000-000000000040/rollback",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            (
+                "POST",
+                "/api/operations/01990f44-1000-7000-8000-000000000040/cancel",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
         ];
+
+        // The table above is written by hand, and a line that is simply
+        // never added is exactly the kind of omission it exists to catch.
+        // So it also has to cover every write the route table knows: an
+        // action recorded on every outcome is a state change, and a state
+        // change whose body reach nobody wrote down here is the case this
+        // test was written for.
+        let covered: std::collections::BTreeSet<&'static str> = routes
+            .iter()
+            .map(|(method, path, _)| requirement(method, path).action)
+            .collect();
+        for (method, path, action, _) in mounted_routes() {
+            let mounted = requirement(method, path);
+            // A GET carries no body, so it has no reach past its URL to
+            // write down - the credential-issuing reads are recorded on
+            // every outcome for a different reason, and
+            // `state_changes_and_credential_issues_are_always_recorded` is
+            // what holds them to it.
+            if method == "GET" || mounted.audit != AuditWhen::Always {
+                continue;
+            }
+            assert!(
+                covered.contains(action),
+                "{method} {path} changes state and no line here says what its body may name \
+                 outside its URL; add one"
+            );
+        }
 
         for (method, path, reach) in routes {
             let requirement = requirement(method, path);
@@ -3221,7 +3382,6 @@ mod tests {
                 "/api/apps/myapp/environments/preview/provider-target-grants",
             ),
             ("GET", "/api/apps/myapp/versions"),
-            ("GET", "/api/runtime"),
         ];
         for (method, path) in allowed {
             let requirement = requirement(method, path);
@@ -3241,6 +3401,10 @@ mod tests {
                 "POST",
                 "/api/apps/myapp/environments/production/deployments",
             ),
+            // Fleet scope is the platform operator's, ADR-016 section
+            // "Platform / Fleet scope": the rows name node addresses and
+            // key fingerprints.
+            ("GET", "/api/runtime"),
             ("GET", "/api/apps/myapp/environments/production/secrets"),
             ("PUT", "/api/apps/myapp/environments/preview/secrets/TOKEN"),
             ("GET", "/api/apps/myapp/environments/preview/storage-token"),

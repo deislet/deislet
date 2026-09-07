@@ -9,14 +9,17 @@
 
 use chrono::{DateTime, Utc};
 use deis_wire::CanonicalId;
-use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, params, params_from_iter};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use serde::Serialize;
 use utoipa::ToSchema;
 
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
 use super::operation::{actor_id, default_organization_id};
-use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
+use super::pagination::{
+    CatalogPage, KeysetDirection, KeysetResume, PagePosition, finish_page, sqlite_fetch_limit,
+};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
 
@@ -113,25 +116,36 @@ pub struct ProviderTargetGrantHistoryFilter {
 /// (`created_at`, `grant_id`) and the limit. `pagination_plans` explains all
 /// four against the real schema.
 pub(crate) mod history_page_sql {
-    pub(crate) const UNFILTERED: &str = "SELECT grant_id FROM provider_target_grants
-                      WHERE (?1 IS NULL OR created_at < ?1
-                             OR (created_at = ?1 AND grant_id < ?2))
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?3";
-    pub(crate) const BY_STATUS: &str = "SELECT grant_id FROM provider_target_grants
-                      WHERE status = ?1
-                        AND (?2 IS NULL OR created_at < ?2
-                             OR (created_at = ?2 AND grant_id < ?3))
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?4";
-    pub(crate) const BY_TARGET: &str = "SELECT grant_id FROM provider_target_grants
-                      WHERE provider_target_id = ?1
-                        AND (?2 IS NULL OR created_at < ?2
-                             OR (created_at = ?2 AND grant_id < ?3))
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?4";
-    pub(crate) const BY_TARGET_AND_STATUS: &str = "SELECT grant_id FROM provider_target_grants
-                      WHERE provider_target_id = ?1 AND status = ?2
-                        AND (?3 IS NULL OR created_at < ?3
-                             OR (created_at = ?3 AND grant_id < ?4))
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?5";
+    use super::KeysetResume;
+
+    fn page(filter: &str, resume: &KeysetResume) -> String {
+        let scope = if filter.is_empty() {
+            resume.where_clause()
+        } else {
+            format!(" WHERE {filter}{}", resume.and_clause())
+        };
+        format!(
+            "SELECT grant_id FROM provider_target_grants{scope}
+              ORDER BY created_at DESC, grant_id DESC LIMIT ?{limit}",
+            limit = resume.limit_index(),
+        )
+    }
+
+    pub(crate) fn unfiltered(resume: &KeysetResume) -> String {
+        page("", resume)
+    }
+
+    pub(crate) fn by_status(resume: &KeysetResume) -> String {
+        page("status = ?1", resume)
+    }
+
+    pub(crate) fn by_target(resume: &KeysetResume) -> String {
+        page("provider_target_id = ?1", resume)
+    }
+
+    pub(crate) fn by_target_and_status(resume: &KeysetResume) -> String {
+        page("provider_target_id = ?1 AND status = ?2", resume)
+    }
 }
 
 /// The per-environment grant list's keyset statements, one per status
@@ -147,23 +161,40 @@ pub(crate) mod history_page_sql {
 /// when filtered, then the cursor (`created_at`, `grant_id`) and the limit.
 /// `pagination_plans` explains both against the real schema.
 pub(crate) mod environment_page_sql {
-    pub(crate) const ALL: &str = "SELECT grant_id FROM provider_target_grants
-                      WHERE application_id = ?1 AND environment_id = ?2
-                        AND (?3 IS NULL OR created_at < ?3
-                             OR (created_at = ?3 AND grant_id < ?4))
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?5";
-    pub(crate) const BY_STATUS: &str = "SELECT grant_id FROM provider_target_grants
-                      WHERE application_id = ?1 AND environment_id = ?2 AND status = ?3
-                        AND (?4 IS NULL OR created_at < ?4
-                             OR (created_at = ?4 AND grant_id < ?5))
-                      ORDER BY created_at DESC, grant_id DESC LIMIT ?6";
+    use super::KeysetResume;
+
+    pub(crate) fn all(resume: &KeysetResume) -> String {
+        super::history_page_sql_for("application_id = ?1 AND environment_id = ?2", resume)
+    }
+
+    pub(crate) fn by_status(resume: &KeysetResume) -> String {
+        super::history_page_sql_for(
+            "application_id = ?1 AND environment_id = ?2 AND status = ?3",
+            resume,
+        )
+    }
+}
+
+/// The grant page statement for one filter shape: the filters as
+/// equalities the planner can seek, then the cursor predicate only when
+/// the request resumes from one.
+fn history_page_sql_for(filter: &str, resume: &KeysetResume) -> String {
+    format!(
+        "SELECT grant_id FROM provider_target_grants
+          WHERE {filter}{resume_clause}
+          ORDER BY created_at DESC, grant_id DESC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
 }
 
 /// One filter shape of a grant list: its count and page statements and the
 /// filter bindings in the order the statements name them.
 struct GrantPageShape {
     count_sql: &'static str,
-    page_sql: &'static str,
+    /// Renders this shape's page statement for the cursor the request
+    /// carries (or for a first page, which writes no cursor predicate).
+    page_sql: fn(&KeysetResume) -> String,
     bindings: Vec<String>,
 }
 
@@ -183,22 +214,17 @@ impl GrantPageShape {
             params_from_iter(self.bindings.iter()),
             |row| row.get::<_, i64>(0),
         )?;
-        let (before_created_at, before_id) = cursor
-            .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-            .unwrap_or((None, String::new()));
-        let mut bindings: Vec<Box<dyn ToSql>> = self
-            .bindings
-            .iter()
-            .map(|value| Box::new(value.clone()) as Box<dyn ToSql>)
-            .collect();
-        bindings.push(Box::new(before_created_at));
-        bindings.push(Box::new(before_id));
-        bindings.push(Box::new(fetch_limit));
-        let mut statement = transaction.prepare(self.page_sql)?;
+        let resume = KeysetResume::value_and_identity(
+            self.bindings.len() + 1,
+            KeysetDirection::Descending,
+            "created_at",
+            "grant_id",
+            cursor,
+        );
+        let bindings = resume.bindings(self.bindings.iter().cloned().map(Value::from), fetch_limit);
+        let mut statement = transaction.prepare(&(self.page_sql)(&resume))?;
         let ids = statement
-            .query_map(params_from_iter(bindings.iter()), |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(params_from_iter(bindings), |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         let grants = ids
             .into_iter()
@@ -225,14 +251,14 @@ impl ProviderTargetGrantStatusFilter {
             None => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants
                              WHERE application_id = ?1 AND environment_id = ?2",
-                page_sql: environment_page_sql::ALL,
+                page_sql: environment_page_sql::all,
                 bindings: scope,
             },
             Some(status) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants
                              WHERE application_id = ?1 AND environment_id = ?2
                                AND status = ?3",
-                page_sql: environment_page_sql::BY_STATUS,
+                page_sql: environment_page_sql::by_status,
                 bindings: scope
                     .into_iter()
                     .chain(std::iter::once(status.to_owned()))
@@ -249,24 +275,24 @@ impl ProviderTargetGrantHistoryFilter {
         match (target, status) {
             (None, None) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants",
-                page_sql: history_page_sql::UNFILTERED,
+                page_sql: history_page_sql::unfiltered,
                 bindings: Vec::new(),
             },
             (None, Some(status)) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants WHERE status = ?1",
-                page_sql: history_page_sql::BY_STATUS,
+                page_sql: history_page_sql::by_status,
                 bindings: vec![status],
             },
             (Some(target), None) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants
                              WHERE provider_target_id = ?1",
-                page_sql: history_page_sql::BY_TARGET,
+                page_sql: history_page_sql::by_target,
                 bindings: vec![target],
             },
             (Some(target), Some(status)) => GrantPageShape {
                 count_sql: "SELECT COUNT(*) FROM provider_target_grants
                              WHERE provider_target_id = ?1 AND status = ?2",
-                page_sql: history_page_sql::BY_TARGET_AND_STATUS,
+                page_sql: history_page_sql::by_target_and_status,
                 bindings: vec![target, status],
             },
         }
@@ -555,22 +581,19 @@ impl CatalogStore {
                     [grant_id.to_string()],
                     |row| row.get::<_, i64>(0),
                 )?;
-                let (after_revision, after_id) = cursor
-                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-                    .unwrap_or((None, String::new()));
-                let mut statement = transaction.prepare(
-                    "SELECT event_id, application_id, environment_id,
-                            provider_target_id, grant_revision, actor_id,
-                            event_type, occurred_at, reason
-                      FROM provider_target_grant_audit_events
-                      WHERE grant_id = ?1
-                        AND (?2 IS NULL OR grant_revision > ?2
-                             OR (grant_revision = ?2 AND event_id > ?3))
-                      ORDER BY grant_revision, event_id LIMIT ?4",
-                )?;
+                let resume = KeysetResume::value_and_identity(
+                    2,
+                    KeysetDirection::Ascending,
+                    "grant_revision",
+                    "event_id",
+                    cursor,
+                );
+                let mut statement = transaction.prepare(&grant_audit_events_page_sql(&resume))?;
                 let rows = statement
                     .query_map(
-                        params![grant_id.to_string(), after_revision, after_id, fetch_limit,],
+                        params_from_iter(
+                            resume.bindings([Value::from(grant_id.to_string())], fetch_limit),
+                        ),
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -942,6 +965,21 @@ fn validate_actor_subject(subject: &str) -> CatalogResult<()> {
         ));
     }
     Ok(())
+}
+
+/// One grant's audit trail, oldest revision first, in the two forms a
+/// keyset page has. `pagination_plans` explains both.
+pub(crate) fn grant_audit_events_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT event_id, application_id, environment_id,
+                provider_target_id, grant_revision, actor_id,
+                event_type, occurred_at, reason
+           FROM provider_target_grant_audit_events
+          WHERE grant_id = ?1{resume_clause}
+          ORDER BY grant_revision, event_id LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
 }
 
 fn parse_id(value: &str, label: &str) -> CatalogResult<CanonicalId> {

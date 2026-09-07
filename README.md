@@ -37,7 +37,7 @@ node.
 the platform: an upstream for the example app's `fetch` to reach, and a
 loopback certificate authority for the ACME checks. It deploys an application
 with `deis deploy` — the same command a person would run, not a `curl` against
-the REST API — and then runs ninety-five checks in twenty-one groups,
+the REST API — and then runs ninety-four checks in twenty groups,
 printing the evidence for each. What they prove, by group — a few rows stand for two
 consecutive checks:
 
@@ -46,17 +46,16 @@ consecutive checks:
 | `deis deploy` takes a project from source to serving | one command builds, uploads a version, moves the pointer, and the app answers |
 | `deis versions` lists what was deployed | both versions, with the one production points at marked |
 | one project compiles for all four targets | `deis build -v all` writes a deislet bundle, a Cloudflare `index.js` with its `wrangler.toml`, a Deno handler with a generated router, and an EdgeOne `edge-functions/index.js` — each the shape that host expects, not one output copied four times |
+| a handler that reaches for `WebSocketPair` is refused by the build | `deis deploy` stops at its first step with `EC_STREAM_WEBSOCKET_NONPORTABLE`, no bundle is written and no application is created — Edge Canon v1 has no portable server-side WebSocket API, so the refusal is the promise, not a 101 |
 | static asset served from the bundle | without entering an isolate |
 | `If-None-Match` answers 304 | the ETag is the asset's own sha256 |
 | a `_redirects` rule answers a static path | 301 to the rule's target, with the request's query string carried through, so a move does not drop the campaign parameter the author was counting |
-| a `_headers` block reaches only the paths it names | the strong cache from the `/css/*` block is on that file and not on `/`; the `/*` block's headers are on both |
+| a `_headers` block reaches only the paths it names | the `/css/*` block's `Cache-Control` and `Referrer-Policy` are both on that file and neither is on `/`; the file carries one block because the locked standard lowers `_headers` first-match and refuses two blocks at build |
 | a path nothing claims gets the site's own 404 | the bundle's `404.html` with status 404, while `/hello/world` still reaches the handler |
 | `env.ASSETS.fetch()` answers out of this version's bundle | byte length and digest match the file on disk; nothing leaves the node |
-| a deployment cannot shadow `env.ASSETS` | the app ships `ASSETS=...` as a variable; the node strips it and the binding is still the one with `fetch()` |
+| an application cannot take the name `env.ASSETS` | a project that declares `ASSETS` in its own environment is refused at the build with `EC_ENV_NAMESPACE_COLLISION`, no bundle and no application; on a project that was accepted, `env.ASSETS` is the platform's object with a `fetch()` |
 | a route placeholder reaches `context.params` | `/hello/:name` |
 | deis-proxy picks the application by host **and** path prefix | not by host alone, out of the routing table it polls from the control plane |
-| a WebSocket handshake through deis-proxy switches protocols | the RFC 6455 answer to a published test key, so the 101 came from the node and was relayed, not invented by the proxy |
-| a text frame and a binary frame survive that round trip | bytes that are not valid UTF-8 echoed back byte for byte |
 | a streamed response crosses deis-proxy frame by frame | five server-sent events arrive 150 ms apart, chunked, with no `Content-Length` and no `Content-Encoding` — no hop on the path collected the body before passing it on |
 | a body taken from `fetch()` is passed on without being collected | the handler answers `new Response(upstream.body)` and the segments arrive at the upstream's own pace |
 | a client that hangs up mid-stream stops the producer | the handler's `cancel()` runs and the frame counter stops moving, so nothing is left writing to a queue nobody reads |
@@ -221,8 +220,8 @@ named here by what they do rather than counted, because the count moves every
 time a check is added: `grpcurl` for the ones that ask deis-telemetry and
 deis-store directly, `openssl` for the ones that mint a capability token,
 decode the base64 a `--json` answer carries back, or digest a file, and
-`python3` for the WebSocket handshake, for the streaming checks that time each
-frame's arrival, for the two that upload a bundle by hand, and for the upstream
+`python3` for the streaming checks that time each frame's arrival, for the two
+that upload a bundle by hand, and for the upstream
 a handler's `fetch` reaches (`python3 -m http.server`). Each check reports a
 failure rather than skipping when a dependency is missing — a skipped check
 reads exactly like a passing one at a glance. The whole run takes a minute or
@@ -245,8 +244,8 @@ opens straight to the dashboard for a direct caller on its own machine,
 because that connection needs no credential and there is none to ask for. A
 reverse proxy must present a credential even when it connects over loopback.
 
-The last line of a `verify` run is a tally and a roll call: `95 passed, 0
-failed, 95 of the 95 checks this file lists`. The second half is there because
+The last line of a `verify` run is a tally and a roll call: `94 passed, 0
+failed, 94 of the 94 checks this file lists`. The second half is there because
 the first half cannot report a check that did not run - a call deleted from
 the list turns a green run into a slightly shorter green run, and nothing in
 the output says so. The number the run is held to is `VERIFY_EXPECTED_CHECKS`
@@ -282,7 +281,7 @@ construction, answer several other questions:
   everywhere, a stub certificate authority, and a `python3` origin standing
   in for the internet.
 
-Read a green run as: these ninety-five claims were each checked, once, in
+Read a green run as: these ninety-four claims were each checked, once, in
 that arrangement. It is a good deal more than a build that compiles, and it
 is not a statement about anything above.
 

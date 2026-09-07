@@ -606,6 +606,7 @@ mod tests {
             artifact: None,
             plan: ProviderNeutralPlan::default(),
             rollback_target: None,
+            reconciles: None,
         }
     }
 
@@ -685,6 +686,42 @@ mod tests {
             json["request"]["rollbackTarget"]["activationReceiptSha256"],
             target.activation_receipt_sha256.as_str()
         );
+        assert_eq!(
+            serde_json::from_value::<DriverProcessRequest>(json).unwrap(),
+            fixture
+        );
+    }
+
+    /// A `reconcile` is a takeover of another operation, and the process
+    /// protocol is the only thing the driver sees, so the request has to
+    /// carry both what is being reconciled and every fact that operation was
+    /// dispatched with.
+    #[test]
+    fn a_reconcile_request_names_what_it_took_over_and_round_trips_the_fixture() {
+        // Operations dispatched directly serialize exactly as the original v1
+        // envelope did, so drivers that reject unknown members keep parsing.
+        let plain = DriverProcessRequest::new(request(DriverOperation::Observe));
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json["request"].get("reconciles").is_none(), "{json}");
+
+        let fixture: DriverProcessRequest = serde_json::from_slice(include_bytes!(
+            "../../../contracts/v1/fixtures/valid/provider-driver-process-reconcile-request.json"
+        ))
+        .unwrap();
+        assert!(fixture.clone().validate().is_ok());
+        assert_eq!(fixture.request.operation, DriverOperation::Reconcile);
+        assert_eq!(
+            fixture
+                .request
+                .reconciles
+                .as_ref()
+                .map(|reconciles| reconciles.operation),
+            Some(DriverOperation::Rollback)
+        );
+        // Reconciling a rollback keeps the activation being restored.
+        assert!(fixture.request.rollback_target.is_some());
+        let json = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(json["request"]["reconciles"]["operation"], "rollback");
         assert_eq!(
             serde_json::from_value::<DriverProcessRequest>(json).unwrap(),
             fixture

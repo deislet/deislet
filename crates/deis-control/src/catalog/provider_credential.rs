@@ -14,14 +14,17 @@ use deis_provider_driver::{
     CredentialMaterial, DriverExecutionContext, ProviderCredentialBroker, ProviderCredentialLease,
 };
 use deis_wire::CanonicalId;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::Serialize;
 use utoipa::ToSchema;
 
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
 use super::operation::{OperationRequestContext, actor_id, default_organization_id};
-use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
+use super::pagination::{
+    CatalogPage, KeysetDirection, KeysetResume, PagePosition, finish_page, sqlite_fetch_limit,
+};
 use super::secrets::{SecretsBackend, provider_credential_revision_aad};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
@@ -239,17 +242,16 @@ impl CatalogProviderCredentialVault {
                     [],
                     |row| row.get::<_, i64>(0),
                 )?;
-                let (after_created_at, after_id) = cursor
-                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-                    .unwrap_or((None, String::new()));
-                let mut statement = transaction.prepare(
-                    "SELECT binding_id FROM provider_credential_bindings
-                      WHERE ?1 IS NULL OR created_at > ?1
-                         OR (created_at = ?1 AND binding_id > ?2)
-                      ORDER BY created_at, binding_id LIMIT ?3",
-                )?;
+                let resume = KeysetResume::value_and_identity(
+                    1,
+                    KeysetDirection::Ascending,
+                    "created_at",
+                    "binding_id",
+                    cursor,
+                );
+                let mut statement = transaction.prepare(&credential_bindings_page_sql(&resume))?;
                 let ids = statement
-                    .query_map(params![after_created_at, after_id, fetch_limit], |row| {
+                    .query_map(params_from_iter(resume.bindings([], fetch_limit)), |row| {
                         row.get::<_, String>(0)
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -465,27 +467,20 @@ impl CatalogProviderCredentialVault {
                     [binding_id.to_string()],
                     |row| row.get::<_, i64>(0),
                 )?;
-                let (after_occurred_at, after_id) = cursor
-                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-                    .unwrap_or((None, String::new()));
-                let mut statement = transaction.prepare(
-                    "SELECT event_id, binding_id, credential_revision, lease_id,
-                            operation_id, owner_id, claim_epoch, actor_id,
-                            event_type, disposition, occurred_at
-                       FROM provider_credential_audit_events
-                      WHERE binding_id = ?1
-                        AND (?2 IS NULL OR occurred_at > ?2
-                             OR (occurred_at = ?2 AND event_id > ?3))
-                      ORDER BY occurred_at, event_id LIMIT ?4",
-                )?;
+                let resume = KeysetResume::value_and_identity(
+                    2,
+                    KeysetDirection::Ascending,
+                    "occurred_at",
+                    "event_id",
+                    cursor,
+                );
+                let mut statement =
+                    transaction.prepare(&credential_audit_events_page_sql(&resume))?;
                 let rows = statement
                     .query_map(
-                        params![
-                            binding_id.to_string(),
-                            after_occurred_at,
-                            after_id,
-                            fetch_limit,
-                        ],
+                        params_from_iter(
+                            resume.bindings([Value::from(binding_id.to_string())], fetch_limit),
+                        ),
                         audit_event_from_row,
                     )?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -973,6 +968,34 @@ fn revoke_active_leases(
     Ok(leases.len())
 }
 
+/// The credential binding list's page statement, in the two forms a keyset
+/// page has: the cursor predicate is written only when the request resumes
+/// from one, so the page seeks `idx_provider_credential_bindings_page_v1`
+/// instead of walking the whole registry (see
+/// `pagination::KeysetResume`). `pagination_plans` explains both.
+pub(crate) fn credential_bindings_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT binding_id FROM provider_credential_bindings{resume_clause}
+          ORDER BY created_at, binding_id LIMIT ?{limit}",
+        resume_clause = resume.where_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+/// One binding's audit trail, oldest first, in the same two forms.
+pub(crate) fn credential_audit_events_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT event_id, binding_id, credential_revision, lease_id,
+                operation_id, owner_id, claim_epoch, actor_id,
+                event_type, disposition, occurred_at
+           FROM provider_credential_audit_events
+          WHERE binding_id = ?1{resume_clause}
+          ORDER BY occurred_at, event_id LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
 fn load_binding(
     connection: &Connection,
     binding_id: CanonicalId,
@@ -1254,6 +1277,7 @@ mod tests {
             artifact: None,
             plan: ProviderNeutralPlan::default(),
             rollback_target: None,
+            reconciles: None,
         };
         Harness {
             _directory: directory,

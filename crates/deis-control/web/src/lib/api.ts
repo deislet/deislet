@@ -21,6 +21,7 @@
  */
 
 import type { components, operations } from "@/generated/control-api";
+import { ApiError, REQUEST_ID_HEADER, RETRY_AFTER_HEADER, refusalFrom } from "@/lib/refusal";
 
 /** The document's schemas by name; `Schemas["FleetResponse"]` and so on. */
 type Schemas = components["schemas"];
@@ -54,93 +55,14 @@ export const API_V1 = "/api/v1";
 export const API_PLATFORM = "/api/platform";
 
 /**
- * The response header carrying the id the control plane logged a request
- * under. The error envelope repeats it as `requestId`; on a refusal from
- * outside the envelope (the authorization gate) the header is all there is.
+ * A refused call, and how the console tells one refusal from another. Both
+ * live in `@/lib/refusal`, which is free of `fetch` and React so that the
+ * classification the pages render can be exercised on its own; they are
+ * re-exported here because a caller that already talks to `api` should not
+ * have to know that.
  */
-const REQUEST_ID_HEADER = "x-request-id";
-
-/**
- * One field a request got wrong, as the control plane names it in the
- * envelope's `violations`.
- */
-export type Violation = Schemas["ErrorViolation"];
-
-/**
- * A refused call.
- *
- * `message` is the sentence to show a person, with the request id appended
- * when the control plane gave one - that id is what an operator searches the
- * control plane's log for. `code` is the stable kebab-case class from the
- * envelope (`not-found`, `invalid-argument`, ...), absent on a refusal that
- * arrived in the flat legacy shape or with no body at all.
- */
-export class ApiError extends Error {
-  status: number;
-  code?: string;
-  requestId?: string;
-  violations: Violation[];
-  retryable: boolean;
-
-  constructor(status: number, message: string, detail: RefusalDetail = {}) {
-    super(detail.requestId ? `${message} (request ${detail.requestId})` : message);
-    this.name = "ApiError";
-    this.status = status;
-    this.code = detail.code;
-    this.requestId = detail.requestId;
-    this.violations = detail.violations ?? [];
-    this.retryable = detail.retryable ?? false;
-  }
-}
-
-interface RefusalDetail {
-  code?: string;
-  requestId?: string;
-  violations?: Violation[];
-  retryable?: boolean;
-}
-
-/**
- * The body of a refusal on `/api/v1` and `/api/platform` -
- * `contracts/v1/control-error.schema.json`, which the document renders as
- * `ErrorBody` around `ErrorEnvelope`. Read leniently: the guard asks only
- * for the code and the message, which is what the console shows, so a
- * member the document promises but an older control plane leaves out does
- * not stop those two from being read.
- */
-type ErrorBody = Schemas["ErrorBody"];
-
-function isErrorBody(value: unknown): value is ErrorBody {
-  const error = asPlainObject(asPlainObject(value)?.error);
-  return typeof error?.code === "string" && typeof error?.message === "string";
-}
-
-/**
- * Turn a non-2xx answer into an `ApiError`, whichever shape it arrived in:
- * the versioned envelope, the flat legacy `{ "error": "<message>" }` that
- * the authorization gate still answers with, or no JSON at all.
- */
-function refusal(res: Response, text: string): ApiError {
-  const headerId = res.headers.get(REQUEST_ID_HEADER) ?? undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    parsed = undefined;
-  }
-  if (isErrorBody(parsed)) {
-    const { code, message, requestId, violations, retryable } = parsed.error;
-    return new ApiError(res.status, message, {
-      code,
-      requestId: requestId ?? headerId,
-      violations: Array.isArray(violations) ? violations : [],
-      retryable: retryable === true,
-    });
-  }
-  const flat = asPlainObject(parsed)?.error;
-  const message = typeof flat === "string" ? flat : text || res.statusText;
-  return new ApiError(res.status, message, { requestId: headerId });
-}
+export { ApiError } from "@/lib/refusal";
+export type { RefusalState, Violation } from "@/lib/refusal";
 
 /**
  * One page of the control plane's unified list envelope -
@@ -273,7 +195,15 @@ async function send<T = unknown>(url: string, options: RequestInit = {}): Promis
 
     // Any other non-2xx
     if (!res.ok) {
-      throw refusal(res, await res.text());
+      throw refusalFrom(
+        res.status,
+        res.statusText,
+        {
+          requestId: res.headers.get(REQUEST_ID_HEADER) ?? undefined,
+          retryAfter: res.headers.get(RETRY_AFTER_HEADER) ?? undefined,
+        },
+        await res.text()
+      );
     }
 
     // No content

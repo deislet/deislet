@@ -144,7 +144,9 @@ impl Reaper {
     /// Issuing a cursor already does this opportunistically, so during
     /// normal paging this pass finds nothing and costs one bounded probe of
     /// the expiry index. It exists for the other case: a table that filled
-    /// up and then went quiet. A failure is one warning and the next pass
+    /// up and then went quiet, whose backlog comes out a bounded slice at a
+    /// time so no one statement holds the shared connection for as long as
+    /// the backlog is deep. A failure is one warning and the next pass
     /// tries again; an expired row that stays is refused on resolve anyway,
     /// so nothing here changes what a client is told, only how much disk
     /// the refused rows occupy.
@@ -264,20 +266,28 @@ impl Reaper {
     /// Start the sweep loop.
     ///
     /// Stops on `shutdown`, and the returned handle is what the caller waits
-    /// on to know that it has. Cooperative like the other background loops:
+    /// on to know that it has. Returns as soon as the loop is spawned: the
+    /// first pass runs inside it, concurrently with whatever the caller
+    /// starts next. Cooperative like the other background loops:
     /// a pass writes command endings, and cutting it mid-pass would leave
     /// exactly the half-finished record this whole module exists to remove.
     pub async fn start(
         self: Arc<Self>,
         shutdown: crate::shutdown::Shutdown,
     ) -> tokio::task::JoinHandle<()> {
-        // One pass before the first tick, so that whatever is already overdue
-        // when this process starts serving is ended now rather than one
-        // interval from now.
-        self.sweep().await;
-
         let reaper = Arc::clone(&self);
         let handle = tokio::spawn(async move {
+            // One pass before the first tick, so that whatever is already
+            // overdue when this process starts serving is ended now rather
+            // than one interval from now. Inside the task rather than
+            // before it: the caller is the startup path, and the API
+            // listener is not bound until it returns. A first pass on a
+            // database that accumulated a backlog while this process was
+            // stopped would otherwise decide how long the port stays shut,
+            // and none of the work it does needs to happen before the first
+            // request rather than alongside it.
+            reaper.sweep().await;
+
             let mut ticker = interval(reaper.tick);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {

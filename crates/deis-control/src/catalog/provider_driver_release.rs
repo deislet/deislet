@@ -21,13 +21,16 @@ use deis_provider_driver::{
     VerifiedDriverReleaseTransparencyProof, VerifiedDriverTrustRootRotation,
 };
 use deis_wire::CanonicalId;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use utoipa::ToSchema;
 
 use super::model::now_secs;
-use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
+use super::pagination::{
+    CatalogPage, KeysetDirection, KeysetResume, PagePosition, finish_page, sqlite_fetch_limit,
+};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogProviderCredentialVault, CatalogResult};
 
@@ -347,19 +350,19 @@ impl ProviderDriverReleaseRegistry {
                     [host.as_str()],
                     |row| row.get::<_, i64>(0),
                 )?;
-                let (before_created_at, before_digest) = cursor
-                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-                    .unwrap_or((None, String::new()));
-                let mut statement = transaction.prepare(
-                    "SELECT release_sha256 FROM provider_driver_releases
-                      WHERE host_operating_system = ?1
-                        AND (?2 IS NULL OR created_at < ?2
-                             OR (created_at = ?2 AND release_sha256 < ?3))
-                      ORDER BY created_at DESC, release_sha256 DESC LIMIT ?4",
-                )?;
+                let resume = KeysetResume::value_and_identity(
+                    2,
+                    KeysetDirection::Descending,
+                    "created_at",
+                    "release_sha256",
+                    cursor,
+                );
+                let mut statement = transaction.prepare(&releases_page_sql(&resume))?;
                 let digests = statement
                     .query_map(
-                        params![host.as_str(), before_created_at, before_digest, fetch_limit,],
+                        params_from_iter(
+                            resume.bindings([Value::from(host.as_str().to_owned())], fetch_limit),
+                        ),
                         |row| row.get::<_, String>(0),
                     )?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -410,26 +413,23 @@ impl ProviderDriverReleaseRegistry {
                     params![release_digest.as_str(), host.as_str()],
                     |row| row.get::<_, i64>(0),
                 )?;
-                let (after_observed_at, after_id) = cursor
-                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-                    .unwrap_or((None, String::new()));
-                let mut statement = transaction.prepare(
-                    "SELECT event_id, event_type, detail, observed_at
-                       FROM provider_driver_release_audit
-                      WHERE release_sha256 = ?1 AND host_operating_system = ?2
-                        AND (?3 IS NULL OR observed_at > ?3
-                             OR (observed_at = ?3 AND event_id > ?4))
-                      ORDER BY observed_at, event_id LIMIT ?5",
-                )?;
+                let resume = KeysetResume::value_and_identity(
+                    3,
+                    KeysetDirection::Ascending,
+                    "observed_at",
+                    "event_id",
+                    cursor,
+                );
+                let mut statement = transaction.prepare(&release_audit_events_page_sql(&resume))?;
                 let events = statement
                     .query_map(
-                        params![
-                            release_digest.as_str(),
-                            host.as_str(),
-                            after_observed_at,
-                            after_id,
+                        params_from_iter(resume.bindings(
+                            [
+                                Value::from(release_digest.as_str().to_owned()),
+                                Value::from(host.as_str().to_owned()),
+                            ],
                             fetch_limit,
-                        ],
+                        )),
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -1770,6 +1770,35 @@ fn validate_loaded_documents(
         ));
     }
     Ok(())
+}
+
+/// The installed-release list for one host, newest first, and one
+/// release's audit trail, oldest first.
+///
+/// Both are written in the two forms a keyset page has: the cursor
+/// predicate appears only when the request resumes from one, which is what
+/// lets SQLite seek the page index rather than walk the host's whole
+/// registry in sort order (see `pagination::KeysetResume`).
+/// `pagination_plans` explains both forms of both.
+pub(crate) fn releases_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT release_sha256 FROM provider_driver_releases
+          WHERE host_operating_system = ?1{resume_clause}
+          ORDER BY created_at DESC, release_sha256 DESC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn release_audit_events_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT event_id, event_type, detail, observed_at
+           FROM provider_driver_release_audit
+          WHERE release_sha256 = ?1 AND host_operating_system = ?2{resume_clause}
+          ORDER BY observed_at, event_id LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
 }
 
 fn load_release_record(

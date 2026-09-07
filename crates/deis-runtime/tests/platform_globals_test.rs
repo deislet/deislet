@@ -114,6 +114,7 @@ const ATTACK_THEN_READ: &str = r#"
             "__deis_runtime_wait_until_all",
             "__deis_runtime_set_response",
             "__deis_runtime_stream_release_all",
+            "__deis_runtime_response_is_whole",
         ]) {
             try {
                 Object.defineProperty(globalThis, name, {
@@ -205,6 +206,13 @@ async fn a_platform_global_cannot_be_redefined_or_deleted() {
         "__deis_runtime_wait_until_all",
         "__deis_runtime_set_response",
         "__deis_runtime_stream_release_all",
+        // Answers whether a response leaves this node whole or chunk by chunk.
+        // The generated entry module reads it to decide whether it has to pull
+        // the body through a stream of its own to see the response end; an
+        // application's own function in its place would either reframe every
+        // ordinary answer as chunked or close an invocation's lifecycle while
+        // its body was still being produced.
+        "__deis_runtime_response_is_whole",
     ] {
         assert_eq!(
             attacked[format!("define_{name}")],

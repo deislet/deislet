@@ -269,8 +269,6 @@ pub struct DeleteInstallationQuery {
         (status = 400, response = openapi::BadRequest),
         (status = 409, response = openapi::Conflict),
         (status = 413, response = openapi::PayloadTooLarge),
-        (status = 422, response = openapi::UnprocessableEntity),
-        (status = 428, response = openapi::PreconditionRequired),
         (status = 503, response = openapi::ServiceUnavailable),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
@@ -546,7 +544,6 @@ pub async fn driver_release_audit(
         (status = 400, response = openapi::BadRequest),
         (status = 409, response = openapi::Conflict),
         (status = 413, response = openapi::PayloadTooLarge),
-        (status = 428, response = openapi::PreconditionRequired),
         (status = 503, response = openapi::ServiceUnavailable),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
@@ -850,7 +847,6 @@ pub async fn credential_audit(
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
-        (status = 428, response = openapi::PreconditionRequired),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
     )
@@ -987,8 +983,6 @@ pub async fn get_installation(
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
-        (status = 422, response = openapi::UnprocessableEntity),
-        (status = 428, response = openapi::PreconditionRequired),
         (status = 503, response = openapi::ServiceUnavailable),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
@@ -1731,7 +1725,6 @@ pub async fn provider_target_grant_history_audit(
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
-        (status = 428, response = openapi::PreconditionRequired),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
     )
@@ -1993,17 +1986,24 @@ async fn provider_target_grant_in_scope(
         .store
         .get_environment(app_name, environment_name)
         .await?;
+    // One answer for both ways this fails. A grant id that does not exist
+    // and one that belongs to another application or environment have to
+    // read identically, or a credential scoped to a single environment
+    // could ask this route about any grant id on the platform and learn
+    // from the wording alone whether it exists.
     let grant = state
         .store
         .provider_target_grant(grant_id)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("provider target grant {grant_id} not found")))?;
-    if grant.application_id != app.canonical_id || grant.environment_id != environment.canonical_id
-    {
-        return Err(ApiError::NotFound(format!(
-            "provider target grant {grant_id} not found for {app_name}/{environment_name}"
-        )));
-    }
+        .filter(|grant| {
+            grant.application_id == app.canonical_id
+                && grant.environment_id == environment.canonical_id
+        })
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "provider target grant {grant_id} not found for {app_name}/{environment_name}"
+            ))
+        })?;
     Ok(grant)
 }
 
@@ -2020,7 +2020,6 @@ async fn provider_target_grant_in_scope(
         (status = 403, response = openapi::Forbidden),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
-        (status = 428, response = openapi::PreconditionRequired),
         (status = 503, response = openapi::ServiceUnavailable),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
@@ -2144,22 +2143,23 @@ pub async fn get_provider_deployment(
         .get_environment(&app_name, &environment_name)
         .await?;
     let operation_id = parse_id(&operation_id, "provider deployment operation")?;
+    // The same single answer as the grant read above: an operation id from
+    // another environment must be indistinguishable from one that was never
+    // issued, so this route cannot be used to test ids the caller may not
+    // read.
     let workflow = state
         .store
         .provider_deployment_workflow(operation_id)
         .await?
+        .filter(|workflow| {
+            workflow.operation.scope.application_id == Some(app.canonical_id)
+                && workflow.operation.scope.environment_id == Some(environment.canonical_id)
+        })
         .ok_or_else(|| {
             ApiError::NotFound(format!(
-                "provider deployment operation {operation_id} not found"
+                "provider deployment operation {operation_id} not found for {app_name}/{environment_name}"
             ))
         })?;
-    if workflow.operation.scope.application_id != Some(app.canonical_id)
-        || workflow.operation.scope.environment_id != Some(environment.canonical_id)
-    {
-        return Err(ApiError::NotFound(format!(
-            "provider deployment operation {operation_id} not found for {app_name}/{environment_name}"
-        )));
-    }
     let headers = operation_headers(paths, &workflow.operation, &app_name, &environment_name)?;
     Ok((headers, Json(workflow)))
 }
@@ -2171,7 +2171,7 @@ pub async fn get_provider_deployment(
     tag = "product",
     params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The deployment or rollback operation's UUIDv7."), ("Idempotency-Key" = Option<String>, Header, description = "Optional. A replay of the same key by the same principal returns the same operation."), ("If-Match" = String, Header, description = "The operation revision the caller expects.")),
     responses(
-        (status = 202, description = "Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
+        (status = 202, description = "Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback. A request that could withhold nothing is refused with `409` `operation-not-cancellable`: the operation is already terminal or cancelling, or it is on its last step and the provider is already holding that call, in which case the deployment finishes and a rollback is the way back.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
@@ -2234,7 +2234,6 @@ pub async fn cancel_provider_deployment(
         (status = 403, response = openapi::Forbidden),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
-        (status = 428, response = openapi::PreconditionRequired),
         (status = 503, response = openapi::ServiceUnavailable),
         (status = 401, response = openapi::Unauthenticated),
     )
@@ -3510,7 +3509,11 @@ pub(crate) mod tests {
         assert_eq!(listed["page"]["total"], 1);
         assert_eq!(listed["items"][0]["grantId"], grant_id);
 
-        let response = router
+        // A grant that exists in another environment and an id that exists
+        // nowhere answer the same sentence. Anything finer would let a
+        // credential scoped to one environment ask this route whether an
+        // id it may not read exists at all.
+        let elsewhere = router
             .clone()
             .oneshot(
                 Request::builder()
@@ -3522,7 +3525,33 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(elsewhere.status(), StatusCode::NOT_FOUND);
+        let unknown_id = deis_wire::CanonicalId::new_v7().to_string();
+        let nowhere = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/apps/demo/environments/preview/provider-target-grants/{unknown_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nowhere.status(), StatusCode::NOT_FOUND);
+        let elsewhere = response_json(elsewhere).await["error"]
+            .as_str()
+            .unwrap()
+            .replace(grant_id, "<id>");
+        let nowhere = response_json(nowhere).await["error"]
+            .as_str()
+            .unwrap()
+            .replace(&unknown_id, "<id>");
+        assert_eq!(
+            elsewhere, nowhere,
+            "the two 404s tell a caller whether the id exists somewhere else"
+        );
 
         let response = router
             .clone()
@@ -5413,6 +5442,47 @@ pub(crate) mod tests {
             .cloned()
             .unwrap()
             .code
+    }
+
+    /// Reading a deployment through an environment it does not belong to
+    /// has to be indistinguishable from reading an id that was never
+    /// issued. Anything else turns this route into a way for a credential
+    /// scoped to one environment to test operation ids across the platform.
+    #[tokio::test]
+    async fn a_deployment_read_out_of_scope_reads_like_one_that_never_existed() {
+        let fixture = ReleaseFixture::new();
+        let seeded = provider_fixture(&fixture).await;
+        let router = &seeded.router;
+        let artifact = attach_artifact(&seeded.harness).await;
+        let (status, operation) =
+            begin_deployment(router, &seeded.target_id, &artifact, "deploy-scope-oracle").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+        let operation_id = operation["operationId"].as_str().unwrap().to_owned();
+
+        let (status, elsewhere) = get(
+            router,
+            &format!("/api/apps/demo/environments/preview/provider-deployments/{operation_id}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{elsewhere}");
+        let unknown_id = deis_wire::CanonicalId::new_v7().to_string();
+        let (status, nowhere) = get(
+            router,
+            &format!("/api/apps/demo/environments/preview/provider-deployments/{unknown_id}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{nowhere}");
+        assert_eq!(
+            elsewhere["error"]
+                .as_str()
+                .unwrap()
+                .replace(&operation_id, "<id>"),
+            nowhere["error"]
+                .as_str()
+                .unwrap()
+                .replace(&unknown_id, "<id>"),
+            "the two 404s tell a caller whether the operation exists somewhere else"
+        );
     }
 
     #[tokio::test]

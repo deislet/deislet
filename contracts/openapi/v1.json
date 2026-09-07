@@ -89,7 +89,7 @@
             }
           }
         },
-        "description": "The mutation needs an `If-Match` revision or an `Idempotency-Key` header and none was sent (`precondition-required`)."
+        "description": "The mutation needs an `If-Match` revision and none was sent (`precondition-required`). A missing `Idempotency-Key` is not this answer: it is 400 `idempotency-key-required`, described under `BadRequest`."
       },
       "ServiceUnavailable": {
         "content": {
@@ -120,6 +120,16 @@
           }
         },
         "description": "The body is well-formed but cannot be acted on: a bundle or envelope that fails verification, a restore set that fails validation (`invalid-argument`)."
+      },
+      "UnsupportedMediaType": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorBody"
+            }
+          }
+        },
+        "description": "The body is not in the media type this operation takes. A JSON body needs `Content-Type: application/json` (`invalid-argument`)."
       }
     },
     "schemas": {
@@ -934,10 +944,15 @@
         "type": "string"
       },
       "CanonicalArtifact": {
-        "description": "A canonical artifact record, as `contracts/v1/canonical-artifact.schema.json` defines it. The verified provider-neutral Build Output of one upload: its content root digest, standard version and file inventory. Returned as stored.",
+        "description": "A canonical artifact record, as `contracts/v1/canonical-artifact.schema.json` defines it. The verified provider-neutral Build Output of one upload, returned exactly as `catalog::artifact::store` wrote it: the digests live under `canonicalOutput`, the standard the validator pinned under `standard`, and `state`/`deployable` say whether anything may be deployed from it.",
         "properties": {
           "$schema": {
             "description": "The `$id` of the schema the record conforms to.",
+            "type": "string"
+          },
+          "applicationId": {
+            "description": "Canonical UUIDv7 of the application it belongs to.",
+            "format": "uuid",
             "type": "string"
           },
           "artifactId": {
@@ -946,22 +961,345 @@
             "type": "string"
           },
           "artifactSha256": {
-            "description": "64 lowercase hexadecimal digits.",
+            "deprecated": true,
+            "description": "Never written. The digest of the archive is `canonicalOutput.artifactSha256`.",
             "type": "string"
           },
+          "attestations": {
+            "description": "The documents that travel with the artifact.",
+            "properties": {
+              "provenance": {
+                "description": "The provenance document.",
+                "properties": {
+                  "digest": {
+                    "description": "Digest of the document.",
+                    "properties": {
+                      "algorithm": {
+                        "description": "`sha256`.",
+                        "type": "string"
+                      },
+                      "value": {
+                        "description": "64 lowercase hexadecimal digits.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "algorithm",
+                      "value"
+                    ],
+                    "type": "object"
+                  },
+                  "path": {
+                    "description": "Path inside the artifact's storage.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "digest"
+                ],
+                "type": "object"
+              },
+              "sbom": {
+                "description": "The SBOM.",
+                "properties": {
+                  "digest": {
+                    "description": "Digest of the document.",
+                    "properties": {
+                      "algorithm": {
+                        "description": "`sha256`.",
+                        "type": "string"
+                      },
+                      "value": {
+                        "description": "64 lowercase hexadecimal digits.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "algorithm",
+                      "value"
+                    ],
+                    "type": "object"
+                  },
+                  "path": {
+                    "description": "Path inside the artifact's storage.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "digest"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "sbom",
+              "provenance"
+            ],
+            "type": "object"
+          },
+          "canonicalOutput": {
+            "description": "The Build Output this record was verified from.",
+            "properties": {
+              "artifactSha256": {
+                "description": "64 lowercase hexadecimal digits over the archive.",
+                "type": "string"
+              },
+              "contentRootSha256": {
+                "description": "64 lowercase hexadecimal digits over the content root.",
+                "type": "string"
+              },
+              "fileCount": {
+                "description": "How many files it holds.",
+                "type": "integer"
+              },
+              "format": {
+                "description": "Always `edge-canon.build-output/v1`.",
+                "type": "string"
+              },
+              "manifestPath": {
+                "description": "Always `.edge-canon/output.json`.",
+                "type": "string"
+              },
+              "storage": {
+                "description": "Where the bytes are.",
+                "properties": {
+                  "kind": {
+                    "description": "`directory` or `object`.",
+                    "type": "string"
+                  },
+                  "locator": {
+                    "description": "Where, in that store.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "locator"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "format",
+              "manifestPath",
+              "artifactSha256",
+              "contentRootSha256",
+              "fileCount",
+              "storage"
+            ],
+            "type": "object"
+          },
           "contentRootSha256": {
-            "description": "64 lowercase hexadecimal digits.",
+            "deprecated": true,
+            "description": "Never written. The digest of the content root is `canonicalOutput.contentRootSha256`.",
+            "type": "string"
+          },
+          "createdAt": {
+            "description": "RFC 3339.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "deployable": {
+            "description": "Whether a version may be derived from this artifact yet.",
+            "type": "boolean"
+          },
+          "recordType": {
+            "description": "Always `deislet.canonical-artifact-record/v1`.",
             "type": "string"
           },
           "schemaVersion": {
             "description": "Always 1.",
             "type": "integer"
           },
+          "signatures": {
+            "items": {
+              "description": "One signature over a target of this record.",
+              "properties": {
+                "algorithm": {
+                  "description": "The signature algorithm.",
+                  "type": "string"
+                },
+                "keyId": {
+                  "description": "Which key signed it.",
+                  "type": "string"
+                },
+                "target": {
+                  "description": "What was signed.",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "The signature.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target",
+                "keyId",
+                "algorithm",
+                "value"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "standard": {
+            "description": "The Build Output standard the validator was pinned to.",
+            "properties": {
+              "artifactSchemaDigest": {
+                "description": "Digest of that schema.",
+                "properties": {
+                  "algorithm": {
+                    "description": "`sha256`.",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "64 lowercase hexadecimal digits.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "algorithm",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "artifactSchemaPath": {
+                "description": "Always `schemas/canonical-build-output.schema.json`.",
+                "type": "string"
+              },
+              "contractDigest": {
+                "description": "Digest of the contract.",
+                "properties": {
+                  "algorithm": {
+                    "description": "`sha256`.",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "64 lowercase hexadecimal digits.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "algorithm",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "contractId": {
+                "description": "Always `edge-canon.next`.",
+                "type": "string"
+              },
+              "releaseStatus": {
+                "description": "`proposal`, `candidate`, `release-candidate` or `standard`.",
+                "type": "string"
+              },
+              "sourceCommit": {
+                "description": "40 hexadecimal digits.",
+                "type": "string"
+              },
+              "version": {
+                "description": "`edge-canon.next@<40 hexadecimal digits>`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "contractId",
+              "version",
+              "releaseStatus",
+              "sourceCommit",
+              "contractDigest",
+              "artifactSchemaPath",
+              "artifactSchemaDigest"
+            ],
+            "type": "object"
+          },
           "standardVersion": {
-            "description": "The Build Output standard version.",
+            "deprecated": true,
+            "description": "Never written. The standard version is `standard.version`.",
             "type": "string"
+          },
+          "state": {
+            "description": "Where the record stands: `draft`, `verified` or `published`.",
+            "enum": [
+              "draft",
+              "verified",
+              "published"
+            ],
+            "type": "string"
+          },
+          "validation": {
+            "description": "What the validator found.",
+            "properties": {
+              "reportDigest": {
+                "description": "Digest of the report.",
+                "properties": {
+                  "algorithm": {
+                    "description": "`sha256`.",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "64 lowercase hexadecimal digits.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "algorithm",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "reportPath": {
+                "description": "Where the report is.",
+                "type": "string"
+              },
+              "requirementsDigest": {
+                "description": "Digest of the requirement set applied.",
+                "properties": {
+                  "algorithm": {
+                    "description": "`sha256`.",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "64 lowercase hexadecimal digits.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "algorithm",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "description": "`pending`, `passed` or `failed`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "requirementsDigest",
+              "reportPath",
+              "reportDigest"
+            ],
+            "type": "object"
           }
         },
+        "required": [
+          "schemaVersion",
+          "recordType",
+          "artifactId",
+          "applicationId",
+          "state",
+          "deployable",
+          "createdAt",
+          "canonicalOutput",
+          "standard",
+          "validation",
+          "attestations",
+          "signatures"
+        ],
         "type": "object"
       },
       "CommandCancelled": {
@@ -1745,10 +2083,15 @@
         "properties": {
           "items": {
             "items": {
-              "description": "A canonical artifact record, as `contracts/v1/canonical-artifact.schema.json` defines it. The verified provider-neutral Build Output of one upload: its content root digest, standard version and file inventory. Returned as stored.",
+              "description": "A canonical artifact record, as `contracts/v1/canonical-artifact.schema.json` defines it. The verified provider-neutral Build Output of one upload, returned exactly as `catalog::artifact::store` wrote it: the digests live under `canonicalOutput`, the standard the validator pinned under `standard`, and `state`/`deployable` say whether anything may be deployed from it.",
               "properties": {
                 "$schema": {
                   "description": "The `$id` of the schema the record conforms to.",
+                  "type": "string"
+                },
+                "applicationId": {
+                  "description": "Canonical UUIDv7 of the application it belongs to.",
+                  "format": "uuid",
                   "type": "string"
                 },
                 "artifactId": {
@@ -1757,22 +2100,345 @@
                   "type": "string"
                 },
                 "artifactSha256": {
-                  "description": "64 lowercase hexadecimal digits.",
+                  "deprecated": true,
+                  "description": "Never written. The digest of the archive is `canonicalOutput.artifactSha256`.",
                   "type": "string"
                 },
+                "attestations": {
+                  "description": "The documents that travel with the artifact.",
+                  "properties": {
+                    "provenance": {
+                      "description": "The provenance document.",
+                      "properties": {
+                        "digest": {
+                          "description": "Digest of the document.",
+                          "properties": {
+                            "algorithm": {
+                              "description": "`sha256`.",
+                              "type": "string"
+                            },
+                            "value": {
+                              "description": "64 lowercase hexadecimal digits.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "algorithm",
+                            "value"
+                          ],
+                          "type": "object"
+                        },
+                        "path": {
+                          "description": "Path inside the artifact's storage.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "digest"
+                      ],
+                      "type": "object"
+                    },
+                    "sbom": {
+                      "description": "The SBOM.",
+                      "properties": {
+                        "digest": {
+                          "description": "Digest of the document.",
+                          "properties": {
+                            "algorithm": {
+                              "description": "`sha256`.",
+                              "type": "string"
+                            },
+                            "value": {
+                              "description": "64 lowercase hexadecimal digits.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "algorithm",
+                            "value"
+                          ],
+                          "type": "object"
+                        },
+                        "path": {
+                          "description": "Path inside the artifact's storage.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "digest"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "sbom",
+                    "provenance"
+                  ],
+                  "type": "object"
+                },
+                "canonicalOutput": {
+                  "description": "The Build Output this record was verified from.",
+                  "properties": {
+                    "artifactSha256": {
+                      "description": "64 lowercase hexadecimal digits over the archive.",
+                      "type": "string"
+                    },
+                    "contentRootSha256": {
+                      "description": "64 lowercase hexadecimal digits over the content root.",
+                      "type": "string"
+                    },
+                    "fileCount": {
+                      "description": "How many files it holds.",
+                      "type": "integer"
+                    },
+                    "format": {
+                      "description": "Always `edge-canon.build-output/v1`.",
+                      "type": "string"
+                    },
+                    "manifestPath": {
+                      "description": "Always `.edge-canon/output.json`.",
+                      "type": "string"
+                    },
+                    "storage": {
+                      "description": "Where the bytes are.",
+                      "properties": {
+                        "kind": {
+                          "description": "`directory` or `object`.",
+                          "type": "string"
+                        },
+                        "locator": {
+                          "description": "Where, in that store.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "locator"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "format",
+                    "manifestPath",
+                    "artifactSha256",
+                    "contentRootSha256",
+                    "fileCount",
+                    "storage"
+                  ],
+                  "type": "object"
+                },
                 "contentRootSha256": {
-                  "description": "64 lowercase hexadecimal digits.",
+                  "deprecated": true,
+                  "description": "Never written. The digest of the content root is `canonicalOutput.contentRootSha256`.",
+                  "type": "string"
+                },
+                "createdAt": {
+                  "description": "RFC 3339.",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "deployable": {
+                  "description": "Whether a version may be derived from this artifact yet.",
+                  "type": "boolean"
+                },
+                "recordType": {
+                  "description": "Always `deislet.canonical-artifact-record/v1`.",
                   "type": "string"
                 },
                 "schemaVersion": {
                   "description": "Always 1.",
                   "type": "integer"
                 },
+                "signatures": {
+                  "items": {
+                    "description": "One signature over a target of this record.",
+                    "properties": {
+                      "algorithm": {
+                        "description": "The signature algorithm.",
+                        "type": "string"
+                      },
+                      "keyId": {
+                        "description": "Which key signed it.",
+                        "type": "string"
+                      },
+                      "target": {
+                        "description": "What was signed.",
+                        "type": "string"
+                      },
+                      "value": {
+                        "description": "The signature.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "target",
+                      "keyId",
+                      "algorithm",
+                      "value"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "standard": {
+                  "description": "The Build Output standard the validator was pinned to.",
+                  "properties": {
+                    "artifactSchemaDigest": {
+                      "description": "Digest of that schema.",
+                      "properties": {
+                        "algorithm": {
+                          "description": "`sha256`.",
+                          "type": "string"
+                        },
+                        "value": {
+                          "description": "64 lowercase hexadecimal digits.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "algorithm",
+                        "value"
+                      ],
+                      "type": "object"
+                    },
+                    "artifactSchemaPath": {
+                      "description": "Always `schemas/canonical-build-output.schema.json`.",
+                      "type": "string"
+                    },
+                    "contractDigest": {
+                      "description": "Digest of the contract.",
+                      "properties": {
+                        "algorithm": {
+                          "description": "`sha256`.",
+                          "type": "string"
+                        },
+                        "value": {
+                          "description": "64 lowercase hexadecimal digits.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "algorithm",
+                        "value"
+                      ],
+                      "type": "object"
+                    },
+                    "contractId": {
+                      "description": "Always `edge-canon.next`.",
+                      "type": "string"
+                    },
+                    "releaseStatus": {
+                      "description": "`proposal`, `candidate`, `release-candidate` or `standard`.",
+                      "type": "string"
+                    },
+                    "sourceCommit": {
+                      "description": "40 hexadecimal digits.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "description": "`edge-canon.next@<40 hexadecimal digits>`.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "contractId",
+                    "version",
+                    "releaseStatus",
+                    "sourceCommit",
+                    "contractDigest",
+                    "artifactSchemaPath",
+                    "artifactSchemaDigest"
+                  ],
+                  "type": "object"
+                },
                 "standardVersion": {
-                  "description": "The Build Output standard version.",
+                  "deprecated": true,
+                  "description": "Never written. The standard version is `standard.version`.",
                   "type": "string"
+                },
+                "state": {
+                  "description": "Where the record stands: `draft`, `verified` or `published`.",
+                  "enum": [
+                    "draft",
+                    "verified",
+                    "published"
+                  ],
+                  "type": "string"
+                },
+                "validation": {
+                  "description": "What the validator found.",
+                  "properties": {
+                    "reportDigest": {
+                      "description": "Digest of the report.",
+                      "properties": {
+                        "algorithm": {
+                          "description": "`sha256`.",
+                          "type": "string"
+                        },
+                        "value": {
+                          "description": "64 lowercase hexadecimal digits.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "algorithm",
+                        "value"
+                      ],
+                      "type": "object"
+                    },
+                    "reportPath": {
+                      "description": "Where the report is.",
+                      "type": "string"
+                    },
+                    "requirementsDigest": {
+                      "description": "Digest of the requirement set applied.",
+                      "properties": {
+                        "algorithm": {
+                          "description": "`sha256`.",
+                          "type": "string"
+                        },
+                        "value": {
+                          "description": "64 lowercase hexadecimal digits.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "algorithm",
+                        "value"
+                      ],
+                      "type": "object"
+                    },
+                    "status": {
+                      "description": "`pending`, `passed` or `failed`.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "requirementsDigest",
+                    "reportPath",
+                    "reportDigest"
+                  ],
+                  "type": "object"
                 }
               },
+              "required": [
+                "schemaVersion",
+                "recordType",
+                "artifactId",
+                "applicationId",
+                "state",
+                "deployable",
+                "createdAt",
+                "canonicalOutput",
+                "standard",
+                "validation",
+                "attestations",
+                "signatures"
+              ],
               "type": "object"
             },
             "type": "array"
@@ -1951,10 +2617,7 @@
                 },
                 "snapshot_id": {
                   "description": "Immutable Edge Canon environment snapshot selected with this pointer.\nAbsent only on deployments written by the legacy schema-1 path.",
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "type": "string"
                 },
                 "version_id": {
                   "type": "string"
@@ -3356,10 +4019,7 @@
                 "canonical_artifact_id": {
                   "description": "Exact provider-neutral parent and provider derivation. Both are absent\nonly for legacy raw-bundle uploads.",
                   "format": "uuid",
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "type": "string"
                 },
                 "canonical_id": {
                   "format": "uuid",
@@ -3391,10 +4051,7 @@
                   "type": "integer"
                 },
                 "provider_derivation_sha256": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "type": "string"
                 }
               },
               "required": [
@@ -3755,10 +4412,7 @@
           },
           "snapshot_id": {
             "description": "Immutable Edge Canon environment snapshot selected with this pointer.\nAbsent only on deployments written by the legacy schema-1 path.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "version_id": {
             "type": "string"
@@ -3900,10 +4554,7 @@
           "coordinator_id": {
             "description": "Short-lived owner of the next coordinator action. This is mutable\nexecution state and is deliberately outside `plan_sha256`.",
             "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "created_at": {
             "format": "int64",
@@ -3928,39 +4579,24 @@
             "type": "string"
           },
           "last_error": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "lease_expires_at": {
             "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": "integer"
           },
           "note": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "plan_sha256": {
             "type": "string"
           },
           "policy": {},
           "previous_deployment_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "previous_generation": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "proxy_ids": {
             "items": {
@@ -3973,10 +4609,7 @@
             "type": "string"
           },
           "snapshot_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "state": {
             "type": "string"
@@ -4016,14 +4649,7 @@
       "DeploymentPlanResponse": {
         "properties": {
           "drain": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DeploymentGenerationDrain"
-              }
-            ]
+            "$ref": "#/components/schemas/DeploymentGenerationDrain"
           },
           "drain_observations": {
             "items": {
@@ -4047,14 +4673,7 @@
             "type": "array"
           },
           "queue": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DeploymentQueueObservation"
-              }
-            ]
+            "$ref": "#/components/schemas/DeploymentQueueObservation"
           },
           "targets": {
             "items": {
@@ -4113,10 +4732,7 @@
             "type": "string"
           },
           "message": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "observed_at": {
             "format": "int64",
@@ -4130,16 +4746,10 @@
             "type": "integer"
           },
           "pending_deployment_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "pending_generation": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "plan_id": {
             "type": "string"
@@ -4158,39 +4768,18 @@
       "DeploymentResponse": {
         "properties": {
           "delivery": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DeliveryReport",
-                "description": "Which nodes took this version. Absent when the response only reads\nback an existing pointer, because then nothing was pushed."
-              }
-            ]
+            "$ref": "#/components/schemas/DeliveryReport",
+            "description": "Which nodes took this version. Absent when the response only reads\nback an existing pointer, because then nothing was pushed."
           },
           "deployment": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Deployment",
-                "description": "Absent while an accepted plan is still draining its pre-commit queue\nbarrier. No production pointer exists for that plan yet."
-              }
-            ]
+            "$ref": "#/components/schemas/Deployment",
+            "description": "Absent while an accepted plan is still draining its pre-commit queue\nbarrier. No production pointer exists for that plan yet."
           },
           "environment": {
             "type": "string"
           },
           "plan": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DeploymentPlan"
-              }
-            ]
+            "$ref": "#/components/schemas/DeploymentPlan"
           },
           "version": {
             "$ref": "#/components/schemas/VersionView"
@@ -4454,10 +5043,8 @@
         "description": "The resource, and optionally the field, an error is about.",
         "properties": {
           "field": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "description": "Absent when the error is about the resource as a whole. Never\n`null`: `contracts/v1/control-error.schema.json` declares a plain\nstring, and `crate::api::error::ErrorTarget` omits the member\ninstead of writing one.",
+            "type": "string"
           },
           "resource": {
             "type": "string"
@@ -5360,7 +5947,7 @@
             "type": "string"
           },
           "error": {
-            "description": "Why the operation failed; present exactly when `state` is `failed`.",
+            "description": "Why the operation failed. The member is always written; its value is `null` unless `state` is `failed`.",
             "properties": {
               "code": {
                 "description": "A stable error class.",
@@ -5371,11 +5958,11 @@
                 "type": "string"
               },
               "remediation": {
-                "description": "What an operator can do about it.",
+                "description": "What an operator can do about it; `null` when there is nothing to say.",
                 "type": "string"
               },
               "retryAfterSeconds": {
-                "description": "How long to wait before retrying.",
+                "description": "How long to wait before retrying; `null` when the failure carries no hint.",
                 "type": "integer"
               },
               "retryable": {
@@ -5385,12 +5972,14 @@
             "required": [
               "code",
               "message",
-              "retryable"
+              "retryable",
+              "retryAfterSeconds",
+              "remediation"
             ],
             "type": "object"
           },
           "finishedAt": {
-            "description": "RFC 3339, once terminal.",
+            "description": "RFC 3339 once the operation is terminal; `null` before that.",
             "format": "date-time",
             "type": "string"
           },
@@ -5413,7 +6002,20 @@
             "type": "object"
           },
           "kind": {
-            "description": "What the operation does: `identity-migration`, `backend-restore`, `provider-deployment`.",
+            "description": "What the operation does. The set is `deis_wire::OperationKind`, which is `contracts/v1/operation.schema.json`'s: an identity migration is `migrate`, a backend restore is `restore` and a provider deployment is `provider`.",
+            "enum": [
+              "build",
+              "provision",
+              "deploy",
+              "promote",
+              "rollback",
+              "migrate",
+              "export",
+              "delete",
+              "restore",
+              "purge",
+              "provider"
+            ],
             "type": "string"
           },
           "operationId": {
@@ -5426,7 +6028,9 @@
             "type": "string"
           },
           "progress": {
-            "description": "0..=100 when the kind reports progress.",
+            "description": "How far the operation has come, in basis points: 0..=10000, where 10000 is the whole of it, as `contracts/v1/operation.schema.json` defines it. `null` whenever the kind has no honest denominator to divide by, which includes every operation that has not started.",
+            "maximum": 10000,
+            "minimum": 0,
             "type": "integer"
           },
           "providerOperations": {
@@ -5456,12 +6060,12 @@
             "description": "The organization, application and environment the operation acts in.",
             "properties": {
               "applicationId": {
-                "description": "Canonical UUIDv7, when scoped to one application.",
+                "description": "Canonical UUIDv7 of the application the operation acts in; `null` when it acts on the whole organization.",
                 "format": "uuid",
                 "type": "string"
               },
               "environmentId": {
-                "description": "Canonical UUIDv7, when scoped to one environment.",
+                "description": "Canonical UUIDv7 of the environment the operation acts in; `null` when it is not scoped to one.",
                 "format": "uuid",
                 "type": "string"
               },
@@ -5472,25 +6076,28 @@
               }
             },
             "required": [
-              "organizationId"
+              "organizationId",
+              "applicationId",
+              "environmentId"
             ],
             "type": "object"
           },
           "startedAt": {
-            "description": "RFC 3339, once running.",
+            "description": "RFC 3339 once the operation started; `null` while it is `queued`.",
             "format": "date-time",
             "type": "string"
           },
           "state": {
-            "description": "`pending`, `running`, `waiting`, `succeeded`, `failed`, `cancelling` or `cancelled`.",
+            "description": "Where the operation is in the state machine of `contracts/v1/operation-transitions.json`. The set is rendered from `deis_wire::OperationState`, so it cannot drift from what the server writes; a freshly accepted operation is `queued`. `pending` is listed because it was published in this enum and a value is never withdrawn from a closed one, and is emitted by nothing: it was the earlier spelling of `queued` and no code path has ever written it.",
             "enum": [
-              "pending",
+              "queued",
               "running",
               "waiting",
+              "cancelling",
               "succeeded",
               "failed",
-              "cancelling",
-              "cancelled"
+              "cancelled",
+              "pending"
             ],
             "type": "string"
           },
@@ -5538,12 +6145,16 @@
           "actorId",
           "requestId",
           "correlationId",
+          "progress",
           "cancellable",
           "retryable",
           "childOperationIds",
           "providerOperations",
+          "error",
           "createdAt",
-          "updatedAt"
+          "startedAt",
+          "updatedAt",
+          "finishedAt"
         ],
         "type": "object"
       },
@@ -6754,14 +7365,7 @@
             "description": "Nodes that picked the new environment up. A secret change creates\nno version, so this is the only evidence it reached anything."
           },
           "plan": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DeploymentPlan"
-              }
-            ]
+            "$ref": "#/components/schemas/DeploymentPlan"
           },
           "secret": {
             "$ref": "#/components/schemas/SecretMeta"
@@ -6783,14 +7387,7 @@
             "$ref": "#/components/schemas/DeliveryReport"
           },
           "plan": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DeploymentPlan"
-              }
-            ]
+            "$ref": "#/components/schemas/DeploymentPlan"
           }
         },
         "required": [
@@ -6954,19 +7551,13 @@
             "items": {
               "type": "string"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           },
           "assignment_refresh_seconds": {
             "description": "On 409: how often the node reconciles its assignment list, in\nseconds - the time within which the application would be back.",
             "format": "int64",
             "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": "integer"
           },
           "error": {
             "description": "Why nothing was sent, and what to do instead.",
@@ -7052,10 +7643,7 @@
           "canonical_artifact_id": {
             "description": "Exact provider-neutral parent and provider derivation. Both are absent\nonly for legacy raw-bundle uploads.",
             "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "canonical_id": {
             "format": "uuid",
@@ -7087,10 +7675,7 @@
             "type": "integer"
           },
           "provider_derivation_sha256": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           }
         },
         "required": [
@@ -7124,7 +7709,7 @@
       "email": "kookyleo@gmail.com",
       "name": "kookyleo"
     },
-    "description": "The human API of the Deislet control plane: the product API under `/api/v1` and the platform diagnostics under `/api/platform`. Every list answers in the `ControlListPage` envelope with an opaque cursor; every error answers with the `ErrorBody` envelope, whose `code` is a closed set and whose `requestId` is echoed in the `x-request-id` header. Mutations that take time answer 202 with a `ProductOperation` and a `Location` to poll.",
+    "description": "The human API of the Deislet control plane: the product API under `/api/v1` and the platform diagnostics under `/api/platform`. Every paginated collection answers in the `ControlListPage` envelope with an opaque cursor; four platform diagnostics still answer a shape of their own and take no cursor (`listAllRoutes`, `listSessions`, `listNodeConfigs`, `listRuntimeFleet`). Every error answers with the `ErrorBody` envelope, whose `code` is a closed set and whose `requestId` is echoed in the `x-request-id` header. Mutations that take time answer 202 with a `ProductOperation` and a `Location` to poll.",
     "license": {
       "identifier": "Apache-2.0",
       "name": "Apache-2.0"
@@ -7178,6 +7763,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/commands - the command history of every node, newest\nfirst.",
@@ -7223,8 +7811,8 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
-          "409": {
-            "$ref": "#/components/responses/Conflict"
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "POST /api/platform/commands/cancel/{command_id} - cancel a command that\nhas not completed.",
@@ -7279,6 +7867,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -7346,6 +7937,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/commands/node/{node_id} - one node's command history,\nnewest first.",
@@ -7390,6 +7984,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/commands/status/{command_id} - where a command is.",
@@ -7417,6 +8014,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/configs - the configuration of every node.",
@@ -7458,6 +8058,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -7512,6 +8115,9 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
           }
@@ -7541,6 +8147,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/configs/stats - counts.",
@@ -7621,6 +8230,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/configs/{node_id} - one node's configuration.",
@@ -7670,6 +8282,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -7734,6 +8349,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/configs/{node_id}/history - every recorded change to\nthe node's configuration, newest first.",
@@ -7832,6 +8450,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/configs/{node_id}/{config_key} - one value.",
@@ -7902,6 +8523,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/configs/{node_id}/{config_key}/history - every recorded\nchange to one key of the node's configuration, newest first.",
@@ -7965,6 +8589,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -8038,6 +8665,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/events - the event log, newest first.",
@@ -8095,6 +8725,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/metrics/summary - the same numbers the Prometheus\nexposition at `GET /api/metrics` reports, as JSON.",
@@ -8154,6 +8787,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/runtime - the runtime fleet: every node that can be\nhanded a deployment or a cron occurrence, with the health last probed\nfor it.",
@@ -8235,6 +8871,9 @@
             },
             "description": "The node answered but did not unload."
           },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
           "502": {
             "$ref": "#/components/responses/BadGateway"
           },
@@ -8301,6 +8940,9 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
           "502": {
             "$ref": "#/components/responses/BadGateway"
           }
@@ -8330,6 +8972,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/sessions - every node currently holding a control\nchannel open.",
@@ -8371,6 +9016,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "GET /api/platform/sessions/{node_id} - one open control channel.",
@@ -8488,6 +9136,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List the accounts, oldest first.",
@@ -8529,6 +9180,12 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Create an account.",
@@ -8583,6 +9240,12 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Mint a token for an account.",
@@ -8624,6 +9287,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Read one account.",
@@ -8676,6 +9342,12 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Change an account's role, or disable it.",
@@ -8728,6 +9400,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List the applications, by id.",
@@ -8769,6 +9444,12 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Create an application.",
@@ -8815,6 +9496,9 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
           }
@@ -8856,6 +9540,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Read one application.",
@@ -8920,6 +9607,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List an application's canonical artifacts.",
@@ -8962,6 +9652,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactUploadResponse"
+                }
+              }
+            },
+            "description": "The same artifact was already stored, byte for byte; `created` is false and nothing was written."
+          },
           "201": {
             "content": {
               "application/json": {
@@ -8970,7 +9670,7 @@
                 }
               }
             },
-            "description": "The artifact was verified and stored; `created` is false when it was already there."
+            "description": "The artifact was verified and stored; `created` is true."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -8990,8 +9690,8 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Upload a transport zip as a canonical artifact.",
@@ -9034,6 +9734,9 @@
             },
             "description": "The canonical artifact record."
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthenticated"
           },
@@ -9042,6 +9745,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Read one canonical artifact.",
@@ -9095,6 +9801,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadResponse"
+                }
+              }
+            },
+            "description": "A byte-identical envelope was already stored under this lineage; `created` is false and nothing was written."
+          },
           "201": {
             "content": {
               "application/json": {
@@ -9123,8 +9839,8 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Upload a provider-derived version bound to its canonical artifact.",
@@ -9189,6 +9905,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List an application's environments, by name.",
@@ -9244,6 +9963,12 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Create an environment of an application.",
@@ -9294,6 +10019,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Read one environment.",
@@ -9345,6 +10073,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Read what an environment is running.",
@@ -9404,6 +10135,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Scoped form used by deployment credentials. The path's environment is\nresolved and compared with the plan, so a caller cannot put an authorised\nprefix around another environment's opaque plan id.",
@@ -9478,6 +10212,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List an environment's deployment history, newest first.",
@@ -9561,6 +10298,12 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -9651,6 +10394,12 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
           }
@@ -9727,6 +10476,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List one environment's routes.",
@@ -9791,6 +10543,12 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Bind a route to an environment.",
@@ -9850,6 +10608,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Remove a route.",
@@ -9924,6 +10685,12 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Replace a route.",
@@ -9998,6 +10765,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -10081,6 +10851,9 @@
           },
           "412": {
             "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -10176,6 +10949,12 @@
           "412": {
             "$ref": "#/components/responses/PreconditionFailed"
           },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
           }
@@ -10232,6 +11011,9 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -10299,6 +11081,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List an application's versions.",
@@ -10341,6 +11126,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadResponse"
+                }
+              }
+            },
+            "description": "A byte-identical bundle was already stored; `created` is false and nothing was written."
+          },
           "201": {
             "content": {
               "application/json": {
@@ -10349,7 +11144,7 @@
                 }
               }
             },
-            "description": "The version was stored; `created` is false when the same bundle was already there."
+            "description": "The version was stored; `created` is true."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -10369,8 +11164,8 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Upload a bundle as a new version.",
@@ -10421,6 +11216,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Read one version.",
@@ -10494,6 +11292,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -10575,8 +11376,11 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -10649,6 +11453,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -10718,7 +11525,7 @@
                 }
               }
             },
-            "description": "Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback.",
+            "description": "Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback. A request that could withhold nothing is refused with `409` `operation-not-cancellable`: the operation is already terminal or cancelling, or it is on its last step and the provider is already holding that call, in which case the deployment finishes and a rollback is the way back.",
             "headers": {
               "Location": {
                 "description": "Where to poll the operation.",
@@ -10748,6 +11555,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -10833,8 +11643,8 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -10919,6 +11729,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -11006,8 +11819,11 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -11104,6 +11920,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -11171,6 +11990,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -11252,6 +12074,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -11292,6 +12117,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -11320,7 +12148,7 @@
             }
           },
           {
-            "description": "The application revision the caller expects.",
+            "description": "Required: the application `revision` the caller expects, quoted, as `GET /api/v1/apps/{application_name}` reports it. A migration freezes an inventory of everything the application owns, so the caller says which revision it read that inventory at; the comparison happens inside the transaction that plans the migration, and a revision that has moved since is refused with 412 rather than snapshotted.",
             "in": "header",
             "name": "If-Match",
             "required": true,
@@ -11368,6 +12196,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -11487,6 +12318,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List the audit log, newest first.",
@@ -11551,11 +12385,11 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
           },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -11610,6 +12444,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -11650,6 +12487,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Read a deployment plan and what every node observed of it.",
@@ -11703,6 +12543,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List the hostname grants.",
@@ -11747,6 +12590,12 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Grant a hostname pattern to an application.",
@@ -11810,6 +12659,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Withdraw a hostname grant.",
@@ -11891,6 +12743,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -11970,6 +12825,9 @@
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
           },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
           }
@@ -12023,6 +12881,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -12092,8 +12953,11 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -12175,6 +13039,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -12224,6 +13091,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -12287,6 +13157,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -12376,8 +13249,14 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -12432,6 +13311,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -12523,11 +13405,8 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
-          },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -12582,6 +13461,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -12649,6 +13531,9 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
           }
@@ -12702,6 +13587,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -12771,8 +13659,11 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -12860,6 +13751,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Soft delete. The response is the installation with `deletedAt` set and\nstatus `revoked`; its targets, grants, workflows and audit stay readable.",
@@ -12910,6 +13804,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -12973,6 +13870,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13051,6 +13951,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13129,6 +14032,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13192,6 +14098,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13270,11 +14179,11 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
           },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
+          "500": {
+            "$ref": "#/components/responses/Internal"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -13347,6 +14256,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Every grant on the platform, newest first, including grants whose\napplication no longer exists. Administrator-only, like every other\ninstallation-wide provider resource.",
@@ -13399,6 +14311,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13462,6 +14377,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "The per-grant audit envelope without an application scope, so the trail\nof a grant remains readable after its application was retired.",
@@ -13514,6 +14432,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13592,6 +14513,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Soft delete. Active grants on the target are revoked in the same\ntransaction; a non-terminal provider deployment workflow on it makes the\nrequest a `provider-target-in-use` conflict that lists the operations.",
@@ -13642,6 +14566,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13705,6 +14632,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13783,6 +14713,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13861,6 +14794,9 @@
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "tags": [
@@ -13913,6 +14849,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List the names deleted applications still hold.",
@@ -13958,6 +14897,9 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Release a retired name so it can be created again.",
@@ -14041,6 +14983,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "List the credentials, oldest first.",
@@ -14074,6 +15019,9 @@
             },
             "description": "The token, now revoked."
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthenticated"
           },
@@ -14082,6 +15030,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
           }
         },
         "summary": "Revoke a token.",

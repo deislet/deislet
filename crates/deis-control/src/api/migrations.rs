@@ -329,7 +329,7 @@ pub async fn get_migration(
     path = "/api/v1/apps/{application_name}/identity-migration",
     operation_id = "startIdentityMigration",
     tag = "product",
-    params(("application_name" = String, Path, description = "The application's id."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation."), ("If-Match" = String, Header, description = "The application revision the caller expects.")),
+    params(("application_name" = String, Path, description = "The application's id."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation."), ("If-Match" = String, Header, description = "Required: the application `revision` the caller expects, quoted, as `GET /api/v1/apps/{application_name}` reports it. A migration freezes an inventory of everything the application owns, so the caller says which revision it read that inventory at; the comparison happens inside the transaction that plans the migration, and a revision that has moved since is refused with 412 rather than snapshotted.")),
     responses(
         (status = 202, description = "The migration was started or is already running; poll `Location`.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
         (status = 400, response = openapi::BadRequest),
@@ -351,12 +351,26 @@ pub async fn start_migration(
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
     let coordinator = state.ready()?;
     let context = operation_context(&headers, &principal, &application_name)?;
+    // The caller's fence, which this route has always documented as
+    // required and, until it was read here, did not apply: a migration
+    // freezes an inventory of everything the application owns, so the
+    // caller says which revision it read that inventory at. The comparison
+    // happens inside the planning transaction, where the revision is read.
+    let expected_application_revision = optional_if_match(&headers)?.ok_or_else(|| {
+        ApiError::PreconditionRequired(
+            "If-Match with the application's current revision is required".to_string(),
+        )
+    })?;
     // Planning is the durable acceptance point. A duplicate request for the
     // same application/revision returns the same operation rather than
     // creating another one.
     let plan = state
         .store
-        .plan_identity_migration_with_operation(&application_name, context)
+        .plan_identity_migration_with_operation(
+            &application_name,
+            context,
+            Some(expected_application_revision),
+        )
         .await?;
     let migration_id = plan.migration_id;
     let operation_id = plan.operation_id;
@@ -780,12 +794,25 @@ fn optional_canonical_header(headers: &HeaderMap, name: &str) -> ApiResult<Optio
 }
 
 fn required_if_match(headers: &HeaderMap) -> ApiResult<u64> {
-    let value = single_header(headers, IF_MATCH)?
-        .ok_or_else(|| {
-            ApiError::PreconditionRequired(
-                "If-Match with the current operation ETag is required".to_string(),
-            )
-        })?
+    optional_if_match(headers)?.ok_or_else(|| {
+        ApiError::PreconditionRequired(
+            "If-Match with the current operation ETag is required".to_string(),
+        )
+    })
+}
+
+/// The revision an `If-Match` names, when the caller sent one.
+///
+/// The same spelling the fenced mutations demand - one strong, quoted
+/// decimal revision - read where the header is a fence the caller may
+/// choose to set rather than one the route insists on. A value that is
+/// there and malformed is still refused: a caller that meant to fence and
+/// mis-spelled it must not be treated as one that did not fence at all.
+fn optional_if_match(headers: &HeaderMap) -> ApiResult<Option<u64>> {
+    let Some(value) = single_header(headers, IF_MATCH)? else {
+        return Ok(None);
+    };
+    let value = value
         .to_str()
         .map_err(|_| ApiError::BadRequest("If-Match is not valid visible ASCII".to_string()))?;
     let value = value
@@ -801,7 +828,7 @@ fn required_if_match(headers: &HeaderMap) -> ApiResult<u64> {
             "If-Match must contain one strong, quoted operation revision".to_string(),
         ));
     }
-    value.parse().map_err(|_| {
+    value.parse().map(Some).map_err(|_| {
         ApiError::BadRequest(
             "If-Match contains an operation revision outside the supported range".to_string(),
         )
@@ -884,6 +911,94 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
+    /// The route documents an `If-Match` and now honours it: a migration
+    /// freezes an inventory of everything the application owns, so a caller
+    /// that read that inventory can insist nothing has changed since. The
+    /// header used to be read by nothing, which meant a caller fencing
+    /// against a stale revision was told its migration had started against
+    /// exactly what it had seen.
+    #[tokio::test]
+    async fn an_if_match_that_names_another_revision_refuses_the_migration() {
+        let directory = TempDir::new().unwrap();
+        let database = Arc::new(
+            Database::init(directory.path().join("control.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let store = Arc::new(CatalogStore::new(database));
+        store.create_app("shop").await.unwrap();
+        store
+            .create_environment("shop", "production")
+            .await
+            .unwrap();
+        let revision = store.get_app("shop").await.unwrap().revision;
+        let config = ControlConfig {
+            store_endpoint: Some("http://127.0.0.1:9".to_string()),
+            queue_endpoint: Some("http://127.0.0.1:10".to_string()),
+            telemetry_endpoint: Some("http://127.0.0.1:11".to_string()),
+            store_migration_admin_token: Some("s".repeat(32)),
+            queue_migration_admin_token: Some("q".repeat(32)),
+            telemetry_migration_admin_token: Some("t".repeat(32)),
+            ..Default::default()
+        };
+        let api = router("/api", MigrationApiState::new(store, &config));
+        let start = |key: &'static str, if_match: Option<String>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/api/apps/shop/identity-migration")
+                .header(IDEMPOTENCY_KEY, key);
+            if let Some(value) = if_match {
+                builder = builder.header(header::IF_MATCH, value);
+            }
+            builder
+                .body(Body::empty())
+                .map(|mut request| {
+                    request.extensions_mut().insert(Principal::anonymous());
+                    request
+                })
+                .unwrap()
+        };
+
+        // A revision the application is not at: nothing is planned.
+        let response = api
+            .clone()
+            .oneshot(start(
+                "migration-stale-fence",
+                Some(format!("\"{}\"", revision + 41)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        // A malformed fence is a mistake, not an absent fence.
+        let response = api
+            .clone()
+            .oneshot(start("migration-bad-fence", Some("not-a-revision".into())))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // No fence at all is refused too: the route has documented the
+        // header as required since it was published.
+        let response = api
+            .clone()
+            .oneshot(start("migration-no-fence", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        // The revision the application is at: accepted.
+        let response = api
+            .clone()
+            .oneshot(start(
+                "migration-good-fence",
+                Some(format!("\"{revision}\"")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
     #[tokio::test]
     async fn start_returns_a_complete_idempotent_operation_resource_and_poll_location() {
         let directory = TempDir::new().unwrap();
@@ -898,6 +1013,7 @@ mod tests {
             .create_environment("shop", "production")
             .await
             .unwrap();
+        let store_revision = store.get_app("shop").await.unwrap();
         let config = ControlConfig {
             store_endpoint: Some("http://127.0.0.1:9".to_string()),
             queue_endpoint: Some("http://127.0.0.1:10".to_string()),
@@ -911,13 +1027,17 @@ mod tests {
         let request_id = CanonicalId::new_v7();
         let correlation_id = CanonicalId::new_v7();
         let idempotency_key = "migration-shop-2026-09-04";
-        let make_request = || {
+        let revision = store_revision.revision;
+        let make_request = move || {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/shop/identity-migration")
                 .header(IDEMPOTENCY_KEY, idempotency_key)
                 .header(REQUEST_ID, request_id.to_string())
                 .header(CORRELATION_ID, correlation_id.to_string())
+                // The fence this route demands: the application revision the
+                // caller planned against.
+                .header(header::IF_MATCH, format!("\"{revision}\""))
                 .body(Body::empty())
                 .map(|mut request| {
                     request.extensions_mut().insert(Principal::anonymous());
@@ -971,6 +1091,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/apps/shop/identity-migration")
                     .header(IDEMPOTENCY_KEY, "different-migration-request")
+                    .header(header::IF_MATCH, format!("\"{revision}\""))
                     .body(Body::empty())
                     .map(|mut request| {
                         request.extensions_mut().insert(Principal::anonymous());
@@ -1593,7 +1714,10 @@ mod gated_tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use super::{CoordinatorAvailability, MigrationApiState, OperationAccess, REQUEST_ID, router};
+    use super::{
+        CORRELATION_ID, CoordinatorAvailability, MigrationApiState, OperationAccess, REQUEST_ID,
+        router,
+    };
     use crate::api::authz::{AuthzState, authorize};
     use crate::api::catalog::providers::tests::{
         attach_artifact, begin_deployment, provider_fixture,
@@ -1696,6 +1820,58 @@ mod gated_tests {
         }
         fn text(&self) -> String {
             String::from_utf8_lossy(&self.bytes).into_owned()
+        }
+    }
+
+    /// The gate is layered outside all three mounts, so a call it refuses
+    /// never reaches the request-context middleware and the answer is built
+    /// by the gate itself. Both ids still come back: a client that sent a
+    /// correlation id has to be able to tie the refusal to the calls it
+    /// sent around it, and an operator has to find the audit line by the
+    /// same id the caller holds.
+    #[tokio::test]
+    async fn a_refusal_from_the_gate_echoes_both_ids() {
+        const CORRELATION: &str = "01990f44-1000-7000-8000-00000000fee1";
+        let database = Arc::new(crate::database::Database::init(":memory:").await.unwrap());
+        let store = Arc::new(CatalogStore::new(database));
+        store.create_app("demo").await.unwrap();
+        let gated = gated(store).await;
+
+        for (uri, credential) in [
+            // No credential at all, and the gate is enforcing: 401.
+            ("/api/v1/apps/demo/identity-migration", None),
+            // A credential that reaches one environment of one
+            // application, asked for an administrator's route: 403.
+            (
+                "/api/v1/apps/demo/identity-migration",
+                Some(gated.deploy_secret.clone()),
+            ),
+            // No route at all under the versioned prefix: the fallback,
+            // which is mounted outside everything.
+            ("/api/v1/nothing-of-the-kind", None),
+        ] {
+            let mut request = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("host", "localhost:8080")
+                .header(REQUEST_ID, REQUEST)
+                .header(CORRELATION_ID, CORRELATION);
+            if let Some(secret) = credential {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {secret}"));
+            }
+            let response = gated
+                .router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_client_error(),
+                "{uri} was not refused: {}",
+                response.status()
+            );
+            assert_eq!(response.headers()[REQUEST_ID], REQUEST, "{uri}");
+            assert_eq!(response.headers()[CORRELATION_ID], CORRELATION, "{uri}");
         }
     }
 

@@ -2819,3 +2819,80 @@ Application/framework source + versioned build plan
   Clippy；Linux 另通过 18 份 Schema/62 组 fixture，macOS 缺 `jsonschema` 仍记为环境未执行。正式记录为
   `evidence/provider-driver-dispatcher-portability-e0086eb.json`；生成式 TypeScript 客户端与 demo 切 v1 由仓内门禁而非三端
   复验覆盖，它证明这些控制路径的三平台代码可移植性，不证明真实 provider 部署或 Edge Canon 合规。
+
+## 97. 标准锁定后的 demo 回归修复与 3ebe108..e0086eb 十视角深度审查
+
+- 背景先说清楚：2026-09-04 起 GitHub Actions 因组织账单问题一个 job 都没跑起来（每个 run 5 秒内结束、所有 job 无 step，
+  annotation 写明账户付款失败或需提高支出上限），至 2026-09-07 已连续 82 个 run 失败。这段时间合入的提交没有被 CI 覆盖过，
+  下面两处真实产品回归正是在这个窗口里进入 main 而无人发现的。main 全红是账单问题，不是代码问题，只有账号管理员能处理。
+- `env.ASSETS` 对所有走标准环境的应用都是 `undefined`：`70fba8d` 之后 `runtime.js` 用 `op_deis_environment_is_standard`
+  把 ASSETS 绑定的安装挡在 schema-2 应用之外，而同一处注释仍写着「应用自带的同名变量已在 Rust 侧摘掉」——那句话在同一个窗口
+  里变成了假话。凡是从 Cloudflare Pages 移植、第一行就是 `env.ASSETS.fetch(request)` 的 handler 在本平台上全是坏的。
+  现在 ASSETS 与具名 logical resource binding 在同一处、以同样不可写不可配置的方式无条件安装，那个 op 已删除。
+- 平台保留名进入 EC-ENV 声明文档：名叫 `ASSETS` 或以 `DEIS_` 开头的 environment declaration 一律被拒，错误码
+  `EC_ENV_NAMESPACE_COLLISION`，判定写在 `deis-wire` 的 `EnvironmentDeclaration::validate` 上。构建（解析 `.config.json`）、
+  上传与装载（`Manifest::validate`）、控制面下发（`snapshot.validate`）、节点物化（`materialize_standard_environment`）
+  本来就都调这一个函数，于是一条规则四处生效、拼写只有一份。对 schema-2 采取整包拒绝而不是摘掉该名字：声明写着 required，
+  摘掉之后部署仍会索要一个应用永远读不到的值，失败被推迟到 handler 里且没有线索指回名字；schema-1 仍走旧路，节点照旧摘键记
+  warn。副作用要写明：入库早于本次改动且声明里带保留名的旧 bundle，从现在起在下发或装载时被拒，必须重新构建。
+- 所有应用应答都丢了 `Content-Length`：`edgeCanonLifecycleResponse` 为了观察响应何时结束，把每个非空响应体重新包成一个
+  `EdgeCanonReadableStream`，于是节点只能分块发送。这对平台上每个应用的每个客户端都可见，也让「缓冲应答」与「流式应答」
+  从外部无法区分——而这正是流式检查赖以成立的区别。现在只有应用仍在生产的响应体才包装，完整响应体原样交给节点并带上长度；
+  构建期与节点对「走哪条路」的判断由同一个函数导出，不会再各说各话。顺带修好的是：定时器扫除告警此前被这层包装吞掉，
+  因为流式应答会在 invocation 收尾之前就 `adopt` 掉仍然挂着的定时器，节点那句「请求结束时仍有定时器，已清理」永不写出。
+- provider 派生把应用的函数路由压成一条 `/*`：canonical artifact 的唯一入口 `functions/main.js` 被 stage 成
+  `functions/[[all]].js`，文件名映射出 `/*`，适配器把它原样抄进 manifest。节点读 manifest `routes` 只为一件事——判断哪些路径
+  属于 isolate——于是 isolate 认领了全部路径，`site.not_found` 声明的 404 页面永不送出，生成入口对未匹配路径答
+  `new Response(null, {status:404})`，demo 的 `/no-such-page` 与 `/verifyx` 都拿到空体 404。修复是把 canonical routing
+  document 的 `functions[].source` 贯穿到 manifest，入口模块仍是单模块单默认导出。定下的规矩：路由事实只有
+  `routing-static-assets.json` 的 `functions[]` 与 `fallback`，打包器自己的 staging 布局是打包细节，永远不得被当成路由表。
+  同类缺陷在 EdgeOne Node Function 模式仍在（`cloud-functions/api-node/config.json` 写死 `^/(.*)$` 且缺
+  `{"handle":"filesystem"}` 分界），本轮未修，已记入 roadmap。
+- demo 自身按锁定后的标准改写而不是放宽：WebSocket 回显 handler 改由「构建期被 `EC_STREAM_WEBSOCKET_NONPORTABLE` 拒绝、
+  没有写出包也没有建出应用」来证明——Edge Canon v1 没有可移植的服务端 WebSocket 应用 API，应用被许诺的就是这次拒绝而不是
+  一个 101；`_headers` 合成单块，因为锁定标准以 first-match 语义下降 `_headers`，多于一块的文件在构建期即被
+  `EC_ROUTING_SOURCE_UNREPRESENTABLE` 拒绝；应用声明 `ASSETS` 那条检查从「运行期被节点摘掉」改为「`deis deploy` 第一步即
+  拒绝」，同一次运行里另证被接受的应用其 `env.ASSETS` 是平台的对象；blob 那条补上 `--binding BLOB`，因为具名绑定在租户内
+  自成命名空间，操作者要拿到应用存的对象就得说出应用声明的绑定名；作用域 token 那条按标准补上 `config_values`——config 值
+  现在只是部署期输入，不进包、不进 canonical artifact、也不被控制面留存，所以每次部署都要自带，且必须带被部署那个版本
+  自己的值（发错版本的值会把 `BUILD_LABEL` 覆盖掉），并接受 201 与 202 两种应答，因为二者的区别在于投递是否当场完成，
+  与凭据被允许做什么无关。检查数 95→94（WebSocket 的两条握手检查合并为一条构建期拒绝检查）。
+- 深度审查覆盖 `3ebe108..e0086eb`（约 110 个文件）十个视角：授权与信息泄露、幂等与并发、契约保真、库表与升级安全、
+  CLI 与 Web 消费方、driver 协议与协调器、错误与日志泄露、测试质量、文档真实性、故障下的运维行为。原始 66 条、去重 64 条，
+  每条由两名独立 skeptic 分别「证伪」与「复现」，两票一致才算确认，共确认 51 条（1 条 blocker、18 条 major、32 条 minor），
+  按区域顺序修复 45 条，退回 4 条。
+- 确认并修复的要害项：ambiguous 或租约过期的 `rollback` 步骤此前永远无法被 reconcile（认领时保留 `rollbackTarget` 却把
+  operation 改写成 `reconcile`，而校验拒绝非 rollback 请求携带 rollback target），现在 `reconcile` 请求带一个必填的
+  `reconciles.operation` 指明它接管了哪个操作，rollback 的 reconcile 保留其 target；取消若在最后一步已交给 provider 之后
+  才到达，此前会把七步全部成功的工作流记为 `cancelled` 且此后 rollback 被拒——目录与线上状态互相矛盾且无路可退，现在这种
+  取消以 `409 operation-not-cancellable` 拒绝（取消是「不做尚未做的事」的承诺，最后一步之后已无可扣留），并说明为何不采用
+  「折算为成功」：那需要 `cancelling → succeeded` 第十三条状态迁移边，与契约、OpenAPI 文字和生成 TS 反复承诺的十二条相悖，
+  属于 ADR 级决定；经 reconcile 接管settle 的 activation 现在是合法的 rollback 源；`cancelling` 工作流即便其 target 或
+  installation 已不活跃也会被就绪扫描收下，否则生命周期删除会被一个永远无法 settle 的取消永久挡住。
+- 分页与查询计划：每个列表页现在是两条语句而不是一条——首页不写游标谓词，只有续页写。此前
+  `(?n IS NULL OR sort < ?n OR (sort = ?n AND tie < ?m))` 这种析取式 SQLite 无法转成索引区间，`*_page_v1` 只提供排序而每页
+  都在扫描作用域前缀。`pagination_plans` 现在全部由各 store 自己的 page-SQL builder 渲染（没有抄写的 SQL），每个列表解释
+  首页与续页两种形态，并要求续页的排序列出现在索引 seek 括号之内；此前完全没有条目的四类诊断历史与生命周期审计页也补齐。
+  第 92 节「逐页 18–25 ms、深度不变」那次测量是在旧语句上取的，结论现在才因它给出的理由成立，数字需重测重述。
+  游标令牌改为派生（HMAC-SHA256 覆盖集合、查询绑定与位置，使用进程内密钥），同一页产出同一令牌并复用同一行，
+  轮询的控制台不再把两条读路由变成持久写路由；到期清理有界（每条语句至多 512 行，reaper 与请求内的顺带删除共用），
+  reaper 的首轮扫除移进它自己的任务，API 监听不再排在它后面。
+- 契约与错误面：每个 operation 都记录 500、每个带 JSON body 的 operation 都记录 415（由 `api::openapi` 的 modifier 保证，
+  写注解时无法遗漏），六条从不发出 422 的路由删除该记录；`ProductOperation` 的 state 与 kind 改为从 `deis_wire` 渲染，
+  发布的枚举不会再与线上漂移，`queued` 终于被记录，`progress` 明确为 0..=10000 的基点而非百分比；axum extractor 的拒绝
+  （畸形 query/JSON/path、超限 body、缺 Content-Type）在 v1 与 platform 也走结构化信封，旧前缀仍是纯文本；每个由后端故障
+  构成的 5xx 一律不透明，具体原因只进带 request id 的日志；provider 的读取不再充当存在性判据，跨作用域的 id 与不存在的 id
+  返回逐字节相同的 404。
+- 退回与开放决策（需要产品拍板，本轮不擅自决定）：`ProductOperation` 中确实会序列化为 `null` 的成员如实标注属于响应类型
+  放宽，兼容门禁判为破坏性，唯一出路是 v1 文档大版本或显式豁免；`api_page_cursors` 没有容量上限，设上限要在「拒绝列表请求」
+  与「驱逐同一查询绑定的旧位置（可能作废正在进行的遍历）」之间选，且要付一条索引的代价；driver 重试没有次数上限，一个持续
+  可重试失败的子操作永远到不了操作者可处置的终态；`idx_events_page_v1` 从未被选中（`id` 即 rowid，既有的
+  `idx_events_timestamp` 已能给出同序），它是否该退役需要决定。
+- 门禁：`cargo fmt --all --check` 干净；整个工作区 `clippy --all-targets -D warnings` 零告警；`cargo test --workspace`
+  110 个测试二进制、3306 项通过、0 失败、15 项按设计忽略；治理（25 个 ADR、6 个 roadmap 阶段、Edge Canon a41a4ca 锁定）、
+  共享契约 18 Schema / 69 组 fixture / 12 条状态迁移、OpenAPI 兼容（113 个 operation 仅增量，1.0.0 → 1.0.0）、
+  生成 TS 客户端与文档一致（170 个 schema、113 个 operation）、文档路径字面量 84 份、demo witness、Web 构建与 lint 全部通过；
+  `./scripts/demo.sh verify` 94 通过 / 0 失败 / 点名 94 项齐全，退出码 0。
+- 未完成：Web organization/application/environment 主线；session/command/event/config history 的 state/status/severity
+  服务端枚举；四条自成形状的平台诊断列表迁入 `ControlListPage`；EdgeOne Node Function 路由配置；README 与 architecture
+  文档中仍以旧前缀拼写的路由表（旧前缀 2027-06-30 前有效）；上一条列出的四项开放决策；总 Goal 需外部资源的项不变。

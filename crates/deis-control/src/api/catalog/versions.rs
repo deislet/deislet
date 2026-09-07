@@ -41,9 +41,10 @@ pub struct VersionView {
     /// Exact provider-neutral parent and provider derivation. Both are absent
     /// only for legacy raw-bundle uploads.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<String>, format = Uuid)]
+    #[schema(value_type = Option<String>, format = Uuid, nullable = false)]
     pub canonical_artifact_id: Option<CanonicalId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub provider_derivation_sha256: Option<String>,
     pub created_at: i64,
     /// The manifest as structured JSON, parsed from the stored text.
@@ -148,12 +149,12 @@ const BUNDLE_ENTRY: &str = "payload/bundle.zip";
     params(("app_id" = String, Path, description = "The application's id."), UploadQuery),
     request_body(content = openapi::BinaryBody, content_type = "application/octet-stream", description = "The bundle bytes."),
     responses(
-        (status = 201, description = "The version was stored; `created` is false when the same bundle was already there.", body = UploadResponse),
+        (status = 200, description = "A byte-identical bundle was already stored; `created` is false and nothing was written.", body = UploadResponse),
+        (status = 201, description = "The version was stored; `created` is true.", body = UploadResponse),
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
         (status = 413, response = openapi::PayloadTooLarge),
-        (status = 422, response = openapi::UnprocessableEntity),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
     )
@@ -215,12 +216,12 @@ pub async fn upload_version(
     params(("app_id" = String, Path, description = "The application's id."), ("artifact_id" = String, Path, description = "The canonical artifact's UUIDv7."), UploadQuery),
     request_body(content = openapi::BinaryBody, content_type = "application/octet-stream", description = "The provider derivation envelope."),
     responses(
+        (status = 200, description = "A byte-identical envelope was already stored under this lineage; `created` is false and nothing was written.", body = UploadResponse),
         (status = 201, description = "The version was stored with its lineage to the canonical artifact.", body = UploadResponse),
         (status = 400, response = openapi::BadRequest),
         (status = 404, response = openapi::NotFound),
         (status = 409, response = openapi::Conflict),
         (status = 413, response = openapi::PayloadTooLarge),
-        (status = 422, response = openapi::UnprocessableEntity),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
     )

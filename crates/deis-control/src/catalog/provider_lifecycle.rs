@@ -24,7 +24,8 @@
 
 use chrono::{DateTime, Utc};
 use deis_wire::CanonicalId;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use utoipa::ToSchema;
@@ -32,7 +33,9 @@ use utoipa::ToSchema;
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
 use super::model::now_secs;
 use super::operation::actor_id;
-use super::pagination::{CatalogPage, PagePosition, finish_page, sqlite_fetch_limit};
+use super::pagination::{
+    CatalogPage, KeysetDirection, KeysetResume, PagePosition, finish_page, sqlite_fetch_limit,
+};
 use super::provider_driver_operation::{
     ProviderInstallation, ProviderTarget, load_installation, load_target_record,
 };
@@ -447,27 +450,24 @@ impl CatalogStore {
                     params![kind.as_str(), resource_id.to_string()],
                     |row| row.get::<_, i64>(0),
                 )?;
-                let (after_revision, after_id) = cursor
-                    .map(|cursor| (Some(cursor.sort_value), cursor.identity))
-                    .unwrap_or((None, String::new()));
-                let mut statement = transaction.prepare(
-                    "SELECT event_id, resource_revision, actor_id, event_type, reason,
-                            cascade_json, occurred_at
-                       FROM provider_lifecycle_audit_events
-                      WHERE resource_kind = ?1 AND resource_id = ?2
-                        AND (?3 IS NULL OR resource_revision > ?3
-                             OR (resource_revision = ?3 AND event_id > ?4))
-                      ORDER BY resource_revision, event_id LIMIT ?5",
-                )?;
+                let resume = KeysetResume::value_and_identity(
+                    3,
+                    KeysetDirection::Ascending,
+                    "resource_revision",
+                    "event_id",
+                    cursor,
+                );
+                let mut statement =
+                    transaction.prepare(&lifecycle_audit_events_page_sql(&resume))?;
                 let rows = statement
                     .query_map(
-                        params![
-                            kind.as_str(),
-                            resource_id.to_string(),
-                            after_revision,
-                            after_id,
-                            fetch_limit
-                        ],
+                        params_from_iter(resume.bindings(
+                            [
+                                Value::from(kind.as_str().to_owned()),
+                                Value::from(resource_id.to_string()),
+                            ],
+                            fetch_limit,
+                        )),
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -773,6 +773,26 @@ fn delete_target_tx(
         "Soft-deleted provider target; its history, grants and workflows are retained"
     );
     Ok(cascade)
+}
+
+/// One resource's lifecycle audit trail, oldest revision first.
+///
+/// The seek is `(resource_kind, resource_id)`, which the table's own
+/// `UNIQUE(resource_kind, resource_id, resource_revision)` index answers;
+/// the cursor predicate is written only when the request resumes from one,
+/// because a predicate guarded by `?n IS NULL` is not a range SQLite can
+/// seek (see `pagination::KeysetResume`). `pagination_plans` explains both
+/// forms.
+pub(crate) fn lifecycle_audit_events_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT event_id, resource_revision, actor_id, event_type, reason,
+                cascade_json, occurred_at
+           FROM provider_lifecycle_audit_events
+          WHERE resource_kind = ?1 AND resource_id = ?2{resume_clause}
+          ORDER BY resource_revision, event_id LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
 }
 
 /// Ids of provider deployment workflows that are not terminal, filtered by

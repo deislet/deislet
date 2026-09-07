@@ -191,7 +191,7 @@ One request, so `--limit` is capped at 1000 — that is one page of the list
 route. The line under the table says how many rows are behind the ones
 printed, and where to look when they are further back than one page reaches.
 
-### `deis provider-deployments list|get|cancel|rollback [--wait]`
+### `deis provider-deployments list|get|cancel|rollback`
 
 One environment's provider deployments: the durable workflows that drive a
 provider's own cloud, not the pointer moves `deis deployments` lists. A
@@ -213,7 +213,9 @@ move it can be asked to stop, and once finished it can be undone.
   deployment left behind. It records a **new** operation rather than undoing
   the named one, so the id it prints is a different one; `--wait` follows that
   new operation to a terminal state instead of returning as soon as the
-  control plane has accepted it.
+  control plane has accepted it. `--json` names the new operation either way:
+  a wait that gives up before the workflow settles leaves `providerDeployment`
+  null and says why in `waitError`, and the command still exits non-zero.
 
 The operation id is the OPERATION column of `list`; anything that is not a
 canonical UUIDv7 is refused before a request is sent.

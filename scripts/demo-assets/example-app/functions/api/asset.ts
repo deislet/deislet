@@ -8,11 +8,12 @@
 // file behind it, a catch-all that answers `/` from `index.html`.
 //
 // The binding is also the one name on `context.env` an application cannot
-// take. This project deliberately declares an ordinary variable called
-// `ASSETS` in its .config.json; the platform removes it before the map becomes
-// `context.env` and installs the binding in its place. So the report below
-// says what `env.ASSETS` actually is, and a platform that let the string win
-// would show up here as a string rather than as an object with a `fetch`.
+// take: a project that writes `ASSETS` into its own environment is refused
+// when it is built, so this project does not have one and could not have one.
+// The report below therefore says what `env.ASSETS` actually is on a project
+// that was accepted - an object with a `fetch` - which is the second half of
+// the same claim: the platform owns the name, and the platform's object is
+// what a handler gets.
 export default async function handler(context: any): Promise<Response> {
   const answer = (body: Record<string, unknown>, status = 200): Response =>
     new Response(JSON.stringify(body), {
@@ -24,8 +25,10 @@ export default async function handler(context: any): Promise<Response> {
   const kind = binding === null ? "null" : typeof binding;
   const usable = kind === "object" && typeof binding.fetch === "function";
   const report = {
-    // What the name holds. "object" is the binding; "string" would be the
-    // variable this project declares having won.
+    // What the name holds. "object" is the binding; "string" would mean an
+    // ordinary value reached `context.env` under this name and won, which is
+    // the outcome the build refusal and the install order between them exist
+    // to make impossible.
     bindingKind: kind,
     bindingIsCallable: usable,
     declaredValueVisible: kind === "string" ? binding : null,

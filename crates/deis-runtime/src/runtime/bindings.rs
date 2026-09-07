@@ -143,7 +143,13 @@ pub const STORAGE_TOKEN_KEY: &str = deis_wire::conventions::STORAGE_TOKEN_ENV;
 ///
 /// Bare, not `DEIS_`-prefixed, because it is the name an author writes; the
 /// spelling is Cloudflare's, so a Pages project's code reads the same here.
-pub const ASSETS_BINDING_KEY: &str = "ASSETS";
+///
+/// The same name is refused as a schema-2 environment declaration and as a
+/// logical resource, both of them from
+/// [`deis_wire::conventions::RESERVED_PLATFORM_BINDING_NAME`], which is where
+/// this spelling comes from: three components have to agree on it and none of
+/// them can see the others' copy.
+pub const ASSETS_BINDING_KEY: &str = deis_wire::conventions::RESERVED_PLATFORM_BINDING_NAME;
 
 /// Reserved deployment-env key carrying this version's binding table.
 ///

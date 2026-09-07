@@ -1251,6 +1251,24 @@ pub(crate) mod tests {
             assert!(error["message"].is_string(), "{uri}");
         }
 
+        // The route fallback runs outside every mount, so it settles the ids
+        // itself; it still echoes both, and a caller quoting either finds
+        // the same answer in the log.
+        for uri in ["/api/v1/nothing-of-the-kind", "/api/nothing-of-the-kind"] {
+            let response = call_with_id(&router, uri).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                header_str(&response, REQUEST_ID_HEADER),
+                Some(SENT),
+                "{uri}"
+            );
+            assert_eq!(
+                header_str(&response, CORRELATION_ID_HEADER),
+                Some(SENT),
+                "{uri}"
+            );
+        }
+
         // A success on every surface echoes the id too.
         for uri in ["/api/apps", "/api/v1/apps", "/api/platform/runtime"] {
             let response = call_with_id(&router, uri).await;

@@ -156,10 +156,24 @@ async fn the_file_tree_becomes_route_patterns() {
         vec!["/users/:id", "/", "/api/*"],
         "canonical patterns and their order both matter"
     );
+    // The manifest names the same paths, and it used to name only `/*`.
+    //
+    // The shape changed because the two tables answer different questions. The
+    // catch-all is a fact about *packaging*: the derived provider project holds
+    // the canonical module under one file, and the entry module built around it
+    // still dispatches internally. The manifest is a fact about *ownership*: a
+    // node reads it to decide whether a request that names no file belongs to
+    // the isolate or to the site, and `/*` told it the isolate owns every path.
+    // A bundle that shipped its own 404.html therefore answered an empty 404
+    // from the entry module's unmatched branch and never served the page.
     assert_eq!(
         manifest.route_patterns(),
-        vec!["/*"],
-        "the Deislet transport invokes the already-routed canonical module through one catch-all"
+        routing
+            .functions
+            .iter()
+            .map(|route| route.source.clone())
+            .collect::<Vec<_>>(),
+        "the bundle has to state the application's own paths, not the staged file name"
     );
     assert!(
         manifest.routes.iter().all(|r| r.methods.is_empty()),

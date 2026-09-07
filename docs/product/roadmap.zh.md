@@ -69,6 +69,14 @@
 
 ## 本地检查
 
+- `P1-ROUTE-001`（新增，queued）：EdgeOne Node Function 模式把路由表写成单条 `^/(.*)$` 且不写 `{"handle":"filesystem"}`
+  分界，函数因此认领全部路径、静态文件不可达。deislet 目标的同类缺陷已修（provider manifest 改由 canonical routing
+  document 的 `functions[]` 决定，打包器的 staging 布局不再被当成路由事实），EdgeOne 一侧待办。
+- `P1-API-002`（新增，queued）：深度审查留下四项需要产品拍板的开放决策——`ProductOperation` 可空成员如实标注属于响应
+  放宽（要 v1 大版本或显式兼容豁免）；`api_page_cursors` 的容量上限该是拒绝列表请求还是驱逐同一查询绑定的旧位置，以及
+  为此付出的索引代价；driver 重试的次数上限与耗尽后父操作是否 `failed`；`idx_events_page_v1` 从未被规划器选中，是否退役。
+  四项均记于阶段分析第 97 节。
+
 ```bash
 python3 scripts/check-product-governance.py
 ```

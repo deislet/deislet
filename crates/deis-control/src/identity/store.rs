@@ -19,7 +19,8 @@
 
 use std::sync::Arc;
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -27,7 +28,7 @@ use uuid::Uuid;
 use super::token;
 use super::{Authority, Principal, PrincipalKind, Role, Scope};
 use crate::catalog::model::now_secs;
-use crate::catalog::pagination::{finish_page, sqlite_fetch_limit};
+use crate::catalog::pagination::{KeysetDirection, KeysetResume, finish_page, sqlite_fetch_limit};
 use crate::catalog::{CatalogError, CatalogPage, PageCursorStore, PagePosition};
 use crate::database::{Database, DatabaseError};
 use utoipa::ToSchema;
@@ -46,7 +47,7 @@ const MAX_NAME_LEN: usize = 64;
 const LAST_USED_RESOLUTION_SECS: i64 = 60;
 
 const ACCOUNT_COLUMNS: &str = "id, name, role, created_at, disabled_at";
-const TOKEN_COLUMNS: &str = "id, account_id, name, origin, scopes, unscoped, created_at, \
+pub(crate) const TOKEN_COLUMNS: &str = "id, account_id, name, origin, scopes, unscoped, created_at, \
                              last_used_at, revoked_at";
 
 /// Everything this store can refuse to do. The variants map one-to-one onto
@@ -283,23 +284,22 @@ impl IdentityStore {
         cursor: Option<PagePosition>,
     ) -> IdentityResult<CatalogPage<Account>> {
         let fetch_limit = sqlite_fetch_limit(limit, "accounts")?;
-        let (after_created_at, after_name) = cursor
-            .map(|position| (Some(position.sort_value), position.identity))
-            .unwrap_or((None, String::new()));
+        let resume = KeysetResume::value_and_identity(
+            1,
+            KeysetDirection::Ascending,
+            "created_at",
+            "name",
+            cursor,
+        );
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             let total = transaction.query_row("SELECT COUNT(*) FROM accounts", [], |row| {
                 row.get::<_, i64>(0)
             })?;
-            let mut stmt = transaction.prepare(&format!(
-                "SELECT {ACCOUNT_COLUMNS} FROM accounts
-                  WHERE (?1 IS NULL OR created_at > ?1
-                         OR (created_at = ?1 AND name > ?2))
-                  ORDER BY created_at ASC, name ASC LIMIT ?3"
-            ))?;
+            let mut stmt = transaction.prepare(&accounts_page_sql(&resume))?;
             let rows = stmt
                 .query_map(
-                    params![after_created_at, after_name, fetch_limit],
+                    params_from_iter(resume.bindings([], fetch_limit)),
                     read_account,
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -474,11 +474,18 @@ impl IdentityStore {
         cursor: Option<PagePosition>,
     ) -> IdentityResult<CatalogPage<ApiToken>> {
         let fetch_limit = sqlite_fetch_limit(limit, "tokens")?;
-        let (after_created_at, after_id) = cursor
-            .map(|position| (Some(position.sort_value), position.identity))
-            .unwrap_or((None, String::new()));
         let unscoped_only = filter.scope == TokenScopeFilter::Unscoped;
         let columns = TOKEN_COLUMNS.replace(", ", ", t.");
+        // The cursor's parameters follow the filters, which is one more
+        // parameter when the page is narrowed to an account.
+        let first_cursor_param = if filter.account_id.is_some() { 4 } else { 3 };
+        let resume = KeysetResume::value_and_identity(
+            first_cursor_param,
+            KeysetDirection::Ascending,
+            "t.created_at",
+            "t.id",
+            cursor,
+        );
         self.with_conn(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             // One statement per account filter. Written as `(?1 IS NULL OR
@@ -499,26 +506,18 @@ impl IdentityStore {
                         params![account_id, filter.include_revoked, unscoped_only],
                         |row| row.get::<_, i64>(0),
                     )?;
-                    let mut stmt = transaction.prepare(&format!(
-                        "SELECT t.{columns}, a.name FROM api_tokens t
-                           JOIN accounts a ON a.id = t.account_id
-                          WHERE t.account_id = ?1
-                            AND (?2 = 1 OR t.revoked_at IS NULL)
-                            AND (?3 = 0 OR t.unscoped = 1)
-                            AND (?4 IS NULL OR t.created_at > ?4
-                                 OR (t.created_at = ?4 AND t.id > ?5))
-                          ORDER BY t.created_at ASC, t.id ASC LIMIT ?6"
-                    ))?;
+                    let mut stmt =
+                        transaction.prepare(&tokens_by_account_page_sql(&columns, &resume))?;
                     let rows = stmt
                         .query_map(
-                            params![
-                                account_id,
-                                filter.include_revoked,
-                                unscoped_only,
-                                after_created_at,
-                                after_id,
+                            params_from_iter(resume.bindings(
+                                [
+                                    Value::from(account_id.clone()),
+                                    Value::from(filter.include_revoked),
+                                    Value::from(unscoped_only),
+                                ],
                                 fetch_limit,
-                            ],
+                            )),
                             read_token,
                         )?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -532,24 +531,16 @@ impl IdentityStore {
                         params![filter.include_revoked, unscoped_only],
                         |row| row.get::<_, i64>(0),
                     )?;
-                    let mut stmt = transaction.prepare(&format!(
-                        "SELECT t.{columns}, a.name FROM api_tokens t
-                           JOIN accounts a ON a.id = t.account_id
-                          WHERE (?1 = 1 OR t.revoked_at IS NULL)
-                            AND (?2 = 0 OR t.unscoped = 1)
-                            AND (?3 IS NULL OR t.created_at > ?3
-                                 OR (t.created_at = ?3 AND t.id > ?4))
-                          ORDER BY t.created_at ASC, t.id ASC LIMIT ?5"
-                    ))?;
+                    let mut stmt = transaction.prepare(&tokens_page_sql(&columns, &resume))?;
                     let rows = stmt
                         .query_map(
-                            params![
-                                filter.include_revoked,
-                                unscoped_only,
-                                after_created_at,
-                                after_id,
+                            params_from_iter(resume.bindings(
+                                [
+                                    Value::from(filter.include_revoked),
+                                    Value::from(unscoped_only),
+                                ],
                                 fetch_limit,
-                            ],
+                            )),
                             read_token,
                         )?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -995,6 +986,50 @@ fn read_credential(row: &Row<'_>) -> rusqlite::Result<Credential> {
         role: Role::parse(&role).unwrap_or(Role::Viewer),
         account_disabled: row.get::<_, Option<i64>>(7)?.is_some(),
     })
+}
+
+// --------------------------------------------------------------------
+// Page statements
+//
+// The two forms a keyset page has: with the cursor predicate when the
+// request resumes from one and without it otherwise, so SQLite seeks the
+// page index instead of walking the collection (see
+// `catalog::pagination::KeysetResume`). `catalog::pagination_plans`
+// explains both forms of each against the real schema.
+// --------------------------------------------------------------------
+
+pub(crate) fn accounts_page_sql(resume: &KeysetResume) -> String {
+    format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM accounts{resume_clause}
+          ORDER BY created_at ASC, name ASC LIMIT ?{limit}",
+        resume_clause = resume.where_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn tokens_page_sql(columns: &str, resume: &KeysetResume) -> String {
+    format!(
+        "SELECT t.{columns}, a.name FROM api_tokens t
+           JOIN accounts a ON a.id = t.account_id
+          WHERE (?1 = 1 OR t.revoked_at IS NULL)
+            AND (?2 = 0 OR t.unscoped = 1){resume_clause}
+          ORDER BY t.created_at ASC, t.id ASC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
+}
+
+pub(crate) fn tokens_by_account_page_sql(columns: &str, resume: &KeysetResume) -> String {
+    format!(
+        "SELECT t.{columns}, a.name FROM api_tokens t
+           JOIN accounts a ON a.id = t.account_id
+          WHERE t.account_id = ?1
+            AND (?2 = 1 OR t.revoked_at IS NULL)
+            AND (?3 = 0 OR t.unscoped = 1){resume_clause}
+          ORDER BY t.created_at ASC, t.id ASC LIMIT ?{limit}",
+        resume_clause = resume.and_clause(),
+        limit = resume.limit_index(),
+    )
 }
 
 fn read_account(row: &Row<'_>) -> rusqlite::Result<Account> {

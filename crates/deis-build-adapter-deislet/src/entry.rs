@@ -121,6 +121,34 @@ function buildContext(context, params) {
   return createEdgeCanonContext(context.request, context.env, params, nativeWaitUntil);
 }
 
+// The node's own answer to "will this response be sent whole?", handed to the
+// handler boundary so that an ordinary answer stays an ordinary answer.
+//
+// The boundary has to know when the response is finished before it can close
+// the invocation's lifecycle, and with no word from the provider its only way
+// to find out is to read the body to its end through a stream of its own -
+// which turns every answer, including a plain string, into a chunked one on the
+// wire. deis-runtime already decides the same question for its own reasons
+// (`bodyLeavesAsWholeBytes` in `js/runtime.js`): a body that was never a
+// ReadableStream leaves the isolate as one buffer with a Content-Length, and
+// anything else leaves chunk by chunk. Asking it here means the two agree by
+// construction rather than by coincidence.
+//
+// Read off the global rather than off the context, because this module is
+// generated twice for one request. The canonical artifact's own entry is
+// staged as the single catch-all handler of the provider build, so the copy
+// that touches the application's response is called with the standard's exact
+// four-field context and has no provider object to ask - and it is that copy
+// that settles the framing, because whatever it hands back is all the outer
+// copy ever sees. A provider that publishes no such name - every target that is
+// not this node, and an older node loading a newer bundle - leaves the boundary
+// on its own road, which is slower for a whole body and wrong for none.
+function providerResponseBodyIsWhole() {
+  const probe = globalThis.__deis_runtime_response_is_whole;
+  if (typeof probe !== 'function') return undefined;
+  return (response) => probe(response);
+}
+
 export default async function deisletEntry(context) {
   const pathname = pathnameOf(context.request);
   const segments = splitPath(pathname);
@@ -131,7 +159,8 @@ export default async function deisletEntry(context) {
     const lifecycle = buildContext(context, params);
     return await invokeEdgeCanonHandler(
       lifecycle,
-      () => route.handler(lifecycle.context)
+      () => route.handler(lifecycle.context),
+      providerResponseBodyIsWhole()
     );
   }
 

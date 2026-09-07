@@ -122,6 +122,8 @@ pub async fn list(
         "OPERATION",
         "KIND",
         "STATE",
+        "PHASE",
+        "PROGRESS",
         "CANCEL",
         "ROLLBACK OF",
     ]);
@@ -154,6 +156,21 @@ fn row(workflow: &ProviderDeployment) -> Vec<String> {
         workflow.operation.operation_id.to_string(),
         escaped(&workflow.kind),
         escaped(&workflow.operation.state),
+        // Phase and progress are here rather than only in `get` because
+        // this is the command an operator watches a long provider
+        // deployment with, and asking them to read one workflow at a time
+        // to answer "is it moving" would make the list the wrong tool for
+        // the one job it has. A dash in either column is a statement of its
+        // own: an unnamed phase, or a control plane with no honest
+        // denominator to divide by - which is not the same fact as 0%.
+        escaped_or_dash(match workflow.operation.phase.is_empty() {
+            true => None,
+            false => Some(workflow.operation.phase.as_str()),
+        }),
+        match workflow.operation.progress {
+            Some(_) => progress(&workflow.operation),
+            None => "-".to_string(),
+        },
         // Not a yes/no: the time a cancel was asked for is what tells an
         // operator whether a workflow that is still `running` has been asked
         // to stop and is taking its time, or was never asked at all.
@@ -296,8 +313,16 @@ pub async fn rollback(
         println!("  state          {}", escaped(&accepted.state));
     }
 
-    let settled = if wait {
-        Some(
+    // The control plane recorded the new operation before any waiting
+    // started, so a wait that then fails - the deadline, a poll the control
+    // plane refuses - has not undone anything. Its failure is carried rather
+    // than raised on the spot: raising it here would return before the
+    // answer is printed, and `--json` would leave a script that has just
+    // started a provider rollback with an empty stdout and no way to name
+    // the operation now running. The error is returned once the document is
+    // out, so the exit status still says the wait did not finish.
+    let waited = match wait {
+        true => Some(
             wait_for(
                 &session.control,
                 &app,
@@ -305,24 +330,47 @@ pub async fn rollback(
                 accepted.operation_id,
                 output,
             )
-            .await?,
-        )
-    } else {
-        None
+            .await,
+        ),
+        false => None,
     };
-
-    if output.json {
-        return output.emit(&serde_json::json!({
-            "app": app,
-            "environment": environment,
-            "control_endpoint": session.control.base_url(),
-            "rolledBackFrom": id.to_string(),
-            "operation": accepted,
-            "waited": wait,
-            "providerDeployment": settled,
-        }));
+    if let Some(Err(error)) = &waited {
+        // Warn, not error: the rollback itself is unaffected and still
+        // running: only the following of it stopped. An operator who sees
+        // this has to go back to `get` for the outcome.
+        tracing::warn!(
+            app_id = %app,
+            environment = %environment,
+            rolled_back_from = %id,
+            operation_id = %accepted.operation_id,
+            %error,
+            "stopped following an accepted provider deployment rollback before it settled"
+        );
     }
 
+    if output.json {
+        let (settled, wait_error) = match &waited {
+            Some(Ok(workflow)) => (Some(workflow), None),
+            Some(Err(error)) => (None, Some(format!("{error:#}"))),
+            None => (None, None),
+        };
+        output.emit(&rollback_document(
+            &app,
+            &environment,
+            session.control.base_url(),
+            id,
+            &accepted,
+            settled,
+            wait_error.as_deref(),
+        ))?;
+        // The document is out. The wait's failure is still this command's
+        // exit status, so a script that only checks the status code is not
+        // told a rollback finished when nothing watched it finish.
+        waited.transpose()?;
+        return Ok(());
+    }
+
+    let settled = waited.transpose()?;
     match &settled {
         Some(workflow) => {
             println!("\n{}", "It finished:".bold());
@@ -339,6 +387,41 @@ pub async fn rollback(
         ),
     }
     Ok(())
+}
+
+/// The machine-readable answer to a rollback, built in one place so that it
+/// is the same document whether or not `--wait` was passed and whether or not
+/// that wait finished.
+///
+/// The `waited` field says whether this command followed the new operation at
+/// all; `providerDeployment` is the workflow it settled as, and is null both
+/// when nothing was waited for and when the wait gave up. `waitError`
+/// separates those two: it carries the wait's own failure, so a script whose
+/// rollback was accepted but whose wait timed out can still read the
+/// operation id it has to go back to, and can tell that outcome from a plain
+/// unwaited acceptance.
+fn rollback_document(
+    app: &str,
+    environment: &str,
+    control_endpoint: &str,
+    rolled_back_from: CanonicalId,
+    accepted: &ProviderOperationSummary,
+    settled: Option<&ProviderDeployment>,
+    wait_error: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "app": app,
+        "environment": environment,
+        "control_endpoint": control_endpoint,
+        "rolledBackFrom": rolled_back_from.to_string(),
+        "operation": accepted,
+        // A wait either produced a workflow or produced the failure that
+        // ended it, so the two of them together say whether one was asked
+        // for - there is no third state to pass in separately.
+        "waited": settled.is_some() || wait_error.is_some(),
+        "providerDeployment": settled,
+        "waitError": wait_error,
+    })
 }
 
 /// Follow one workflow to a terminal state, saying so first when a person is
@@ -541,13 +624,38 @@ mod tests {
     #[test]
     fn a_row_names_the_operation_its_kind_and_its_state() {
         let row = row(&workflow("deploy", "running"));
-        assert_eq!(row.len(), 7);
+        assert_eq!(row.len(), 9);
         assert_eq!(row[2], DEPLOYMENT_ID);
         assert_eq!(row[3], "deploy");
         assert_eq!(row[4], "running");
         // Never asked to stop, and not a rollback of anything: two dashes
         // rather than two empty cells, so a reader can tell "nothing here"
         // from a column that failed to render.
+        assert_eq!(row[7], "-");
+        assert_eq!(row[8], "-");
+    }
+
+    /// The two columns that answer "is this one moving" without a second
+    /// command. The README documents them as part of what `list` prints, and
+    /// an operator watching a ten-minute provider deployment reads exactly
+    /// these two while it runs.
+    #[test]
+    fn a_row_says_which_phase_a_running_workflow_is_in_and_how_far_it_has_got() {
+        let row = row(&workflow("deploy", "running"));
+        assert_eq!(row[5], "apply");
+        assert_eq!(row[6], "42.0%");
+    }
+
+    /// "no phase named" and "no honest denominator" are both facts the
+    /// control plane is allowed to state, and neither may be printed as
+    /// something else - 0.0% in the progress column would read as a workflow
+    /// that has started and gone nowhere.
+    #[test]
+    fn a_workflow_with_neither_phase_nor_progress_shows_dashes_rather_than_zero() {
+        let mut workflow = workflow("deploy", "queued");
+        workflow.operation.phase = String::new();
+        workflow.operation.progress = None;
+        let row = row(&workflow);
         assert_eq!(row[5], "-");
         assert_eq!(row[6], "-");
     }
@@ -564,8 +672,8 @@ mod tests {
         let row = row(&workflow);
         assert_eq!(row[3], "rollback");
         assert_eq!(row[4], "cancelling");
-        assert_eq!(row[5], "3m ago");
-        assert_eq!(row[6], ROLLBACK_ID);
+        assert_eq!(row[7], "3m ago");
+        assert_eq!(row[8], ROLLBACK_ID);
     }
 
     /// Everything in a row came off the wire, so a control plane that serves
@@ -607,6 +715,72 @@ mod tests {
             let error = operation_id(bad).unwrap_err().to_string();
             assert!(error.contains("provider-deployments list"), "{error}");
         }
+    }
+
+    /// A rollback whose wait gave up. The control plane had already recorded
+    /// the new operation when the wait started, so the document has to name
+    /// it: it is the only thing a script can go back to, and the wait's
+    /// failure reaches stderr where nothing parses it.
+    #[test]
+    fn a_rollback_whose_wait_gave_up_still_names_the_operation_that_is_running() {
+        let mut accepted = workflow("rollback", "running").operation;
+        accepted.operation_id = ROLLBACK_ID.parse().unwrap();
+        let document = rollback_document(
+            "demo",
+            "production",
+            "http://control.invalid",
+            DEPLOYMENT_ID.parse().unwrap(),
+            &accepted,
+            None,
+            Some("it is still running after 900 seconds"),
+        );
+
+        assert_eq!(document["operation"]["operationId"], ROLLBACK_ID);
+        assert_eq!(document["rolledBackFrom"], DEPLOYMENT_ID);
+        assert_eq!(document["waited"], true);
+        assert!(document["providerDeployment"].is_null());
+        assert_eq!(
+            document["waitError"],
+            "it is still running after 900 seconds"
+        );
+    }
+
+    /// The two outcomes that both leave `providerDeployment` null must be
+    /// distinguishable: nothing was waited for, or the wait ended badly.
+    #[test]
+    fn an_unwaited_rollback_and_a_settled_one_are_not_spelled_the_same() {
+        let mut accepted = workflow("rollback", "running").operation;
+        accepted.operation_id = ROLLBACK_ID.parse().unwrap();
+
+        let unwaited = rollback_document(
+            "demo",
+            "production",
+            "http://control.invalid",
+            DEPLOYMENT_ID.parse().unwrap(),
+            &accepted,
+            None,
+            None,
+        );
+        assert_eq!(unwaited["waited"], false);
+        assert!(unwaited["waitError"].is_null());
+        assert!(unwaited["providerDeployment"].is_null());
+
+        let finished = workflow("rollback", "succeeded");
+        let settled = rollback_document(
+            "demo",
+            "production",
+            "http://control.invalid",
+            DEPLOYMENT_ID.parse().unwrap(),
+            &accepted,
+            Some(&finished),
+            None,
+        );
+        assert_eq!(settled["waited"], true);
+        assert!(settled["waitError"].is_null());
+        assert_eq!(
+            settled["providerDeployment"]["operation"]["state"],
+            "succeeded"
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::conventions;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -211,6 +213,45 @@ impl EnvironmentDeclaration {
             return Err(EnvironmentError::new(
                 "EC_ENV_NAME_INVALID",
                 "environment binding name is outside the v1 portable grammar",
+            ));
+        }
+        // A declaration is a name on `context.env`, and some of those names
+        // are the platform's. It is refused rather than shadowed, because
+        // shadowing has no honest outcome: the platform installs its own
+        // property after the declared values are copied, so the author's value
+        // is never readable, while the declaration goes on saying a value is
+        // required and the deployment goes on demanding one for it. The same
+        // sentence is already refused on the other side of the environment
+        // table - `deis_bundle::Bindings::validate` refuses a logical resource
+        // called ASSETS - and this is the half that covers a variable or a
+        // secret.
+        //
+        // Here, on the declaration itself, so that every reader of the
+        // document reaches the same verdict: the compiler when it writes one,
+        // the control plane when a bundle is uploaded, and a node when a
+        // deployment is loaded - including a bundle that reached that node
+        // without passing through any control plane of ours.
+        if self
+            .name
+            .eq_ignore_ascii_case(conventions::RESERVED_PLATFORM_BINDING_NAME)
+        {
+            return Err(EnvironmentError::new(
+                "EC_ENV_NAMESPACE_COLLISION",
+                "an environment declaration is named ASSETS, which is the platform's own binding \
+                 for this version's static files; the platform's property wins, so the declared \
+                 value could never be read and env.ASSETS.fetch() would still be the platform's",
+            ));
+        }
+        if self
+            .name
+            .to_ascii_uppercase()
+            .starts_with(conventions::RESERVED_PLATFORM_PREFIX)
+        {
+            return Err(EnvironmentError::new(
+                "EC_ENV_NAMESPACE_COLLISION",
+                "an environment declaration begins with DEIS_, the prefix the platform carries a \
+                 deployment's own wiring under; such a name is lifted back out of the map before \
+                 it becomes context.env, so the declared value could never be read",
             ));
         }
         if self.kind == EnvironmentKind::Secret && self.value_type != EnvironmentValueType::String {
@@ -654,6 +695,43 @@ mod tests {
             invalid.validate(STANDARD, ["CACHE"]).unwrap_err().code(),
             "EC_ENV_DECLARATION_INVALID"
         );
+    }
+
+    /// A declaration may not take a name the platform publishes on
+    /// `context.env` itself. Both halves are checked at the document level,
+    /// because that is the call every reader makes: the compiler when it
+    /// writes the document, deis-bundle when a bundle is uploaded or loaded,
+    /// and a node when it materializes the environment. Without this, the
+    /// name would be minted as a required declaration, every layer would
+    /// demand a value for it, and the value would then be unreadable - the
+    /// platform's own property is installed last and wins.
+    #[test]
+    fn a_declaration_may_not_take_a_platform_name() {
+        for name in [
+            conventions::RESERVED_PLATFORM_BINDING_NAME,
+            "DEIS_STORE_ENDPOINT",
+        ] {
+            let mut taken = declarations();
+            taken.declarations.push(EnvironmentDeclaration {
+                name: name.to_string(),
+                kind: EnvironmentKind::Config,
+                value_type: EnvironmentValueType::String,
+                required: true,
+            });
+            let error = taken.validate(STANDARD, ["CACHE"]).unwrap_err();
+            assert_eq!(error.code(), "EC_ENV_NAMESPACE_COLLISION", "{name}");
+            // The name is in the sentence, not only in the code: what an
+            // author sees is a compiler's stderr line, and a refusal that did
+            // not say which name it meant would send them looking through
+            // every declaration they wrote.
+            assert!(
+                error.to_string().contains(name)
+                    || error
+                        .to_string()
+                        .contains(conventions::RESERVED_PLATFORM_PREFIX),
+                "the refusal for {name:?} does not name it: {error}"
+            );
+        }
     }
 
     #[test]
