@@ -199,6 +199,12 @@ pub fn publish_current(
 }
 
 /// Resolve and fully revalidate the latest successful immutable payload.
+///
+/// The returned path keeps the caller's own spelling of `output_base`: it is
+/// that argument extended by the payload's content address, never a resolved
+/// or otherwise rewritten form of it. Callers compare the result against the
+/// `output_path` a build reported, so both sides have to reach the directory
+/// by the same name rather than only by the same inode.
 pub fn resolve_current(output_base: &Path, provider: &str) -> Result<PathBuf> {
     Ok(resolve_current_summary(output_base, provider)?.payload_root)
 }

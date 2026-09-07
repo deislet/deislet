@@ -1143,6 +1143,44 @@ impl Compiler {
         }
     }
 
+    /// The one spelling every directory this compiler reports is built from.
+    ///
+    /// A single build hands back two paths that name the same place: the
+    /// payload root in `VendorBuild::output_path`, and the output base under
+    /// which `provider_derivation::publish_current` records the selection that
+    /// `deis deploy --no-build` resolves later. Callers do compare them - that
+    /// is how anything checks that the payload it was just given is the one
+    /// this build published - so they have to agree as paths and not merely
+    /// point at the same directory once the kernel has resolved them.
+    ///
+    /// Until 2026-09-07 the provider half resolved the project directory with
+    /// `fs::canonicalize` while every other half joined the caller's own
+    /// spelling. On Linux the difference was invisible, because nothing on the
+    /// way to `/tmp` is a link; on macOS the caller's `/var/folders/...`
+    /// arrived back as `/private/var/folders/...` and an equality check over
+    /// two names for one directory failed. The canonicalization was there to
+    /// make the base absolute - a provider build runs out of a reconstructed
+    /// scratch source tree, so a relative `./dist` would land beside that
+    /// scratch tree instead of in the project - and `std::path::absolute` buys
+    /// exactly that without following links, and without the `\\?\` prefix
+    /// `fs::canonicalize` adds on Windows to a string this compiler prints and
+    /// stores. It also drops the `.` that `./dist` would otherwise leave in
+    /// the middle of every path a reader is shown.
+    fn output_base(project_dir: &Path, config: &ProjectConfig) -> anyhow::Result<PathBuf> {
+        let configured = config
+            .build
+            .as_ref()
+            .map(|build| build.out_dir.as_str())
+            .unwrap_or("./dist");
+        std::path::absolute(project_dir.join(configured)).map_err(|error| {
+            anyhow::anyhow!(
+                "the configured output directory {configured:?} cannot be resolved against the \
+                 project at {}: {error}",
+                project_dir.display()
+            )
+        })
+    }
+
     async fn build_for_vendor(
         &self,
         project_dir: &Path,
@@ -1237,14 +1275,7 @@ impl Compiler {
         Self::validate_canonical_routing_files(&manifest, &routing)?;
         crate::canonical_routing::require_target_implementation(vendor, &routing)?;
 
-        let original_project_root = fs::canonicalize(original_project_dir)?;
-        let output_base = original_project_root.join(
-            deployment_config
-                .build
-                .as_ref()
-                .map(|build| build.out_dir.as_str())
-                .unwrap_or("./dist"),
-        );
+        let output_base = Self::output_base(original_project_dir, deployment_config)?;
         let provider_staging = if self.options.output_mode == OutputMode::Memory {
             None
         } else {
@@ -1735,15 +1766,7 @@ impl Compiler {
             ));
         }
 
-        let output_dir = project_dir
-            .join(
-                config
-                    .build
-                    .as_ref()
-                    .map(|b| b.out_dir.as_str())
-                    .unwrap_or("./dist"),
-            )
-            .join(vendor);
+        let output_dir = Self::output_base(project_dir, config)?.join(vendor);
 
         // Memory mode lays the tree out on disk too, in a scratch directory
         // that is removed on the way out.

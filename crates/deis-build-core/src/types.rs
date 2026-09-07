@@ -83,6 +83,8 @@ pub struct CompilationResult {
 
 #[derive(Debug, Clone)]
 pub struct CanonicalBuild {
+    /// Where the completed artifact sits, spelled the way
+    /// `VendorBuild::output_path` documents.
     pub output_path: String,
     pub manifest_path: String,
     pub artifact_sha256: String,
@@ -93,7 +95,17 @@ pub struct CanonicalBuild {
 #[derive(Debug, Clone)]
 pub struct VendorBuild {
     pub vendor: String,
-    /// Output directory path (set in Files/Both modes)
+    /// Output directory path (set in Files/Both modes).
+    ///
+    /// It is the project directory the caller passed in, made absolute against
+    /// the process's working directory and with any `.` component dropped, and
+    /// then extended by the configured `build.outDir` and the payload's own
+    /// content address. Symbolic links on the way in are deliberately left
+    /// alone: a caller who joins the same project directory with the same
+    /// `outDir` - which is exactly what `deis deploy --no-build` does before
+    /// calling `provider_derivation::resolve_current` - must get a path equal
+    /// to this one. Resolving links here would break that on any host where
+    /// the project sits behind one, as macOS does for everything under `/var`.
     pub output_path: String,
     /// List of file paths (set in Files/Both modes)
     pub files: Vec<String>,
