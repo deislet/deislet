@@ -358,6 +358,20 @@ rate-limited / server），信封的 `retryAfterSeconds` 真正参与轮询节�
 schema 中，21 个映射到 CLI 镜像类型、27 个写明由 Web 消费，新增路由因此必须就「CLI 是否该读它」作出决定。
 兼容门禁补齐范围、长度与 pattern 约束的判定：请求侧收紧下界/长度/条目数、响应侧放宽，都算破坏性。见阶段分析第 97 节。
 
+四项此前退回产品拍板的开放决策已结清。① `ProductOperation` 中确实会序列化为 `null` 的八个成员
+（`scope.applicationId`、`scope.environmentId`、`progress`、`error` 及其 `retryAfterSeconds` 与 `remediation`、
+`startedAt`、`finishedAt`）如实标注为可空。`contracts/v1/operation.schema.json` 从一开始就这么写，只有 OpenAPI 渲染
+声称它们非空，而这个方向恰好是有害的：由错的那一半生成的客户端会给成员一个非空类型，然后对一个没人告诉过它的 `null`
+解引用。v1 尚未发布，不存在按基线写成的客户端，因此不升大版本，改由 `scripts/check-openapi-compat.py` 的
+`PRERELEASE_CORRECTIONS` 逐条具名接受这八处放宽——条目必须与报告的变更逐字相符才生效，未列出的放宽照旧拒绝；该清单
+只减不增，合入后基线自然覆盖，运行时会提示删除。② `api_page_cursors` 不设硬性容量上限：满表时拒绝列表请求会把满表
+变成读取路径的故障，驱逐同一查询绑定的旧位置又会让正在翻页的人凭空失效，且只在高负载下发生、事后无法复现。游标本就
+带三天有效期，清理只按年龄进行，另加一个 `CURSOR_COUNT_WARNING_THRESHOLD`（10,000）软阈值，由 reaper 每轮扫描后报
+一次，而不是挂在被别人时钟抓取的 metrics 端点上——那会把一个持续一天的状态变成一天的重复日志。token 是派生的，一行
+对应一个查询的一页，控制台反复轮询同一页只占一行，因此这个计数反映的是同时打开的遍历数，不是请求数。③ provider 重试
+上限见 ADR-006。④ `idx_events_page_v1` 退役：`id` 即 rowid，`idx_events_timestamp` 已能给出完全相同的顺序，查询计划
+证据里规划器从未选中过它，留着只是让每次写入 events 多维护一棵 b-tree。
+
 这些实现仍明确低于本 ADR 的公共 API 完成门槛：Rust CLI client 仍以示例反序列化校验替代生成；state/status/severity 类字段在文档中仍是普通字符串而非 enum；Web 尚无 organization/application/environment 主线；旧前缀尚在弃用窗口内。
 
 1. 建立 versioned API/error/operation/schema 基础与安全 Web session。

@@ -72,10 +72,15 @@
 - `P1-ROUTE-001`（新增，queued）：EdgeOne Node Function 模式把路由表写成单条 `^/(.*)$` 且不写 `{"handle":"filesystem"}`
   分界，函数因此认领全部路径、静态文件不可达。deislet 目标的同类缺陷已修（provider manifest 改由 canonical routing
   document 的 `functions[]` 决定，打包器的 staging 布局不再被当成路由事实），EdgeOne 一侧待办。
-- `P1-API-002`（新增，queued）：深度审查留下四项需要产品拍板的开放决策——`ProductOperation` 可空成员如实标注属于响应
-  放宽（要 v1 大版本或显式兼容豁免）；`api_page_cursors` 的容量上限该是拒绝列表请求还是驱逐同一查询绑定的旧位置，以及
-  为此付出的索引代价；driver 重试的次数上限与耗尽后父操作是否 `failed`；`idx_events_page_v1` 从未被规划器选中，是否退役。
-  四项均记于阶段分析第 97 节。
+- `P1-API-002`（done）：深度审查留下的四项开放决策已拍板并落地。① `ProductOperation` 中会序列化为 `null` 的八个成员
+  如实标注为可空，与 `contracts/v1/operation.schema.json` 一致；v1 尚未发布、不存在按基线写成的客户端，因此不升大
+  版本，改由 `scripts/check-openapi-compat.py` 的 `PRERELEASE_CORRECTIONS` 逐条具名接受这八处放宽，未列出的放宽照旧
+  拒绝，清单只减不增。② `api_page_cursors` 不设硬性容量上限——满表拒绝列表请求会把满表变成读取路径的故障，驱逐旧
+  位置会让正在翻页的人凭空失效——清理只按年龄进行，另加软阈值 `CURSOR_COUNT_WARNING_THRESHOLD`（10,000）由 reaper
+  每轮扫描后报一次。③ 子操作重试上限 `MAX_PROVIDER_CHILD_ATTEMPTS`（10）、派发失败上限
+  `MAX_PROVIDER_DISPATCH_FAILURES`（10），耗尽后父操作以 driver 最后一次的错误 `failed`。④ `idx_events_page_v1`
+  退役：`id` 即 rowid，`idx_events_timestamp` 已能给出同序，规划器从未选中它。取舍理由见 ADR-016 与 ADR-006，过程记于
+  阶段分析第 98 节。
 - `P1-CASE-001`（新增，queued）：`resolve_local_module` 用字符串拼接构造候选路径、用 `is_file()` 判定命中且不做
   canonicalize，命中结果按 `PathBuf` 进 `staged_modules` 去重。在不区分大小写的主机上 `./Util.js` 与 `./util.js` 命中
   同一个真实文件却各 stage 一次，产物里同一份代码出现两遍，而这样的构建在 macOS 上会成功、bundle 拿到区分大小写的

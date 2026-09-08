@@ -39,6 +39,26 @@ const TOKEN_TEXT_BYTES: usize = 43;
 /// (docs/adr/016, list and query section): three days.
 pub const CURSOR_TTL_SECONDS: i64 = 3 * 24 * 60 * 60;
 
+/// The number of live cursors above which the sweep starts saying so.
+///
+/// The table has no hard ceiling, on purpose. Both ways of imposing one hurt
+/// the wrong person: refusing list requests once the table is full turns a
+/// full table into an outage of the read path, and evicting the oldest
+/// position bound to the same query invalidates a traversal somebody is in
+/// the middle of - a failure that appears only under load and cannot be
+/// reproduced afterwards. Age is the bound a cursor already carries
+/// ([`CURSOR_TTL_SECONDS`]), the sweep removes by that and nothing else, and
+/// this number exists only so an installation that is filling the table
+/// hears it from a log line instead of from the disk.
+///
+/// One row is one distinct page of one distinct query, because the token is
+/// derived rather than random: a console polling a single page reuses its
+/// row. So the count tracks how many separate traversals are open, not how
+/// many requests arrive, and ten thousand of them is far past what
+/// interactive paging produces while still being small enough to notice long
+/// before it matters.
+pub const CURSOR_COUNT_WARNING_THRESHOLD: usize = 10_000;
+
 /// How many expired cursors one expiry statement removes.
 ///
 /// Expiry runs on the process's single connection, the same one every list

@@ -54,6 +54,14 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCUMENT_PATH = "contracts/openapi/v1.json"
 CONTROL_ERROR_SCHEMA = "contracts/v1/control-error.schema.json"
 BASELINE_REF = "origin/main"
+# Where the pre-release corrections below are reported. Seven other routes
+# answer with the same `ProductOperation`, by reference; the comparison
+# memoizes on schema content rather than on location, so a shared member is
+# compared once and named after whichever route reaches it first. Sorted
+# order makes that this one.
+_OPERATION_LIST_ROUTE = (
+    "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments"
+)
 
 TAG_PREFIXES = {
     "product": "/api/v1/",
@@ -748,6 +756,44 @@ def self_check() -> None:
         )
 
 
+# Changes accepted once, by name, because v1 has not been published.
+#
+# There is no client anywhere that was written against the baseline, so the
+# question the rules above answer - what would a reader already out there
+# notice - has no subject yet. That is the only thing this list stands on,
+# and it goes away when v1 ships.
+#
+# Every entry is one response member that really is `null` on the wire and
+# was documented as though it never could be. `contracts/v1/operation.
+# schema.json` has said `null` about all eight from the start; only the
+# OpenAPI rendering disagreed, which is the direction that hurts - a client
+# generated from the wrong half gives the member a non-null type and
+# dereferences a `null` nobody told it about. Correcting it widens a
+# response type, which is refused on principle, so each correction is named
+# here in full: an entry that does not match a reported change exactly does
+# nothing, and a widening that is not listed is still refused.
+#
+# The list is meant to be emptied rather than grown. Once these are on
+# `origin/main` the baseline carries them and the comparison stops reporting
+# them, which the run says so that the entries can be deleted.
+PRERELEASE_CORRECTIONS = frozenset(
+    {
+        f"GET {_OPERATION_LIST_ROUTE} 200 application/json.items[].operation.{member}: "
+        f"type changed from {was} to {now}"
+        for member, was, now in [
+            ("error", "object", "['object', 'null']"),
+            ("error.remediation", "string", "['string', 'null']"),
+            ("error.retryAfterSeconds", "integer", "['integer', 'null']"),
+            ("finishedAt", "string", "['string', 'null']"),
+            ("progress", "integer", "['integer', 'null']"),
+            ("scope.applicationId", "string", "['string', 'null']"),
+            ("scope.environmentId", "string", "['string', 'null']"),
+            ("startedAt", "string", "['string', 'null']"),
+        ]
+    }
+)
+
+
 def main() -> int:
     try:
         self_check()
@@ -775,6 +821,27 @@ def main() -> int:
     comparison.run()
     old_version = baseline["info"]["version"]
     new_version = document["info"]["version"]
+
+    accepted = [line for line in comparison.breaking if line in PRERELEASE_CORRECTIONS]
+    comparison.breaking = [
+        line for line in comparison.breaking if line not in PRERELEASE_CORRECTIONS
+    ]
+    if accepted:
+        print(
+            f"note: {len(accepted)} pre-release correction(s) accepted "
+            f"(see PRERELEASE_CORRECTIONS in {Path(__file__).name}):"
+        )
+        for line in accepted:
+            print(f"  - {line}")
+    stale = sorted(PRERELEASE_CORRECTIONS - set(accepted))
+    if stale:
+        print(
+            f"note: {len(stale)} pre-release correction(s) are no longer reported and can be "
+            f"removed from the list:"
+        )
+        for line in stale:
+            print(f"  - {line}")
+
     if comparison.breaking:
         if major(new_version) > major(old_version):
             print(

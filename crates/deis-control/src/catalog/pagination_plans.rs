@@ -754,18 +754,18 @@ fn diagnostic_queries() -> Vec<KeysetQuery> {
         }
     }
     shapes(vec![
-        // The unfiltered log is the one page whose sort an older index
-        // already answers: `id` is the row id, so `events(timestamp)`
-        // orders equal seconds by id as well, and with no statistics the
-        // planner takes whichever of the two it meets first. Both are the
-        // same single seek, so either is accepted here.
+        // The unfiltered log is the one page with no index of its own: `id`
+        // is the row id, so `events(timestamp)` orders equal seconds by id
+        // as well and answers this page with the same single seek. The index
+        // that paired the two columns was never once chosen over it and is
+        // retired in the schema, so only the older one is accepted here.
         case(
             "list_events_page unfiltered",
             "events",
             EVENT_COLUMNS,
             "timestamp",
             &[],
-            &["idx_events_page_v1", "idx_events_timestamp"],
+            &["idx_events_timestamp"],
         ),
         case(
             "list_events_page by node",

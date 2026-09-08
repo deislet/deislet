@@ -765,6 +765,17 @@ fn integer_property(description: &str) -> ObjectBuilder {
         .description(Some(description))
 }
 
+/// The same property, with `null` admitted. A member that is written on
+/// every record and carries `null` when there is nothing to put there is
+/// spelled `["<type>", "null"]` in `contracts/v1/*.schema.json`, and OpenAPI
+/// 3.1 spells it the same way, so the two authorities describe one document
+/// rather than two. Saying it here is what stops a generated client from
+/// giving the member a non-null type and dereferencing a `null` nobody told
+/// it about. Call this last: it replaces whatever type the builder carried.
+fn nullable(property: ObjectBuilder, present: Type) -> ObjectBuilder {
+    property.schema_type(SchemaType::Array(vec![present, Type::Null]))
+}
+
 /// A long operation: the answer of every 202 and the resource behind
 /// `GET /api/v1/operations/{operation_id}`.
 pub struct ProductOperationDocument;
@@ -808,17 +819,23 @@ impl PartialSchema for ProductOperationDocument {
                 .required("organizationId")
                 .property(
                     "applicationId",
-                    uuid_property(
-                        "Canonical UUIDv7 of the application the operation acts in; `null` \
-                         when it acts on the whole organization.",
+                    nullable(
+                        uuid_property(
+                            "Canonical UUIDv7 of the application the operation acts in; `null` \
+                             when it acts on the whole organization.",
+                        ),
+                        Type::String,
                     ),
                 )
                 .required("applicationId")
                 .property(
                     "environmentId",
-                    uuid_property(
-                        "Canonical UUIDv7 of the environment the operation acts in; `null` \
-                         when it is not scoped to one.",
+                    nullable(
+                        uuid_property(
+                            "Canonical UUIDv7 of the environment the operation acts in; `null` \
+                             when it is not scoped to one.",
+                        ),
+                        Type::String,
                     ),
                 )
                 .required("environmentId"),
@@ -874,14 +891,17 @@ impl PartialSchema for ProductOperationDocument {
         .required("correlationId")
         .property(
             "progress",
-            integer_property(
-                "How far the operation has come, in basis points: 0..=10000, where 10000 is \
-                 the whole of it, as `contracts/v1/operation.schema.json` defines it. `null` \
-                 whenever the kind has no honest denominator to divide by, which includes \
-                 every operation that has not started.",
-            )
-            .minimum(Some(0))
-            .maximum(Some(10_000)),
+            nullable(
+                integer_property(
+                    "How far the operation has come, in basis points: 0..=10000, where 10000 \
+                     is the whole of it, as `contracts/v1/operation.schema.json` defines it. \
+                     `null` whenever the kind has no honest denominator to divide by, which \
+                     includes every operation that has not started.",
+                )
+                .minimum(Some(0))
+                .maximum(Some(10_000)),
+                Type::Integer,
+            ),
         )
         .required("progress")
         .property("cancellable", ObjectBuilder::new().schema_type(SchemaType::Type(Type::Boolean)))
@@ -913,19 +933,44 @@ impl PartialSchema for ProductOperationDocument {
                 .required("message")
                 .property("retryable", ObjectBuilder::new().schema_type(SchemaType::Type(Type::Boolean)))
                 .required("retryable")
-                .property("retryAfterSeconds", integer_property("How long to wait before retrying; `null` when the failure carries no hint."))
+                .property(
+                    "retryAfterSeconds",
+                    nullable(
+                        integer_property("How long to wait before retrying; `null` when the failure carries no hint."),
+                        Type::Integer,
+                    ),
+                )
                 .required("retryAfterSeconds")
-                .property("remediation", string_property("What an operator can do about it; `null` when there is nothing to say."))
-                .required("remediation"),
+                .property(
+                    "remediation",
+                    nullable(
+                        string_property("What an operator can do about it; `null` when there is nothing to say."),
+                        Type::String,
+                    ),
+                )
+                .required("remediation")
+                .schema_type(SchemaType::Array(vec![Type::Object, Type::Null])),
         )
         .required("error")
         .property("createdAt", date_time_property("RFC 3339."))
         .required("createdAt")
-        .property("startedAt", date_time_property("RFC 3339 once the operation started; `null` while it is `queued`."))
+        .property(
+            "startedAt",
+            nullable(
+                date_time_property("RFC 3339 once the operation started; `null` while it is `queued`."),
+                Type::String,
+            ),
+        )
         .required("startedAt")
         .property("updatedAt", date_time_property("RFC 3339."))
         .required("updatedAt")
-        .property("finishedAt", date_time_property("RFC 3339 once the operation is terminal; `null` before that."))
+        .property(
+            "finishedAt",
+            nullable(
+                date_time_property("RFC 3339 once the operation is terminal; `null` before that."),
+                Type::String,
+            ),
+        )
         .required("finishedAt")
         .into()
     }

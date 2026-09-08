@@ -5959,11 +5959,17 @@
               },
               "remediation": {
                 "description": "What an operator can do about it; `null` when there is nothing to say.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "retryAfterSeconds": {
                 "description": "How long to wait before retrying; `null` when the failure carries no hint.",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "retryable": {
                 "type": "boolean"
@@ -5976,12 +5982,18 @@
               "retryAfterSeconds",
               "remediation"
             ],
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "finishedAt": {
             "description": "RFC 3339 once the operation is terminal; `null` before that.",
             "format": "date-time",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "idempotencyKeyDigest": {
             "description": "SHA-256 of the `Idempotency-Key` that started the operation.",
@@ -6031,7 +6043,10 @@
             "description": "How far the operation has come, in basis points: 0..=10000, where 10000 is the whole of it, as `contracts/v1/operation.schema.json` defines it. `null` whenever the kind has no honest denominator to divide by, which includes every operation that has not started.",
             "maximum": 10000,
             "minimum": 0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "providerOperations": {
             "items": {
@@ -6062,12 +6077,18 @@
               "applicationId": {
                 "description": "Canonical UUIDv7 of the application the operation acts in; `null` when it acts on the whole organization.",
                 "format": "uuid",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "environmentId": {
                 "description": "Canonical UUIDv7 of the environment the operation acts in; `null` when it is not scoped to one.",
                 "format": "uuid",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "organizationId": {
                 "description": "Canonical UUIDv7.",
@@ -6085,7 +6106,10 @@
           "startedAt": {
             "description": "RFC 3339 once the operation started; `null` while it is `queued`.",
             "format": "date-time",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "state": {
             "description": "Where the operation is in the state machine of `contracts/v1/operation-transitions.json`. The set is rendered from `deis_wire::OperationState`, so it cannot drift from what the server writes; a freshly accepted operation is `queued`. `pending` is listed because it was published in this enum and a value is never withdrawn from a closed one, and is emitted by nothing: it was the earlier spelling of `queued` and no code path has ever written it.",

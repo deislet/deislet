@@ -67,6 +67,39 @@ fn provider_retry_backoff_seconds(base: u64, attempts: u64) -> u64 {
 }
 const MAX_PROVIDER_DISPATCH_ERROR_CHARS: usize = 2_048;
 
+/// How many times one provider child is attempted before a retryable
+/// failure stops being retried.
+///
+/// A failure the driver calls retryable says nothing about when it will stop
+/// being true, so retrying it without a ceiling produces a child that never
+/// reaches a state anyone can act on: the parent stays `waiting`, no error is
+/// ever written, and the only way to learn about it is for somebody to go
+/// looking. Ten attempts on the doubling clock of
+/// [`provider_retry_backoff_seconds`] span a little over two hours at the
+/// default thirty-second base - long enough for a provider outage, a
+/// credential rotation or a rate limit to pass on its own, and short enough
+/// that a deployment nobody is watching still ends the same day.
+///
+/// The ceiling counts attempts rather than wall-clock because that is what a
+/// test can pin down: ten attempts are ten attempts whatever base delay the
+/// installation configured. It applies to a plain retryable failure only. A
+/// child the driver left in an unknown state keeps being reconciled past
+/// this count, because giving up there would leave provider state that
+/// nothing ever goes back to look at.
+const MAX_PROVIDER_CHILD_ATTEMPTS: u64 = 10;
+
+/// How many dispatch failures one deployment step takes before the parent
+/// operation fails.
+///
+/// The same argument one layer out: a driver that cannot be selected or
+/// cannot be spawned is something outside this process, and nothing here
+/// makes the next attempt more likely to work. Without a ceiling a host that
+/// lost its driver binary, or an installation whose credential binding was
+/// deleted, leaves every deployment against it waiting for ever with no
+/// error to read. The count matches [`MAX_PROVIDER_CHILD_ATTEMPTS`] because
+/// the two are the same wait seen from either side of the dispatch.
+const MAX_PROVIDER_DISPATCH_FAILURES: u64 = 10;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderInstallationSpec {
     pub backend_id: String,
@@ -1616,6 +1649,67 @@ impl CatalogStore {
                 } else {
                     0
                 };
+                let attempts = failures.saturating_add(1);
+                // A cancelling workflow is not failed here: the cancel still
+                // owes a settlement or a cleanup, and the backoff only spaces
+                // out the work it owes rather than waiting on a dispatch.
+                if attempts >= MAX_PROVIDER_DISPATCH_FAILURES && state != OperationState::Cancelling
+                {
+                    warn!(
+                        operation_id = %operation_id,
+                        child_operation_id = %child_operation_id,
+                        step = step.as_str(),
+                        attempts,
+                        ceiling = MAX_PROVIDER_DISPATCH_FAILURES,
+                        error_code = %error_code,
+                        "Provider deployment step could not be dispatched on any attempt it is \
+                         given; the operation fails with the last dispatch error instead of \
+                         waiting on a driver that has not been runnable once"
+                    );
+                    let settled = OperationError {
+                        code: "PROVIDER_DISPATCH_UNAVAILABLE".to_owned(),
+                        message: format!(
+                            "provider deployment step {} could not be dispatched in {attempts} \
+                             attempts; the last failure was {error_code}: {error_message}",
+                            step.as_str()
+                        ),
+                        retryable: true,
+                        retry_after_seconds: None,
+                        remediation: Some(
+                            "make the driver runnable - check its installation, its credential \
+                             binding and the host's process limits - then start the operation \
+                             again"
+                                .to_owned(),
+                        ),
+                    };
+                    clear_provider_deployment_dispatch_backoff_tx(
+                        &transaction,
+                        operation_id,
+                        child_operation_id,
+                    )?;
+                    transition_operation_tx(
+                        &transaction,
+                        operation_id,
+                        None,
+                        deis_wire::OperationEvent::Failed,
+                        step.as_str(),
+                        Some(&settled),
+                    )?;
+                    transaction.execute(
+                        "UPDATE product_operations SET retryable = ?2 WHERE operation_id = ?1",
+                        params![operation_id.to_string(), settled.retryable],
+                    )?;
+                    update_provider_deployment_state_tx(
+                        &transaction,
+                        operation_id,
+                        OperationState::Failed,
+                        usize::try_from(next_step_index).map_err(|_| {
+                            CatalogError::invalid("provider deployment step index out of range")
+                        })?,
+                    )?;
+                    transaction.commit()?;
+                    return Ok(());
+                }
                 let delay = provider_retry_backoff_seconds(base_delay, failures + 1);
                 let now = now_secs();
                 let not_before = now.saturating_add(i64::try_from(delay).map_err(|_| {
@@ -3929,9 +4023,40 @@ fn settle_error(
     } else {
         ProviderOperationState::Failed
     };
-    let waiting = error.retryable
-        || error.next_action != DriverNextAction::None
-        || error.side_effect != SideEffect::None;
+    // `attempt_count` was raised when this claim was taken, so it counts the
+    // attempts made including the one this settlement ends.
+    //
+    // The ceiling applies to a plain repeat only: nothing left behind at the
+    // provider (`SideEffect::None`) and nothing asked of anyone but this
+    // process (`None` or `Retry`). `Observe`, `Reconcile` and `Rollback`
+    // point at provider state that would go unexamined if the child were
+    // abandoned, and `ManualIntervention` has already asked for the operator
+    // this ceiling exists to reach, so none of them is counted out here.
+    let attempts = load_claim_row(&transaction, claim.operation_id)?
+        .map(|row| row.attempt_count)
+        .unwrap_or_default();
+    let plain_repeat = error.side_effect == SideEffect::None
+        && matches!(
+            error.next_action,
+            DriverNextAction::None | DriverNextAction::Retry
+        );
+    let exhausted = error.retryable && plain_repeat && attempts >= MAX_PROVIDER_CHILD_ATTEMPTS;
+    let waiting = !exhausted
+        && (error.retryable
+            || error.next_action != DriverNextAction::None
+            || error.side_effect != SideEffect::None);
+    if exhausted {
+        warn!(
+            operation_id = %claim.operation_id,
+            operation = claim.request.operation.as_str(),
+            attempts,
+            ceiling = MAX_PROVIDER_CHILD_ATTEMPTS,
+            error_code = %error.code,
+            "Provider operation failed on every attempt it is given; the parent operation now \
+             fails with the driver's last error instead of waiting on a retry that has not \
+             worked once"
+        );
+    }
     let changed = transaction.execute(
         "UPDATE provider_driver_operations
             SET state = ?4, receipt_json = NULL, driver_error_json = ?5,
@@ -3964,7 +4089,16 @@ fn settle_error(
         None,
         now,
     )?;
-    let product_error = (!waiting).then(|| operation_error(error));
+    let product_error = (!waiting).then(|| {
+        let mut settled = operation_error(error);
+        if exhausted {
+            settled.message = format!("{} (given up after {attempts} attempts)", settled.message);
+            settled.remediation = settled.remediation.or_else(|| {
+                Some("fix what the driver reported, then start the operation again".to_owned())
+            });
+        }
+        settled
+    });
     transition_settled_product(
         &transaction,
         claim.operation_id,
@@ -6934,6 +7068,171 @@ mod tests {
             provider_retry_backoff_seconds(900, 99),
             MAX_PROVIDER_DISPATCH_BACKOFF_SECONDS
         );
+    }
+
+    /// A driver that calls every failure retryable does not buy the child an
+    /// unlimited number of attempts. At the ceiling the failure is settled as
+    /// terminal, which is what gives the operator an error to read instead of
+    /// an operation that says `waiting` for ever.
+    #[tokio::test]
+    async fn a_child_that_only_ever_fails_is_given_up_on_at_the_ceiling() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent = begin_test_deployment(&harness, &artifact, "provider-retry-ceiling").await;
+        let prepared = harness
+            .store
+            .prepare_provider_deployment(parent.operation_id)
+            .await
+            .unwrap();
+        let child_operation_id = prepared.steps[0].child_operation_id;
+
+        for attempt in 1..=MAX_PROVIDER_CHILD_ATTEMPTS {
+            let claim = harness
+                .store
+                .claim(
+                    child_operation_id,
+                    CanonicalId::new_v7(),
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap()
+                .into_claim()
+                .unwrap();
+            harness
+                .store
+                .record_driver_error(
+                    &claim,
+                    &DriverError {
+                        operation_id: child_operation_id,
+                        operation: claim.request.operation,
+                        desired_state_digest: claim.request.desired_state_digest.clone(),
+                        category: deis_provider_driver::DriverErrorCategory::TransientProvider,
+                        code: "DRIVER_PROCESS_SPAWN".to_owned(),
+                        message: "the driver process could not be started".to_owned(),
+                        retryable: true,
+                        side_effect: SideEffect::None,
+                        next_action: DriverNextAction::Retry,
+                        provider_request_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let record = harness
+                .store
+                .provider_driver_operation(child_operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.attempt_count, attempt);
+
+            let child = read_child_operation(&harness, child_operation_id).await;
+            if attempt < MAX_PROVIDER_CHILD_ATTEMPTS {
+                assert_eq!(
+                    child.0, "waiting",
+                    "attempt {attempt} of {MAX_PROVIDER_CHILD_ATTEMPTS} already gave up"
+                );
+                assert!(child.1.is_none(), "attempt {attempt} wrote an error early");
+            } else {
+                assert_eq!(child.0, "failed", "the ceiling did not end the child");
+                let message = child
+                    .1
+                    .expect("the settled child carries the driver's error");
+                assert!(
+                    message.contains("the driver process could not be started"),
+                    "the driver's own message is lost: {message}"
+                );
+                assert!(
+                    message.contains(&format!("given up after {MAX_PROVIDER_CHILD_ATTEMPTS}")),
+                    "the settled error does not say the attempts ran out: {message}"
+                );
+            }
+        }
+    }
+
+    /// The same ceiling one layer out: a step that cannot be dispatched at
+    /// all fails its operation rather than deferring for ever.
+    #[tokio::test]
+    async fn a_step_that_can_never_be_dispatched_fails_its_operation() {
+        let harness = harness().await;
+        let artifact = attach_cloudflare_artifact(&harness).await;
+        let parent = begin_test_deployment(&harness, &artifact, "provider-dispatch-ceiling").await;
+        let prepared = harness
+            .store
+            .prepare_provider_deployment(parent.operation_id)
+            .await
+            .unwrap();
+        let child_operation_id = prepared.steps[0].child_operation_id;
+
+        for attempt in 1..=MAX_PROVIDER_DISPATCH_FAILURES {
+            harness
+                .store
+                .defer_provider_deployment_dispatch(
+                    parent.operation_id,
+                    child_operation_id,
+                    Duration::from_secs(30),
+                    &CatalogError::invalid("verified driver release is temporarily unavailable"),
+                )
+                .await
+                .unwrap();
+            let workflow = harness
+                .store
+                .provider_deployment_workflow(parent.operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if attempt < MAX_PROVIDER_DISPATCH_FAILURES {
+                assert_eq!(
+                    workflow.operation.state,
+                    OperationState::Waiting,
+                    "attempt {attempt} of {MAX_PROVIDER_DISPATCH_FAILURES} already gave up"
+                );
+                assert_eq!(workflow.dispatch_failure_count, attempt);
+            } else {
+                assert_eq!(
+                    workflow.operation.state,
+                    OperationState::Failed,
+                    "the ceiling did not end the operation"
+                );
+                let error = workflow
+                    .operation
+                    .error
+                    .as_ref()
+                    .expect("a failed operation carries its error");
+                assert_eq!(error.code, "PROVIDER_DISPATCH_UNAVAILABLE");
+                assert!(
+                    error.message.contains("CATALOG_INVALID")
+                        && error
+                            .message
+                            .contains("verified driver release is temporarily unavailable"),
+                    "the last dispatch error is lost: {}",
+                    error.message
+                );
+                // The backoff bookkeeping goes with the operation it was
+                // spacing out; nothing is left pointing at a child that will
+                // not be dispatched again.
+                assert_eq!(workflow.dispatch_failure_count, 0);
+                assert_eq!(workflow.dispatch_failure_child_operation_id, None);
+            }
+        }
+    }
+
+    /// The state and error message of one child's product operation.
+    async fn read_child_operation(
+        harness: &Harness,
+        child_operation_id: CanonicalId,
+    ) -> (String, Option<String>) {
+        harness
+            .database
+            .with_connection(move |connection| {
+                let row = connection.query_row(
+                    "SELECT state, error_json FROM product_operations WHERE operation_id = ?1",
+                    params![child_operation_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?;
+                Ok::<_, crate::database::DatabaseError>(row)
+            })
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

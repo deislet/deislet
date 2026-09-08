@@ -225,19 +225,23 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Keyset pages of the event log, `(timestamp DESC, id DESC)`: unfiltered,
-    // under one node, and under one severity. A request filtering on both
-    // is seeked through the severity index and has its node compared row by
-    // row: Control never runs ANALYZE, so the planner has no statistics to
-    // tell it which of the two partitions is smaller and simply takes the
-    // later index. That costs a walk of one severity partition instead of
-    // one node partition on a large log, which is why no fourth index pairs
-    // the two columns - the event log is written on every node report, and
-    // a diagnostic filter is not worth a b-tree on that write path.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_events_page_v1 ON events(timestamp DESC, id DESC)",
-        [],
-    )?;
+    // Keyset pages of the event log, `(timestamp DESC, id DESC)`: under one
+    // node and under one severity. The unfiltered page needs no index of its
+    // own - `id` is the row id, so `idx_events_timestamp` already orders
+    // equal timestamps by id and answers that page with the same single
+    // seek. `idx_events_page_v1(timestamp DESC, id DESC)` was created for it
+    // anyway, and the query plan evidence never once caught the planner
+    // choosing it, so a database that carries it sheds it here rather than
+    // keep writing a second b-tree on every node report. A request filtering
+    // on both columns is seeked through the severity index and has its node
+    // compared row by row: Control never runs ANALYZE, so the planner has no
+    // statistics to tell it which of the two partitions is smaller and
+    // simply takes the later index. That costs a walk of one severity
+    // partition instead of one node partition on a large log, which is why
+    // no index pairs the two columns - the event log is written on every
+    // node report, and a diagnostic filter is not worth a b-tree on that
+    // write path.
+    conn.execute("DROP INDEX IF EXISTS idx_events_page_v1", [])?;
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_node_page_v1 \

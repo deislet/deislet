@@ -45,9 +45,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::catalog::{PageCursorStore, now_secs};
+use crate::catalog::{CURSOR_COUNT_WARNING_THRESHOLD, PageCursorStore, now_secs};
 use crate::command::CommandExecutor;
 use crate::config::ControlConfig;
 use crate::database::{Database, Event, EventSeverity};
@@ -151,13 +151,55 @@ impl Reaper {
     /// so nothing here changes what a client is told, only how much disk
     /// the refused rows occupy.
     async fn expire_page_cursors(&self) {
-        if let Err(e) = self.page_cursors.expire(now_secs()).await {
+        let now = now_secs();
+        if let Err(e) = self.page_cursors.expire(now).await {
             warn!(
                 error = %e,
                 "Could not remove expired list cursors on this pass; expired rows stay refused \
                  but keep occupying the cursor table until a later pass or a new cursor issue \
                  succeeds"
             );
+            return;
+        }
+        self.report_cursor_table_pressure(now).await;
+    }
+
+    /// Say so once a pass when the cursor table carries more live rows than
+    /// an installation of this shape produces.
+    ///
+    /// The reading belongs here rather than on the metrics endpoint, which is
+    /// scraped on somebody else's clock - every few seconds in an ordinary
+    /// deployment - so a condition that holds for a day would be a day of
+    /// identical lines. The sweep runs on this process's own clock, which
+    /// makes the same condition one line a pass.
+    ///
+    /// A failed reading is not a warning: the sweep it follows already
+    /// succeeded, nothing a client sees depends on the count, and the gauges
+    /// on the metrics endpoint report the same number to anyone watching.
+    /// Returns whether the count was reported, so a test can pin the
+    /// threshold down without reading the log.
+    async fn report_cursor_table_pressure(&self, now: i64) -> bool {
+        match self.page_cursors.statistics(now).await {
+            Ok(statistics) if statistics.live > CURSOR_COUNT_WARNING_THRESHOLD => {
+                warn!(
+                    live = statistics.live,
+                    threshold = CURSOR_COUNT_WARNING_THRESHOLD,
+                    oldest_live_age_seconds = statistics.oldest_live_age_seconds,
+                    "The list-cursor table carries more live cursors than expected. They are \
+                     removed by age alone, so the count falls on its own within a cursor \
+                     lifetime unless something is opening traversals faster than they expire"
+                );
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "Could not read the list-cursor table after this pass swept it; the live \
+                     count goes unreported for one pass and the sweep itself was unaffected"
+                );
+                false
+            }
         }
     }
 
@@ -574,5 +616,73 @@ mod tests {
         // A second pass over a clean table is a no-op, not an error.
         reaper.sweep().await;
         assert_eq!(reaper.page_cursors.statistics(now).await.unwrap().live, 1);
+    }
+
+    /// The cursor table has no hard ceiling on purpose - a full table must
+    /// not become an outage of the read path, and evicting a position
+    /// somebody is paging through would fail only under load. What it has
+    /// instead is a count the sweep reports, so an installation filling the
+    /// table hears about it from a log line rather than from the disk.
+    #[tokio::test]
+    async fn a_cursor_table_over_the_threshold_is_reported_by_the_sweep() {
+        let sessions = Arc::new(SessionManager::new());
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let cfg = config(30, 90);
+        let reaper = reaper(&sessions, &database, &cfg);
+        let now = now_secs();
+
+        let insert = |count: usize, from: usize| {
+            let database = Arc::clone(&database);
+            async move {
+                database
+                    .with_connection(move |conn| {
+                        let transaction = conn.unchecked_transaction()?;
+                        {
+                            let mut statement = transaction.prepare(
+                                "INSERT INTO api_page_cursors
+                                   (token_sha256, collection, query_sha256, position_json,
+                                    created_at, expires_at)
+                                 VALUES (?1, 'accounts', ?2,
+                                         '{\"sortValue\":1,\"identity\":\"one\"}', ?3, ?4)",
+                            )?;
+                            for index in from..from + count {
+                                statement.execute(rusqlite::params![
+                                    format!("{index:064x}"),
+                                    "b".repeat(64),
+                                    now,
+                                    now + 86_400,
+                                ])?;
+                            }
+                        }
+                        transaction.commit()?;
+                        Ok::<_, crate::database::DatabaseError>(())
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+
+        insert(CURSOR_COUNT_WARNING_THRESHOLD, 0).await;
+        assert_eq!(
+            reaper.page_cursors.statistics(now).await.unwrap().live,
+            CURSOR_COUNT_WARNING_THRESHOLD
+        );
+        assert!(
+            !reaper.report_cursor_table_pressure(now).await,
+            "a table exactly at the threshold is not over it"
+        );
+
+        insert(1, CURSOR_COUNT_WARNING_THRESHOLD).await;
+        assert!(
+            reaper.report_cursor_table_pressure(now).await,
+            "one row past the threshold went unreported"
+        );
+
+        // Nothing was removed to say it: the count falls by age alone, and a
+        // client holding any of these cursors can still resume from it.
+        assert_eq!(
+            reaper.page_cursors.statistics(now).await.unwrap().live,
+            CURSOR_COUNT_WARNING_THRESHOLD + 1
+        );
     }
 }

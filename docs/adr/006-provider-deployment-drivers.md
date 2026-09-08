@@ -410,6 +410,18 @@ settle 中较晚的秒数加 29；Windows 较慢执行使两次 settle 跨秒，
 1/1，三端严格 Clippy 全过。Linux 同一 archive 另通过 16 份 Schema/48 组 fixture 和产品治理；正式 evidence 同时保留
 Windows 失败—修复关系及 macOS 非登录 SSH 缺 Cargo PATH 的环境观察。
 
+provider 重试自此有明确上限。此前只要 driver 把失败标为可重试，子操作就会在倍增时钟上被无限次重新认领，父 operation
+永远停在 `waiting`、始终不写 error，操作者除非主动去翻记录否则无从知晓。现在同一子操作最多尝试
+`MAX_PROVIDER_CHILD_ATTEMPTS`（10）次：在默认 30 秒基值下，倍增退避把这 10 次摊在两小时零几分钟里，足够让 provider
+故障、凭据轮换或限流自行恢复，也保证无人盯着的部署当天就能结束。上限只对「纯粹的重复」生效——provider 侧没有留下
+副作用（`side_effect=none`）且 next action 是 `none` 或 `retry`；`observe`/`reconcile`/`rollback` 指向需要回头核对的
+provider 状态，`manual-intervention` 本就已经在叫人，四者都不计入上限，否则会留下再也没人去看的 provider 状态。达到
+上限时该次失败按终态结算，父 operation 以 driver 最后一次的错误 `failed`，消息追加「given up after N attempts」。派发
+侧同理：同一步骤连续 `MAX_PROVIDER_DISPATCH_FAILURES`（10）次选不出或起不来 driver 时，operation 以
+`PROVIDER_DISPATCH_UNAVAILABLE` 失败并带上最后一次派发错误的码与消息，退避簿记随之清空；正在取消的 workflow 不走
+这条路，因为取消仍欠一次结算或清理。上限按次数而非墙钟计，是为了让测试能钉死：无论安装方把基值配成多少，10 次就是
+10 次。
+
 这仍不是完整供应链闭环：当前 contract fixture 是合成分发物，尚未生成并实际签署 Wrangler 的真实完整安装树，也没有
 真实透明日志/独立 witness 的采集与可用性运营，以及真实 Windows Service 安装演练。公共
 provider 生命周期中 installation/target 已有 disable/enable/软删除、级联撤销 grant 与 lifecycle audit，创建类 mutation 已接入

@@ -2917,3 +2917,44 @@ Application/framework source + versioned build plan
 - 未完成：Web organization/application/environment 主线；session/command/event/config history 的 state/status/severity
   服务端枚举；四条自成形状的平台诊断列表迁入 `ControlListPage`；EdgeOne Node Function 路由配置；README 与 architecture
   文档中仍以旧前缀拼写的路由表（旧前缀 2027-06-30 前有效）；上一条列出的四项开放决策；总 Goal 需外部资源的项不变。
+
+## 98. 四项开放决策的结清与 P1-CASE-001 的实测结论
+
+- 第 97 节退回产品拍板的四项开放决策已逐条给出结论并落到代码、测试与文档。历史章节不改写，结论记在这里。
+- `ProductOperation` 的可空成员：`scope.applicationId`、`scope.environmentId`、`progress`、`error` 及其
+  `retryAfterSeconds` 与 `remediation`、`startedAt`、`finishedAt` 这八个成员确实会序列化为 `null`，
+  `contracts/v1/operation.schema.json` 从一开始就这么写，只有 OpenAPI 渲染声称它们非空。这个方向恰好是有害的：由错的
+  那一半生成的客户端会给成员一个非空类型，然后对一个没人告诉过它的 `null` 解引用。产品决定 v1 尚未发布、不存在按基线
+  写成的客户端，因此不升大版本、直接如实修正。兼容门禁把「响应类型放宽」判为破坏性是对的，不该为此放松规则，于是
+  `scripts/check-openapi-compat.py` 增加 `PRERELEASE_CORRECTIONS`：八条变更逐字具名接受，与报告文本不完全相符的条目
+  不生效，未列出的放宽照旧拒绝；清单只减不增，合入后基线自然覆盖，届时运行会提示删除。
+- `api_page_cursors` 的容量：不设硬性上限。两种硬上限都伤到不该伤的人——满表时拒绝列表请求，等于让一次容量事故变成
+  读取路径的故障；驱逐同一查询绑定的旧位置，会让正在翻页的人凭空拿到「游标失效」，且只在高负载下发生、事后无法复现。
+  游标本就带三天有效期（`CURSOR_TTL_SECONDS`），reaper 每轮按年龄批量清理的机制早已存在，本轮补的是缺口的另一半：
+  `CURSOR_COUNT_WARNING_THRESHOLD`（10,000）软阈值，由 reaper 扫描后报一次。放在 reaper 而不是 metrics 端点，是因为
+  端点被别人的时钟抓取——一个持续一天的状态会变成一天的重复日志。token 是派生的，一行对应一个查询的一页，控制台反复
+  轮询同一页只占一行，所以这个计数反映的是同时打开的遍历数，不是请求数。
+- driver 重试上限：子操作 `MAX_PROVIDER_CHILD_ATTEMPTS`（10）、派发 `MAX_PROVIDER_DISPATCH_FAILURES`（10），耗尽后
+  父操作 `failed`。此前只要 driver 把失败标为可重试，子操作就会在倍增时钟上被无限次重新认领，父操作永远停在 `waiting`、
+  始终不写 error，操作者除非主动去翻记录否则无从知晓。上限按次数而非墙钟计，是为了让测试能钉死：无论安装方把基值配成
+  多少，10 次就是 10 次；在默认 30 秒基值下这 10 次摊在两小时零几分钟里。上限只对「纯粹的重复」生效——provider 侧没有
+  留下副作用且 next action 是 `none` 或 `retry`；`observe`/`reconcile`/`rollback` 指向需要回头核对的 provider 状态，
+  `manual-intervention` 本就已经在叫人，四者都不计入，否则会留下再也没人去看的 provider 状态。正在取消的 workflow 也
+  不走派发上限这条路，因为取消仍欠一次结算或清理。两条上限各有一个回归测试逐次走到边界。
+- `idx_events_page_v1`：退役。`id` 即 rowid，`idx_events_timestamp` 已能给出完全相同的顺序，查询计划证据里规划器从未
+  选中过它，留着只是让每次写入 events 多维护一棵 b-tree。schema 改为 `DROP INDEX IF EXISTS`，旧库下次启动即脱落；
+  分页查询计划证据的无过滤分支也从「两者取一」收紧为只接受 `idx_events_timestamp`。
+- 路线图记账：`P1-API-002` 标为 done，并去掉了它对 `P1-DEPLOY-001` 的 `dependsOn`。那条依赖记录的是这四项决策的来处，
+  不是真正的前置条件——四项都是针对现有实现拍板的，不需要等 provider driver 生命周期整体完成。此处明说，避免这个改动
+  被当成为了让治理检查通过而做的手脚。
+- `P1-CASE-001` 已实测，两段推断一真一假。在本机用 loopback 镜像格式化出带 casefold 的 ext4 卷（`touch a` 后 `ls A`
+  命中同一文件为实证）复现：一个真实文件 `shared/util.js`，入口分别 `import` `./util.js` 与 `./Util.js`，deislet 与
+  deno 两个 vendor 的产物里同一份代码各出现两次——重复 stage 成立。路线图原话「不做 canonicalize」不准确：
+  `resolve_local_module` 确实调用了 `fs::canonicalize`，但在折叠大小写的卷上它不会把路径纠正成磁盘上的真实拼写，
+  传 `Util.js` 进去吐出来的还是 `Util.js`，所以 `HashSet<PathBuf>` 的去重天然失效。第二段推断不成立：不管目标是哪个
+  vendor，构建都会先在构建机上把整棵模块图内联成不含 `import` 的自包含文件，运行时没有文件系统级的模块解析这一步，
+  因此不会出现「一个 import 解析不到」。也就是说这条缺陷的后果是产物里同一份代码被打进两遍，而不是部署后炸掉。
+- 未完成：第 97 节列出的其余各项不变；`P1-CASE-001` 的修法尚未拍板——直接 canonicalize 治标不治本，因为最终打包用的
+  bundler 会从入口在磁盘上独立地再解析一遍模块图，同样会把两个拼写当成两个模块；备选是在解析阶段发现两个仅大小写不同
+  的拼写指向同一路径时直接拒绝构建并报出两处具体路径，与该文件里拒绝绝对路径、拒绝符号链接、拒绝越出项目根的既有风格
+  一致。
