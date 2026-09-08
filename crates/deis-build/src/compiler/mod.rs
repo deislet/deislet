@@ -175,7 +175,10 @@ impl Compiler {
             let code = fs::read_to_string(&handler_path)?;
 
             // Parse handler
-            let handler_info = self.parser.parse(&code, &handler_path)?;
+            let handler_info = self.parser.parse(
+                &code,
+                &Self::portable_display_path(Path::new(&handler_path)),
+            )?;
             let relative_path = Path::new(&handler_path).strip_prefix(
                 function_root
                     .as_deref()
@@ -756,6 +759,33 @@ impl Compiler {
             ));
         }
         Ok(Some(resolved))
+    }
+
+    /// The one spelling every source file this compiler names in a
+    /// diagnostic is written in.
+    ///
+    /// Module resolution runs on canonical paths so that a symlinked or
+    /// `..`-laden import can be compared against the project root at all, and
+    /// `fs::canonicalize` is what produces them. On Windows that returns a
+    /// verbatim path - `\\?\C:\...`, the prefix the kernel uses to opt out of
+    /// the old 260-character limit - and the separator is a backslash. Both
+    /// are correct as a path and wrong as a name: the author is shown a
+    /// prefix that means nothing to them, and a message that reads
+    /// `shared/value.ts:1:1` on Linux reads `\\?\C:\...\shared\value.ts:1:1`
+    /// on Windows, for the same source file and the same defect.
+    ///
+    /// ADR-018 already requires `/` and refuses `\` for the paths a manifest
+    /// carries. This applies the same rule to the paths a diagnostic carries,
+    /// which had never been checked because the compiler's tests could not be
+    /// built on Windows at all until that host had libclang.
+    fn portable_display_path(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        let stripped = text
+            .strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| text.strip_prefix(r"\\?\").map(str::to_owned))
+            .unwrap_or_else(|| text.to_string());
+        stripped.replace('\\', "/")
     }
 
     fn project_mirror_path(
@@ -1856,24 +1886,25 @@ impl Compiler {
             }
 
             let code = fs::read_to_string(&handler_path)?;
-            let parsed = self.parser.parse(&code, &handler_path)?;
-            Self::refuse_a_handler_with_no_default_export(&handler_path, Some(&parsed))?;
+            let handler_name = Self::portable_display_path(&source_path);
+            let parsed = self.parser.parse(&code, &handler_name)?;
+            Self::refuse_a_handler_with_no_default_export(&handler_name, Some(&parsed))?;
             Self::refuse_non_literal_module_loads(&handler_path, &parsed)?;
-            Self::refuse_external_runtime_module_edges(&handler_path, &parsed)?;
-            Self::refuse_provider_only_globals(&handler_path, &parsed)?;
-            Self::refuse_non_portable_stream_constructors(&handler_path, &parsed)?;
+            Self::refuse_external_runtime_module_edges(&handler_name, &parsed)?;
+            Self::refuse_provider_only_globals(&handler_name, &parsed)?;
+            Self::refuse_non_portable_stream_constructors(&handler_name, &parsed)?;
             if deis_build_core::routes::handler_kind(&relative_path.to_string_lossy())
                 == deis_build_core::routes::HandlerKind::Http
             {
-                Self::refuse_non_standard_context_fields(&handler_path, &parsed)?;
+                Self::refuse_non_standard_context_fields(&handler_name, &parsed)?;
             }
-            module_references.push((handler_path.clone(), parsed.module_references.clone()));
-            handler_specifiers.push((handler_path.clone(), parsed.imports.clone()));
+            module_references.push((handler_name.clone(), parsed.module_references.clone()));
+            handler_specifiers.push((handler_name.clone(), parsed.imports.clone()));
             module_queue.push_back((source_path.clone(), parsed.imports));
             staged_modules.insert(source_path.clone());
             let transformed = self
                 .transformer
-                .transform(&code, &handler_path, vendor, config)?;
+                .transform(&code, &handler_name, vendor, config)?;
             Self::write_staged_file(&mirror_path, transformed.as_bytes())?;
             let proxy = Self::proxy_module(&output_path, &mirror_path)?;
             Self::write_staged_file(&output_path, proxy.as_bytes())?;
@@ -1957,7 +1988,7 @@ impl Compiler {
                         Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
                     );
                     if is_script {
-                        let name = dependency.to_string_lossy().to_string();
+                        let name = Self::portable_display_path(&dependency);
                         let parsed = self.parser.parse(code, &name)?;
                         Self::refuse_non_literal_module_loads(&name, &parsed)?;
                         Self::refuse_external_runtime_module_edges(&name, &parsed)?;
@@ -3320,6 +3351,42 @@ struct BundleOutcome {
     path: std::path::PathBuf,
     size: usize,
     warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod diagnostic_path_tests {
+    use super::*;
+
+    /// The names in a diagnostic are the same names on every build host.
+    ///
+    /// The Windows spellings are checked here rather than only on a Windows
+    /// runner because this is plain string work: what `fs::canonicalize`
+    /// hands back there is what goes in, and the rule that comes out has to
+    /// hold whoever runs the test. Until that host could build this crate at
+    /// all, the only proof available was a Windows run that never happened.
+    #[test]
+    fn a_diagnostic_names_a_source_file_the_same_way_on_every_host() {
+        // What a Unix host resolves is already the answer; nothing moves.
+        assert_eq!(
+            Compiler::portable_display_path(Path::new("/tmp/build/shared/value.ts")),
+            "/tmp/build/shared/value.ts"
+        );
+        // What Windows resolves carries the verbatim prefix and backslashes.
+        assert_eq!(
+            Compiler::portable_display_path(Path::new(r"\\?\C:\Users\leo\shared\value.ts")),
+            "C:/Users/leo/shared/value.ts"
+        );
+        // A drive path without the prefix still has the separator to fix.
+        assert_eq!(
+            Compiler::portable_display_path(Path::new(r"C:\build\shared\value.ts")),
+            "C:/build/shared/value.ts"
+        );
+        // A verbatim UNC path keeps the share it names.
+        assert_eq!(
+            Compiler::portable_display_path(Path::new(r"\\?\UNC\host\share\value.ts")),
+            "//host/share/value.ts"
+        );
+    }
 }
 
 #[cfg(test)]

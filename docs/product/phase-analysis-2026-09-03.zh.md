@@ -2958,3 +2958,31 @@ Application/framework source + versioned build plan
   bundler 会从入口在磁盘上独立地再解析一遍模块图，同样会把两个拼写当成两个模块；备选是在解析阶段发现两个仅大小写不同
   的拼写指向同一路径时直接拒绝构建并报出两处具体路径，与该文件里拒绝绝对路径、拒绝符号链接、拒绝越出项目根的既有风格
   一致。
+
+## 99. s69 补上 libclang 后编译器首次在 Windows 受测，暴露诊断路径拼写缺陷
+
+- 第 97 节记的那个唯一真实覆盖缺口已闭合。s69 装上 LLVM 23.1.0（官方 `LLVM-23.1.0-win64.msi`，先核对官方 SHA-256 再
+  静默安装；该版本已不再提供 `.exe` 安装包），`LIBCLANG_PATH` 设为机器级环境变量指向 `C:\Program Files\LLVM\bin`，并
+  另开一个全新 ssh 会话验证过能读到——机器级变量只对新会话生效，这一步不能省。
+- 根因确认为 `zstd-sys`：`deis-build` 经 zip → zstd → zstd-safe 传导到它，且 `legacy` 非默认特性被打开。zstd-sys 只在
+  纯默认特性下带预生成绑定，一旦启用非默认特性就走 bindgen 现场生成，bindgen 需要 libclang 解析 C 头文件。实测日志里
+  `bindgen` 与 `zstd-sys` 均编译通过，不再报「Unable to find libclang」。
+- 编译器由此第一次在 Windows 上完整构建（约 38 分钟；该机被一批与本任务无关的长期进程占满 CPU）并跑起测试，
+  provider driver 58/58、Control 90/90、pagination、authz 41 条、target grant、协调器与五项迁移测试全部通过。
+- 随即暴露一处从未被测过的真实缺陷：`crates/deis-build/tests/every_target_checks_what_its_modules_import.rs` 第 210 行
+  断言诊断里含 `shared/value.ts:1:`，Windows 上实际得到
+  `\\?\C:\Users\leo\AppData\Local\Temp\...\shared\value.ts:1:1`。判断本身是对的（确实识别出 https-scheme 外部边并拒绝），
+  错的是那条被嵌进文案的路径：模块解析用 `fs::canonicalize` 得到规范路径，是为了能把符号链接或带 `..` 的 import 与项目根
+  做比较，而 Windows 上它返回带 `\\?\` 前缀、以反斜杠分隔的 verbatim path，被原样拼进用户可见的诊断。同一个源文件、同一处
+  缺陷，Linux 显示 `shared/value.ts:1:1`，Windows 显示一串作者根本不认识的前缀。
+- 修法：新增 `Compiler::portable_display_path`，去掉 verbatim 前缀（含 `\\?\UNC\` 形式）并把分隔符归一为 `/`，用于
+  handler 与传递可达模块的解析名与全部 `refuse_*` 诊断；路径本身仍是规范路径，改的只是「名字」这一面。ADR-018 对
+  manifest path 早已要求 `/` 并拒绝 `\`，这里是把同一条规则补到诊断文案上。配一个纯字符串单元测试，让这条规则在任何
+  主机上都能验证，而不必等一次 Windows 实跑——这正是它此前从未被发现的原因。
+- 因为 cargo 在一个测试二进制失败后不再跑排队中的其余二进制，`deis-build/tests/` 下另有 11 个测试文件那一轮没有机会执行，
+  如实记为「未覆盖」而非通过；`deis-build-adapter-deislet`、`deis-wire`、`deis-bundle`、CLI 测试与两轮严格 Clippy 同样
+  未跑到。修复后需重跑一轮才能给出完整的 Windows 结论。
+- 两点环境观察：① s69 长期被一批与本项目无关的进程占满 CPU（累计 CPU 时间十几万秒），是本轮耗时的主要来源，未触碰；
+  ② `deis-build` 经 zip 拉进的依赖树极大，其中包含通过 git 依赖拉取的 rolldown/rollup 与整套类 Deno 运行时依赖，
+  `deis-runtime`（按本 ADR 只支持 Linux）确实作为 dev-dependency 被编译，与 ADR-018「非 Linux 客户端构建不应编译 Linux
+  server 依赖」的关注点属同一类风险，值得后续处理。

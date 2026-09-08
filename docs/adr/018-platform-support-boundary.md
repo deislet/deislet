@@ -218,6 +218,17 @@ Project-local config 可跨平台提交，不写绝对 home/drive path。User ov
 
 远程实机任务必须固定 commit/artifact、记录 OS/architecture/tool versions、上传结构化结果并清理测试 credential/resources。共享主机的测试隔离、并发与端口/目录必须显式，不能依靠人工记忆。
 
+s69 此前一直缺 libclang，`deis-build` 在那台机器上连编译都过不去（依赖链 zip → zstd → zstd-safe → zstd-sys，且 `legacy`
+非默认特性打开，zstd-sys 因此走 bindgen 现场生成绑定，bindgen 需要 libclang 解析 C 头文件）。本 ADR 承诺编译器三平台
+支持，所以这不是边界而是真实覆盖缺口。2026-09-08 在 s69 装上 LLVM 23.1.0 并把 `LIBCLANG_PATH` 设为机器级环境变量后，
+编译器第一次在 Windows 上完整构建并跑起测试，随即暴露一处从未被测过的缺陷：模块解析用 `fs::canonicalize` 得到规范
+路径（这是为了能把符号链接或带 `..` 的 import 与项目根做比较），而 Windows 上它返回带 `\\?\` 前缀、以反斜杠分隔的
+verbatim path，这条路径被原样拼进用户可见的诊断文案——同一个源文件、同一处缺陷，Linux 上显示 `shared/value.ts:1:1`，
+Windows 上显示 `\\?\C:\...\shared\value.ts:1:1`。路径作为路径是对的，作为名字是错的：作者看到一个对他毫无意义的
+前缀。本 ADR 对 manifest path 早已要求统一用 `/` 并拒绝 `\`，诊断文案适用同一条规则，现由 `portable_display_path`
+统一（去掉 verbatim 前缀、分隔符归一），并配一个纯字符串单元测试，使这条规则在任何主机上都能被验证，而不必等一次
+Windows 实跑。
+
 CI provider deploy 使用 sandbox/test accounts 和短期 credential；常规 PR 可以 package/validate，真实外部部署在受控 nightly/release gate 执行。
 
 ## 文档与支持用语
