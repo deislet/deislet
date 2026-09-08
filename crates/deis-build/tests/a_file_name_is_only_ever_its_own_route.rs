@@ -20,6 +20,15 @@
 //! because unlike a `:` or a `*` there is no single right reading of it: the
 //! same tree would be two different route tables on two machines.
 
+//! Both cases need a file whose name Windows will not accept - `*`, `:` and
+//! `\` are reserved there - so there is nothing in this file for that
+//! platform to run, and the whole of it is compiled only where a test can
+//! run. Saying that with `cfg`, rather than leaving helpers behind for a
+//! strict `-D warnings` build to trip over, keeps the record honest about
+//! which of these promises Windows has been held to: none of them.
+
+#![cfg(unix)]
+
 use std::path::Path;
 
 use deis_build::{Compiler, CompilerOptions};

@@ -2986,3 +2986,34 @@ Application/framework source + versioned build plan
   ② `deis-build` 经 zip 拉进的依赖树极大，其中包含通过 git 依赖拉取的 rolldown/rollup 与整套类 Deno 运行时依赖，
   `deis-runtime`（按本 ADR 只支持 Linux）确实作为 dev-dependency 被编译，与 ADR-018「非 Linux 客户端构建不应编译 Linux
   server 依赖」的关注点属同一类风险，值得后续处理。
+
+## 100. 带修复重跑 s69：一个漏网同类点、两处平台限定缺口与一条存疑观察
+
+- 第 99 节那处诊断路径缺陷的修复经实测生效，原失败用例
+  `a_local_dependency_cannot_hide_an_external_runtime_module` 通过。这一轮加了 `--no-fail-fast`，26 个测试二进制全部跑完，
+  一次拿到完整清单，而不是每修一条就重编近 40 分钟。
+- 修复漏了一个同类调用点：`crates/deis-build/src/compiler/mod.rs` 里 handler 那一组诊断调用中，
+  `refuse_non_literal_module_loads` 仍在用未归一化的 `handler_path`，而紧挨着的四个姊妹调用都已改用
+  `portable_display_path` 处理过的 `handler_name`。表现为 `node_npm_contract.rs` 的
+  `dynamic_resolution_uses_the_standard_error_on_every_target` 在 Windows 上仍打印 `\\?\C:\...`。已补上。
+- `deis-build` 的严格 Clippy 在 Windows 上因 7 处 `dead_code` 被 `-D warnings` 升级成硬错误：
+  `a_rejected_artifact_is_not_a_successful_build.rs` 与 `a_file_name_is_only_ever_its_own_route.rs` 里的 helper 只被
+  文件内 `#[cfg(unix)]` 的用例调用，Windows 上那些用例整体被裁掉，helper 就真的没人用。普通 `cargo test` 只当警告，
+  严格 Clippy 才暴露成错误。两个文件都改为整文件 `#![cfg(unix)]`：前者的 stub wrangler 是 shell 脚本，后者需要文件名带
+  `*`、`:`、`\`——Windows 文件系统不接受这些字符。这不是把问题藏起来，而是如实声明这两组承诺在 Windows 上一条都没被
+  验证过；要真正覆盖，前者需要一个 `.cmd` 版 stub，后者在 Windows 上无法成立。
+- `provider_node_facade.rs` 的
+  `every_provider_node_bundle_normalizes_identity_globals_and_invocation_env` 在 s69 上硬失败：该用例要真的拉起
+  Node.js 执行打包产物验证运行时行为，而那台机器没装 Node。属环境缺口，不是代码缺陷；s69 要完整覆盖编译器测试还需装
+  Node.js（wrangler 缺失该用例有容忍分支，Node 缺失没有）。
+- 一条存疑观察，未定性：CLI 的 `render::tests::a_non_terminal_stdin_is_refused_rather_than_read_from` 在这一轮卡死超过
+  60 秒。`crates/deis/src/render.rs:73` 先判 `IsTerminal::is_terminal(&stdin())`，判为终端才会走到会阻塞的
+  `read_line`；测试的前提是「测试进程的 stdin 从来不是终端」。但这一轮为了让长构建扛住 SSH 断线，是用
+  `Win32_Process.Create`（WMI）拉起整条链路的，这样创建的进程根本没有配置任何标准输入句柄——与真实场景里
+  stdin 被重定向到 NUL 或管道、进程持有一个「有效但非终端」句柄是两回事。所以更可能是这次跑法造成的假象，但不能排除
+  产品在正常 Windows 环境下也会踩。按失败如实记录，定性需要用一次带正常重定向 stdin 的非交互 shell 单独复验，已并入
+  下一轮复验待办，不作为已确认的 Windows 缺陷处理。
+- 本轮 s69 通过：provider driver 58/58、Control 92/92、pagination、authz 41 条、target grant、协调器、五项迁移、
+  `deis-build-adapter-deislet`、`deis-wire`、`deis-bundle`，以及 driver/control/build-core/adapter-deislet/wire/bundle/cli
+  七个包的严格 Clippy 零警告。`deis-build` 测试 119 通过 / 2 失败（即上面两条）。按 ADR-018，`deis-proxy` 与
+  `deis-runtime` 不在 Windows 覆盖范围内。

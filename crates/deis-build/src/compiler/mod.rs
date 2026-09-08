@@ -1889,7 +1889,7 @@ impl Compiler {
             let handler_name = Self::portable_display_path(&source_path);
             let parsed = self.parser.parse(&code, &handler_name)?;
             Self::refuse_a_handler_with_no_default_export(&handler_name, Some(&parsed))?;
-            Self::refuse_non_literal_module_loads(&handler_path, &parsed)?;
+            Self::refuse_non_literal_module_loads(&handler_name, &parsed)?;
             Self::refuse_external_runtime_module_edges(&handler_name, &parsed)?;
             Self::refuse_provider_only_globals(&handler_name, &parsed)?;
             Self::refuse_non_portable_stream_constructors(&handler_name, &parsed)?;

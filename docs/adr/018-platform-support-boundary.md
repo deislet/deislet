@@ -214,7 +214,8 @@ Project-local config 可跨平台提交，不写绝对 home/drive path。User ov
 - s17：本机 Ubuntu 24.04.4 开发/快速验证；
 - s90/s91/s68：Ubuntu 24.04.4 多节点、HA、故障与升级；
 - s67：macOS 26.5 native CLI/compiler/dev；
-- s69：Windows 10/PowerShell 5.1 native CLI/compiler/dev compatibility。
+- s69：Windows 10/PowerShell 5.1 native CLI/compiler/dev compatibility。该机需装 LLVM（编译器依赖链经 zstd-sys 走
+  bindgen）与 Node.js（provider node facade 测试要真的执行打包产物）；缺 Node 时该用例硬失败，缺 wrangler 只是容忍分支。
 
 远程实机任务必须固定 commit/artifact、记录 OS/architecture/tool versions、上传结构化结果并清理测试 credential/resources。共享主机的测试隔离、并发与端口/目录必须显式，不能依靠人工记忆。
 

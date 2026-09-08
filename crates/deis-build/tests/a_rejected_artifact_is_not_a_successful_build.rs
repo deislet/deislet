@@ -15,6 +15,14 @@
 //! and a stub is the only way to produce one on a machine that may not have
 //! the tool installed at all. Both halves live in one test on purpose - `PATH`
 //! is process-wide, so two tests setting it would race.
+//!
+//! The stub is a shell script, so this file has nothing for Windows to run
+//! and the whole of it is compiled only where a test can run. A `.cmd` stub
+//! would give that platform the same evidence; until one exists, the `cfg`
+//! says plainly that the promise is unverified there rather than leaving
+//! helpers behind for a strict `-D warnings` build to trip over.
+
+#![cfg(unix)]
 
 use std::fs;
 use std::path::Path;
@@ -51,7 +59,6 @@ fn stage(dir: &Path) {
 /// One script rather than two, because the test switches between the two
 /// answers by creating and removing that file; swapping `PATH` twice would be
 /// the same race the module note describes.
-#[cfg(unix)]
 fn install_stub_wrangler(bin: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
