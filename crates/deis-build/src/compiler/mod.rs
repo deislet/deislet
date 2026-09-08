@@ -161,7 +161,9 @@ impl Compiler {
         let function_root = if handlers.is_empty() {
             None
         } else {
-            Some(fs::canonicalize(project_dir.join(&config.function_root))?)
+            Some(fs::canonicalize(project_dir.join(
+                Self::on_disk_directory(project_dir, &config.function_root)?,
+            ))?)
         };
 
         let mut result = ValidationResult::new();
@@ -646,7 +648,8 @@ impl Compiler {
         config: &ProjectConfig,
     ) -> anyhow::Result<Vec<String>> {
         let project_root = fs::canonicalize(project_dir)?;
-        let configured_functions_dir = project_dir.join(&config.function_root);
+        let configured_functions_dir =
+            project_dir.join(Self::on_disk_directory(project_dir, &config.function_root)?);
         let mut handlers = Vec::new();
 
         // A project with no function root is a site made only of static files,
@@ -711,11 +714,19 @@ impl Compiler {
         }
 
         let suffix_at = specifier.find(['?', '#']).unwrap_or(specifier.len());
-        let disk_specifier = &specifier[..suffix_at];
-        let requested = importer
+        let written = &specifier[..suffix_at];
+        let importer_dir = importer
             .parent()
-            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", importer.display()))?
-            .join(disk_specifier);
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", importer.display()))?;
+        // Every candidate below is built from the on-disk spelling, so the
+        // file this import names is found the same way on a case-sensitive
+        // filesystem as on one that folds case, and one file reaches
+        // `staged_modules` under one path however many ways it was spelled.
+        // The staged text is respelled to match, when the file is staged; see
+        // `source_with_on_disk_import_spellings`, which is where the author is
+        // told about it.
+        let disk_specifier = Self::on_disk_specifier(importer_dir, written)?;
+        let requested = importer_dir.join(&disk_specifier);
         let mut candidates = vec![requested.clone()];
         if requested.extension().is_none() {
             for extension in ["ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "wasm"] {
@@ -759,6 +770,277 @@ impl Compiler {
             ));
         }
         Ok(Some(resolved))
+    }
+
+    /// The component text an author wrote, respelled with the letters the
+    /// file on disk actually uses, or `None` when the two do not name the
+    /// same thing.
+    ///
+    /// Three forms count as the same thing, because `resolve_local_module`
+    /// accepts all three: the plain name (`util.js` on disk for a written
+    /// `Util.js`), the name an extension is appended to (`util.js` on disk for
+    /// a written, extensionless `Util`), and the TypeScript source behind a
+    /// JavaScript name (`util.ts` on disk for a written `Util.js`). Only the
+    /// letters the author actually typed are respelled: an appended extension
+    /// is not theirs to spell, and a substituted one is the resolver's, so
+    /// neither is written back into their import.
+    fn component_with_disk_case(written: &str, on_disk: &str) -> Option<String> {
+        if written.to_lowercase() == on_disk.to_lowercase() {
+            return Some(on_disk.to_string());
+        }
+
+        let written_length = written.chars().count();
+        let prefix: String = on_disk.chars().take(written_length).collect();
+        let rest: String = on_disk.chars().skip(written_length).collect();
+        if rest.starts_with('.') && prefix.to_lowercase() == written.to_lowercase() {
+            return Some(prefix);
+        }
+
+        let (written_stem, written_extension) = written.rsplit_once('.')?;
+        let (disk_stem, disk_extension) = on_disk.rsplit_once('.')?;
+        if written_stem.to_lowercase() == disk_stem.to_lowercase()
+            && matches!(written_extension, "js" | "jsx" | "mjs" | "cjs")
+            && matches!(disk_extension, "ts" | "tsx")
+        {
+            return Some(format!("{disk_stem}.{written_extension}"));
+        }
+
+        None
+    }
+
+    /// The import specifier, respelled the way the files on disk spell it.
+    ///
+    /// A build host whose filesystem folds letter case - APFS in its default
+    /// mode, most Windows volumes, ext4 with `casefold` - opens `./Util.js`
+    /// when the file is `util.js`, and `fs::canonicalize` does not correct the
+    /// spelling on the way back: it returns `Util.js`. Two spellings of one
+    /// file then travel through the build as two paths, and every consumer
+    /// that keys off the path counts the file twice - `staged_modules` stages
+    /// it twice, `canonical_source_tree_sha256` hashes it under two names so
+    /// the artifact's identity depends on which host built it, and the
+    /// bundler, which resolves the module graph again from the source text,
+    /// inlines the same module twice under two identities. A module that was
+    /// meant to be one instance becomes two, and a registry or connection pool
+    /// declared at its top level silently splits in half.
+    ///
+    /// Resolving case-insensitively here, on every host and not only on the
+    /// ones whose filesystem does it for us, is what esbuild does, and for the
+    /// same reason: the alternative is that one source tree builds on a
+    /// developer's laptop and fails on a Linux CI runner. ADR-018 asks for the
+    /// stronger version of that promise - the three supported platforms give
+    /// the same answer for the same source - which this delivers by making the
+    /// answer not depend on the filesystem at all. The author still hears
+    /// about it: the caller warns, naming both spellings.
+    ///
+    /// Returns the specifier unchanged when nothing on disk corresponds to it,
+    /// so the resolver below produces its own "no project file resolves that
+    /// module" diagnostic rather than a worse one from here.
+    fn on_disk_specifier(importer_dir: &Path, disk_specifier: &str) -> anyhow::Result<String> {
+        Self::on_disk_path(importer_dir, disk_specifier, false)
+    }
+
+    /// The same correction for a directory the project's configuration names.
+    ///
+    /// `functionRoot` and the assets directory are author-written paths too,
+    /// and they fail more quietly than an import does. A `functionRoot` of
+    /// `./Functions` in front of a directory called `functions` finds every
+    /// handler on a case-folding host and none at all on Linux, where the
+    /// missing directory is read as "this project is a site made only of
+    /// static files" - a shape the platform supports on purpose, so nothing
+    /// complains. The same project then deploys with all of its routes from
+    /// one machine and with none of them from another, and says so nowhere.
+    /// A miscased assets directory loses the site's files the same way.
+    fn on_disk_directory(base: &Path, written: &str) -> anyhow::Result<String> {
+        if Path::new(written).is_absolute() {
+            return Ok(written.to_string());
+        }
+        Self::on_disk_path(base, written, true)
+    }
+
+    fn on_disk_path(
+        base: &Path,
+        written: &str,
+        last_component_is_a_directory: bool,
+    ) -> anyhow::Result<String> {
+        let parts: Vec<&str> = written.split('/').collect();
+        let mut cursor = base.to_path_buf();
+        let mut respelled: Vec<String> = Vec::with_capacity(parts.len());
+
+        for (index, part) in parts.iter().enumerate() {
+            let is_last = index + 1 == parts.len();
+            if part.is_empty() || *part == "." {
+                respelled.push((*part).to_string());
+                continue;
+            }
+            if *part == ".." {
+                respelled.push("..".to_string());
+                cursor.pop();
+                continue;
+            }
+
+            let Ok(entries) = fs::read_dir(&cursor) else {
+                respelled.extend(parts[index..].iter().map(|rest| (*rest).to_string()));
+                return Ok(respelled.join("/"));
+            };
+
+            let mut exact = false;
+            let mut candidates: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // Only a directory can carry the components before the last
+                // one. Without this a file called `shared` would answer for
+                // the `shared` in `./shared/util.js`.
+                if (!is_last || last_component_is_a_directory) && !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                if name == *part {
+                    exact = true;
+                }
+                if let Some(text) = Self::component_with_disk_case(part, &name) {
+                    candidates.entry(text).or_default().push(name);
+                }
+            }
+
+            // An exact hit settles it, and so does a single respelling that
+            // several files agree on: `./util` matching both `util.ts` and
+            // `util.js` is the resolver's ordinary extension search, not an
+            // ambiguity. Two different respellings are a real one, and can
+            // only happen on a case-sensitive filesystem holding two files
+            // whose names differ only in case - which is a source tree that
+            // cannot be checked out on the other two supported platforms.
+            let chosen = if exact {
+                (*part).to_string()
+            } else {
+                match candidates.len() {
+                    0 => {
+                        respelled.extend(parts[index..].iter().map(|rest| (*rest).to_string()));
+                        return Ok(respelled.join("/"));
+                    }
+                    1 => candidates.keys().next().expect("one candidate").clone(),
+                    _ => {
+                        let mut names: Vec<String> =
+                            candidates.values().flatten().cloned().collect();
+                        names.sort();
+                        return Err(anyhow::anyhow!(
+                            "{part:?} in {written:?} names more than one file in {}, differing \
+                             only in letter case: {}. A case-insensitive filesystem cannot tell \
+                             them apart, so this path has no one answer; rename them",
+                            Self::portable_display_path(&cursor),
+                            names.join(", "),
+                        ));
+                    }
+                }
+            };
+
+            cursor.push(&chosen);
+            respelled.push(chosen);
+        }
+
+        Ok(respelled.join("/"))
+    }
+
+    /// `code`, with every project-local import respelled the way the files on
+    /// disk spell it, and the list of what was respelled.
+    ///
+    /// Correcting the compiler's own bookkeeping is not enough. The bundler
+    /// that produces the deployable resolves the module graph a second time,
+    /// from this text, with its own resolver: rolldown keys a module by the
+    /// resolved path as written and Deno keys it by URL, and neither folds
+    /// letter case the way esbuild does. Leave `./Util.js` in the source and
+    /// the bundler finds `util.js` on a case-folding host, calls it a second
+    /// module, and inlines the file twice. So the correction has to reach the
+    /// text every consumer downstream actually reads.
+    ///
+    /// Only the bytes the author wrote are replaced, and only when the literal
+    /// says exactly what the parser recorded. A specifier written with an
+    /// escape (`'./Util.js'`) is refused rather than rewritten: this
+    /// rewrites source code, and a rewrite it cannot prove correct is worse
+    /// than an error message.
+    fn source_with_on_disk_import_spellings(
+        importer: &Path,
+        code: &str,
+        literals: &[SpecifierLiteral],
+    ) -> anyhow::Result<(String, Vec<(String, String)>)> {
+        let Some(importer_dir) = importer.parent() else {
+            return Ok((code.to_string(), Vec::new()));
+        };
+
+        let mut corrections: Vec<(&SpecifierLiteral, String)> = Vec::new();
+        for literal in literals {
+            if !literal.specifier.starts_with("./") && !literal.specifier.starts_with("../") {
+                continue;
+            }
+            let suffix_at = literal
+                .specifier
+                .find(['?', '#'])
+                .unwrap_or(literal.specifier.len());
+            let written = &literal.specifier[..suffix_at];
+            let on_disk = Self::on_disk_specifier(importer_dir, written)?;
+            if on_disk == written {
+                continue;
+            }
+            corrections.push((
+                literal,
+                format!("{on_disk}{}", &literal.specifier[suffix_at..]),
+            ));
+        }
+        if corrections.is_empty() {
+            return Ok((code.to_string(), Vec::new()));
+        }
+
+        // Later first, so that replacing one literal cannot move the byte
+        // range of another that has not been replaced yet.
+        corrections.sort_by_key(|(literal, _)| std::cmp::Reverse(literal.start));
+
+        let name = Self::portable_display_path(importer);
+        let mut respelled = code.to_string();
+        let mut reported = Vec::with_capacity(corrections.len());
+        for (literal, on_disk) in corrections {
+            let quoted = respelled.get(literal.start..literal.end).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{name} imports {:?} at a source range this file does not have; the import \
+                     cannot be corrected to the spelling on disk",
+                    literal.specifier
+                )
+            })?;
+            let quote = quoted.chars().next().unwrap_or(' ');
+            let unquoted = matches!(quote, '"' | '\'' | '`')
+                .then(|| {
+                    quoted
+                        .strip_prefix(quote)
+                        .and_then(|rest| rest.strip_suffix(quote))
+                })
+                .flatten();
+            let Some(unquoted) = unquoted.filter(|text| *text == literal.specifier) else {
+                return Err(anyhow::anyhow!(
+                    "{name} imports {:?}, but the file on disk spells it {on_disk:?}. The import \
+                     is not written as plain text in the source - an escape or an unusual quote \
+                     stands between the two - so it cannot be corrected here. Write {on_disk:?} \
+                     at the import site: only that spelling names this file on a case-sensitive \
+                     filesystem",
+                    literal.specifier
+                ));
+            };
+            reported.push((unquoted.to_string(), on_disk.clone()));
+            respelled.replace_range(
+                literal.start..literal.end,
+                &format!("{quote}{on_disk}{quote}"),
+            );
+        }
+
+        reported.reverse();
+        Ok((respelled, reported))
+    }
+
+    /// What to tell an author about an import this compiler respelled.
+    fn on_disk_spelling_warning(name: &str, written: &str, on_disk: &str) -> String {
+        format!(
+            "{name} imports {written:?}, and the file on disk is spelled {on_disk:?}. The build \
+             uses the spelling on disk, because that is the only one a case-sensitive filesystem \
+             resolves; write {on_disk:?} at the import site so this project builds the same way \
+             on every host"
+        )
     }
 
     /// The one spelling every source file this compiler names in a
@@ -1839,12 +2121,18 @@ impl Compiler {
         // original project-relative shape is what makes `../shared/x.js`
         // continue to mean the same file after staging, including when the
         // configured function root is nested.
+        for warning in Self::configured_directory_warnings(project_dir, config)? {
+            println!("{}", format!("  ⚠ {warning}").yellow());
+            warnings.push(warning);
+        }
         let handlers = self.discover_handlers(project_dir, config)?;
         let project_root = fs::canonicalize(project_dir)?;
         let function_root = if handlers.is_empty() {
             None
         } else {
-            Some(fs::canonicalize(project_dir.join(&config.function_root))?)
+            Some(fs::canonicalize(project_dir.join(
+                Self::on_disk_directory(project_dir, &config.function_root)?,
+            ))?)
         };
         let mut routes = Vec::new();
         let mut files = Vec::new();
@@ -1902,6 +2190,16 @@ impl Compiler {
             handler_specifiers.push((handler_name.clone(), parsed.imports.clone()));
             module_queue.push_back((source_path.clone(), parsed.imports));
             staged_modules.insert(source_path.clone());
+            let (code, respellings) = Self::source_with_on_disk_import_spellings(
+                &source_path,
+                &code,
+                &parsed.specifier_literals,
+            )?;
+            for (written, on_disk) in respellings {
+                let warning = Self::on_disk_spelling_warning(&handler_name, &written, &on_disk);
+                println!("{}", format!("  ⚠ {warning}").yellow());
+                warnings.push(warning);
+            }
             let transformed = self
                 .transformer
                 .transform(&code, &handler_name, vendor, config)?;
@@ -1983,6 +2281,9 @@ impl Compiler {
                 files.push(dependency.to_string_lossy().to_string());
 
                 if let Ok(code) = std::str::from_utf8(&bytes) {
+                    // Set only for a script, which is the only kind of file
+                    // whose imports can need respelling.
+                    let mut staged_source: Option<String> = None;
                     let is_script = matches!(
                         dependency.extension().and_then(|value| value.to_str()),
                         Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
@@ -1994,11 +2295,22 @@ impl Compiler {
                         Self::refuse_external_runtime_module_edges(&name, &parsed)?;
                         Self::refuse_provider_only_globals(&name, &parsed)?;
                         Self::refuse_non_portable_stream_constructors(&name, &parsed)?;
+                        let (respelled, respellings) = Self::source_with_on_disk_import_spellings(
+                            &dependency,
+                            code,
+                            &parsed.specifier_literals,
+                        )?;
+                        for (written, on_disk) in respellings {
+                            let warning = Self::on_disk_spelling_warning(&name, &written, &on_disk);
+                            println!("{}", format!("  ⚠ {warning}").yellow());
+                            warnings.push(warning);
+                        }
+                        staged_source = Some(respelled);
                         module_references.push((name.clone(), parsed.module_references.clone()));
                         handler_specifiers.push((name, parsed.imports.clone()));
                         module_queue.push_back((dependency.clone(), parsed.imports));
                     }
-                    let staged_code = code.to_string();
+                    let staged_code = staged_source.unwrap_or_else(|| code.to_string());
                     Self::write_staged_file(&mirror_path, staged_code.as_bytes())?;
                     total_size += staged_code.len();
                     if should_collect_memory {
@@ -2733,13 +3045,50 @@ impl Compiler {
     /// target reads the same directory - two spellings of the default would
     /// mean one target carrying a project's files and another not.
     fn assets_dir(project_dir: &Path, config: &ProjectConfig) -> std::path::PathBuf {
-        project_dir.join(
-            config
-                .assets
-                .as_ref()
-                .map(|a| a.dir.as_str())
-                .unwrap_or("./public"),
-        )
+        let written = Self::configured_assets_dir(config);
+        // A directory that cannot be respelled is used as written, so a
+        // project with no assets at all keeps behaving as one.
+        let on_disk =
+            Self::on_disk_directory(project_dir, written).unwrap_or_else(|_| written.to_string());
+        project_dir.join(on_disk)
+    }
+
+    fn configured_assets_dir(config: &ProjectConfig) -> &str {
+        config
+            .assets
+            .as_ref()
+            .map(|assets| assets.dir.as_str())
+            .unwrap_or("./public")
+    }
+
+    /// What to tell an author whose configuration spells a project directory
+    /// differently from disk.
+    ///
+    /// The build goes on using the directory that is there - that is what
+    /// `on_disk_directory` is for - but a `functionRoot` only this host can
+    /// find is worth hearing about before it reaches a Linux CI runner, where
+    /// it would quietly produce a deployable with no routes in it.
+    fn configured_directory_warnings(
+        project_dir: &Path,
+        config: &ProjectConfig,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut warnings = Vec::new();
+        for (setting, written) in [
+            ("functionRoot", config.function_root.as_str()),
+            ("assets.dir", Self::configured_assets_dir(config)),
+        ] {
+            let on_disk = Self::on_disk_directory(project_dir, written)?;
+            if on_disk == written {
+                continue;
+            }
+            warnings.push(format!(
+                "{setting} is {written:?}, and the directory on disk is spelled {on_disk:?}. \
+                 The build uses the directory on disk, because that is the only spelling a \
+                 case-sensitive filesystem finds; write {on_disk:?} in the project \
+                 configuration so this project builds the same way on every host"
+            ));
+        }
+        Ok(warnings)
     }
 
     fn locked_standard_version() -> anyhow::Result<String> {
@@ -3351,6 +3700,228 @@ struct BundleOutcome {
     path: std::path::PathBuf,
     size: usize,
     warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod import_case_tests {
+    use super::*;
+
+    fn literal(specifier: &str, start: usize, end: usize) -> SpecifierLiteral {
+        SpecifierLiteral {
+            specifier: specifier.to_string(),
+            start,
+            end,
+        }
+    }
+
+    /// Only the letters the author typed are theirs to respell.
+    #[test]
+    fn a_component_takes_the_disk_case_of_the_letters_that_were_written() {
+        // The plain form.
+        assert_eq!(
+            Compiler::component_with_disk_case("Util.js", "util.js").as_deref(),
+            Some("util.js")
+        );
+        // An extensionless import keeps its extensionless spelling: the
+        // resolver appended `.js`, the author did not write it.
+        assert_eq!(
+            Compiler::component_with_disk_case("Util", "util.js").as_deref(),
+            Some("util")
+        );
+        // A JavaScript name in front of a TypeScript file keeps the author's
+        // extension, which is the substitution the resolver makes on purpose.
+        assert_eq!(
+            Compiler::component_with_disk_case("Util.js", "util.ts").as_deref(),
+            Some("util.js")
+        );
+        // Same spelling, nothing to do.
+        assert_eq!(
+            Compiler::component_with_disk_case("util.js", "util.js").as_deref(),
+            Some("util.js")
+        );
+        // Different files.
+        assert_eq!(Compiler::component_with_disk_case("util", "utils.js"), None);
+        assert_eq!(
+            Compiler::component_with_disk_case("util.js", "other.js"),
+            None
+        );
+        // A TypeScript name is not substituted for a JavaScript file; the
+        // resolver only goes the other way.
+        assert_eq!(
+            Compiler::component_with_disk_case("Util.ts", "util.js"),
+            None
+        );
+    }
+
+    /// The same specifier names the same file on a case-sensitive host as on
+    /// one that folds case - which is why this test can run anywhere.
+    #[test]
+    fn a_specifier_is_respelled_the_way_the_files_on_disk_spell_it() {
+        let root = tempfile::tempdir().expect("temporary project");
+        let importer_dir = root.path().join("web/functions");
+        fs::create_dir_all(&importer_dir).expect("function root");
+        fs::create_dir_all(root.path().join("Shared")).expect("helper root");
+        fs::write(root.path().join("Shared/util.js"), "export const a = 1;\n").expect("helper");
+        fs::write(root.path().join("Shared/typed.ts"), "export const b = 2;\n")
+            .expect("typed helper");
+
+        // Both a directory and a file name are corrected.
+        assert_eq!(
+            Compiler::on_disk_specifier(&importer_dir, "../../shared/Util.js").expect("respelled"),
+            "../../Shared/util.js"
+        );
+        // An extensionless import stays extensionless.
+        assert_eq!(
+            Compiler::on_disk_specifier(&importer_dir, "../../shared/UTIL").expect("respelled"),
+            "../../Shared/util"
+        );
+        // A `.js` name in front of a `.ts` file keeps `.js`.
+        assert_eq!(
+            Compiler::on_disk_specifier(&importer_dir, "../../SHARED/Typed.js").expect("respelled"),
+            "../../Shared/typed.js"
+        );
+        // Already correct, and left alone byte for byte.
+        assert_eq!(
+            Compiler::on_disk_specifier(&importer_dir, "../../Shared/util.js").expect("respelled"),
+            "../../Shared/util.js"
+        );
+        // Nothing on disk answers to it: unchanged, so the resolver gets to
+        // give its own account of what is missing.
+        assert_eq!(
+            Compiler::on_disk_specifier(&importer_dir, "../../Shared/missing.js")
+                .expect("respelled"),
+            "../../Shared/missing.js"
+        );
+    }
+
+    /// Two files whose names differ only in case can only exist on a
+    /// case-sensitive filesystem, and an import that matches neither exactly
+    /// has no one answer. Saying so beats picking one.
+    #[test]
+    #[cfg(unix)]
+    fn two_files_that_differ_only_in_case_make_an_import_ambiguous() {
+        let root = tempfile::tempdir().expect("temporary project");
+        let importer_dir = root.path().join("functions");
+        fs::create_dir_all(&importer_dir).expect("function root");
+        fs::create_dir_all(root.path().join("shared")).expect("helper root");
+        fs::write(root.path().join("shared/util.js"), "export const a = 1;\n").expect("lower");
+        fs::write(root.path().join("shared/Util.js"), "export const b = 2;\n").expect("upper");
+
+        // An exact spelling is never ambiguous, whatever else sits beside it.
+        assert_eq!(
+            Compiler::on_disk_specifier(&importer_dir, "../shared/Util.js").expect("respelled"),
+            "../shared/Util.js"
+        );
+
+        let error = Compiler::on_disk_specifier(&importer_dir, "../shared/UTIL.js")
+            .expect_err("an import matching both is refused");
+        let message = error.to_string();
+        assert!(message.contains("util.js"), "{message}");
+        assert!(message.contains("Util.js"), "{message}");
+        assert!(message.contains("letter case"), "{message}");
+    }
+
+    /// The bundler reads the source text, not this compiler's bookkeeping, so
+    /// the correction has to land in the text.
+    #[test]
+    fn a_staged_source_names_its_imports_the_way_disk_does() {
+        let root = tempfile::tempdir().expect("temporary project");
+        fs::create_dir_all(root.path().join("shared")).expect("helper root");
+        fs::write(root.path().join("shared/util.js"), "export const a = 1;\n").expect("helper");
+        let importer = root.path().join("index.js");
+
+        let code =
+            "import { a } from \"./shared/Util.js\";\nimport type { T } from './shared/UTIL.js';\n";
+        let first = code.find('"').expect("first literal");
+        let second = code.find('\'').expect("second literal");
+        let (respelled, reported) = Compiler::source_with_on_disk_import_spellings(
+            &importer,
+            code,
+            &[
+                literal(
+                    "./shared/Util.js",
+                    first,
+                    first + "\"./shared/Util.js\"".len(),
+                ),
+                literal(
+                    "./shared/UTIL.js",
+                    second,
+                    second + "'./shared/UTIL.js'".len(),
+                ),
+            ],
+        )
+        .expect("respelled source");
+
+        // Each literal keeps the author's own quoting, and a type-only import
+        // is corrected too: it is erased from the emitted code but it still
+        // names a file that gets staged.
+        assert_eq!(
+            respelled,
+            "import { a } from \"./shared/util.js\";\nimport type { T } from './shared/util.js';\n"
+        );
+        assert_eq!(
+            reported,
+            vec![
+                (
+                    "./shared/Util.js".to_string(),
+                    "./shared/util.js".to_string()
+                ),
+                (
+                    "./shared/UTIL.js".to_string(),
+                    "./shared/util.js".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// A specifier this compiler cannot see verbatim in the source is not one
+    /// it may rewrite.
+    #[test]
+    fn an_import_that_is_not_written_as_plain_text_is_refused_rather_than_rewritten() {
+        let root = tempfile::tempdir().expect("temporary project");
+        fs::create_dir_all(root.path().join("shared")).expect("helper root");
+        fs::write(root.path().join("shared/util.js"), "export const a = 1;\n").expect("helper");
+        let importer = root.path().join("index.js");
+
+        // What the parser read is `./shared/Util.js`; what the file says is an
+        // escape that happens to mean the same thing.
+        let code = "import { a } from \"./shared/\\u0055til.js\";\n";
+        let start = code.find('"').expect("literal");
+        let end = code.rfind('"').expect("literal end") + 1;
+        let error = Compiler::source_with_on_disk_import_spellings(
+            &importer,
+            code,
+            &[literal("./shared/Util.js", start, end)],
+        )
+        .expect_err("an escaped specifier is not rewritten");
+        let message = error.to_string();
+        assert!(message.contains("./shared/util.js"), "{message}");
+        assert!(message.contains("cannot be corrected"), "{message}");
+    }
+
+    /// Nothing to correct, nothing touched.
+    #[test]
+    fn a_source_whose_imports_already_match_disk_is_left_alone() {
+        let root = tempfile::tempdir().expect("temporary project");
+        fs::create_dir_all(root.path().join("shared")).expect("helper root");
+        fs::write(root.path().join("shared/util.js"), "export const a = 1;\n").expect("helper");
+        let importer = root.path().join("index.js");
+
+        let code = "import { a } from \"./shared/util.js\";\nimport \"node:crypto\";\n";
+        let start = code.find('"').expect("literal");
+        let (respelled, reported) = Compiler::source_with_on_disk_import_spellings(
+            &importer,
+            code,
+            &[literal(
+                "./shared/util.js",
+                start,
+                start + "\"./shared/util.js\"".len(),
+            )],
+        )
+        .expect("unchanged source");
+        assert_eq!(respelled, code);
+        assert!(reported.is_empty());
+    }
 }
 
 #[cfg(test)]

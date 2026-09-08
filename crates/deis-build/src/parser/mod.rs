@@ -1,11 +1,11 @@
 use deis_build_core::{
     HandlerInfo, ModuleReference, ModuleReferenceKind, ModuleSourcePosition,
     NonPortableStreamConstructorReference, NonStandardContextReference,
-    ProviderOnlyGlobalReference,
+    ProviderOnlyGlobalReference, SpecifierLiteral,
 };
 use std::collections::HashSet;
 use swc_common::{
-    sync::Lrc, FileName, Globals, Mark, SourceMap, Span, Spanned, SyntaxContext, GLOBALS,
+    sync::Lrc, BytePos, FileName, Globals, Mark, SourceMap, Span, Spanned, SyntaxContext, GLOBALS,
 };
 use swc_ecma_ast::*;
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
@@ -34,6 +34,7 @@ impl TypeScriptParser {
             FileName::Custom(filename.to_string()).into(),
             code.to_string(),
         );
+        let file_start = source_file.start_pos;
 
         let lexer = Lexer::new(
             Syntax::Typescript(Default::default()),
@@ -83,8 +84,12 @@ impl TypeScriptParser {
                 destructured_fields,
                 ..
             } = contexts;
-            let mut visitor =
-                HandlerVisitor::new(self.source_map.clone(), unresolved_context, contexts);
+            let mut visitor = HandlerVisitor::new(
+                self.source_map.clone(),
+                file_start,
+                unresolved_context,
+                contexts,
+            );
             for (field, span) in destructured_fields {
                 visitor.record_context_field(field, span);
             }
@@ -99,6 +104,7 @@ impl TypeScriptParser {
             named_exports: visitor.named_exports,
             used_services: visitor.used_services,
             imports: visitor.imports,
+            specifier_literals: visitor.specifier_literals,
             module_references: visitor.module_references,
             non_literal_module_loads: visitor.non_literal_module_loads,
             non_literal_module_load_positions: visitor.non_literal_module_load_positions,
@@ -340,11 +346,18 @@ impl Visit for ContextAliasCollector<'_> {
 
 struct HandlerVisitor {
     source_map: Lrc<SourceMap>,
+    /// Where this file begins in the shared source map. One parser instance
+    /// keeps one map across every file it is handed, so a span's `BytePos` is
+    /// an offset into that whole map and not into the file. Subtracting this
+    /// is what turns a span back into an index the caller can slice its own
+    /// source string with.
+    file_start: BytePos,
     unresolved_context: SyntaxContext,
     has_default_export: bool,
     named_exports: Vec<String>,
     used_services: Vec<String>,
     imports: Vec<String>,
+    specifier_literals: Vec<SpecifierLiteral>,
     module_references: Vec<ModuleReference>,
     non_literal_module_loads: usize,
     non_literal_module_load_positions: Vec<ModuleSourcePosition>,
@@ -357,16 +370,19 @@ struct HandlerVisitor {
 impl HandlerVisitor {
     fn new(
         source_map: Lrc<SourceMap>,
+        file_start: BytePos,
         unresolved_context: SyntaxContext,
         context_bindings: HashSet<Id>,
     ) -> Self {
         Self {
             source_map,
+            file_start,
             unresolved_context,
             has_default_export: false,
             named_exports: Vec::new(),
             used_services: Vec::new(),
             imports: Vec::new(),
+            specifier_literals: Vec::new(),
             module_references: Vec::new(),
             non_literal_module_loads: 0,
             non_literal_module_load_positions: Vec::new(),
@@ -438,10 +454,22 @@ impl HandlerVisitor {
         }
     }
 
-    fn record_import(&mut self, specifier: &str) {
+    /// Note that this file names `specifier`, and where the literal that
+    /// names it sits.
+    ///
+    /// `imports` is deduplicated because staging only needs to know which
+    /// files to walk. `specifier_literals` deliberately is not: rewriting a
+    /// misspelled import has to reach every occurrence, and two occurrences of
+    /// the same text are two different byte ranges.
+    fn record_import(&mut self, specifier: &str, literal: Span) {
         if !self.imports.iter().any(|existing| existing == specifier) {
             self.imports.push(specifier.to_string());
         }
+        self.specifier_literals.push(SpecifierLiteral {
+            specifier: specifier.to_string(),
+            start: (literal.lo() - self.file_start).0 as usize,
+            end: (literal.hi() - self.file_start).0 as usize,
+        });
     }
 
     fn record_module_reference(
@@ -640,8 +668,9 @@ impl Visit for HandlerVisitor {
             }
         }
         if let Some(source) = &n.src {
+            let literal = source.span;
             let source = source.value.to_string_lossy();
-            self.record_import(&source);
+            self.record_import(&source, literal);
             if !n.type_only {
                 let mut requested_exports = Vec::new();
                 let mut loads_namespace = false;
@@ -672,7 +701,7 @@ impl Visit for HandlerVisitor {
 
     fn visit_import_decl(&mut self, n: &ImportDecl) {
         let source = n.src.value.to_string_lossy();
-        self.record_import(&source);
+        self.record_import(&source, n.src.span);
         if n.type_only {
             return;
         }
@@ -708,7 +737,7 @@ impl Visit for HandlerVisitor {
 
     fn visit_export_all(&mut self, n: &ExportAll) {
         let source = n.src.value.to_string_lossy();
-        self.record_import(&source);
+        self.record_import(&source, n.src.span);
         if !n.type_only {
             self.record_module_reference(
                 &source,
@@ -772,8 +801,9 @@ impl Visit for HandlerVisitor {
             if imports_module {
                 if let Some(argument) = call.args.first() {
                     if let Expr::Lit(Lit::Str(specifier)) = &*argument.expr {
+                        let literal = specifier.span;
                         let specifier = specifier.value.to_string_lossy();
-                        self.record_import(&specifier);
+                        self.record_import(&specifier, literal);
                         self.record_module_reference(
                             &specifier,
                             Vec::new(),

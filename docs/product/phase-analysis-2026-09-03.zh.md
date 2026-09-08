@@ -3017,3 +3017,55 @@ Application/framework source + versioned build plan
   `deis-build-adapter-deislet`、`deis-wire`、`deis-bundle`，以及 driver/control/build-core/adapter-deislet/wire/bundle/cli
   七个包的严格 Clippy 零警告。`deis-build` 测试 119 通过 / 2 失败（即上面两条）。按 ADR-018，`deis-proxy` 与
   `deis-runtime` 不在 Windows 覆盖范围内。
+
+## 101. P1-CASE-001 定案：照 Cloudflare/esbuild 的做法归一并改写 import
+
+- 先纠正上一节留下的一处判断。第 98 节把「直接 canonicalize 治标不治本」当作否掉归一路线的理由，这个理由本身成立，
+  但当时给出的备选（发现两个仅大小写不同的拼写指向同一路径就拒绝构建）只抓症状：必须两种拼写同时出现才报，项目里
+  全程只写一种错拼写的情况完全放过，而那种情况后果更重——在 macOS 上能建，在 Linux 上直接建不起来。
+- 查了 Cloudflare 这条链路的一手来源，结论改变了取舍。wrangler 用 esbuild 打包，esbuild 的模块去重键是
+  `canonicalFileSystemPathForWindows`：小写化的绝对路径并把 `\` 换成 `/`，用在 `maybeParseFile` 的 visited 表上，
+  没有任何平台条件；其目录条目缓存本身也按 `strings.ToLower(name)` 建键，所以 `./Util.js` 在 Linux 上照样解析到
+  `util.js`，只发一条警告 `Use "x" instead of "y" to avoid issues with case-sensitive file systems`（`node_modules`
+  内跳过）。2021 年引入这条时给的理由与本项目 ADR-018 的关切一致：Windows/macOS 能过、Linux 永远不行，为避免跨平台
+  构建失败。反面是 wrangler 把 esbuild 的 `logLevel` 设成 `silent`，`result.warnings` 只在构建失败时随
+  `BuildFailure` 抛出，构建成功时这条警告用户根本看不到——这一段不抄。
+- 关键差异解释了 Deislet 为什么会有这个 bug 而 Cloudflare 没有：esbuild 既是解析器又是打包器，一套键贯穿到底；
+  Deislet 是自己解析 + staging，再交给 rolldown（按解析路径建模块 id）或 Deno（按 URL），两者都不折叠大小写，
+  所以没有兜底。也因此「只在编译器里归一」不够——打包器读的是源码文本，不是编译器的记账。
+- 采用的修法（用户拍板「完整照搬：归一＋改写 import」）：① `Compiler::on_disk_path` 逐段读目录，把作者写的路径归一到
+  磁盘真实拼写，`resolve_local_module` 在构造候选之前就用归一后的拼写，于是一个文件只以一个路径进 `staged_modules`，
+  `canonical_source_tree_sha256` 也只入账一次，artifact identity 不再取决于构建机；② `source_with_on_disk_import_spellings`
+  按解析器新给出的 specifier 字面量字节范围，把 staged 源码里的 import 改写成磁盘拼写，让下游打包器也只看到一个拼写；
+  ③ 每处改写记入 `VendorBuild::warnings` 并打印，文案给出两个拼写。
+- 只改作者真正写下的字母：`Util` 解析到 `util.js` 时改写结果仍是 `util`（扩展名是解析器补的，不是作者写的），
+  `Util.js` 解析到 `util.ts` 时结果是 `util.js`（扩展名替换是解析器的既定行为）。这三种形态由
+  `component_with_disk_case` 一处判定。
+- 改写的安全边界：解析器新增 `SpecifierLiteral`（specifier 文本 + 字面量在文件内的字节起止），改写前核对该范围内的
+  文本去掉引号后与解析器读到的 specifier 逐字节相同；不同（例如写成 `'./shared/\u0055til.js'` 这种转义）则拒绝构建
+  并说明原因，而不是猜着改。这是在改别人的源码，一次证明不了正确的改写比一条错误消息更糟。`SpecifierLiteral` 覆盖
+  `import type`——它在运行时被擦除，但仍然会让一个文件进 staging，拼写同样要紧。
+- 仍然拒绝的只有一种情况：区分大小写的卷上并存两个仅大小写不同的真实文件，而 import 与两者都不精确相等。此时没有
+  唯一答案，报错列出两个真实文件名。注意「`./util` 同时匹配 `util.ts` 与 `util.js`」不算歧义——两者归一后是同一段
+  文本，那只是解析器原有的扩展名搜索。
+- 一并排查资产 staging（用户要求）。资产内容本身没有同类问题：`collect_assets` 用 WalkDir 直接从磁盘取名，不存在
+  「作者拼写 vs 磁盘」这一步比对，也没有以作者写的名字做去重的地方。但往上一层查到了同类且更安静的缺陷：
+  `functionRoot` 与 `assets.dir` 都是作者在 `.config.json` 里写的路径，`discover_handlers` 对不存在的目录直接
+  `return Ok(handlers)`（空），因为「没有 function root 的项目是纯静态站点」本是受支持的形态。于是 `./Web/Functions`
+  配 `web/functions` 目录在 macOS 上找到全部 handler，在 Linux 上一个都找不到，构建照样成功，产出一个没有任何路由的
+  deployable，全程无提示；miscased 的 assets 目录同样静默丢掉整站文件。两者现在都走同一套归一并各发一条警告。
+- 三处 `fs::canonicalize(project_dir.join(&config.function_root))` 都改为先归一，否则 discover 与 strip_prefix 两侧
+  会对不上（第一版就是漏了这两处，测试直接以 `No such file or directory` 失败）。
+- 测试：`import_case_tests` 六个纯逻辑/临时目录单测（三种同名形态、目录与文件逐段归一、歧义拒绝、两种引号与
+  `import type` 的改写、转义拒绝、无需改写时逐字节不动）；`local_module_graph.rs` 两个集成用例，
+  `a_helper_imported_under_two_spellings_is_carried_once` 对 cloudflare/deno/deislet 三个目标断言标记各只出现一次并且
+  警告里同时含两个拼写，`the_staged_handler_names_the_helper_the_way_disk_does` 断言 staged 源码里不再有错拼写；
+  新增 `a_project_path_means_the_same_thing_on_every_host.rs` 覆盖配置目录那一条。
+- 这些用例全部能在**普通区分大小写的 ext4 上**跑，不需要 casefold 卷——因为解析已不依赖宿主文件系统的折叠行为。
+  这正是这条修法相对「只在折叠主机上纠正」的额外好处：缺陷的回归证据不再依赖一台特殊机器。
+- 本机门禁：`cargo test --workspace --no-fail-fast` 113 个二进制 3325 通过 0 失败；`cargo clippy --workspace
+  --all-targets -- -D warnings` 零警告；`cargo fmt --all --check`、`check-product-governance.py`、
+  `check-doc-path-literals.sh` 均通过。
+- 未做：npm 安装树内不做这项检查是 esbuild 的既有边界（`!IsInsideNodeModules`），Deislet 这边天然不涉及——
+  `resolve_local_module` 只处理 `./`、`../` 开头的项目内相对导入，bare specifier 早就返回 `None`；但如果将来有人从
+  项目文件里写 `../node_modules/...`，归一会照常发生，这一点尚无用例覆盖。

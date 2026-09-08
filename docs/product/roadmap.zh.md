@@ -81,10 +81,13 @@
   `MAX_PROVIDER_DISPATCH_FAILURES`（10），耗尽后父操作以 driver 最后一次的错误 `failed`。④ `idx_events_page_v1`
   退役：`id` 即 rowid，`idx_events_timestamp` 已能给出同序，规划器从未选中它。取舍理由见 ADR-016 与 ADR-006，过程记于
   阶段分析第 98 节。
-- `P1-CASE-001`（新增，queued）：`resolve_local_module` 用字符串拼接构造候选路径、用 `is_file()` 判定命中且不做
-  canonicalize，命中结果按 `PathBuf` 进 `staged_modules` 去重。在不区分大小写的主机上 `./Util.js` 与 `./util.js` 命中
-  同一个真实文件却各 stage 一次，产物里同一份代码出现两遍，而这样的构建在 macOS 上会成功、bundle 拿到区分大小写的
-  运行时上会有一个 import 解析不到。属静态推断，尚未复现，需先在开启 casefold 的卷上复现或证伪。
+- `P1-CASE-001`（done）：在折叠大小写的卷上 `./Util.js` 与 `./util.js` 命中同一个真实文件却各 stage 一次，
+  已在带 casefold 的 ext4 卷上复现。后果不是原先推断的「运行时有一个 import 解析不到」（构建会先把模块图内联成自包含
+  文件，运行时没有文件系统级解析），而是同一份代码被打进产物两遍、同一模块变成两个实例，且 canonical artifact 的
+  source tree 摘要以两个键入账，identity 取决于构建机。修法照 esbuild：解析在任何主机上都按不区分大小写匹配并归一到
+  磁盘真名，同时把 staged 源码里的 import 字面量改写成磁盘拼写（打包器会从源码再解析一遍，rolldown 按路径、Deno 按
+  URL，都不折叠大小写），每处改写都发警告。同一规则覆盖 `functionRoot` 与 `assets.dir`——两者拼写不符时在 Linux 上
+  会静默产出没有路由或没有资产的 deployable。资产内容本身无同类问题。回归证据不再依赖 casefold 卷。
 
 ```bash
 python3 scripts/check-product-governance.py

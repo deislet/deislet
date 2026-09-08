@@ -957,17 +957,26 @@
           "id": "P1-CASE-001",
           "title": "核实不区分大小写主机上的本地模块解析是否重复 stage",
           "owner": "deislet",
-          "status": "queued",
-          "dependsOn": [
-            "P1-BUILD-001"
-          ],
+          "status": "done",
           "outputs": [
             {
               "type": "local-path",
               "value": "crates/deis-build/src/compiler/mod.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-build/src/parser/mod.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-build/tests/local_module_graph.rs"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-build/tests/a_project_path_means_the_same_thing_on_every_host.rs"
             }
           ],
-          "verification": "resolve_local_module 以字符串拼接构造候选路径、以 is_file() 判定命中且不做 canonicalize，命中结果按 PathBuf 进 staged_modules 去重。在不区分大小写的主机上 ./Util.js 与 ./util.js 会命中同一个真实文件却各 stage 一次，产物中同一份代码出现两遍，且该构建在 macOS 上成功、bundle 到区分大小写的运行时上会有一个 import 解析不到。此为静态推断，尚未复现：需先在开启 casefold 的卷上复现或证伪，再决定是否 canonicalize。同期修复的 npm 安装树大小写冲突测试见阶段分析第 97 节"
+          "verification": "已实测并修复。在本机用 loopback 镜像格式化出带 casefold 的 ext4 卷复现：一个真实文件 shared/util.js，入口分别 import ./util.js 与 ./Util.js，deislet 与 deno 两个 vendor 的产物里同一份代码各出现两次——重复 stage 成立。路线图原话「不做 canonicalize」不准确：resolve_local_module 确实调用了 fs::canonicalize，但在折叠大小写的卷上它不会把路径纠正成磁盘上的真实拼写。第二段推断不成立：构建会先把整棵模块图内联成自包含文件，运行时没有文件系统级的模块解析，因此后果是产物里同一份代码被打进两遍（模块变成两个实例）以及 canonical_source_tree_sha256 以两个键入账，而不是部署后炸掉。修法照 esbuild：解析在任何主机上都按不区分大小写匹配并归一到磁盘真名，并把 staged 源码里的 import 字面量改写成磁盘拼写（打包器会从源码再解析一遍，rolldown 按路径、Deno 按 URL，都不折叠大小写），每处改写记入 VendorBuild::warnings。同一规则覆盖 functionRoot 与 assets.dir：两者拼写不符时在 Linux 上会静默产出没有路由或没有资产的 deployable。资产内容本身无同类问题（collect_assets 用 WalkDir 从磁盘取名）。回归证据不再依赖 casefold 卷：六个单测与三个集成用例在普通 ext4 上即可复现。详见阶段分析第 101 节。"
         }
       ]
     },

@@ -151,6 +151,7 @@ Server crate 在非 Linux 若无法正确实现时应明确不构建/不发布�
 
 - manifest path 统一使用 `/`，拒绝 `\` 等不可移植歧义；
 - 拒绝在目标文件系统上碰撞的 case/Unicode normalization names；
+- 源码里的模块解析不跟随构建机文件系统的大小写折叠行为，见下文 2026-09-08 条；
 - archive entry 排序、timestamp、owner/mode、compression 设置规范化；
 - 文本换行是否规范化由 source snapshot/build plan 明确，不能由 Git checkout 默认值暗改；
 - symlink/junction/reparse point、path traversal、reserved Windows names 有共同验证规则；
@@ -229,6 +230,24 @@ Windows 上显示 `\\?\C:\...\shared\value.ts:1:1`。路径作为路径是对的
 前缀。本 ADR 对 manifest path 早已要求统一用 `/` 并拒绝 `\`，诊断文案适用同一条规则，现由 `portable_display_path`
 统一（去掉 verbatim 前缀、分隔符归一），并配一个纯字符串单元测试，使这条规则在任何主机上都能被验证，而不必等一次
 Windows 实跑。
+
+2026-09-08 另修一处同源缺陷，它此前只在折叠大小写的卷上出现，因此三平台复验一直没碰到。模块解析原先跟随宿主文件
+系统的大小写行为：在折叠卷（APFS 默认模式、多数 Windows 卷、开启 casefold 的 ext4）上 `./Util.js` 能打开磁盘上的
+`util.js`，而 `fs::canonicalize` 不会把拼写纠正回真名，原样返回 `Util.js`。同一个文件因此以两个路径穿过整条构建：
+`staged_modules` 两次 stage，`canonical_source_tree_sha256` 以两个键入账（artifact identity 因此取决于构建机是哪台），
+打包器又从源码把模块图独立再解析一遍——rolldown 以解析出的路径、Deno 以 URL 作模块 id，两者都不折叠大小写——于是同
+一模块被内联两遍，一个本应只有一个实例的模块变成两个，模块顶层的注册表或连接池悄悄一分为二。反过来，在区分大小
+写的 Linux 上同一份源码根本解析不到，构建直接失败。也就是说同一 fixture 在三平台给出三种结果，正是本节要禁止的。
+
+现在解析在任何主机上都按不区分大小写匹配磁盘条目，并把结果归一到磁盘上的真实拼写；同时把 staged 源码里的 import
+字面量改写成磁盘拼写（打包器读的是源码，不是编译器的记账），每处改写都记入 `VendorBuild::warnings` 并打印。这与
+esbuild 的做法一致：它以小写化的绝对路径作模块去重键（`canonicalFileSystemPathForWindows`，无平台条件），并在拼写
+与磁盘不符时发 `Use "x" instead of "y" to avoid issues with case-sensitive file systems`；差别在于 wrangler 把
+esbuild 的 `logLevel` 设为 `silent`，构建成功时这条警告被丢掉，Deislet 不这样做。同一条规则适用于配置里的目录：
+`functionRoot` 与 `assets.dir` 也是作者写的路径，且失败得更安静——miscased 的 `functionRoot` 在 Linux 上落进「没有
+function root 即纯静态站点」这条合法分支，静默产出一个没有任何路由的 deployable。仍然拒绝的只有一种情况：区分大小
+写的卷上并存两个仅大小写不同的真实文件，而 import 与两者都不精确相等，此时没有唯一答案。资产内容本身不受影响，
+`collect_assets` 用 WalkDir 直接从磁盘取名，不存在作者拼写与磁盘比对这一步。
 
 CI provider deploy 使用 sandbox/test accounts 和短期 credential；常规 PR 可以 package/validate，真实外部部署在受控 nightly/release gate 执行。
 

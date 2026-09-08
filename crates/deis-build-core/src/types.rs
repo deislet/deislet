@@ -139,6 +139,9 @@ pub struct HandlerInfo {
     pub named_exports: Vec<String>,
     pub used_services: Vec<String>,
     pub imports: Vec<String>,
+    /// Every module specifier literal in the file, in source order. See
+    /// `SpecifierLiteral` for why this exists next to `imports`.
+    pub specifier_literals: Vec<SpecifierLiteral>,
     /// Runtime module edges with enough information to validate an exact
     /// application surface. `imports` above remains the deduplicated graph
     /// used by staging; these records deliberately preserve how a module was
@@ -202,6 +205,28 @@ pub enum ModuleReferenceKind {
     ReExport,
     DynamicImport,
     Require,
+}
+
+/// One module specifier exactly as the source text writes it.
+///
+/// `imports` above is the deduplicated graph and `ModuleReference` describes
+/// the edge; this is the third question neither of them answers - where in the
+/// file the name sits and how many bytes it occupies. The compiler needs that
+/// to correct an import whose letter case does not match the file on disk,
+/// which it cannot do by re-deriving the text: only the author's own quoting
+/// and only the bytes they wrote may be replaced.
+///
+/// Type-only imports are recorded here even though they carry no runtime edge.
+/// They are erased from the emitted code but still name a project file that
+/// gets staged, so their spelling matters exactly as much as any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecifierLiteral {
+    pub specifier: String,
+    /// Byte offset of the opening quote, relative to the start of the file
+    /// this literal was parsed from.
+    pub start: usize,
+    /// Byte offset one past the closing quote, same origin as `start`.
+    pub end: usize,
 }
 
 /// One statically named runtime module edge.
