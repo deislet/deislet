@@ -438,6 +438,51 @@ impl Compiler {
         })
     }
 
+    /// The suffixes a vendor tool's executable can carry on this host, in the
+    /// order to try them.
+    ///
+    /// A CLI npm installs globally lands on Windows as `<name>.cmd` and
+    /// `<name>.ps1` with no `.exe` beside them, and `Command::new` resolves a
+    /// bare name by appending `.exe` and nothing else. So
+    /// `Command::new("wrangler")` answers "program not found" on a machine
+    /// where `wrangler --version` works in every shell, and the build recorded
+    /// the cloudflare target as unverified because the tool was not on PATH -
+    /// which was untrue, and which installing wrangler again did not change.
+    /// A tool that ships a real executable, as deno's installers do, answers
+    /// to the first spelling, so the extra spawns cost nothing where they are
+    /// not needed.
+    #[cfg(windows)]
+    const TOOL_SUFFIXES: &'static [&'static str] = &["", ".cmd", ".bat"];
+    #[cfg(not(windows))]
+    const TOOL_SUFFIXES: &'static [&'static str] = &[""];
+
+    /// The program name that runs `name` on this host, if any spelling does.
+    ///
+    /// Spawning is the question being asked, so spawning is how it is
+    /// answered: a tool present but unrunnable is the same to this build as
+    /// one that is absent, and both must leave the target unverified rather
+    /// than verified by a check that never ran.
+    fn vendor_tool(name: &str) -> Option<String> {
+        Self::TOOL_SUFFIXES.iter().find_map(|suffix| {
+            let program = format!("{name}{suffix}");
+            std::process::Command::new(&program)
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|_| program)
+        })
+    }
+
+    /// What was looked for, so that a reader can tell "install it" from
+    /// "it is installed under a name this build did not try".
+    fn vendor_tool_spellings(name: &str) -> String {
+        Self::TOOL_SUFFIXES
+            .iter()
+            .map(|suffix| format!("{name}{suffix}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Hand the finished artifact to the target's own tooling and report what
     /// that tooling said.
     ///
@@ -454,7 +499,7 @@ impl Compiler {
             deis_build_adapter_cloudflare::VENDOR => {
                 use std::process::Command;
                 // Check for wrangler
-                if Command::new("wrangler").arg("--version").output().is_ok() {
+                if let Some(wrangler) = Self::vendor_tool("wrangler") {
                     println!(
                         "{}",
                         "  Create smoke test (wrangler deploy --dry-run)...".dimmed()
@@ -477,7 +522,7 @@ impl Compiler {
                     // path below. `current_dir` stays the output directory:
                     // that is where the `wrangler.toml` being checked is.
                     let scratch = ScratchDir::create("cloudflare-verify")?;
-                    let status = Command::new("wrangler")
+                    let status = Command::new(&wrangler)
                         .args(["deploy", "--dry-run", "--outdir"])
                         .arg(scratch.path())
                         .current_dir(output_dir)
@@ -495,18 +540,18 @@ impl Compiler {
                         "wrangler accepted the Worker (deploy --dry-run)".to_string(),
                     ))
                 } else {
-                    Ok(Verification::Skipped(
-                        "the cloudflare target was not verified: 'wrangler' is not on PATH, so \
-                         nothing checked that this Worker deploys. Install wrangler to have the \
-                         build refuse an artifact Cloudflare would reject"
-                            .to_string(),
-                    ))
+                    Ok(Verification::Skipped(format!(
+                        "the cloudflare target was not verified: nothing on PATH answered to {}, \
+                         so nothing checked that this Worker deploys. Install wrangler to have \
+                         the build refuse an artifact Cloudflare would reject",
+                        Self::vendor_tool_spellings("wrangler")
+                    )))
                 }
             }
             deis_build_adapter_deno::VENDOR => {
                 use std::process::Command;
                 // Check for deno
-                if Command::new("deno").arg("--version").output().is_ok() {
+                if let Some(deno) = Self::vendor_tool("deno") {
                     println!(
                         "{}",
                         "  Create smoke test (deno cache --no-check --no-remote)...".dimmed()
@@ -541,7 +586,7 @@ impl Compiler {
                     // resolves the complete staged graph. `--no-remote` makes the
                     // closure promise fail closed even if a generated import edge
                     // regresses past the compiler's own external-module gate.
-                    let status = Command::new("deno")
+                    let status = Command::new(&deno)
                         .args([
                             "cache",
                             "--no-check",
@@ -565,13 +610,13 @@ impl Compiler {
                             .to_string(),
                     ))
                 } else {
-                    Ok(Verification::Skipped(
-                        "the deno target was not verified: 'deno' is not on PATH, so nothing \
-                         parsed and resolved its generated module graph with the provider tool. \
-                         Install deno to have the build refuse a program Deno Deploy could not \
-                         load"
-                            .to_string(),
-                    ))
+                    Ok(Verification::Skipped(format!(
+                        "the deno target was not verified: nothing on PATH answered to {}, so \
+                         nothing parsed and resolved its generated module graph with the \
+                         provider tool. Install deno to have the build refuse a program Deno \
+                         Deploy could not load",
+                        Self::vendor_tool_spellings("deno")
+                    )))
                 }
             }
             deis_build_adapter_tencent::VENDOR => {

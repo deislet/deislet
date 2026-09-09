@@ -3104,3 +3104,57 @@ Application/framework source + versioned build plan
   对现版本跑，`test-demo-witnesses.sh` 全部通过。顺带一提，旧版倒下的位置与线上那次（读端第 8470 行）并不相同——
   取决于协程是否已被回收，两个展开点都会中招，所以两处都要保护。
 - `shellcheck` 对 `demo.sh` 的告警集合与改前逐条一致（该项目未把 shellcheck 纳入 CI，此处只作对照）。
+
+## 103. s69 补齐厂商工具，并由此查出 `Command::new` 在 Windows 上看不见 npm 全局命令
+
+- 起因是给 s69「缺什么装什么」。先盘点：node v24.16.0（fnm 装，`npm config get prefix` 指向 per-shell 的
+  `fnm_multishells\<pid>_<ts>`，但那是个 reparse point，指向持久的 `scoop\apps\fnm\current\aliases\default`，
+  所以全局安装不会随会话消失）、rustc/cargo 1.96.0（宿主 `x86_64-pc-windows-msvc`）、libclang 已在
+  `C:\Program Files\LLVM\bin` 且 `LIBCLANG_PATH` 已设、git 与 python 走 scoop；缺 wrangler、deno、perl，
+  也没有 winget/choco。
+- **Perl 不需要装**，这一点先厘清，免得又被当成覆盖缺口：`openssl` / `openssl-sys` 在 Cargo.lock 里只被
+  `deis-proxy`（以及 native-tls 这条在 Windows 上走 schannel 的链）拉进来，而按 ADR-018 代理是 Linux-only。
+  s69 没有 Perl 不构成 Windows 支持面的缺失。
+- 装了两个：`scoop install deno` 得到 deno 2.9.6，`npm install -g wrangler` 得到 wrangler 4.130.0。
+- 装完立刻撞上一个更值得记的问题：**装了也不算数**。编译器用 `Command::new("wrangler")` 探工具，而 Rust 在 Windows 上
+  解析裸程序名时只补 `.exe`，npm 的全局命令却只落 `wrangler`、`wrangler.cmd`、`wrangler.ps1` 三个文件，没有 `.exe`。
+  用一个二十行的探针在 s69 上实测：`Command::new("deno")` 成功（scoop 的 shim 是真的 `deno.exe`），
+  `Command::new("wrangler")` 返回 `NotFound: program not found`，`Command::new("wrangler.cmd")` 成功并打印 4.130.0。
+- 后果的性质是**一句会误导的话**：构建于是记下「the cloudflare target was not verified: 'wrangler' is not on PATH」，
+  而在那台机器上 wrangler 在任何 shell 里都能用。这条提示不但不真，而且不可行动——照它去再装一次 wrangler，
+  下次构建还是同一句话。第 99、100 节那两条 Windows 缺陷是「路径拼写」，这条是「程序名拼写」，同一族。
+- 修法：`Compiler::TOOL_SUFFIXES` 按平台给出要尝试的后缀（Windows 是 `""`、`.cmd`、`.bat`；其它平台只有 `""`），
+  `vendor_tool` 按序尝试、以**能否 spawn** 作为判据并返回真正能用的那个名字，两处调用改用它的返回值。
+  不试 `.ps1`：`Command` 起不了 PowerShell 脚本，列进去只会多一次注定失败的 spawn。deno 这类自带真实可执行文件的
+  工具在第一个后缀就命中，代价为零。
+- 提示文案同时改成「nothing on PATH answered to wrangler, wrangler.cmd, wrangler.bat」，把**找过哪些名字**说出来，
+  这样「没装」和「装了但这个构建没试过那个名字」对读的人才是两件事。`demo.sh` 的 `vendor_verification_summary`
+  按前缀 `the cloudflare target was not verified` 匹配，不受影响；`test-demo-witnesses.sh` 第 16 节的样例日志顺手
+  更新为当前真实文案（原来那段 deno 文案早已与代码不符，写着「type-checked this program」，代码里是
+  「parsed and resolved its generated module graph」），并新增一条 Windows 措辞的样例，证明摘要读的是构建的结论
+  而不是句子的结尾。
+- **本机的 Windows 交叉检查在这个 crate 上用不了**，这是对上一轮方法的修正：`cargo clippy -p deis-build
+  --target x86_64-pc-windows-gnu` 会失败，因为 `deis-build` 的 dev-dependency 链
+  （deis-runtime → deno_core → deno_v8 → v8）需要 rusty_v8 的预编译包，而上游没有为 `x86_64-pc-windows-gnu` 发布
+  （`.../rusty_v8_simdutf_release_x86_64-pc-windows-gnu.lib.gz` 是 404）。`#[cfg(windows)]` 分支只能到真机上验。
+- s69 实机证据（rustc 1.96.0 MSVC，`test` profile 首次全量编译 32m15s）：`cargo test -p deis-build --test
+  provider_node_facade` **1 passed / 0 failed**，日志里三个 vendor 依次给出
+  `✓ wrangler accepted the Worker (deploy --dry-run)`（wrangler 4.130.0）、
+  `⚠ the tencent target was not verified against EdgeOne`、
+  `✓ deno parsed and resolved the closed module graph (cache --no-check --no-remote)`（deno 2.9.6），
+  三次 canonical 构建都是同一个 `2da7183da80c`（content root `7da96b4e0aa3`，8 个文件）。第一行在改动之前的代码里
+  在 Windows 上不可能出现，这就是这条修法的直接证据。
+- 顺带结清一件长期欠账：`provider_node_facade` 这条用例过去在 s69 被记为「缺 Node，硬失败」。node 现已在位，用例通过，
+  而它断言的是**归一之后**的身份——`platform` 为 `linux`、`version` 为 `v24.20.0`、`process.versions.node` 为
+  `24.20.0`，`node:process` 导入与 `globalThis.process` 两侧都如此——而承载它运行的是 Windows 上的真实 node v24.16.0。
+  换句话说，这条证据说明 facade 的归一是完整的：宿主平台与宿主版本都没有漏出来。
+- 另一件欠账也定性了：`render::tests::a_non_terminal_stdin_is_refused_rather_than_read_from` 上一轮在 s69「卡死超 60 秒」
+  是复验方式造成的假象。这次用三种**真实的**非终端标准输入各跑一次——NUL 设备（`< NUL`）、一个普通空文件、
+  一条管道（`type nul |`）——三次都通过，测试自身每次都是 `finished in 0.00s`（其中一次外层耗时 285 秒，那是首次编译
+  `deis` crate 的时间，不是测试）。上一轮是用 WMI `Win32_Process.Create` 拉起的，那样创建的进程没有任何标准输入句柄，
+  与「句柄有效但不是终端」是两回事。`confirm_destructive` 只做一次 `IsTerminal::is_terminal(&stdin())` 判断，
+  三种真实形态下都立即拒绝。注意调用要用 `-p deis --bins`：`deis` 没有 lib target，`--lib` 会直接报
+  `no library targets found in package deis` 而不是跑测试。
+- 本机门禁：`cargo fmt --all --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 零告警；
+  `cargo test --workspace --no-fail-fast` 113 个二进制 **3325 通过 0 失败**；`cargo test -p deis-build` 单独跑
+  27 个二进制 136 通过 0 失败，过程中 wrangler 4.86.0 真实执行了 13 次 dry-run；`test-demo-witnesses.sh` 全部通过。

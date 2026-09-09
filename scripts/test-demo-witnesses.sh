@@ -1485,16 +1485,29 @@ vendor_case "wrangler ran and deno was absent (this workstation)" \
  ⛅️ wrangler 4.86.0 (update available 4.128.0)
 --dry-run: exiting now.
   ✓ wrangler accepted the Worker (deploy --dry-run)
-  ⚠ the deno target was not verified: 'deno' is not on PATH, so nothing type-checked this program. Install deno to have the build refuse a program Deno Deploy would reject
+  ⚠ the deno target was not verified: nothing on PATH answered to deno, so nothing parsed and resolved its generated module graph with the provider tool. Install deno to have the build refuse a program Deno Deploy could not load
   ⚡ Bundling for tencent...
   ⚠ the tencent target was not verified against EdgeOne: there is no local dry-run for it, so only this compiler's own checks stand behind the artifact
   ✓ Bundle manifest reads back: app portable, entry worker/index.js, 1 route(s), 0 asset(s)
 LOG
 
+# The same two refusals as a Windows host words them. There the message names
+# every spelling it tried, because a bare name is resolved by appending `.exe`
+# and npm installs a global CLI as `<name>.cmd` - so "not on PATH" alone would
+# send a reader to install a tool that is already installed. The summary reads
+# the same, which is the point: it keys on what the build decided, not on how
+# the sentence ends.
+vendor_case "neither tool answered on a Windows host" \
+  "cloudflare NOT verified (wrangler is not on PATH); deno NOT verified (deno is not on PATH); tencent NOT verified (EdgeOne has no local dry-run)" <<'LOG'
+  ⚠ the cloudflare target was not verified: nothing on PATH answered to wrangler, wrangler.cmd, wrangler.bat, so nothing checked that this Worker deploys. Install wrangler to have the build refuse an artifact Cloudflare would reject
+  ⚠ the deno target was not verified: nothing on PATH answered to deno, deno.cmd, deno.bat, so nothing parsed and resolved its generated module graph with the provider tool. Install deno to have the build refuse a program Deno Deploy could not load
+  ⚠ the tencent target was not verified against EdgeOne: there is no local dry-run for it, so only this compiler's own checks stand behind the artifact
+LOG
+
 vendor_case "neither tool is on PATH (ubuntu-latest)" \
   "cloudflare NOT verified (wrangler is not on PATH); deno NOT verified (deno is not on PATH); tencent NOT verified (EdgeOne has no local dry-run)" <<'LOG'
-  ⚠ the cloudflare target was not verified: 'wrangler' is not on PATH, so nothing checked that this Worker deploys. Install wrangler to have the build refuse an artifact Cloudflare would reject
-  ⚠ the deno target was not verified: 'deno' is not on PATH, so nothing type-checked this program. Install deno to have the build refuse a program Deno Deploy would reject
+  ⚠ the cloudflare target was not verified: nothing on PATH answered to wrangler, so nothing checked that this Worker deploys. Install wrangler to have the build refuse an artifact Cloudflare would reject
+  ⚠ the deno target was not verified: nothing on PATH answered to deno, so nothing parsed and resolved its generated module graph with the provider tool. Install deno to have the build refuse a program Deno Deploy could not load
   ⚠ the tencent target was not verified against EdgeOne: there is no local dry-run for it, so only this compiler's own checks stand behind the artifact
 LOG
 
