@@ -3069,3 +3069,38 @@ Application/framework source + versioned build plan
 - 未做：npm 安装树内不做这项检查是 esbuild 的既有边界（`!IsInsideNodeModules`），Deislet 这边天然不涉及——
   `resolve_local_module` 只处理 `./`、`../` 开头的项目内相对导入，bare specifier 早就返回 `None`；但如果将来有人从
   项目文件里写 `../node_modules/...`，归一会照常发生，这一点尚无用例覆盖。
+
+## 102. demo 一次无声中止的根因：coproc 变量在 `set -u` 下是「未绑定」而不是「已关闭」
+
+- 起因是第 101 节那轮里的一次无效运行：`verify` 打到第 47 项时停住，只留下一行
+  `./scripts/demo.sh: line 8470: DEIS_TRACE[0]: unbound variable`，汇总写的是「the run stopped before it had
+  finished / no failing command was recorded」。当时判定为残留实例造成的假象，清干净后重跑 94/94 通过，就没有再追。
+  这次回头看那一行：残留实例只是让 `deis trace` 起不来的**诱因**，把「一个 CLI 起不来」放大成「整轮不再往下问」的是
+  脚本自己。
+- 根因与直觉相反。协程的读端一般被想成「进程死了 → 管道关闭 → `read` 读到 EOF → 循环正常结束」，但 bash 在**回收**
+  一个已退出的协程时，会连同 `DEIS_TRACE` 数组和 `DEIS_TRACE_PID` 一起 unset。于是 `${DEIS_TRACE[0]}` 拿到的不是一个
+  已关闭的描述符，而是**根本没有值**；`set -u` 下这就是未绑定变量，非交互 shell 当场结束。用最小复现确认过三种形态：
+  协程立刻退出且已被回收时数组已不存在；先取出的描述符可以一直读到 EOF、循环干净结束；不加保护地展开则直接
+  `unbound variable` 并使 shell 以 1 退出。
+- 影响面比那一处大。同一写法有两条链路四个点：`open_trace_stream` 的读、`await_trace_row` 的读、
+  `close_trace_stream` 的 `kill`/`wait`，以及 `check_cli_tail` 里的 `local tail_pid=$DEIS_TAIL_PID` 与两处
+  `${DEIS_TAIL[0]}`。`check_cli_trace` 在 open 失败后本来就会调用 `close_trace_stream`，那正是 pid 从未被赋值的路径，
+  所以失败处理自身也会踩中同一个雷。
+- 后果的性质要说清楚：这不是「一个检查误报通过」，而是**运行提前终止**。终止之后的检查既不算通过也不算失败，
+  汇总没有办法回答它们本来会是什么结论——一次 47/94 的运行看起来像「跑过了一半」，实际上是「后一半从来没有被问过」。
+  同一形状在第 2 节（`test-demo-witnesses.sh` 里的编号）已经出现过一次：一个匹配不到东西的 `grep` 借 `pipefail`
+  终止全程。判据相同，位置不同。
+- 修法：两条链路都只在协程刚建立时**取一次**描述符，并且通过默认值取（`${DEIS_TRACE[0]:-}`）；取不到就把原因写进
+  该检查的 transcript 并返回失败。取到之后即便 CLI 中途退出，缓存下来的描述符仍然读得到 EOF，循环自然结束，
+  仍然只是这一个检查失败。`close_trace_stream` 改成先用默认值取 pid，没有就直接返回，因此在「流从未打开」这条路径上
+  也是安全的。
+- 回归证据放进 `scripts/test-demo-witnesses.sh` 第 18 节，沿用该文件既有的做法：不复制函数，运行时用 `sed` 从
+  `demo.sh` 里把真实定义抽出来，配一个立刻 `exit 3` 的假 `deis`（一次没建完的构建、一个没起来的节点、一个 CLI 不再
+  接受的参数，从调用方看都是这个样子），在一个同样 `set -euo pipefail` 的子 shell 里跑。断言五条：子 shell 必须走到
+  最后一行；`open_trace_stream`、`await_trace_row` 各自返回失败；`close_trace_stream` 正常返回；`check_cli_tail`
+  给出 fail 而不是 pass、也不是不出声。
+- 该文件接受一个 demo.sh 路径参数，本来就是为了「这条从前会红」能被任何人重跑而不是只写在提交信息里。对
+  `git show HEAD:scripts/demo.sh` 那份跑，五条里红四条，倒在 `close_trace_stream` 的 `DEIS_TRACE_PID` 上；
+  对现版本跑，`test-demo-witnesses.sh` 全部通过。顺带一提，旧版倒下的位置与线上那次（读端第 8470 行）并不相同——
+  取决于协程是否已被回收，两个展开点都会中招，所以两处都要保护。
+- `shellcheck` 对 `demo.sh` 的告警集合与改前逐条一致（该项目未把 shellcheck 纳入 CI，此处只作对照）。

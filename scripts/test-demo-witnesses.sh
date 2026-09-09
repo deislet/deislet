@@ -1708,6 +1708,115 @@ else
     "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
 fi
 
+# ----------------------------------------------------------------------
+# 18. A streaming CLI that dies on startup costs one check, not the run
+# ----------------------------------------------------------------------
+#
+# `deis trace --follow` and `deis tail` are read through a coprocess, and bash
+# removes a coprocess's array and pid variable the moment it reaps a process
+# that has already exited. So when either CLI dies at startup - a build that is
+# half written, a node that is not up, a flag the CLI no longer takes - the
+# descriptor the reader asks for is not a closed one, it has no value at all.
+# Under `set -euo pipefail` that expansion is an unbound variable, and an
+# unbound variable ends the run where it stands.
+#
+# It has happened: a run reported 47 checks, printed
+# "demo.sh: line 8470: DEIS_TRACE[0]: unbound variable", and never asked the
+# other 47. That is worse than a failed check, because the summary of a run
+# that stopped early cannot say whether the checks below it would have passed
+# - and the same shape had already been found once before, in section 2.
+#
+# The stand-in CLI here exits immediately, which is what all of those causes
+# look like from the caller's side. What is tested is the definitions as they
+# ship: each entry point must come back with a verdict, and the script must
+# reach the line after it.
+
+trace_stream_probe() {
+  local work="${WORK_DIR}/coproc"
+  rm -rf "$work"
+  mkdir -p "${work}/bin" "${work}/logs"
+
+  # A `deis` that is gone before its first line, the way every one of the
+  # causes above presents itself to the reader.
+  printf '#!/bin/sh\nexit 3\n' > "${work}/bin/deis"
+  chmod +x "${work}/bin/deis"
+
+  # Run in a child shell with the same flags demo.sh sets, so that an unbound
+  # variable ends that shell and this one goes on to report it.
+  BASH_ENV=/dev/null bash --noprofile --norc -c '
+    set -euo pipefail
+    DEMO_SH=$1
+    work=$2
+
+    BIN_DIR="${work}/bin"
+    LOG_DIR="${work}/logs"
+    ENV_NAME=witness-env
+    DEIS_CLI_ENV=()
+    deis_cli_env() { DEIS_CLI_ENV=(DEIS_WITNESS=1); }
+    app_request() { return 0; }
+    pass_check() { echo "PASS ${1}"; }
+    fail_check() { echo "FAIL ${1}"; }
+
+    for name in open_trace_stream await_trace_row close_trace_stream check_cli_tail; do
+      eval "$(sed -n "/^${name}() {/,/^}/p" "$DEMO_SH")"
+    done
+
+    transcript="${LOG_DIR}/transcript.log"
+    : > "$transcript"
+
+    if open_trace_stream "$ENV_NAME" "$transcript"; then
+      echo "OPENED"
+    else
+      echo "open_trace_stream reported failure"
+    fi
+
+    close_trace_stream
+    echo "close_trace_stream returned"
+
+    if await_trace_row "a-row-nobody-will-write" "$transcript"; then
+      echo "ROW"
+    else
+      echo "await_trace_row reported failure"
+    fi
+
+    check_cli_tail
+
+    echo "reached the end"
+  ' witness "$DEMO_SH" "$work" 2>&1
+}
+
+probe_out=$(trace_stream_probe) || true
+
+# The whole point: the child shell got to its last line. A bare expansion of
+# the coprocess variables never does.
+if [ "${probe_out#*reached the end}" != "$probe_out" ]; then
+  pass "a deis that exits at once leaves the run to carry on"
+else
+  fail "a deis that exits at once leaves the run to carry on" \
+    "the child shell stopped early; it printed: $(printf '%s' "$probe_out" | tr '\n' ' ' | head -c 400)"
+fi
+
+# Each entry point separately, because the run carrying on is no use if a
+# check ends up passing or saying nothing on the way there.
+for wanted in \
+  'open_trace_stream reported failure' \
+  'close_trace_stream returned' \
+  'await_trace_row reported failure'; do
+  if [ "${probe_out#*${wanted}}" != "$probe_out" ]; then
+    pass "with no stream to read: ${wanted}"
+  else
+    fail "with no stream to read: ${wanted}" \
+      "it printed: $(printf '%s' "$probe_out" | tr '\n' ' ' | head -c 400)"
+  fi
+done
+
+if [ "${probe_out#*FAIL }" != "$probe_out" ] && [ "${probe_out#*PASS }" = "$probe_out" ]; then
+  pass "check_cli_tail fails rather than passing or ending the run"
+else
+  fail "check_cli_tail fails rather than passing or ending the run" \
+    "it printed: $(printf '%s' "$probe_out" | tr '\n' ' ' | head -c 400)"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
   echo "all witness tests passed"

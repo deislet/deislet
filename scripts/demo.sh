@@ -8455,19 +8455,36 @@ check_the_node_channel_needs_the_node_key() {
 # correctly shows only new invocations looks broken.
 #
 # `exec` so that the pid is the CLI itself and not a shell around it, which
-# matters when it is interrupted; the coprocess file descriptors are global, so
-# the caller reads from ${DEIS_TRACE[0]} and closes with close_trace_stream.
+# matters when it is interrupted; the descriptor is held in DEIS_TRACE_FD for
+# await_trace_row to read from, and close_trace_stream ends the stream.
 open_trace_stream() {
   local environment=$1
   local transcript=$2
 
+  DEIS_TRACE_FD=""
   deis_cli_env
   coproc DEIS_TRACE {
     exec env "${DEIS_CLI_ENV[@]}" "${BIN_DIR}/deis" trace --follow -e "$environment" 2>&1
   }
 
+  # bash removes the array the moment it reaps a coprocess that has already
+  # exited, so a `deis trace` that dies on startup leaves ${DEIS_TRACE[0]} with
+  # no value at all. Reading it then is not a check that fails but an unbound
+  # variable, and `set -u` ends the entire run on the spot - the symptom being
+  # a run that reported 47 checks, never asked the remaining 47, and named no
+  # failing command. Take the descriptor once, through a default, so a dead
+  # stream costs this one check and nothing else. Once taken it stays readable
+  # to its end even if the CLI exits mid-stream: the loop simply reaches EOF.
+  DEIS_TRACE_FD=${DEIS_TRACE[0]:-}
+  if [ -z "$DEIS_TRACE_FD" ]; then
+    printf '%s\n' \
+      "deis trace --follow -e ${environment} exited before one line could be read from it" \
+      >> "$transcript"
+    return 1
+  fi
+
   local line
-  while IFS= read -r -t 30 -u "${DEIS_TRACE[0]}" line; do
+  while IFS= read -r -t 30 -u "$DEIS_TRACE_FD" line; do
     printf '%s\n' "$line" >> "$transcript"
     case "$line" in
       *"following invocations from now on"*) return 0 ;;
@@ -8495,7 +8512,14 @@ await_trace_row() {
   local line
 
   TRACE_ROW=""
-  while IFS= read -r -t 60 -u "${DEIS_TRACE[0]}" line; do
+  if [ -z "${DEIS_TRACE_FD:-}" ]; then
+    printf '%s\n' \
+      "no trace stream is open, so no row naming ${wanted} could be waited for" \
+      >> "$transcript"
+    return 1
+  fi
+
+  while IFS= read -r -t 60 -u "$DEIS_TRACE_FD" line; do
     printf '%s\n' "$line" >> "$transcript"
     case "$line" in
       *"$wanted"*)
@@ -8516,9 +8540,15 @@ await_trace_row() {
 # SIGINT, not SIGKILL: `deis trace --follow` races Ctrl-C against the stream so
 # that it unwinds normally and closes the connection. That is the path a person
 # takes to stop it, so it is the one worth exercising.
+#
+# Called on both paths, including the one where the stream never opened, so the
+# pid may never have been set - hence the default rather than a bare expansion.
 close_trace_stream() {
-  kill -INT "$DEIS_TRACE_PID" 2>/dev/null || true
-  wait "$DEIS_TRACE_PID" 2>/dev/null || true
+  local pid=${DEIS_TRACE_PID:-}
+  DEIS_TRACE_FD=""
+  [ -n "$pid" ] || return 0
+  kill -INT "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
 }
 
 check_cli_trace() {
@@ -8710,7 +8740,19 @@ check_cli_tail() {
   # around it, which matters when it is interrupted at the end.
   deis_cli_env
   coproc DEIS_TAIL { exec env "${DEIS_CLI_ENV[@]}" "${BIN_DIR}/deis" tail -e "$ENV_NAME" 2>&1; }
-  local tail_pid=$DEIS_TAIL_PID
+
+  # A coprocess that has already exited is reaped and its array removed, so
+  # both of these are unset when `deis tail` dies on startup. Under `set -u` a
+  # bare expansion would end the whole run instead of this one check - see the
+  # same guard in open_trace_stream. The descriptor stays readable to EOF once
+  # taken, so a CLI that exits mid-stream still leaves a failed check behind.
+  local tail_pid=${DEIS_TAIL_PID:-}
+  local tail_fd=${DEIS_TAIL[0]:-}
+  if [ -z "$tail_fd" ]; then
+    fail_check "$title" \
+      "deis tail -e ${ENV_NAME} exited before one line could be read from it"
+    return
+  fi
 
   # Wait until the stream is really open before producing anything to see.
   #
@@ -8721,7 +8763,7 @@ check_cli_tail() {
   # request is logged, flushed and broadcast while nobody is listening, and a
   # tail that correctly shows only new lines looks broken.
   local line opened=0
-  while IFS= read -r -t 30 -u "${DEIS_TAIL[0]}" line; do
+  while IFS= read -r -t 30 -u "$tail_fd" line; do
     printf '%s\n' "$line" >> "$out"
     case "$line" in
       *"following new lines only"*)
@@ -8742,7 +8784,7 @@ check_cli_tail() {
   app_request "${LOG_DIR}/verify-cli-tail.headers" "/hello/${probe}" > /dev/null
 
   local seen=0
-  while IFS= read -r -t 60 -u "${DEIS_TAIL[0]}" line; do
+  while IFS= read -r -t 60 -u "$tail_fd" line; do
     printf '%s\n' "$line" >> "$out"
     case "$line" in
       *"greeted ${probe}"*)
