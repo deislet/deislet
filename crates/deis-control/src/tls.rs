@@ -68,10 +68,29 @@ pub fn build_tls_config(tls_config: &TlsConfig) -> Result<Arc<ServerConfig>, Tls
     tracing::info!("Loaded private key from {:?}", tls_config.key_path);
 
     // Build TLS configuration
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(TlsError::ConfigError)?;
+
+    // This port carries the REST API and the node gRPC channel together, so it
+    // has to be able to agree to either.
+    //
+    // Nothing set this before, and the fleet worked anyway: hyper's server
+    // sniffs the HTTP/2 connection preface off the byte stream and carries on
+    // whether or not the handshake agreed anything. But that is a property of
+    // one implementation rather than an agreement between the two ends, and a
+    // strict client, a load balancer or a proxy in the path turns it into a
+    // connection that completes and then behaves in a way neither log
+    // explains. `axum_server`'s own configuration helpers set exactly this
+    // list; this control plane builds its `ServerConfig` by hand and so has to
+    // set it here.
+    //
+    // A caller that offers no protocol at all is unaffected - nothing is
+    // agreed and the connection proceeds, as it always did. A caller that
+    // offers only something neither of these is now refused during the
+    // handshake, which is the point: it could not have been served anyway.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }

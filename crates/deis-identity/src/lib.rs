@@ -76,6 +76,44 @@ pub use crate::spiffe::{SpiffeId, SpiffeIdError, check_path_segment};
 
 use crate::material::Material;
 
+/// A protocol a TLS connection on this channel may carry.
+///
+/// # Why this has to be said out loud
+///
+/// TLS negotiates the application protocol during the handshake, and a peer
+/// that offers `h2` to a listener advertising nothing gets a connection with
+/// no agreed protocol. What happens next depends on the stack: hyper's server
+/// sniffs the HTTP/2 connection preface off the byte stream and carries on, so
+/// this fleet works today without ever setting it - but that is an accident of
+/// one implementation, not an agreement. Put a strict client, a load balancer
+/// or a service mesh in the path and the connection completes and then behaves
+/// in a way nobody can explain from either log.
+///
+/// So the protocols are stated. The machine listener carries gRPC and a bundle
+/// download, which is both of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// HTTP/2, which is what gRPC runs on.
+    Http2,
+    /// HTTP/1.1, which is what the bundle download is.
+    Http11,
+}
+
+impl Protocol {
+    /// The identifier as it goes on the wire, from the IANA registry.
+    pub fn wire_name(self) -> &'static [u8] {
+        match self {
+            Self::Http2 => b"h2",
+            Self::Http11 => b"http/1.1",
+        }
+    }
+
+    /// The list rustls wants, in the caller's order of preference.
+    fn wire_names(protocols: &[Self]) -> Vec<Vec<u8>> {
+        protocols.iter().map(|p| p.wire_name().to_vec()).collect()
+    }
+}
+
 /// Where the three files live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityFiles {
@@ -109,6 +147,9 @@ impl IdentityFiles {
 #[derive(Debug)]
 pub struct MachineIdentity {
     files: IdentityFiles,
+    /// What this process's listener advertises, kept so a reload rebuilds the
+    /// server configuration with the same answer it started with.
+    serves: Vec<Vec<u8>>,
     current: ArcSwap<Material>,
 }
 
@@ -120,10 +161,21 @@ impl MachineIdentity {
     /// only move the failure to the first connection - by which time it is an
     /// outage being diagnosed from a handshake error instead of a startup
     /// message naming the file.
-    pub fn load(files: IdentityFiles) -> Result<Self, IdentityError> {
-        let material = Material::load(&files, default_provider())?;
+    /// `serves` is what this process's own listener will carry, in order of
+    /// preference. It belongs here rather than on [`Self::server_config`]
+    /// because it is fixed for the life of the process, and a listener whose
+    /// advertised protocols could change under it would be a listener no
+    /// peer's cached connection could rely on. What a *dialler* wants is a
+    /// different question and is answered per call - see
+    /// [`Self::client_config`].
+    ///
+    /// A process that only dials passes an empty slice.
+    pub fn load(files: IdentityFiles, serves: &[Protocol]) -> Result<Self, IdentityError> {
+        let serves = Protocol::wire_names(serves);
+        let material = Material::load(&files, default_provider(), &serves)?;
         Ok(Self {
             files,
+            serves,
             current: ArcSwap::from_pointee(material),
         })
     }
@@ -148,11 +200,18 @@ impl MachineIdentity {
     ///
     /// The address is not the identity: this will refuse to talk to whatever
     /// answers at the address unless it proves it is `expected_peer`.
+    /// `speaking` is what this particular connection is for, in order of
+    /// preference: `Http2` to open a gRPC channel, `Http11` to fetch a
+    /// bundle. Per call and not per identity, because one process does both
+    /// over the same certificate.
     pub fn client_config(
         &self,
         expected_peer: &SpiffeId,
+        speaking: &[Protocol],
     ) -> Result<Arc<ClientConfig>, IdentityError> {
-        self.current.load().client_config(expected_peer)
+        self.current
+            .load()
+            .client_config(expected_peer, &Protocol::wire_names(speaking))
     }
 
     /// Re-read the files, and adopt them if they are usable and new.
@@ -164,7 +223,7 @@ impl MachineIdentity {
     /// not be able to take a running fleet's authentication down with it.
     pub fn reload(&self) -> Result<Reload, IdentityError> {
         let previous = self.current.load_full();
-        let candidate = Material::load(&self.files, Arc::clone(&previous.provider))?;
+        let candidate = Material::load(&self.files, Arc::clone(&previous.provider), &self.serves)?;
         if candidate.digest == previous.digest {
             return Ok(Reload::Unchanged);
         }

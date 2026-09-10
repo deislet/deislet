@@ -54,6 +54,7 @@ impl Material {
     pub(crate) fn load(
         files: &IdentityFiles,
         provider: Arc<CryptoProvider>,
+        serves: &[Vec<u8>],
     ) -> Result<Self, IdentityError> {
         let certificate_pem = read(&files.certificate, FileRole::Certificate)?;
         let key_pem = read(&files.private_key, FileRole::PrivateKey)?;
@@ -88,7 +89,7 @@ impl Material {
                     source: rustls::Error::General(source.to_string()),
                 })?;
 
-        let server = ServerConfig::builder_with_provider(Arc::clone(&provider))
+        let mut server = ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()?
             .with_client_cert_verifier(Arc::new(VerifyPeerIsInTrustDomain::new(
                 peer_verifier,
@@ -100,6 +101,9 @@ impl Material {
                 private_key: files.private_key.clone(),
                 source,
             })?;
+        // Set after the builder rather than through it: rustls exposes this as
+        // a field, and the builder chain has no step for it.
+        server.alpn_protocols = serves.to_vec();
 
         Ok(Self {
             id,
@@ -120,17 +124,19 @@ impl Material {
     pub(crate) fn client_config(
         &self,
         expected_peer: &SpiffeId,
+        speaking: &[Vec<u8>],
     ) -> Result<Arc<ClientConfig>, IdentityError> {
         let verifier = VerifyPeerIs::new(
             Arc::clone(&self.roots),
             expected_peer.clone(),
             Arc::clone(&self.provider),
         );
-        let config = ClientConfig::builder_with_provider(Arc::clone(&self.provider))
+        let mut config = ClientConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_client_auth_cert(self.chain.clone(), self.key.clone_key())?;
+        config.alpn_protocols = speaking.to_vec();
         Ok(Arc::new(config))
     }
 }

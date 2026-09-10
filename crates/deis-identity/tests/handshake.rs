@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use deis_identity::{
-    FileRole, IdentityError, MachineIdentity, Reload, SpiffeId, name_presented_by,
+    FileRole, IdentityError, MachineIdentity, Protocol, Reload, SpiffeId, name_presented_by,
 };
 use rustls::pki_types::ServerName;
 use support::{TestCa, write_files};
@@ -30,6 +30,9 @@ const PATIENCE: Duration = Duration::from_secs(10);
 /// the certificate, so what was typed into the address bar must not matter.
 const UNRELATED_HOST: &str = "nothing.of.the.sort.invalid";
 
+/// What the machine listener carries: gRPC, and the bundle download beside it.
+const SERVES: &[Protocol] = &[Protocol::Http2, Protocol::Http11];
+
 fn id(text: &str) -> SpiffeId {
     SpiffeId::parse(text).expect("a valid identity")
 }
@@ -40,6 +43,11 @@ struct Handshake {
     server: Result<SpiffeId, String>,
     /// Whether the dialler accepted what answered, and why not.
     client: Result<(), String>,
+    /// The application protocol each end came away believing was agreed.
+    /// `None` means none was: the two offered nothing in common, or one of
+    /// them offered nothing at all.
+    server_alpn: Option<Vec<u8>>,
+    client_alpn: Option<Vec<u8>>,
 }
 
 /// Dial `server` from `client`, expecting to reach `expected_peer`.
@@ -47,6 +55,16 @@ async fn connect(
     server: &Arc<MachineIdentity>,
     client: &MachineIdentity,
     expected_peer: &SpiffeId,
+) -> Handshake {
+    connect_speaking(server, client, expected_peer, SERVES).await
+}
+
+/// The same, with the dialler offering exactly `speaking`.
+async fn connect_speaking(
+    server: &Arc<MachineIdentity>,
+    client: &MachineIdentity,
+    expected_peer: &SpiffeId,
+    speaking: &[Protocol],
 ) -> Handshake {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
     let address = listener.local_addr().expect("an address");
@@ -56,12 +74,15 @@ async fn connect(
         let (stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
         let tls = acceptor.accept(stream).await.map_err(|e| e.to_string())?;
         let (_, connection) = tls.get_ref();
-        name_presented_by(connection.peer_certificates()).map_err(|e| e.to_string())
+        let alpn = connection.alpn_protocol().map(<[u8]>::to_vec);
+        name_presented_by(connection.peer_certificates())
+            .map(|name| (name, alpn))
+            .map_err(|e| e.to_string())
     });
 
     let connector = TlsConnector::from(
         client
-            .client_config(expected_peer)
+            .client_config(expected_peer, speaking)
             .expect("a client configuration"),
     );
     let dialled = async {
@@ -72,19 +93,26 @@ async fn connect(
         connector
             .connect(name, stream)
             .await
-            .map(|_| ())
+            .map(|tls| tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec))
             .map_err(|e| e.to_string())
     };
 
-    let client = tokio::time::timeout(PATIENCE, dialled)
+    let dialled = tokio::time::timeout(PATIENCE, dialled)
         .await
         .unwrap_or_else(|_| Err("the dialler never finished".to_string()));
-    let server = tokio::time::timeout(PATIENCE, listening)
+    let accepted = tokio::time::timeout(PATIENCE, listening)
         .await
         .expect("the listener never finished")
         .expect("the listener task did not panic");
 
-    Handshake { server, client }
+    let client_alpn = dialled.as_ref().ok().and_then(Clone::clone);
+    let server_alpn = accepted.as_ref().ok().and_then(|(_, alpn)| alpn.clone());
+    Handshake {
+        server: accepted.map(|(name, _)| name),
+        client: dialled.map(|_| ()),
+        server_alpn,
+        client_alpn,
+    }
 }
 
 #[tokio::test]
@@ -104,12 +132,14 @@ async fn a_peer_that_proves_its_name_is_recognised_on_both_ends() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("the control plane's identity"),
     );
     let node = MachineIdentity::load(
         write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem)
             .as_identity_files(),
+        SERVES,
     )
     .expect("the node's identity");
 
@@ -148,6 +178,7 @@ async fn the_address_dialled_is_not_the_identity() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
@@ -159,6 +190,7 @@ async fn the_address_dialled_is_not_the_identity() {
             &ca.root_pem,
         )
         .as_identity_files(),
+        SERVES,
     )
     .expect("an identity");
 
@@ -185,6 +217,7 @@ async fn a_certificate_from_another_authority_cannot_open_a_connection() {
                 &ours.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
@@ -198,6 +231,7 @@ async fn a_certificate_from_another_authority_cannot_open_a_connection() {
             &theirs.root_pem,
         )
         .as_identity_files(),
+        SERVES,
     )
     .expect("an identity");
 
@@ -223,6 +257,7 @@ async fn reaching_a_different_machine_than_the_one_dialled_is_refused() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
@@ -234,6 +269,7 @@ async fn reaching_a_different_machine_than_the_one_dialled_is_refused() {
             &ca.root_pem,
         )
         .as_identity_files(),
+        SERVES,
     )
     .expect("an identity");
 
@@ -263,6 +299,7 @@ async fn a_certificate_carrying_no_machine_name_cannot_open_a_connection() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
@@ -276,7 +313,7 @@ async fn a_certificate_carrying_no_machine_name_cannot_open_a_connection() {
         &ca.issue_without_a_name("node7.deis.internal"),
         &ca.root_pem,
     );
-    let error = MachineIdentity::load(anonymous.as_identity_files())
+    let error = MachineIdentity::load(anonymous.as_identity_files(), SERVES)
         .expect_err("an identity was loaded from a certificate that names nobody");
     assert!(
         matches!(error, IdentityError::NoSpiffeName),
@@ -301,7 +338,7 @@ async fn a_certificate_naming_two_machines_is_refused() {
         &ca.root_pem,
     );
 
-    match MachineIdentity::load(two_faced.as_identity_files()) {
+    match MachineIdentity::load(two_faced.as_identity_files(), SERVES) {
         Err(IdentityError::AmbiguousSpiffeName { count, names }) => {
             assert_eq!(count, 2);
             assert!(names.contains("runtime/07") && names.contains("control/01"));
@@ -325,6 +362,7 @@ async fn a_peer_our_root_signed_into_another_trust_domain_is_refused() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
@@ -338,6 +376,7 @@ async fn a_peer_our_root_signed_into_another_trust_domain_is_refused() {
             &ca.root_pem,
         )
         .as_identity_files(),
+        SERVES,
     )
     .expect("an identity");
 
@@ -365,11 +404,12 @@ async fn a_renewal_is_adopted_without_a_restart_and_reaches_the_wire() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
     let node_files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
-    let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
+    let node = MachineIdentity::load(node_files.as_identity_files(), SERVES).expect("an identity");
 
     assert_eq!(
         node.reload().expect("a look at unchanged files"),
@@ -419,11 +459,12 @@ async fn what_a_reload_adopts_is_what_the_far_end_sees() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
     let node_files = write_files(directory.path(), "node", &ca.issue(&was), &ca.root_pem);
-    let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
+    let node = MachineIdentity::load(node_files.as_identity_files(), SERVES).expect("an identity");
 
     let reissued = ca.issue(&now);
     std::fs::write(&node_files.certificate, &reissued.certificate_pem).expect("write certificate");
@@ -462,11 +503,12 @@ async fn a_rotation_that_goes_wrong_leaves_the_working_material_in_force() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
     let node_files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
-    let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
+    let node = MachineIdentity::load(node_files.as_identity_files(), SERVES).expect("an identity");
 
     // Caught mid-write: the file exists and holds no complete PEM block.
     std::fs::write(
@@ -519,7 +561,7 @@ async fn a_certificate_and_a_key_from_different_issuances_are_refused_together()
     let node_id = id("spiffe://deis.internal/machine/runtime/07");
 
     let node_files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
-    let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
+    let node = MachineIdentity::load(node_files.as_identity_files(), SERVES).expect("an identity");
 
     // Only the certificate was replaced; the key on disk still belongs to the
     // one before it.
@@ -559,6 +601,7 @@ async fn an_address_in_a_certificate_changes_nothing_about_who_it_names() {
                 &ca.root_pem,
             )
             .as_identity_files(),
+            SERVES,
         )
         .expect("an identity"),
     );
@@ -571,6 +614,7 @@ async fn an_address_in_a_certificate_changes_nothing_about_who_it_names() {
     let node = MachineIdentity::load(
         write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem)
             .as_identity_files(),
+        SERVES,
     )
     .expect("an identity");
 
@@ -594,8 +638,9 @@ async fn the_watcher_adopts_a_rotation_without_being_asked() {
     let now = id("spiffe://deis.internal/machine/runtime/08");
 
     let node_files = write_files(directory.path(), "node", &ca.issue(&was), &ca.root_pem);
-    let node =
-        Arc::new(MachineIdentity::load(node_files.as_identity_files()).expect("an identity"));
+    let node = Arc::new(
+        MachineIdentity::load(node_files.as_identity_files(), SERVES).expect("an identity"),
+    );
     let watching = node.watch(Duration::from_secs(30));
     // Let the watcher reach the point where it is waiting on its timer. Until
     // it has, moving the clock moves it past nothing.
@@ -620,4 +665,92 @@ async fn the_watcher_adopts_a_rotation_without_being_asked() {
         "the watcher did not pick up what was written under it"
     );
     watching.abort();
+}
+
+/// The application protocol is agreed during the handshake, not assumed
+/// afterwards.
+///
+/// A listener that advertises nothing leaves every connection with no agreed
+/// protocol, and what happens next is a property of whichever stack is on the
+/// other end rather than of anything either side stated. This fleet carries
+/// gRPC and a file download on one socket, so what was agreed has to be
+/// observable - and the two ends have to agree.
+#[tokio::test]
+async fn the_two_ends_agree_on_what_they_are_speaking() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let control_id = id("spiffe://deis.internal/machine/control/01");
+    let node_id = id("spiffe://deis.internal/machine/runtime/07");
+
+    let control = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "control",
+                &ca.issue(&control_id),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+            SERVES,
+        )
+        .expect("an identity"),
+    );
+    let node = MachineIdentity::load(
+        write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem)
+            .as_identity_files(),
+        SERVES,
+    )
+    .expect("an identity");
+
+    // A gRPC channel offers only HTTP/2, and the listener serves it.
+    let grpc = connect_speaking(&control, &node, &control_id, &[Protocol::Http2]).await;
+    assert_eq!(grpc.client, Ok(()));
+    assert_eq!(grpc.server_alpn.as_deref(), Some(b"h2".as_slice()));
+    assert_eq!(grpc.client_alpn, grpc.server_alpn);
+
+    // A bundle download offers only HTTP/1.1 over the same certificate, and
+    // gets it - the listener serves both, and the dialler decides per call.
+    let bundle = connect_speaking(&control, &node, &control_id, &[Protocol::Http11]).await;
+    assert_eq!(bundle.client, Ok(()));
+    assert_eq!(bundle.server_alpn.as_deref(), Some(b"http/1.1".as_slice()));
+    assert_eq!(bundle.client_alpn, bundle.server_alpn);
+}
+
+/// A dialler that can speak nothing the listener serves is refused during the
+/// handshake, rather than getting a connection that then behaves in a way
+/// neither log explains.
+#[tokio::test]
+async fn a_protocol_the_listener_does_not_serve_ends_the_handshake() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let control_id = id("spiffe://deis.internal/machine/control/01");
+    let node_id = id("spiffe://deis.internal/machine/runtime/07");
+
+    // A listener that carries gRPC and nothing else.
+    let control = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "control",
+                &ca.issue(&control_id),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+            &[Protocol::Http2],
+        )
+        .expect("an identity"),
+    );
+    let node = MachineIdentity::load(
+        write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem)
+            .as_identity_files(),
+        SERVES,
+    )
+    .expect("an identity");
+
+    let outcome = connect_speaking(&control, &node, &control_id, &[Protocol::Http11]).await;
+    assert!(
+        outcome.server.is_err(),
+        "a dialler speaking a protocol this listener does not serve was let in: {:?}",
+        outcome.server
+    );
 }
