@@ -1245,10 +1245,15 @@ impl ApplicationManager {
     /// checked with; a second spelling of it here would be a second place to
     /// get it wrong. An empty stored token never matches, which is what the
     /// helper's own emptiness check is for.
+    ///
+    /// The helper is [`deis_wire::conventions::secret_matches`] and not the
+    /// node key's own wrapper: this token is minted by this node, held in
+    /// memory, and expires. It is not the fleet credential and must not
+    /// follow it out of the codebase when that is retired.
     pub fn validate_inspect_token(&self, key: &AppKey, token: &str) -> bool {
         if let Some(entry) = self.inspect_sessions.get(key) {
             let (stored_token, expires_at) = entry.value();
-            if deis_wire::conventions::node_secret_matches(stored_token, token)
+            if deis_wire::conventions::secret_matches(stored_token, token)
                 && SystemTime::now() < *expires_at
             {
                 return true;

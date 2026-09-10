@@ -474,15 +474,34 @@ pub fn node_auth_secret(value: &str) -> &str {
     value.strip_prefix("Bearer ").unwrap_or(value)
 }
 
-/// Whether a presented node key is one the receiver accepts, in time that
-/// does not depend on how many leading bytes matched.
+/// Whether a presented credential is the one the receiver accepts, in time
+/// that does not depend on how many leading bytes matched.
 ///
-/// The empty key is never a match, in either position. An unconfigured
+/// The empty credential is never a match, in either position. An unconfigured
 /// credential must be a refusal on the checking side, not an empty string
 /// that happens to compare equal to another empty string - that is the
 /// difference between a closed door and an open one.
-pub fn node_secret_matches(expected: &str, presented: &str) -> bool {
+///
+/// # Why this is not named after the node key
+///
+/// Three unrelated credentials are checked here, and only one of them is the
+/// fleet's node key: the storage token below, and deis-runtime's per-session
+/// inspector token, which is minted by the node, lives in memory, expires,
+/// and has nothing to do with any fleet-wide value. Naming the comparator
+/// after one of its callers made the other two look like the same credential,
+/// and it meant that retiring the node key would have taken an unrelated
+/// check down with it.
+pub fn secret_matches(expected: &str, presented: &str) -> bool {
     !expected.is_empty() && constant_time_eq(expected, presented)
+}
+
+/// Whether a presented node key is one the receiver accepts.
+///
+/// [`secret_matches`] under the fleet key's own name, kept for the callers
+/// that really are checking that credential so the grep for it still finds
+/// them all. It carries no rule of its own.
+pub fn node_secret_matches(expected: &str, presented: &str) -> bool {
+    secret_matches(expected, presented)
 }
 
 /// Compare two credentials in time that does not depend on how many leading
@@ -584,6 +603,21 @@ mod tests {
         assert!(node_secret_matches("node-psk", "node-psk"));
         assert!(!node_secret_matches("node-psk", "node-psl"));
         assert!(!node_secret_matches("node-psk", "node-psk-longer"));
+    }
+
+    /// The same rule, asserted at the name the credentials that are not the
+    /// fleet key are checked under. Both spellings are pinned so that
+    /// retiring the node key's wrapper cannot quietly take the rule with it -
+    /// deis-runtime's per-session inspector token is checked here, and it
+    /// outlives the fleet key by design.
+    #[test]
+    fn an_empty_credential_matches_nothing_at_all() {
+        assert!(!secret_matches("", ""));
+        assert!(!secret_matches("", "anything"));
+        assert!(!secret_matches("session-token", ""));
+        assert!(secret_matches("session-token", "session-token"));
+        assert!(!secret_matches("session-token", "session-tokem"));
+        assert!(!secret_matches("session-token", "session-token-longer"));
     }
 
     #[test]
