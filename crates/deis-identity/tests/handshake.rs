@@ -100,7 +100,7 @@ async fn a_peer_that_proves_its_name_is_recognised_on_both_ends() {
             write_files(
                 directory.path(),
                 "control",
-                &ca.issue(control_id.as_str()),
+                &ca.issue(&control_id),
                 &ca.root_pem,
             )
             .as_identity_files(),
@@ -108,13 +108,8 @@ async fn a_peer_that_proves_its_name_is_recognised_on_both_ends() {
         .expect("the control plane's identity"),
     );
     let node = MachineIdentity::load(
-        write_files(
-            directory.path(),
-            "node",
-            &ca.issue(node_id.as_str()),
-            &ca.root_pem,
-        )
-        .as_identity_files(),
+        write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem)
+            .as_identity_files(),
     )
     .expect("the node's identity");
 
@@ -149,7 +144,7 @@ async fn the_address_dialled_is_not_the_identity() {
             write_files(
                 directory.path(),
                 "server",
-                &ca.issue(server_id.as_str()),
+                &ca.issue(&server_id),
                 &ca.root_pem,
             )
             .as_identity_files(),
@@ -160,7 +155,7 @@ async fn the_address_dialled_is_not_the_identity() {
         write_files(
             directory.path(),
             "client",
-            &ca.issue("spiffe://deis.internal/machine/runtime/07"),
+            &ca.issue_named("spiffe://deis.internal/machine/runtime/07"),
             &ca.root_pem,
         )
         .as_identity_files(),
@@ -186,7 +181,7 @@ async fn a_certificate_from_another_authority_cannot_open_a_connection() {
             write_files(
                 directory.path(),
                 "server",
-                &ours.issue(server_id.as_str()),
+                &ours.issue(&server_id),
                 &ours.root_pem,
             )
             .as_identity_files(),
@@ -199,7 +194,7 @@ async fn a_certificate_from_another_authority_cannot_open_a_connection() {
         write_files(
             directory.path(),
             "stranger",
-            &theirs.issue("spiffe://deis.internal/machine/runtime/07"),
+            &theirs.issue_named("spiffe://deis.internal/machine/runtime/07"),
             &theirs.root_pem,
         )
         .as_identity_files(),
@@ -224,7 +219,7 @@ async fn reaching_a_different_machine_than_the_one_dialled_is_refused() {
             write_files(
                 directory.path(),
                 "server",
-                &ca.issue("spiffe://deis.internal/machine/control/02"),
+                &ca.issue_named("spiffe://deis.internal/machine/control/02"),
                 &ca.root_pem,
             )
             .as_identity_files(),
@@ -235,7 +230,7 @@ async fn reaching_a_different_machine_than_the_one_dialled_is_refused() {
         write_files(
             directory.path(),
             "client",
-            &ca.issue("spiffe://deis.internal/machine/runtime/07"),
+            &ca.issue_named("spiffe://deis.internal/machine/runtime/07"),
             &ca.root_pem,
         )
         .as_identity_files(),
@@ -264,7 +259,7 @@ async fn a_certificate_carrying_no_machine_name_cannot_open_a_connection() {
             write_files(
                 directory.path(),
                 "server",
-                &ca.issue(server_id.as_str()),
+                &ca.issue(&server_id),
                 &ca.root_pem,
             )
             .as_identity_files(),
@@ -326,7 +321,7 @@ async fn a_peer_our_root_signed_into_another_trust_domain_is_refused() {
             write_files(
                 directory.path(),
                 "server",
-                &ca.issue(server_id.as_str()),
+                &ca.issue(&server_id),
                 &ca.root_pem,
             )
             .as_identity_files(),
@@ -339,7 +334,7 @@ async fn a_peer_our_root_signed_into_another_trust_domain_is_refused() {
         write_files(
             directory.path(),
             "outsider",
-            &ca.issue("spiffe://someone.else/machine/runtime/07"),
+            &ca.issue_named("spiffe://someone.else/machine/runtime/07"),
             &ca.root_pem,
         )
         .as_identity_files(),
@@ -366,19 +361,14 @@ async fn a_renewal_is_adopted_without_a_restart_and_reaches_the_wire() {
             write_files(
                 directory.path(),
                 "control",
-                &ca.issue(control_id.as_str()),
+                &ca.issue(&control_id),
                 &ca.root_pem,
             )
             .as_identity_files(),
         )
         .expect("an identity"),
     );
-    let node_files = write_files(
-        directory.path(),
-        "node",
-        &ca.issue(node_id.as_str()),
-        &ca.root_pem,
-    );
+    let node_files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
     let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
 
     assert_eq!(
@@ -388,7 +378,7 @@ async fn a_renewal_is_adopted_without_a_restart_and_reaches_the_wire() {
     );
 
     // A renewal: the same machine, a new certificate and a new key.
-    let renewed = ca.issue(node_id.as_str());
+    let renewed = ca.issue(&node_id);
     std::fs::write(&node_files.certificate, &renewed.certificate_pem).expect("write certificate");
     std::fs::write(&node_files.private_key, &renewed.key_pem).expect("write key");
 
@@ -425,22 +415,17 @@ async fn what_a_reload_adopts_is_what_the_far_end_sees() {
             write_files(
                 directory.path(),
                 "control",
-                &ca.issue(control_id.as_str()),
+                &ca.issue(&control_id),
                 &ca.root_pem,
             )
             .as_identity_files(),
         )
         .expect("an identity"),
     );
-    let node_files = write_files(
-        directory.path(),
-        "node",
-        &ca.issue(was.as_str()),
-        &ca.root_pem,
-    );
+    let node_files = write_files(directory.path(), "node", &ca.issue(&was), &ca.root_pem);
     let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
 
-    let reissued = ca.issue(now.as_str());
+    let reissued = ca.issue(&now);
     std::fs::write(&node_files.certificate, &reissued.certificate_pem).expect("write certificate");
     std::fs::write(&node_files.private_key, &reissued.key_pem).expect("write key");
 
@@ -473,19 +458,14 @@ async fn a_rotation_that_goes_wrong_leaves_the_working_material_in_force() {
             write_files(
                 directory.path(),
                 "control",
-                &ca.issue(control_id.as_str()),
+                &ca.issue(&control_id),
                 &ca.root_pem,
             )
             .as_identity_files(),
         )
         .expect("an identity"),
     );
-    let node_files = write_files(
-        directory.path(),
-        "node",
-        &ca.issue(node_id.as_str()),
-        &ca.root_pem,
-    );
+    let node_files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
     let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
 
     // Caught mid-write: the file exists and holds no complete PEM block.
@@ -538,17 +518,12 @@ async fn a_certificate_and_a_key_from_different_issuances_are_refused_together()
     let directory = tempfile::tempdir().expect("a directory");
     let node_id = id("spiffe://deis.internal/machine/runtime/07");
 
-    let node_files = write_files(
-        directory.path(),
-        "node",
-        &ca.issue(node_id.as_str()),
-        &ca.root_pem,
-    );
+    let node_files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
     let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
 
     // Only the certificate was replaced; the key on disk still belongs to the
     // one before it.
-    let renewed = ca.issue(node_id.as_str());
+    let renewed = ca.issue(&node_id);
     std::fs::write(&node_files.certificate, &renewed.certificate_pem).expect("write certificate");
 
     let error = node.reload().expect_err("a mismatched pair was adopted");
@@ -557,6 +532,54 @@ async fn a_certificate_and_a_key_from_different_issuances_are_refused_together()
         "expected a refusal about the pair, got {error}"
     );
     assert_eq!(node.id(), node_id);
+}
+
+/// A certificate carrying an address as well as a name still authenticates by
+/// the name alone.
+///
+/// The extra subject alternative name exists for probes that verify a server
+/// the ordinary way before this crate's own check runs. It must be inert as
+/// far as identity goes: a leaf with an IP SAN is not thereby entitled to
+/// anything, and one without an IP SAN is not thereby refused.
+#[tokio::test]
+async fn an_address_in_a_certificate_changes_nothing_about_who_it_names() {
+    use std::net::IpAddr;
+
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let control_id = id("spiffe://deis.internal/machine/control/01");
+    let node_id = id("spiffe://deis.internal/machine/runtime/07");
+
+    let control = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "control",
+                &ca.issue_with_addresses(&control_id, &["127.0.0.1".parse::<IpAddr>().unwrap()]),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+    assert_eq!(
+        control.id(),
+        control_id,
+        "the address displaced the name the certificate carries"
+    );
+
+    let node = MachineIdentity::load(
+        write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem)
+            .as_identity_files(),
+    )
+    .expect("an identity");
+
+    let outcome = connect(&control, &node, &control_id).await;
+    assert_eq!(outcome.client, Ok(()));
+    assert_eq!(
+        outcome.server.as_ref().map(SpiffeId::as_str),
+        Ok(node_id.as_str())
+    );
 }
 
 /// The watcher is three lines around [`MachineIdentity::reload`], and the one
@@ -570,12 +593,7 @@ async fn the_watcher_adopts_a_rotation_without_being_asked() {
     let was = id("spiffe://deis.internal/machine/runtime/07");
     let now = id("spiffe://deis.internal/machine/runtime/08");
 
-    let node_files = write_files(
-        directory.path(),
-        "node",
-        &ca.issue(was.as_str()),
-        &ca.root_pem,
-    );
+    let node_files = write_files(directory.path(), "node", &ca.issue(&was), &ca.root_pem);
     let node =
         Arc::new(MachineIdentity::load(node_files.as_identity_files()).expect("an identity"));
     let watching = node.watch(Duration::from_secs(30));
@@ -583,7 +601,7 @@ async fn the_watcher_adopts_a_rotation_without_being_asked() {
     // it has, moving the clock moves it past nothing.
     tokio::task::yield_now().await;
 
-    let reissued = ca.issue(now.as_str());
+    let reissued = ca.issue(&now);
     std::fs::write(&node_files.certificate, &reissued.certificate_pem).expect("write certificate");
     std::fs::write(&node_files.private_key, &reissued.key_pem).expect("write key");
     assert_eq!(node.id(), was, "nothing should have looked yet");

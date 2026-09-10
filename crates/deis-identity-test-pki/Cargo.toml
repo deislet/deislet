@@ -1,0 +1,12 @@
+[package]
+name = "deis-identity-test-pki"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository = "https://github.com/deislet/deislet"
+description = "A certificate authority small enough to hand a test, for harnesses that hold a real mutual TLS handshake"
+
+[dependencies]
+deis-identity = { path = "../deis-identity" }
+rcgen = "0.14"

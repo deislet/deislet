@@ -56,6 +56,8 @@ mod error;
 mod material;
 pub mod names;
 mod spiffe;
+/// A certificate authority small enough to hand a test.
+///
 mod verify;
 
 use std::path::PathBuf;

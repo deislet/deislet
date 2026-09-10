@@ -28,7 +28,10 @@ tracing.workspace = true
 x509-parser = "0.18"
 
 [dev-dependencies]
-rcgen = "0.14"
+# The certificate authority these tests mint from. It is a crate of its own
+# rather than a feature of this one so that no workspace build can unify it
+# into a shipping process - see that crate's own module documentation.
+deis-identity-test-pki = { path = "../deis-identity-test-pki" }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # The tests handshake over a real socket rather than asserting on a parser:
