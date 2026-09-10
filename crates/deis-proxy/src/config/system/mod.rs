@@ -5,6 +5,7 @@ pub mod compression;
 pub mod health;
 pub mod https;
 pub mod log;
+pub mod machine_identity;
 pub mod routing;
 pub mod tls;
 pub mod upstream;
@@ -27,6 +28,7 @@ pub use health::{
 };
 pub use https::HttpsConfig;
 pub use log::*;
+pub use machine_identity::MachineIdentityConfig;
 pub use routing::RoutingConfig;
 pub use tls::TlsConfig;
 pub use upstream::UpstreamServer;
@@ -167,6 +169,12 @@ pub struct SystemConfig {
     /// environments get an automatic address. Only meaningful with
     /// `control` set: without a control plane there is no table to fetch.
     pub routing: Option<RoutingConfig>,
+    /// This proxy's certificate on the machine channel that is replacing
+    /// `node_preshared_keys`, and the control plane name it expects to see
+    /// proved back. Absent means what it means today: `control` above still
+    /// dials with the shared secret, and nothing in this crate yet reads
+    /// what is loaded from here. See [`machine_identity`] for why.
+    pub machine_identity: Option<MachineIdentityConfig>,
 }
 
 impl SystemConfig {
@@ -200,6 +208,7 @@ impl SystemConfig {
             control: None,
             max_request_body_bytes: Some(DEFAULT_MAX_REQUEST_BODY_BYTES),
             routing: Some(RoutingConfig::default()),
+            machine_identity: None,
         }
     }
 
@@ -359,6 +368,18 @@ impl SystemConfig {
     /// purpose: re-pointing a link still takes effect on the next reload.
     pub fn resolve_paths(&mut self, base: &Path) {
         let resolve = |path: &mut String| {
+            // An unset path stays unset. `Path::new("").join(base)` is the
+            // base directory with a trailing slash, which is not empty and
+            // not absent - so resolving one would turn "the operator left
+            // this out" into "the operator named a directory", and the
+            // validation that refuses a half-filled table by naming the
+            // missing field would have nothing left to notice. The failure
+            // would then arrive as a certificate loader reporting a
+            // directory, at a point where there is no line of configuration
+            // to connect it to.
+            if path.is_empty() {
+                return;
+            }
             if !Path::new(path.as_str()).is_absolute() {
                 *path = base.join(path.as_str()).to_string_lossy().into_owned();
             }
@@ -395,6 +416,15 @@ impl SystemConfig {
             if let Some(acme) = tls.acme.as_mut() {
                 resolve(&mut acme.storage_dir);
             }
+        }
+        // Read again long after a rotation, on whatever timer `watch()`
+        // runs on - by which time a relative path would mean whatever the
+        // working directory happens to be at that moment, not the one this
+        // process started from.
+        if let Some(identity) = self.machine_identity.as_mut() {
+            resolve(&mut identity.certificate);
+            resolve(&mut identity.private_key);
+            resolve(&mut identity.trust_root);
         }
     }
 }
@@ -508,6 +538,9 @@ impl Validatable for SystemConfig {
         if let Some(routing) = &self.routing {
             routing.validate()?;
         }
+        if let Some(machine_identity) = &self.machine_identity {
+            machine_identity.validate()?;
+        }
         Ok(())
     }
 }
@@ -551,6 +584,7 @@ impl Add<SystemConfig> for SystemConfig {
             control: other.control.or(self.control),
             max_request_body_bytes: other.max_request_body_bytes.or(self.max_request_body_bytes),
             routing: other.routing.or(self.routing),
+            machine_identity: other.machine_identity.or(self.machine_identity),
         }
     }
 }
@@ -822,5 +856,70 @@ enabled = false
         merged.resolve_paths(Path::new("/srv/deis-proxy"));
         assert_eq!(merged.database(), "/srv/deis-proxy/sites.db");
         assert_eq!(merged.pid_file(), DEFAULT_PID_FILE);
+    }
+
+    #[test]
+    fn machine_identity_is_absent_by_default_and_the_process_is_unaffected() {
+        // The behavioural no-op this table is required to be until something
+        // reads it: a bare instance carries no machine identity at all.
+        assert!(SystemConfig::baseline().machine_identity.is_none());
+        assert!(SystemConfig::default().machine_identity.is_none());
+    }
+
+    #[test]
+    fn machine_identity_paths_resolve_against_the_base_like_every_other_path() {
+        // `watch()` re-reads these files on its own timer, long after
+        // daemon mode has moved the working directory to `/`; a path left
+        // relative would then mean a directory that does not hold this
+        // proxy's certificate at all.
+        let local: SystemConfig = toml::from_str(
+            r#"
+[machine_identity]
+certificate = "machine/proxy.pem"
+private_key = "machine/proxy-key.pem"
+trust_root = "/etc/deislet/root.pem"
+trust_domain = "deis.internal"
+"#,
+        )
+        .unwrap();
+        let mut merged = SystemConfig::baseline() + local;
+        merged.resolve_paths(Path::new("/srv/deis-proxy"));
+        let identity = merged.machine_identity.as_ref().unwrap();
+        assert_eq!(identity.certificate, "/srv/deis-proxy/machine/proxy.pem");
+        assert_eq!(
+            identity.private_key,
+            "/srv/deis-proxy/machine/proxy-key.pem"
+        );
+        // Already absolute, and left alone rather than joined onto the base.
+        assert_eq!(identity.trust_root, "/etc/deislet/root.pem");
+        merged.validate().expect("a complete table is usable");
+    }
+
+    #[test]
+    fn a_half_filled_machine_identity_table_fails_configuration_validation() {
+        // Caught where `[control]`, `[tls]` and every other table are caught
+        // - at `SystemConfig::validate`, not left to surface later as a
+        // handshake failure nobody connected to this line of the file.
+        let local: SystemConfig = toml::from_str(
+            r#"
+[machine_identity]
+certificate = "machine/proxy.pem"
+"#,
+        )
+        .unwrap();
+        // In the order `load_system_config` uses: paths are resolved against
+        // the start directory first, and only then is the merged result
+        // validated. Asserting on an unresolved config would pass while the
+        // production path silently stopped refusing anything, because
+        // resolution used to turn the two absent paths into the base
+        // directory before validation could name them.
+        let mut merged = SystemConfig::baseline() + local;
+        merged.resolve_paths(Path::new("/srv/deis-proxy"));
+        let error = merged.validate().unwrap_err().to_string();
+        assert!(error.contains("machine_identity"), "{error}");
+        assert!(
+            error.contains("private_key") && error.contains("trust_root"),
+            "the refusal does not name what is missing: {error}"
+        );
     }
 }

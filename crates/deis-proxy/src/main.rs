@@ -5,12 +5,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use deis_identity::{IdentityFiles, MachineIdentity};
 use nix::unistd::{Group, User, getegid, geteuid};
 use pingora::listeners::tls::TlsSettings;
 use pingora::proxy::http_proxy_service_with_name;
 use pingora::server::Server;
+use pingora::server::ShutdownWatch;
 use pingora::server::configuration::{Opt, ServerConf};
-use pingora::services::background::background_service;
+use pingora::services::background::{BackgroundService, background_service};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -18,8 +21,8 @@ use tracing_subscriber::EnvFilter;
 use deis_proxy::acme;
 use deis_proxy::catalog::{CatalogClient, CatalogPoller, ControlEndpoint};
 use deis_proxy::cli::CliConfig;
-use deis_proxy::config::system::LogLevel;
 use deis_proxy::config::system::acme::{LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING};
+use deis_proxy::config::system::{LogLevel, MachineIdentityConfig};
 use deis_proxy::config::{ConfigManager, SystemConfig};
 use deis_proxy::control::{ControlService, ProxyControlClient};
 use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic, InheritedListeners};
@@ -255,6 +258,82 @@ fn announce_acme(system: &SystemConfig, settings: &deis_proxy::config::system::A
     }
 }
 
+/// Load this proxy's machine-channel identity: the certificate it will one
+/// day present on that channel, and the material behind it kept fresh on
+/// disk. Nothing in this crate reads the result yet - see
+/// [`MachineIdentityConfig`] - so this only proves the three files are
+/// present and agree with each other before the process goes on to do
+/// anything else.
+///
+/// Fails rather than starting with a `[machine_identity]` table that cannot
+/// load. Starting anyway would leave [`MachineIdentityWatch`] re-reading
+/// files that were never readable in the first place, silently, for as long
+/// as the process runs; refusing here puts the reason in the one log an
+/// operator is watching at startup.
+///
+/// `serves` is empty: this proxy only ever dials the control plane over this
+/// identity and serves nothing of its own on the machine channel, which is
+/// exactly the case [`MachineIdentity::load`] documents an empty slice for.
+fn load_machine_identity(config: &MachineIdentityConfig) -> Result<Arc<MachineIdentity>> {
+    let identity = MachineIdentity::load(
+        IdentityFiles::new(
+            config.certificate.clone(),
+            config.private_key.clone(),
+            config.trust_root.clone(),
+        ),
+        &[],
+    )
+    .with_context(|| {
+        format!(
+            "loading this proxy's machine-channel identity from {}",
+            config.certificate
+        )
+    })?;
+    info!(
+        identity = %identity.id(),
+        certificate = %config.certificate,
+        reload_secs = config.identity_reload_seconds,
+        "loaded this proxy's machine-channel identity; the files are re-read on that interval, \
+         so a renewal needs no restart. Nothing on this proxy authenticates with it yet - the \
+         control channel below still dials with control.secret exactly as it did before this \
+         table existed"
+    );
+    Ok(Arc::new(identity))
+}
+
+/// Keeps [`load_machine_identity`]'s material in step with its files for as
+/// long as the process runs.
+///
+/// A thin [`BackgroundService`] around [`MachineIdentity::watch`] rather than
+/// a bare `tokio::spawn` at startup, because there is nowhere to put a bare
+/// spawn that would live long enough: the runtime `main` builds for
+/// initialization is deliberately thrown away before `server.run_forever()`,
+/// and pingora's own runtime does not exist until services are started on
+/// it. Registering this as a service gets the re-read loop the same
+/// lifetime, and the same shutdown handling, as every other background task
+/// in this process.
+struct MachineIdentityWatch {
+    identity: Arc<MachineIdentity>,
+    interval: Duration,
+}
+
+#[async_trait]
+impl BackgroundService for MachineIdentityWatch {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        // `watch` spawns its own re-read loop and hands back a handle to it.
+        // The handle is kept and aborted rather than dropped: dropping a
+        // `JoinHandle` detaches the task, and a detached re-read loop would
+        // go on re-reading the files - and go on emitting its own warn lines
+        // when they cannot be read - under a process that has already handed
+        // over to its replacement. During a zero-downtime upgrade that means
+        // two processes narrating the same certificate at once, in one log,
+        // with nothing to say which of them is the one still serving.
+        let handle = self.identity.watch(self.interval);
+        let _ = shutdown.changed().await;
+        handle.abort();
+    }
+}
+
 /// Everything that has to work before this replacement tells the running
 /// process it may leave.
 ///
@@ -430,6 +509,25 @@ fn main() -> Result<()> {
         }
     };
 
+    // The machine-channel identity: loaded and kept fresh whether or not
+    // anything uses it yet, so that turning `[machine_identity]` on and
+    // turning on whatever dials with it are two separate, separately
+    // reviewable steps. See `load_machine_identity` for why a load failure
+    // is a startup failure here too.
+    let machine_identity = match &system.machine_identity {
+        Some(identity_config) => Some((
+            load_machine_identity(identity_config)?,
+            Duration::from_secs(identity_config.identity_reload_seconds),
+        )),
+        None => {
+            info!(
+                "no machine_identity configured; this proxy holds no certificate on the machine \
+                 channel and authenticates to the control plane exactly as it does today"
+            );
+            None
+        }
+    };
+
     let opt = Opt {
         upgrade: cli.upgrade,
         daemon,
@@ -507,6 +605,19 @@ fn main() -> Result<()> {
         system.listen_addresses(),
     )));
     server.add_services(vec![balancer_service]);
+
+    // Owned by the server like every other background task, so a
+    // zero-downtime upgrade replaces the re-read loop rather than leaving a
+    // detached one running under the process that is about to leave.
+    if let Some((identity, interval)) = &machine_identity {
+        server.add_service(background_service(
+            "machine identity",
+            MachineIdentityWatch {
+                identity: Arc::clone(identity),
+                interval: *interval,
+            },
+        ));
+    }
 
     // Owned by the server like every other background task, so a
     // zero-downtime upgrade replaces it rather than leaving two renewal

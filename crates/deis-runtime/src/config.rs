@@ -151,6 +151,19 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub control: ControlPlaneConfig,
 
+    /// This node's mutual-TLS identity on the machine channel, the
+    /// replacement for `node_preshared_keys` that is being rolled out
+    /// alongside it.
+    ///
+    /// Absent, the default, means this node authenticates the way it always
+    /// has: `[control] secret` on the wire, nothing proved beyond a string
+    /// every node in the fleet also holds. Nothing here reaches for it yet -
+    /// see `crate::config::MachineIdentityConfig` - so setting this section
+    /// today changes only what is loaded and logged at startup, not what any
+    /// request carries.
+    #[serde(default)]
+    pub machine_identity: Option<MachineIdentityConfig>,
+
     /// Where this node's control-plane-facing gRPC listens, and which node
     /// keys it accepts there.
     #[serde(default)]
@@ -215,6 +228,7 @@ impl Default for RuntimeConfig {
             default_execution_limits: ExecutionLimits::default(),
             logging: LoggingConfig::default(),
             control: ControlPlaneConfig::default(),
+            machine_identity: None,
             management: ManagementConfig::default(),
             bundles: BundleConfig::default(),
             assets: AssetsConfig::default(),
@@ -325,6 +339,88 @@ impl Default for ControlPlaneConfig {
             request_timeout_secs: default_control_request_timeout_secs(),
             retry_interval_secs: default_control_retry_interval_secs(),
             reconcile_interval_secs: default_control_reconcile_interval_secs(),
+        }
+    }
+}
+
+/// This node's mutual-TLS identity, and the name it expects the control plane
+/// to prove when it dials the machine channel.
+///
+/// Everything here is a no-op by itself: nothing in this crate yet dials with
+/// it or accepts it in place of `[control] secret`. It exists so that an
+/// operator can stage the three files and the reload loop ahead of the change
+/// that switches the assignment client onto them, and so that a node running
+/// with this section filled in is, from a log, visibly different from one
+/// that is not.
+///
+/// # Why `trust_domain` and not just a name
+///
+/// `[control] endpoint` is an address - `client_config` needs the peer's
+/// *name* as well, and that is a value this file has never had to state
+/// before. Two ways to get it: an operator writes the control plane's full
+/// SPIFFE identity out, or this node derives it from a trust domain plus the
+/// fixed path every control plane answers to
+/// (`deis_identity::names::control`). Derive-with-override is what is here:
+/// `trust_domain` is the normal setting, and `control_identity` is an escape
+/// hatch for whatever derivation cannot cover - a control plane addressed
+/// under a name this fleet's own convention does not produce - that wins when
+/// it is set.
+///
+/// This is the same choice deis-proxy has to make for the same reason, and
+/// the two must not diverge: a node and a proxy pointed at the same control
+/// plane have to derive the same name from the same trust domain, or one of
+/// them refuses a handshake the other accepts and the disagreement is
+/// diagnosed from two logs that each look correct on their own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MachineIdentityConfig {
+    /// This node's certificate chain, end-entity certificate first.
+    #[serde(default)]
+    pub certificate: Option<PathBuf>,
+
+    /// The private key belonging to that certificate.
+    #[serde(default)]
+    pub private_key: Option<PathBuf>,
+
+    /// What the control plane's certificate must chain to.
+    #[serde(default)]
+    pub trust_root: Option<PathBuf>,
+
+    /// How often the three files above are re-read, in seconds.
+    ///
+    /// Same default as the control plane's own `[machine]
+    /// identity_reload_seconds`, for the same reason: it wants to be far
+    /// shorter than the shortest certificate lifetime in use, and there is no
+    /// reason for one side of a rotation to notice it faster than the other.
+    #[serde(default = "default_identity_reload_seconds")]
+    pub identity_reload_seconds: u64,
+
+    /// This fleet's trust domain, e.g. `deis.internal`, combined with the
+    /// fixed control path to name the control plane this node expects to
+    /// reach. See the struct doc for why this exists instead of just asking
+    /// for the name outright.
+    #[serde(default)]
+    pub trust_domain: Option<String>,
+
+    /// Explicit override of the control plane's expected SPIFFE identity,
+    /// e.g. `spiffe://deis.internal/deislet/control`. Wins over `trust_domain`
+    /// when both are set.
+    #[serde(default)]
+    pub control_identity: Option<String>,
+}
+
+fn default_identity_reload_seconds() -> u64 {
+    60
+}
+
+impl Default for MachineIdentityConfig {
+    fn default() -> Self {
+        Self {
+            certificate: None,
+            private_key: None,
+            trust_root: None,
+            identity_reload_seconds: default_identity_reload_seconds(),
+            trust_domain: None,
+            control_identity: None,
         }
     }
 }
@@ -1141,6 +1237,46 @@ impl RuntimeConfig {
             )?;
         }
 
+        if let Some(value) = env_var("DEIS_RUNTIME_MACHINE_IDENTITY_CERTIFICATE") {
+            self.machine_identity
+                .get_or_insert_with(MachineIdentityConfig::default)
+                .certificate = Some(PathBuf::from(value));
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_MACHINE_IDENTITY_PRIVATE_KEY") {
+            self.machine_identity
+                .get_or_insert_with(MachineIdentityConfig::default)
+                .private_key = Some(PathBuf::from(value));
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_ROOT") {
+            self.machine_identity
+                .get_or_insert_with(MachineIdentityConfig::default)
+                .trust_root = Some(PathBuf::from(value));
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_MACHINE_IDENTITY_RELOAD_SECONDS") {
+            self.machine_identity
+                .get_or_insert_with(MachineIdentityConfig::default)
+                .identity_reload_seconds = parse_env(
+                &value,
+                "DEIS_RUNTIME_MACHINE_IDENTITY_RELOAD_SECONDS",
+                "a whole number of seconds",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_DOMAIN") {
+            self.machine_identity
+                .get_or_insert_with(MachineIdentityConfig::default)
+                .trust_domain = Some(value);
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_MACHINE_IDENTITY_CONTROL_IDENTITY") {
+            self.machine_identity
+                .get_or_insert_with(MachineIdentityConfig::default)
+                .control_identity = Some(value);
+        }
+
         if let Some(value) = env_var("DEIS_RUNTIME_MANAGEMENT_LISTEN") {
             self.management.listen = Some(value);
         }
@@ -1359,6 +1495,9 @@ impl RuntimeConfig {
 
         self.logging.validate()?;
         self.control.validate()?;
+        if let Some(identity) = &self.machine_identity {
+            identity.validate()?;
+        }
         self.management.validate()?;
         self.bundles.validate()?;
         self.assets.validate()?;
@@ -1426,6 +1565,106 @@ impl ControlPlaneConfig {
                  and re-installs every deployment as fast as it can"
             ));
         }
+
+        Ok(())
+    }
+}
+
+impl MachineIdentityConfig {
+    /// The three files, ready to hand to [`deis_identity::MachineIdentity::load`].
+    ///
+    /// Panics if `certificate`, `private_key` or `trust_root` is unset.
+    /// `RuntimeConfig::validate` refuses a section with any of the three
+    /// missing before this node does anything else, so by the time startup
+    /// reaches this call that has already been checked; this is the promise
+    /// kept, not a panic waiting to happen.
+    pub fn identity_files(&self) -> deis_identity::IdentityFiles {
+        deis_identity::IdentityFiles::new(
+            self.certificate
+                .clone()
+                .expect("machine_identity.certificate is required and validated at startup"),
+            self.private_key
+                .clone()
+                .expect("machine_identity.private_key is required and validated at startup"),
+            self.trust_root
+                .clone()
+                .expect("machine_identity.trust_root is required and validated at startup"),
+        )
+    }
+
+    /// The SPIFFE name this node expects the control plane to prove when it
+    /// dials the machine channel.
+    ///
+    /// `control_identity` wins when it is set; otherwise the name is derived
+    /// from `trust_domain` by [`deis_identity::names::control`]. See the
+    /// struct doc for why this is derive-with-override rather than one field
+    /// or the other.
+    pub fn expected_control_identity(&self) -> Result<deis_identity::SpiffeId> {
+        if let Some(explicit) = self.control_identity.as_deref() {
+            return deis_identity::SpiffeId::parse(explicit).map_err(|e| {
+                anyhow!(
+                    "machine_identity.control_identity {explicit:?} is not a valid SPIFFE \
+                     identity: {e}"
+                )
+            });
+        }
+
+        let trust_domain = self.trust_domain.as_deref().ok_or_else(|| {
+            anyhow!(
+                "machine_identity has neither trust_domain nor control_identity set, so this \
+                 node has no way to know which name the control plane must prove; set \
+                 trust_domain to this fleet's trust domain, or control_identity to the control \
+                 plane's full SPIFFE identity"
+            )
+        })?;
+
+        deis_identity::names::control(trust_domain).map_err(|e| {
+            anyhow!(
+                "machine_identity.trust_domain {trust_domain:?} cannot name the control plane: {e}"
+            )
+        })
+    }
+
+    /// Reject a section that cannot be loaded or that names no one.
+    ///
+    /// Every rule here is the same shape: a value that would otherwise turn
+    /// into a startup failure three layers down - a missing file
+    /// `MachineIdentity::load` reports against a path with no context, a
+    /// handshake refused because the peer name was never resolved - is
+    /// refused here instead, against the setting that is actually wrong.
+    fn validate(&self) -> Result<()> {
+        let missing: Vec<&str> = [
+            ("certificate", self.certificate.is_none()),
+            ("private_key", self.private_key.is_none()),
+            ("trust_root", self.trust_root.is_none()),
+        ]
+        .into_iter()
+        .filter_map(|(name, absent)| absent.then_some(name))
+        .collect();
+
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "machine_identity is missing {}; certificate, private_key and trust_root are \
+                 required together, because a section that loads two of the three files and \
+                 fails on the connection using the third is a startup that looked like it \
+                 succeeded. Either set all three, or remove the section entirely to keep this \
+                 node on [control] secret",
+                missing.join(", ")
+            ));
+        }
+
+        if self.identity_reload_seconds == 0 {
+            return Err(anyhow!(
+                "machine_identity.identity_reload_seconds must be greater than 0; 0 re-reads the \
+                 three files in a hot loop instead of on the interval an operator meant to set"
+            ));
+        }
+
+        // Also confirms trust_domain/control_identity resolve to something
+        // this node could actually present as an expected peer, so a typo'd
+        // trust domain is refused here and not in the first handshake this
+        // node's client makes.
+        self.expected_control_identity()?;
 
         Ok(())
     }
@@ -2255,6 +2494,225 @@ mod tests {
         );
         assert_eq!(config.bundles.max_bytes, 4096);
         assert_eq!(config.assets.max_bytes, 8192);
+    }
+
+    #[test]
+    fn test_machine_identity_is_absent_by_default() {
+        // Absent means today's behaviour exactly: no section to half-fill,
+        // nothing to reject.
+        let config = RuntimeConfig::default();
+        assert!(config.machine_identity.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_a_machine_identity_missing_its_key_and_trust_root() {
+        let config = RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+                trust_domain: Some("deis.internal".to_string()),
+                ..MachineIdentityConfig::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        // Names both missing files in one pass, and not the one that was
+        // already set.
+        assert!(err.contains("is missing private_key, trust_root"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_a_machine_identity_with_no_way_to_name_the_control_plane() {
+        let config = RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+                ..MachineIdentityConfig::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("trust_domain"), "{err}");
+        assert!(err.contains("control_identity"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_a_trust_domain_that_is_not_a_valid_spiffe_segment() {
+        let config = RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+                trust_domain: Some("Not A Domain".to_string()),
+                ..MachineIdentityConfig::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_a_malformed_control_identity_override() {
+        let config = RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+                control_identity: Some("not-a-spiffe-uri".to_string()),
+                ..MachineIdentityConfig::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("control_identity"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_a_zero_identity_reload_interval() {
+        let config = RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+                trust_domain: Some("deis.internal".to_string()),
+                identity_reload_seconds: 0,
+                ..MachineIdentityConfig::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("identity_reload_seconds"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_accepts_a_complete_machine_identity_derived_from_a_trust_domain() {
+        let config = RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+                trust_domain: Some("deis.internal".to_string()),
+                ..MachineIdentityConfig::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        config
+            .validate()
+            .expect("a complete section must be accepted");
+        assert_eq!(
+            config
+                .machine_identity
+                .as_ref()
+                .unwrap()
+                .expected_control_identity()
+                .unwrap()
+                .to_string(),
+            "spiffe://deis.internal/deislet/control"
+        );
+    }
+
+    #[test]
+    fn test_explicit_control_identity_wins_over_a_configured_trust_domain() {
+        // Both set at once is not a conflict this refuses: `control_identity`
+        // is the named escape hatch for whatever the derivation cannot cover,
+        // so it simply wins - see the struct doc.
+        let config = RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+                trust_domain: Some("wrong.internal".to_string()),
+                control_identity: Some("spiffe://deis.internal/deislet/control".to_string()),
+                ..MachineIdentityConfig::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        config
+            .validate()
+            .expect("a complete section must be accepted");
+        assert_eq!(
+            config
+                .machine_identity
+                .as_ref()
+                .unwrap()
+                .expected_control_identity()
+                .unwrap()
+                .to_string(),
+            "spiffe://deis.internal/deislet/control"
+        );
+    }
+
+    #[test]
+    fn test_machine_identity_config_defaults_the_reload_interval() {
+        let identity = MachineIdentityConfig::default();
+        assert_eq!(identity.identity_reload_seconds, 60);
+    }
+
+    #[test]
+    fn test_parse_toml_machine_identity_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deis-runtime.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [machine_identity]
+            certificate = "/etc/deislet/node.crt"
+            private_key = "/etc/deislet/node.key"
+            trust_root = "/etc/deislet/root.pem"
+            trust_domain = "deis.internal"
+            identity_reload_seconds = 45
+            "#,
+        )
+        .unwrap();
+
+        let config = RuntimeConfig::load_from(&path).expect("must parse");
+        config.validate().expect("must validate");
+        let identity = config.machine_identity.expect("section must be read");
+        assert_eq!(
+            identity.certificate,
+            Some(PathBuf::from("/etc/deislet/node.crt"))
+        );
+        assert_eq!(identity.identity_reload_seconds, 45);
+        assert_eq!(identity.trust_domain.as_deref(), Some("deis.internal"));
+        assert!(identity.control_identity.is_none());
+    }
+
+    #[test]
+    fn test_env_overrides_machine_identity() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+
+        env::set_var("DEIS_RUNTIME_MACHINE_IDENTITY_CERTIFICATE", "/env/node.crt");
+        env::set_var("DEIS_RUNTIME_MACHINE_IDENTITY_PRIVATE_KEY", "/env/node.key");
+        env::set_var("DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_ROOT", "/env/root.pem");
+        env::set_var(
+            "DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_DOMAIN",
+            "deis.internal",
+        );
+        env::set_var("DEIS_RUNTIME_MACHINE_IDENTITY_RELOAD_SECONDS", "10");
+
+        let mut config = RuntimeConfig::default();
+        let result = config.apply_env_overrides();
+
+        env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_CERTIFICATE");
+        env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_PRIVATE_KEY");
+        env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_ROOT");
+        env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_DOMAIN");
+        env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_RELOAD_SECONDS");
+
+        result.unwrap();
+        let identity = config
+            .machine_identity
+            .as_ref()
+            .expect("an env override must create the section");
+        assert_eq!(identity.certificate, Some(PathBuf::from("/env/node.crt")));
+        assert_eq!(identity.private_key, Some(PathBuf::from("/env/node.key")));
+        assert_eq!(identity.trust_root, Some(PathBuf::from("/env/root.pem")));
+        assert_eq!(identity.trust_domain.as_deref(), Some("deis.internal"));
+        assert_eq!(identity.identity_reload_seconds, 10);
+        config
+            .validate()
+            .expect("the env-built section must validate");
     }
 
     #[test]

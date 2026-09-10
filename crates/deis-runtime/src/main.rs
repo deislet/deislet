@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
+use deis_identity::MachineIdentity;
 use deis_runtime::app::ApplicationManager;
 use deis_runtime::app_repo::AppRepo;
 use deis_runtime::config::RuntimeConfig;
@@ -66,6 +67,57 @@ struct Cli {
 /// must not be the thing that keeps a node from serving.
 fn log_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+}
+
+/// Load this node's machine identity, if `[machine_identity]` was configured.
+///
+/// Fails rather than starting degraded, the same choice `deis-control`'s own
+/// `machine::listen::load_identity` makes: a node that was told to have an
+/// identity and cannot load one is a configuration mistake, and starting
+/// anyway would turn it into a node that comes up looking healthy while
+/// quietly unable to do the one new thing it was just asked to do --
+/// diagnosed later from a handshake failure that names no file, instead of
+/// from this error, which does.
+///
+/// This is a behavioural no-op beyond the loading and the log line: nothing
+/// in this process yet dials with the identity or accepts it in place of
+/// `[control] secret`. `RuntimeConfig::validate` has already refused a
+/// half-filled section, so the only way this returns `Err` is a file that
+/// does not read as the certificate, key or trust root it claims to be.
+fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIdentity>>> {
+    let Some(identity_config) = config.machine_identity.as_ref() else {
+        info!(
+            "No machine_identity configured; this node reaches the control plane with \
+             [control] secret, the shared fleet key, same as before"
+        );
+        return Ok(None);
+    };
+
+    // This process only dials the machine channel; it does not (yet) serve
+    // one of its own, so it advertises no protocol of its own to negotiate.
+    // What a *dialler* wants is decided per call, on the client_config the
+    // next change will ask for - see `MachineIdentity::client_config`.
+    let identity = Arc::new(
+        MachineIdentity::load(identity_config.identity_files(), &[])
+            .context("loading this node's machine identity")?,
+    );
+    identity.watch(std::time::Duration::from_secs(
+        identity_config.identity_reload_seconds,
+    ));
+
+    info!(
+        identity = %identity.id(),
+        certificate = %identity_config
+            .certificate
+            .as_deref()
+            .expect("validated present")
+            .display(),
+        reload_secs = identity_config.identity_reload_seconds,
+        "Loaded this node's machine identity; the files are re-read on that interval, so a \
+         renewal needs no restart. Nothing dials with it yet"
+    );
+
+    Ok(Some(identity))
 }
 
 /// Everything that has to happen while this process is still single-threaded.
@@ -169,6 +221,13 @@ async fn run(
     // Held back until now because it happens before logging exists: what
     // became of this node's proxy variables, and what that costs.
     proxy.log();
+
+    // Held for the life of the process: `MachineIdentity::watch` keeps a
+    // clone of its own alive on a background task regardless, but this is
+    // where the next change -- the one that actually dials the control plane
+    // with it -- reaches in and finds it, rather than having to thread a
+    // second load through startup.
+    let _machine_identity = load_machine_identity(&config)?;
 
     // Initialize data storage (Single SQLite DB)
     let data_dir = &config.data_dir;
