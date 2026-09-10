@@ -372,10 +372,7 @@ pub fn node_router(state: CatalogState) -> Router {
             deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE,
             get(assignments::for_node),
         )
-        .route(
-            "/api/apps/:app_id/versions/:version_id/bundle",
-            get(versions::download_bundle),
-        )
+        .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
         .route(
             routing_table::ROUTING_TABLE_ROUTE,
             get(routing_table::routing_table),

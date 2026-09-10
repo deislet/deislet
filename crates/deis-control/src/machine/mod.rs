@@ -11,5 +11,8 @@
 //! handshake, by [`identity_acceptor`].
 
 pub mod accept;
+pub mod listen;
+pub mod service;
 
 pub use accept::{PeerIdentity, identity_acceptor};
+pub use service::MachineChannelService;

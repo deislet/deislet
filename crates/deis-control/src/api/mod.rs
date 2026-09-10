@@ -79,6 +79,11 @@ pub struct ApiRouter {
     /// credentials because it is the third thing that decides who gets in.
     pub cors_origins: Vec<String>,
     pub tls_enabled: bool,
+    /// Everything the machine channel answers from, handed back so the binary
+    /// can mount the machine listener beside this one. The same state, not a
+    /// second copy built from the same configuration: two would be two views
+    /// of the catalog that could disagree about what is deployed.
+    pub catalog_state: catalog::CatalogState,
 }
 
 // Each argument is a distinct shared component; bundling them into a struct
@@ -205,7 +210,7 @@ pub async fn build_api_router(
     // layered with the API key middleware: `api_auth_enabled` is a dashboard
     // setting, and one of these hands out decrypted secrets while another
     // decides which machines are delivery targets at all.
-    let node_routes = catalog::node_router(catalog_state).merge(registration::node_router(
+    let node_routes = catalog::node_router(catalog_state.clone()).merge(registration::node_router(
         registration::RegistrationState {
             nodes: Arc::clone(&deis_runtime_manager),
             node_auth: node_auth.clone(),
@@ -243,6 +248,7 @@ pub async fn build_api_router(
         .unwrap_or(false);
 
     ApiRouter {
+        catalog_state: catalog_state.clone(),
         router: app,
         provider_deployment_reconciler,
         auth_config,

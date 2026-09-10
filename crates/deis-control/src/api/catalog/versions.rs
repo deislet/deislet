@@ -719,6 +719,15 @@ pub async fn get_version(
 /// Streams the stored zip. This is the address that ends up in every
 /// assignment, so nodes fetch bundles here rather than receiving them
 /// inside a gRPC message.
+/// Where a machine downloads one version's bundle from.
+///
+/// Spelled once because two listeners mount it: the machine channel, which is
+/// where it belongs, and - until the fleet has moved - the node router on the
+/// human listener. Two spellings of one route is the mistake
+/// `scripts/check-doc-path-literals.sh` exists to catch in documents, and it
+/// is no better in code.
+pub const BUNDLE_ROUTE: &str = "/api/apps/:app_id/versions/:version_id/bundle";
+
 pub async fn download_bundle(
     State(state): State<CatalogState>,
     Path((app_id, version_id)): Path<(String, String)>,

@@ -99,28 +99,6 @@ async fn main() -> Result<(), anyhow::Error> {
         );
     }
 
-    // Before anything is served: refuse a [machine] section, because the
-    // listener it describes does not exist yet.
-    //
-    // The section is read by exactly one thing today - the address bundle
-    // URLs are built from - so configuring it makes every assignment and
-    // every deployment push hand a node a download address on a port nothing
-    // listens on. Every bundle download then fails, one at a time, with no
-    // startup diagnostic and nothing in the message pointing back at the
-    // configuration that caused it. Refusing here costs an operator one
-    // restart; the alternative costs them an afternoon.
-    //
-    // This check goes away in the same change that starts the listener.
-    if config.machine.is_some() {
-        anyhow::bail!(
-            "the configuration has a [machine] section, and this control plane does not serve a \
-             machine listener yet. While that is true, the only thing the section changes is the \
-             address nodes are told to download bundles from - which would point at a port \
-             nothing is listening on, and every bundle download would fail. Remove the section \
-             until a build that serves the machine channel is deployed."
-        );
-    }
-
     let bind_addr = config.bind_addr.clone();
     let port = config.port;
 
@@ -329,6 +307,37 @@ async fn main() -> Result<(), anyhow::Error> {
         None
     };
 
+    // The machine channel, when this installation has one: its own socket,
+    // its own certificate, and no caller that is not one of our own machines.
+    // Started before the human listener so that a bad certificate is a
+    // startup failure rather than something discovered after the dashboard is
+    // already answering.
+    let machine = match api_config.machine.as_ref() {
+        Some(machine_config) => {
+            let identity = deis_control::machine::listen::load_identity(machine_config)?;
+            let machine_addr = format!("{}:{}", machine_config.bind_addr, machine_config.port);
+            let machine_listener = std::net::TcpListener::bind(&machine_addr)?;
+            machine_listener.set_nonblocking(true)?;
+            let machine_app = deis_control::machine::listen::router(api.catalog_state.clone());
+            let shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                deis_control::machine::listen::serve(
+                    machine_listener,
+                    machine_app,
+                    identity,
+                    async move { shutdown.wait().await },
+                )
+                .await
+            }))
+        }
+        None => {
+            info!(
+                "No [machine] section, so this control plane serves no machine channel of its own; nodes and the proxy reach it on the same listener as the dashboard, presenting the fleet key"
+            );
+            None
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     // The REST API and the node gRPC channel share this listener, so this
     // one call serves both and later drains both.
@@ -337,6 +346,24 @@ async fn main() -> Result<(), anyhow::Error> {
         async move { shutdown.wait().await }
     })
     .await;
+
+    // Both listeners were told to stop by the same signal. Whether the machine
+    // channel drained cleanly is reported here rather than swallowed: a node
+    // whose call was cut retries, and an operator reading the log should be
+    // able to tell that from a channel that fell over on its own.
+    if let Some(machine) = machine {
+        match machine.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(
+                error = %e,
+                "The machine channel stopped serving with an error"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                "The task serving the machine channel did not finish; whether it drained is unknown"
+            ),
+        }
+    }
 
     // Serving is over, whether that was the stop signal or the server failing
     // on its own. Announcing it here is what covers the second case: the
