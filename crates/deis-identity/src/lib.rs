@@ -54,6 +54,7 @@
 mod cert;
 mod error;
 mod material;
+pub mod names;
 mod spiffe;
 mod verify;
 
@@ -69,7 +70,7 @@ use tracing::{info, warn};
 
 pub use crate::cert::name_in_certificate;
 pub use crate::error::{FileRole, IdentityError};
-pub use crate::spiffe::{SpiffeId, SpiffeIdError};
+pub use crate::spiffe::{SpiffeId, SpiffeIdError, check_path_segment};
 
 use crate::material::Material;
 

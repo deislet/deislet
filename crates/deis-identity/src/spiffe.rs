@@ -151,38 +151,63 @@ fn check_trust_domain(trust_domain: &str) -> Result<(), SpiffeIdError> {
     Ok(())
 }
 
+/// Whether `value` may stand as exactly one path segment.
+///
+/// The check to make before building a name out of an identifier that came
+/// from somewhere else - a node id read from a configuration file, say. It is
+/// the `/` that matters most: without this check an id of `07/08` does not
+/// fail, it silently becomes a name one segment longer than the caller meant,
+/// which then belongs to nobody and is read back as nothing.
+pub fn check_path_segment(value: &str) -> Result<(), SpiffeIdError> {
+    if value.is_empty() {
+        return Err(SpiffeIdError::EmptySegment {
+            path: value.to_string(),
+        });
+    }
+    if value == "." || value == ".." {
+        return Err(SpiffeIdError::RelativeSegment {
+            segment: value.to_string(),
+            path: value.to_string(),
+        });
+    }
+    for character in value.chars() {
+        let allowed = character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_');
+        if !allowed {
+            return Err(SpiffeIdError::PathCharacter {
+                character,
+                path: value.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Path characters, per SPIFFE: letters of either case, digits, and the same
 /// three marks. Empty segments and the two relative segments are refused,
 /// because `/node//a`, `/node/a/` and `/node/b/../a` would otherwise be three
 /// more ways to write one principal.
+///
+/// One rule, applied per segment, and it lives in [`check_path_segment`] so
+/// that a caller assembling a name out of parts is held to exactly what a
+/// caller parsing a whole name is held to.
 fn check_path(path: &str) -> Result<(), SpiffeIdError> {
     debug_assert!(path.starts_with('/'));
-    let mut segments = 0usize;
     for segment in path[1..].split('/') {
-        segments += 1;
-        if segment.is_empty() {
-            return Err(SpiffeIdError::EmptySegment {
+        check_path_segment(segment).map_err(|error| match error {
+            SpiffeIdError::EmptySegment { .. } => SpiffeIdError::EmptySegment {
                 path: path.to_string(),
-            });
-        }
-        if segment == "." || segment == ".." {
-            return Err(SpiffeIdError::RelativeSegment {
-                segment: segment.to_string(),
+            },
+            SpiffeIdError::RelativeSegment { segment, .. } => SpiffeIdError::RelativeSegment {
+                segment,
                 path: path.to_string(),
-            });
-        }
-        for character in segment.chars() {
-            let allowed = character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_');
-            if !allowed {
-                return Err(SpiffeIdError::PathCharacter {
-                    character,
-                    path: path.to_string(),
-                });
-            }
-        }
+            },
+            SpiffeIdError::PathCharacter { character, .. } => SpiffeIdError::PathCharacter {
+                character,
+                path: path.to_string(),
+            },
+            other => other,
+        })?;
     }
-    debug_assert!(segments > 0, "a path starting with / has one segment");
-    let _ = segments;
     Ok(())
 }
 
