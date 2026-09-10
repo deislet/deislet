@@ -9,6 +9,10 @@ authors = ["kookyleo <kookyleo@gmail.com>"]
 deis-bundle = { path = "../deis-bundle" }
 deis-artifact = { path = "../deis-artifact" }
 deis-provider-driver = { path = "../deis-provider-driver" }
+# Machine identity for the mutual-TLS migration replacing node_preshared_keys.
+# Not called from this crate yet -- the dependency is being taken as its own
+# reviewable step, ahead of the change that moves authentication over to it.
+deis-identity = { path = "../deis-identity" }
 async-trait = "0.1"
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

@@ -8,6 +8,10 @@ authors = ["kookyleo <kookyleo@gmail.com>"]
 [dependencies]
 deis-wire = { workspace = true }
 deis-node-contract = { path = "../deis-node-contract" }
+# Machine identity for the mutual-TLS migration replacing node_preshared_keys.
+# Not called from this crate yet -- the dependency is being taken as its own
+# reviewable step, ahead of the change that moves authentication over to it.
+deis-identity = { path = "../deis-identity" }
 # The command line. Every other component of this platform takes `-c`, and a
 # binary that read no arguments at all answered `-c /etc/deis-runtime.toml`
 # and `--help` by starting an unconfigured node on default ports and calling

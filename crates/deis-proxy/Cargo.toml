@@ -6,6 +6,10 @@ license = "Apache-2.0"
 authors = ["kookyleo <kookyleo@gmail.com>"]
 
 [dependencies]
+# Machine identity for the mutual-TLS migration replacing node_preshared_keys.
+# Not called from this crate yet -- the dependency is being taken as its own
+# reviewable step, ahead of the change that moves authentication over to it.
+deis-identity = { path = "../deis-identity" }
 tokio = { version = "1.45", features = ["full"] }
 anyhow = "1.0"
 tracing = "0.1"
