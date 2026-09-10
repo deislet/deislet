@@ -52,6 +52,7 @@
 //! is what a route consults.
 
 mod cert;
+pub mod dial;
 mod error;
 mod material;
 pub mod names;
@@ -71,6 +72,7 @@ use rustls::{ClientConfig, ServerConfig};
 use tracing::{info, warn};
 
 pub use crate::cert::name_in_certificate;
+pub use crate::dial::Dialler;
 pub use crate::error::{FileRole, IdentityError};
 pub use crate::spiffe::{SpiffeId, SpiffeIdError, check_path_segment};
 

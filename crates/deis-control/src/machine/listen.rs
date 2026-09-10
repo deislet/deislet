@@ -137,3 +137,89 @@ pub async fn serve(
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::catalog::tests::harness;
+    use deis_identity::{Dialler, names};
+    use deis_identity_test_pki::{TestCa, write_files};
+    use deis_wire::machine::FetchAssignmentsRequest;
+    use deis_wire::machine::machine_channel_client::MachineChannelClient;
+    use tonic::transport::Endpoint;
+
+    const TRUST_DOMAIN: &str = "deis.internal";
+
+    /// The whole path, end to end: a real listener with a real certificate, a
+    /// real handshake made by the dialler this fleet ships, a real gRPC call,
+    /// and the authorisation check at the end of it.
+    ///
+    /// Every piece of this has a unit test of its own. This is the one that
+    /// would notice them being wired together wrongly - a connector that
+    /// negotiates the wrong protocol, an acceptor whose identity never reaches
+    /// the service, a listener serving a router the client cannot address.
+    #[tokio::test]
+    async fn a_node_reaches_its_own_assignments_over_a_real_handshake() {
+        let harness = harness(true).await;
+        let ca = TestCa::new();
+        let directory = tempfile::tempdir().expect("a directory");
+
+        let control_id = names::control(TRUST_DOMAIN).expect("a control name");
+        let control = load_from(&ca, &directory, "control", &control_id);
+        let node_id = names::node(TRUST_DOMAIN, "runtime-test").expect("a node name");
+        let node = load_from(&ca, &directory, "node", &node_id);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let address = listener.local_addr().expect("an address");
+        let app = router(harness.state.clone());
+        tokio::spawn(async move {
+            let _ = serve(listener, app, control, std::future::pending()).await;
+        });
+
+        let dialler = Dialler::new(
+            node.client_config(&control_id, &[Protocol::Http2])
+                .expect("a client configuration"),
+        );
+        let channel = Endpoint::from_shared(format!("https://{address}"))
+            .expect("an endpoint")
+            .connect_with_connector(dialler)
+            .await
+            .expect("the node could not reach the machine channel");
+        let mut client = MachineChannelClient::new(channel);
+
+        let answer = client
+            .fetch_assignments(FetchAssignmentsRequest {
+                node_id: "runtime-test".to_string(),
+            })
+            .await
+            .expect("a node asking for its own assignments was refused");
+        assert!(answer.get_ref().complete);
+
+        // And the refusal, over the same connection: the name was proved once
+        // at the handshake and is held against every call made on it.
+        let refusal = client
+            .fetch_assignments(FetchAssignmentsRequest {
+                node_id: "runtime-other".to_string(),
+            })
+            .await
+            .expect_err("one node was handed another node's secrets");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    }
+
+    fn load_from(
+        ca: &TestCa,
+        directory: &tempfile::TempDir,
+        name: &str,
+        id: &deis_identity::SpiffeId,
+    ) -> Arc<MachineIdentity> {
+        Arc::new(
+            MachineIdentity::load(
+                write_files(directory.path(), name, &ca.issue(id), &ca.root_pem)
+                    .as_identity_files(),
+                SERVES,
+            )
+            .expect("an identity"),
+        )
+    }
+}

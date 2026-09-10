@@ -26,6 +26,14 @@ tracing.workspace = true
 # vendored fork happens to carry is the wrong dependency to accept, and the
 # cost of the duplicate is compile time in a crate the runtime does not link.
 x509-parser = "0.18"
+# The three the dialler needs, and no RPC framework: what it produces is a
+# TLS stream that any hyper-based client can be handed, so nothing here has
+# to know that the thing on top of it is gRPC.
+# The URI type a connector is asked to dial, and nothing else from it.
+http = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = "0.26"
+tower-service = "0.3"
 
 [dev-dependencies]
 # The certificate authority these tests mint from. It is a crate of its own
