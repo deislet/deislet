@@ -22,6 +22,16 @@ pub mod pb {
     tonic::include_proto!("deis.control");
 }
 
+/// The machine channel: what Deislet's own processes call, and nothing a
+/// browser or an operator's token ever reaches.
+///
+/// Served on its own listener, which is what lets it require a certificate
+/// from both ends. See `proto/machine.proto` for why the payloads are JSON
+/// rather than a second set of message definitions.
+pub mod machine {
+    tonic::include_proto!("deis.machine");
+}
+
 // Re-export core types
 pub use backend_restore::{
     BACKEND_RESTORE_REPORT_SCHEMA_V1, BACKEND_RESTORE_SET_SCHEMA_V1, BackendRestoreExecutionReport,

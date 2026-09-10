@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package deis.machine;
+
+// The channel Deislet's own processes talk on.
+//
+// Everything here used to be an HTTP route on the same listener that serves
+// the dashboard and the human API. That put two very different kinds of
+// traffic on one socket - one authenticated by a fleet-wide bearer secret,
+// the other by an operator's API token - and it meant the response carrying
+// every application's decrypted secrets was reachable wherever the dashboard
+// was. These are RPCs on a listener of their own, so the machine channel can
+// be bound to its own interface and can require a certificate from both ends
+// without that requirement reaching a browser.
+//
+// `deis.control.ControlService.EstablishChannel` is part of this channel too
+// and is served on the same listener. It stays in its own file because moving
+// it would rename an RPC path for no gain.
+service MachineChannel {
+  // A node says it exists and is ready to be given work.
+  rpc Register(RegisterNodeRequest) returns (RegisterNodeResponse);
+
+  // A node says it is going away.
+  rpc Deregister(DeregisterNodeRequest) returns (DeregisterNodeResponse);
+
+  // What a node should be running. Carries decrypted secrets, which is why
+  // this channel exists at all.
+  rpc FetchAssignments(FetchAssignmentsRequest) returns (FetchAssignmentsResponse);
+
+  // Every hostname and route on the platform. deis-proxy runs on this.
+  rpc FetchRoutingTable(FetchRoutingTableRequest) returns (FetchRoutingTableResponse);
+}
+
+// ---- what is deliberately not here --------------------------------------
+//
+// Downloading a bundle stays an HTTP route, served on the same listener as
+// these RPCs and behind the same mutual TLS. It is a file transfer with a
+// content digest for an ETag, which is what HTTP is for, and moving it would
+// have cost more than it bought: the deployment push hands a node a URL to
+// fetch, and `deis dev` - which drives a real node with the real push and has
+// no control plane at all - serves that URL itself. Turning the transfer into
+// an RPC would have made a developer running one command locally provision
+// certificates first, for no gain in what an attacker can reach: the route is
+// on the machine listener, so it is already unreachable without a certificate
+// this fleet signed.
+
+// ---- why the payloads below are JSON ------------------------------------
+//
+// The bodies these RPCs carry are defined once, as Rust types with serde
+// derives, and they are what the wire contract in
+// docs/implementation-plan.zh.md section 4 describes. Restating them as
+// protobuf messages would create a second schema for the same data, and the
+// two would drift the first time a field was added to one of them - which is
+// the failure this project has already paid for elsewhere.
+//
+// So the transport moved and the payload did not. `deis.control.RegisterRequest`
+// has carried `node_info_json` since the first version of that service; this
+// is the same decision, applied to the four bodies that used to be HTTP
+// responses.
+
+message RegisterNodeRequest {
+  // Which node is registering. Stated rather than inferred, exactly as the
+  // path parameter used to state it.
+  string node_id = 1;
+  // A `deis_control::api::registration::RegisterRequest` as JSON.
+  string registration_json = 2;
+}
+
+message RegisterNodeResponse {
+  // A `deis_control::api::registration::RegisterResponse` as JSON.
+  string registration_json = 1;
+}
+
+message DeregisterNodeRequest {
+  string node_id = 1;
+}
+
+message DeregisterNodeResponse {}
+
+message FetchAssignmentsRequest {
+  string node_id = 1;
+}
+
+message FetchAssignmentsResponse {
+  // A JSON array of `deis_control::api::catalog::assignments::AssignmentView`.
+  string assignments_json = 1;
+
+  // Whether the array above is the whole truth about what this node should
+  // run, so a node reconciling against it may stop serving what is missing
+  // from it. False means at least one assignment could not be described, and
+  // the node must remove nothing on the strength of this answer.
+  //
+  // A field where the HTTP endpoint used a header, for the same reason the
+  // header existed: a node must be able to tell "nothing is assigned" from
+  // "the list is short because something went wrong here".
+  bool complete = 2;
+
+  // How many assignments were left out, and so why `complete` is false.
+  uint32 withheld = 3;
+}
+
+message FetchRoutingTableRequest {
+  // Which proxy is asking, and which table version it is already running.
+  //
+  // Both were HTTP headers, and both are how the control plane learns that a
+  // table it published has actually been taken up - the acknowledgement half
+  // of an ordered deployment switch, not decoration. A caller that has
+  // applied nothing yet leaves them empty and simply gets the table.
+  string proxy_id = 1;
+  string observed_routing_table_version = 2;
+}
+
+message FetchRoutingTableResponse {
+  // A `deis_control::api::catalog::routing_table::RoutingTable` as JSON.
+  string routing_table_json = 1;
+}
+
+

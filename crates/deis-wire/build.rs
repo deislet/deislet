@@ -2,9 +2,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos_with_config(protobuf_config()?, &["proto/control.proto"], &["proto"])?;
+        .compile_protos_with_config(
+            protobuf_config()?,
+            &["proto/control.proto", "proto/machine.proto"],
+            &["proto"],
+        )?;
 
     println!("cargo:rerun-if-changed=proto/control.proto");
+    println!("cargo:rerun-if-changed=proto/machine.proto");
     Ok(())
 }
 
