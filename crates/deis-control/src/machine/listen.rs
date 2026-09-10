@@ -167,7 +167,10 @@ mod tests {
         let control_id = names::control(TRUST_DOMAIN).expect("a control name");
         let control = load_from(&ca, &directory, "control", &control_id);
         let node_id = names::node(TRUST_DOMAIN, "runtime-test").expect("a node name");
-        let node = load_from(&ca, &directory, "node", &node_id);
+        let node_files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
+        let node = Arc::new(
+            MachineIdentity::load(node_files.as_identity_files(), SERVES).expect("an identity"),
+        );
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
@@ -177,10 +180,7 @@ mod tests {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });
 
-        let dialler = Dialler::new(
-            node.client_config(&control_id, &[Protocol::Http2])
-                .expect("a client configuration"),
-        );
+        let dialler = Dialler::new(Arc::clone(&node), control_id.clone(), &[Protocol::Http2]);
         let channel = Endpoint::from_shared(format!("https://{address}"))
             .expect("an endpoint")
             .connect_with_connector(dialler)
@@ -204,6 +204,75 @@ mod tests {
             })
             .await
             .expect_err("one node was handed another node's secrets");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// A renewal reaches the wire without a restart.
+    ///
+    /// This is the failure the dialler is shaped to avoid: one that captured
+    /// its certificate at construction would go on presenting the old one
+    /// after a renewal, every log line would say the rotation worked, and
+    /// every connection made after the old certificate expired would fail at
+    /// once - a rotation performed to avoid an expiry having caused one.
+    #[tokio::test]
+    async fn a_renewed_certificate_is_what_the_next_connection_presents() {
+        let harness = harness(true).await;
+        let ca = TestCa::new();
+        let directory = tempfile::tempdir().expect("a directory");
+
+        let control_id = names::control(TRUST_DOMAIN).expect("a control name");
+        let control = load_from(&ca, &directory, "control", &control_id);
+        let was = names::node(TRUST_DOMAIN, "runtime-test").expect("a node name");
+        let now = names::node(TRUST_DOMAIN, "runtime-other").expect("a node name");
+        let node_files = write_files(directory.path(), "node", &ca.issue(&was), &ca.root_pem);
+        let node = Arc::new(
+            MachineIdentity::load(node_files.as_identity_files(), SERVES).expect("an identity"),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let address = listener.local_addr().expect("an address");
+        let app = router(harness.state.clone());
+        tokio::spawn(async move {
+            let _ = serve(listener, app, control, std::future::pending()).await;
+        });
+
+        // Reissued as another machine, which is what makes the change
+        // observable at the far end: the listener answers for the name the
+        // connection proved, so if the dialler were still presenting the old
+        // certificate the refusal below would name the old node.
+        let reissued = ca.issue(&now);
+        std::fs::write(&node_files.certificate, &reissued.certificate_pem).expect("certificate");
+        std::fs::write(&node_files.private_key, &reissued.key_pem).expect("key");
+        assert!(matches!(
+            node.reload().expect("the renewal loads"),
+            deis_identity::Reload::Replaced { .. }
+        ));
+
+        let dialler = Dialler::new(Arc::clone(&node), control_id.clone(), &[Protocol::Http2]);
+        let channel = Endpoint::from_shared(format!("https://{address}"))
+            .expect("an endpoint")
+            .connect_with_connector(dialler)
+            .await
+            .expect("the renewed certificate could not open a connection");
+        let mut client = MachineChannelClient::new(channel);
+
+        // The renewed certificate names runtime-other, so this is now its own
+        // assignment list and is answered.
+        client
+            .fetch_assignments(FetchAssignmentsRequest {
+                node_id: "runtime-other".to_string(),
+            })
+            .await
+            .expect("the connection did not present the renewed certificate");
+
+        // And the name it used to have is now somebody else's.
+        let refusal = client
+            .fetch_assignments(FetchAssignmentsRequest {
+                node_id: "runtime-test".to_string(),
+            })
+            .await
+            .expect_err("the old name was still accepted after the renewal");
         assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
     }
 

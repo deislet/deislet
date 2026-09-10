@@ -40,7 +40,7 @@
 //! every id this platform accepts is spellable here. The two exceptions are
 //! `.` and `..`, which are valid node ids and are not valid path segments;
 //! they are refused rather than escaped, for the reason
-//! [`crate::spiffe`] refuses rather than normalises.
+//! [`SpiffeId`] refuses rather than normalises.
 
 use crate::spiffe::{SpiffeId, SpiffeIdError, check_path_segment};
 

@@ -2,7 +2,7 @@
 //!
 //! # Why a connector and not a client configuration
 //!
-//! Handing a gRPC client a [`ClientConfig`] would be the obvious thing, and
+//! Handing a gRPC client a [`rustls::ClientConfig`] would be the obvious thing, and
 //! it is not possible: tonic's own TLS configuration accepts a certificate
 //! authority, an identity and a host name, and verifies the far end by host
 //! name the ordinary way. There is no opening in it for a verifier of one's
@@ -15,12 +15,28 @@
 //! one, and the identity check has already happened by the time it sees the
 //! stream.
 //!
+//! # Why it holds the identity and not a configuration
+//!
+//! A [`rustls::ClientConfig`] is built from the certificate material in force when it
+//! was built, and it goes on presenting that certificate for as long as
+//! anything holds it. A dialler that captured one at construction would keep
+//! dialling with the certificate this process started with, and would go on
+//! doing so after a renewal replaced it - so the renewal would look like it
+//! worked, every log line would say so, and every connection made after the
+//! old certificate expired would fail at once. A rotation performed to avoid
+//! an expiry would have caused one.
+//!
+//! So the configuration is resolved per connection, from the identity itself,
+//! which is what [`MachineIdentity::client_config`] answers with the material
+//! in force at that instant. A connection is a rare event next to a request;
+//! resolving it there costs nothing worth measuring.
+//!
 //! # What the address is for
 //!
 //! Only for finding the machine. The name in the URI is never checked against
 //! the certificate: an address can be taken over and a machine can be moved,
 //! so what decides whether this is the right peer is the SPIFFE name the
-//! [`ClientConfig`] was built to expect. Dialling by bare IP address is
+//! [`rustls::ClientConfig`] was built to expect. Dialling by bare IP address is
 //! therefore normal here, not a workaround.
 
 use std::future::Future;
@@ -30,11 +46,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use hyper_util::rt::TokioIo;
-use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tower_service::Service;
+
+use crate::{MachineIdentity, Protocol, SpiffeId};
 
 /// The host name put on the handshake.
 ///
@@ -48,16 +65,29 @@ const UNCHECKED_HOST: &str = "machine.deislet.invalid";
 /// Opens connections to one other machine, refusing anything that is not it.
 #[derive(Clone)]
 pub struct Dialler {
-    tls: TlsConnector,
+    identity: Arc<MachineIdentity>,
+    peer: SpiffeId,
+    speaking: Vec<Protocol>,
 }
 
 impl Dialler {
-    /// `config` decides who the far end must prove itself to be; build it with
-    /// [`crate::MachineIdentity::client_config`].
-    pub fn new(config: Arc<ClientConfig>) -> Self {
+    /// Dial `peer`, proving `identity`, speaking `speaking`.
+    ///
+    /// There is deliberately no constructor that takes a prepared
+    /// [`rustls::ClientConfig`]: one would be a dialler that cannot follow a renewal,
+    /// and the failure that causes is invisible until the moment it is worst -
+    /// see the module note.
+    pub fn new(identity: Arc<MachineIdentity>, peer: SpiffeId, speaking: &[Protocol]) -> Self {
         Self {
-            tls: TlsConnector::from(config),
+            identity,
+            peer,
+            speaking: speaking.to_vec(),
         }
+    }
+
+    /// The identity this dialler proves, as it stands right now.
+    pub fn proving(&self) -> SpiffeId {
+        self.identity.id()
     }
 }
 
@@ -78,8 +108,15 @@ impl Service<http::Uri> for Dialler {
     }
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
-        let tls = self.tls.clone();
+        // Resolved here, once per connection, so a certificate renewed since
+        // the last connection is the one this connection presents.
+        let config = self
+            .identity
+            .client_config(&self.peer, &self.speaking)
+            .map(TlsConnector::from)
+            .map_err(|error| io::Error::other(error.to_string()));
         Box::pin(async move {
+            let tls = config?;
             let authority = uri.authority().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
