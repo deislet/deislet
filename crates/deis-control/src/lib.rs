@@ -12,6 +12,7 @@ pub mod database;
 pub mod delivery;
 pub mod handler;
 pub mod identity;
+pub mod machine;
 pub mod message;
 pub mod metrics;
 pub mod node_key;

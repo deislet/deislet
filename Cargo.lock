@@ -2237,6 +2237,7 @@ dependencies = [
  "deis-backend-migration",
  "deis-bundle",
  "deis-identity",
+ "deis-identity-test-pki",
  "deis-provider-driver",
  "deis-queue",
  "deis-wire",
