@@ -628,6 +628,10 @@ pub(crate) mod tests {
         let address = Arc::new(PublicAddress {
             configured: Some("http://control.test".to_string()),
             fallback: "http://127.0.0.1:8080".to_string(),
+            // No machine listener in these tests, which is also the shape
+            // every installation has today: the machine base resolves to the
+            // human one, so the bundle URLs asserted below do not move.
+            machine: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let runtime_addr = listener.local_addr().unwrap();

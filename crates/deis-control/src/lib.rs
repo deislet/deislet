@@ -43,8 +43,8 @@ pub use database::{
     HeartbeatEntry, Withdrawn,
 };
 pub use delivery::{
-    DeliveryReason, DeliveryReport, DeploymentDeliverer, DeploymentPayload, PublicAddress,
-    RemovalReport,
+    DeliveryReason, DeliveryReport, DeploymentDeliverer, DeploymentPayload, MachineAddress,
+    PublicAddress, RemovalReport,
 };
 pub use handler::MessageHandler;
 pub use identity::{

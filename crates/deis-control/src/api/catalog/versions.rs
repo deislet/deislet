@@ -405,7 +405,10 @@ async fn record_stored_bundle(
         "Bundle upload accepted"
     );
 
-    let base = state.deliverer.base_url(headers);
+    // The one bundle link in this crate built for a person rather than a
+    // node: it goes back to whoever just uploaded, so it is spelled on the
+    // listener their client is already talking to.
+    let base = state.deliverer.human_base_url(headers);
     let bundle_url = crate::delivery::bundle_url(&base, app_id, &version.id);
     let status = if created {
         StatusCode::CREATED

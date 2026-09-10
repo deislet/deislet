@@ -43,7 +43,7 @@ use crate::{
     config::ControlConfig,
     config_manager::ConfigManager,
     database::Database,
-    delivery::{DeploymentDeliverer, PublicAddress, StorageWiring},
+    delivery::{DeploymentDeliverer, MachineAddress, PublicAddress, StorageWiring},
     identity::IdentityStore,
     metrics::MetricsCollector,
     runtime_client::RuntimeNodeManager,
@@ -566,6 +566,21 @@ pub async fn anchor_bundle_paths(database: &Arc<Database>, config: &ControlConfi
     }
 }
 
+/// The host part of an address a peer elsewhere can dial.
+///
+/// A wildcard bind says which interfaces this process accepts on, not where
+/// anybody reaches it, and neither spelling of it is a usable destination. The
+/// loopback substitution is only ever a guess good enough for a single box; an
+/// installation whose peers are on another host is expected to say where it is
+/// reachable with a `public_base_url` instead.
+fn reachable_host(bind_addr: &str) -> &str {
+    if bind_addr == "0.0.0.0" || bind_addr == "::" {
+        "127.0.0.1"
+    } else {
+        bind_addr
+    }
+}
+
 /// Assemble the state every catalog endpoint shares.
 ///
 /// Both fallible pieces - the bundle directory and the secret master key -
@@ -612,14 +627,24 @@ async fn build_catalog_state(
         .map(|tls| tls.api_enabled)
         .unwrap_or(false);
     let scheme = if tls_enabled { "https" } else { "http" };
-    let host = if config.bind_addr == "0.0.0.0" || config.bind_addr == "::" {
-        "127.0.0.1"
-    } else {
-        config.bind_addr.as_str()
-    };
+    let host = reachable_host(&config.bind_addr);
+    // The machine listener is not started here yet, but the address nodes
+    // will fetch bundles from is already decided by its configuration, and
+    // resolving it now is what keeps the two audiences apart in one place.
+    // Its scheme is always https: the channel exists to demand a certificate
+    // from both ends, so there is no plaintext variant of it to configure.
+    let machine = config.machine.as_ref().map(|machine| MachineAddress {
+        configured: machine.public_base_url.clone(),
+        fallback: format!(
+            "https://{}:{}",
+            reachable_host(&machine.bind_addr),
+            machine.port
+        ),
+    });
     let address = Arc::new(PublicAddress {
         configured: config.public_base_url.clone(),
         fallback: format!("{}://{}:{}", scheme, host, config.port),
+        machine,
     });
     if config.public_base_url.is_none() && !nodes.is_empty() {
         warn!(

@@ -48,22 +48,66 @@ use crate::catalog::{
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
 
-/// How the control plane names itself to nodes.
+/// How the control plane names itself, once for each audience that is given
+/// an absolute URL.
 ///
 /// Nodes fetch bundles over HTTP from an absolute URL, so both the
 /// assignment list and every deployment push have to carry an address that
 /// is reachable from the node, not from the control plane's own point of
 /// view.
+///
+/// There are two such addresses because there are two listeners. A browser
+/// finds the dashboard and the human API on the address an operator publishes
+/// as `public_base_url`; a node downloads its bundle from the machine channel,
+/// which is a separate socket with a separate port and a mutual-TLS handshake
+/// no browser would survive. Handing one audience the other's address gives it
+/// a URL it cannot use, so the two are resolved apart and every caller of
+/// [`bundle_url`] picks the one it is building for - see
+/// [`Self::resolve_human`] and [`Self::resolve_machine`].
+///
+/// The machine listener is still being built, so no installation configures
+/// one yet and both resolutions currently answer with the same address. The
+/// split is made now because the day the bundle route moves, the code that
+/// hands a node a URL must already be pointing at the listener that serves
+/// it, and a fleet learns otherwise only by failing to download anything.
 #[derive(Debug, Clone)]
 pub struct PublicAddress {
-    /// Explicit `public_base_url` from the config. Always wins.
+    /// Explicit `public_base_url` from the config. Always wins for a human.
     pub configured: Option<String>,
     /// Last resort, derived from the bind address.
     pub fallback: String,
+    /// The machine listener's address, present exactly when `[machine]` is
+    /// configured. `None` means this installation has no machine channel yet,
+    /// and everything still runs on the one listener the human uses.
+    pub machine: Option<MachineAddress>,
+}
+
+/// Where the machine channel is reachable from, as a node sees it.
+///
+/// Separate from the human address rather than two more `Option` fields on it,
+/// because "no machine listener at all" and "a machine listener whose public
+/// address the operator did not spell out" are different situations with
+/// different answers, and flattening them would let the two disagree.
+#[derive(Debug, Clone)]
+pub struct MachineAddress {
+    /// Explicit `machine.public_base_url` from the config. Always wins.
+    pub configured: Option<String>,
+    /// Derived from the machine listener's bind address and port.
+    pub fallback: String,
+}
+
+impl MachineAddress {
+    /// The base a node downloads bundles from once `[machine]` exists.
+    fn resolve(&self) -> String {
+        if let Some(configured) = &self.configured {
+            return configured.trim_end_matches('/').to_string();
+        }
+        self.fallback.clone()
+    }
 }
 
 impl PublicAddress {
-    /// Resolve the base URL bundle links are built from.
+    /// Resolve the base URL a person's browser is pointed at.
     ///
     /// The configured value wins. Without one, use the bind-derived fallback.
     ///
@@ -72,7 +116,7 @@ impl PublicAddress {
     /// reach, and it is caller-controlled. Putting it into a deployment would
     /// let a deploy-scoped caller make every node issue a request to an
     /// arbitrary host.
-    pub fn resolve(&self, _headers: &HeaderMap) -> String {
+    pub fn resolve_human(&self, _headers: &HeaderMap) -> String {
         if let Some(configured) = &self.configured {
             return configured.trim_end_matches('/').to_string();
         }
@@ -81,6 +125,48 @@ impl PublicAddress {
             "public_base_url is unset, so bundle URLs use the bind-derived fallback; nodes on another host may not be able to reach it"
         );
         self.fallback.clone()
+    }
+
+    /// Resolve the base URL a node downloads bundles from.
+    ///
+    /// `machine.public_base_url` wins, then the machine listener's own bind
+    /// address, and only when there is no machine listener at all does this
+    /// fall back to the human base.
+    ///
+    /// The fallback runs in that direction and never the other. While
+    /// `[machine]` is absent the bundle route is still served by the one
+    /// listener this process has, so borrowing the human base is exactly
+    /// today's behaviour and this whole split changes nothing. A human base
+    /// that fell back to the machine one would instead hand a browser the
+    /// address of a socket that demands a client certificate, which no browser
+    /// in this fleet holds.
+    pub fn resolve_machine(&self, headers: &HeaderMap) -> String {
+        match &self.machine {
+            Some(machine) => machine.resolve(),
+            None => self.resolve_human(headers),
+        }
+    }
+
+    /// The same machine base for a caller holding no request.
+    ///
+    /// Restart reconciliation rebuilds a payload without any HTTP request
+    /// behind it. The headers were never consulted anyway, so the machine
+    /// branch is the same answer either way. The human fallback differs from
+    /// [`Self::resolve_human`] in two ways, both inherited from the code this
+    /// replaced rather than chosen here: it does not log the warning, because
+    /// reconciliation runs on a timer and would repeat that line for as long
+    /// as the address stayed unset; and it does not trim a trailing slash off
+    /// a configured value. The second is a real inconsistency and is left
+    /// alone deliberately - changing it here would alter the address a
+    /// reconciling node is given, which is not what this change is for.
+    pub fn resolve_machine_without_request(&self) -> String {
+        match &self.machine {
+            Some(machine) => machine.resolve(),
+            None => self
+                .configured
+                .clone()
+                .unwrap_or_else(|| self.fallback.clone()),
+        }
     }
 }
 
@@ -852,18 +938,33 @@ impl DeploymentDeliverer {
     }
 
     /// The base URL bundle links in this delivery should carry.
-    pub fn base_url(&self, headers: &HeaderMap) -> String {
-        self.address.resolve(headers)
+    ///
+    /// Everything this deliverer sends is read by a node, so this is what
+    /// almost every caller wants. The one exception is the upload answer,
+    /// which shows a person the link they just created and takes
+    /// [`Self::human_base_url`].
+    pub fn machine_base_url(&self, headers: &HeaderMap) -> String {
+        self.address.resolve_machine(headers)
+    }
+
+    /// The base URL a link shown to a person should carry.
+    ///
+    /// It lives next to [`Self::machine_base_url`] only because this is where
+    /// the resolved [`PublicAddress`] is held; nothing this deliverer pushes
+    /// to a node uses it.
+    pub fn human_base_url(&self, headers: &HeaderMap) -> String {
+        self.address.resolve_human(headers)
     }
 
     /// Stable address used by restart reconciliation, where no original HTTP
-    /// request headers exist. PublicAddress already prefers explicit config;
-    /// the fallback is the same bind-derived address normal deploys use.
-    pub fn reconciliation_base_url(&self) -> String {
-        self.address
-            .configured
-            .clone()
-            .unwrap_or_else(|| self.address.fallback.clone())
+    /// request headers exist.
+    ///
+    /// A node is what reads it, so it resolves the machine audience like
+    /// every other push - see [`PublicAddress::resolve_machine_without_request`]
+    /// for the two ways its human fallback differs from the one a live
+    /// request takes.
+    pub fn machine_reconciliation_base_url(&self) -> String {
+        self.address.resolve_machine_without_request()
     }
 
     pub fn requires_consumer_fence(&self, version: &Version) -> CatalogResult<bool> {
@@ -2159,6 +2260,7 @@ mod tests {
             Arc::new(PublicAddress {
                 configured: Some("http://control.test".to_string()),
                 fallback: "http://127.0.0.1:8080".to_string(),
+                machine: None,
             }),
             storage,
         );
@@ -3185,19 +3287,110 @@ mod tests {
         let address = PublicAddress {
             configured: Some("https://deis.example.com/".to_string()),
             fallback: "http://127.0.0.1:8080".to_string(),
+            machine: None,
         };
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::HOST,
             "attacker.invalid:9000".parse().unwrap(),
         );
-        assert_eq!(address.resolve(&headers), "https://deis.example.com");
+        assert_eq!(address.resolve_human(&headers), "https://deis.example.com");
 
         let address = PublicAddress {
             configured: None,
             fallback: "http://127.0.0.1:8080".to_string(),
+            machine: None,
         };
-        assert_eq!(address.resolve(&headers), "http://127.0.0.1:8080");
-        assert_eq!(address.resolve(&HeaderMap::new()), "http://127.0.0.1:8080");
+        assert_eq!(address.resolve_human(&headers), "http://127.0.0.1:8080");
+        assert_eq!(
+            address.resolve_human(&HeaderMap::new()),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn machine_base_prefers_the_machine_listener_public_url() {
+        let address = PublicAddress {
+            configured: Some("https://deis.example.com".to_string()),
+            fallback: "http://127.0.0.1:8080".to_string(),
+            machine: Some(MachineAddress {
+                configured: Some("https://machine.example.com/".to_string()),
+                fallback: "https://10.0.0.1:8443".to_string(),
+            }),
+        };
+
+        // The trailing slash is dropped here and not where the URL is joined,
+        // so a configured value written either way produces the same link.
+        assert_eq!(
+            address.resolve_machine(&HeaderMap::new()),
+            "https://machine.example.com"
+        );
+        assert_eq!(
+            address.resolve_machine_without_request(),
+            "https://machine.example.com"
+        );
+        // The human address is untouched by any of this.
+        assert_eq!(
+            address.resolve_human(&HeaderMap::new()),
+            "https://deis.example.com"
+        );
+    }
+
+    #[test]
+    fn machine_base_falls_back_to_the_machine_listener_bind_address() {
+        // `[machine]` is configured without a public_base_url: the node is
+        // pointed at the machine listener's own address, never at the human
+        // one, because the bundle route has moved off the human listener.
+        let address = PublicAddress {
+            configured: Some("https://deis.example.com".to_string()),
+            fallback: "http://127.0.0.1:8080".to_string(),
+            machine: Some(MachineAddress {
+                configured: None,
+                fallback: "https://10.0.0.1:8443".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            address.resolve_machine(&HeaderMap::new()),
+            "https://10.0.0.1:8443"
+        );
+        assert_eq!(
+            address.resolve_machine_without_request(),
+            "https://10.0.0.1:8443"
+        );
+    }
+
+    #[test]
+    fn machine_base_without_a_machine_listener_is_the_human_base() {
+        // The property this whole split is built to preserve: with no
+        // `[machine]` section, a node is handed exactly the URL it is handed
+        // today, whether the human address is configured or derived.
+        let address = PublicAddress {
+            configured: Some("https://deis.example.com/".to_string()),
+            fallback: "http://127.0.0.1:8080".to_string(),
+            machine: None,
+        };
+        assert_eq!(
+            address.resolve_machine(&HeaderMap::new()),
+            address.resolve_human(&HeaderMap::new())
+        );
+        assert_eq!(
+            address.resolve_machine(&HeaderMap::new()),
+            "https://deis.example.com"
+        );
+
+        let address = PublicAddress {
+            configured: None,
+            fallback: "http://127.0.0.1:8080".to_string(),
+            machine: None,
+        };
+        assert_eq!(
+            address.resolve_machine(&HeaderMap::new()),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            address.resolve_machine_without_request(),
+            "http://127.0.0.1:8080"
+        );
     }
 }

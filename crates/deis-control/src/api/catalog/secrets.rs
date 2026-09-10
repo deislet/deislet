@@ -119,7 +119,7 @@ pub async fn put_secret(
 
     // No new version exists to point at, so the running one is delivered
     // again with a freshly decrypted environment.
-    let base = state.deliverer.base_url(&headers);
+    let base = state.deliverer.machine_base_url(&headers);
     let delivery_result = state
         .deliverer
         .prepare_secret_change(
@@ -308,7 +308,7 @@ pub async fn delete_secret(
 
     // Same reason as on write: without this the nodes would keep serving
     // the deleted value until something else moved the version pointer.
-    let base = state.deliverer.base_url(&headers);
+    let base = state.deliverer.machine_base_url(&headers);
     let preparation = state
         .deliverer
         .prepare_secret_change(&env, &base, &name, None, Some(&expected_revision))

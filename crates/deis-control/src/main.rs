@@ -99,6 +99,28 @@ async fn main() -> Result<(), anyhow::Error> {
         );
     }
 
+    // Before anything is served: refuse a [machine] section, because the
+    // listener it describes does not exist yet.
+    //
+    // The section is read by exactly one thing today - the address bundle
+    // URLs are built from - so configuring it makes every assignment and
+    // every deployment push hand a node a download address on a port nothing
+    // listens on. Every bundle download then fails, one at a time, with no
+    // startup diagnostic and nothing in the message pointing back at the
+    // configuration that caused it. Refusing here costs an operator one
+    // restart; the alternative costs them an afternoon.
+    //
+    // This check goes away in the same change that starts the listener.
+    if config.machine.is_some() {
+        anyhow::bail!(
+            "the configuration has a [machine] section, and this control plane does not serve a \
+             machine listener yet. While that is true, the only thing the section changes is the \
+             address nodes are told to download bundles from - which would point at a port \
+             nothing is listening on, and every bundle download would fail. Remove the section \
+             until a build that serves the machine channel is deployed."
+        );
+    }
+
     let bind_addr = config.bind_addr.clone();
     let port = config.port;
 

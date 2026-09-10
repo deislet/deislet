@@ -154,7 +154,9 @@ pub async fn for_node(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<(HeaderMap, Json<Vec<AssignmentView>>)> {
-    let base = state.deliverer.base_url(&headers);
+    // Every URL in this answer is fetched by the node that asked, so it is
+    // built on the machine base even though the request arrived here.
+    let base = state.deliverer.machine_base_url(&headers);
     let answer = assignments_for(&state, &node_id, &base).await?;
 
     let mut response_headers = HeaderMap::new();

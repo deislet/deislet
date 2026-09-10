@@ -252,7 +252,7 @@ pub async fn deploy(
     )
     .await?;
 
-    let base = state.deliverer.base_url(&headers);
+    let base = state.deliverer.machine_base_url(&headers);
     let mut payload = state
         .deliverer
         .payload_with_config(&env, &version, &base, request.config_values)
@@ -357,7 +357,7 @@ pub async fn rollback(
             state.store.get_version(&app_id, &previous).await?
         };
 
-    let base = state.deliverer.base_url(&headers);
+    let base = state.deliverer.machine_base_url(&headers);
     let historical_snapshot = state
         .store
         .deployment_snapshot_for_version(&env.id, &version.id)
@@ -1090,7 +1090,7 @@ async fn reconcile_claimed_generation_drain(
         .store
         .get_version(&plan.app_id, &plan.version_id)
         .await?;
-    let base_url = state.deliverer.reconciliation_base_url();
+    let base_url = state.deliverer.machine_reconciliation_base_url();
     let mut payload = if let Some(snapshot_id) = &plan.snapshot_id {
         let snapshot = state.store.get_environment_snapshot(snapshot_id).await?;
         state
@@ -1250,7 +1250,7 @@ async fn reconcile_claimed_plan(
         .store
         .get_version(&plan.app_id, &plan.version_id)
         .await?;
-    let base_url = state.deliverer.reconciliation_base_url();
+    let base_url = state.deliverer.machine_reconciliation_base_url();
     let mut payload = if let Some(snapshot_id) = &plan.snapshot_id {
         let snapshot = state.store.get_environment_snapshot(snapshot_id).await?;
         state
