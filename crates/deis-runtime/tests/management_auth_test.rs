@@ -59,7 +59,7 @@ async fn start_node(
         ..RuntimeConfig::default()
     };
     let deployer = Arc::new(
-        DeploymentManager::from_config(app_manager.clone(), &config)
+        DeploymentManager::from_config(app_manager.clone(), &config, None)
             .await
             .expect("preparing the bundle directory"),
     );

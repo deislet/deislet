@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use deis_proxy::acme;
-use deis_proxy::catalog::{CatalogClient, CatalogPoller, ControlEndpoint};
+use deis_proxy::catalog::{CatalogPoller, routing_table_client};
 use deis_proxy::cli::CliConfig;
 use deis_proxy::config::system::acme::{LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING};
 use deis_proxy::config::system::{LogLevel, MachineIdentityConfig};
@@ -258,12 +258,14 @@ fn announce_acme(system: &SystemConfig, settings: &deis_proxy::config::system::A
     }
 }
 
-/// Load this proxy's machine-channel identity: the certificate it will one
-/// day present on that channel, and the material behind it kept fresh on
-/// disk. Nothing in this crate reads the result yet - see
-/// [`MachineIdentityConfig`] - so this only proves the three files are
-/// present and agree with each other before the process goes on to do
-/// anything else.
+/// Load this proxy's machine-channel identity: the certificate it presents on
+/// that channel, and the material behind it kept fresh on disk.
+///
+/// What uses it today is the routing-table poller, which fetches the catalog's
+/// table over the machine channel instead of over HTTP with the fleet secret
+/// whenever this table is present; see `deis_proxy::catalog::client`.
+/// Registration, heartbeats and the gRPC control channel have not moved and
+/// still dial with `control.secret`.
 ///
 /// Fails rather than starting with a `[machine_identity]` table that cannot
 /// load. Starting anyway would leave [`MachineIdentityWatch`] re-reading
@@ -292,11 +294,12 @@ fn load_machine_identity(config: &MachineIdentityConfig) -> Result<Arc<MachineId
     info!(
         identity = %identity.id(),
         certificate = %config.certificate,
+        control_endpoint = %config.control_endpoint,
         reload_secs = config.identity_reload_seconds,
         "loaded this proxy's machine-channel identity; the files are re-read on that interval, \
-         so a renewal needs no restart. Nothing on this proxy authenticates with it yet - the \
-         control channel below still dials with control.secret exactly as it did before this \
-         table existed"
+         so a renewal needs no restart. The routing table is fetched over the machine channel \
+         with it. Registration, heartbeats and the control channel still dial with \
+         control.secret, because those routes have not moved yet"
     );
     Ok(Arc::new(identity))
 }
@@ -522,7 +525,8 @@ fn main() -> Result<()> {
         None => {
             info!(
                 "no machine_identity configured; this proxy holds no certificate on the machine \
-                 channel and authenticates to the control plane exactly as it does today"
+                 channel and authenticates to the control plane exactly as it does today - the \
+                 routing table included, fetched over HTTP with the fleet-wide secret"
             );
             None
         }
@@ -662,8 +666,17 @@ fn main() -> Result<()> {
             // the server, so an upgrade replaces it rather than stacking
             // another poll loop on top; see deis_proxy::catalog.
             let routing = system.routing();
-            match ControlEndpoint::parse(&control.addr) {
-                Ok(endpoint) => {
+            // Paired here because the two halves live in two places: the
+            // loaded material above, and the table that says where to take it
+            // and whose name to expect there. Both or neither - a
+            // `[machine_identity]` table that failed to load has already
+            // stopped this process.
+            let identity = machine_identity
+                .as_ref()
+                .map(|(identity, _)| identity)
+                .zip(system.machine_identity.as_ref());
+            match routing_table_client(control, identity, routing.max_table_bytes()) {
+                Ok(client) => {
                     match routing.preview_zone() {
                         Some(zone) => info!(
                             zone = zone.as_str(),
@@ -685,28 +698,21 @@ fn main() -> Result<()> {
                          interval, and a poll that fails leaves the last table in force"
                     );
                     let poller = CatalogPoller::new(
-                        CatalogClient::new(
-                            endpoint,
-                            control.secret.clone(),
-                            control.request_timeout_duration(),
-                            routing.max_table_bytes(),
-                        )
-                        .with_proxy_id(control.associated_id.clone()),
+                        client,
                         Arc::clone(&config),
                         Duration::from_secs(routing.control_poll_interval_secs()),
                     );
                     server.add_service(background_service("routing table", poller));
                 }
                 // Unreachable through the configuration file, which validates
-                // the address, but a control plane this process cannot dial
+                // both addresses, but a control plane this process cannot dial
                 // must not become a silent loss of routing.
                 Err(e) => error!(
                     addr = %control.addr,
                     error = %e,
-                    "not polling for the routing table: the control plane address cannot be \
-                     dialled over HTTP. Every route created through the control plane is \
-                     unreachable, and this instance routes only by the applications configured \
-                     on this machine"
+                    "not polling for the routing table: the control plane cannot be dialled for \
+                     it. Every route created through the control plane is unreachable, and this \
+                     instance routes only by the applications configured on this machine"
                 ),
             }
         }

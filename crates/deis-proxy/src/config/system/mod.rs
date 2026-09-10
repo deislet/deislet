@@ -879,6 +879,7 @@ certificate = "machine/proxy.pem"
 private_key = "machine/proxy-key.pem"
 trust_root = "/etc/deislet/root.pem"
 trust_domain = "deis.internal"
+control_endpoint = "https://control.internal:8443"
 "#,
         )
         .unwrap();
@@ -892,6 +893,9 @@ trust_domain = "deis.internal"
         );
         // Already absolute, and left alone rather than joined onto the base.
         assert_eq!(identity.trust_root, "/etc/deislet/root.pem");
+        // Not a path, and so not resolved against anything: an address that
+        // had been joined onto the start directory would name nothing.
+        assert_eq!(identity.control_endpoint, "https://control.internal:8443");
         merged.validate().expect("a complete table is usable");
     }
 

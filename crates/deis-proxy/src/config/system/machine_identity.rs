@@ -4,13 +4,18 @@
 //!
 //! # What this is, today
 //!
-//! Absent unless an operator writes a `[machine_identity]` table, and nothing
-//! in this crate reads the loaded material yet: the control channel
-//! configured by `[control]` still dials with the shared secret in
-//! `deis_wire::ControlConfig`, exactly as it does without this table. Adding
-//! it here is a reviewable step on its own, ahead of the change that moves
-//! that dial over to it - see `crates/deis-identity` for the certificate
-//! format and what carrying this identity will let a peer refuse.
+//! Absent unless an operator writes a `[machine_identity]` table. With it
+//! present, one thing moves: the catalog's routing table is fetched over the
+//! control plane's machine channel, as a `FetchRoutingTable` call proving
+//! this certificate, instead of over HTTP with the fleet secret in the
+//! `Authorization` header (see [`crate::catalog::client`]). Everything else
+//! this proxy asks the control plane - registration, heartbeats, the gRPC
+//! control channel configured by `[control]` - still dials with that shared
+//! secret, because those routes have not moved yet.
+//!
+//! With the table absent, nothing changes at all: the routing table is
+//! fetched over HTTP exactly as it was. See `crates/deis-identity` for the
+//! certificate format and what carrying this identity lets a peer refuse.
 //!
 //! # Naming the control plane
 //!
@@ -30,6 +35,36 @@
 //! naming convention, or a migration in progress where the two sides have not
 //! yet agreed on one trust domain. Writing the full name there is taken
 //! exactly as written and skips deriving it from `trust_domain` at all.
+//!
+//! # Where the address is written, and why not beside the other one
+//!
+//! The machine channel is a listener of its own on a port of its own, so
+//! `[control] addr` - the human listener, where registration and the gRPC
+//! control channel still live - does not say where it is. Somewhere has to,
+//! and `control_endpoint` below is it.
+//!
+//! Next to the identity, because an address and the name that must be proved
+//! at it are one fact rather than two. A machine-channel address with no
+//! certificate to present is a connection that will be closed at the
+//! handshake; a certificate with no address is material that will never be
+//! used. Both are half a configuration and both have to be refused at
+//! startup, and keeping them in one table makes that one refusal in one
+//! [`Validatable::validate`] that can name the field to fix.
+//!
+//! deis-runtime configures the same thing and put it in the other place, as
+//! `[control] machine_endpoint` beside its own control endpoint. The
+//! difference is not a disagreement about which is better: `[control]` in
+//! this file is not this crate's type at all. It is
+//! `deis_wire::ControlConfig`, shared with deis-control and with every
+//! process that speaks the control channel, and carrying `grpc_endpoint()`,
+//! which builds the URL for *that* channel. A field only deis-proxy reads
+//! does not belong in it. If the two are ever to be spelled identically, the
+//! move is to put `machine_endpoint` into `deis_wire::ControlConfig` and have
+//! both crates read it from there.
+//!
+//! What does not differ, and must not, is the value: the same
+//! `https://host:port` an operator writes for a node, refused for the same
+//! reasons - see `check_control_endpoint`.
 
 use deis_identity::{SpiffeId, SpiffeIdError, names};
 use serde::{Deserialize, Serialize};
@@ -83,6 +118,20 @@ pub struct MachineIdentityConfig {
     /// `trust_domain` cannot cover. Overrides the derived name completely
     /// rather than replacing one part of it.
     pub control_identity: Option<String>,
+    /// Where the control plane's machine channel listens, as
+    /// `https://host:port` - the address matching that control plane's
+    /// `[machine] bind_addr` and `[machine] port`, which is a different port
+    /// from `[control] addr`.
+    ///
+    /// Required whenever this table is present; see the module doc for why it
+    /// is stated here rather than beside the control channel's own address,
+    /// and `check_control_endpoint` for what is refused.
+    ///
+    /// Written exactly as deis-runtime's `control.machine_endpoint` is
+    /// written, down to the scheme and the mandatory port, because it is the
+    /// same listener: an operator pointing a node and a proxy at one control
+    /// plane copies one string into two files.
+    pub control_endpoint: String,
 }
 
 /// Written out rather than derived, because the derived one sets
@@ -99,6 +148,7 @@ impl Default for MachineIdentityConfig {
             identity_reload_seconds: default_identity_reload_seconds(),
             trust_domain: String::new(),
             control_identity: None,
+            control_endpoint: String::new(),
         }
     }
 }
@@ -118,6 +168,76 @@ impl MachineIdentityConfig {
             Some(explicit) => SpiffeId::parse(explicit),
             None => names::control(&self.trust_domain),
         }
+    }
+}
+
+/// Refuse a `control_endpoint` that is not an `https://host:port` URL, saying
+/// which shape was written and which one is wanted.
+///
+/// The three refusals are the three mistakes that are actually made here, and
+/// each one is silent later if it is not caught now: leaving the field out
+/// while filling the rest of the table in, spelling the endpoint `http://`
+/// because that is what `[control] addr` says, and leaving the port off
+/// because every other address in a configuration file has a default.
+///
+/// These are the same three rules, in the same order, that deis-runtime holds
+/// its `control.machine_endpoint` to. One listener, one spelling.
+fn check_control_endpoint(endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(
+            "machine_identity.control_endpoint is required. It is where the control plane's \
+             machine channel listens, written as https://host:port - the address matching that \
+             control plane's [machine] bind_addr and [machine] port, which is a different port \
+             from [control] addr. A certificate with no machine to present it to would be \
+             loaded, logged and never used"
+                .to_string(),
+        );
+    }
+    let authority = match endpoint.strip_prefix("https://") {
+        Some(authority) => authority,
+        None => {
+            return Err(format!(
+                "machine_identity.control_endpoint {endpoint:?} is not an https:// URL. The \
+                 machine channel demands a certificate from both ends on every route it carries, \
+                 so there is no plaintext spelling of it that reaches anything; an http:// here \
+                 would read as a way to turn the certificates off, and is refused rather than \
+                 quietly upgraded"
+            ));
+        }
+    };
+    // The path, if one was written, is not part of the address dialled; a
+    // gRPC method supplies its own.
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+    // An IPv6 literal is bracketed, so the port is what follows the bracket;
+    // anything else splits on the last colon.
+    let port = match authority.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((host, port)) if !host.is_empty() => port.strip_prefix(':'),
+            _ => {
+                return Err(format!(
+                    "machine_identity.control_endpoint {endpoint:?} opens an IPv6 literal it \
+                     never closes"
+                ));
+            }
+        },
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() => Some(port),
+            _ => None,
+        },
+    };
+    match port {
+        Some(port) if port.parse::<u16>().is_ok() => Ok(()),
+        Some(port) => Err(format!(
+            "machine_identity.control_endpoint {endpoint:?} names {port:?} where a port number \
+             belongs"
+        )),
+        None => Err(format!(
+            "machine_identity.control_endpoint {endpoint:?} names no port. This channel has no \
+             default to fall back on - it is not the web, and guessing 443 would dial whatever \
+             else happens to be listening there. Write the port the control plane's [machine] \
+             port is set to"
+        )),
     }
 }
 
@@ -150,6 +270,15 @@ impl Validatable for MachineIdentityConfig {
                 "machine_identity.identity_reload_seconds must be at least 1".to_string(),
             );
         }
+        // The other half of the same rule the missing-file check enforces. An
+        // identity is material for proving who this proxy is to one named
+        // machine; without an address it has no machine to prove it to, and
+        // the process would start, load the certificate, log that it did, and
+        // go on fetching the routing table with the fleet secret it was
+        // configured to stop using.
+        if let Err(reason) = check_control_endpoint(&self.control_endpoint) {
+            return refuse(reason);
+        }
         if let Err(error) = self.expected_control_identity() {
             return refuse(format!(
                 "machine_identity does not name a control plane to expect: {error}. Set \
@@ -178,6 +307,7 @@ mod tests {
             // meant to be a complete, valid table has to set it explicitly.
             identity_reload_seconds: default_identity_reload_seconds(),
             trust_domain: "deis.internal".to_string(),
+            control_endpoint: "https://control.internal:8443".to_string(),
             ..Default::default()
         }
     }
@@ -295,6 +425,7 @@ certificate = "machine/proxy.pem"
 private_key = "machine/proxy-key.pem"
 trust_root = "machine/root.pem"
 trust_domain = "deis.internal"
+control_endpoint = "https://control.internal:8443"
 "#,
         )
         .unwrap();
@@ -304,5 +435,85 @@ trust_domain = "deis.internal"
         );
         assert!(config.control_identity.is_none());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn an_identity_with_nowhere_to_dial_is_refused_by_name() {
+        // The failure this catches is silent otherwise: the certificate
+        // loads, the log says so, and the routing table goes on being
+        // fetched with the fleet secret this table exists to stop using.
+        let config = MachineIdentityConfig {
+            control_endpoint: String::new(),
+            ..filled()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("machine_identity.control_endpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_address_with_nothing_to_prove_is_refused_by_name() {
+        // The mirror image, and the reason the address lives in this table:
+        // one validate() sees both halves, so neither can be written alone.
+        let config = MachineIdentityConfig {
+            certificate: String::new(),
+            private_key: String::new(),
+            trust_root: String::new(),
+            control_endpoint: "https://control.internal:8443".to_string(),
+            ..filled()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("machine_identity.certificate"), "{error}");
+    }
+
+    #[test]
+    fn a_plaintext_control_endpoint_is_refused_rather_than_quietly_upgraded() {
+        // Copying `[control] addr` across is the mistake this catches, and
+        // `http://` must not read as a way to turn the certificates off.
+        for written in ["http://control.internal:8443", "control.internal:8443"] {
+            let config = MachineIdentityConfig {
+                control_endpoint: written.to_string(),
+                ..filled()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("https://"), "{written}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_control_endpoint_without_a_port_is_refused_rather_than_defaulted() {
+        let config = MachineIdentityConfig {
+            control_endpoint: "https://control.internal".to_string(),
+            ..filled()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("no port"), "{error}");
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_control_endpoint_is_usable() {
+        let config = MachineIdentityConfig {
+            control_endpoint: "https://[::1]:8443".to_string(),
+            ..filled()
+        };
+        config.validate().expect("an IPv6 literal names a machine");
+
+        let unclosed = MachineIdentityConfig {
+            control_endpoint: "https://[::1:8443".to_string(),
+            ..filled()
+        };
+        assert!(unclosed.validate().is_err());
+    }
+
+    #[test]
+    fn a_control_endpoint_whose_port_is_not_a_number_is_refused() {
+        let config = MachineIdentityConfig {
+            control_endpoint: "https://control.internal:https".to_string(),
+            ..filled()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("where a port number belongs"), "{error}");
     }
 }

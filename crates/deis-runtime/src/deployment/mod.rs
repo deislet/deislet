@@ -53,7 +53,7 @@ pub use assignments::{
     SyncOutcome,
 };
 pub use credential::NodeCredential;
-pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle};
+pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle, MachineTransport};
 pub use registration::{NodeRegistrar, NodeRegistration, Registered, RegistrationError};
 pub use store::{
     check_identifier, BundleStore, CanonicalTenantConflict, InstalledRecord, InvalidIdentifier,
@@ -381,15 +381,52 @@ pub struct DeploymentManager {
 }
 
 impl DeploymentManager {
+    /// `identity` is what `main` loaded from `[machine_identity]`, or `None`
+    /// on a node that was given none.
+    ///
+    /// It decides one thing: whether a bundle URL that points at the control
+    /// plane's machine listener can be fetched at all. Present, and downloads
+    /// to that listener go out over mutual TLS; absent, every download goes
+    /// out exactly as it did before. Nothing else about this manager changes
+    /// with it.
     pub async fn from_config(
         app_manager: Arc<ApplicationManager>,
         config: &RuntimeConfig,
+        identity: Option<Arc<deis_identity::MachineIdentity>>,
     ) -> anyhow::Result<Self> {
-        let fetcher = BundleFetcher::new(
+        let mut fetcher = BundleFetcher::new(
             Duration::from_secs(config.bundles.download_timeout_secs),
             config.bundles.max_bytes,
             config.node_credential(),
         )?;
+
+        // Both halves or neither: `RuntimeConfig::validate` has already
+        // refused a configuration that sets one without the other, so this
+        // only has to say what to do when both are there.
+        if let (Some(machine_endpoint), Some(identity)) = (
+            config
+                .machine_identity
+                .as_ref()
+                .and_then(|m| m.control_endpoint.as_deref()),
+            identity,
+        ) {
+            let control_identity = config
+                .machine_identity
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "a machine identity was loaded but [machine_identity] is absent from the \
+                         configuration it was loaded from"
+                    )
+                })?
+                .expected_control_identity()?;
+            fetcher = fetcher.over_machine_channel(MachineTransport::new(
+                machine_endpoint,
+                identity,
+                control_identity,
+            )?);
+        }
+
         let store = BundleStore::open(config.bundle_dir()).await?;
         Ok(Self {
             app_manager,

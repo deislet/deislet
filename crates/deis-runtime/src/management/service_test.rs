@@ -60,7 +60,7 @@ async fn service_with(
     let service = RuntimeManagementService::new(
         apps.clone(),
         Arc::new(
-            DeploymentManager::from_config(apps.clone(), &config)
+            DeploymentManager::from_config(apps.clone(), &config, None)
                 .await
                 .unwrap(),
         ),

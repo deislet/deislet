@@ -88,7 +88,33 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # written in terms of hyper-util's `Name`, so a custom resolver has to be
 # implemented against the same crate deno_fetch links; the workspace lock keeps
 # it on the one version already in the graph.
-hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+#
+# "http1" is what the bundle download over the machine channel needs: that
+# transfer is HTTP/1.1 over mutual TLS, and it is made with this crate's legacy
+# client rather than with reqwest. Two reasons, and the second is the one that
+# would still hold if the first were dealt with.
+#
+# reqwest here is on its default TLS backend, which is native-tls -- that is
+# where the openssl in this tree behind `deis-runtime` comes from. Handing it
+# the rustls configuration `deis-identity` builds needs its `rustls-tls`
+# feature, which would put rustls beside native-tls inside one HTTP client:
+# two TLS stacks in the process that already has the rustls deno links, which
+# is the same trap the tokio-tungstenite note below describes.
+#
+# The second reason survives that. reqwest builds its TLS configuration once,
+# when the client is built, and gives no way to supply a connector per
+# connection - so a client built at startup would go on presenting the
+# certificate this node started with, through a renewal and past it, and every
+# connection made after the old one expired would fail at once. The dialler in
+# deis-identity resolves the certificate per connection for exactly that
+# reason, and it needs a client that will take a connector.
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
+# Named directly for the request, response and IO traits that client deals in.
+hyper = { version = "1.7", features = ["client", "http1"] }
+# Reading that response body frame by frame, so the bundle is hashed and
+# written as it arrives rather than buffered whole, exactly as the reqwest path
+# does with its byte stream.
+http-body-util = "0.1"
 
 # WebSocket client, with no TLS backend of its own on purpose.
 #
@@ -144,6 +170,13 @@ sys_traits = "0.1.22"
 sha2 = "0.10"
 
 [dev-dependencies]
+# A certificate authority small enough to hand a test, so the machine-channel
+# transports can be exercised against real material rather than mocked.
+deis-identity-test-pki = { path = "../deis-identity-test-pki" }
+# Only the test listener needs to accept a TLS connection; nothing in this
+# crate's own build does. This is the version deis-identity already links, so
+# it adds nothing to the graph.
+tokio-rustls = "0.26"
 # Test dependencies
 # V8 requires one process-wide parent for its isolate thread families. The
 # pre-main hook also serializes independent libtest bodies; concurrency inside

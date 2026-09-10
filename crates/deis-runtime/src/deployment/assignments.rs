@@ -46,8 +46,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use deis_identity::{Dialler, MachineIdentity};
+use deis_wire::machine::machine_channel_client::MachineChannelClient;
+use deis_wire::machine::{FetchAssignmentsRequest, FetchAssignmentsResponse};
 use deis_wire::{CanonicalId, CanonicalTenantId};
 use serde::Deserialize;
+use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
 use super::credential::NodeCredential;
@@ -274,11 +278,72 @@ impl std::fmt::Display for AssignmentError {
 impl std::error::Error for AssignmentError {}
 
 /// Asks the control plane what this node should run.
+///
+/// # Two transports, one question
+///
+/// The question and the answer are the same either way: which versions this
+/// node should be running, and whether that list is the whole truth. What
+/// differs is the door it is asked at and what the control plane knows about
+/// the caller when it answers.
+///
+/// * [`AssignmentClient::new`] asks over HTTP on the control plane's human
+///   listener, presenting `[control] secret` - the key every node in the fleet
+///   holds. Any holder of that one value can ask for any node's list, secrets
+///   and all.
+/// * [`AssignmentClient::over_machine_channel`] asks over the machine
+///   channel, where the connection itself proves which machine is asking. The
+///   control plane refuses a call whose `node_id` is not the name the
+///   certificate proved, so this node can only ever be handed its own
+///   assignments.
+///
+/// Which one exists is decided once, at startup, by
+/// [`AssignmentClient::from_config`]. A node with no `[machine_identity]`
+/// configured gets the first and behaves in every respect as it did before
+/// this channel existed.
 pub struct AssignmentClient {
-    client: reqwest::Client,
+    transport: Transport,
+    /// What every log line and every error names. For HTTP that is the URL
+    /// being fetched; for the machine channel it is the endpoint followed by
+    /// the RPC's own path, which is literally what goes on the wire over
+    /// HTTP/2 - so either way an operator can match this against the control
+    /// plane's own log.
     url: String,
-    credential: Option<NodeCredential>,
 }
+
+/// How this node asks, and what it proves while asking.
+enum Transport {
+    /// `GET /api/nodes/{node_id}/assignments` with the fleet key in an
+    /// `Authorization` header.
+    Http {
+        client: reqwest::Client,
+        credential: Option<NodeCredential>,
+    },
+    /// `deis.machine.MachineChannel/FetchAssignments` over mutual TLS.
+    Machine {
+        /// Built once, at startup, and kept for the life of the process. It
+        /// is a channel and not a connection: it dials when it is first used
+        /// and redials after a broken one, and the dialler behind it resolves
+        /// the certificate per connection, so a renewal reaches the wire
+        /// without this being rebuilt. Building one per fetch would instead
+        /// pay a fresh TCP connection and a fresh TLS handshake on every
+        /// reconcile interval, on every node, for no gain at all.
+        client: MachineChannelClient<Channel>,
+        /// Kept so a refusal can name what this node proved, which is the
+        /// other half of diagnosing one - and read through the identity
+        /// rather than copied at startup, so it says what the connection
+        /// actually presented after a renewal.
+        identity: Arc<MachineIdentity>,
+        /// The name this node asks about. It has to equal the name in the
+        /// certificate, or the control plane refuses; see
+        /// [`machine_failure`].
+        node_id: String,
+    },
+}
+
+/// The path `FetchAssignments` is addressed at on the wire. gRPC over HTTP/2
+/// is `POST /<package>.<service>/<method>`, so this is the real path and not a
+/// label invented for the log.
+const FETCH_ASSIGNMENTS_PATH: &str = "/deis.machine.MachineChannel/FetchAssignments";
 
 impl AssignmentClient {
     /// `credential` is the node key from `[control] secret`. Without it the
@@ -304,19 +369,186 @@ impl AssignmentClient {
             deis_wire::conventions::node_assignments_path(&urlencode(node_id))
         );
         Ok(Self {
-            client,
+            transport: Transport::Http { client, credential },
             url,
-            credential,
         })
+    }
+
+    /// Ask over the machine channel instead, proving `identity` and refusing
+    /// to talk to anything that cannot prove it is `control_identity`.
+    ///
+    /// No credential is carried and none is wanted: the connection has already
+    /// said which machine is asking, and putting the fleet key on it as well
+    /// would keep alive the exact secret this channel exists to retire.
+    pub fn over_machine_channel(
+        machine_endpoint: &str,
+        node_id: &str,
+        timeout: Duration,
+        identity: Arc<MachineIdentity>,
+        control_identity: deis_identity::SpiffeId,
+    ) -> anyhow::Result<Self> {
+        let endpoint = Endpoint::from_shared(machine_endpoint.to_string())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "control.machine_endpoint {machine_endpoint:?} is not an address this node \
+                     can dial: {e}"
+                )
+            })?
+            // The same ceiling `[control] request_timeout_secs` puts on the
+            // HTTP fetch, applied to the same question: one that hangs is one
+            // this node stops waiting on and retries.
+            .timeout(timeout)
+            .connect_timeout(timeout);
+
+        // gRPC runs on HTTP/2 and on nothing else, so that is what the
+        // handshake asks for. Stating it is not decoration - see
+        // `deis_identity::Protocol`.
+        let dialler = Dialler::new(
+            Arc::clone(&identity),
+            control_identity,
+            &[deis_identity::Protocol::Http2],
+        );
+
+        // Lazily, so a control plane that is not up yet is a failed fetch that
+        // retries rather than a node that refuses to start. This matches what
+        // the HTTP client does: neither one connects while it is being built.
+        let client = MachineChannelClient::new(endpoint.connect_with_connector_lazy(dialler));
+
+        Ok(Self {
+            transport: Transport::Machine {
+                client,
+                identity,
+                node_id: node_id.to_string(),
+            },
+            url: format!(
+                "{}{FETCH_ASSIGNMENTS_PATH}",
+                machine_endpoint.trim_end_matches('/')
+            ),
+        })
+    }
+
+    /// The machine transport over a channel somebody else built.
+    ///
+    /// For the harness. A test can put a real `MachineChannel` server on a
+    /// plain socket and drive this client against it, which is what covers the
+    /// decode, the refusal and the error mapping without a certificate
+    /// authority in the loop; the handshake itself is covered where it lives,
+    /// against the control plane's own listener. The only difference from
+    /// [`Self::over_machine_channel`] is who dialled.
+    #[cfg(test)]
+    pub(crate) fn over_channel(
+        channel: Channel,
+        node_id: &str,
+        identity: Arc<MachineIdentity>,
+        url: String,
+    ) -> Self {
+        Self {
+            transport: Transport::Machine {
+                client: MachineChannelClient::new(channel),
+                identity,
+                node_id: node_id.to_string(),
+            },
+            url,
+        }
+    }
+
+    /// The client this configuration calls for, or `None` when this node was
+    /// told about no control plane at all and so asks nobody.
+    ///
+    /// `identity` is what `main` loaded from `[machine_identity]`. The two
+    /// halves are required together by `RuntimeConfig::validate`, so the
+    /// mismatched cases below are a startup that skipped that check rather
+    /// than anything an operator can write; they are refused instead of
+    /// quietly falling back, because falling back would mean a node that was
+    /// configured for mutual TLS going on using the fleet key with nothing in
+    /// any log to say so.
+    pub fn from_config(
+        config: &crate::config::RuntimeConfig,
+        node_id: &str,
+        identity: Option<Arc<MachineIdentity>>,
+    ) -> anyhow::Result<Option<Self>> {
+        let timeout = Duration::from_secs(config.control.request_timeout_secs);
+        match (
+            config
+                .machine_identity
+                .as_ref()
+                .and_then(|m| m.control_endpoint.as_deref()),
+            identity,
+        ) {
+            (Some(machine_endpoint), Some(identity)) => {
+                let control_identity = config
+                    .machine_identity
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "a machine identity was loaded but [machine_identity] is absent from \
+                             the configuration it was loaded from"
+                        )
+                    })?
+                    .expected_control_identity()?;
+                Ok(Some(Self::over_machine_channel(
+                    machine_endpoint,
+                    node_id,
+                    timeout,
+                    identity,
+                    control_identity,
+                )?))
+            }
+            (Some(machine_endpoint), None) => Err(anyhow::anyhow!(
+                "control.machine_endpoint is {machine_endpoint:?} but this node has no machine \
+                 identity loaded, so it could not complete a handshake with that listener"
+            )),
+            (None, Some(_)) => Err(anyhow::anyhow!(
+                "this node loaded a machine identity but control.machine_endpoint is not set, so \
+                 there is nowhere to present it"
+            )),
+            (None, None) => match config.control.endpoint.as_deref() {
+                Some(endpoint) => Ok(Some(Self::new(
+                    endpoint,
+                    node_id,
+                    timeout,
+                    config.control.credential(),
+                )?)),
+                None => Ok(None),
+            },
+        }
     }
 
     pub fn url(&self) -> &str {
         &self.url
     }
 
+    /// How this node is asking, for the one startup line that says so.
+    pub fn transport_name(&self) -> &'static str {
+        match self.transport {
+            Transport::Http { .. } => "HTTP with the shared fleet key",
+            Transport::Machine { .. } => "the machine channel, over mutual TLS",
+        }
+    }
+
     pub async fn fetch(&self) -> Result<AssignmentList, AssignmentError> {
-        let mut request = self.client.get(&self.url);
-        if let Some(credential) = &self.credential {
+        match &self.transport {
+            Transport::Http { client, credential } => {
+                self.fetch_over_http(client, credential.as_ref()).await
+            }
+            Transport::Machine {
+                client,
+                identity,
+                node_id,
+            } => {
+                self.fetch_over_machine_channel(client, identity, node_id)
+                    .await
+            }
+        }
+    }
+
+    async fn fetch_over_http(
+        &self,
+        client: &reqwest::Client,
+        credential: Option<&NodeCredential>,
+    ) -> Result<AssignmentList, AssignmentError> {
+        let mut request = client.get(&self.url);
+        if let Some(credential) = credential {
             request = request.header(reqwest::header::AUTHORIZATION, credential.header_value());
         }
 
@@ -331,7 +563,7 @@ impl AssignmentClient {
         if !response.status().is_success() {
             let code = response.status().as_u16();
             if code == 401 || code == 403 {
-                let has_credential = self.credential.is_some();
+                let has_credential = credential.is_some();
                 error!(
                     url = %self.url,
                     code,
@@ -379,6 +611,147 @@ impl AssignmentClient {
             complete,
             withheld,
         })
+    }
+
+    async fn fetch_over_machine_channel(
+        &self,
+        client: &MachineChannelClient<Channel>,
+        identity: &MachineIdentity,
+        node_id: &str,
+    ) -> Result<AssignmentList, AssignmentError> {
+        // tonic's generated client takes `&mut self` per call, and it is a
+        // handle rather than a connection: this clone shares the one channel
+        // built at startup, and with it whatever connection that channel
+        // already has open.
+        let mut client = client.clone();
+        let answer = client
+            .fetch_assignments(FetchAssignmentsRequest {
+                node_id: node_id.to_string(),
+            })
+            .await
+            .map_err(|status| {
+                machine_failure(&self.url, node_id, &identity.id().to_string(), &status)
+            })?;
+
+        decode_machine_answer(&self.url, answer.into_inner())
+    }
+}
+
+/// Turn what the RPC carries into the same answer the HTTP route produces.
+///
+/// The payload did not move when the transport did: `assignments_json` is the
+/// identical JSON array the HTTP route served, so this is the whole decode.
+///
+/// `complete` is an explicit field here and was a header there, and both mean
+/// exactly the same thing - whether the list may be acted on for removal. On
+/// HTTP an absent header is read as false on purpose, because a control plane
+/// too old to send it cannot promise anything; on the RPC the field is always
+/// present, so it is read straight and needs no such rule. A node must remove
+/// nothing on the strength of an answer whose `complete` is false, whichever
+/// door the answer came through.
+fn decode_machine_answer(
+    url: &str,
+    answer: FetchAssignmentsResponse,
+) -> Result<AssignmentList, AssignmentError> {
+    let assignments =
+        serde_json::from_str::<Vec<Assignment>>(&answer.assignments_json).map_err(|e| {
+            AssignmentError::Malformed {
+                url: url.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    Ok(AssignmentList {
+        assignments,
+        complete: answer.complete,
+        withheld: answer.withheld,
+    })
+}
+
+/// Put a failed RPC into the taxonomy an operator already diagnoses this node
+/// from.
+///
+/// The three classes are what the logs and the runbooks are written around, so
+/// a gRPC failure is placed in one of them rather than given a fourth:
+///
+/// * a call that never reached a control plane willing to answer - a refused
+///   connection, a handshake that failed, a deadline, a cancelled call - is
+///   `Transport`, which is the same thing the HTTP client reports when the
+///   socket does not open.
+/// * anything the control plane answered with a status is `Status`, carrying
+///   the HTTP code gRPC's own specification maps that code onto, so that
+///   "refused this node's credential" reads as 401/403 whichever transport it
+///   arrived on.
+///
+/// `PERMISSION_DENIED` gets its own message because it is not a fault of the
+/// network or of the control plane: it means this node asked for a node it is
+/// not. The connection proved one name and the request named another, so both
+/// names are in the line - without them an operator is left with a bare
+/// "permission denied" and no way to see that the certificate and the
+/// configured `node_id` disagree.
+fn machine_failure(
+    url: &str,
+    asked_for: &str,
+    proving: &str,
+    status: &tonic::Status,
+) -> AssignmentError {
+    use tonic::Code;
+
+    match status.code() {
+        Code::PermissionDenied => {
+            error!(
+                url = %url,
+                asked_for = %asked_for,
+                proving = %proving,
+                message = status.message(),
+                "The control plane refused to hand this node another node's assignments: the \
+                 connection proved one name and the request asked about a different one. A node \
+                 may only fetch its own list, so this node gets none at all and picks up no new \
+                 version. Either node_id is wrong for the certificate in [machine_identity], or \
+                 the certificate is the wrong machine's"
+            );
+            AssignmentError::Status {
+                url: url.to_string(),
+                code: 403,
+            }
+        }
+        Code::Unauthenticated => {
+            error!(
+                url = %url,
+                proving = %proving,
+                message = status.message(),
+                "The control plane would not authenticate this node on the machine channel, so \
+                 this node gets no assignment list at all: it keeps serving whatever it already \
+                 had and picks up no new version. Check that the certificate in \
+                 [machine_identity] is one this fleet's trust root signed and that it has not \
+                 expired"
+            );
+            AssignmentError::Status {
+                url: url.to_string(),
+                code: 401,
+            }
+        }
+        // No answer from a serving control plane, which is what a refused
+        // socket is on the HTTP side. The message is kept because it is where
+        // a handshake failure says which certificate it did not like.
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Unknown => {
+            AssignmentError::Transport {
+                url: url.to_string(),
+                reason: format!("{}: {}", status.code(), status.message()),
+            }
+        }
+        code => AssignmentError::Status {
+            url: url.to_string(),
+            code: match code {
+                Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => 400,
+                Code::NotFound => 404,
+                Code::AlreadyExists | Code::Aborted => 409,
+                Code::ResourceExhausted => 429,
+                Code::Unimplemented => 501,
+                // Internal, DataLoss and anything a later gRPC version adds.
+                _ => 500,
+            },
+        },
     }
 }
 

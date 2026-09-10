@@ -20,9 +20,14 @@
 //! # Poll, not push
 //!
 //! deis-proxy asks the control plane for the whole table every
-//! `routing.control_poll_interval_secs` seconds
-//! (`GET /api/routing-table`, authenticated with the same
-//! `node_preshared_keys` value the gRPC control channel already uses).
+//! `routing.control_poll_interval_secs` seconds. A proxy with a
+//! `[machine_identity]` table asks over the control plane's machine channel,
+//! as `deis.machine.MachineChannel/FetchRoutingTable`, proving a certificate
+//! that names this proxy alone; one without asks the way it always has, `GET
+//! /api/routing-table` authenticated with the same `node_preshared_keys`
+//! value the gRPC control channel already uses. The document, and everything
+//! below about what is done with it, is the same either way - see
+//! [`client`] for why the transport is the only difference.
 //!
 //! The alternatives were a push down the gRPC channel that is already open,
 //! and reading the control plane's SQLite file directly. Both were rejected:
@@ -88,7 +93,7 @@ pub mod service;
 pub mod table;
 pub mod wire;
 
-pub use client::{CatalogClient, ControlEndpoint, FetchError};
+pub use client::{CatalogClient, ControlEndpoint, FetchError, routing_table_client};
 pub use service::CatalogPoller;
 pub use table::{CatalogRoutes, Match, MatchSource, PreviewZone, Target};
 pub use wire::{ROUTING_TABLE_PATH, RoutingTableDocument};

@@ -214,6 +214,12 @@ max_pending_entries = 10000
 [control]
 # endpoint = "http://127.0.0.1:8080"
 
+# The control plane's machine channel is configured in [machine_identity]
+# below, address included: what this node proves and where it proves it are two
+# halves of one act, and keeping them apart let one be set without the other.
+# Registration and deregistration stay on the endpoint above either way - they
+# are still HTTP routes guarded by the fleet key, and they have not moved yet.
+
 # One of the control plane's node_preshared_keys. The assignment list carries
 # this node's decrypted secrets, so a control plane that has node keys
 # configured refuses to serve it - and the bundle download - to a caller that
@@ -357,3 +363,23 @@ allow = []
 # pre-flight check on the URL, and the refusal of this platform's own
 # endpoints, are unaffected. The trade is logged at warn on every start.
 proxy_from_env = false
+
+# This node's identity on the control plane's machine channel, and where that
+# channel is. Leave the whole section out - the default - and this node fetches
+# its assignments and its bundles over [control] endpoint with the shared fleet
+# key, exactly as it always has.
+#
+# All of it or none of it: a certificate with nowhere to present it, and an
+# address with nothing to prove when it gets there, are both useless in a way
+# nothing notices until the first dial, so a half-filled section is refused at
+# startup by name.
+#
+# Nothing here issues or renews these files. The three are re-read on the
+# interval below, so a renewal needs no restart.
+# [machine_identity]
+# control_endpoint = "https://127.0.0.1:8443"
+# certificate = "/etc/deislet/node.crt"
+# private_key = "/etc/deislet/node.key"
+# trust_root = "/etc/deislet/fleet-root.pem"
+# trust_domain = "deis.internal"
+# identity_reload_seconds = 60

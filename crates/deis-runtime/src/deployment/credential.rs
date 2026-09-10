@@ -81,7 +81,14 @@ impl NodeCredential {
 /// The default port is filled in so `http://host` and `http://host:80` are one
 /// origin, and userinfo is dropped so a credential in the URL cannot make the
 /// same host look like a different one.
-fn origin_of(url: &str) -> Option<String> {
+///
+/// Shared with [`super::fetch`], which asks the same question about a bundle
+/// URL for a different reason - whether it is on the machine listener this
+/// node was configured with, and so whether the download speaks mutual TLS.
+/// Two spellings of "is this the host we were pointed at" would eventually
+/// disagree, and then a node would present a credential on a connection it
+/// had decided was somebody else's, or the reverse.
+pub(super) fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
     let authority = rest

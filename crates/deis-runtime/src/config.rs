@@ -401,6 +401,27 @@ pub struct MachineIdentityConfig {
     #[serde(default)]
     pub trust_domain: Option<String>,
 
+    /// Where the control plane's machine channel is, as this node dials it -
+    /// `https://host:port`.
+    ///
+    /// # Why the address lives with the identity and not with `[control]`
+    ///
+    /// A certificate and a destination are the two halves of one act: prove
+    /// this, to that. Kept apart, each can be configured without the other,
+    /// and both halves alone are useless in a way nothing notices until the
+    /// first dial - an identity with nowhere to present it, or an address
+    /// with nothing to prove. Kept in one table, "all of it or none of it" is
+    /// a rule this table enforces about itself, and there is no second place
+    /// that has to remember to cross-check.
+    ///
+    /// It is a different port from `[control] endpoint`, which is the human
+    /// listener. Registration and deregistration stay there either way: they
+    /// are still HTTP routes guarded by the fleet key and have not moved, so
+    /// a node with a machine channel configured uses it for what is on it and
+    /// the old path for what is not.
+    #[serde(default)]
+    pub control_endpoint: Option<String>,
+
     /// Explicit override of the control plane's expected SPIFFE identity,
     /// e.g. `spiffe://deis.internal/deislet/control`. Wins over `trust_domain`
     /// when both are set.
@@ -419,6 +440,7 @@ impl Default for MachineIdentityConfig {
             private_key: None,
             trust_root: None,
             identity_reload_seconds: default_identity_reload_seconds(),
+            control_endpoint: None,
             trust_domain: None,
             control_identity: None,
         }
@@ -1213,6 +1235,12 @@ impl RuntimeConfig {
             self.control.endpoint = Some(value);
         }
 
+        if let Some(value) = env_var("DEIS_RUNTIME_MACHINE_IDENTITY_CONTROL_ENDPOINT") {
+            self.machine_identity
+                .get_or_insert_with(Default::default)
+                .control_endpoint = Some(value);
+        }
+
         if let Some(value) = env_var("DEIS_RUNTIME_CONTROL_REQUEST_TIMEOUT_SECS") {
             self.control.request_timeout_secs = parse_env(
                 &value,
@@ -1497,7 +1525,25 @@ impl RuntimeConfig {
         self.control.validate()?;
         if let Some(identity) = &self.machine_identity {
             identity.validate()?;
+
+            // Registration has not moved to the machine channel yet: it is
+            // still an HTTP route on the human listener, guarded by the fleet
+            // key. A node with only a machine channel would therefore fetch
+            // its assignments perfectly well and never announce itself, so
+            // the control plane would never push it a deployment and never
+            // fire it a cron occurrence - and nothing about that looks like a
+            // failure from either side.
+            if self.control.endpoint.is_none() {
+                return Err(anyhow!(
+                    "[machine_identity] is configured but control.endpoint is not. Registration \
+                     is still an HTTP route on the control plane's human listener, so without \
+                     that address this node can fetch what it is assigned but can never announce \
+                     itself - it would take no deployment push and no cron fire, while looking \
+                     healthy throughout. Set control.endpoint as well"
+                ));
+            }
         }
+
         self.management.validate()?;
         self.bundles.validate()?;
         self.assets.validate()?;
@@ -1633,6 +1679,47 @@ impl MachineIdentityConfig {
     /// handshake refused because the peer name was never resolved - is
     /// refused here instead, against the setting that is actually wrong.
     fn validate(&self) -> Result<()> {
+        // The address and the files are one setting. A certificate with
+        // nowhere to present it, and an address with nothing to prove when it
+        // gets there, are both useless in a way nothing notices until the
+        // first dial - so they are refused together, here, because this table
+        // is the only thing that has to see both.
+        if self.control_endpoint.is_none() {
+            return Err(anyhow!(
+                "machine_identity.control_endpoint is required. It is where the control plane's \
+                 machine listener is - a different port from [control] endpoint, which is the \
+                 human one - and without it this node would load its certificate, log that it \
+                 had, and go on fetching its assignments over the shared fleet key exactly as \
+                 before"
+            ));
+        }
+        if let Some(endpoint) = self.control_endpoint.as_deref() {
+            if endpoint.trim().is_empty() {
+                return Err(anyhow!(
+                    "machine_identity.control_endpoint is empty; either remove it - along with the \
+                     [machine_identity] section, which is useless without it - or set it to the \
+                     control plane's machine listener, e.g. https://127.0.0.1:8443"
+                ));
+            }
+            if !endpoint.starts_with("https://") {
+                return Err(anyhow!(
+                    "machine_identity.control_endpoint {endpoint:?} is not an https:// URL; the machine \
+                     channel is mutual TLS on every route it carries, and an http:// spelling of \
+                     it would also stop this node recognising the bundle URLs the control plane \
+                     hands out as belonging to that listener, so those downloads would go out \
+                     over plain HTTP and be refused"
+                ));
+            }
+            if !names_an_explicit_port(endpoint) {
+                return Err(anyhow!(
+                    "machine_identity.control_endpoint {endpoint:?} names no port. This channel has no \
+                     default port to fall back on: it is not the web, and guessing 443 would \
+                     dial whatever else happens to be listening there. Add the port the control \
+                     plane's [machine] listen is bound to"
+                ));
+            }
+        }
+
         let missing: Vec<&str> = [
             ("certificate", self.certificate.is_none()),
             ("private_key", self.private_key.is_none()),
@@ -1855,6 +1942,35 @@ fn reject_removed_env_vars() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `endpoint` spells a port out.
+///
+/// The machine channel's dialler refuses a URI without one - it has no default
+/// port to fall back on, and guessing 443 would dial whatever else is
+/// listening there - so an address missing it fails on every connection
+/// attempt rather than at startup. This is what lets that be said once, in an
+/// error naming the setting.
+///
+/// Only the authority is looked at, and an IPv6 literal's own colons do not
+/// count: only digits after the closing bracket are a port.
+fn names_an_explicit_port(endpoint: &str) -> bool {
+    let Some((_, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    let Some(authority) = rest.split(['/', '?', '#']).next().filter(|a| !a.is_empty()) else {
+        return false;
+    };
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    match authority.rfind(':') {
+        Some(index) => {
+            let port = &authority[index + 1..];
+            !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -2507,14 +2623,12 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_a_machine_identity_missing_its_key_and_trust_root() {
-        let config = RuntimeConfig {
-            machine_identity: Some(MachineIdentityConfig {
-                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
-                trust_domain: Some("deis.internal".to_string()),
-                ..MachineIdentityConfig::default()
-            }),
-            ..RuntimeConfig::default()
-        };
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            trust_domain: Some("deis.internal".to_string()),
+            control_endpoint: Some("https://control.internal:8443".to_string()),
+            ..MachineIdentityConfig::default()
+        });
         let err = config.validate().unwrap_err().to_string();
         // Names both missing files in one pass, and not the one that was
         // already set.
@@ -2523,15 +2637,13 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_a_machine_identity_with_no_way_to_name_the_control_plane() {
-        let config = RuntimeConfig {
-            machine_identity: Some(MachineIdentityConfig {
-                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
-                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
-                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
-                ..MachineIdentityConfig::default()
-            }),
-            ..RuntimeConfig::default()
-        };
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            control_endpoint: Some("https://control.internal:8443".to_string()),
+            ..MachineIdentityConfig::default()
+        });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("trust_domain"), "{err}");
         assert!(err.contains("control_identity"), "{err}");
@@ -2539,64 +2651,56 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_a_trust_domain_that_is_not_a_valid_spiffe_segment() {
-        let config = RuntimeConfig {
-            machine_identity: Some(MachineIdentityConfig {
-                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
-                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
-                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
-                trust_domain: Some("Not A Domain".to_string()),
-                ..MachineIdentityConfig::default()
-            }),
-            ..RuntimeConfig::default()
-        };
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            trust_domain: Some("Not A Domain".to_string()),
+            control_endpoint: Some("https://control.internal:8443".to_string()),
+            ..MachineIdentityConfig::default()
+        });
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validate_rejects_a_malformed_control_identity_override() {
-        let config = RuntimeConfig {
-            machine_identity: Some(MachineIdentityConfig {
-                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
-                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
-                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
-                control_identity: Some("not-a-spiffe-uri".to_string()),
-                ..MachineIdentityConfig::default()
-            }),
-            ..RuntimeConfig::default()
-        };
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            control_identity: Some("not-a-spiffe-uri".to_string()),
+            control_endpoint: Some("https://control.internal:8443".to_string()),
+            ..MachineIdentityConfig::default()
+        });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("control_identity"), "{err}");
     }
 
     #[test]
     fn test_validate_rejects_a_zero_identity_reload_interval() {
-        let config = RuntimeConfig {
-            machine_identity: Some(MachineIdentityConfig {
-                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
-                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
-                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
-                trust_domain: Some("deis.internal".to_string()),
-                identity_reload_seconds: 0,
-                ..MachineIdentityConfig::default()
-            }),
-            ..RuntimeConfig::default()
-        };
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            trust_domain: Some("deis.internal".to_string()),
+            identity_reload_seconds: 0,
+            control_endpoint: Some("https://control.internal:8443".to_string()),
+            ..MachineIdentityConfig::default()
+        });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("identity_reload_seconds"), "{err}");
     }
 
     #[test]
     fn test_validate_accepts_a_complete_machine_identity_derived_from_a_trust_domain() {
-        let config = RuntimeConfig {
-            machine_identity: Some(MachineIdentityConfig {
-                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
-                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
-                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
-                trust_domain: Some("deis.internal".to_string()),
-                ..MachineIdentityConfig::default()
-            }),
-            ..RuntimeConfig::default()
-        };
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            trust_domain: Some("deis.internal".to_string()),
+            control_endpoint: Some("https://control.internal:8443".to_string()),
+            ..MachineIdentityConfig::default()
+        });
         config
             .validate()
             .expect("a complete section must be accepted");
@@ -2617,17 +2721,15 @@ mod tests {
         // Both set at once is not a conflict this refuses: `control_identity`
         // is the named escape hatch for whatever the derivation cannot cover,
         // so it simply wins - see the struct doc.
-        let config = RuntimeConfig {
-            machine_identity: Some(MachineIdentityConfig {
-                certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
-                private_key: Some(PathBuf::from("/etc/deislet/node.key")),
-                trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
-                trust_domain: Some("wrong.internal".to_string()),
-                control_identity: Some("spiffe://deis.internal/deislet/control".to_string()),
-                ..MachineIdentityConfig::default()
-            }),
-            ..RuntimeConfig::default()
-        };
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            trust_domain: Some("wrong.internal".to_string()),
+            control_identity: Some("spiffe://deis.internal/deislet/control".to_string()),
+            control_endpoint: Some("https://control.internal:8443".to_string()),
+            ..MachineIdentityConfig::default()
+        });
         config
             .validate()
             .expect("a complete section must be accepted");
@@ -2643,6 +2745,129 @@ mod tests {
         );
     }
 
+    /// The three files plus a trust domain, and no address: a node that would
+    /// have loaded a certificate, logged that it had, and gone on using the
+    /// shared fleet key for everything. Refused, naming both settings, because
+    /// the operator who wrote the section believes the opposite.
+    #[test]
+    fn test_validate_rejects_an_identity_with_nowhere_to_dial() {
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            trust_domain: Some("deis.internal".to_string()),
+            ..MachineIdentityConfig::default()
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("machine_identity.control_endpoint"), "{err}");
+    }
+
+    /// The mirror image - an address to dial with nothing to prove when it
+    /// gets there - cannot be written down at all, which is why there is no
+    /// test for it and why the address lives in this table. It used to be a
+    /// key on `[control]`, where the two halves could be configured apart
+    /// and a rule somewhere else had to remember to compare them.
+    /// A node that can be told what to run but can never say it exists.
+    /// Registration has not moved to the machine channel, so the old address
+    /// is still required alongside it.
+    #[test]
+    fn test_validate_rejects_a_machine_channel_with_no_way_to_register() {
+        let config = RuntimeConfig {
+            machine_identity: Some(complete_identity()),
+            control: ControlPlaneConfig {
+                endpoint: None,
+                ..ControlPlaneConfig::default()
+            },
+            ..RuntimeConfig::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("control.endpoint"), "{err}");
+        assert!(err.contains("announce itself"), "{err}");
+    }
+
+    #[test]
+    fn test_a_configuration_with_no_machine_channel_is_still_valid() {
+        RuntimeConfig::default()
+            .validate()
+            .expect("a node with no machine channel configured is the ordinary case");
+    }
+
+    #[test]
+    fn test_validate_rejects_a_machine_endpoint_that_is_not_tls() {
+        let config = with_machine_channel(MachineIdentityConfig {
+            control_endpoint: Some("http://control.internal:8443".to_string()),
+            ..complete_identity()
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("https://"), "{err}");
+    }
+
+    /// The dialler has no default port, so an address without one fails on
+    /// every connection instead of at startup. An IPv6 literal is the case
+    /// that has to be got right rather than merely rejected: its own colons
+    /// are not a port, and its bracketed form with a port is ordinary.
+    #[test]
+    fn test_validate_rejects_a_machine_endpoint_with_no_port() {
+        let at = |endpoint: &str| {
+            with_machine_channel(MachineIdentityConfig {
+                control_endpoint: Some(endpoint.to_string()),
+                ..complete_identity()
+            })
+        };
+
+        let err = at("https://control.internal")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names no port"), "{err}");
+
+        assert!(
+            at("https://[::1]").validate().is_err(),
+            "an IPv6 literal's own colons are not a port"
+        );
+
+        at("https://[::1]:8443")
+            .validate()
+            .expect("a bracketed IPv6 address with a port is an ordinary machine endpoint");
+    }
+
+    /// Neither half set is the default and the only configuration that must
+    /// keep behaving in every respect as it did before the machine channel
+    /// existed.
+    #[test]
+    fn test_validate_accepts_a_node_with_neither_half_of_the_machine_channel() {
+        let config = RuntimeConfig::default();
+        assert!(config.machine_identity.is_none());
+        assert!(config.machine_identity.is_none());
+        config.validate().expect("the default must stay valid");
+    }
+
+    /// A node with a machine channel is still a node that has to register,
+    /// and registration has not moved off the human listener - so a valid
+    /// configuration carries both addresses. Tests about the machine channel
+    /// say only what they are about and take the rest from here.
+    fn with_machine_channel(identity: MachineIdentityConfig) -> RuntimeConfig {
+        RuntimeConfig {
+            machine_identity: Some(identity),
+            control: ControlPlaneConfig {
+                endpoint: Some("http://control.internal:8080".to_string()),
+                ..ControlPlaneConfig::default()
+            },
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn complete_identity() -> MachineIdentityConfig {
+        MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            trust_domain: Some("deis.internal".to_string()),
+            control_endpoint: Some("https://control.internal:8443".to_string()),
+            ..MachineIdentityConfig::default()
+        }
+    }
+
     #[test]
     fn test_machine_identity_config_defaults_the_reload_interval() {
         let identity = MachineIdentityConfig::default();
@@ -2656,7 +2881,11 @@ mod tests {
         std::fs::write(
             &path,
             r#"
+            [control]
+            endpoint = "http://127.0.0.1:8080"
+
             [machine_identity]
+            control_endpoint = "https://127.0.0.1:8443"
             certificate = "/etc/deislet/node.crt"
             private_key = "/etc/deislet/node.key"
             trust_root = "/etc/deislet/root.pem"
@@ -2668,6 +2897,13 @@ mod tests {
 
         let config = RuntimeConfig::load_from(&path).expect("must parse");
         config.validate().expect("must validate");
+        assert_eq!(
+            config
+                .machine_identity
+                .as_ref()
+                .and_then(|m| m.control_endpoint.as_deref()),
+            Some("https://127.0.0.1:8443")
+        );
         let identity = config.machine_identity.expect("section must be read");
         assert_eq!(
             identity.certificate,
@@ -2690,6 +2926,10 @@ mod tests {
             "deis.internal",
         );
         env::set_var("DEIS_RUNTIME_MACHINE_IDENTITY_RELOAD_SECONDS", "10");
+        env::set_var(
+            "DEIS_RUNTIME_MACHINE_IDENTITY_CONTROL_ENDPOINT",
+            "https://127.0.0.1:8443",
+        );
 
         let mut config = RuntimeConfig::default();
         let result = config.apply_env_overrides();
@@ -2699,8 +2939,12 @@ mod tests {
         env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_ROOT");
         env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_DOMAIN");
         env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_RELOAD_SECONDS");
+        env::remove_var("DEIS_RUNTIME_MACHINE_IDENTITY_CONTROL_ENDPOINT");
 
         result.unwrap();
+        // Registration still lives on the human listener, and validate now says
+        // so; this test is about the env overrides, not about that rule.
+        config.control.endpoint = Some("http://127.0.0.1:8080".to_string());
         let identity = config
             .machine_identity
             .as_ref()
@@ -2710,6 +2954,13 @@ mod tests {
         assert_eq!(identity.trust_root, Some(PathBuf::from("/env/root.pem")));
         assert_eq!(identity.trust_domain.as_deref(), Some("deis.internal"));
         assert_eq!(identity.identity_reload_seconds, 10);
+        assert_eq!(
+            config
+                .machine_identity
+                .as_ref()
+                .and_then(|m| m.control_endpoint.as_deref()),
+            Some("https://127.0.0.1:8443")
+        );
         config
             .validate()
             .expect("the env-built section must validate");

@@ -167,3 +167,230 @@ async fn reports_a_control_plane_that_is_not_there() {
 
     assert!(matches!(err, FetchError::Transport { .. }), "{err}");
 }
+
+// ---- the machine channel -------------------------------------------------
+
+use std::net::SocketAddr as MachineAddr;
+
+use deis_identity::{names, IdentityFiles, MachineIdentity, Protocol, SpiffeId};
+use deis_identity_test_pki::{write_files, TestCa};
+use tokio::io::AsyncReadExt;
+
+const TRUST_DOMAIN: &str = "deis.internal";
+
+/// Both ends of a fleet: the machine listener's identity and one node's.
+struct Fleet {
+    control: Arc<MachineIdentity>,
+    control_id: SpiffeId,
+    node: Arc<MachineIdentity>,
+    /// The files stay on disk for as long as a test runs; an identity re-reads
+    /// them on a reload and a dropped directory would take them away.
+    _directory: tempfile::TempDir,
+}
+
+fn fleet() -> Fleet {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().unwrap();
+
+    let control_id = names::control(TRUST_DOMAIN).unwrap();
+    let control_files = write_files(
+        directory.path(),
+        "control",
+        &ca.issue(&control_id),
+        &ca.root_pem,
+    );
+    // The listener carries a file transfer and says so at the handshake, which
+    // is what the node's dialler asks for.
+    let control = Arc::new(
+        MachineIdentity::load(control_files.as_identity_files(), &[Protocol::Http11]).unwrap(),
+    );
+
+    let node_id = names::node(TRUST_DOMAIN, "node-a").unwrap();
+    let node_files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
+    let node = Arc::new(
+        MachineIdentity::load(
+            IdentityFiles::new(
+                node_files.certificate.clone(),
+                node_files.private_key.clone(),
+                node_files.trust_root.clone(),
+            ),
+            &[],
+        )
+        .unwrap(),
+    );
+
+    Fleet {
+        control,
+        control_id,
+        node,
+        _directory: directory,
+    }
+}
+
+/// A machine listener that answers any request with one fixed body.
+///
+/// The response is written by hand rather than served by a real HTTP server:
+/// what is under test is this crate's client - the connector, the ceiling, the
+/// hashing - and a server here would only need a second HTTP stack to say
+/// "200, this many bytes, these bytes".
+async fn machine_listener(identity: Arc<MachineIdentity>, body: Vec<u8>) -> MachineAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(identity.server_config());
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    // A client that could not prove a name never gets here,
+                    // which is the point of the listener.
+                    return;
+                };
+
+                // Read to the end of the request head; nothing in it is worth
+                // parsing, because this listener has one answer.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match tls.read(&mut byte).await {
+                        Ok(1) => head.extend_from_slice(&byte),
+                        _ => return,
+                    }
+                }
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/zip\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.write_all(&body).await;
+                let _ = tls.flush().await;
+            });
+        }
+    });
+
+    address
+}
+
+fn machine_fetcher(fleet: &Fleet, machine_endpoint: &str, max_bytes: u64) -> BundleFetcher {
+    BundleFetcher::new(Duration::from_secs(10), max_bytes, None)
+        .unwrap()
+        .over_machine_channel(
+            MachineTransport::new(
+                machine_endpoint,
+                Arc::clone(&fleet.node),
+                fleet.control_id.clone(),
+            )
+            .unwrap(),
+        )
+}
+
+/// The whole path: a listener that will not talk to an unnamed caller, a node
+/// that proves a name to reach it, and a bundle that arrives and hashes to
+/// what was promised.
+#[tokio::test]
+async fn a_bundle_on_the_machine_listener_is_downloaded_over_mutual_tls() {
+    let fleet = fleet();
+    let body = b"a bundle, delivered over a connection that proved both ends".to_vec();
+    let address = machine_listener(Arc::clone(&fleet.control), body.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let temp = dir.path().join("incoming.part");
+    let fetcher = machine_fetcher(&fleet, &format!("https://{address}"), 1024);
+
+    let fetched = fetcher
+        .fetch(
+            &format!("https://{address}/bundle"),
+            &sha256_hex(&body),
+            &temp,
+        )
+        .await
+        .expect("the bundle could not be fetched over the machine channel");
+
+    assert_eq!(fetched.bytes, body.len() as u64);
+    assert_eq!(fetched.sha256, sha256_hex(&body));
+    assert_eq!(std::fs::read(&temp).unwrap(), body);
+}
+
+/// The ceiling is the node's, not the transport's: a declared length over it is
+/// refused before a byte is written, whichever door the bundle came through.
+#[tokio::test]
+async fn the_size_ceiling_still_applies_over_the_machine_channel() {
+    let fleet = fleet();
+    let body = vec![b'x'; 4096];
+    let address = machine_listener(Arc::clone(&fleet.control), body.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let temp = dir.path().join("incoming.part");
+    let fetcher = machine_fetcher(&fleet, &format!("https://{address}"), 128);
+
+    let err = fetcher
+        .fetch(
+            &format!("https://{address}/bundle"),
+            &sha256_hex(&body),
+            &temp,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, FetchError::TooLarge { limit: 128, .. }),
+        "{err}"
+    );
+    assert!(!temp.exists(), "a refused download left its partial file");
+}
+
+/// A digest that does not match is refused over this transport too, and the
+/// bytes are discarded without anything opening them.
+#[tokio::test]
+async fn a_bundle_that_is_not_what_was_promised_is_refused_over_the_machine_channel() {
+    let fleet = fleet();
+    let body = b"not the bundle the control plane described".to_vec();
+    let address = machine_listener(Arc::clone(&fleet.control), body).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let temp = dir.path().join("incoming.part");
+    let fetcher = machine_fetcher(&fleet, &format!("https://{address}"), 1024);
+
+    let err = fetcher
+        .fetch(
+            &format!("https://{address}/bundle"),
+            &sha256_hex(b"something else entirely"),
+            &temp,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, FetchError::DigestMismatch { .. }), "{err}");
+    assert!(!temp.exists(), "a rejected download left its partial file");
+}
+
+/// The URL decides, and it has to: an older control plane serves bundles from
+/// its human listener, and `deis dev` serves them itself with no control plane
+/// anywhere. A node that has a machine channel still fetches those exactly as
+/// it did before.
+#[tokio::test]
+async fn a_bundle_url_that_is_not_the_machine_listener_goes_out_the_ordinary_way() {
+    let fleet = fleet();
+    let body = b"served by something that is not the machine listener".to_vec();
+    let plain = BundleServer::serve(body.clone(), StatusCode::OK).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let temp = dir.path().join("incoming.part");
+    // Configured for a machine listener that is not this server, and not even
+    // running: if the choice were made by configuration rather than by URL,
+    // this download would try mutual TLS against a plain HTTP server and fail.
+    let fetcher = machine_fetcher(&fleet, "https://127.0.0.1:9", 1024);
+
+    let fetched = fetcher
+        .fetch(&plain.url(), &sha256_hex(&body), &temp)
+        .await
+        .expect("a bundle on the human listener must still be fetchable");
+
+    assert_eq!(fetched.sha256, sha256_hex(&body));
+}

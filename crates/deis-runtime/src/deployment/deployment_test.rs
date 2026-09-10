@@ -252,7 +252,7 @@ async fn deployer_in(
     dir: &std::path::Path,
     app_manager: Arc<ApplicationManager>,
 ) -> DeploymentManager {
-    DeploymentManager::from_config(app_manager, &config_in(dir))
+    DeploymentManager::from_config(app_manager, &config_in(dir), None)
         .await
         .unwrap()
 }

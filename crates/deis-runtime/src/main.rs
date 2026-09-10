@@ -79,11 +79,16 @@ fn log_filter() -> EnvFilter {
 /// diagnosed later from a handshake failure that names no file, instead of
 /// from this error, which does.
 ///
-/// This is a behavioural no-op beyond the loading and the log line: nothing
-/// in this process yet dials with the identity or accepts it in place of
-/// `[control] secret`. `RuntimeConfig::validate` has already refused a
-/// half-filled section, so the only way this returns `Err` is a file that
-/// does not read as the certificate, key or trust root it claims to be.
+/// What it changes once it is loaded: this node asks for its assignments over
+/// the machine channel instead of over HTTP with the fleet key, and a bundle
+/// URL on the control plane's machine listener is downloaded over mutual TLS.
+/// Registration and deregistration are unaffected - they are still HTTP routes
+/// guarded by `[control] secret` and they have not moved yet.
+///
+/// `RuntimeConfig::validate` has already refused a half-filled section, and
+/// refused an identity with no `machine_identity.control_endpoint` to dial, so the only
+/// way this returns `Err` is a file that does not read as the certificate, key
+/// or trust root it claims to be.
 fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIdentity>>> {
     let Some(identity_config) = config.machine_identity.as_ref() else {
         info!(
@@ -93,10 +98,10 @@ fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIde
         return Ok(None);
     };
 
-    // This process only dials the machine channel; it does not (yet) serve
-    // one of its own, so it advertises no protocol of its own to negotiate.
-    // What a *dialler* wants is decided per call, on the client_config the
-    // next change will ask for - see `MachineIdentity::client_config`.
+    // This process only dials the machine channel; it does not serve one of
+    // its own, so it advertises no protocol of its own to negotiate. What a
+    // *dialler* wants is decided per call - HTTP/2 for the assignment RPC,
+    // HTTP/1.1 for the bundle download - see `MachineIdentity::client_config`.
     let identity = Arc::new(
         MachineIdentity::load(identity_config.identity_files(), &[])
             .context("loading this node's machine identity")?,
@@ -113,8 +118,14 @@ fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIde
             .expect("validated present")
             .display(),
         reload_secs = identity_config.identity_reload_seconds,
+        control_endpoint = %identity_config
+            .control_endpoint
+            .as_deref()
+            .expect("validated present alongside the files"),
         "Loaded this node's machine identity; the files are re-read on that interval, so a \
-         renewal needs no restart. Nothing dials with it yet"
+         renewal needs no restart. This node asks for its assignments over the machine channel \
+         and downloads bundles from that listener over mutual TLS; registration still goes to \
+         [control] endpoint with the fleet key"
     );
 
     Ok(Some(identity))
@@ -222,12 +233,11 @@ async fn run(
     // became of this node's proxy variables, and what that costs.
     proxy.log();
 
-    // Held for the life of the process: `MachineIdentity::watch` keeps a
-    // clone of its own alive on a background task regardless, but this is
-    // where the next change -- the one that actually dials the control plane
-    // with it -- reaches in and finds it, rather than having to thread a
-    // second load through startup.
-    let _machine_identity = load_machine_identity(&config)?;
+    // Held for the life of the process: `MachineIdentity::watch` keeps a clone
+    // of its own alive on a background task regardless, but this is what the
+    // assignment client and the bundle fetcher are built from, so both dial
+    // with the one identity and a renewal reaches both.
+    let machine_identity = load_machine_identity(&config)?;
 
     // Initialize data storage (Single SQLite DB)
     let data_dir = &config.data_dir;
@@ -316,7 +326,7 @@ async fn run(
     // Deployment delivery: bundles land here and versions are loaded from
     // here, whether the control plane pushed them or this node asked for them.
     let deployer = Arc::new(
-        DeploymentManager::from_config(app_manager.clone(), &config)
+        DeploymentManager::from_config(app_manager.clone(), &config, machine_identity.clone())
             .await
             .context("preparing the bundle directory")?,
     );
@@ -332,27 +342,42 @@ async fn run(
     // answer that says "starting" rather than a refused connection.
     let health = NodeHealth::starting();
 
+    // Only about the HTTP path. With a machine channel configured the
+    // assignment list is fetched over mutual TLS and needs no key at all, but
+    // registration has not moved yet and still does, so the warning is worth
+    // making either way -- with the consequence named for the case at hand.
     if config.control.endpoint.is_some() && config.control.secret.is_none() {
-        warn!(
-            "No control.secret is configured, so this node asks the control plane for its \
-             assignments anonymously. A control plane with node_preshared_keys set answers 401 \
-             and this node will never load a version it was assigned"
-        );
+        if config.machine_identity.is_some() {
+            warn!(
+                "No control.secret is configured. The assignment list comes over the machine \
+                 channel and does not need one, but registration is still an HTTP route guarded \
+                 by the fleet key, so this node cannot announce itself and the control plane \
+                 will not know how to push a deployment to it"
+            );
+        } else {
+            warn!(
+                "No control.secret is configured, so this node asks the control plane for its \
+                 assignments anonymously. A control plane with node_preshared_keys set answers \
+                 401 and this node will never load a version it was assigned"
+            );
+        }
     }
 
     let request_timeout = std::time::Duration::from_secs(config.control.request_timeout_secs);
-    let assignment_client = match config.control.endpoint.as_deref() {
-        Some(endpoint) => Some(
-            AssignmentClient::new(
-                endpoint,
-                &node_id,
-                request_timeout,
-                config.control.credential(),
-            )
-            .context("building the control plane client")?,
+    let assignment_client =
+        AssignmentClient::from_config(&config, &node_id, machine_identity.clone())
+            .context("building the control plane client")?;
+    match &assignment_client {
+        Some(client) => info!(
+            url = client.url(),
+            "This node asks the control plane what to run over {}",
+            client.transport_name()
         ),
-        None => None,
-    };
+        None => info!(
+            "No control.endpoint is configured, so this node asks nobody what to run and serves \
+             whatever is already in its bundle directory"
+        ),
+    }
 
     // Without an endpoint there is nobody to register with, which is the
     // standalone case; the loop below says so and reports the node ready.

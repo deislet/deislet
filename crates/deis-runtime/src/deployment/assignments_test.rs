@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -294,7 +295,11 @@ async fn deployer_for(
     config.bundles.dir = Some(dir.join("bundles"));
     config.control.endpoint = endpoint.map(str::to_string);
     config.control.secret = secret.map(str::to_string);
-    Arc::new(DeploymentManager::from_config(apps, &config).await.unwrap())
+    Arc::new(
+        DeploymentManager::from_config(apps, &config, None)
+            .await
+            .unwrap(),
+    )
 }
 
 fn client(base: &str, node_id: &str) -> AssignmentClient {
@@ -1328,4 +1333,302 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
         "v2",
         "a reconcile stopped an application a push had just installed"
     );
+}
+
+// ---- the machine channel -------------------------------------------------
+//
+// The same question, asked at the other door. What these cover is everything
+// between the RPC and an `AssignmentList`: the decode, `complete` read as an
+// explicit field, and a failed call put into the taxonomy the control loop and
+// the runbooks are written around. The handshake itself is not here - it is
+// covered against the control plane's own listener, in deis-control, which is
+// the only place both ends of it exist.
+
+use deis_identity::{names, MachineIdentity};
+use deis_identity_test_pki::{write_files, TestCa};
+use deis_wire::machine::machine_channel_server::{MachineChannel, MachineChannelServer};
+use deis_wire::machine::{
+    FetchAssignmentsRequest, FetchAssignmentsResponse, FetchRoutingTableRequest,
+    FetchRoutingTableResponse,
+};
+use tonic::transport::Endpoint;
+use tonic::Status;
+
+const TRUST_DOMAIN: &str = "deis.internal";
+
+/// A stand-in machine channel that answers `FetchAssignments` with whatever it
+/// was built with.
+struct MachineControlPlane {
+    answer: Result<FetchAssignmentsResponse, Status>,
+}
+
+#[tonic::async_trait]
+impl MachineChannel for MachineControlPlane {
+    async fn fetch_assignments(
+        &self,
+        _request: tonic::Request<FetchAssignmentsRequest>,
+    ) -> Result<tonic::Response<FetchAssignmentsResponse>, Status> {
+        match &self.answer {
+            Ok(answer) => Ok(tonic::Response::new(answer.clone())),
+            Err(status) => Err(Status::new(status.code(), status.message())),
+        }
+    }
+
+    async fn fetch_routing_table(
+        &self,
+        _request: tonic::Request<FetchRoutingTableRequest>,
+    ) -> Result<tonic::Response<FetchRoutingTableResponse>, Status> {
+        Err(Status::unimplemented(
+            "this node never asks for the routing table",
+        ))
+    }
+}
+
+/// Serve that channel on a loopback port and point a client at it.
+///
+/// Plain TCP on purpose: mutual TLS is what `Dialler` does and what
+/// deis-control's own listener test proves end to end, and repeating it here
+/// would test that crate again rather than this one. What is exercised here is
+/// everything this crate owns above the connection.
+async fn machine_client(answer: Result<FetchAssignmentsResponse, Status>) -> AssignmentClient {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+        .expect("a listener tonic can serve on");
+    tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(MachineChannelServer::new(MachineControlPlane { answer }))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    let channel = Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_lazy();
+    AssignmentClient::over_channel(
+        channel,
+        "node-a",
+        test_identity("node-a"),
+        format!("https://{address}/deis.machine.MachineChannel/FetchAssignments"),
+    )
+}
+
+/// A real identity for a node of this name, from a real certificate. Nothing
+/// dials with it in these tests; it is what a refusal names.
+fn test_identity(node_id: &str) -> Arc<MachineIdentity> {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().unwrap();
+    let name = names::node(TRUST_DOMAIN, node_id).unwrap();
+    let files = write_files(directory.path(), "node", &ca.issue(&name), &ca.root_pem);
+    let identity = Arc::new(MachineIdentity::load(files.as_identity_files(), &[]).unwrap());
+    // The files are read at load and never again unless a reload asks, so the
+    // directory can go now; keeping it alive would mean plumbing a guard
+    // through every test that wants an identity.
+    drop(directory);
+    identity
+}
+
+fn one_assignment_json() -> String {
+    serde_json::json!([{
+        "app_id": "demo",
+        "version_id": "v1",
+        "environment": "production",
+        "bundle_url": "https://control.internal:8443/bundle",
+        "bundle_sha": "abc",
+    }])
+    .to_string()
+}
+
+#[tokio::test]
+async fn an_rpc_answer_becomes_the_same_assignment_list_the_http_route_produced() {
+    let client = machine_client(Ok(FetchAssignmentsResponse {
+        assignments_json: one_assignment_json(),
+        complete: true,
+        withheld: 0,
+    }))
+    .await;
+
+    let list = client.fetch().await.expect("a well-formed answer");
+    assert_eq!(list.assignments.len(), 1);
+    assert_eq!(list.assignments[0].app_id, "demo");
+    assert_eq!(list.assignments[0].version_id, "v1");
+    assert!(list.complete);
+    assert_eq!(list.withheld, 0);
+}
+
+/// `complete` is a field here and was a header there, and it has to mean the
+/// same thing: false is "remove nothing on the strength of this". The HTTP
+/// path reads an absent header as false; this path reads the field straight,
+/// and a node must not be able to tell the difference.
+#[tokio::test]
+async fn an_incomplete_rpc_answer_is_incomplete_the_same_way_an_http_one_is() {
+    let client = machine_client(Ok(FetchAssignmentsResponse {
+        assignments_json: one_assignment_json(),
+        complete: false,
+        withheld: 3,
+    }))
+    .await;
+
+    let list = client
+        .fetch()
+        .await
+        .expect("an incomplete answer still parses");
+    assert_eq!(list.assignments.len(), 1);
+    assert!(!list.complete, "a node would have unloaded on this answer");
+    assert_eq!(list.withheld, 3);
+}
+
+#[tokio::test]
+async fn an_rpc_answer_this_node_cannot_read_is_malformed_rather_than_empty() {
+    let client = machine_client(Ok(FetchAssignmentsResponse {
+        assignments_json: "{ this is not a list }".to_string(),
+        complete: true,
+        withheld: 0,
+    }))
+    .await;
+
+    let err = client.fetch().await.unwrap_err();
+    assert!(matches!(err, AssignmentError::Malformed { .. }), "{err}");
+}
+
+/// The refusal that means a configuration mistake and not a broken network:
+/// the connection proved one machine and the request asked about another.
+/// Reported as a refusal - the same class an HTTP 403 lands in - so the
+/// control loop and an operator's runbook read it the way they always have.
+#[tokio::test]
+async fn asking_for_another_node_is_a_refusal_and_not_a_transport_failure() {
+    let client = machine_client(Err(Status::permission_denied(
+        "node-a may not fetch assignments for node-b",
+    )))
+    .await;
+
+    let err = client.fetch().await.unwrap_err();
+    assert!(
+        matches!(err, AssignmentError::Status { code: 403, .. }),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_control_plane_that_cannot_authenticate_this_node_is_a_refusal_too() {
+    let client = machine_client(Err(Status::unauthenticated("no name was proved"))).await;
+
+    let err = client.fetch().await.unwrap_err();
+    assert!(
+        matches!(err, AssignmentError::Status { code: 401, .. }),
+        "{err}"
+    );
+}
+
+/// A machine channel that is not listening has to look like a control plane
+/// that is not there, because it is one: the node keeps serving what it has
+/// and retries, rather than treating the failure as an answer.
+#[tokio::test]
+async fn a_machine_channel_that_is_not_there_is_a_transport_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+
+    let channel = Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_lazy();
+    let client = AssignmentClient::over_channel(
+        channel,
+        "node-a",
+        test_identity("node-a"),
+        format!("https://{address}/deis.machine.MachineChannel/FetchAssignments"),
+    );
+
+    let err = client.fetch().await.unwrap_err();
+    assert!(matches!(err, AssignmentError::Transport { .. }), "{err}");
+}
+
+// ---- which transport a configuration asks for ----------------------------
+
+fn machine_config() -> (RuntimeConfig, Arc<MachineIdentity>) {
+    let mut config = RuntimeConfig::default();
+    config.control.endpoint = Some("http://127.0.0.1:8080".to_string());
+    config.machine_identity = Some(crate::config::MachineIdentityConfig {
+        control_endpoint: Some("https://127.0.0.1:8443".to_string()),
+        certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+        private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+        trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+        trust_domain: Some(TRUST_DOMAIN.to_string()),
+        ..Default::default()
+    });
+    (config, test_identity("node-a"))
+}
+
+#[tokio::test]
+async fn a_node_with_an_identity_asks_over_the_machine_channel() {
+    let (config, identity) = machine_config();
+    let client = AssignmentClient::from_config(&config, "node-a", Some(identity))
+        .expect("a complete machine configuration must build a client")
+        .expect("a configured node has a client");
+
+    assert!(
+        client.transport_name().contains("machine channel"),
+        "{}",
+        client.transport_name()
+    );
+    // The endpoint and the RPC's own path, which is what an operator matches
+    // against the control plane's log.
+    assert_eq!(
+        client.url(),
+        "https://127.0.0.1:8443/deis.machine.MachineChannel/FetchAssignments"
+    );
+}
+
+#[tokio::test]
+async fn a_node_with_no_identity_asks_the_way_it_always_did() {
+    let mut config = RuntimeConfig::default();
+    config.control.endpoint = Some("http://127.0.0.1:8080".to_string());
+
+    let client = AssignmentClient::from_config(&config, "node-a", None)
+        .expect("an ordinary configuration must build a client")
+        .expect("a configured node has a client");
+
+    assert!(
+        client.transport_name().contains("HTTP"),
+        "{}",
+        client.transport_name()
+    );
+    assert_eq!(
+        client.url(),
+        "http://127.0.0.1:8080/api/nodes/node-a/assignments"
+    );
+}
+
+#[tokio::test]
+async fn a_node_told_about_no_control_plane_at_all_asks_nobody() {
+    let config = RuntimeConfig::default();
+    assert!(AssignmentClient::from_config(&config, "node-a", None)
+        .expect("no endpoint is not an error")
+        .is_none());
+}
+
+/// Half a machine channel is refused rather than quietly demoted to the old
+/// path. `RuntimeConfig::validate` refuses both halves of this before startup
+/// gets here, so reaching it means the check was skipped - and falling back
+/// silently would mean a node configured for mutual TLS going on using the
+/// fleet key with nothing in any log to say so.
+#[tokio::test]
+async fn neither_half_of_the_machine_channel_works_on_its_own() {
+    let (mut config, identity) = machine_config();
+    // A table with no address in it. Startup refuses this, so reaching it
+    // means the check was skipped, and falling back to the old path silently
+    // would mean a node configured for mutual TLS going on using the fleet
+    // key with nothing in any log to say so.
+    config
+        .machine_identity
+        .as_mut()
+        .expect("the fixture configures one")
+        .control_endpoint = None;
+    assert!(AssignmentClient::from_config(&config, "node-a", Some(Arc::clone(&identity))).is_err());
+
+    // The mirror image cannot come from a configuration file - the address
+    // and the files are one table - but it can come from a caller that loaded
+    // no identity for a table that has one, which is the same refusal.
+    let (config, _) = machine_config();
+    assert!(AssignmentClient::from_config(&config, "node-a", None).is_err());
 }

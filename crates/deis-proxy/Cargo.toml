@@ -6,9 +6,10 @@ license = "Apache-2.0"
 authors = ["kookyleo <kookyleo@gmail.com>"]
 
 [dependencies]
-# Machine identity for the mutual-TLS migration replacing node_preshared_keys.
-# Not called from this crate yet -- the dependency is being taken as its own
-# reviewable step, ahead of the change that moves authentication over to it.
+# Machine identity for the mutual-TLS migration replacing node_preshared_keys:
+# the certificate this proxy presents on the machine channel, and the dialler
+# that proves the control plane's name back before a byte of the routing table
+# is believed. See `catalog::client`.
 deis-identity = { path = "../deis-identity" }
 tokio = { version = "1.45", features = ["full"] }
 anyhow = "1.0"
@@ -78,15 +79,28 @@ openssl = "0.10"
 
 # Control (deis-control) client.
 deis-wire = { path = "../deis-wire" }
+# The machine channel is gRPC, so the routing-table poller needs a client for
+# it. This is not a second HTTP stack arriving in the process: deis-wire's
+# control client is tonic 0.12 and this binary has linked it, and the hyper
+# behind it, since it grew a control channel - `cargo tree -p deis-proxy -e
+# normal -i tonic` shows the only edge. Naming it here rather than reaching it
+# through deis-wire's re-exports keeps the version this crate compiles against
+# stated where it can be seen, and it must stay the version deis-wire uses:
+# the generated `MachineChannelClient` comes from there and is built on
+# tonic's own types.
+tonic = "0.12"
 # Drives the instance lifecycle (src/control/state.rs) off deis-wire's
 # `InstanceFSM` and the ACME order/authorization statuses (src/acme/status.rs).
 yasm = { workspace = true }
 
 [dev-dependencies]
-# In-process control the client tests register against
-# (src/control/mock.rs).
-tonic = "0.12"
+# In-process servers the client tests speak to: the control plane
+# (src/control/mock.rs) and the machine channel (src/catalog/client.rs).
+# tonic itself is a normal dependency above.
 tokio-stream = { version = "0.1", features = ["net"] }
+# A certificate authority small enough to hand a test, so the machine-channel
+# tests can build a real loaded identity rather than a stub of one.
+deis-identity-test-pki = { path = "../deis-identity-test-pki" }
 # Somewhere for tests/upgrade_framing_test.rs to put the configuration, the
 # database and the log of the proxy process it starts.
 tempfile = "3"

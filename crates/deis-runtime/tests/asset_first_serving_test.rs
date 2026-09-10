@@ -109,7 +109,7 @@ async fn a_bundled_site_is_served_from_its_assets_and_falls_through_on_a_miss() 
         data_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let deployer = DeploymentManager::from_config(app_manager.clone(), &config)
+    let deployer = DeploymentManager::from_config(app_manager.clone(), &config, None)
         .await
         .unwrap();
 

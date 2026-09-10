@@ -40,7 +40,7 @@ impl CatalogPoller {
     /// changes no routing state at all, which is the whole contract of this
     /// module - the table that was in force a moment ago is still in force.
     async fn poll_once(&self, failures_so_far: u64) -> u64 {
-        let authority = self.client.endpoint().authority();
+        let authority = self.client.authority();
         match self.client.fetch().await {
             Ok(document) => {
                 if failures_so_far > 0 {
@@ -91,10 +91,16 @@ impl CatalogPoller {
 #[async_trait]
 impl BackgroundService for CatalogPoller {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        let authority = self.client.endpoint().authority();
+        let authority = self.client.authority();
+        // The transport is logged because it is the one thing about this loop
+        // an operator cannot see from anywhere else, and it is the thing they
+        // have just changed: a `[machine_identity]` table that did not take
+        // effect looks exactly like one that did until this line says which
+        // channel the table is coming over.
         info!(
             control = %authority,
-            path = super::ROUTING_TABLE_PATH,
+            transport = self.client.transport(),
+            path = self.client.path(),
             interval_secs = self.interval.as_secs(),
             "polling the control plane for the routing table; the last table accepted stays in \
              force whenever a poll fails"
