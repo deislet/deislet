@@ -1,0 +1,37 @@
+[package]
+name = "deis-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository = "https://github.com/deislet/deislet"
+description = "Machine identity for the deislet control channel: SPIFFE-named certificates over mutual TLS"
+
+[dependencies]
+arc-swap = "1.9"
+rustls = "0.23"
+rustls-pemfile = "2.0"
+sha2 = "0.10"
+thiserror = "1.0"
+tokio = { workspace = true }
+tracing.workspace = true
+# The one thing rustls cannot do for us: read the URI SAN back out of a
+# certificate it has just verified. webpki parses subject alternative names
+# but keeps `GeneralName` crate-private, so the name a peer is known by has to
+# be parsed here.
+#
+# The deno fork also brings x509-parser 0.15 through deno_net and
+# deno_node_crypto, so this is a second copy in the tree. That is deliberate:
+# pinning the parser that reads machine identities to whichever version a
+# vendored fork happens to carry is the wrong dependency to accept, and the
+# cost of the duplicate is compile time in a crate the runtime does not link.
+x509-parser = "0.18"
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# The tests handshake over a real socket rather than asserting on a parser:
+# what has to hold is that a listener built here refuses a connection, and
+# refusing it is something only the TLS stack can do.
+tokio-rustls = "0.26"

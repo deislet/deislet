@@ -1,0 +1,605 @@
+//! What the machine channel promises, checked over a real socket.
+//!
+//! These tests do not assert on a parser. Each one opens a TCP connection,
+//! runs a TLS handshake through rustls, and asks what the two ends concluded -
+//! because "this peer cannot get in" is a claim only the TLS stack can make
+//! good on, and a unit test of the verifier would pass just as happily if the
+//! verifier were never wired into the configuration at all.
+
+mod support;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use deis_identity::{
+    FileRole, IdentityError, MachineIdentity, Reload, SpiffeId, name_presented_by,
+};
+use rustls::pki_types::ServerName;
+use support::{TestCa, write_files};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+/// Long enough that a loaded machine does not fail the test, short enough that
+/// a handshake which will never finish is reported as a failure rather than
+/// hanging the run.
+const PATIENCE: Duration = Duration::from_secs(10);
+
+/// A host name that matches nothing in any certificate these tests issue.
+///
+/// It is passed to every dial on purpose: the identity is the SPIFFE name in
+/// the certificate, so what was typed into the address bar must not matter.
+const UNRELATED_HOST: &str = "nothing.of.the.sort.invalid";
+
+fn id(text: &str) -> SpiffeId {
+    SpiffeId::parse(text).expect("a valid identity")
+}
+
+/// One connection, and what each end made of it.
+struct Handshake {
+    /// The name the listener read off the connection, or why it got none.
+    server: Result<SpiffeId, String>,
+    /// Whether the dialler accepted what answered, and why not.
+    client: Result<(), String>,
+}
+
+/// Dial `server` from `client`, expecting to reach `expected_peer`.
+async fn connect(
+    server: &Arc<MachineIdentity>,
+    client: &MachineIdentity,
+    expected_peer: &SpiffeId,
+) -> Handshake {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let address = listener.local_addr().expect("an address");
+    let acceptor = TlsAcceptor::from(server.server_config());
+
+    let listening = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let tls = acceptor.accept(stream).await.map_err(|e| e.to_string())?;
+        let (_, connection) = tls.get_ref();
+        name_presented_by(connection.peer_certificates()).map_err(|e| e.to_string())
+    });
+
+    let connector = TlsConnector::from(
+        client
+            .client_config(expected_peer)
+            .expect("a client configuration"),
+    );
+    let dialled = async {
+        let stream = TcpStream::connect(address)
+            .await
+            .map_err(|e| e.to_string())?;
+        let name = ServerName::try_from(UNRELATED_HOST).expect("a server name");
+        connector
+            .connect(name, stream)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+
+    let client = tokio::time::timeout(PATIENCE, dialled)
+        .await
+        .unwrap_or_else(|_| Err("the dialler never finished".to_string()));
+    let server = tokio::time::timeout(PATIENCE, listening)
+        .await
+        .expect("the listener never finished")
+        .expect("the listener task did not panic");
+
+    Handshake { server, client }
+}
+
+#[tokio::test]
+async fn a_peer_that_proves_its_name_is_recognised_on_both_ends() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+
+    let control_id = id("spiffe://deis.internal/machine/control/01");
+    let node_id = id("spiffe://deis.internal/machine/runtime/07");
+
+    let control = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "control",
+                &ca.issue(control_id.as_str()),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("the control plane's identity"),
+    );
+    let node = MachineIdentity::load(
+        write_files(
+            directory.path(),
+            "node",
+            &ca.issue(node_id.as_str()),
+            &ca.root_pem,
+        )
+        .as_identity_files(),
+    )
+    .expect("the node's identity");
+
+    assert_eq!(control.id(), control_id);
+    assert_eq!(node.id(), node_id);
+
+    let outcome = connect(&control, &node, &control_id).await;
+    assert_eq!(
+        outcome.client,
+        Ok(()),
+        "the node did not accept the control plane it dialled"
+    );
+    assert_eq!(
+        outcome.server.as_ref().map(SpiffeId::as_str),
+        Ok(node_id.as_str()),
+        "the control plane did not read the node's name off the connection"
+    );
+}
+
+/// The address, the DNS name and the port prove nothing, and this is the test
+/// that says so: the dial above and every dial below is made to
+/// `nothing.of.the.sort.invalid` at a loopback port, and it is the name inside
+/// the certificate that decides.
+#[tokio::test]
+async fn the_address_dialled_is_not_the_identity() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let server_id = id("spiffe://deis.internal/machine/control/01");
+
+    let server = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "server",
+                &ca.issue(server_id.as_str()),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+    let client = MachineIdentity::load(
+        write_files(
+            directory.path(),
+            "client",
+            &ca.issue("spiffe://deis.internal/machine/runtime/07"),
+            &ca.root_pem,
+        )
+        .as_identity_files(),
+    )
+    .expect("an identity");
+
+    // No certificate here carries a DNS name at all, so a handshake that
+    // checked host names could not have succeeded.
+    let outcome = connect(&server, &client, &server_id).await;
+    assert_eq!(outcome.client, Ok(()));
+    assert!(outcome.server.is_ok());
+}
+
+#[tokio::test]
+async fn a_certificate_from_another_authority_cannot_open_a_connection() {
+    let ours = TestCa::new();
+    let theirs = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let server_id = id("spiffe://deis.internal/machine/control/01");
+
+    let server = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "server",
+                &ours.issue(server_id.as_str()),
+                &ours.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+    // A well-formed name, an honest-looking certificate - and a signature from
+    // an authority this fleet has never heard of.
+    let stranger = MachineIdentity::load(
+        write_files(
+            directory.path(),
+            "stranger",
+            &theirs.issue("spiffe://deis.internal/machine/runtime/07"),
+            &theirs.root_pem,
+        )
+        .as_identity_files(),
+    )
+    .expect("an identity");
+
+    let outcome = connect(&server, &stranger, &server_id).await;
+    assert!(
+        outcome.server.is_err(),
+        "the listener accepted a certificate from an authority it does not trust: {:?}",
+        outcome.server
+    );
+}
+
+#[tokio::test]
+async fn reaching_a_different_machine_than_the_one_dialled_is_refused() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+
+    let server = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "server",
+                &ca.issue("spiffe://deis.internal/machine/control/02"),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+    let client = MachineIdentity::load(
+        write_files(
+            directory.path(),
+            "client",
+            &ca.issue("spiffe://deis.internal/machine/runtime/07"),
+            &ca.root_pem,
+        )
+        .as_identity_files(),
+    )
+    .expect("an identity");
+
+    // Both are ours, both are valid, and this is still the wrong machine.
+    let meant_to_reach = id("spiffe://deis.internal/machine/control/01");
+    let outcome = connect(&server, &client, &meant_to_reach).await;
+
+    let refusal = outcome.client.expect_err("the dialler accepted a stranger");
+    assert!(
+        refusal.contains("machine/control/01") && refusal.contains("machine/control/02"),
+        "the refusal names neither who was dialled nor who answered: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_carrying_no_machine_name_cannot_open_a_connection() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let server_id = id("spiffe://deis.internal/machine/control/01");
+
+    let server = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "server",
+                &ca.issue(server_id.as_str()),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+
+    // Signed by the right authority, and it still says nothing about who holds
+    // it - which is exactly the state the fleet pre-shared key left everything
+    // in.
+    let anonymous = write_files(
+        directory.path(),
+        "anonymous",
+        &ca.issue_without_a_name("node7.deis.internal"),
+        &ca.root_pem,
+    );
+    let error = MachineIdentity::load(anonymous.as_identity_files())
+        .expect_err("an identity was loaded from a certificate that names nobody");
+    assert!(
+        matches!(error, IdentityError::NoSpiffeName),
+        "expected a refusal about the missing name, got {error}"
+    );
+
+    let _ = server;
+}
+
+#[tokio::test]
+async fn a_certificate_naming_two_machines_is_refused() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+
+    let two_faced = write_files(
+        directory.path(),
+        "two-faced",
+        &ca.issue_with_two_names(
+            "spiffe://deis.internal/machine/runtime/07",
+            "spiffe://deis.internal/machine/control/01",
+        ),
+        &ca.root_pem,
+    );
+
+    match MachineIdentity::load(two_faced.as_identity_files()) {
+        Err(IdentityError::AmbiguousSpiffeName { count, names }) => {
+            assert_eq!(count, 2);
+            assert!(names.contains("runtime/07") && names.contains("control/01"));
+        }
+        other => panic!("expected a refusal about the two names, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_peer_our_root_signed_into_another_trust_domain_is_refused() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let server_id = id("spiffe://deis.internal/machine/control/01");
+
+    let server = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "server",
+                &ca.issue(server_id.as_str()),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+    // Our own authority signed it, so the chain is beyond reproach. The name
+    // it carries belongs to somebody else's fleet.
+    let outsider = MachineIdentity::load(
+        write_files(
+            directory.path(),
+            "outsider",
+            &ca.issue("spiffe://someone.else/machine/runtime/07"),
+            &ca.root_pem,
+        )
+        .as_identity_files(),
+    )
+    .expect("an identity");
+
+    let outcome = connect(&server, &outsider, &server_id).await;
+    assert!(
+        outcome.server.is_err(),
+        "a machine from another trust domain was let in: {:?}",
+        outcome.server
+    );
+}
+
+#[tokio::test]
+async fn a_renewal_is_adopted_without_a_restart_and_reaches_the_wire() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let control_id = id("spiffe://deis.internal/machine/control/01");
+    let node_id = id("spiffe://deis.internal/machine/runtime/07");
+
+    let control = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "control",
+                &ca.issue(control_id.as_str()),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+    let node_files = write_files(
+        directory.path(),
+        "node",
+        &ca.issue(node_id.as_str()),
+        &ca.root_pem,
+    );
+    let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
+
+    assert_eq!(
+        node.reload().expect("a look at unchanged files"),
+        Reload::Unchanged,
+        "nothing was written, so nothing should have been adopted"
+    );
+
+    // A renewal: the same machine, a new certificate and a new key.
+    let renewed = ca.issue(node_id.as_str());
+    std::fs::write(&node_files.certificate, &renewed.certificate_pem).expect("write certificate");
+    std::fs::write(&node_files.private_key, &renewed.key_pem).expect("write key");
+
+    assert_eq!(
+        node.reload().expect("the renewal loads"),
+        Reload::Replaced {
+            from: node_id.clone(),
+            to: node_id.clone(),
+        }
+    );
+    assert_eq!(node.id(), node_id, "a renewal does not change who we are");
+
+    let outcome = connect(&control, &node, &control_id).await;
+    assert_eq!(outcome.client, Ok(()));
+    assert_eq!(
+        outcome.server.as_ref().map(SpiffeId::as_str),
+        Ok(node_id.as_str()),
+        "the renewed certificate did not work on the wire"
+    );
+}
+
+/// Rotating to a different name is the observable proof that a reload reaches
+/// the socket: the listener reads a name it could not have seen before.
+#[tokio::test]
+async fn what_a_reload_adopts_is_what_the_far_end_sees() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let control_id = id("spiffe://deis.internal/machine/control/01");
+    let was = id("spiffe://deis.internal/machine/runtime/07");
+    let now = id("spiffe://deis.internal/machine/runtime/08");
+
+    let control = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "control",
+                &ca.issue(control_id.as_str()),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+    let node_files = write_files(
+        directory.path(),
+        "node",
+        &ca.issue(was.as_str()),
+        &ca.root_pem,
+    );
+    let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
+
+    let reissued = ca.issue(now.as_str());
+    std::fs::write(&node_files.certificate, &reissued.certificate_pem).expect("write certificate");
+    std::fs::write(&node_files.private_key, &reissued.key_pem).expect("write key");
+
+    assert_eq!(
+        node.reload().expect("the new certificate loads"),
+        Reload::Replaced {
+            from: was,
+            to: now.clone(),
+        }
+    );
+
+    let outcome = connect(&control, &node, &control_id).await;
+    assert_eq!(
+        outcome.server.as_ref().map(SpiffeId::as_str),
+        Ok(now.as_str())
+    );
+}
+
+/// The failure this crate exists to survive: a rotation that goes wrong must
+/// not take a working fleet's authentication down with it.
+#[tokio::test]
+async fn a_rotation_that_goes_wrong_leaves_the_working_material_in_force() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let control_id = id("spiffe://deis.internal/machine/control/01");
+    let node_id = id("spiffe://deis.internal/machine/runtime/07");
+
+    let control = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "control",
+                &ca.issue(control_id.as_str()),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+        )
+        .expect("an identity"),
+    );
+    let node_files = write_files(
+        directory.path(),
+        "node",
+        &ca.issue(node_id.as_str()),
+        &ca.root_pem,
+    );
+    let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
+
+    // Caught mid-write: the file exists and holds no complete PEM block.
+    std::fs::write(
+        &node_files.certificate,
+        b"-----BEGIN CERTIFICATE-----\nMIIB",
+    )
+    .expect("write a half-finished certificate");
+    let error = node
+        .reload()
+        .expect_err("a half-written certificate was adopted");
+    // Either shape is a refusal: rustls-pemfile says "no block" for a file it
+    // could read nothing out of and "malformed" for one it got part way
+    // through. What matters is that the file is named, so an operator who
+    // interrupted a rotation is told which one to finish writing.
+    assert!(
+        matches!(
+            error,
+            IdentityError::NoPemBlock {
+                role: FileRole::Certificate,
+                ..
+            } | IdentityError::MalformedPem {
+                role: FileRole::Certificate,
+                ..
+            }
+        ),
+        "expected a refusal naming the certificate file, got {error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&node_files.certificate.display().to_string()),
+        "the refusal does not say which file to look at: {error}"
+    );
+
+    assert_eq!(node.id(), node_id, "the identity in force changed anyway");
+    let outcome = connect(&control, &node, &control_id).await;
+    assert_eq!(
+        outcome.server.as_ref().map(SpiffeId::as_str),
+        Ok(node_id.as_str()),
+        "the fleet stopped authenticating because a rotation was interrupted"
+    );
+}
+
+/// The other half of the same window: both files are whole, and they are from
+/// two different issuances.
+#[tokio::test]
+async fn a_certificate_and_a_key_from_different_issuances_are_refused_together() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let node_id = id("spiffe://deis.internal/machine/runtime/07");
+
+    let node_files = write_files(
+        directory.path(),
+        "node",
+        &ca.issue(node_id.as_str()),
+        &ca.root_pem,
+    );
+    let node = MachineIdentity::load(node_files.as_identity_files()).expect("an identity");
+
+    // Only the certificate was replaced; the key on disk still belongs to the
+    // one before it.
+    let renewed = ca.issue(node_id.as_str());
+    std::fs::write(&node_files.certificate, &renewed.certificate_pem).expect("write certificate");
+
+    let error = node.reload().expect_err("a mismatched pair was adopted");
+    assert!(
+        matches!(error, IdentityError::Mismatched { .. }),
+        "expected a refusal about the pair, got {error}"
+    );
+    assert_eq!(node.id(), node_id);
+}
+
+/// The watcher is three lines around [`MachineIdentity::reload`], and the one
+/// thing those three lines claim is that nobody has to call it. Time is moved
+/// by hand here rather than waited out, so the test is deterministic and takes
+/// no longer than the work it does.
+#[tokio::test(start_paused = true)]
+async fn the_watcher_adopts_a_rotation_without_being_asked() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let was = id("spiffe://deis.internal/machine/runtime/07");
+    let now = id("spiffe://deis.internal/machine/runtime/08");
+
+    let node_files = write_files(
+        directory.path(),
+        "node",
+        &ca.issue(was.as_str()),
+        &ca.root_pem,
+    );
+    let node =
+        Arc::new(MachineIdentity::load(node_files.as_identity_files()).expect("an identity"));
+    let watching = node.watch(Duration::from_secs(30));
+    // Let the watcher reach the point where it is waiting on its timer. Until
+    // it has, moving the clock moves it past nothing.
+    tokio::task::yield_now().await;
+
+    let reissued = ca.issue(now.as_str());
+    std::fs::write(&node_files.certificate, &reissued.certificate_pem).expect("write certificate");
+    std::fs::write(&node_files.private_key, &reissued.key_pem).expect("write key");
+    assert_eq!(node.id(), was, "nothing should have looked yet");
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..16 {
+        if node.id() == now {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        node.id(),
+        now,
+        "the watcher did not pick up what was written under it"
+    );
+    watching.abort();
+}

@@ -30,7 +30,7 @@ EXPECTED_TEST_SHARDS = {
         "-p deis-build -p deis --no-fail-fast"
     ),
     "control-services-tests": (
-        "cargo test -p deis-wire -p deis-provider-driver -p deis-backend-migration "
+        "cargo test -p deis-wire -p deis-identity -p deis-provider-driver -p deis-backend-migration "
         "-p deis-backend-topology "
         "-p deis-control -p deis-store "
         "-p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests "

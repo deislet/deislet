@@ -3158,3 +3158,63 @@ Application/framework source + versioned build plan
 - 本机门禁：`cargo fmt --all --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 零告警；
   `cargo test --workspace --no-fail-fast` 113 个二进制 **3325 通过 0 失败**；`cargo test -p deis-build` 单独跑
   27 个二进制 136 通过 0 失败，过程中 wrangler 4.86.0 真实执行了 13 次 dry-run；`test-demo-witnesses.sh` 全部通过。
+
+## 104. 机器通道身份定契约：三个文件、一个 SPIFFE 名字，签发留在产品之外
+
+### 决策
+
+替换 fleet 级共享口令 `node_preshared_keys` 的方向已定为 ADR-025 的 mTLS 每实例身份（选项 D）。本轮先落地它的**契约**，
+并把契约边界收窄到一句话：
+
+> 一对 PEM 文件（本进程的证书链与私钥）、一个信任根、校验对端证书里的 SPIFFE URI、文件变了自动重载。
+
+产品**不负责**签发、续期与吊销分发。这不是省事，是刻意的边界：内建 CA、step-ca、SPIRE，甚至一段 `openssl` 脚本，
+只要能把那三个文件写到位，两端的代码一模一样。Deislet 坚持的是身份的形状（一个名字，`spiffe://...`，由证书证明），
+不是证书从哪来。ADR-025 的非目标里「可内建 CA，也可接入符合契约的外部工作负载身份系统」说的就是这个安排，
+本节把它具体化为可编译的接口，ADR 本身不需要修改。
+
+选择这个边界的直接原因：Deislet 连单机 embedded 都要能跑，把 SPIRE 之类做成必需依赖，等于要求用户为了装一个 mini 平台
+先运维一套有状态的签发设施。反过来，只认三个文件的话，SPIRE 那条路仍然随时能接——它的 helper 把 SVID 写成文件即可。
+
+### 落点：新增 crate `deis-identity`
+
+control、runtime、proxy 三边都要用，放进任何一个都是错的位置，因此独立成 crate。
+
+- `spiffe.rs` —— 名字类型。**拒绝而不归一**：`SPIFFE://`、大写 trust domain、`//`、结尾 `/`、`/./`、`/../`、
+  百分号转义、端口、userinfo、query、fragment 一律在 parse 处报错并说明违反了哪条规则，之后比较就是字节比较。
+  归一意味着两种拼写都能进来，就有别名，而别名是「被当成别人授权」的入口；拒绝之后一个主体只有一种合法拼写。
+  path 保持大小写敏感（SPIFFE 如此规定），这不产生别名，因为大写 trust domain 是被拒绝而不是被折叠的。
+- `cert.rs` —— 从证书里读名字。要求**恰好一个** `spiffe://` 开头的 URI SAN：零个是「这张证书没说持有者是谁」，
+  两个是「持有者可以被当成其中任一个，而算成哪个取决于解析顺序」。不看 subject CN（没人校验它）。
+- `verify.rs` —— 两个 rustls 校验器。服务端：先由 webpki 判断证书是否链到我们的信任根且在有效期内，再要求名字属于
+  **我们自己的** trust domain（防止信任根被交叉签名后混进外人）。客户端：同样先验链，然后把名字与调用方声明要拨的那个
+  身份做相等比较，**完全不看主机名**。这是更强的检查而不是更弱的——期望身份来自调用方自己的配置，不来自网络；
+  副作用是内网可以直接按 IP 拨号，不用为证书凑 DNS 名。
+- `material.rs` —— 三个文件到 rustls 配置。**整套建成才采用**：轮换时三个文件不可能同时改，中间必然有一段
+  「新证书配旧私钥」的窗口，逐个采用就会在那段窗口里用不匹配的一对去握手。
+- `lib.rs` —— `MachineIdentity`：`load` / `id` / `server_config` / `client_config(expected_peer)` / `reload` / `watch`。
+  `reload` 出错时**保持已生效的材料不变**并如实报错——一次失败的轮换不能顺手把在跑的 fleet 的认证一起弄停。
+  `watch` 用定时看而不是文件事件：轮换写三个文件、顺序无人保证，事件式监听必然看到中间态，于是必须加防抖，
+  而「先等一等再动手」的监听器就是一个零件更多的轮询。日志级别按后果给：同名续期 info，证书换了名字 warn
+  （等于进程中途改了身份），读不出来 warn 并写明「若持续到证书过期，机器通道会同时全部握手失败」。
+
+### 证据
+
+`crates/deis-identity/tests/handshake.rs` 十二条**全部走真实 TCP + 真实 rustls 握手**，不是对解析器做单测——
+「这个对端进不来」只有 TLS 栈能兑现，而校验器压根没被接进配置的话，单测一样会通过。覆盖：双向认名、
+另一家 CA 的证书进不来、拨 A 接到 B 被拒（错误里同时点名两边）、没有 SPIFFE 名字的证书装不进去、
+一张证书两个名字被拒、被我方根签进别人 trust domain 的证书进不来、续期后新证书真的上了线、
+换名后对端读到的是新名字、半截证书导致的轮换失败后**旧材料仍在服务**、证书与私钥来自两次签发被拒、
+watch 在无人调用的情况下采纳轮换（用 `tokio::time::advance` 手动推时钟，不睡）。
+另有 7 条单测钉住名字规则。本机：19 通过 0 失败，`cargo clippy -p deis-identity --all-targets -- -D warnings` 零告警，
+`cargo fmt --all --check` 通过，`check-product-governance.py` 通过（新 crate 已按其要求加入 CI 的
+`control-services-tests` 分片，并同步脚本里的期望命令）。
+
+### 尚未做的事（下一片）
+
+这一片只提供能力，还没有任何一条现网路径改用它。接线是下一片，且卡在一个需要先定的问题上：Control 目前把 REST API
+和节点 gRPC **合在同一个监听端口**（`main.rs` 把 `grpc_service.into_axum_router()` 与 `api.router` merge 成一个 app，
+`tls` 段是 `Option` 且默认关闭、`bind_addr` 默认 `0.0.0.0`——也就是说开箱状态下那条带解密后 secret 的 assignment
+响应是明文 HTTP 监听在所有网卡上）。要 mTLS 就得决定：给机器通道拆一个独立监听（ADR-025 M1 明确要求
+「独立 machine listener/client 配置」，但要改配置形状与三边拨号目标），还是在共用端口上放「请求但不强制客户端证书」
+再按路由分别强制（改动小，但人面与机器面共用一套证书和信任根，且路由分类一旦写错就是静默降级）。
