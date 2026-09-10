@@ -75,6 +75,16 @@ pub struct ControlConfig {
     /// TLS configuration (optional)
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// The machine channel's listener and identity.
+    ///
+    /// Absent means this control plane serves no machine channel at all: no
+    /// node can register, fetch an assignment or download a bundle, and no
+    /// proxy can fetch a routing table. That is the right refusal to make
+    /// loudly at startup rather than to paper over, because the alternative -
+    /// serving those answers to whoever asks - is what this section exists to
+    /// end.
+    #[serde(default)]
+    pub machine: Option<MachineChannelConfig>,
     /// Runtime nodes this control plane knows about before any of them has
     /// said anything - the fallback, not the only source.
     ///
@@ -305,6 +315,60 @@ pub struct RuntimeNodeConfig {
     pub addr: String,
 }
 
+/// The listener Deislet's own processes talk to, and the identity this
+/// control plane proves on it.
+///
+/// # Why it is a listener of its own
+///
+/// The machine channel answers with every application's decrypted secrets and
+/// with a map of every hostname on the platform. Until this existed it shared
+/// a socket with the dashboard and the human API, which meant those answers
+/// were reachable from wherever an operator's browser was - guarded only by a
+/// bearer secret every node in the fleet held a copy of. A separate listener
+/// can be bound to an interface nodes reach and nothing else does, and it can
+/// demand a certificate from its callers without a browser ever meeting that
+/// demand.
+///
+/// # The three files
+///
+/// See `deis_identity`: this control plane's own certificate chain and key,
+/// and the trust root every node and proxy must chain to. Nothing here issues
+/// or renews them, and the identity is re-read on a timer so a rotation needs
+/// no restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineChannelConfig {
+    /// Interface to listen on. Deliberately not defaulted to `0.0.0.0`: the
+    /// point of this listener is that an operator says where it is reachable
+    /// from.
+    pub bind_addr: String,
+    pub port: u16,
+    /// This control plane's certificate chain, end-entity certificate first.
+    pub certificate: PathBuf,
+    /// The private key belonging to that certificate.
+    pub private_key: PathBuf,
+    /// What every peer's certificate must chain to.
+    pub trust_root: PathBuf,
+    /// How often the three files above are re-read, in seconds.
+    ///
+    /// The longest a renewal can go unnoticed. It wants to be far shorter
+    /// than the shortest certificate lifetime in use, and that is the only
+    /// thing it trades against.
+    #[serde(default = "default_identity_reload_seconds")]
+    pub identity_reload_seconds: u64,
+    /// The address nodes reach this listener at, used to build the bundle
+    /// URLs an assignment carries.
+    ///
+    /// Needed because the bundle download is served here rather than on the
+    /// human listener, so `public_base_url` - which names where a browser
+    /// finds the dashboard - is the wrong address to hand a node.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+}
+
+fn default_identity_reload_seconds() -> u64 {
+    60
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Enable TLS on the port this control plane serves, which carries the
@@ -329,6 +393,7 @@ impl Default for ControlConfig {
             api_auth_enabled: false,
             api_cors_allowed_origins: Vec::new(),
             tls: None,
+            machine: None,
             deis_runtime_nodes: Vec::new(),
             deis_runtime_poll_interval: default_deis_runtime_poll_interval(),
             bundle_dir: default_bundle_dir(),

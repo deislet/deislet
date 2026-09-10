@@ -154,8 +154,49 @@ pub async fn for_node(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<(HeaderMap, Json<Vec<AssignmentView>>)> {
-    let list = state.store.list_assignments().await?;
     let base = state.deliverer.base_url(&headers);
+    let answer = assignments_for(&state, &node_id, &base).await?;
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        ASSIGNMENTS_COMPLETE_HEADER,
+        HeaderValue::from_static(if answer.complete { "true" } else { "false" }),
+    );
+    response_headers.insert(
+        ASSIGNMENTS_WITHHELD_HEADER,
+        // Only ASCII digits, so this cannot fail; a failure would still not
+        // be worth failing the request over, and an absent count reads as
+        // zero on a node that predates the header.
+        HeaderValue::from_str(&answer.withheld.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    Ok((response_headers, Json(answer.views)))
+}
+
+/// What a node should be running, and whether that list is the whole truth.
+///
+/// The two facts travel together because a node may only remove what is
+/// missing from a list that says it is complete - see
+/// [`ASSIGNMENTS_COMPLETE_HEADER`] for what turns on that.
+pub(crate) struct AssignmentAnswer {
+    pub(crate) views: Vec<AssignmentView>,
+    pub(crate) complete: bool,
+    pub(crate) withheld: usize,
+}
+
+/// Build one node's assignment list.
+///
+/// Separate from the HTTP handler above because the machine channel asks for
+/// the same list over gRPC, and one of the two callers has no request headers
+/// to derive a base URL from. Everything that decides *what* is in the list
+/// lives here; the callers only differ in how they say "complete" and where
+/// `base` came from.
+pub(crate) async fn assignments_for(
+    state: &CatalogState,
+    node_id: &str,
+    base: &str,
+) -> ApiResult<AssignmentAnswer> {
+    let list = state.store.list_assignments().await?;
 
     let mut views: Vec<AssignmentView> = Vec::with_capacity(list.assignments.len());
 
@@ -189,7 +230,7 @@ pub async fn for_node(
             canonical_environment_id,
             standard_environment,
             deployment_action,
-        ) = match state.deliverer.assignment_payload(assignment, &base).await {
+        ) = match state.deliverer.assignment_payload(assignment, base).await {
             Ok(payload) => {
                 let deployment_action = match payload.action() {
                     crate::runtime_client::proto::DeploymentAction::Prepare => "prepare",
@@ -234,7 +275,7 @@ pub async fn for_node(
 
         views.push(AssignmentView {
             bundle_url: crate::delivery::bundle_url(
-                &base,
+                base,
                 &assignment.app_id,
                 &assignment.version_id,
             ),
@@ -273,19 +314,6 @@ pub async fn for_node(
     // caused by this control plane failing to describe a row is not, which is
     // the whole reason the two cases are told apart on the wire.
     let complete = withheld == 0;
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        ASSIGNMENTS_COMPLETE_HEADER,
-        HeaderValue::from_static(if complete { "true" } else { "false" }),
-    );
-    response_headers.insert(
-        ASSIGNMENTS_WITHHELD_HEADER,
-        // Only ASCII digits, so this cannot fail; a failure would still not
-        // be worth failing the request over, and an absent count reads as
-        // zero on a node that predates the header.
-        HeaderValue::from_str(&withheld.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("0")),
-    );
 
     if !complete {
         warn!(
@@ -306,5 +334,9 @@ pub async fn for_node(
             "Served the authoritative assignment list"
         );
     }
-    Ok((response_headers, Json(views)))
+    Ok(AssignmentAnswer {
+        views,
+        complete,
+        withheld,
+    })
 }

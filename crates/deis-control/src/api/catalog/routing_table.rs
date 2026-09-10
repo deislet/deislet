@@ -97,15 +97,35 @@ pub async fn routing_table(
     State(state): State<CatalogState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<RoutingTable>> {
+    let proxy_id = headers
+        .get(deis_wire::conventions::PROXY_ID_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let observed = headers
+        .get(deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER)
+        .and_then(|value| value.to_str().ok());
+    Ok(Json(routing_table_for(&state, proxy_id, observed).await?))
+}
+
+/// Build the routing table, and record that the caller has taken up the one
+/// it says it is already running.
+///
+/// Separate from the HTTP handler above because the machine channel asks for
+/// the same table over gRPC, where the two facts the handler reads out of
+/// headers arrive as request fields instead.
+pub(crate) async fn routing_table_for(
+    state: &CatalogState,
+    proxy_id: Option<&str>,
+    observed_version: Option<&str>,
+) -> ApiResult<RoutingTable> {
     let table = build(&state.store).await?;
-    observe_applied_table(&state, &headers, &table).await?;
+    observe_applied_table(state, proxy_id, observed_version, &table).await?;
     debug!(
         version = %table.version,
         routes = table.routes.len(),
         environments = table.environments.len(),
         "Served the routing table"
     );
-    Ok(Json(table))
+    Ok(table)
 }
 
 /// A proxy reports the table it published on the *next* authenticated poll.
@@ -113,19 +133,14 @@ pub async fn routing_table(
 /// generation changed between application and acknowledgement.
 async fn observe_applied_table(
     state: &CatalogState,
-    headers: &HeaderMap,
+    proxy_id: Option<&str>,
+    observed_version: Option<&str>,
     table: &RoutingTable,
 ) -> ApiResult<()> {
-    let Some(proxy_id) = headers
-        .get(deis_wire::conventions::PROXY_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(proxy_id) = proxy_id.filter(|id| !id.is_empty()) else {
         return Ok(());
     };
-    let Some(observed_version) = headers
-        .get(deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(observed_version) = observed_version.filter(|version| !version.is_empty()) else {
         return Ok(());
     };
     if observed_version != table.version {
