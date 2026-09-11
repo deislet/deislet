@@ -2404,6 +2404,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "axum",
+ "axum-server",
  "base64 0.22.1",
  "bytes",
  "chrono",
