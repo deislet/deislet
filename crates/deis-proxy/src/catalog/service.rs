@@ -138,8 +138,8 @@ impl BackgroundService for CatalogPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::CatalogClient;
     use crate::catalog::mock::{Answer, MockControl};
-    use crate::catalog::{CatalogClient, ControlEndpoint};
     use crate::config::system::RoutingConfig;
     use crate::config::{ConfigManager, SystemConfig};
 
@@ -159,15 +159,20 @@ mod tests {
         Arc::new(ConfigManager::with_system_config(system).await.unwrap())
     }
 
+    /// A poller dialling `control` as the proxy `edge-1`, over the same
+    /// mutual TLS handshake a real proxy's machine channel uses: a
+    /// certificate `control` minted from its own root, naming this proxy and
+    /// nothing else.
     fn poller(control: &MockControl, config: Arc<ConfigManager>) -> CatalogPoller {
-        let endpoint = ControlEndpoint::parse(&control.addr).unwrap();
         CatalogPoller::new(
-            CatalogClient::new(
-                endpoint,
-                "node-psk".to_string(),
+            CatalogClient::over_machine_channel(
+                control.addr.clone(),
+                control.issue_proxy("edge-1"),
+                control.control_identity(),
                 Duration::from_secs(5),
                 1024 * 1024,
-            ),
+            )
+            .with_proxy_id("edge-1".to_string()),
             config,
             Duration::from_secs(5),
         )
@@ -197,9 +202,11 @@ mod tests {
             Some("shop/production")
         );
         assert_eq!(
-            control.last_authorization().as_deref(),
-            Some("Bearer node-psk"),
-            "the routing table is on the node channel, so the node credential has to be presented"
+            control.last_request().proxy_id,
+            "edge-1",
+            "the routing table is on the machine channel, authenticated by the certificate this \
+             proxy proved during the handshake rather than a shared credential; the id it asks \
+             for still has to arrive on the request"
         );
     }
 
@@ -207,11 +214,11 @@ mod tests {
     async fn a_proxy_reports_only_a_table_it_has_already_published() {
         let control = MockControl::start(Answer::Ok(V1.to_string())).await;
         let config = config_manager().await;
-        let endpoint = ControlEndpoint::parse(&control.addr).unwrap();
         let poller = CatalogPoller::new(
-            CatalogClient::new(
-                endpoint,
-                "node-psk".to_string(),
+            CatalogClient::over_machine_channel(
+                control.addr.clone(),
+                control.issue_proxy("proxy-a"),
+                control.control_identity(),
                 Duration::from_secs(5),
                 1024 * 1024,
             )
@@ -221,25 +228,19 @@ mod tests {
         );
 
         assert_eq!(poller.poll_once(0).await, 0);
-        assert_eq!(
-            control
-                .last_header(deis_wire::conventions::PROXY_ID_HEADER)
-                .as_deref(),
-            Some("proxy-a")
-        );
+        assert_eq!(control.last_request().proxy_id, "proxy-a");
         assert!(
             control
-                .last_header(deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER)
-                .is_none(),
+                .last_request()
+                .observed_routing_table_version
+                .is_empty(),
             "receipt of the first response is not yet an applied observation"
         );
 
         assert_eq!(poller.poll_once(0).await, 0);
         assert_eq!(
-            control
-                .last_header(deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER)
-                .as_deref(),
-            Some("v1")
+            control.last_request().observed_routing_table_version,
+            "v1"
         );
     }
 
@@ -278,9 +279,9 @@ mod tests {
         let poller = poller(&control, Arc::clone(&config));
         poller.poll_once(0).await;
 
-        // The second answer declares a full body and sends half of it: the
-        // half that arrives is a valid prefix of the table, which is exactly
-        // the shape that must never be applied.
+        // The second answer's routing table document is cut off partway
+        // through: what arrives is a valid prefix of the table's text, which
+        // is exactly the shape that must never be applied.
         control.answer(Answer::CutShort(V2.to_string(), V2.len() / 2));
         assert_eq!(poller.poll_once(0).await, 1);
         assert_eq!(config.catalog_routes().version(), "v1");
@@ -317,16 +318,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_credential_is_a_failure_and_not_an_empty_table() {
-        // The dangerous reading of 401 would be "the control plane has no
-        // routes"; that would silently unroute the whole platform.
+        // The dangerous reading of a refusal would be "the control plane has
+        // no routes"; that would silently unroute the whole platform. What a
+        // refusal looks like now is the machine channel answering
+        // PermissionDenied - what the control plane sends a proxy asking for
+        // a table under a name its connection did not prove.
         let control = MockControl::start(Answer::Ok(V1.to_string())).await;
         let config = config_manager().await;
         let poller = poller(&control, Arc::clone(&config));
         poller.poll_once(0).await;
 
-        control.answer(Answer::Status(
-            401,
-            r#"{"error":"Unauthorized"}"#.to_string(),
+        control.answer(Answer::Denied(
+            "this connection proved a different proxy".to_string(),
         ));
         assert_eq!(poller.poll_once(0).await, 1);
         assert_eq!(config.catalog_routes().version(), "v1");
@@ -340,11 +343,11 @@ mod tests {
     async fn a_table_larger_than_the_ceiling_is_refused() {
         let control = MockControl::start(Answer::Ok(V1.to_string())).await;
         let config = config_manager().await;
-        let endpoint = ControlEndpoint::parse(&control.addr).unwrap();
         let poller = CatalogPoller::new(
-            CatalogClient::new(
-                endpoint,
-                "node-psk".to_string(),
+            CatalogClient::over_machine_channel(
+                control.addr.clone(),
+                control.issue_proxy("edge-1"),
+                control.control_identity(),
                 Duration::from_secs(5),
                 // Smaller than the answer, so the ceiling is what refuses it.
                 32,

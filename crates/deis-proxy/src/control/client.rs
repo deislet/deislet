@@ -13,27 +13,28 @@
 //! - `system`: a system configuration overlay (traffic policy only, see
 //!   [`ControlSystemConfig`]).
 //!
-//! # Two transports, one channel
+//! # One transport
 //!
-//! The channel itself - `deis.control.ControlService/EstablishChannel`, the
+//! The channel - `deis.control.ControlService/EstablishChannel`, which the
 //! stream registration, heartbeats, commands and configuration pushes all run
-//! on - is the same either way. What differs is the connection under it, and
-//! [`control_client`] is the one place that chooses.
-//!
-//! Without a `[machine_identity]` table, the connection is a plaintext dial of
-//! `[control] addr`, the control plane's human listener, exactly as it has
-//! always been.
-//!
-//! With one, the connection is made by `deis_identity::Dialler` to
+//! on - is opened by `deis_identity::Dialler` to
 //! `machine_identity.control_endpoint`: mutual TLS, this proxy proving the one
 //! name its certificate carries and refusing to talk to anything that cannot
-//! prove the control plane's name back. The same channel the routing-table
-//! poller already runs on; see [`crate::catalog::client`], which made the same
-//! move for the catalog first.
+//! prove the control plane's name back. It is the same channel the
+//! routing-table poller runs on; see [`crate::catalog::client`], which made
+//! that move for the catalog first.
 //!
-//! The fleet secret is presented in the handshake only if the configuration
-//! still names one. See [`machine_channel`] for why a proxy with an identity
-//! no longer needs to.
+//! There used to be a second way: a plaintext dial of `[control] addr`, the
+//! control plane's human listener, with a fleet-wide secret in the handshake.
+//! The control plane admits a channel by the name the connection proved and by
+//! nothing else now, so a plaintext dial is refused wherever it is made, and
+//! `[control] addr` is what the fleet list shows rather than what anything
+//! dials. A proxy with no `[machine_identity]` table is refused at startup by
+//! `SystemConfig::validate` rather than left to discover this per connection.
+//!
+//! The `secret` field is still on the wire because removing a proto field is a
+//! change both ends have to make in the same instant. It goes out empty and is
+//! not read; see [`machine_channel`].
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -315,11 +316,6 @@ impl ProxyControlClient {
     pub fn new(config: ControlConfig) -> SdkResult<Self> {
         config.validate().map_err(WireError::ConfigurationError)?;
         CLIENT_PRESENT.store(true, std::sync::atomic::Ordering::Release);
-        // Accepted, like the control plane accepts it, and flagged: the
-        // node endpoints it opens have no lockout.
-        if let Some(advisory) = config.secret_advisory() {
-            warn!(instance = %config.associated_id, "{advisory}");
-        }
         let state_manager = Arc::new(ProxyStateManager::new(config.associated_id.clone()));
         let ports = vec![80, 443];
         let deis_wire_client = Self::build_deis_wire_client(&config, ports.clone(), None);
@@ -587,10 +583,12 @@ impl ProxyControlClient {
     /// Open the channel, building it first if this is the first connection.
     ///
     /// The one place `WireClient::connect` is called from, and it must stay
-    /// that way: a call that skipped this would find a wire client that had no
-    /// channel yet and would quietly dial `[control] addr` in plaintext -
-    /// which is to say a proxy configured for mutual TLS would fall back to
-    /// the fleet secret without anything saying so.
+    /// that way: a call that skipped this would find a wire client with no
+    /// channel yet. That used to mean a quiet plaintext dial of `[control]
+    /// addr` with the fleet secret; now it means a client that cannot dial at
+    /// all, which is a failure rather than a downgrade - but a failure at the
+    /// first command rather than at startup, which is still the wrong place
+    /// to find out.
     ///
     /// Building here rather than at construction is what keeps the channel on
     /// the runtime that will serve it; see [`MachineChannel`].
@@ -1052,7 +1050,16 @@ mod tests {
 
     /// The whole path: a listener that will not talk to an unnamed caller, a
     /// proxy that proves a name to reach it, and a control channel that
-    /// registers over the connection they agreed on.
+    /// registers over the connection they agreed on - with no shared
+    /// credential anywhere in it, because `ControlConfig` no longer has one
+    /// to hold.
+    ///
+    /// What the control plane receives in the handshake's `secret` field is
+    /// the empty string - the honest encoding of "nothing presented" - and
+    /// it is admitted anyway, by the name proved during the TLS handshake. A
+    /// control plane that still compared that field would refuse this,
+    /// which is why the mock admits a mutually authenticated connection the
+    /// way the real one does.
     #[tokio::test]
     async fn a_proxy_with_an_identity_registers_over_mutual_tls() {
         let fleet = fleet();
@@ -1070,47 +1077,10 @@ mod tests {
         timeout(Duration::from_secs(10), client.connect_and_register())
             .await
             .expect("a handshake, a registration, or an error - not a hang")
-            .expect("the control plane proved its name and took the registration");
-
-        assert_eq!(control.next_registration().await, 1);
-        assert!(client.is_ready().await);
-        assert_eq!(client.current_state().await, State::Active);
-        assert_eq!(
-            control.secrets(),
-            vec![test_config().secret.unwrap()],
-            "a secret that is configured is still put in the handshake; what changed is that it \
-             is no longer what admits the connection"
-        );
-    }
-
-    /// The point of the whole exercise: a proxy that proves a certificate
-    /// needs no fleet secret at all, so its configuration can stop naming
-    /// one, and it still registers.
-    ///
-    /// What the control plane receives in the handshake's `secret` field is
-    /// then the empty string - the honest encoding of "nothing presented" -
-    /// and it is admitted anyway, by the name it proved during the TLS
-    /// handshake. A control plane that still compared that field would refuse
-    /// this, which is why the mock admits a mutually authenticated connection
-    /// the way the real one does.
-    #[tokio::test]
-    async fn a_proxy_with_an_identity_registers_with_no_fleet_secret_at_all() {
-        let fleet = fleet();
-        let mut control = MockControl::start_over_mutual_tls(Arc::clone(&fleet.control)).await;
-        let config = machine_identity_config(&fleet.files, &control.addr);
-
-        let mut without = test_config();
-        without.secret = None;
-
-        let mut client = control_client(&without, Some((&fleet.proxy, &config)))
-            .unwrap()
-            .with_backoff(fast_backoff());
-        timeout(Duration::from_secs(10), client.connect_and_register())
-            .await
-            .expect("a handshake, a registration, or an error - not a hang")
             .expect("a proved name is enough; nothing shared should be needed");
 
         assert_eq!(control.next_registration().await, 1);
+        assert!(client.is_ready().await);
         assert_eq!(client.current_state().await, State::Active);
         assert_eq!(
             control.secrets(),
@@ -1154,9 +1124,6 @@ mod tests {
     fn config_for(addr: &str) -> ControlConfig {
         ControlConfig {
             associated_id: "test-worker".to_string(),
-            secret: Some(
-                "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
-            ),
             addr: addr.to_string(),
             heartbeat_interval: 30,
             request_timeout: 10,
@@ -1171,13 +1138,27 @@ mod tests {
         }
     }
 
+    /// A client on the machine channel, for the tests below that are about
+    /// retrying rather than about being admitted.
+    ///
+    /// They have to run on this transport and not a plaintext one: a control
+    /// plane admits a channel by the name the connection proved, so a proxy
+    /// dialling in plaintext is refused at every attempt and
+    /// `connect_with_backoff` - which retries until it succeeds - never
+    /// returns. A test of backoff needs a connection that can eventually work.
+    async fn retrying_client(fleet: &Fleet, control: &MockControl) -> ProxyControlClient {
+        let config = machine_identity_config(&fleet.files, &control.addr);
+        control_client(&test_config(), Some((&fleet.proxy, &config)))
+            .expect("a machine-channel client")
+            .with_backoff(fast_backoff())
+    }
+
     #[tokio::test]
     async fn registers_once_the_control_answers() {
-        let mut control = MockControl::start().await;
+        let fleet = fleet();
+        let mut control = MockControl::start_over_mutual_tls(Arc::clone(&fleet.control)).await;
         control.refuse_next(1);
-        let mut client = ProxyControlClient::new(config_for(&control.addr))
-            .unwrap()
-            .with_backoff(fast_backoff());
+        let mut client = retrying_client(&fleet, &control).await;
 
         client.connect_with_backoff().await;
 
@@ -1189,10 +1170,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconnects_after_an_outage_longer_than_five_attempts() {
-        let mut control = MockControl::start().await;
-        let mut client = ProxyControlClient::new(config_for(&control.addr))
-            .unwrap()
-            .with_backoff(fast_backoff());
+        let fleet = fleet();
+        let mut control = MockControl::start_over_mutual_tls(Arc::clone(&fleet.control)).await;
+        let mut client = retrying_client(&fleet, &control).await;
         client.connect_with_backoff().await;
         assert_eq!(control.next_registration().await, 1);
         let state = Arc::clone(client.state_manager());
@@ -1226,20 +1206,6 @@ mod tests {
     #[test]
     fn creates_client() {
         assert!(ProxyControlClient::new(test_config()).is_ok());
-    }
-
-    /// The proxy accepts the secret shapes the control plane accepts and
-    /// refuses only a blank one; a short value starts with a warning rather
-    /// than not at all (r9 tenancy-fleet F6).
-    #[test]
-    fn accepts_what_the_control_plane_accepts_and_refuses_only_a_blank_secret() {
-        let mut config = test_config();
-        config.secret = Some("r9nodekey".to_string());
-        assert!(ProxyControlClient::new(config).is_ok());
-
-        let mut config = test_config();
-        config.secret = Some(" ".to_string());
-        assert!(ProxyControlClient::new(config).is_err());
     }
 
     #[tokio::test]

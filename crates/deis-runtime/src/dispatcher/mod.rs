@@ -14,7 +14,6 @@ use auth::ManagementAuth;
 use axum::Router;
 pub use machine::MachineManagement;
 use std::future::IntoFuture;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -73,38 +72,6 @@ pub struct ServerOptions {
     /// was validated against.
     pub max_request_body_bytes: usize,
 
-    /// Node keys the management plane accepts, from
-    /// `RuntimeConfig::management_keys` - `[control] secret` plus any
-    /// `[management] keys`.
-    ///
-    /// Empty is only legal on a loopback management listener.
-    /// [`ManagementAuth::for_listener`] is what decides that, and it decides
-    /// it before either listener is bound, so a node that may serve no
-    /// management call has said so at error level in its first lines rather
-    /// than after it looked healthy. It is deliberately not a startup
-    /// failure: the node's other half is public application traffic, which a
-    /// missing node key does not guard.
-    pub management_keys: Vec<String>,
-
-    /// Where the control-plane-facing gRPC listens, from
-    /// `[management] listen`.
-    ///
-    /// `None` - the default - keeps it on the data listener, which is the
-    /// address every existing `deis_runtime_nodes` entry already names.
-    /// `Some` gives it a socket of its own and takes it off the public port
-    /// entirely, so nothing that can reach an application can reach it.
-    pub management_listen: Option<SocketAddr>,
-
-    /// The mutually authenticated management plane, when this node has an
-    /// identity and an address to serve it on.
-    ///
-    /// `None` - the default, and every node configured before
-    /// `[machine_identity] management_listen` existed - means the management
-    /// plane is only what the two fields above describe: the fleet key, on a
-    /// plaintext socket. `Some` binds a third listener beside them that
-    /// admits one machine by certificate and asks nothing of the request.
-    /// The two coexist on purpose while the control plane is still dialling
-    /// nodes by key; see [`machine`] and [`auth::ManagementAuth::for_machine_listener`].
     pub machine_management: Option<MachineManagement>,
 }
 
@@ -174,8 +141,6 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         started_at,
         shutdown_grace,
         max_request_body_bytes,
-        management_keys,
-        management_listen,
         machine_management,
     } = options;
 
@@ -191,31 +156,13 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     );
     let trigger_service = TriggerServer::create_service(app_manager.clone());
 
-    // One door in front of both gRPC services.
-    //
-    // Both of them are administrative control of this node - apply a
-    // deployment, unload an application, list every tenant's applications,
-    // mint an inspector session, fire a queue or cron handler - and by default
-    // they are dispatched from the same listener as public application
-    // traffic. The check therefore sits here rather than inside either
-    // service: a handler cannot forget it, and a third service mounted on
-    // these paths later cannot become a third unguarded entrance without
-    // deleting this call. See `dispatcher::auth` for what it accepts and what
-    // it does when nothing is configured.
-    let management_addr =
-        management_listen.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], port)));
-    let management_auth = ManagementAuth::for_listener(management_keys, management_addr);
-
     // The entrance both gRPC services are dispatched from, built once per
     // listener that carries them.
     //
-    // It is a factory rather than a single value because a node may have two
-    // management listeners at once, admitting callers on different terms: the
-    // plaintext one guarded by the fleet key, and - while an identity is
-    // configured - one that admitted its caller by certificate before the
-    // request existed. What is behind the door is the same in both cases and
-    // must stay that way, so the dispatch below is written once and the guard
-    // is the only thing that differs.
+    // Still a factory, though there is one listener to build it for. What it
+    // buys is that the dispatch below - which service answers which path, and
+    // what an unknown path gets - is written once, so a second management
+    // listener added later cannot quietly answer differently from this one.
     let entrance = |auth: ManagementAuth| {
         let management_service = management_service.clone();
         let trigger_service = trigger_service.clone();
@@ -225,18 +172,23 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
             let management_auth = auth.clone();
             async move {
                 let path = req.uri().path();
-                if let Err(status) = management_auth.check(path, req.headers()) {
-                    // Answered as gRPC rather than as an HTTP 401: a caller that
-                    // gets a bare status code with no `grpc-status` reports
-                    // "unknown error", which would send whoever debugs a key
-                    // mismatch looking at the transport instead of at the
-                    // credential.
-                    let (parts, body) = status.into_http().into_parts();
-                    return Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
-                        parts,
-                        axum::body::Body::new(body),
-                    ));
-                }
+                // Nothing is checked here, and that is not an omission.
+                //
+                // The caller was identified before this request existed - it
+                // proved a certificate naming this node's control plane during
+                // the handshake, and `machine::ControlPlaneAcceptor` closed the
+                // connection if the name was anything else. A request that
+                // reaches this line arrived on a connection that could not have
+                // been opened by anyone else, so reading a header would be
+                // asking a proven caller to also say who it is.
+                //
+                // There used to be a credential check here, against a value the
+                // whole fleet shared, and a refusal was answered as gRPC rather
+                // than as a bare HTTP 401 so that whoever debugged it looked at
+                // the credential instead of at the transport. Both the value and
+                // the refusal are gone: a caller who cannot prove the name never
+                // gets a connection to refuse on.
+                let _ = &management_auth;
                 if path.starts_with("/deis.management.") {
                     match tower::Service::call(&mut management_service, req).await {
                         Ok(res) => {
@@ -275,32 +227,21 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         })
     };
 
-    let grpc_service = entrance(management_auth);
-
     // Build HTTP routes - every request is routed by the x-deis-app-id and
     // x-deis-environment headers.
     // gRPC services must be mounted on their explicit path prefixes BEFORE
     // the wildcard, otherwise `/*path` swallows every gRPC call and the
     // management plane is unreachable.
     //
-    // They are mounted on this listener only while the management plane
-    // shares it. Once `[management] listen` has given the plane a socket of
-    // its own, leaving these two prefixes here as well would keep open
-    // exactly the door the separation was asked for. Their paths then fall
-    // through to the wildcard below and are answered as any other request
-    // that names no application is - 400 for want of an `x-deis-app-id`
-    // header - which is a public port having nothing to say about a
-    // management call, not a management call being refused.
-    let mut app = Router::new();
-    if management_listen.is_none() {
-        app = app
-            .route_service(
-                "/deis.management.RuntimeManagement/*rpc",
-                grpc_service.clone(),
-            )
-            .route_service("/deis.trigger.Trigger/*rpc", grpc_service.clone());
-    }
-    let app = app
+    // Nothing administrative is mounted here. The two gRPC prefixes used to
+    // be, on this same `0.0.0.0` port that public application traffic arrives
+    // on, guarded by a value the whole fleet shared; both the value and that
+    // door are gone. Their paths now fall through to the wildcard below and
+    // are answered as any other request that names no application is - 400 for
+    // want of an `x-deis-app-id` header - which is a public port having
+    // nothing to say about a management call, not a management call being
+    // refused.
+    let app = Router::new()
         .route("/*path", axum::routing::any(handlers::handle_request))
         .route("/", axum::routing::any(handlers::handle_request))
         .with_state(state)
@@ -310,38 +251,15 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // The management plane's own socket, when it has one. Bound here, beside
-    // the data listener and before any application is loaded, so an address
-    // already in use is a startup failure rather than a node that comes up
-    // healthy and serving while no control plane can reach it.
-    let management_listener = match management_listen {
-        Some(addr) => Some((
-            addr,
-            tokio::net::TcpListener::bind(addr).await.with_context(|| {
-                format!("cannot bind the management plane on management.listen {addr}")
-            })?,
-            Router::new()
-                .route_service(
-                    "/deis.management.RuntimeManagement/*rpc",
-                    grpc_service.clone(),
-                )
-                .route_service("/deis.trigger.Trigger/*rpc", grpc_service.clone())
-                .layer(TraceLayer::new_for_http()),
-        )),
-        None => None,
-    };
-
     // The mutually authenticated management plane's socket, when this node
     // has one. Bound here for the same reason as the one above: before any
     // application is loaded, so an address already in use ends startup rather
     // than leaving a node that looks healthy while its control plane's
     // connections are refused by whatever else holds the port.
     //
-    // Its entrance is built with a guard of its own. The caller on this
-    // socket proved a certificate naming exactly this node's control plane
-    // before the connection existed, so the node key is not asked for - see
-    // `auth::ManagementAuth::for_machine_listener` for what that decides
-    // about the key and what has to change for it to be refused outright.
+    // The caller on this socket proved a certificate naming exactly this
+    // node's control plane before the connection existed, so nothing on the
+    // request is read - see `auth::ManagementAuth::for_machine_listener`.
     let machine_serving = match machine_management {
         Some(machine) => {
             let listener = std::net::TcpListener::bind(machine.listen).with_context(|| {
@@ -388,16 +306,7 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     info!("====================================");
     info!("✅ Runtime Platform is ready!");
     info!("📡 HTTP Server: http://localhost:{}", port);
-    match management_listen {
-        Some(addr) => info!(
-            "📡 gRPC Management: {} - its own listener, off the public port (content-type: application/grpc)",
-            addr
-        ),
-        None => info!(
-            "📡 gRPC Management: localhost:{} - shares the public port; set [management] listen to move it off (content-type: application/grpc)",
-            port
-        ),
-    }
+
     info!(
         "🎯 Routing: {} names the application, {} the environment (absent = {})",
         crate::APP_ID_HEADER,
@@ -431,34 +340,6 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         })
         .into_future();
     tokio::pin!(server);
-
-    // The management plane's listener drains on the same edge as the data
-    // one. A node that had stopped taking public traffic but kept accepting
-    // deployment pushes would apply a version it is on its way to not serving,
-    // and the control plane would record a success for a node that is leaving.
-    let mut management_drain = None;
-    let mut management_task = None;
-    if let Some((addr, listener, app)) = management_listener {
-        let (tx, rx) = oneshot::channel::<()>();
-        management_drain = Some(tx);
-        management_task = Some(tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = rx.await;
-                })
-                .await
-            {
-                error!(
-                    %addr,
-                    error = %e,
-                    "The management listener stopped with an error; this node keeps serving \
-                     public traffic, but the control plane can no longer push a deployment or \
-                     fire a cron at it, so what it runs drifts from what it is assigned until it \
-                     is restarted"
-                );
-            }
-        }));
-    }
 
     // The mutually authenticated plane drains on the same edge, and for the
     // same reason: a node that had stopped taking public traffic but kept
@@ -500,9 +381,6 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
                  have the grace period to finish"
             );
             let _ = drain_tx.send(());
-            if let Some(tx) = management_drain.take() {
-                let _ = tx.send(());
-            }
             if let Some(tx) = machine_drain.take() {
                 let _ = tx.send(());
             }
@@ -526,28 +404,10 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     // Reached from both arms, so the management listener is closed whether the
     // node was signalled or the data listener stopped by itself. `drain` has
     // already been sent in the signal case; sending it here covers the other.
-    if let Some(tx) = management_drain.take() {
-        let _ = tx.send(());
-    }
     if let Some(tx) = machine_drain.take() {
         let _ = tx.send(());
     }
-    if let Some(task) = management_task {
-        match tokio::time::timeout(shutdown_grace, task).await {
-            Ok(Ok(())) => info!("The management listener drained"),
-            Ok(Err(e)) => warn!(
-                error = %e,
-                "The management listener did not finish cleanly; a deployment push or cron fire \
-                 that was in flight may have been cut off, and the control plane will see it as \
-                 a failure and retry"
-            ),
-            Err(_) => error!(
-                grace_secs = shutdown_grace.as_secs(),
-                "The management listener was still busy when the grace period expired; a \
-                 deployment being applied on this node is being cut off mid-way"
-            ),
-        }
-    }
+
     if let Some(task) = machine_task {
         // Awaited without a timeout of its own, which is where this differs
         // from the two listeners above. Their graceful shutdown is unbounded,

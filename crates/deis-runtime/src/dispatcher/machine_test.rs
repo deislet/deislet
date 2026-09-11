@@ -199,9 +199,7 @@ fn only_the_expected_name_is_authorised() {
     let auth =
         ManagementAuth::for_machine_listener(expected.clone(), "127.0.0.1:8187".parse().unwrap());
 
-    assert_eq!(auth.expected_peer(), Some(&expected));
-    assert!(auth.is_enforcing(), "a certificate is a credential");
-    assert!(!auth.is_shut());
+    assert_eq!(auth.expected_peer(), &expected);
 
     // Two names from the same trust domain that are not it, so the check is
     // known not to be satisfied by anything this fleet signed.
@@ -209,33 +207,6 @@ fn only_the_expected_name_is_authorised() {
         names::node(TRUST_DOMAIN, NODE_ID).expect("a node name"),
         names::proxy(TRUST_DOMAIN, "edge-1").expect("a proxy name"),
     ] {
-        assert_ne!(auth.expected_peer(), Some(&other));
+        assert_ne!(auth.expected_peer(), &other);
     }
-}
-
-/// The fleet key is neither required nor refused on this listener.
-///
-/// Both halves matter while the migration is in flight: the control plane
-/// still puts a node key on every management call it makes, so a listener
-/// that refused one would refuse the first control plane to reach it, and a
-/// listener that required one would make a node that has given the key up
-/// undrivable.
-#[test]
-fn the_node_key_decides_nothing_once_a_certificate_has() {
-    let auth = ManagementAuth::for_machine_listener(
-        names::control(TRUST_DOMAIN).expect("a control name"),
-        "127.0.0.1:8187".parse().unwrap(),
-    );
-
-    let rpc = "/deis.management.RuntimeManagement/ApplyDeployment";
-    let mut with_a_key = axum::http::HeaderMap::new();
-    with_a_key.insert(
-        deis_wire::conventions::NODE_AUTH_METADATA,
-        "Bearer whatever-the-control-plane-still-sends"
-            .parse()
-            .unwrap(),
-    );
-
-    assert!(auth.check(rpc, &with_a_key).is_ok());
-    assert!(auth.check(rpc, &axum::http::HeaderMap::new()).is_ok());
 }

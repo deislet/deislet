@@ -24,6 +24,21 @@ QUEUE_PORT="${QUEUE_PORT:-8091}"
 TELEMETRY_PORT="${TELEMETRY_PORT:-8092}"
 TELEMETRY_METRICS_PORT="${TELEMETRY_METRICS_PORT:-8093}"
 
+# The two listeners Deislet's own processes talk to each other on. They are
+# separate from the ports above because what is served on them is different in
+# kind: an assignment list carries every environment's decrypted secrets, and
+# the routing table is a map of every hostname on the installation. A caller is
+# admitted there by a certificate naming a machine of this installation, and by
+# nothing else.
+CONTROL_MACHINE_PORT="${CONTROL_MACHINE_PORT:-8084}"
+RUNTIME_MACHINE_PORT="${RUNTIME_MACHINE_PORT:-8087}"
+
+# The name every machine here is issued under. It is not resolved and nothing
+# connects to it; it is the first half of a SPIFFE name, and its only job is to
+# be the same on every certificate this installation trusts.
+FLEET_TRUST_DOMAIN="${FLEET_TRUST_DOMAIN:-canary.deislet.internal}"
+PKI_DIR=/etc/deis/pki
+
 BINS=(deis-control deis-runtime deis-proxy deis-store deis-queue deis-telemetry deis-backend-topology deis)
 
 usage() {
@@ -97,7 +112,6 @@ ensure_secrets() {
     return
   fi
 
-  NODE_PSK="$(openssl rand -hex 32)"
   API_KEY="$(openssl rand -hex 32)"
   STORAGE_AUTH="$(openssl rand -hex 32)"
   TELEMETRY_AUTH="$(openssl rand -hex 32)"
@@ -110,7 +124,6 @@ LAN_IP=${LAN_IP}
 ZONE=${ZONE}
 NODE_ID=${NODE_ID}
 PROXY_ID=${PROXY_ID}
-NODE_PSK=${NODE_PSK}
 API_KEY=${API_KEY}
 STORAGE_AUTH=${STORAGE_AUTH}
 TELEMETRY_AUTH=${TELEMETRY_AUTH}
@@ -128,6 +141,90 @@ EOF
   log "wrote ${secrets}"
 }
 
+# ---- the installation's certificate authority ----------------------------
+#
+# Control, node and proxy all live on this one machine, so one authority minted
+# here is enough for them to prove who they are to each other. A multi-machine
+# installation would put the authority somewhere with a life longer than any
+# one host and hand each machine only its own leaf and the root; nothing in
+# Deislet knows or cares where the three files came from, so that substitution
+# costs nothing here.
+#
+# Two things are easy to get wrong and expensive to diagnose:
+#
+#   * the extensions go in an -extfile, not -addext. `openssl x509 -req` does
+#     not carry extensions over from the signing request unless given
+#     -copy_extensions, which is not spelled the same way across openssl
+#     versions. Get it wrong and every certificate is signed with no URI
+#     subject alternative name at all, which surfaces much later as a process
+#     reporting that its certificate names no machine.
+#   * every leaf carries both serverAuth and clientAuth, because each process
+#     here is a server on one connection and a client on another: the control
+#     plane serves the machine channel and dials its nodes, and a node serves
+#     its management plane and dials the control plane.
+#
+# Like secrets.env, existing files are reused: a release must not hand a live
+# installation new names. Delete /etc/deis/pki to start over, and remember that
+# every process has to be restarted to pick the new root up.
+mint_ca() {
+  local prefix=$1
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout "${prefix}.key" -out "${prefix}.crt" -days 3650 \
+    -subj "/CN=${FLEET_TRUST_DOMAIN} fleet authority" >/dev/null 2>&1
+  chmod 600 "${prefix}.key"
+}
+
+# mint_leaf <leaf-prefix> <spiffe-path> [extra-san]
+mint_leaf() {
+  local leaf=$1
+  local path=$2
+  local extra=${3:-}
+  local san="URI:spiffe://${FLEET_TRUST_DOMAIN}${path}"
+  if [[ -n ${extra} ]]; then
+    san="${san},${extra}"
+  fi
+  # The subject is decoration and deliberately not the SPIFFE name: the
+  # identity lives in the URI subject alternative name, which is the only thing
+  # the platform reads, and openssl parses a `/` in a subject string as the
+  # separator between one relative distinguished name and the next - so a
+  # `spiffe://` subject is refused outright.
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout "${leaf}.key" -out "${leaf}.csr" -subj "/CN=${leaf##*/}" \
+    >/dev/null 2>&1
+  cat > "${leaf}.ext" <<EXT
+subjectAltName=${san}
+basicConstraints=CA:FALSE
+extendedKeyUsage=serverAuth,clientAuth
+EXT
+  openssl x509 -req -in "${leaf}.csr" -CA "${PKI_DIR}/ca.crt" \
+    -CAkey "${PKI_DIR}/ca.key" -CAcreateserial -days 825 \
+    -extfile "${leaf}.ext" -out "${leaf}.crt" >/dev/null 2>&1
+  chmod 600 "${leaf}.key"
+  rm -f "${leaf}.csr" "${leaf}.ext"
+}
+
+ensure_pki() {
+  if [[ -f ${PKI_DIR}/ca.crt ]]; then
+    log "reusing existing ${PKI_DIR}"
+    return
+  fi
+  command -v openssl >/dev/null 2>&1 || die "openssl is needed to issue this installation's certificates"
+
+  mkdir -p "${PKI_DIR}"
+  chmod 700 "${PKI_DIR}"
+  mint_ca "${PKI_DIR}/ca"
+
+  # Each leaf carries the address its own listener answers on, because a peer
+  # dialling it checks the name it dialled as well as the certificate: an IP
+  # address reached over a name it does not carry is refused at the handshake.
+  mint_leaf "${PKI_DIR}/control" "/deislet/control" "IP:${LAN_IP},IP:127.0.0.1"
+  mint_leaf "${PKI_DIR}/node" "/deislet/node/${NODE_ID}" "IP:${LAN_IP},IP:127.0.0.1"
+  mint_leaf "${PKI_DIR}/proxy" "/deislet/proxy/${PROXY_ID}"
+
+  chown -R deis:deis "${PKI_DIR}"
+  log "issued ${PKI_DIR}: one authority and three machines under spiffe://${FLEET_TRUST_DOMAIN}"
+}
+
 write_master_key() {
   printf '%s\n' "${MASTER_KEY}" >/etc/deis/secret.key
   chown deis:deis /etc/deis/secret.key
@@ -142,7 +239,6 @@ bind_addr = "0.0.0.0"
 port = ${CONTROL_PORT}
 heartbeat_interval = 15
 heartbeat_timeout = 90
-node_preshared_keys = ["${NODE_PSK}"]
 api_auth_enabled = true
 api_keys = ["${API_KEY}"]
 api_cors_allowed_origins = []
@@ -159,6 +255,25 @@ cron_tick_seconds = 60
 [[deis_runtime_nodes]]
 id = "${NODE_ID}"
 addr = "http://${LAN_IP}:${RUNTIME_PORT}"
+
+# The listener this installation's own processes talk to. Registration,
+# assignments, bundle downloads and the routing table are served here and
+# nowhere else, and a caller is admitted only by a certificate that chains to
+# the root below and names a machine of this installation. Leave it out and
+# no node can register and no proxy can fetch a routing table.
+[machine]
+bind_addr = "0.0.0.0"
+port = ${CONTROL_MACHINE_PORT}
+certificate = "${PKI_DIR}/control.crt"
+private_key = "${PKI_DIR}/control.key"
+trust_root = "${PKI_DIR}/ca.crt"
+# The longest a renewal can go unnoticed. Far shorter than any certificate
+# lifetime in use, and a rotation needs no restart.
+identity_reload_seconds = 60
+# Where nodes reach this listener, which is what bundle URLs in an assignment
+# are built from. public_base_url above names where a browser finds the
+# dashboard, and that is the wrong address to hand a node.
+public_base_url = "https://${LAN_IP}:${CONTROL_MACHINE_PORT}"
 EOF
 
   cat >/etc/deis/runtime.toml <<EOF
@@ -187,12 +302,30 @@ batch_size = 100
 max_retries = 3
 max_pending_entries = 10000
 
+# On startup the node asks the control plane which applications and versions
+# it should be running, downloads each bundle itself, and only reports healthy
+# once they are loaded. There is no `secret` line and that is the finished
+# state rather than an omission: the assignment list carries every
+# environment's decrypted secrets, and what entitles this node to it is the
+# certificate below, which names this one node.
 [control]
 endpoint = "http://${LAN_IP}:${CONTROL_PORT}"
-secret = "${NODE_PSK}"
 request_timeout_secs = 30
 retry_interval_secs = 15
 reconcile_interval_secs = 60
+
+# This node's own identity, and where the machine channel is. Registration,
+# assignments and bundle downloads all go over it, under a certificate naming
+# this node and no other.
+[machine_identity]
+control_endpoint = "https://${LAN_IP}:${CONTROL_MACHINE_PORT}"
+certificate = "${PKI_DIR}/node.crt"
+private_key = "${PKI_DIR}/node.key"
+trust_root = "${PKI_DIR}/ca.crt"
+trust_domain = "${FLEET_TRUST_DOMAIN}"
+# The other direction: what the control plane pushes into this node arrives
+# here, admitted only if the connection proved the control plane's own name.
+management_listen = "${LAN_IP}:${RUNTIME_MACHINE_PORT}"
 
 [bundles]
 max_bytes = 268435456
@@ -250,8 +383,18 @@ level = "info"
 [control]
 addr = "http://${LAN_IP}:${CONTROL_PORT}"
 associated_id = "${PROXY_ID}"
-secret = "${NODE_PSK}"
 heartbeat_interval = 30
+
+# The proxy's identity on the machine channel. The routing table is fetched
+# over it, and the acknowledgement this proxy sends - which table version it is
+# already running - is held against the name this connection proved, so no
+# proxy can acknowledge on another's behalf.
+[machine_identity]
+control_endpoint = "https://${LAN_IP}:${CONTROL_MACHINE_PORT}"
+certificate = "${PKI_DIR}/proxy.crt"
+private_key = "${PKI_DIR}/proxy.key"
+trust_root = "${PKI_DIR}/ca.crt"
+trust_domain = "${FLEET_TRUST_DOMAIN}"
 
 [routing]
 control_poll_interval_secs = 5
@@ -466,6 +609,7 @@ fi
 ensure_secrets
 # shellcheck disable=SC1091
 source /etc/deis/secrets.env
+ensure_pki
 
 if ((FIRST_INSTALL)) || ((REWRITE_CONFIG)); then
   write_master_key

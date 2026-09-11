@@ -15,7 +15,6 @@ pub mod identity;
 pub mod machine;
 pub mod message;
 pub mod metrics;
-pub mod node_key;
 pub mod reaper;
 pub mod runtime_client;
 pub mod scheduler;
@@ -69,7 +68,7 @@ mod tests {
 
     use crate::config::ControlConfig;
     use crate::handler::MessageHandler;
-    use crate::message::{AuthData, HeartbeatRequest, NodeInfo, NodeRole, RegisterRequest};
+    use crate::message::{HeartbeatRequest, NodeInfo, NodeRole, RegisterRequest};
     use crate::session::{NodeEvent, NodeSession, NodeState, SessionManager};
 
     #[test]
@@ -88,7 +87,6 @@ mod tests {
             port: 9000,
             heartbeat_interval: 60,
             heartbeat_timeout: 180,
-            node_preshared_keys: vec!["key1".to_string()],
             ..Default::default()
         };
         assert_eq!(config.bind_addr, "127.0.0.1");
@@ -159,81 +157,6 @@ mod tests {
         assert_eq!(manager.count(), 0);
     }
 
-    /// A control plane with no node credential admits no node. It used to
-    /// admit every one of them, which made "no configuration" the same
-    /// thing as "no authentication".
-    #[tokio::test]
-    async fn test_message_handler_auth_no_psk() {
-        let config = ControlConfig::default();
-        assert!(config.node_preshared_keys.is_empty());
-        let sessions = SessionManager::new();
-        let handler =
-            MessageHandler::new(std::sync::Arc::new(config), std::sync::Arc::new(sessions));
-
-        let auth_data = AuthData {
-            associated_id: "test-node".to_string(),
-            signature: "any".to_string(),
-            timestamp: chrono::Utc::now().timestamp() as u64,
-        };
-
-        let response = handler.handle_auth(auth_data).await;
-        assert!(!response.authenticated);
-        assert!(response.error.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_message_handler_auth_with_valid_signature() {
-        use sha2::{Digest, Sha256};
-
-        let secret = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
-        let config = ControlConfig {
-            node_preshared_keys: vec![secret.to_string()],
-            ..Default::default()
-        };
-        let sessions = SessionManager::new();
-        let handler =
-            MessageHandler::new(std::sync::Arc::new(config), std::sync::Arc::new(sessions));
-
-        let associated_id = "test-node".to_string();
-        let timestamp = chrono::Utc::now().timestamp() as u64;
-
-        let mut hasher = Sha256::new();
-        hasher.update(secret.as_bytes());
-        hasher.update(associated_id.as_bytes());
-        hasher.update(timestamp.to_be_bytes());
-        let signature = format!("{:x}", hasher.finalize());
-
-        let auth_data = AuthData {
-            associated_id,
-            signature,
-            timestamp,
-        };
-
-        let response = handler.handle_auth(auth_data).await;
-        assert!(response.authenticated);
-    }
-
-    #[tokio::test]
-    async fn test_message_handler_auth_with_invalid_signature() {
-        let secret = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
-        let config = ControlConfig {
-            node_preshared_keys: vec![secret.to_string()],
-            ..Default::default()
-        };
-        let sessions = SessionManager::new();
-        let handler =
-            MessageHandler::new(std::sync::Arc::new(config), std::sync::Arc::new(sessions));
-
-        let auth_data = AuthData {
-            associated_id: "test-node".to_string(),
-            signature: "invalid_signature".to_string(),
-            timestamp: chrono::Utc::now().timestamp() as u64,
-        };
-
-        let response = handler.handle_auth(auth_data).await;
-        assert!(!response.authenticated);
-        assert!(response.error.is_some());
-    }
 
     #[tokio::test]
     async fn test_message_handler_register() {

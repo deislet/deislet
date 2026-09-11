@@ -175,7 +175,7 @@ mod tests {
     /// An app with one environment, on a control plane wired the way the
     /// `storage` argument says.
     async fn platform(storage: crate::delivery::StorageWiring) -> Harness {
-        let h = harness_with_storage(true, vec!["node-psk".to_string()], storage).await;
+        let h = harness_with_storage(true, storage).await;
         json(
             &h.router,
             "POST",

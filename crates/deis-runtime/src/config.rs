@@ -151,23 +151,19 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub control: ControlPlaneConfig,
 
-    /// This node's mutual-TLS identity on the machine channel, the
-    /// replacement for `node_preshared_keys` that is being rolled out
-    /// alongside it.
+    /// This node's mutual-TLS identity on the machine channel.
     ///
-    /// Absent, the default, means this node authenticates the way it always
-    /// has: `[control] secret` on the wire, nothing proved beyond a string
-    /// every node in the fleet also holds. Nothing here reaches for it yet -
-    /// see `crate::config::MachineIdentityConfig` - so setting this section
-    /// today changes only what is loaded and logged at startup, not what any
-    /// request carries.
+    /// It is how this node registers, fetches its assignments and downloads
+    /// its bundles, and it is what admits the control plane to this node's
+    /// management plane. There is nothing else: the fleet-wide value all of
+    /// that once rode on no longer exists.
+    ///
+    /// `Option` only so a configuration without it can be read and then
+    /// refused by name. A node that started without one would serve a
+    /// management plane nobody is admitted to and fetch nothing, while
+    /// looking healthy, so `main` refuses to start instead.
     #[serde(default)]
     pub machine_identity: Option<MachineIdentityConfig>,
-
-    /// Where this node's control-plane-facing gRPC listens, and which node
-    /// keys it accepts there.
-    #[serde(default)]
-    pub management: ManagementConfig,
 
     /// Where downloaded application bundles live and how large one may be.
     #[serde(default)]
@@ -229,7 +225,6 @@ impl Default for RuntimeConfig {
             logging: LoggingConfig::default(),
             control: ControlPlaneConfig::default(),
             machine_identity: None,
-            management: ManagementConfig::default(),
             bundles: BundleConfig::default(),
             assets: AssetsConfig::default(),
             fetch: FetchConfig::default(),
@@ -258,28 +253,17 @@ impl Default for RuntimeConfig {
 /// is a name that tells a reader nothing.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ControlPlaneConfig {
-    /// Base URL of the control plane, e.g. `http://127.0.0.1:8080`.
+    /// Base URL of the control plane's human listener, e.g.
+    /// `http://127.0.0.1:8080`.
     ///
-    /// A URL with a scheme and not a socket address, which is why it is not
-    /// spelled `addr` like `deis_wire::config::ControlConfig`: that one dials
-    /// gRPC, this one is joined with `/api/nodes/{id}/assignments` to make an
-    /// HTTP request.
+    /// Not where this node fetches its assignments: that is the machine
+    /// channel, named by `[machine_identity] control_endpoint`, and reaching
+    /// it needs a certificate rather than an address. What is left here is the
+    /// address an operator would open, kept because a startup line naming
+    /// where this node's control plane is has to name something a person can
+    /// follow.
     #[serde(default)]
     pub endpoint: Option<String>,
-
-    /// The node credential, one of the control plane's `node_preshared_keys`.
-    ///
-    /// The assignment list carries this node's decrypted secrets, so the
-    /// control plane refuses to serve it - and the bundle download - to a
-    /// caller that cannot prove it is a node. Unset means the requests go out
-    /// anonymous, which works only against a control plane that has no node
-    /// keys configured at all; against one that has, every assignment fetch
-    /// returns 401 and this node never picks up a new version.
-    ///
-    /// Named `secret` to match `[control] secret` in deis-proxy's file: it is
-    /// the same value from the same list.
-    #[serde(default)]
-    pub secret: Option<String>,
 
     /// Seconds one assignment request may take before it is abandoned.
     #[serde(default = "default_control_request_timeout_secs")]
@@ -317,13 +301,14 @@ fn default_control_reconcile_interval_secs() -> u64 {
     60
 }
 
-/// Hand-written so dumping the configuration - in a startup line, in an error
-/// context - cannot print the node key.
+/// Hand-written, and kept hand-written after the credential it was written to
+/// hide was removed. Nothing in this struct is secret any more, but a derived
+/// `Debug` would print whatever is added to it next, and the next thing added
+/// to a control-plane configuration is as likely as not to be a credential.
 impl std::fmt::Debug for ControlPlaneConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlPlaneConfig")
             .field("endpoint", &self.endpoint)
-            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .field("request_timeout_secs", &self.request_timeout_secs)
             .field("retry_interval_secs", &self.retry_interval_secs)
             .field("reconcile_interval_secs", &self.reconcile_interval_secs)
@@ -335,7 +320,6 @@ impl Default for ControlPlaneConfig {
     fn default() -> Self {
         Self {
             endpoint: None,
-            secret: None,
             request_timeout_secs: default_control_request_timeout_secs(),
             retry_interval_secs: default_control_retry_interval_secs(),
             reconcile_interval_secs: default_control_reconcile_interval_secs(),
@@ -415,12 +399,12 @@ pub struct MachineIdentityConfig {
     /// that has to remember to cross-check.
     ///
     /// It is a different port from `[control] endpoint`, which is the human
-    /// listener. A node that has this dialled announces itself here too -
-    /// registering over this channel is what gets it recorded by name rather
-    /// than by a fleet-wide key, and a node recorded by name is the only kind
-    /// the control plane dials back by certificate. What has not moved off the
-    /// human listener is the bundle download, which still presents the fleet
-    /// key when a bundle URL points there.
+    /// listener a browser reaches. This node announces itself here -
+    /// registering over this channel is what gets it recorded by the name its
+    /// certificate carries, and a node recorded by name is the only kind the
+    /// control plane can dial back. The bundle download is served here too,
+    /// which is why a bundle URL in an assignment names this address and not
+    /// the human one.
     #[serde(default)]
     pub control_endpoint: Option<String>,
 
@@ -434,31 +418,25 @@ pub struct MachineIdentityConfig {
     /// management plane, under mutual TLS, for the control plane to drive it
     /// through. An `ip:port` literal, e.g. `0.0.0.0:8187`.
     ///
-    /// # Why this is a third socket and not one of the two the node already has
+    /// # Why this is a second socket and not the one the node already has
     ///
-    /// Neither existing listener can be the one that demands a certificate.
-    /// The data listener carries public application traffic, so a demand for
-    /// a client certificate there would end every browser request during the
-    /// handshake. `[management] listen` is the plaintext door the control
-    /// plane drives today, and it has to keep working until the control plane
-    /// dials its nodes by certificate - a change being made separately, on
-    /// the other side of this channel. So the authenticated plane arrives
-    /// beside them rather than on top of one of them, and is the only socket
-    /// on this node whose caller is known by name rather than by a string the
-    /// whole fleet holds.
+    /// The node's other listener carries public application traffic, so a
+    /// demand for a client certificate there would end every browser request
+    /// during the handshake. The management plane has the opposite
+    /// requirement - no caller without a certificate, ever - so the two
+    /// cannot share a socket, and this one is separate for that reason rather
+    /// than for tidiness.
     ///
-    /// Unset - the default - means this node dials the machine channel and
-    /// does not serve one, which is what every node configured before this
-    /// setting existed does. That is not a half-filled section: the direction
-    /// that has moved to certificates is node-to-control, and serving is the
-    /// direction that has not. A node in that state logs, at warn, that its
-    /// management plane is still the fleet key's.
+    /// Unset - the default - means this node serves no management plane, and
+    /// the control plane can drive it in no way at all: it can be deployed to
+    /// only by the assignments this node pulls for itself. `main` refuses to
+    /// start in that state rather than leave a node that looks reachable and
+    /// is not.
     ///
-    /// It must be an `ip:port` literal and not a hostname, for the reason
-    /// `[management] listen` must be: which interface a management plane
-    /// binds is not a question DNS should be answering at startup, and an
-    /// address that resolved differently on two nodes would be a fleet whose
-    /// exposure nobody can read off the file.
+    /// It must be an `ip:port` literal and not a hostname: which interface a
+    /// management plane binds is not a question DNS should be answering at
+    /// startup, and an address that resolved differently on two nodes would
+    /// be an installation whose exposure nobody can read off the file.
     #[serde(default)]
     pub management_listen: Option<String>,
 }
@@ -479,140 +457,6 @@ impl Default for MachineIdentityConfig {
             control_identity: None,
             management_listen: None,
         }
-    }
-}
-
-/// This node's own management plane: the gRPC the control plane drives it
-/// through.
-///
-/// `deis.management.RuntimeManagement` and `deis.trigger.Trigger` between them
-/// apply a deployment, unload an application, list every tenant's
-/// applications, mint an inspector session and fire a queue or cron handler.
-/// That is administrative control of the node, so it is authenticated on every
-/// call - see [`crate::dispatcher::auth`] - and this section is the two
-/// decisions an operator gets to make about it: where it listens, and which
-/// keys it accepts.
-///
-/// Leaving the whole section out is the supported default and changes nothing
-/// about where the node listens: the management plane shares the data port,
-/// which is the address every control plane's `deis_runtime_nodes` entry and
-/// every self-registration already names. What it does *not* do any more is
-/// serve that plane to a caller with no credential.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct ManagementConfig {
-    /// Address the management gRPC binds, as `ip:port`, e.g.
-    /// `127.0.0.1:8186`.
-    ///
-    /// Unset - the default - means it shares the node's data listener on
-    /// `0.0.0.0:http_port`, which is what an existing installation already
-    /// dials. Setting it moves both gRPC services onto their own socket, and
-    /// the data port stops carrying them: their paths fall through to the
-    /// application router and are answered as any request naming no
-    /// application is. Public application traffic and administrative control
-    /// no longer arrive through the same door.
-    ///
-    /// A node that moves it advertises the new port when it registers, so a
-    /// control plane that learned this node from its registration follows on
-    /// its own. One that has the node written down in `deis_runtime_nodes`
-    /// does not: there the file's address wins, the disagreement is only
-    /// logged at warn, and every push keeps going to the old port until that
-    /// file is edited too.
-    ///
-    /// It must be an `ip:port` literal and not a hostname. Whether this
-    /// address is reachable from another host is what decides whether a node
-    /// with no key may serve at all, and that decision must not depend on
-    /// what DNS happened to answer at startup.
-    #[serde(default)]
-    pub listen: Option<String>,
-
-    /// Node keys this management plane accepts *in addition to*
-    /// `[control] secret`.
-    ///
-    /// One key is the normal case and needs nothing here: the value in
-    /// `[control] secret` is one of the control plane's `node_preshared_keys`
-    /// and is accepted in both directions, so a node has one credential and
-    /// not two.
-    ///
-    /// This list exists for a rotation. A fleet cannot change a shared secret
-    /// on the control plane and on every node in the same instant, so the
-    /// order is: add the new key here on every node and restart them (each
-    /// node now answers to both), put the new key first in the control
-    /// plane's `node_preshared_keys` (it is now what the control plane
-    /// presents, and it still accepts the old one on the pull side), move each
-    /// node's `[control] secret` to the new value and drop the old one from
-    /// here, then drop the old key from the control plane. No step of that
-    /// leaves a node the control plane cannot drive.
-    #[serde(default)]
-    pub keys: Vec<String>,
-}
-
-/// Hand-written so dumping the configuration - in a startup line, in an error
-/// context - cannot print the node keys.
-impl std::fmt::Debug for ManagementConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ManagementConfig")
-            .field("listen", &self.listen)
-            .field("keys", &format_args!("<{} redacted>", self.keys.len()))
-            .finish()
-    }
-}
-
-impl ManagementConfig {
-    fn validate(&self) -> Result<()> {
-        // Parsed here as well as where it is used, so a typo is a startup
-        // error naming the key rather than a management plane that quietly
-        // stayed on the public port.
-        let addr = self.listen_addr()?;
-
-        if let Some(addr) = addr {
-            if addr.port() == 0 {
-                return Err(anyhow!(
-                    "management.listen {addr} asks the OS for an arbitrary port; the control \
-                     plane addresses this node by the port it registers, so a port that changes \
-                     on every restart is a node nothing can drive"
-                ));
-            }
-        }
-
-        for key in &self.keys {
-            if key.trim().is_empty() {
-                return Err(anyhow!(
-                    "management.keys holds an empty entry; either remove it or set it to one of \
-                     the control plane's node_preshared_keys. A blank entry is an operator who \
-                     meant to fill it in, and treating it as a key would make this node's \
-                     authentication a formality"
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// The configured listener address, parsed.
-    ///
-    /// `Ok(None)` means the management plane shares the data listener, which
-    /// is the default and what an existing installation is addressed at.
-    pub fn listen_addr(&self) -> Result<Option<std::net::SocketAddr>> {
-        let Some(listen) = self
-            .listen
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(None);
-        };
-        listen
-            .parse::<std::net::SocketAddr>()
-            .map(Some)
-            .map_err(|e| {
-                anyhow!(
-                    "management.listen {listen:?} is not an ip:port address ({e}); write it \
-                     as 127.0.0.1:8186 or 0.0.0.0:8186. A hostname is refused because \
-                     whether this address is reachable from another host is what decides \
-                     whether this node may serve its management plane without a key, and \
-                     that must not depend on what DNS answers"
-                )
-            })
     }
 }
 
@@ -1346,10 +1190,6 @@ impl RuntimeConfig {
                 .management_listen = Some(value);
         }
 
-        if let Some(value) = env_var("DEIS_RUNTIME_MANAGEMENT_LISTEN") {
-            self.management.listen = Some(value);
-        }
-
         if let Some(value) = env_var("DEIS_RUNTIME_BUNDLES_DIR") {
             self.bundles.dir = Some(PathBuf::from(value));
         }
@@ -1383,63 +1223,6 @@ impl RuntimeConfig {
         }
 
         Ok(())
-    }
-
-    /// The node credential to present to the control plane, if one was
-    /// configured.
-    pub fn node_credential(&self) -> Option<crate::deployment::NodeCredential> {
-        self.control.credential()
-    }
-
-    /// Every node key this node's management plane accepts.
-    ///
-    /// `[control] secret` first, then `[management] keys`. The same value in
-    /// both is folded into one entry so that a config which repeats it does
-    /// not read as a two-key rotation in the startup log.
-    pub fn management_keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = Vec::new();
-        let candidates = self
-            .control
-            .secret
-            .as_deref()
-            .into_iter()
-            .chain(self.management.keys.iter().map(String::as_str));
-        for key in candidates {
-            let key = key.trim();
-            if !key.is_empty() && !keys.iter().any(|seen| seen == key) {
-                keys.push(key.to_string());
-            }
-        }
-        keys
-    }
-
-    /// The address this node's management plane is bound to.
-    ///
-    /// The data listener when the two share a port - which is `0.0.0.0`, the
-    /// address public application traffic arrives on - and `[management]
-    /// listen` when they do not. This is the address the loopback rule in
-    /// [`Self::validate`] and in [`crate::dispatcher::auth`] is decided from,
-    /// so it is derived once here rather than inferred at each of them.
-    pub fn management_bind_addr(&self) -> Result<std::net::SocketAddr> {
-        match self.management.listen_addr()? {
-            Some(addr) => Ok(addr),
-            None => Ok(std::net::SocketAddr::from(([0, 0, 0, 0], self.http_port))),
-        }
-    }
-
-    /// The port this node tells the control plane to drive it through when it
-    /// registers.
-    ///
-    /// The management port, not the data port: a registration is what the
-    /// control plane dials `ApplyDeployment` and `OnScheduled` at. Advertising
-    /// the data port after `[management] listen` moved the plane elsewhere
-    /// would leave every push and every cron fire answered with a 404 from the
-    /// public router, which looks exactly like a node that is running fine.
-    pub fn management_advertised_port(&self) -> Result<u16> {
-        Ok(self
-            .management
-            .listen_addr()?
-            .map_or(self.http_port, |addr| addr.port()))
     }
 
     /// Directory holding downloaded bundles, resolved against `data_dir` when
@@ -1619,22 +1402,9 @@ impl RuntimeConfig {
                         self.http_port
                     ));
                 }
-                if let Some(plain) = self.management.listen_addr()? {
-                    if plain.port() == machine.port() {
-                        return Err(anyhow!(
-                            "machine_identity.management_listen {machine} and management.listen \
-                             {plain} name the same port. They are two doors into the same \
-                             management plane that authenticate their callers differently - one \
-                             by certificate, one by the fleet key - and only one of them can \
-                             have that port, so which regime the control plane met would depend \
-                             on which listener bound first"
-                        ));
-                    }
-                }
             }
         }
 
-        self.management.validate()?;
         self.bundles.validate()?;
         self.assets.validate()?;
         self.fetch.validate()?;
@@ -1644,13 +1414,7 @@ impl RuntimeConfig {
 }
 
 impl ControlPlaneConfig {
-    /// The credential to present on the control plane's node endpoints, bound
-    /// to the configured endpoint so it travels nowhere else.
-    pub fn credential(&self) -> Option<crate::deployment::NodeCredential> {
-        self.secret
-            .as_deref()
-            .map(|secret| crate::deployment::NodeCredential::new(secret, self.endpoint.as_deref()))
-    }
+
 
     fn validate(&self) -> Result<()> {
         if let Some(endpoint) = self.endpoint.as_deref() {
@@ -1665,16 +1429,6 @@ impl ControlPlaneConfig {
                 return Err(anyhow!(
                     "control.endpoint {endpoint:?} has no http:// or https:// scheme; the node \
                      builds an absolute URL from it and would never reach the control plane"
-                ));
-            }
-        }
-
-        if let Some(secret) = self.secret.as_deref() {
-            if secret.trim().is_empty() {
-                return Err(anyhow!(
-                    "control.secret is empty; either remove it or set it to one of the control \
-                     plane's node_preshared_keys. An empty value is sent as a credential and \
-                     refused, so this node would never fetch an assignment list"
                 ));
             }
         }
@@ -1764,8 +1518,8 @@ impl MachineIdentityConfig {
     /// Where this node serves its own machine channel, parsed.
     ///
     /// `Ok(None)` - the default - means it serves none: this node dials the
-    /// control plane by certificate and is still driven over the plaintext
-    /// management plane guarded by the fleet key.
+    /// control plane by certificate and can be driven by nobody, because the
+    /// plaintext management plane this used to fall back to no longer exists.
     pub fn management_listen_addr(&self) -> Result<Option<std::net::SocketAddr>> {
         let Some(listen) = self
             .management_listen
@@ -1796,18 +1550,26 @@ impl MachineIdentityConfig {
     /// handshake refused because the peer name was never resolved - is
     /// refused here instead, against the setting that is actually wrong.
     fn validate(&self) -> Result<()> {
-        // The address and the files are one setting. A certificate with
-        // nowhere to present it, and an address with nothing to prove when it
-        // gets there, are both useless in a way nothing notices until the
-        // first dial - so they are refused together, here, because this table
-        // is the only thing that has to see both.
-        if self.control_endpoint.is_none() {
+        // The address and the files are one setting, with one exception. A
+        // certificate this node never presents anywhere, and an address with
+        // nothing to prove when it gets there, are both useless in a way
+        // nothing notices until the first dial - so they are refused together,
+        // here, because this table is the only thing that has to see both.
+        //
+        // The exception is a node that serves a management plane and dials
+        // nobody. Its certificate is not useless: it is what that listener
+        // presents to whoever drives it. That is what `deis dev` runs - a node
+        // driven entirely by the CLI beside it, with no control plane anywhere
+        // to fetch assignments from - and refusing it would be refusing a
+        // configuration that works.
+        if self.control_endpoint.is_none() && self.management_listen.is_none() {
             return Err(anyhow!(
-                "machine_identity.control_endpoint is required. It is where the control plane's \
-                 machine listener is - a different port from [control] endpoint, which is the \
-                 human one - and without it this node would load its certificate, log that it \
-                 had, and go on fetching its assignments over the shared fleet key exactly as \
-                 before"
+                "machine_identity has neither control_endpoint nor management_listen, so this \
+                 node would load its certificate, log that it had, and then neither ask anything \
+                 of a control plane nor let one drive it. Set control_endpoint to the control \
+                 plane's machine listener - a different port from [control] endpoint, which is \
+                 the human one - or management_listen if this node is driven locally and fetches \
+                 nothing"
             ));
         }
         if let Some(endpoint) = self.control_endpoint.as_deref() {
@@ -1867,16 +1629,16 @@ impl MachineIdentityConfig {
         // An address that was meant to be filled in and was not. Left as an
         // empty string it would read, to `management_listen_addr`, exactly
         // like the section that never asked to serve at all - so the node
-        // would come up dialling happily, with its management plane still on
-        // the fleet key, and the setting an operator wrote would be the thing
-        // that said otherwise.
+        // would come up dialling happily and serving no management plane, and
+        // the setting an operator wrote would be the thing that said
+        // otherwise.
         if let Some(listen) = self.management_listen.as_deref() {
             if listen.trim().is_empty() {
                 return Err(anyhow!(
                     "machine_identity.management_listen is empty; either remove it, which leaves \
-                     this node's management plane where it is today - the fleet key on the \
-                     plaintext listener - or set it to the ip:port this node should serve its \
-                     mutually authenticated management plane on, e.g. 0.0.0.0:8187"
+                     this node with no management plane at all and so nothing that can deploy to \
+                     it, unload from it or fire its crons - or set it to the ip:port this node \
+                     should serve that plane on, e.g. 0.0.0.0:8187"
                 ));
             }
         }
@@ -1946,8 +1708,7 @@ impl AssetsConfig {
 }
 
 /// Hand-written so dumping the configuration - in a startup line, in an error
-/// context - cannot print the telemetry secret, the same rule
-/// [`ControlPlaneConfig`] follows for the node key.
+/// context - cannot print the telemetry secret.
 impl std::fmt::Debug for LoggingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoggingConfig")
@@ -2903,9 +2664,9 @@ mod tests {
     }
 
     /// The three files plus a trust domain, and no address: a node that would
-    /// have loaded a certificate, logged that it had, and gone on using the
-    /// shared fleet key for everything. Refused, naming both settings, because
-    /// the operator who wrote the section believes the opposite.
+    /// have loaded a certificate, logged that it had, and then asked nobody
+    /// for anything. Refused, naming both settings, because the operator who
+    /// wrote the section believes the opposite.
     #[test]
     fn test_validate_rejects_an_identity_with_nowhere_to_dial() {
         let config = with_machine_channel(MachineIdentityConfig {
@@ -2916,7 +2677,27 @@ mod tests {
             ..MachineIdentityConfig::default()
         });
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("machine_identity.control_endpoint"), "{err}");
+        assert!(err.contains("control_endpoint"), "{err}");
+        assert!(err.contains("management_listen"), "{err}");
+    }
+
+    /// The one shape that has an identity, no address to dial, and is still
+    /// useful: a node driven by something beside it and fetching nothing.
+    /// `deis dev` is exactly this, and it is the reason the rule above is
+    /// "neither of the two" rather than "not control_endpoint".
+    #[test]
+    fn an_identity_that_only_serves_a_management_plane_is_accepted() {
+        let config = with_machine_channel(MachineIdentityConfig {
+            certificate: Some(PathBuf::from("/etc/deislet/node.crt")),
+            private_key: Some(PathBuf::from("/etc/deislet/node.key")),
+            trust_root: Some(PathBuf::from("/etc/deislet/root.pem")),
+            control_identity: Some("spiffe://deis.dev/deislet/control".to_string()),
+            management_listen: Some("127.0.0.1:8187".to_string()),
+            ..MachineIdentityConfig::default()
+        });
+        config
+            .validate()
+            .expect("a node that only serves its management plane is a configuration, not a typo");
     }
 
     /// A machine channel with no `control.endpoint` beside it used to be
@@ -2958,7 +2739,6 @@ mod tests {
             machine_identity: None,
             control: ControlPlaneConfig {
                 endpoint: Some("http://control.internal:8080".to_string()),
-                secret: Some("node-psk".to_string()),
                 ..ControlPlaneConfig::default()
             },
             ..RuntimeConfig::default()
@@ -3084,7 +2864,7 @@ mod tests {
     fn test_validate_rejects_a_machine_management_listener_that_says_nothing() {
         // Empty reads exactly like absent to `management_listen_addr`, so an
         // operator who meant to fill it in would get a node that came up
-        // dialling happily with its management plane still on the fleet key.
+        // dialling happily and serving no management plane at all.
         for listen in ["", "   "] {
             let config = with_machine_channel(MachineIdentityConfig {
                 management_listen: Some(listen.to_string()),
@@ -3127,22 +2907,12 @@ mod tests {
     fn test_validate_rejects_a_machine_management_listener_sharing_a_port() {
         // The data port. `0.0.0.0:http_port` covers every address on this
         // host, so any spelling of this port is the same socket.
-        let mut config = with_machine_channel(MachineIdentityConfig {
+        let config = with_machine_channel(MachineIdentityConfig {
             management_listen: Some(format!("127.0.0.1:{}", RuntimeConfig::default().http_port)),
             ..complete_identity()
         });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("http_port"), "{err}");
-
-        // And the plaintext management plane, which is the worse of the two:
-        // the two doors admit their callers on different terms, so sharing a
-        // port would leave which regime a control plane met to whichever
-        // listener bound first.
-        config.machine_identity.as_mut().unwrap().management_listen =
-            Some("0.0.0.0:8187".to_string());
-        config.management.listen = Some("127.0.0.1:8187".to_string());
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("management.listen"), "{err}");
     }
 
     #[test]
@@ -3307,133 +3077,6 @@ mod tests {
                 "{removed} points at {replacement}, which this build does not read either"
             );
         }
-    }
-
-    /// A node attached to a control plane, with the management plane on the
-    /// data port and `secret` either set or not.
-    ///
-    /// The identity is here because a node that names a control plane has to
-    /// have one - everything it would ask that control plane for is served on
-    /// the machine channel. `secret` no longer takes part in any of that: what
-    /// it still does is open the plaintext management plane, which is what the
-    /// tests below are about.
-    fn node_with_secret(secret: Option<&str>) -> RuntimeConfig {
-        RuntimeConfig {
-            machine_identity: Some(complete_identity()),
-            control: ControlPlaneConfig {
-                endpoint: Some("http://127.0.0.1:8080".to_string()),
-                secret: secret.map(str::to_string),
-                ..ControlPlaneConfig::default()
-            },
-            ..RuntimeConfig::default()
-        }
-    }
-
-    #[test]
-    fn a_node_with_no_key_on_the_public_port_serves_no_management_call() {
-        // The defect: the management plane was served from the same 0.0.0.0
-        // port as public application traffic with no credential at all, so
-        // anything that could reach an application could unload it. The
-        // configuration still loads - a node's other half is public traffic
-        // and that is not what the missing key guards - but the plane itself
-        // is shut, and the guard is decided from this address.
-        let config = node_with_secret(None);
-        config
-            .validate()
-            .expect("a node with no key still serves public traffic");
-        assert!(config.management_keys().is_empty());
-        let addr = config.management_bind_addr().unwrap();
-        assert!(
-            !addr.ip().is_loopback(),
-            "the shared data port is reachable from other hosts: {addr}"
-        );
-    }
-
-    /// This test used to say that an operator upgrading had to do nothing,
-    /// because the key the node already held was the one it needed to fetch
-    /// its assignments. That stopped being true when the assignment fetch
-    /// moved to the machine channel, and the value left behind turned into
-    /// something else entirely.
-    ///
-    /// It is not a credential this node presents any more. It is a door it
-    /// opens: `management_keys` still folds it in, so whoever holds that
-    /// string can drive the plaintext management plane - which shares the data
-    /// port, on `0.0.0.0`, unless `[management] listen` has moved it. The name
-    /// `control.secret` reads like the first thing and does the second, which
-    /// is why `main` warns about it at startup and why this test holds the
-    /// behaviour in place rather than letting it be discovered.
-    #[test]
-    fn a_control_secret_left_behind_opens_the_plaintext_management_plane() {
-        let config = node_with_secret(Some("node-psk"));
-        config.validate().expect("a leftover key is not a startup error");
-        assert_eq!(config.management_keys(), vec!["node-psk".to_string()]);
-        assert_eq!(
-            config.management_bind_addr().unwrap().to_string(),
-            format!("0.0.0.0:{}", config.http_port)
-        );
-        assert_eq!(
-            config.management_advertised_port().unwrap(),
-            config.http_port
-        );
-    }
-
-    #[test]
-    fn a_loopback_management_listener_is_the_other_way_out() {
-        // The single-box install, and the answer for a node with no control
-        // plane at all: move the management plane somewhere no other host can
-        // reach and it may run without a key. The port it registers moves
-        // with it, so the control plane does not keep dialling the data port.
-        let mut config = node_with_secret(None);
-        config.management.listen = Some("127.0.0.1:8186".to_string());
-        config.validate().expect("loopback with no key is allowed");
-        assert!(config.management_keys().is_empty());
-        assert!(config.management_bind_addr().unwrap().ip().is_loopback());
-        assert_eq!(config.management_advertised_port().unwrap(), 8186);
-
-        // ... but only loopback. A second address other hosts can reach is
-        // the same hole in a different place, and is shut for the same reason.
-        config.management.listen = Some("0.0.0.0:8186".to_string());
-        assert!(!config.management_bind_addr().unwrap().ip().is_loopback());
-    }
-
-    #[test]
-    fn a_rotation_key_is_accepted_beside_the_control_secret() {
-        let mut config = node_with_secret(Some("old-key"));
-        config.management.keys = vec!["new-key".to_string()];
-        config.validate().unwrap();
-        assert_eq!(
-            config.management_keys(),
-            vec!["old-key".to_string(), "new-key".to_string()]
-        );
-
-        // The same value in both places is one key, not a rotation in
-        // progress; the startup log counts what it accepts.
-        config.management.keys = vec!["old-key".to_string()];
-        assert_eq!(config.management_keys(), vec!["old-key".to_string()]);
-    }
-
-    #[test]
-    fn a_management_listener_must_be_an_addressable_ip_and_port() {
-        // A hostname is refused because whether the address is reachable from
-        // another host is what decides whether a node with no key may serve,
-        // and that must not turn on what DNS answered at startup. Port 0 is
-        // refused because the control plane addresses a node by the port it
-        // registered.
-        for bad in ["localhost:8186", "127.0.0.1", "127.0.0.1:0", "not an addr"] {
-            let mut config = node_with_secret(Some("node-psk"));
-            config.management.listen = Some(bad.to_string());
-            assert!(
-                config.validate().is_err(),
-                "management.listen {bad:?} must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn a_blank_management_key_is_refused_rather_than_counted() {
-        let mut config = node_with_secret(Some("node-psk"));
-        config.management.keys = vec!["  ".to_string()];
-        assert!(config.validate().is_err());
     }
 
     #[test]

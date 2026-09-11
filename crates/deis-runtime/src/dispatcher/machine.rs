@@ -1,21 +1,22 @@
 //! The listener that takes management instructions from one machine only.
 //!
-//! # Why this is a third socket
+//! # Why this is a socket of its own
 //!
-//! A node has two listeners already and neither could become this one. The
-//! data listener carries public application traffic, so demanding a client
-//! certificate there would end every browser request inside the handshake.
-//! `[management] listen` is the plaintext door the control plane drives
-//! today, over the fleet key, and it has to keep working until the control
-//! plane dials its nodes by certificate - which is a change on the other side
-//! of this channel and is not this node's to make. So the authenticated plane
-//! is bound beside them, at `[machine_identity] management_listen`, and the
-//! two regimes run side by side for as long as the migration takes.
+//! The node's other listener carries public application traffic, so demanding
+//! a client certificate there would end every browser request inside the
+//! handshake. The management plane has the opposite requirement - no caller
+//! without a certificate, ever - so the two cannot share a socket.
 //!
-//! What it serves is the same two gRPC services, dispatched through the same
-//! entrance, and what differs is who is admitted: see
-//! [`crate::dispatcher::auth`] for why nothing in the request is checked once
-//! the connection has been.
+//! There was a third for a while: a plaintext `[management] listen` the
+//! control plane drove with the fleet-wide key. It is gone, and with it the
+//! only other way onto this node's management plane. The data port has no
+//! management dispatcher on it at all now, so a management path there is
+//! read as ordinary application traffic.
+//!
+//! What this serves is the two gRPC services, dispatched through one
+//! entrance, and what decides who is admitted happens before a request
+//! exists: see [`crate::dispatcher::auth`] for why nothing in the request is
+//! checked once the connection has been.
 //!
 //! # Why an acceptor and not a middleware
 //!
@@ -47,9 +48,9 @@
 //! into a running isolate or fire its cron handlers, and that is the control
 //! plane this node was configured to expect - the same name it dials, from
 //! `MachineIdentityConfig::expected_control_identity`. A node that took
-//! instructions from any certificate the fleet signed would be a node that
-//! any other node could redeploy, which is the fleet key's failure with a
-//! longer handshake in front of it.
+//! instructions from any certificate the installation signed would be a node
+//! that any other node could redeploy - which is exactly the failure the
+//! fleet-wide key had, with a longer handshake in front of it.
 //!
 //! The answer here is a constant - one name, fixed for the life of the
 //! process - so the check belongs at the connection and the refusal is the
@@ -262,8 +263,8 @@ pub async fn serve(
         identity = %identity.id(),
         expected_control = %expected_control,
         "This node's management plane is listening for its control plane; a caller that cannot \
-         prove that name does not get a connection, and the node key is not asked for on this \
-         socket"
+         prove that name does not get a connection, and there is no other socket on this node \
+         that serves a management call"
     );
 
     let result = axum_server::from_tcp(listener)

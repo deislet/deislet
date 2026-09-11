@@ -51,7 +51,7 @@ use tokio::io::AsyncWriteExt;
 use tower::Service;
 use tracing::{debug, error, warn};
 
-use super::credential::{origin_of, NodeCredential};
+use super::credential::origin_of;
 
 /// Why a bundle did not arrive, or arrived and could not be trusted.
 #[derive(Debug)]
@@ -132,7 +132,6 @@ pub struct BundleFetcher {
     machine: Option<MachineTransport>,
     max_bytes: u64,
     timeout: Duration,
-    credential: Option<NodeCredential>,
 }
 
 /// Everything a bundle download over the machine channel needs, built once.
@@ -263,14 +262,16 @@ impl<S> Connection for MachineStream<S> {
 }
 
 impl BundleFetcher {
-    /// `credential` is the node key. It is presented only when the bundle URL
-    /// is the control plane this node was configured with; see
-    /// [`NodeCredential`].
-    pub fn new(
-        timeout: Duration,
-        max_bytes: u64,
-        credential: Option<NodeCredential>,
-    ) -> anyhow::Result<Self> {
+    /// The plain client, for a bundle URL that is not on this node's machine
+    /// listener.
+    ///
+    /// It carries no credential, because there is none left to carry: the
+    /// control plane serves bundles only on its machine channel, where the
+    /// certificate on the connection is what admits the request. What still
+    /// reaches this client is a URL somewhere else entirely - `deis dev`
+    /// serving a bundle from a local directory, say - and a bundle host that
+    /// wanted a credential would be a host this node was never told about.
+    pub fn new(timeout: Duration, max_bytes: u64) -> anyhow::Result<Self> {
         // See `crate::egress_proxy`: this node keeps the operator's proxy,
         // applications no longer inherit it.
         let client = crate::egress_proxy::for_node_clients(
@@ -291,7 +292,6 @@ impl BundleFetcher {
             machine: None,
             max_bytes,
             timeout,
-            credential,
         })
     }
 
@@ -402,12 +402,7 @@ impl BundleFetcher {
         url: &str,
         temp_path: &Path,
     ) -> Result<(u64, String), FetchError> {
-        let mut request = self.client.get(url);
-        if let Some(credential) = &self.credential {
-            if let Some(value) = credential.header_value_for(url) {
-                request = request.header(reqwest::header::AUTHORIZATION, value);
-            }
-        }
+        let request = self.client.get(url);
 
         let response = request.send().await.map_err(|e| FetchError::Transport {
             url: url.to_string(),
@@ -420,9 +415,10 @@ impl BundleFetcher {
                 error!(
                     url,
                     code,
-                    "The bundle host refused this node's credential, so this version cannot be \
-                     installed and the environment keeps running its previous version. Set \
-                     control.secret to one of the control plane's node_preshared_keys"
+                    "The bundle host wants a credential, and this node has none to offer it. A \
+                     bundle served by this node's own control plane is fetched over the machine \
+                     channel and never reaches here, so this URL points somewhere else - check \
+                     where the version that named it was uploaded from"
                 );
             }
             return Err(FetchError::Status {

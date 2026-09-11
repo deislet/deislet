@@ -18,6 +18,14 @@ deis-bundle = { path = "../deis-bundle" }
 # Shared conventions: the default environment name and what an application or
 # environment name is allowed to contain.
 deis-wire = { workspace = true }
+# `deis dev` drives the node it starts over the same mutually authenticated
+# management plane a control plane uses, so it loads an identity and dials
+# with it exactly as the control plane does.
+deis-identity = { path = "../deis-identity" }
+# ...and, having no authority to ask, issues that identity itself: a throwaway
+# root and two leaves, for one run, on loopback. See `dev::pki` for what that
+# is and is not.
+rcgen = "0.14"
 
 clap = { version = "4.4", features = ["derive", "cargo"] }
 colored = "2.1"

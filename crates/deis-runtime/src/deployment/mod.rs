@@ -55,7 +55,6 @@ pub use assignments::{
     run_control_loop, Assignment, AssignmentClient, AssignmentError, AssignmentList, Reconciler,
     SyncOutcome,
 };
-pub use credential::NodeCredential;
 pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle, MachineTransport};
 pub use registration::{
     Deregistered, NodeRegistrar, NodeRegistration, Registered, RegistrationError,
@@ -402,12 +401,13 @@ impl DeploymentManager {
         let mut fetcher = BundleFetcher::new(
             Duration::from_secs(config.bundles.download_timeout_secs),
             config.bundles.max_bytes,
-            config.node_credential(),
         )?;
 
-        // Both halves or neither: `RuntimeConfig::validate` has already
-        // refused a configuration that sets one without the other, so this
-        // only has to say what to do when both are there.
+        // Only a node that names a control plane's machine listener downloads
+        // a bundle from it. A node with an identity and no address serves its
+        // management plane and is handed bundles by whoever drives it - that
+        // is `deis dev` - and a node with an address and no identity is
+        // refused by `RuntimeConfig::validate` before this runs.
         if let (Some(machine_endpoint), Some(identity)) = (
             config
                 .machine_identity

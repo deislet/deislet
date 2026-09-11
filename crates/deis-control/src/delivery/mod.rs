@@ -3088,9 +3088,8 @@ mod tests {
                     addr: "http://127.0.0.1:1".to_string(),
                     machine_addr: None,
                     version: None,
-                    proof: crate::node_key::NodeProof::PresharedKey(
-                        crate::node_key::NodeKeyFingerprint::of("node-psk"),
-                    ),
+                    identity: deis_identity::names::node("test.deislet.local", "node-b")
+                        .expect("a node name"),
                 },
                 Utc::now() - chrono::Duration::hours(1),
             )
@@ -3113,9 +3112,8 @@ mod tests {
                     addr: "http://127.0.0.1:1".to_string(),
                     machine_addr: None,
                     version: None,
-                    proof: crate::node_key::NodeProof::PresharedKey(
-                        crate::node_key::NodeKeyFingerprint::of("node-psk"),
-                    ),
+                    identity: deis_identity::names::node("test.deislet.local", "node-a")
+                        .expect("a node name"),
                 },
                 now,
                 |_| async { None },
@@ -3129,9 +3127,8 @@ mod tests {
                     addr: "http://127.0.0.2:1".to_string(),
                     machine_addr: None,
                     version: None,
-                    proof: crate::node_key::NodeProof::PresharedKey(
-                        crate::node_key::NodeKeyFingerprint::of("node-psk"),
-                    ),
+                    identity: deis_identity::names::node("test.deislet.local", "node-a")
+                        .expect("a node name"),
                 },
                 now,
                 |_| async {
@@ -3271,9 +3268,8 @@ mod tests {
                     addr: "http://127.0.0.1:1".to_string(),
                     machine_addr: None,
                     version: None,
-                    proof: crate::node_key::NodeProof::PresharedKey(
-                        crate::node_key::NodeKeyFingerprint::of("node-psk"),
-                    ),
+                    identity: deis_identity::names::node("test.deislet.local", "node-b")
+                        .expect("a node name"),
                 },
                 Utc::now(),
             )

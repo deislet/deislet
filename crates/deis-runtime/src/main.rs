@@ -79,11 +79,12 @@ fn log_filter() -> EnvFilter {
 /// diagnosed later from a handshake failure that names no file, instead of
 /// from this error, which does.
 ///
-/// What it changes once it is loaded: this node asks for its assignments over
-/// the machine channel instead of over HTTP with the fleet key, and a bundle
-/// URL on the control plane's machine listener is downloaded over mutual TLS.
-/// Registration and deregistration are unaffected - they are still HTTP routes
-/// guarded by `[control] secret` and they have not moved yet.
+/// What it is for: everything this node says to its control plane, and
+/// everything the control plane says to this node. Registration and
+/// deregistration, the assignment list, the bundle download, and the
+/// management plane the control plane drives this node through. There is no
+/// other channel and no other credential - the fleet-wide value all of that
+/// once rode on does not exist.
 ///
 /// `RuntimeConfig::validate` has already refused a half-filled section, and
 /// refused an identity with no `machine_identity.control_endpoint` to dial, so the only
@@ -92,8 +93,9 @@ fn log_filter() -> EnvFilter {
 fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIdentity>>> {
     let Some(identity_config) = config.machine_identity.as_ref() else {
         info!(
-            "No machine_identity configured; this node reaches the control plane with \
-             [control] secret, the shared fleet key, same as before"
+            "No machine_identity configured; this node reaches no control plane and serves no \
+             management plane. A configuration naming [control] endpoint without it is refused \
+             before this point, so reaching here means a node that was asked to run alone"
         );
         return Ok(None);
     };
@@ -122,47 +124,61 @@ fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIde
         identity_config.identity_reload_seconds,
     ));
 
-    info!(
-        identity = %identity.id(),
-        certificate = %identity_config
-            .certificate
-            .as_deref()
-            .expect("validated present")
-            .display(),
-        reload_secs = identity_config.identity_reload_seconds,
-        control_endpoint = %identity_config
-            .control_endpoint
-            .as_deref()
-            .expect("validated present alongside the files"),
-        "Loaded this node's machine identity; the files are re-read on that interval, so a \
-         renewal needs no restart. This node asks for its assignments over the machine channel \
-         and downloads bundles from that listener over mutual TLS; registration still goes to \
-         [control] endpoint with the fleet key"
-    );
+    match identity_config.control_endpoint.as_deref() {
+        Some(control_endpoint) => info!(
+            identity = %identity.id(),
+            certificate = %identity_config
+                .certificate
+                .as_deref()
+                .expect("validated present")
+                .display(),
+            reload_secs = identity_config.identity_reload_seconds,
+            %control_endpoint,
+            "Loaded this node's machine identity; the files are re-read on that interval, so a \
+             renewal needs no restart. This node registers, asks for its assignments and \
+             downloads its bundles over the machine channel, proving this certificate on every \
+             one of them"
+        ),
+        // No address to dial is a configuration and not an oversight -
+        // `validate` accepts it only alongside a management listener - so it
+        // is said plainly rather than asserted away. This is what `deis dev`
+        // runs: a node driven by the thing that started it, with no control
+        // plane anywhere to pull from.
+        None => info!(
+            identity = %identity.id(),
+            certificate = %identity_config
+                .certificate
+                .as_deref()
+                .expect("validated present")
+                .display(),
+            reload_secs = identity_config.identity_reload_seconds,
+            "Loaded this node's machine identity; the files are re-read on that interval, so a \
+             renewal needs no restart. No machine_identity.control_endpoint is set, so this node \
+             asks no control plane for anything and runs what it is handed over its management \
+             plane"
+        ),
+    }
 
-    // The direction that has not moved, said out loud on every node that has
-    // not moved it. An identity makes this node's *outbound* half mutual TLS;
-    // what the control plane pushes *into* this node still arrives on the
-    // plaintext management plane, authenticated by a string every machine in
-    // the fleet holds, until this names a socket.
+    // The inbound half. An identity is what this node proves when it dials
+    // out; `management_listen` is where it serves the other direction, and a
+    // node that names no socket for it can be deployed to only by the
+    // assignments it pulls for itself.
     match identity_config.management_listen_addr()? {
         Some(listen) => info!(
             %listen,
-            "This node also serves its management plane over mutual TLS on that address, and \
-             admits only the control plane named above. The plaintext management plane is still \
-             bound beside it, because the control plane has not moved to dialling nodes by \
-             certificate yet"
+            "This node serves its management plane on that address and admits only the control \
+             plane named above. It is the only socket on this node that serves a management \
+             call: the data port has no management dispatcher on it at all"
         ),
-        // Said at info and not at warn on purpose. This is the state of every
-        // node in this fleet today, and a warning that is always present is a
-        // warning nobody reads - including the day one appears that matters.
-        None => info!(
-            "No machine_identity.management_listen is set, so only this node's outbound half is \
-             authenticated by certificate. What the control plane pushes into this node - a \
-             deployment, an unload, an inspector session, a cron fire - still arrives on the \
-             plaintext management plane and is admitted by the fleet key, which every machine in \
-             this fleet holds and which names none of them. Set it to an ip:port to serve that \
-             plane to one machine only"
+        // At warn, because a node reachable by no control plane is a node
+        // nobody can deploy to, unload from or fire a cron on - and unlike
+        // the states this used to describe, it is not what any node in a
+        // running installation looks like.
+        None => warn!(
+            "No machine_identity.management_listen is set, so nothing can drive this node: a \
+             deployment, an unload, an inspector session and a cron fire all arrive on that \
+             socket and there is no other. This node will load only what it pulls for itself. \
+             Set it to an ip:port to serve that plane to its control plane alone"
         ),
     }
 
@@ -215,10 +231,11 @@ async fn run(
     let started_at = std::time::Instant::now();
 
     let port = config.http_port;
-    // What this node registers as its address. The same port while the
-    // management plane shares the data listener, which is every installation
-    // that has not set `[management] listen`.
-    let management_port = config.management_advertised_port()?;
+    // What this node registers as its address: its data port. It is what the
+    // fleet list shows and what the console links to, and it is not what the
+    // control plane drives - driving goes to the mutually authenticated
+    // management plane, whose address this node reports separately.
+    let management_port = port;
     let node_id = config.resolved_node_id();
 
     let log_buffer = Arc::new(LogBuffer::new(config.logging.buffer_size));
@@ -380,44 +397,6 @@ async fn run(
     // answer that says "starting" rather than a refused connection.
     let health = NodeHealth::starting();
 
-    // What `control.secret` is for, now that a node cannot be attached to a
-    // control plane without a certificate.
-    //
-    // It no longer gets this node anything: registering, asking what to run
-    // and fetching a bundle all go over the machine channel and are admitted
-    // by the name this node proves. What it still does is the other
-    // direction - it is folded into `management_keys()`, so a value here
-    // opens the *plaintext* management plane to whoever holds it. That plane
-    // shares the data port unless `[management] listen` moves it, and the
-    // data port is `0.0.0.0`.
-    //
-    // Which makes a leftover `control.secret` the opposite of what an
-    // operator reading the name would expect: not a credential this node
-    // presents, a door it opens. Said at warn, with the address, because
-    // nothing else in a startup log distinguishes "the node key I have always
-    // set" from "an administrative plane on my public port".
-    if config.machine_identity.is_some() && config.control.secret.is_some() {
-        warn!(
-            management_plane = %config
-                .management_bind_addr()
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|_| "unparsable".to_string()),
-            "control.secret is set and this node has a machine identity. The secret gets this \
-             node nothing any more - it registers, asks what to run and downloads its bundles \
-             over the machine channel, admitted by the certificate it proves - but it is still \
-             accepted on the plaintext management plane, which means anything that can reach \
-             that address and holds this string can list every tenant's applications here, \
-             unload one, replace it, or open an inspector session into a running isolate. \
-             Remove the line unless something still drives this node with it"
-        );
-    }
-    // There is no warning for the other case. A node with an identity and no
-    // `control.secret` is the finished configuration, and a line at warn on
-    // every correct startup is a line operators stop reading. The one thing
-    // that value would still have been for - a bundle whose URL is not on the
-    // machine listener - is reported by the fetcher, at the moment it happens,
-    // naming the URL and the endpoint that disagree with it.
-
     let assignment_client =
         AssignmentClient::from_config(&config, &node_id, machine_identity.clone())
             .context("building the control plane client")?;
@@ -469,9 +448,20 @@ async fn run(
     info!("====================================");
     info!("✅ Runtime Platform ready to serve!");
     info!("📡 Accepting traffic on port {}", port);
-    match config.management.listen_addr()? {
-        Some(addr) => info!("🔧 Management API (gRPC) on its own listener {}", addr),
-        None => info!("🔧 Management API (gRPC) on same port"),
+    match config
+        .machine_identity
+        .as_ref()
+        .and_then(|identity| identity.management_listen_addr().ok().flatten())
+    {
+        Some(addr) => info!(
+            "🔧 Management API (gRPC) on {addr}, mutual TLS only - the data port above serves \
+             no management call at all"
+        ),
+        None => warn!(
+            "🔧 No management API: this node has no [machine_identity] management_listen, so \
+             its control plane has nowhere to push a deployment or fire a cron. It serves what it \
+             pulled and nothing changes it"
+        ),
     }
     info!("====================================");
 
@@ -508,8 +498,6 @@ async fn run(
         started_at,
         shutdown_grace: config.shutdown_grace_period(),
         max_request_body_bytes: config.max_request_body_bytes,
-        management_keys: config.management_keys(),
-        management_listen: config.management.listen_addr()?,
         machine_management,
     })
     .await?;

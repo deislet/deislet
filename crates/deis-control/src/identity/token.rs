@@ -123,6 +123,29 @@ pub fn split(presented: &str) -> Option<PresentedToken<'_>> {
     Some(PresentedToken { id, secret_half })
 }
 
+/// Compare two credential-shaped strings in time that does not depend on how
+/// many leading bytes matched.
+///
+/// It lives here because this module is what says what a credential is and
+/// how one is checked, and both callers are asking that question: a token's
+/// stored hash against the hash of what was presented ([`secret_matches`]),
+/// and a configured `api_keys` entry against a presented one
+/// (`crate::api::authz`). The second is where it earns its keep - those are
+/// raw secrets compared directly, and a byte-at-a-time comparison of one is
+/// the textbook timing oracle. The first is closer to a formality, and says
+/// so where it is written.
+///
+/// It used to live in `api::middleware`, on the grounds that the node channel
+/// compared its fleet key with it too. There is no node channel and no fleet
+/// key, so that reason went with them.
+pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Whether a presented secret half is the one behind a stored hash.
 ///
 /// Compared in time that does not depend on how many leading bytes matched.
@@ -131,7 +154,7 @@ pub fn split(presented: &str) -> Option<PresentedToken<'_>> {
 /// who has the database already has, and spelling the comparison this way
 /// costs nothing and removes the question.
 pub fn secret_matches(stored_hash: &str, presented_secret_half: &str) -> bool {
-    crate::api::middleware::secret_eq(stored_hash, &hash_secret(presented_secret_half))
+    secret_eq(stored_hash, &hash_secret(presented_secret_half))
 }
 
 #[cfg(test)]

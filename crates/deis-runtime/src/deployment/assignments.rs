@@ -54,7 +54,6 @@ use serde::Deserialize;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
-use super::credential::NodeCredential;
 use super::registration::{NodeRegistrar, Registered};
 use super::{Applied, DeploymentManager, DeploymentOrder};
 use crate::app::{AppKey, InstalledVersion};
@@ -312,12 +311,6 @@ pub struct AssignmentClient {
 
 /// How this node asks, and what it proves while asking.
 enum Transport {
-    /// `GET /api/nodes/{node_id}/assignments` with the fleet key in an
-    /// `Authorization` header.
-    Http {
-        client: reqwest::Client,
-        credential: Option<NodeCredential>,
-    },
     /// `deis.machine.MachineChannel/FetchAssignments` over mutual TLS.
     Machine {
         /// Built once, at startup, and kept for the life of the process. It
@@ -346,40 +339,14 @@ enum Transport {
 const FETCH_ASSIGNMENTS_PATH: &str = "/deis.machine.MachineChannel/FetchAssignments";
 
 impl AssignmentClient {
-    /// `credential` is the node key from `[control] secret`. Without it the
-    /// request is anonymous, which a control plane with `node_preshared_keys`
-    /// configured answers with 401 - it will not hand this node's decrypted
-    /// secrets to a caller that cannot prove it is a node.
-    pub fn new(
-        endpoint: &str,
-        node_id: &str,
-        timeout: Duration,
-        credential: Option<NodeCredential>,
-    ) -> anyhow::Result<Self> {
-        // The node's own traffic, not an application's: it keeps whatever
-        // proxy the operator's environment named, which `crate::egress_proxy`
-        // took out of that environment so applications would stop inheriting
-        // it silently.
-        let client =
-            crate::egress_proxy::for_node_clients(reqwest::Client::builder().timeout(timeout))?
-                .build()?;
-        let url = format!(
-            "{}{}",
-            endpoint.trim_end_matches('/'),
-            deis_wire::conventions::node_assignments_path(&urlencode(node_id))
-        );
-        Ok(Self {
-            transport: Transport::Http { client, credential },
-            url,
-        })
-    }
 
-    /// Ask over the machine channel instead, proving `identity` and refusing
-    /// to talk to anything that cannot prove it is `control_identity`.
+
+    /// Ask over the machine channel, proving `identity` and refusing to talk
+    /// to anything that cannot prove it is `control_identity`.
     ///
-    /// No credential is carried and none is wanted: the connection has already
-    /// said which machine is asking, and putting the fleet key on it as well
-    /// would keep alive the exact secret this channel exists to retire.
+    /// No credential is carried and there is none to carry: the connection has
+    /// already said which machine is asking, which is more than any string
+    /// could have said.
     pub fn over_machine_channel(
         machine_endpoint: &str,
         node_id: &str,
@@ -455,13 +422,15 @@ impl AssignmentClient {
     /// The client this configuration calls for, or `None` when this node was
     /// told about no control plane at all and so asks nobody.
     ///
-    /// `identity` is what `main` loaded from `[machine_identity]`. The two
-    /// halves are required together by `RuntimeConfig::validate`, so the
-    /// mismatched cases below are a startup that skipped that check rather
-    /// than anything an operator can write; they are refused instead of
-    /// quietly falling back, because falling back would mean a node that was
-    /// configured for mutual TLS going on using the fleet key with nothing in
-    /// any log to say so.
+    /// `identity` is what `main` loaded from `[machine_identity]`. An identity
+    /// with an address is a node that asks; an identity with no address is a
+    /// node that only serves its management plane and is handed what to run -
+    /// `deis dev` runs exactly that - and it asks nobody. The remaining
+    /// mismatch, an address with no identity, is a startup that skipped
+    /// `RuntimeConfig::validate` rather than anything an operator can write,
+    /// and is refused rather than returning `None`, because a `None` there
+    /// would be a node that fetches nothing while every other part of it looks
+    /// configured.
     pub fn from_config(
         config: &crate::config::RuntimeConfig,
         node_id: &str,
@@ -498,19 +467,18 @@ impl AssignmentClient {
                 "control.machine_endpoint is {machine_endpoint:?} but this node has no machine \
                  identity loaded, so it could not complete a handshake with that listener"
             )),
-            (None, Some(_)) => Err(anyhow::anyhow!(
-                "this node loaded a machine identity but control.machine_endpoint is not set, so \
-                 there is nowhere to present it"
-            )),
-            (None, None) => match config.control.endpoint.as_deref() {
-                Some(endpoint) => Ok(Some(Self::new(
-                    endpoint,
-                    node_id,
-                    timeout,
-                    config.control.credential(),
-                )?)),
-                None => Ok(None),
-            },
+            // An identity and nowhere to ask: a node that serves its
+            // management plane and pulls nothing, which `validate` accepts
+            // only alongside a management listener. It asks nobody, the same
+            // as a node with no identity at all.
+            (None, Some(_)) => Ok(None),
+            // No identity and no machine endpoint: a node that asks nobody
+            // what to run and serves what is already in its local store.
+            // There is no fourth case - a node that names a control plane
+            // without a certificate is refused by `RuntimeConfig::validate`,
+            // because everything it would ask for is served only on the
+            // machine channel.
+            (None, None) => Ok(None),
         }
     }
 
@@ -521,97 +489,20 @@ impl AssignmentClient {
     /// How this node is asking, for the one startup line that says so.
     pub fn transport_name(&self) -> &'static str {
         match self.transport {
-            Transport::Http { .. } => "HTTP with the shared fleet key",
             Transport::Machine { .. } => "the machine channel, over mutual TLS",
         }
     }
 
     pub async fn fetch(&self) -> Result<AssignmentList, AssignmentError> {
-        match &self.transport {
-            Transport::Http { client, credential } => {
-                self.fetch_over_http(client, credential.as_ref()).await
-            }
-            Transport::Machine {
-                client,
-                identity,
-                node_id,
-            } => {
-                self.fetch_over_machine_channel(client, identity, node_id)
-                    .await
-            }
-        }
-    }
-
-    async fn fetch_over_http(
-        &self,
-        client: &reqwest::Client,
-        credential: Option<&NodeCredential>,
-    ) -> Result<AssignmentList, AssignmentError> {
-        let mut request = client.get(&self.url);
-        if let Some(credential) = credential {
-            request = request.header(reqwest::header::AUTHORIZATION, credential.header_value());
-        }
-
-        let response = request
-            .send()
+        let Transport::Machine {
+            client,
+            identity,
+            node_id,
+        } = &self.transport;
+        self.fetch_over_machine_channel(client, identity, node_id)
             .await
-            .map_err(|e| AssignmentError::Transport {
-                url: self.url.clone(),
-                reason: e.to_string(),
-            })?;
-
-        if !response.status().is_success() {
-            let code = response.status().as_u16();
-            if code == 401 || code == 403 {
-                let has_credential = credential.is_some();
-                error!(
-                    url = %self.url,
-                    code,
-                    has_credential,
-                    "The control plane refused this node's credential, so this node gets no \
-                     assignment list at all: it keeps serving whatever it already had and picks \
-                     up no new version. Set control.secret to one of the control plane's \
-                     node_preshared_keys"
-                );
-            }
-            return Err(AssignmentError::Status {
-                url: self.url.clone(),
-                code,
-            });
-        }
-
-        // Read before the body is consumed. Absence is deliberately read as
-        // "not complete": a control plane older than the header cannot tell
-        // this node whether its list is the whole truth, and acting on a
-        // short list as though it were would unload applications that are
-        // running perfectly well.
-        let complete = response
-            .headers()
-            .get(ASSIGNMENTS_COMPLETE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-        let withheld = response
-            .headers()
-            .get(ASSIGNMENTS_WITHHELD_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u32>().ok())
-            .unwrap_or(0);
-
-        let assignments =
-            response
-                .json::<Vec<Assignment>>()
-                .await
-                .map_err(|e| AssignmentError::Malformed {
-                    url: self.url.clone(),
-                    reason: e.to_string(),
-                })?;
-
-        Ok(AssignmentList {
-            assignments,
-            complete,
-            withheld,
-        })
     }
+
 
     async fn fetch_over_machine_channel(
         &self,
@@ -755,7 +646,6 @@ fn machine_failure(
     }
 }
 
-use deis_wire::conventions::{ASSIGNMENTS_COMPLETE_HEADER, ASSIGNMENTS_WITHHELD_HEADER};
 
 /// One answer from the control plane.
 ///
@@ -775,25 +665,6 @@ pub struct AssignmentList {
     pub withheld: u32,
 }
 
-/// Percent-encode the few characters that would otherwise change which path a
-/// node id addresses. Node ids are hostnames in practice, but an id with a `/`
-/// in it would silently ask the control plane a different question.
-///
-/// Shared with [`super::registration`], which builds a sibling URL from the
-/// same id: two spellings of this would let a node register under one path and
-/// fetch its assignments from another.
-pub(super) fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
 
 /// Result of one pass over the assignment list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

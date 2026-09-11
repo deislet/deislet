@@ -169,11 +169,14 @@ pub struct SystemConfig {
     /// environments get an automatic address. Only meaningful with
     /// `control` set: without a control plane there is no table to fetch.
     pub routing: Option<RoutingConfig>,
-    /// This proxy's certificate on the machine channel that is replacing
-    /// `node_preshared_keys`, and the control plane name it expects to see
-    /// proved back. Absent means what it means today: `control` above still
-    /// dials with the shared secret, and nothing in this crate yet reads
-    /// what is loaded from here. See [`machine_identity`] for why.
+    /// This proxy's certificate on the machine channel, and the control plane
+    /// name it expects to see proved back.
+    ///
+    /// `Option` for the standalone instance only - one with no `control`
+    /// table, which fetches no routing table and attaches to nothing. Set
+    /// `control` without this and [`SystemConfig::validate`] refuses the
+    /// configuration, because there is no other way to reach a control plane:
+    /// the fleet-wide value that used to open one is gone.
     pub machine_identity: Option<MachineIdentityConfig>,
 }
 

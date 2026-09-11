@@ -1,183 +1,22 @@
 //! What a node tells the control plane about itself, and what it does when the
 //! control plane will not hear it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::put;
-use axum::{Json, Router};
-
 use super::*;
 
-/// A stand-in control plane that records what it was told.
-struct Plane {
-    base: String,
-    seen: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
-    calls: Arc<AtomicUsize>,
-    _task: tokio::task::JoinHandle<()>,
-}
-
-#[derive(Clone)]
-struct PlaneState {
-    seen: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
-    calls: Arc<AtomicUsize>,
-    status: StatusCode,
-    required_key: Option<String>,
-}
-
-impl Plane {
-    async fn answering(status: StatusCode, required_key: Option<&str>) -> Self {
-        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let state = PlaneState {
-            seen: seen.clone(),
-            calls: calls.clone(),
-            status,
-            required_key: required_key.map(str::to_string),
-        };
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        // The route, the method and the answer are deis-control's, taken from
-        // the shared constant rather than written out here. A stand-in shaped
-        // like this crate's own assumption is how the two halves came to
-        // disagree in the first place: the node called `POST /register` while
-        // the control plane served `PUT /registration`, both sides compiled,
-        // both sides' tests passed, and no node ever registered.
-        let router = Router::new()
-            .route(
-                deis_wire::conventions::NODE_REGISTRATION_ROUTE,
-                put(
-                    |State(state): State<PlaneState>,
-                     headers: HeaderMap,
-                     body: Json<serde_json::Value>| async move {
-                        state.calls.fetch_add(1, Ordering::SeqCst);
-                        if let Some(required) = &state.required_key {
-                            let presented = headers
-                                .get(axum::http::header::AUTHORIZATION)
-                                .and_then(|value| value.to_str().ok())
-                                .unwrap_or_default()
-                                .to_string();
-                            if presented != format!("Bearer {required}") {
-                                return StatusCode::UNAUTHORIZED.into_response();
-                            }
-                        }
-                        state.seen.lock().push(body.0);
-                        if state.status.is_success() {
-                            return (
-                                state.status,
-                                Json(serde_json::json!({
-                                    "node_id": "node-a",
-                                    "address": "http://example:8123",
-                                    "outcome": "new",
-                                    "source": "registered",
-                                    "refresh_after_seconds": 30,
-                                    "registration_ttl_seconds": 90,
-                                    "assignment_refresh_seconds": 30,
-                                })),
-                            )
-                                .into_response();
-                        }
-                        state.status.into_response()
-                    },
-                ),
-            )
-            .with_state(state);
-
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
-        });
-        Self {
-            base,
-            seen,
-            calls,
-            _task: task,
-        }
-    }
-}
-
-fn registrar(base: &str, node_id: &str, secret: Option<&str>) -> NodeRegistrar {
-    NodeRegistrar::new(
-        base,
-        NodeRegistration::of_this_node(node_id, 8123),
-        Duration::from_secs(5),
-        secret.map(|secret| NodeCredential::new(secret, Some(base))),
-        None,
-    )
-    .expect("the registrar is built")
-}
-
-#[tokio::test]
-async fn a_node_tells_the_control_plane_where_to_dial_it() {
-    let plane = Plane::answering(StatusCode::OK, None).await;
-
-    let outcome = registrar(&plane.base, "node-a", None)
-        .await_registered()
-        .await;
-    assert_eq!(
-        outcome,
-        Registered::Accepted {
-            refresh_after: Duration::from_secs(30)
-        },
-        "the refresh interval is the control plane's to set, and the node has to carry it"
-    );
-
-    let seen = plane.seen.lock();
-    assert_eq!(seen.len(), 1);
-    let body = &seen[0];
-    // deis-control reads exactly two fields, and `address` has to be dialable
-    // as it stands: it is what every deployment push and cron fire goes to.
-    let address = body["address"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the control plane cannot dial this node back: {body}"));
-    assert!(
-        address.starts_with("http://") && address.ends_with(":8123"),
-        "deis-control refuses an address without a scheme and a host: {address}"
-    );
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-}
-
-#[tokio::test]
-async fn the_registration_url_is_the_one_deis_control_serves() {
-    // The path and the method are the whole contract here, and neither is
-    // checked by the compiler. This asserts the URL a node actually calls, so
-    // that changing either side alone fails here instead of in a fleet that
-    // quietly never learns about its nodes.
-    let node = registrar("http://control.example", "node-a", None);
-    assert_eq!(
-        node.url(),
-        format!(
-            "http://control.example{}",
-            deis_wire::conventions::node_registration_path("node-a")
-        )
-    );
-    assert!(
-        node.url().ends_with("/api/nodes/node-a/registration"),
-        "deis-control serves /registration, not /register: {}",
-        node.url()
-    );
-}
-
+/// A control plane that accepts a registration but says nothing about how
+/// often to refresh it must not leave a node believing it is registered
+/// forever: the registration is a lease, and a node that never refreshes it
+/// is silently dropped from the fleet. `refresh_interval` reads the same
+/// JSON either door delivers it over, so this only has to be exercised once,
+/// against the machine channel's own stand-in below.
 #[tokio::test]
 async fn an_answer_without_a_refresh_interval_still_gets_one() {
-    // A control plane that answers 200 with nothing useful must not leave the
-    // node believing it is registered for ever: the registration is a lease,
-    // and never refreshing it drops the node out of the fleet silently.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = Router::new().route(
-        deis_wire::conventions::NODE_REGISTRATION_ROUTE,
-        put(|| async { Json(serde_json::json!({})) }),
-    );
-    let _task = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
+    let (registrar, _plane) = machine_registrar(Ok("{}".to_string()), Ok(true)).await;
 
-    match registrar(&base, "node-a", None).await_registered().await {
+    match registrar.await_registered().await {
         Registered::Accepted { refresh_after } => {
             assert!(
                 refresh_after > Duration::ZERO && refresh_after < Duration::from_secs(90),
@@ -186,128 +25,6 @@ async fn an_answer_without_a_refresh_interval_still_gets_one() {
         }
         other => panic!("expected an accepted registration, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn registration_presents_the_node_credential() {
-    // The node endpoints are guarded by node_preshared_keys, independent of
-    // the human API's api_auth_enabled. A registration that went out
-    // anonymous would be refused and the node would never appear in the
-    // fleet.
-    let plane = Plane::answering(StatusCode::OK, Some("node-key")).await;
-
-    let outcome = registrar(&plane.base, "node-a", Some("node-key"))
-        .await_registered()
-        .await;
-    assert!(matches!(outcome, Registered::Accepted { .. }));
-    assert_eq!(plane.seen.lock().len(), 1);
-}
-
-#[tokio::test]
-async fn a_refused_credential_is_an_error_the_caller_retries() {
-    let plane = Plane::answering(StatusCode::OK, Some("node-key")).await;
-
-    let error = registrar(&plane.base, "node-a", Some("wrong-key"))
-        .register()
-        .await
-        .expect_err("the control plane refuses the wrong key");
-    assert!(
-        matches!(error, RegistrationError::Status { code: 401, .. }),
-        "{error}"
-    );
-    assert!(plane.seen.lock().is_empty());
-}
-
-#[tokio::test]
-async fn a_control_plane_without_the_endpoint_is_a_permanent_answer() {
-    // Retrying this every reconcile interval would fill the log of every node
-    // in the fleet with a line about a feature the other side does not have.
-    let plane = Plane::answering(StatusCode::OK, None).await;
-    // Nothing is routed at this path, so axum answers 404.
-    let registrar = NodeRegistrar::new(
-        &format!("{}/nowhere", plane.base),
-        NodeRegistration::of_this_node("node-a", 8123),
-        Duration::from_secs(5),
-        None,
-        None,
-    )
-    .expect("the registrar is built");
-
-    assert_eq!(
-        registrar.register().await.expect("404 is not an error"),
-        Registered::NotSupported
-    );
-    assert_eq!(plane.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn a_control_plane_that_is_not_there_is_a_transport_failure() {
-    // Nothing listens on port 1.
-    let registrar = registrar("http://127.0.0.1:1", "node-a", None);
-    let error = registrar
-        .register()
-        .await
-        .expect_err("nothing is listening");
-    assert!(
-        matches!(error, RegistrationError::Transport { .. }),
-        "{error}"
-    );
-}
-
-/// The other method on the same path: a node that is stopping on purpose.
-/// Without it the control plane keeps this node on the fleet list until the
-/// lease expires and spends that window pushing deployments and firing cron at
-/// a process that has gone.
-#[tokio::test]
-async fn a_node_that_is_stopping_says_so_on_the_http_route_too() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = Router::new().route(
-        deis_wire::conventions::NODE_REGISTRATION_ROUTE,
-        axum::routing::delete(|| async {
-            Json(serde_json::json!({ "node_id": "node-a", "removed": true }))
-        }),
-    );
-    let _task = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    assert_eq!(
-        registrar(&base, "node-a", None)
-            .deregister()
-            .await
-            .expect("the control plane answers"),
-        Deregistered::Removed
-    );
-}
-
-/// A node named in the control plane's own `deis_runtime_nodes` is not removed
-/// by asking, and that is not a failure to report: the file says it exists, and
-/// there is nothing this node can do about it on its way out.
-#[tokio::test]
-async fn a_node_the_control_plane_will_not_drop_is_not_an_error_to_retry() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = Router::new().route(
-        deis_wire::conventions::NODE_REGISTRATION_ROUTE,
-        axum::routing::delete(|| async {
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "node_id": "node-a", "removed": false })),
-            )
-        }),
-    );
-    let _task = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    assert_eq!(
-        registrar(&base, "node-a", None)
-            .deregister()
-            .await
-            .expect("a kept node is an answer, not a failure"),
-        Deregistered::Kept
-    );
 }
 
 /// Small helper so the happy-path tests read as one statement.
@@ -647,6 +364,29 @@ async fn a_machine_channel_without_the_rpc_is_a_permanent_answer() {
     );
 }
 
+/// The refusal that means this node could not prove it was a node at all:
+/// no certificate this fleet's authority signed, or none presented. Nothing
+/// this node holds a preshared key for any more - the handshake either
+/// proves it or the call never lands - so this is the one mapping that used
+/// to be a wrong credential and is now a connection that never authenticated.
+#[tokio::test]
+async fn a_control_plane_that_cannot_authenticate_this_node_is_a_refusal_too() {
+    let (registrar, _plane) = machine_registrar(
+        Err(Status::unauthenticated("no name was proved")),
+        Ok(true),
+    )
+    .await;
+
+    let error = registrar
+        .register()
+        .await
+        .expect_err("an unauthenticated call is not a registration");
+    assert!(
+        matches!(error, RegistrationError::Status { code: 401, .. }),
+        "{error}"
+    );
+}
+
 /// A machine channel that is not listening has to look like a control plane
 /// that is not there, because it is one: the node keeps serving what it has
 /// and says it again on the next pass.
@@ -719,30 +459,6 @@ async fn a_node_with_an_identity_registers_over_the_machine_channel() {
 }
 
 #[tokio::test]
-async fn a_node_with_no_identity_registers_the_way_it_always_did() {
-    let mut config = RuntimeConfig::default();
-    config.control.endpoint = Some("http://127.0.0.1:8080".to_string());
-
-    let registrar = NodeRegistrar::from_config(
-        &config,
-        NodeRegistration::of_this_node("node-a", 8123),
-        None,
-    )
-    .expect("an ordinary configuration must build a registrar")
-    .expect("a configured node has a registrar");
-
-    assert!(
-        registrar.transport_name().contains("HTTP"),
-        "{}",
-        registrar.transport_name()
-    );
-    assert_eq!(
-        registrar.url(),
-        "http://127.0.0.1:8080/api/nodes/node-a/registration"
-    );
-}
-
-#[tokio::test]
 async fn a_node_told_about_no_control_plane_at_all_announces_itself_to_nobody() {
     let config = RuntimeConfig::default();
     assert!(NodeRegistrar::from_config(
@@ -754,14 +470,20 @@ async fn a_node_told_about_no_control_plane_at_all_announces_itself_to_nobody() 
     .is_none());
 }
 
-/// Half a machine channel is refused rather than quietly demoted to the old
-/// path. `RuntimeConfig::validate` refuses both halves of this before startup
-/// gets here, so reaching it means the check was skipped - and falling back
-/// silently would mean a node configured for mutual TLS going on announcing
-/// itself with the fleet key, and so being recorded by that key rather than by
-/// name, with nothing in any log to say so.
+/// The two halves of a machine channel mean different things on their own.
+///
+/// An identity with no address is a node that serves its management plane and
+/// registers with nobody: whatever drives it already knows where it is, so it
+/// needs no fleet list to be found on. `deis dev` runs exactly that, and
+/// `RuntimeConfig::validate` accepts it alongside a `management_listen`.
+///
+/// An address with no identity is not a configuration - the address and the
+/// files are one table - so it can only come from a caller that loaded no
+/// identity for a table that has one. That is refused rather than quietly
+/// returning `None`, because a node that was configured to announce itself
+/// and silently did not would be handed no work while looking configured.
 #[tokio::test]
-async fn neither_half_of_the_machine_channel_registers_on_its_own() {
+async fn an_address_without_an_identity_is_refused_and_an_identity_without_one_announces_nothing() {
     let (mut config, identity) = machine_config();
     config
         .machine_identity
@@ -773,7 +495,8 @@ async fn neither_half_of_the_machine_channel_registers_on_its_own() {
         NodeRegistration::of_this_node("node-a", 8123),
         Some(Arc::clone(&identity))
     )
-    .is_err());
+    .expect("an identity with nobody to announce to is a configuration, not an error")
+    .is_none());
 
     // The mirror image cannot come from a configuration file - the address and
     // the files are one table - but it can come from a caller that loaded no

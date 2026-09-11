@@ -763,33 +763,32 @@ def self_check() -> None:
 # notice - has no subject yet. That is the only thing this list stands on,
 # and it goes away when v1 ships.
 #
-# Every entry is one response member that really is `null` on the wire and
-# was documented as though it never could be. `contracts/v1/operation.
-# schema.json` has said `null` about all eight from the start; only the
-# OpenAPI rendering disagreed, which is the direction that hurts - a client
-# generated from the wrong half gives the member a non-null type and
-# dereferences a `null` nobody told it about. Correcting it widens a
-# response type, which is refused on principle, so each correction is named
-# here in full: an entry that does not match a reported change exactly does
-# nothing, and a widening that is not listed is still refused.
+# Two kinds of entry have been here.
+#
+# The first was a response member that really is `null` on the wire and was
+# documented as though it never could be. Those eight are on `origin/main`
+# now, so the baseline carries them and the comparison no longer reports
+# them; they have been deleted, which is what this list is for.
+#
+# The second is what is here now: a response member that described a
+# credential this platform no longer has. The fleet-wide node key is gone -
+# it is not a field of any configuration struct, and a control plane whose
+# file still sets `node_preshared_keys` refuses to start - so "which of the
+# fleet's keys did this node prove" has no answer to report. Restoring the
+# members is not available; they would have to be filled with something
+# untrue. Removing a response property is refused on principle, so each
+# removal is named here in full: an entry that does not match a reported
+# change exactly does nothing, and a removal that is not listed is still
+# refused.
 #
 # The list is meant to be emptied rather than grown. Once these are on
 # `origin/main` the baseline carries them and the comparison stops reporting
 # them, which the run says so that the entries can be deleted.
 PRERELEASE_CORRECTIONS = frozenset(
     {
-        f"GET {_OPERATION_LIST_ROUTE} 200 application/json.items[].operation.{member}: "
-        f"type changed from {was} to {now}"
-        for member, was, now in [
-            ("error", "object", "['object', 'null']"),
-            ("error.remediation", "string", "['string', 'null']"),
-            ("error.retryAfterSeconds", "integer", "['integer', 'null']"),
-            ("finishedAt", "string", "['string', 'null']"),
-            ("progress", "integer", "['integer', 'null']"),
-            ("scope.applicationId", "string", "['string', 'null']"),
-            ("scope.environmentId", "string", "['string', 'null']"),
-            ("startedAt", "string", "['string', 'null']"),
-        ]
+        "GET /api/platform/runtime 200 application/json.nodes[].allOf[1]: "
+        f"response property {member} removed"
+        for member in ["key_fingerprint", "key_status"]
     }
 )
 

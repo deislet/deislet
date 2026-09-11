@@ -2016,6 +2016,7 @@ dependencies = [
  "colored",
  "deis-build",
  "deis-bundle",
+ "deis-identity",
  "deis-queue",
  "deis-telemetry",
  "deis-wire",
@@ -2025,6 +2026,7 @@ dependencies = [
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
@@ -2543,16 +2545,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "yasm",
-]
-
-[[package]]
-name = "deislet-integration-tests"
-version = "0.1.0"
-dependencies = [
- "deis-identity",
- "deis-proxy",
- "deis-wire",
- "tokio",
 ]
 
 [[package]]

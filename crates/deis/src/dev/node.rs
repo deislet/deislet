@@ -12,12 +12,17 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
+use deis_identity::{Dialler, MachineIdentity, Protocol, SpiffeId};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tonic::transport::{Channel, Endpoint};
+
+use super::pki;
 
 /// Generated client for `deis.management`, the same management plane the
 /// control plane calls.
@@ -89,25 +94,51 @@ impl DevNode {
         })?;
 
         // The node's management plane - ApplyDeployment, UnloadApp,
-        // GetStatus, StartInspect and the trigger service - is authenticated,
-        // and a dev node has no control plane to share a key with. It gets a
-        // loopback socket of its own instead: an address no other host can
-        // reach is what a node accepts in place of a key, and `deis dev` is
-        // the only thing that needs to drive this one.
+        // GetStatus, StartInspect and the trigger service - admits a caller
+        // only by the certificate it proved during the handshake, naming that
+        // node's control plane. There is no string that opens it instead.
         //
-        // That also takes the plane off the data port, which the node binds
-        // on every interface so a phone on the same network can load the
-        // site. Leaving it there would put "replace this application's code"
-        // and "take it offline" on the address a developer hands out.
+        // So `deis dev` issues itself a throwaway authority and two names
+        // under it: one for the node it is about to start, one for itself as
+        // that node's control plane. See [`super::pki`] for what those are and
+        // are not. They live in this run's data directory and go away with it.
+        //
+        // The plane is bound on a loopback socket of its own, separate from
+        // the data port, which the node binds on every interface so a phone on
+        // the same network can load the site. Sharing them would put "replace
+        // this application's code" and "take it offline" on the address a
+        // developer hands out - and would also demand a client certificate of
+        // that phone.
         let management_port = super::free_port()?;
+        let pki = pki::issue(&data_dir.join("pki"))?;
 
         let mut command = Command::new(binary);
         command
-            .env("DEIS_RUNTIME_NODE_ID", "deis-dev")
+            .env("DEIS_RUNTIME_NODE_ID", pki::DEV_NODE_ID)
             .env("DEIS_RUNTIME_HTTP_PORT", port.to_string())
             .env(
-                "DEIS_RUNTIME_MANAGEMENT_LISTEN",
+                "DEIS_RUNTIME_MACHINE_IDENTITY_MANAGEMENT_LISTEN",
                 format!("127.0.0.1:{management_port}"),
+            )
+            .env(
+                "DEIS_RUNTIME_MACHINE_IDENTITY_CERTIFICATE",
+                &pki.node.certificate,
+            )
+            .env(
+                "DEIS_RUNTIME_MACHINE_IDENTITY_PRIVATE_KEY",
+                &pki.node.private_key,
+            )
+            .env(
+                "DEIS_RUNTIME_MACHINE_IDENTITY_TRUST_ROOT",
+                &pki.node.trust_root,
+            )
+            // The name this node will demand of whoever drives it, set
+            // explicitly rather than derived from a trust domain so that the
+            // name the node expects and the name this CLI proves are one
+            // value written once.
+            .env(
+                "DEIS_RUNTIME_MACHINE_IDENTITY_CONTROL_IDENTITY",
+                &pki.control_name,
             )
             .env("DEIS_RUNTIME_DATA_DIR", &data_dir)
             // Nothing is collecting logs locally, so the node keeps them in
@@ -146,7 +177,7 @@ impl DevNode {
 
         let exited = forward_output(&mut child, debug);
 
-        let client = connect(management_port, &mut child, binary).await?;
+        let client = connect(management_port, &mut child, binary, &pki).await?;
 
         Ok((
             Self {
@@ -453,15 +484,48 @@ fn strip_ansi(line: &str) -> String {
 /// Wait for the node's management plane to answer.
 ///
 /// Dialled on the node's own management port, not the port applications are
-/// served on: the two are separate sockets here, and this one is on loopback
-/// so the node serves it without a node key.
+/// served on: the two are separate sockets, and this one demands a
+/// certificate. This CLI presents the control-plane leaf from [`pki`] and
+/// requires the node to prove its own name back, which is the same exchange a
+/// real control plane makes with a real node - the only difference is who
+/// signed the two certificates.
 async fn connect(
     management_port: u16,
     child: &mut Child,
     binary: &Path,
+    pki: &pki::DevPki,
 ) -> Result<RuntimeManagementClient<Channel>> {
-    let url = format!("http://127.0.0.1:{management_port}");
+    // https, not http: the scheme is what tells tonic's endpoint this is a
+    // TLS connection, and a mismatch here is a handshake that never starts.
+    let url = format!("https://127.0.0.1:{management_port}");
+    let identity = Arc::new(
+        MachineIdentity::load(
+            deis_identity::IdentityFiles::new(
+                pki.control.certificate.clone(),
+                pki.control.private_key.clone(),
+                pki.control.trust_root.clone(),
+            ),
+            &[Protocol::Http2],
+        )
+        .context("loading this run's own control-plane certificate")?,
+    );
+    let node_name = SpiffeId::parse(&format!(
+        "spiffe://{}/deislet/node/{}",
+        pki::DEV_TRUST_DOMAIN,
+        pki::DEV_NODE_ID
+    ))
+    .context("the dev node's name")?;
+    // Parsed once: the address does not change between attempts, so a URL this
+    // cannot read is a bug here rather than a node that is not up yet, and
+    // retrying it sixty times would report it as a timeout.
+    let endpoint = Endpoint::from_shared(url.clone())
+        .with_context(|| format!("{url} is not an address this can dial"))?
+        .connect_timeout(Duration::from_secs(2));
     let deadline = Instant::now() + START_TIMEOUT;
+    // Declared without a value rather than with `None`: every path to the
+    // timeout below has made an attempt and recorded what it said, so a `None`
+    // here would be a state that cannot happen dressed up as one that can.
+    let mut last_failure: String;
 
     loop {
         // Checked first: a node that has already exited will never answer,
@@ -475,27 +539,36 @@ async fn connect(
             );
         }
 
-        if let Ok(endpoint) = Endpoint::from_shared(url.clone())
-            && let Ok(channel) = endpoint
-                .connect_timeout(Duration::from_secs(2))
-                .connect()
-                .await
-        {
-            let mut client = RuntimeManagementClient::new(channel)
-                .max_decoding_message_size(deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES)
-                .max_encoding_message_size(deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES);
-            if client.health_check(HealthCheckRequest {}).await.is_ok() {
-                return Ok(client);
+        // Built fresh each attempt: a dialler holds the certificate material
+        // in force when it was made, and the node may not have finished
+        // binding its listener on the first try.
+        let dialler = Dialler::new(
+            Arc::clone(&identity),
+            node_name.clone(),
+            &[Protocol::Http2],
+        );
+        match endpoint.clone().connect_with_connector(dialler).await {
+            Ok(channel) => {
+                let mut client = RuntimeManagementClient::new(channel)
+                    .max_decoding_message_size(deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES);
+                match client.health_check(HealthCheckRequest {}).await {
+                    Ok(_) => return Ok(client),
+                    Err(status) => last_failure = status.to_string(),
+                }
             }
+            Err(error) => last_failure = error.to_string(),
         }
 
         if Instant::now() >= deadline {
             let _ = child.start_kill();
             bail!(
                 "the deis-runtime at {} did not answer on its management port \
-                 {management_port} within {}s. Its output above says how far it got.",
+                 {management_port} within {}s. The last attempt said: {}. Its output above says \
+                 how far it got.",
                 binary.display(),
-                START_TIMEOUT.as_secs()
+                START_TIMEOUT.as_secs(),
+                last_failure
             );
         }
         tokio::time::sleep(CONNECT_RETRY_GAP).await;

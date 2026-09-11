@@ -477,10 +477,7 @@ mod tests {
     }
 
     async fn platform() -> Harness {
-        harness_with_storage(
-            true,
-            vec!["node-psk".to_string()],
-            storage_wiring(Some(TEST_STORAGE_SECRET)),
+        harness_with_storage(true, storage_wiring(Some(TEST_STORAGE_SECRET)),
         )
         .await
     }

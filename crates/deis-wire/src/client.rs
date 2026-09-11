@@ -7,9 +7,10 @@
 //! [`WireClient`] can either dial for itself or run on a channel its caller
 //! built. Dialling for itself is the original behaviour and still the default:
 //! `connect` opens a plaintext connection to [`ControlConfig::addr`] and the
-//! handshake presents [`ControlConfig::secret`], the fleet-wide value every
-//! process holds a copy of - if it has one. A process with a machine
-//! identity has no reason to hold one and the field is then absent.
+//! handshake carries an empty `secret` field, which is all there is to carry:
+//! what admits a channel is the certificate on the connection the caller
+//! built, and this crate's own dial builds a plaintext one that proves
+//! nothing.
 //!
 //! A caller that has a machine identity wants the other thing - the same
 //! control channel over mutual TLS, on a connection where the control plane
@@ -85,7 +86,7 @@ impl WireClient {
     ///
     /// Everything above the connection is unchanged: the same
     /// `EstablishChannel` stream, the same handshake, the same
-    /// [`ControlConfig::secret`] in it. What the caller decides by building
+    /// empty `secret` field in it. What the caller decides by building
     /// the channel is only how the connection underneath is made - which host
     /// it goes to, and what, if anything, is proved on it.
     ///
@@ -180,16 +181,20 @@ impl WireClient {
 
     /// Authenticate
     pub async fn authenticate(&mut self) -> Result<(), WireError> {
-        // An absent secret goes on the wire as the empty string, which is
-        // the honest encoding of "I am presenting nothing". The control
-        // plane compares it against its configured keys only when the
-        // connection proved no certificate, and no configured key is ever
-        // blank, so a process with neither is refused rather than admitted
-        // by an accidental match. A process that did prove one is admitted
-        // by the name it proved and this field is not read at all.
+        // The `secret` field is empty because there is no longer anything to
+        // put in it. What admits this channel is the certificate presented
+        // during the handshake, and the control plane does not read this
+        // field at all.
+        //
+        // The field is still on the wire because removing one from a proto is
+        // a change both ends have to make in the same instant, and this end
+        // cannot know when the other made it. An empty string is the honest
+        // encoding of "nothing presented" and a control plane still comparing
+        // it will refuse the connection - which is correct, because such a
+        // control plane is not one this build can talk to anyway.
         let req = AuthenticateRequest {
             instance_id: self.config.associated_id.clone(),
-            secret: self.config.secret.clone().unwrap_or_default(),
+            secret: String::new(),
         };
 
         self.send_message(Payload::Authenticate(req)).await?;
@@ -373,7 +378,6 @@ mod tests {
     fn create_test_config() -> ControlConfig {
         ControlConfig::new(
             "test_node".to_string(),
-            "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
             "http://localhost:8080".to_string(),
         )
     }
@@ -441,8 +445,18 @@ mod tests {
                             let mut seen = seen.lock().unwrap();
                             seen.secret = Some(request.secret.clone());
                             seen.instance_id = Some(request.instance_id.clone());
+                            // Admits everything, and says so rather than
+                            // pretending to decide. What admits a channel in
+                            // production is the certificate on the connection,
+                            // and this stand-in is a bare gRPC service with no
+                            // TLS under it - it cannot observe that, so a rule
+                            // written here would be a rule about nothing. The
+                            // two tests below assert which connection carried
+                            // the exchange, which is what this crate decides;
+                            // `deis_control::api::grpc` is where admission is
+                            // decided and tested.
                             Payload::AuthResponse(AuthResponse {
-                                success: !request.secret.is_empty(),
+                                success: true,
                                 message: "welcome".to_string(),
                             })
                         }
@@ -483,15 +497,18 @@ mod tests {
         (addr, seen)
     }
 
-    /// The unchanged path: no channel supplied, so the client dials
-    /// `ControlConfig::addr` itself, in plaintext, and presents the fleet
-    /// secret exactly as it always has.
+    /// No channel supplied, so the client dials `ControlConfig::addr` itself.
+    ///
+    /// It sends an empty `secret`, which is the honest encoding of "nothing
+    /// presented": a control plane admits this channel by the name the
+    /// connection proved, and a client that dialled for itself in plaintext
+    /// proved none. This exercises the SDK's own dial, not a path any process
+    /// in this fleet takes.
     #[tokio::test]
     async fn a_client_with_no_channel_dials_the_configured_address_itself() {
         let (addr, seen) = mock_control().await;
         let mut config = create_test_config();
         config.addr = addr;
-        let secret = config.secret.clone().expect("the test configuration names one");
 
         let mut client = WireClient::new(config, create_test_node_info());
         client.connect().await.expect("a connection");
@@ -499,7 +516,11 @@ mod tests {
         client.register().await.expect("a registration");
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.secret.as_deref(), Some(secret.as_str()));
+        assert_eq!(
+            seen.secret.as_deref(),
+            Some(""),
+            "there is nothing left to put in this field"
+        );
         assert_eq!(seen.instance_id.as_deref(), Some("test_node"));
         assert!(seen.registered);
     }
@@ -512,7 +533,6 @@ mod tests {
         let (addr, seen) = mock_control().await;
         let mut config = create_test_config();
         config.addr = "http://127.0.0.1:1".to_string();
-        let secret = config.secret.clone().expect("the test configuration names one");
         // Lazy on purpose: this is the shape a caller with a connector of its
         // own builds, and it means the channel exists before anything has
         // been dialled - the connection is made by the first call on it.
@@ -529,7 +549,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen.secret.as_deref(),
-            Some(secret.as_str()),
+            Some(""),
             "the handshake above the connection is the same one on either transport"
         );
         assert!(seen.registered);

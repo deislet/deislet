@@ -11,25 +11,28 @@
 //! its assignments ([`super::assignments`]) - and, like that fetch, on one of
 //! two doors.
 //!
-//! # Two doors, one statement
+//! # One door, and why it is one
 //!
 //! Registering is how a node becomes a delivery target: what registers is what
 //! gets deployment pushes, cron occurrences and, on its next assignment fetch,
 //! its environments' decrypted secrets. So who is allowed to say it matters as
 //! much as what is said.
 //!
-//! * [`NodeRegistrar::new`] says it over HTTP on the control plane's human
-//!   listener, guarded by `node_preshared_keys` - independent of the human
-//!   API's `api_auth_enabled`, because registering is a node action like any
-//!   other. That credential is one value the whole fleet holds, so the control
-//!   plane has to take the caller's word for which node it is: any holder of
-//!   it can register any name and be handed that name's work.
-//! * [`NodeRegistrar::over_machine_channel`] says it over the machine channel,
-//!   where the connection proved a name before the call was read. The control
-//!   plane refuses a registration whose `node_id` is not that name, records the
-//!   node by the name rather than by which of two rotating fleet-key values it
-//!   happened to present, and only a node recorded that way is dialled back by
-//!   certificate.
+//! [`NodeRegistrar::over_machine_channel`] is the only way to say it. The
+//! connection proved a name before the call was read, the control plane
+//! refuses a registration whose `node_id` is not that name, and the node is
+//! recorded under the name its certificate carries.
+//!
+//! There was a second door, and it is worth remembering what was wrong with
+//! it rather than only that it is shut. A node registered over HTTP on the
+//! control plane's human listener, guarded by a value the whole installation
+//! held a copy of. That value could say "a machine of this installation is
+//! calling" and could not say which one, so the control plane had to take the
+//! caller's word for the name: any holder could register any name and be
+//! handed that name's work, including that name's decrypted secrets on the
+//! next fetch. Closing it was not a matter of guarding it better - no
+//! comparison against a shared string could have answered the question that
+//! mattered.
 //!
 //! Which door this node uses is decided once, at startup, by
 //! [`NodeRegistrar::from_config`]. A node with no `[machine_identity]`
@@ -54,7 +57,6 @@ use serde::{Deserialize, Serialize};
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, warn};
 
-use super::credential::NodeCredential;
 
 /// What a node says about itself.
 ///
@@ -138,17 +140,6 @@ struct RegisterAnswer {
     refresh_after_seconds: u64,
 }
 
-/// What the control plane answers a deregistration with, on the HTTP route.
-///
-/// The machine channel says the same thing in a typed field
-/// (`DeregisterNodeResponse::removed`), which is why only the HTTP side needs
-/// a shape to decode.
-#[derive(Debug, Clone, Deserialize)]
-struct DeregisterAnswer {
-    /// Whether this call actually removed the node from the fleet list.
-    #[serde(default)]
-    removed: bool,
-}
 
 impl NodeRegistration {
     /// The role string a deis-runtime node registers under.
@@ -298,12 +289,6 @@ pub struct NodeRegistrar {
 
 /// How this node registers, and what it proves while registering.
 enum Transport {
-    /// `PUT /api/nodes/{node_id}/registration` with the fleet key in an
-    /// `Authorization` header, and `DELETE` on the same path to leave.
-    Http {
-        client: reqwest::Client,
-        credential: Option<NodeCredential>,
-    },
     /// `deis.machine.MachineChannel/Register` over mutual TLS.
     Machine {
         /// Built once, at startup, and kept for the life of the process. A
@@ -329,48 +314,13 @@ enum Transport {
 }
 
 impl NodeRegistrar {
-    /// `credential` is the node key from `[control] secret`, the same one the
-    /// assignment fetch presents. Without it the request goes out anonymous,
-    /// which a control plane with `node_preshared_keys` configured refuses.
-    /// `machine_address` is where this node serves its management plane over
-    /// mutual TLS, or `None` when it serves none. It reaches the control plane
-    /// through the registration because the control plane has no other way to
-    /// learn it: the socket a registration arrives on is not the socket
-    /// management calls go to, and only this node knows whether it bound a
-    /// second one.
-    pub fn new(
-        endpoint: &str,
-        node: NodeRegistration,
-        timeout: Duration,
-        credential: Option<NodeCredential>,
-        machine_address: Option<String>,
-    ) -> anyhow::Result<Self> {
-        // See `crate::egress_proxy`: this node keeps the operator's proxy,
-        // applications no longer inherit it.
-        let client =
-            crate::egress_proxy::for_node_clients(reqwest::Client::builder().timeout(timeout))?
-                .build()?;
-        let url = format!(
-            "{}{}",
-            endpoint.trim_end_matches('/'),
-            deis_wire::conventions::node_registration_path(&super::assignments::urlencode(
-                &node.node_id
-            ))
-        );
-        Ok(Self {
-            transport: Transport::Http { client, credential },
-            url,
-            machine_address,
-            node,
-        })
-    }
 
-    /// Register over the machine channel instead, proving `identity` and
-    /// refusing to talk to anything that cannot prove it is `control_identity`.
+    /// Register over the machine channel, proving `identity` and refusing to
+    /// talk to anything that cannot prove it is `control_identity`.
     ///
-    /// No credential is carried and none is wanted: the connection has already
-    /// said which machine is registering, and putting the fleet key on it as
-    /// well would keep alive the exact secret this channel exists to retire.
+    /// No credential is carried and there is none to carry: the connection has
+    /// already said which machine is registering, and the control plane
+    /// refuses a registration naming anything else.
     pub fn over_machine_channel(
         machine_endpoint: &str,
         node: NodeRegistration,
@@ -525,23 +475,17 @@ impl NodeRegistrar {
                 "control.machine_endpoint is {machine_endpoint:?} but this node has no machine \
                  identity loaded, so it could not complete a handshake with that listener"
             )),
-            (None, Some(_)) => Err(anyhow::anyhow!(
-                "this node loaded a machine identity but control.machine_endpoint is not set, so \
-                 there is nowhere to present it"
-            )),
+            // An identity and nowhere to present it: a node that serves its
+            // management plane and registers with nobody, which `validate`
+            // accepts only alongside a management listener. `deis dev` runs
+            // exactly that - the thing that started the node is the only
+            // thing that will ever drive it, and it needs no fleet list to
+            // find it.
+            (None, Some(_)) => Ok(None),
             // Without an endpoint there is nobody to register with, which is
             // the standalone case: the control loop says so and reports the
             // node ready on what it finds on its own disk.
-            (None, None) => match config.control.endpoint.as_deref() {
-                Some(endpoint) => Ok(Some(Self::new(
-                    endpoint,
-                    node,
-                    timeout,
-                    config.control.credential(),
-                    machine_address,
-                )?)),
-                None => Ok(None),
-            },
+            (None, None) => Ok(None),
         }
     }
 
@@ -549,14 +493,10 @@ impl NodeRegistrar {
         &self.url
     }
 
-    /// Where a deregistration is addressed. The same place for HTTP, where it
-    /// is another method on one path, and the other RPC on the machine
-    /// channel.
+    /// Where a deregistration is addressed.
     fn deregister_url(&self) -> &str {
-        match &self.transport {
-            Transport::Http { .. } => &self.url,
-            Transport::Machine { deregister_url, .. } => deregister_url,
-        }
+        let Transport::Machine { deregister_url, .. } = &self.transport;
+        deregister_url
     }
 
     pub fn node(&self) -> &NodeRegistration {
@@ -565,10 +505,7 @@ impl NodeRegistrar {
 
     /// How this node registers, for the one startup line that says so.
     pub fn transport_name(&self) -> &'static str {
-        match self.transport {
-            Transport::Http { .. } => "HTTP with the shared fleet key",
-            Transport::Machine { .. } => "the machine channel, over mutual TLS",
-        }
+        "the machine channel, over mutual TLS"
     }
 
     /// Announce this node, or refresh what it already said.
@@ -584,70 +521,13 @@ impl NodeRegistrar {
             version: self.node.version,
         };
 
-        match &self.transport {
-            Transport::Http { client, credential } => {
-                self.register_over_http(client, credential.as_ref(), &body)
-                    .await
-            }
-            Transport::Machine {
-                client, identity, ..
-            } => {
-                self.register_over_machine_channel(client, identity, &body)
-                    .await
-            }
-        }
-    }
-
-    async fn register_over_http(
-        &self,
-        client: &reqwest::Client,
-        credential: Option<&NodeCredential>,
-        body: &RegisterBody,
-    ) -> Result<Registered, RegistrationError> {
-        let mut request = client.put(&self.url).json(body);
-        if let Some(credential) = credential {
-            request = request.header(reqwest::header::AUTHORIZATION, credential.header_value());
-        }
-
-        let response = request
-            .send()
+        let Transport::Machine {
+            client, identity, ..
+        } = &self.transport;
+        self.register_over_machine_channel(client, identity, &body)
             .await
-            .map_err(|e| RegistrationError::Transport {
-                url: self.url.clone(),
-                reason: e.to_string(),
-            })?;
-
-        let code = response.status().as_u16();
-        if response.status().is_success() {
-            let refresh_after = refresh_interval(
-                &self.url,
-                response
-                    .json::<RegisterAnswer>()
-                    .await
-                    .map_err(|e| e.to_string()),
-            );
-            debug!(
-                url = %self.url,
-                code,
-                refresh_after_secs = refresh_after.as_secs(),
-                "The control plane accepted this node's registration"
-            );
-            return Ok(Registered::Accepted { refresh_after });
-        }
-
-        // 404/405 is a control plane with no such route; 501 is one that has
-        // the route and does not implement it. All three mean "this control
-        // plane does not do registration", which is a permanent answer and
-        // must not be retried every interval.
-        if matches!(code, 404 | 405 | 501) {
-            return Ok(Registered::NotSupported);
-        }
-
-        Err(RegistrationError::Status {
-            url: self.url.clone(),
-            code,
-        })
     }
+
 
     async fn register_over_machine_channel(
         &self,
@@ -717,78 +597,12 @@ impl NodeRegistrar {
     /// fallback that was there before anything said anything.
     pub async fn deregister(&self) -> Result<Deregistered, RegistrationError> {
         match &self.transport {
-            Transport::Http { client, credential } => {
-                self.deregister_over_http(client, credential.as_ref()).await
-            }
             Transport::Machine {
                 client, identity, ..
             } => self.deregister_over_machine_channel(client, identity).await,
         }
     }
 
-    async fn deregister_over_http(
-        &self,
-        client: &reqwest::Client,
-        credential: Option<&NodeCredential>,
-    ) -> Result<Deregistered, RegistrationError> {
-        let mut request = client.delete(&self.url);
-        if let Some(credential) = credential {
-            request = request.header(reqwest::header::AUTHORIZATION, credential.header_value());
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| RegistrationError::Transport {
-                url: self.url.clone(),
-                reason: e.to_string(),
-            })?;
-
-        let code = response.status().as_u16();
-        if response.status().is_success() {
-            // The control plane says whether it removed anything; an answer
-            // that cannot be read is read as "it did not", which is the
-            // cautious way round - it only ever understates what this node
-            // believes it achieved on the way out.
-            let removed = response
-                .json::<DeregisterAnswer>()
-                .await
-                .map(|answer| answer.removed)
-                .unwrap_or(false);
-            debug!(
-                url = %self.url,
-                code,
-                removed,
-                "The control plane took this node's deregistration"
-            );
-            return Ok(if removed {
-                Deregistered::Removed
-            } else {
-                Deregistered::Kept
-            });
-        }
-
-        match code {
-            // Two answers wearing one code, and a node that is stopping does
-            // the same thing about both: deis-control serves `DELETE` on the
-            // same path as the `PUT`, so a 404 here is a control plane that
-            // does not know this node rather than one with no such route. The
-            // entry this call asked about is not there either way.
-            404 => Ok(Deregistered::Kept),
-            // A node named in `deis_runtime_nodes` stays on the list: the
-            // control plane's file says it exists, and a running fleet that
-            // disagrees with the file until somebody restarts the process is
-            // worse than one stale entry.
-            409 => Ok(Deregistered::Kept),
-            // The route exists for `PUT` and not for `DELETE`, or exists and
-            // is not implemented.
-            405 | 501 => Ok(Deregistered::NotSupported),
-            _ => Err(RegistrationError::Status {
-                url: self.url.clone(),
-                code,
-            }),
-        }
-    }
 
     async fn deregister_over_machine_channel(
         &self,

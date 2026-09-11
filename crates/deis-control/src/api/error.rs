@@ -913,7 +913,7 @@ impl From<crate::runtime_client::NodeError> for ApiError {
             // proved is no longer one this control plane holds. Not the
             // caller's fault and not a gateway failure - the node has to
             // register again.
-            NodeError::KeyRetired { .. } => ApiError::Conflict(message),
+            NodeError::NotReachable { .. } => ApiError::Conflict(message),
         }
     }
 }

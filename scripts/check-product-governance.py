@@ -34,7 +34,7 @@ EXPECTED_TEST_SHARDS = {
         "-p deis-provider-driver -p deis-backend-migration "
         "-p deis-backend-topology "
         "-p deis-control -p deis-store "
-        "-p deis-queue -p deis-telemetry -p deis-proxy -p deislet-integration-tests "
+        "-p deis-queue -p deis-telemetry -p deis-proxy "
         "--no-fail-fast"
     ),
 }

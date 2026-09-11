@@ -1241,15 +1241,15 @@ impl ApplicationManager {
     /// is presented over the node's public port by whoever wants to attach,
     /// and a comparison whose duration reports how many leading bytes were
     /// right hands an attacker the token one byte at a time. It is the same
-    /// rule and the same function the node key and the storage token are
-    /// checked with; a second spelling of it here would be a second place to
-    /// get it wrong. An empty stored token never matches, which is what the
-    /// helper's own emptiness check is for.
+    /// rule and the same function the storage token is checked with; a second
+    /// spelling of it here would be a second place to get it wrong. An empty
+    /// stored token never matches, which is what the helper's own emptiness
+    /// check is for.
     ///
-    /// The helper is [`deis_wire::conventions::secret_matches`] and not the
-    /// node key's own wrapper: this token is minted by this node, held in
-    /// memory, and expires. It is not the fleet credential and must not
-    /// follow it out of the codebase when that is retired.
+    /// [`deis_wire::conventions::secret_matches`] is the last constant-time
+    /// comparison left in the platform's own plumbing, and it stayed when the
+    /// fleet-wide node key went, because this token is a different thing: it
+    /// is minted by this node for one attach, held in memory, and expires.
     pub fn validate_inspect_token(&self, key: &AppKey, token: &str) -> bool {
         if let Some(entry) = self.inspect_sessions.get(key) {
             let (stored_token, expires_at) = entry.value();

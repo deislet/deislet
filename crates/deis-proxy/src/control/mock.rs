@@ -47,17 +47,10 @@ struct Service {
     cut: broadcast::Sender<()>,
     secrets: Arc<Mutex<Vec<String>>>,
     registered: mpsc::UnboundedSender<u32>,
-    /// Whether a connection that reached this service has already proved a
+    /// Whether a connection reaching this service has already proved a
     /// certificate, which is true of the TLS listener and false of the
-    /// plaintext one.
-    ///
-    /// It decides authentication the way the real control plane decides it:
-    /// a peer that proved a name is admitted by that name and whatever it put
-    /// in the handshake's `secret` field is not consulted, while a peer that
-    /// proved nothing has only the shared value left and is refused without
-    /// one. Modelled by which listener took the connection rather than by a
-    /// switch a test sets, because that is exactly what distinguishes the two
-    /// in the real thing.
+    /// plaintext one. It is the whole of the authentication decision, here
+    /// and in the control plane this stands in for.
     mutually_authenticated: bool,
 }
 
@@ -274,8 +267,22 @@ impl ControlService for Service {
                 };
                 let reply = match payload {
                     Payload::Authenticate(req) => {
+                        // Decided by which listener took the connection, the
+                        // way the real control plane decides it: `proved` is
+                        // `Some` only on a mutually authenticated one, and
+                        // `deis_control::api::grpc` admits a channel on that
+                        // and on nothing else. There is no longer anything in
+                        // this message to check - `ControlConfig` carries no
+                        // secret on either listener - so a plaintext caller
+                        // is refused here for the same reason it is refused
+                        // there: nothing about it was ever established.
+                        //
+                        // Modelled rather than simplified to `true` because a
+                        // mock that admitted a plaintext caller would let a
+                        // change to that rule pass every test here while
+                        // leaving no proxy in the fleet able to attach.
                         secrets.lock().unwrap().push(req.secret.clone());
-                        authenticated = mutually_authenticated || !req.secret.is_empty();
+                        authenticated = mutually_authenticated;
                         Payload::AuthResponse(AuthResponse {
                             success: authenticated,
                             message: String::new(),

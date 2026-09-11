@@ -484,16 +484,47 @@ mod tests {
             .unwrap();
         catalog.deploy(&env, &version.id, None).await.unwrap();
 
-        let state = AppsState {
-            deis_runtime: Arc::new(RuntimeNodeManager::new(
-                vec![crate::config::RuntimeNodeConfig {
-                    id: "node-a".to_string(),
-                    // Nothing listens here. A test that reaches the node at
-                    // all fails on the connection rather than passing quietly.
+        const TRUST_DOMAIN: &str = "deis.internal";
+
+        // A node this control plane could dial, pointed at a port nothing
+        // holds. Both halves matter: without an identity and a registered
+        // name `channel` refuses before it opens a socket, and a test that
+        // wanted to prove the request left this process would instead be
+        // proving it never started.
+        let authority = deis_identity_test_pki::TestCa::new();
+        let pki = tempfile::tempdir().expect("a directory for the identity");
+        let control_name = deis_identity::names::control(TRUST_DOMAIN).expect("a control name");
+        let files = deis_identity_test_pki::write_files(
+            pki.path(),
+            "control",
+            &authority.issue(&control_name),
+            &authority.root_pem,
+        );
+        let identity = Arc::new(
+            deis_identity::MachineIdentity::load(files.as_identity_files(), &[])
+                .expect("the control plane's own identity"),
+        );
+        let nodes = Arc::new(
+            RuntimeNodeManager::new(Vec::new(), 15).with_machine_identity(Some(identity)),
+        );
+        nodes
+            .register(
+                "node-a",
+                crate::runtime_client::NodeClaim {
                     addr: "http://127.0.0.1:1".to_string(),
-                }],
-                15,
-            )),
+                    // Port 1, so the dial is made and refused rather than
+                    // hanging on something that might answer.
+                    machine_addr: Some("https://127.0.0.1:1".to_string()),
+                    version: None,
+                    identity: deis_identity::names::node(TRUST_DOMAIN, "node-a")
+                        .expect("a node name"),
+                },
+                chrono::Utc::now(),
+            )
+            .expect("the node registers");
+
+        let state = AppsState {
+            deis_runtime: nodes,
             catalog: Arc::clone(&catalog),
         };
         (state, catalog)

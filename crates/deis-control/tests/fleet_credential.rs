@@ -17,20 +17,27 @@
 //!
 //! # What is guarded instead
 //!
-//! The three ways a call can go out, which is what `RuntimeNodeManager::channel`
-//! decides before it dials anything:
+//! That there is now exactly one way a call into a node can go out, and that
+//! the two situations which used to be dialled anyway are refused by name
+//! instead. `RuntimeNodeManager::channel` decides all three before it dials:
 //!
 //! * a node that proved a certificate **and** reported a `machine_addr` is
 //!   dialled there over mutual TLS, carrying no bearer credential at all -
-//!   the handshake is what says who is calling, and a shared secret riding
-//!   along would suggest the secret was still doing something;
-//! * a node that proved a certificate and reported no machine address is
-//!   dialled over its plaintext address with the first configured key. This
-//!   is documented in `credential_for` as temporary and is the weakest thing
-//!   left in this direction, so it is pinned down rather than left to drift;
-//! * a node from the configuration file that has registered nothing is driven
-//!   with the first key too, because the file is the operator's word that the
-//!   address is theirs.
+//!   the handshake is what says who is calling, and there is nothing else
+//!   left to send;
+//! * a node that proved a certificate and reported no machine address is not
+//!   dialled at all. It used to fall back to its plaintext address with the
+//!   fleet key; that key is gone, so falling back would mean opening an
+//!   unauthenticated connection to a machine this control plane cannot name
+//!   on the wire;
+//! * a node from the configuration file that has registered nothing is not
+//!   dialled either. The file is the operator's word that an address exists,
+//!   which is not a claim about who answers there.
+//!
+//! The last two are refusals and not silences, which is the part worth
+//! pinning: each carries the node id and says which half is missing, so
+//! "why did this deployment not reach that machine" is answered in the log
+//! rather than by comparing two fleet listings.
 //!
 //! The node in these tests is a stand-in built from the real management
 //! proto. It answers `HealthCheck` and records, for every call, the credential
@@ -45,7 +52,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use chrono::Utc;
 use deis_control::config::RuntimeNodeConfig;
 use deis_control::machine::{PeerIdentity, identity_acceptor};
-use deis_control::node_key::NodeProof;
 use deis_control::runtime_client::proto::runtime_management_server::{
     RuntimeManagement, RuntimeManagementServer,
 };
@@ -55,7 +61,7 @@ use deis_control::runtime_client::proto::{
     PushConfigRequest, PushConfigResponse, StartInspectRequest, StartInspectResponse,
     UnloadAppRequest, UnloadAppResponse, UpdateAppRequest, UpdateAppResponse,
 };
-use deis_control::runtime_client::{NodeClaim, NodeKeyStatus, RuntimeNodeManager};
+use deis_control::runtime_client::{NodeClaim, RuntimeNodeManager};
 use deis_identity::{MachineIdentity, Protocol, SpiffeId, names};
 use deis_identity_test_pki::{TestCa, write_files};
 use deis_wire::conventions::{NODE_AUTH_METADATA, node_auth_secret};
@@ -68,17 +74,18 @@ const NODE_SERVES: &[Protocol] = &[Protocol::Http2];
 
 /// One management call, as the node saw it arrive.
 ///
-/// Both halves are recorded because the interesting failure is not a missing
-/// credential on its own: a call that arrived over mutual TLS *and* carried a
-/// fleet key would pass an assertion about the handshake while still handing
-/// every node the one secret the certificate was brought in to replace.
+/// Both halves are recorded, and `credential` is the half worth watching. A
+/// call that arrived over mutual TLS *and* carried a bearer value would pass
+/// every assertion about the handshake while still putting a shared secret on
+/// the wire, which is the thing the certificate was brought in to replace. It
+/// is asserted absent rather than assumed absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Call {
     /// The node key on the call, without its `Bearer ` prefix.
     credential: Option<String>,
-    /// The name the connection proved, for a call that arrived over the
-    /// authenticated plane. `None` on the plaintext plane, where nothing is
-    /// proved by a handshake.
+    /// The name the connection proved. `None` would mean a call that reached
+    /// this node without a handshake having said who made it, which is a state
+    /// the node has no listener for.
     proved: Option<String>,
 }
 
@@ -88,14 +95,6 @@ impl Call {
         Self {
             credential: None,
             proved: Some(proved.to_string()),
-        }
-    }
-
-    /// A call on the plaintext plane carrying one of the fleet keys.
-    fn carrying(key: &str) -> Self {
-        Self {
-            credential: Some(key.to_string()),
-            proved: None,
         }
     }
 }
@@ -318,14 +317,10 @@ impl Fleet {
 /// identity on an installation that has a machine channel.
 fn control_plane(
     configured: Vec<RuntimeNodeConfig>,
-    keys: &[&str],
     identity: Option<Arc<MachineIdentity>>,
 ) -> Arc<RuntimeNodeManager> {
-    let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
     Arc::new(
-        RuntimeNodeManager::new_with_ttl(configured, 15, 90)
-            .with_node_keys(&keys)
-            .with_machine_identity(identity),
+        RuntimeNodeManager::new_with_ttl(configured, 15, 90).with_machine_identity(identity),
     )
 }
 
@@ -346,7 +341,7 @@ async fn register(
                 addr: addr.to_string(),
                 machine_addr: machine_addr.map(str::to_string),
                 version: None,
-                proof: NodeProof::Certificate(name.clone()),
+                identity: name.clone(),
             },
             Utc::now(),
         )
@@ -370,7 +365,9 @@ async fn a_node_reached_over_mutual_tls_is_handed_no_key_at_all() {
     let (machine_addr, over_tls) = machine_node("node-07", &identity).await;
     let (plaintext_addr, over_plaintext) = plaintext_node("node-07").await;
 
-    let nodes = control_plane(Vec::new(), &["fleet-key"], Some(Arc::clone(&fleet.control)));
+    let nodes = control_plane(
+        Vec::new(),
+        Some(Arc::clone(&fleet.control)));
     register(
         &nodes,
         "node-07",
@@ -394,71 +391,65 @@ async fn a_node_reached_over_mutual_tls_is_handed_no_key_at_all() {
         seen(&over_plaintext)
     );
 
-    // The fleet listing says who this node is, and still says it without
-    // putting a credential in an answer the API serves and `deis status`
-    // prints.
+    // The fleet listing says who this node is, in full. A SPIFFE name is not
+    // a credential - it is what the certificate says out loud - so unlike the
+    // fingerprint this replaced, it is safe to put in an answer the API serves
+    // and `deis status` prints.
     let view = nodes
         .list()
         .into_iter()
         .find(|view| view.id == "node-07")
         .expect("the node is on the fleet list");
-    assert_eq!(view.key_status, NodeKeyStatus::Proved);
     assert_eq!(view.identity.as_deref(), Some(name.as_str()));
-    assert_eq!(
-        view.key_fingerprint, None,
-        "a node that proved a certificate holds no key to name"
-    );
-    let rendered = serde_json::to_string(&view).unwrap();
-    assert!(!rendered.contains("fleet-key"), "{rendered}");
 }
 
-/// The weakest thing left in this direction, pinned down so that it changes
-/// deliberately rather than by drift: a node that proved a name but bound no
-/// authenticated socket is still dialled over plaintext, carrying the first
-/// configured key, because the node at the other end still checks one.
+/// A node that proved a name but bound no authenticated socket is not
+/// dialled at all, and says so.
 ///
-/// This is the arm `credential_for` documents as temporary. When a node
-/// refuses the key and the key leaves the configuration, this test is the one
-/// that has to be rewritten - which is the point of having it.
+/// This used to be the weakest arm in this direction: such a node was dialled
+/// over its plaintext address carrying the first configured key. There is no
+/// key to carry now, and the alternative to refusing would be an
+/// unauthenticated connection to a machine this control plane cannot name on
+/// the wire - which is the thing the machine channel exists to stop.
 #[tokio::test]
-async fn a_certificate_node_with_no_machine_address_still_gets_the_first_key() {
+async fn a_certificate_node_with_no_machine_address_is_not_dialled_at_all() {
     let fleet = Fleet::new();
     let (name, _identity) = fleet.node("node-07");
     let (plaintext_addr, calls) = plaintext_node("node-07").await;
 
-    // Two keys, so that "the first one" is a choice this test can observe
-    // rather than the only value available.
-    let nodes = control_plane(
-        Vec::new(),
-        &["first-key", "second-key"],
-        Some(Arc::clone(&fleet.control)),
-    );
+    let nodes = control_plane(Vec::new(), Some(Arc::clone(&fleet.control)));
     register(&nodes, "node-07", &name, &plaintext_addr, None).await;
 
-    let health = nodes.check_node("node-07").await.expect("the node answers");
-    assert!(health.healthy);
+    let error = nodes
+        .check_node("node-07")
+        .await
+        .expect_err("a node with nowhere authenticated to be reached must not be dialled");
+    let said = error.to_string();
+    assert!(
+        said.contains("management_listen"),
+        "the refusal has to name the setting that is missing, and said: {said}"
+    );
     assert_eq!(
         seen(&calls),
-        vec![Call::carrying("first-key")],
-        "a node that reported no authenticated address is dialled the old way, with the first configured key"
+        Vec::new(),
+        "nothing may be sent to its plaintext address either"
     );
 }
 
-/// The whole of the authenticated path has to be there before any of it is
-/// used: a control plane with no identity of its own cannot prove anything to
-/// a node, so a node that reported a machine address is still dialled over
-/// plaintext with the first key. There is no half of this that works, and the
-/// half that looks like it would - opening the TLS socket with nothing to
-/// present - is a connection refused at the handshake and a node that has
-/// gone quiet for no reason its own log states.
+/// A control plane with no identity of its own cannot dial any node, and
+/// fails at the first one rather than reaching for something weaker.
+///
+/// There is no half of this that works. The half that looks like it would -
+/// opening the TLS socket with nothing to present - is a connection refused
+/// at the handshake, and a node gone quiet for no reason its own log states.
 #[tokio::test]
-async fn without_an_identity_of_its_own_the_control_plane_dials_the_old_way() {
+async fn without_an_identity_of_its_own_the_control_plane_dials_nothing() {
     let fleet = Fleet::new();
     let (name, identity) = fleet.node("node-07");
     let (machine_addr, over_tls) = machine_node("node-07", &identity).await;
     let (plaintext_addr, over_plaintext) = plaintext_node("node-07").await;
 
-    let nodes = control_plane(Vec::new(), &["first-key", "second-key"], None);
+    let nodes = control_plane(Vec::new(), None);
     register(
         &nodes,
         "node-07",
@@ -468,17 +459,27 @@ async fn without_an_identity_of_its_own_the_control_plane_dials_the_old_way() {
     )
     .await;
 
-    let health = nodes.check_node("node-07").await.expect("the node answers");
-    assert!(health.healthy);
+    let error = nodes
+        .check_node("node-07")
+        .await
+        .expect_err("a control plane with nothing to prove must not dial");
+    assert!(
+        error.to_string().contains("machine identity"),
+        "the refusal has to name what this control plane is missing, and said: {error}"
+    );
     assert_eq!(seen(&over_tls), Vec::new());
-    assert_eq!(seen(&over_plaintext), vec![Call::carrying("first-key")]);
+    assert_eq!(
+        seen(&over_plaintext),
+        Vec::new(),
+        "and must not reach for the plaintext address instead"
+    );
 }
 
 /// A node named in `deis_runtime_nodes` that has registered nothing has
-/// proved nothing, and is driven with the first key: the file is the
-/// operator's own word that this address is theirs.
+/// proved nothing, and is not driven: the file is the operator's word that an
+/// address exists, which is not a claim about who answers there.
 #[tokio::test]
-async fn a_configured_node_that_registered_nothing_gets_the_first_key() {
+async fn a_configured_node_that_registered_nothing_is_not_driven() {
     let fleet = Fleet::new();
     let (addr, calls) = plaintext_node("from-file").await;
 
@@ -487,16 +488,18 @@ async fn a_configured_node_that_registered_nothing_gets_the_first_key() {
             id: "from-file".to_string(),
             addr,
         }],
-        &["first-key", "second-key"],
         Some(Arc::clone(&fleet.control)),
     );
 
-    let health = nodes
+    let error = nodes
         .check_node("from-file")
         .await
-        .expect("the node answers");
-    assert!(health.healthy);
-    assert_eq!(seen(&calls), vec![Call::carrying("first-key")]);
+        .expect_err("nothing has proved which machine is at that address");
+    assert!(
+        error.to_string().contains("never registered"),
+        "the refusal has to say why, and said: {error}"
+    );
+    assert_eq!(seen(&calls), Vec::new());
 
     let view = nodes
         .list()
@@ -504,9 +507,7 @@ async fn a_configured_node_that_registered_nothing_gets_the_first_key() {
         .find(|view| view.id == "from-file")
         .expect("the node is on the fleet list");
     assert_eq!(
-        view.key_status,
-        NodeKeyStatus::FromFile,
-        "a node that has proved nothing must be reported as one, not as a node that proved a key"
+        view.identity, None,
+        "a node that has proved nothing must be reported as one"
     );
-    assert_eq!(view.identity, None);
 }

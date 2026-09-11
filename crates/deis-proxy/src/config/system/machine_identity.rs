@@ -1,34 +1,29 @@
 //! Machine-channel identity: the certificate this proxy holds and the name
-//! it expects the control plane to prove back, for the mutual TLS migration
-//! that is replacing `node_preshared_keys` fleet-wide.
+//! it expects the control plane to prove back.
 //!
-//! # What this is, today
+//! # What this is
 //!
-//! Absent unless an operator writes a `[machine_identity]` table. With it
-//! present, two things move onto the control plane's machine channel, both
-//! proving this certificate and both requiring the control plane to prove its
-//! own name back. The catalog's routing table is fetched as a
-//! `FetchRoutingTable` call instead of over HTTP with the fleet secret in the
-//! `Authorization` header (see [`crate::catalog::client`]); and the long-lived
-//! gRPC control channel - registration, heartbeats, commands, configuration
-//! pushes - is opened over a mutual-TLS connection to the same listener
-//! instead of a plaintext dial of `[control] addr` (see
+//! Everything this proxy says to a control plane goes over the machine
+//! channel under this certificate, and the control plane proves its own name
+//! back on the same connection. Two things ride on it: the catalog's routing
+//! table, fetched as a `FetchRoutingTable` call (see
+//! [`crate::catalog::client`]), and the long-lived gRPC control channel -
+//! registration, heartbeats, commands, configuration pushes (see
 //! [`crate::control::client`]).
 //!
-//! With it, `[control] secret` can go. The control plane now admits the
-//! control channel by the name the connection proved rather than by comparing
-//! a shared value, so a proxy carrying this table has nothing left to put in
-//! that field and its configuration file need not name one at all. A secret
-//! that is still written is still sent, because a fleet is updated one process
-//! at a time and a control plane that has not been updated yet is still
-//! comparing it - but it is no longer what gets this proxy in, and the last
-//! copy of it can be deleted once every process in the installation carries a
-//! table like this one.
+//! Both used to have another way. The routing table was an HTTP GET on the
+//! control plane's human listener with a fleet-wide value in the
+//! `Authorization` header, and the control channel was a plaintext dial of
+//! `[control] addr` presenting the same value. `[control] secret` is gone with
+//! it: the control plane admits a channel by the name the connection proved,
+//! and there is nothing a caller can bring instead.
 //!
-//! With the table absent, nothing changes at all: the routing table is
-//! fetched over HTTP and the control channel is dialled in plaintext, exactly
-//! as they were. See `crates/deis-identity` for the certificate format and
-//! what carrying this identity lets a peer refuse.
+//! Absent, this table means standalone: no control plane is reached at all,
+//! and this proxy serves whatever its own file routes. A configuration that
+//! names `[control]` without this table is refused at startup rather than
+//! started into a state where nothing could ever attach. See
+//! `crates/deis-identity` for the certificate format and what carrying this
+//! identity lets a peer refuse.
 //!
 //! # Naming the control plane
 //!
@@ -287,8 +282,8 @@ impl Validatable for MachineIdentityConfig {
         // identity is material for proving who this proxy is to one named
         // machine; without an address it has no machine to prove it to, and
         // the process would start, load the certificate, log that it did, and
-        // go on fetching the routing table with the fleet secret it was
-        // configured to stop using.
+        // then fetch no routing table at all - serving whatever its own file
+        // routes while looking like a proxy that had attached.
         if let Err(reason) = check_control_endpoint(&self.control_endpoint) {
             return refuse(reason);
         }
@@ -453,8 +448,9 @@ control_endpoint = "https://control.internal:8443"
     #[test]
     fn an_identity_with_nowhere_to_dial_is_refused_by_name() {
         // The failure this catches is silent otherwise: the certificate
-        // loads, the log says so, and the routing table goes on being
-        // fetched with the fleet secret this table exists to stop using.
+        // loads, the log says so, and no routing table is ever fetched,
+        // because there is no address to fetch it from and no second way to
+        // reach a control plane left to fall back to.
         let config = MachineIdentityConfig {
             control_endpoint: String::new(),
             ..filled()

@@ -81,41 +81,6 @@ async fn main() -> Result<(), anyhow::Error> {
         config.port = port;
     }
 
-    // Before anything is served: this control plane must have a credential
-    // that tells a node from any other caller. Without one, registering a
-    // node - and thereby becoming a delivery target that is handed every
-    // environment's decrypted secrets - would be open to whoever can reach
-    // the port. A missing key is filled in here rather than left empty, and
-    // the value is printed once because it exists nowhere else.
-    match config.ensure_node_credential() {
-        deis_control::config::NodeCredentialSource::Generated(key) => warn!(
-            "No node_preshared_keys in the configuration, so one was generated for this run:\n\
-             \n    node_preshared_keys = [\"{key}\"]\n\
-             \nPut that line in the control plane's configuration file and the same value in \
-             every node's [control] secret. Until then it changes on every restart, and a node \
-             holding the old value gets 401 and keeps serving whatever it already had. The way \
-             out of shared values altogether is a [machine] channel, after which this file needs \
-             no node_preshared_keys line at all."
-        ),
-        deis_control::config::NodeCredentialSource::NotNeeded => info!(
-            "No node_preshared_keys, and none is needed: every machine that reaches this control \
-             plane's machine channel is admitted by a certificate naming one machine, so there is \
-             no fleet-wide value left for a leak to hand over"
-        ),
-        deis_control::config::NodeCredentialSource::Configured { keys } => {
-            if config.machine.is_some() {
-                warn!(
-                    node_keys = keys,
-                    "This control plane serves a machine channel and still has node_preshared_keys \
-                     configured. Both regimes are live: a peer that proves a certificate is \
-                     admitted by its name, and a peer that proves nothing is still admitted by \
-                     holding the shared value, so the fleet is only as strong as that value. Once \
-                     every node and proxy carries a [machine_identity] table, remove the line"
-                );
-            }
-        }
-    }
-
     let bind_addr = config.bind_addr.clone();
     let port = config.port;
 
@@ -220,15 +185,10 @@ async fn main() -> Result<(), anyhow::Error> {
             api_config.deis_runtime_poll_interval,
             api_config.node_registration_ttl_secs,
         )
-        // A node's management plane can unload an application, list every
-        // tenant on the node and replace one tenant's code, so it is served
-        // only to a caller that presents a node key. The same list the node
-        // endpoints authenticate against, so a node is driven with the very
-        // value it proved when it registered.
-        .with_node_keys(&api_config.node_preshared_keys)
-        // And the identity this control plane proves when it dials a node that
-        // registered by proving one of its own. Without it every call goes out
-        // over the plaintext management plane with that same node key.
+        // The identity this control plane proves when it dials a node. There
+        // is no other way it dials one: a node that has not registered a
+        // certificate and a management address of its own is not driven at
+        // all, and says so rather than being quietly skipped.
         .with_machine_identity(machine_identity.clone()),
     );
     let runtime_poll_task =
@@ -337,8 +297,8 @@ async fn main() -> Result<(), anyhow::Error> {
     deis_control::api::log_api_ready(
         port,
         api.tls_enabled,
-        &api.auth_config,
-        &api.node_auth,
+        api_config.api_auth_enabled,
+        api_config.api_keys.len(),
         &api.cors_origins,
         true,
         api_config.machine.is_some(),

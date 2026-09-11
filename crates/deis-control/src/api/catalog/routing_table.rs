@@ -336,37 +336,25 @@ fn digest(routes: &[RoutingEntry], environments: &[EnvironmentRef]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::catalog::tests::{TEST_NODE_KEY, harness};
+    use crate::api::catalog::tests::harness;
 
-    use axum::body::{Body, to_bytes};
+    use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    async fn get_table(router: &axum::Router, key: Option<&str>) -> (StatusCode, RoutingTable) {
-        let mut request = Request::builder().uri(ROUTING_TABLE_ROUTE);
-        if let Some(key) = key {
-            request = request.header("X-API-Key", key);
-        }
-        let response = router
-            .clone()
-            .oneshot(request.body(Body::empty()).unwrap())
+    /// The table, asked for the way the product asks for it.
+    ///
+    /// Not over HTTP: `GET /api/routing-table` is not mounted anywhere any
+    /// more. The machine channel's `FetchRoutingTable` calls
+    /// `routing_table_for`, and so does this, so these tests exercise the
+    /// function the fleet actually runs rather than a route mounted only for
+    /// them.
+    async fn table_of(state: &CatalogState, proxy_id: Option<&str>) -> RoutingTable {
+        routing_table_for(state, proxy_id, None)
             .await
-            .unwrap();
-        let status = response.status();
-        if status != StatusCode::OK {
-            return (
-                status,
-                RoutingTable {
-                    version: String::new(),
-                    generated_at: 0,
-                    routes: Vec::new(),
-                    environments: Vec::new(),
-                },
-            );
-        }
-        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        (status, serde_json::from_slice(&body).unwrap())
+            .expect("the routing table is built")
     }
+
 
     async fn create_app(router: &axum::Router, id: &str) {
         let response = router
@@ -451,8 +439,7 @@ mod tests {
         )
         .await;
 
-        let (status, table) = get_table(&harness.router, Some(TEST_NODE_KEY)).await;
-        assert_eq!(status, StatusCode::OK);
+        let table = table_of(&harness.state, None).await;
         assert_eq!(
             table.routes,
             vec![RoutingEntry {
@@ -492,8 +479,8 @@ mod tests {
 
         grant_everything(&harness.router, "shop").await;
 
-        let (_, first) = get_table(&harness.router, Some(TEST_NODE_KEY)).await;
-        let (_, again) = get_table(&harness.router, Some(TEST_NODE_KEY)).await;
+        let first = table_of(&harness.state, None).await;
+        let again = table_of(&harness.state, None).await;
         assert_eq!(
             first.version, again.version,
             "an unchanged catalog must produce the same version, or every poll would look like a change"
@@ -506,7 +493,7 @@ mod tests {
             r#"{"path_prefix":"/"}"#,
         )
         .await;
-        let (_, after) = get_table(&harness.router, Some(TEST_NODE_KEY)).await;
+        let after = table_of(&harness.state, None).await;
         assert_ne!(first.version, after.version);
     }
 
@@ -537,20 +524,11 @@ mod tests {
         )
         .await;
 
-        let response = harness
-            .router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(ROUTING_TABLE_ROUTE)
-                    .header("X-API-Key", TEST_NODE_KEY)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Serialised, not fetched: the field names are the contract, and the
+        // machine channel puts exactly this JSON in `routing_table_json`, so
+        // this is the same bytes a proxy parses.
+        let table = table_of(&harness.state, None).await;
+        let value = serde_json::to_value(&table).expect("the table serialises");
 
         let mut top: Vec<&str> = value
             .as_object()
@@ -574,12 +552,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_table_needs_a_node_credential() {
-        let harness = harness(true).await;
-        let (status, _) = get_table(&harness.router, None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, _) = get_table(&harness.router, Some("not-the-node-key")).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
 }

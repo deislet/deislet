@@ -38,9 +38,6 @@ use axum::{
     routing::{delete, get, post, put},
 };
 
-use crate::api::middleware::NodeAuthConfig;
-#[cfg(test)]
-use crate::api::middleware::node_auth;
 use crate::catalog::{
     ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore,
     ProviderDriverDispatcher, SecretsBackend,
@@ -82,14 +79,6 @@ pub struct CatalogState {
     /// never two built from the same configuration: a token minted here that
     /// did not match the one a deployment carries would authorise nothing.
     pub storage: StorageWiring,
-    /// The credential the node endpoints demand.
-    ///
-    /// Handlers read it to learn whether this control plane can tell a node
-    /// from anyone else at all: [`node_router`] layers the check, so when a
-    /// key is configured every request that reaches a handler is from a
-    /// caller that presented one, and when none is configured every caller
-    /// is anonymous and no secret value may be served.
-    pub node_auth: NodeAuthConfig,
     /// Live proxy identities are frozen into deployment plans and checked
     /// again when a proxy reports that a routing table is applied.
     pub sessions: Arc<SessionManager>,
@@ -365,39 +354,6 @@ pub(super) fn actor_subject(principal: &crate::identity::Principal) -> String {
     }
 }
 
-/// Build the node half: the assignment list, the bundle download and the
-/// routing table.
-///
-/// The authentication layer is applied here rather than by the caller, so
-/// there is no way to mount these routes without it. A dashboard API key is
-/// not accepted on any of them, for two different reasons:
-///
-/// * the assignment list returns secret values that the dashboard is
-///   deliberately unable to read back (docs/architecture.zh.md section 8);
-/// * the routing table is what deis-proxy runs on, and `api_auth_enabled`
-///   defaults to off - mounting it on the human router would publish a map
-///   of every application and hostname on the platform to anyone who can
-///   reach the port. deis-proxy already holds a `node_preshared_keys` value
-///   for its gRPC control channel, so this costs it no second credential.
-#[cfg(test)]
-pub(crate) fn node_router(state: CatalogState) -> Router {
-    let auth = state.node_auth.clone();
-    Router::new()
-        // The path parameter is named `:id` to match the node routes it
-        // shares a prefix with; the router rejects two names in the same
-        // position.
-        .route(
-            deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE,
-            get(assignments::for_node),
-        )
-        .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
-        .route(
-            routing_table::ROUTING_TABLE_ROUTE,
-            get(routing_table::routing_table),
-        )
-        .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(auth, node_auth))
-}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -406,13 +362,23 @@ pub(crate) mod tests {
     use crate::catalog::{SecretCipher, secrets::MASTER_KEY_LEN};
     use crate::database::Database;
     use crate::delivery::PublicAddress;
+    use crate::machine::identity_acceptor;
+    use crate::runtime_client::NodeClaim;
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use axum_server::tls_rustls::RustlsConfig;
+    use deis_identity::{MachineIdentity, Protocol, names};
+    use deis_identity_test_pki::{TestCa, write_files};
     use serde_json::Value;
     use sha2::{Digest, Sha256};
     use std::io::Write;
     use tower::ServiceExt;
+
+    /// The trust domain the stand-in fleet below is signed for. Any value
+    /// works, since nothing outside this test module reads it; kept the same
+    /// spelling as `fleet_credential.rs` so the two read as one convention.
+    const TRUST_DOMAIN: &str = "deis.internal";
 
     pub(crate) struct Harness {
         pub router: Router,
@@ -420,6 +386,12 @@ pub(crate) mod tests {
         pub sessions: Arc<SessionManager>,
         pub queue_endpoint: Option<String>,
         pub _bundle_dir: tempfile::TempDir,
+        /// Holds the PEM files the test fleet's certificates were written
+        /// to. Kept alive for the harness's lifetime because a
+        /// `MachineIdentity` re-reads its files on a renewal; nothing here
+        /// triggers one, but a directory that vanished under a live identity
+        /// would be a trap for the next thing built on this harness.
+        pub _pki_dir: tempfile::TempDir,
         pub _runtime_shutdown: tokio::sync::oneshot::Sender<()>,
         pub _queue_dir: Option<tempfile::TempDir>,
         pub _queue_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -528,19 +500,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// The node key every harness below is built with. There is no
-    /// credential-less variant on purpose: a control plane without a node
-    /// key serves none of these routes at all.
-    pub(crate) const TEST_NODE_KEY: &str = "node-psk";
-
-    /// A router with the ordinary shape: one node key, so the node
-    /// endpoints answer a caller that presents it and nobody else.
+    /// A router with the ordinary shape.
     pub(crate) async fn harness(secrets_ready: bool) -> Harness {
-        harness_with(secrets_ready, vec![TEST_NODE_KEY.to_string()]).await
+        harness_with(secrets_ready).await
     }
 
-    pub(crate) async fn harness_with(secrets_ready: bool, node_keys: Vec<String>) -> Harness {
-        harness_with_storage(secrets_ready, node_keys, storage_wiring(None)).await
+    pub(crate) async fn harness_with(secrets_ready: bool) -> Harness {
+        harness_with_storage(secrets_ready, storage_wiring(None)).await
     }
 
     pub(crate) async fn harness_with_queue(secrets_ready: bool) -> Harness {
@@ -574,7 +540,7 @@ pub(crate) mod tests {
             ..Default::default()
         });
         let mut harness =
-            harness_with_storage(secrets_ready, vec![TEST_NODE_KEY.to_string()], storage).await;
+            harness_with_storage(secrets_ready, storage).await;
         harness.queue_endpoint = Some(endpoint);
         harness._queue_dir = Some(queue_dir);
         harness._queue_shutdown = Some(shutdown);
@@ -599,10 +565,9 @@ pub(crate) mod tests {
 
     pub(crate) async fn harness_with_storage(
         secrets_ready: bool,
-        node_keys: Vec<String>,
         storage: crate::delivery::StorageWiring,
     ) -> Harness {
-        harness_with_storage_and_failed_runtime(secrets_ready, node_keys, storage, false).await
+        harness_with_storage_and_failed_runtime(secrets_ready, storage, false).await
     }
 
     /// A strict-deployment fixture with one healthy runtime and one endpoint
@@ -611,7 +576,6 @@ pub(crate) mod tests {
     pub(crate) async fn harness_with_failed_runtime(secrets_ready: bool) -> Harness {
         harness_with_storage_and_failed_runtime(
             secrets_ready,
-            vec![TEST_NODE_KEY.to_string()],
             storage_wiring(None),
             true,
         )
@@ -620,7 +584,6 @@ pub(crate) mod tests {
 
     async fn harness_with_storage_and_failed_runtime(
         secrets_ready: bool,
-        node_keys: Vec<String>,
         storage: crate::delivery::StorageWiring,
         include_failed_runtime: bool,
     ) -> Harness {
@@ -642,43 +605,126 @@ pub(crate) mod tests {
         let address = Arc::new(PublicAddress {
             configured: Some("http://control.test".to_string()),
             fallback: "http://127.0.0.1:8080".to_string(),
-            // No machine listener in these tests, which is also the shape
-            // every installation has today: the machine base resolves to the
-            // human one, so the bundle URLs asserted below do not move.
+            // `PublicAddress::machine` is the base a node downloads bundles
+            // from once this control plane's own `[machine]` listener is
+            // configured; it has nothing to do with the mutual-TLS channel
+            // `RuntimeNodeManager` dials nodes on, which is wired up below
+            // with its own test certificate authority. Left `None` here so
+            // the bundle URLs asserted below stay pinned to the human
+            // address instead of moving to one this test never binds.
             machine: None,
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        // The fleet's own certificate authority. It signs both halves of the
+        // handshake below: this control plane's identity, which is what
+        // `RuntimeNodeManager::channel` now requires before it will dial
+        // anything, and the stand-in node's identity, which is what proves
+        // to a connecting client which machine answered.
+        let ca = TestCa::new();
+        let pki_dir = tempfile::tempdir().unwrap();
+        let control_name = names::control(TRUST_DOMAIN).expect("a control name");
+        let control_identity = Arc::new(
+            MachineIdentity::load(
+                write_files(
+                    pki_dir.path(),
+                    "control",
+                    &ca.issue(&control_name),
+                    &ca.root_pem,
+                )
+                .as_identity_files(),
+                // This identity only ever dials out to a node; it serves no
+                // listener of its own in these tests.
+                &[],
+            )
+            .expect("the control plane's test identity"),
+        );
+        let node_name = names::node(TRUST_DOMAIN, "runtime-test").expect("a node name");
+        let node_identity = MachineIdentity::load(
+            write_files(
+                pki_dir.path(),
+                "runtime-test",
+                &ca.issue(&node_name),
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+            &[Protocol::Http2],
+        )
+        .expect("the stand-in node's test identity");
+
+        // `PreparedRuntime` stands in for a node's management plane, served
+        // over mutual TLS exactly as a real node serves it: a listener built
+        // from the node's own certificate, requiring every caller to
+        // complete a handshake before a request is read. The acceptor does
+        // not itself check which name the caller proved - that a node's real
+        // listener refuses anyone but its configured control plane is
+        // covered in `deis-runtime`'s own tests - so what is under test here
+        // is the shape `RuntimeNodeManager` needs to reach it at all: a
+        // certificate this fleet signed on both ends, and nothing shared
+        // between them.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let runtime_addr = listener.local_addr().unwrap();
+        let runtime_app = tonic::service::Routes::default()
+            .add_service(
+                crate::runtime_client::proto::runtime_management_server::RuntimeManagementServer::new(
+                    PreparedRuntime,
+                ),
+            )
+            .into_axum_router();
+        let runtime_acceptor =
+            identity_acceptor(RustlsConfig::from_config(node_identity.server_config()));
+        let runtime_handle = axum_server::Handle::new();
         let (runtime_shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(
-                    crate::runtime_client::proto::runtime_management_server::RuntimeManagementServer::new(
-                        PreparedRuntime,
-                    ),
-                )
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    async move {
-                        let _ = shutdown_rx.await;
-                    },
-                )
-                .await
-                .unwrap();
+        tokio::spawn({
+            let handle = runtime_handle.clone();
+            async move {
+                let _ = shutdown_rx.await;
+                handle.shutdown();
+            }
         });
-        let mut node_configs = vec![crate::config::RuntimeNodeConfig {
-            id: "runtime-test".to_string(),
-            addr: format!("http://{runtime_addr}"),
-        }];
+        tokio::spawn(async move {
+            let _ = axum_server::from_tcp(listener)
+                .acceptor(runtime_acceptor)
+                .handle(runtime_handle)
+                .serve(runtime_app.into_make_service())
+                .await;
+        });
+
+        let mut node_configs = Vec::new();
         if include_failed_runtime {
             node_configs.push(crate::config::RuntimeNodeConfig {
                 id: "runtime-failed".to_string(),
-                // Port zero cannot be a remote listener, so this is a
-                // deterministic transport refusal rather than a timing race.
+                // Configured but never registered: nothing has proved which
+                // machine holds this id or where it serves an authenticated
+                // management plane, so `RuntimeNodeManager::channel` refuses
+                // it before a socket is ever opened. That refusal is
+                // immediate and independent of the network, which is what
+                // keeps it deterministic rather than a race against a
+                // connect timeout.
                 addr: "http://127.0.0.1:0".to_string(),
             });
         }
-        let runtime_nodes = Arc::new(RuntimeNodeManager::new(node_configs, 15));
+        let runtime_nodes = Arc::new(
+            RuntimeNodeManager::new(node_configs, 15)
+                .with_machine_identity(Some(Arc::clone(&control_identity))),
+        );
+        // The one node these tests can actually drive: it proved
+        // `node_name` over the handshake above and says that is where its
+        // authenticated management plane lives, which is exactly what
+        // `RuntimeNodeManager::channel` requires before it will dial it.
+        runtime_nodes
+            .register_claim(
+                "runtime-test",
+                NodeClaim {
+                    addr: format!("https://{runtime_addr}"),
+                    machine_addr: Some(format!("https://{runtime_addr}")),
+                    version: None,
+                    identity: node_name,
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("the stand-in runtime node registers");
         let runtime_nodes_for_state = Arc::clone(&runtime_nodes);
         let sessions = Arc::new(SessionManager::new());
         let state = CatalogState {
@@ -696,7 +742,6 @@ pub(crate) mod tests {
                 address,
                 storage,
             )),
-            node_auth: NodeAuthConfig::new(node_keys),
             sessions: Arc::clone(&sessions),
             nodes: Arc::clone(&runtime_nodes_for_state),
             // Long enough that no test reaches it by accident; a test about
@@ -706,11 +751,8 @@ pub(crate) mod tests {
             ),
         };
         Harness {
-            // Both halves, mounted the way the API mounts them: the node
-            // half brings its own authentication layer, so a test that
-            // calls it is exercising the real check.
-            //
-            // The human half is normally mounted behind
+            // The human half, which since the node routes left this listener
+            // is the whole of it. It is normally mounted behind
             // `crate::api::authz::authorize`, which resolves the caller and
             // leaves a `Principal` in the request. These tests are about the
             // catalog rather than about who may reach it, so the gate is not
@@ -723,10 +765,10 @@ pub(crate) mod tests {
             // same routers under another prefix, covered in `api::tests`.
             router: router("/api", state.clone())
                 .merge(platform_router("/api", state.clone()))
-                .layer(axum::middleware::from_fn(supply_test_principal))
-                .merge(node_router(state.clone())),
+                .layer(axum::middleware::from_fn(supply_test_principal)),
             state: state.clone(),
             _bundle_dir: bundle_dir,
+            _pki_dir: pki_dir,
             _runtime_shutdown: runtime_shutdown,
             _queue_dir: None,
             _queue_shutdown: None,
@@ -786,79 +828,30 @@ pub(crate) mod tests {
         call(router, method, uri, body, "application/json").await
     }
 
-    /// GET as a node, keeping the response headers.
+    /// One node's assignment list, asked for the way the product asks for it.
     ///
-    /// The assignment list says whether it is the whole truth in a header,
-    /// and that bit is what decides whether a node may unload anything, so
-    /// it has to be asserted on rather than dropped with the rest.
-    async fn get_as_node_full(
-        router: &Router,
-        uri: &str,
-        credential: Option<&str>,
-    ) -> (StatusCode, axum::http::HeaderMap, Value) {
-        let mut builder = Request::builder().method("GET").uri(uri);
-        if let Some(credential) = credential {
-            builder = builder.header("Authorization", format!("Bearer {credential}"));
-        }
-        let response = router
-            .clone()
-            .oneshot(builder.body(Body::empty()).unwrap())
+    /// Not over HTTP: there is no HTTP route for this any more. The machine
+    /// channel's `FetchAssignments` calls `assignments::assignments_for`, and
+    /// so does this, so what these tests exercise is the function the fleet
+    /// actually runs rather than a route mounted only for them.
+    /// The whole answer, including whether it claims to be the complete
+    /// expected set. On the machine channel that claim travels as fields on
+    /// the response; it used to be a pair of HTTP headers, which is why tests
+    /// written then read headers.
+    pub(crate) async fn assignment_answer(
+        state: &CatalogState,
+        node_id: &str,
+    ) -> super::assignments::AssignmentAnswer {
+        super::assignments::assignments_for(state, node_id, "http://control.test")
             .await
-            .unwrap();
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = to_bytes(response.into_body(), MAX_BUNDLE_BYTES)
-            .await
-            .unwrap();
-        (
-            status,
-            headers,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+            .expect("the assignment list is built")
     }
 
-    /// What the assignment list said about its own completeness: the flag,
-    /// and how many rows it could not describe.
-    fn completeness(headers: &axum::http::HeaderMap) -> (bool, usize) {
-        let complete = headers
-            .get(assignments::ASSIGNMENTS_COMPLETE_HEADER)
-            .expect("the list must always say whether it is complete")
-            .to_str()
-            .unwrap()
-            == "true";
-        let withheld = headers
-            .get(assignments::ASSIGNMENTS_WITHHELD_HEADER)
-            .expect("the list must always say how much it left out")
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        (complete, withheld)
-    }
-
-    /// GET with an optional node credential, in the header a node sends.
-    async fn get_as_node(
-        router: &Router,
-        uri: &str,
-        credential: Option<&str>,
-    ) -> (StatusCode, Value) {
-        let mut builder = Request::builder().method("GET").uri(uri);
-        if let Some(credential) = credential {
-            builder = builder.header("Authorization", format!("Bearer {credential}"));
-        }
-        let response = router
-            .clone()
-            .oneshot(builder.body(Body::empty()).unwrap())
+    pub(crate) async fn assignments_of(state: &CatalogState, node_id: &str) -> Value {
+        let answer = super::assignments::assignments_for(state, node_id, "http://control.test")
             .await
-            .unwrap();
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), MAX_BUNDLE_BYTES)
-            .await
-            .unwrap();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+            .expect("the assignment list is built");
+        serde_json::to_value(&answer.views).expect("the views serialise")
     }
 
     /// Deploy one version of `app` and store `secret` in its production
@@ -903,67 +896,26 @@ pub(crate) mod tests {
     }
 
     /// The assignment list is the one read API that answers with decrypted
-    /// secrets, so it authenticates the caller as a node - and does it
-    /// whatever `api_auth_enabled` says, which is a dashboard setting this
-    /// router does not even see.
+    /// secret values, which is the whole reason it is served nowhere a person
+    /// can reach.
+    ///
+    /// What this asserts is the positive half: the value really is in the
+    /// list, because a node that received the list without it would load the
+    /// application and run it misconfigured. The other half - who may ask for
+    /// it - is not assertable here any more and is not asserted twice: a
+    /// caller reaches this list only by completing a mutual-TLS handshake on
+    /// the machine listener and then proving the node id it asks about, which
+    /// `crate::machine::service` tests directly and `scripts/demo.sh` proves
+    /// against a running fleet with a real certificate issued for another
+    /// machine.
     #[tokio::test]
-    async fn the_assignment_list_serves_secrets_only_to_an_authenticated_node() {
-        let h = harness_with(true, vec!["node-psk".to_string()]).await;
+    async fn the_assignment_list_carries_the_environments_decrypted_secret() {
+        let h = harness(true).await;
         let router = &h.router;
         deployed_app(router, "demo", Some(("API_KEY", "super-secret"))).await;
 
-        let (status, body) = get_as_node(router, "/api/nodes/node-a/assignments", None).await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "an anonymous caller must not receive the fleet's secrets"
-        );
-        assert!(!body.to_string().contains("super-secret"));
-
-        let (status, body) =
-            get_as_node(router, "/api/nodes/node-a/assignments", Some("wrong-key")).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(!body.to_string().contains("super-secret"));
-
-        // The node's own credential works, and the value it needs is there.
-        let (status, body) =
-            get_as_node(router, "/api/nodes/node-a/assignments", Some("node-psk")).await;
-        assert_eq!(status, StatusCode::OK);
+        let body = assignments_of(&h.state, "node-a").await;
         assert_eq!(body[0]["env"]["API_KEY"], "super-secret");
-
-        // The bundle download is the other half of the same channel.
-        let (status, _) = get_as_node(
-            router,
-            &format!(
-                "/api/apps/demo/versions/{}/bundle",
-                body[0]["version_id"].as_str().unwrap()
-            ),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    /// With no node credential nobody can prove they are a node, so the
-    /// channel is shut rather than served anonymously. There is no
-    /// half-answer to build: the list carries decrypted secrets, and the
-    /// bundle download beside it is the code those secrets belong to.
-    #[tokio::test]
-    async fn a_control_plane_without_a_node_key_serves_no_node_endpoint() {
-        let h = harness_with(true, Vec::new()).await;
-        let router = &h.router;
-        deployed_app(router, "with-secret", Some(("API_KEY", "super-secret"))).await;
-
-        for credential in [None, Some("guess")] {
-            let (status, body) =
-                get_as_node(router, "/api/nodes/node-a/assignments", credential).await;
-            assert_eq!(
-                status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "an unconfigured node channel must be shut, not open"
-            );
-            assert!(!body.to_string().contains("super-secret"), "got {body}");
-        }
     }
 
     /// The other half of deletion. Push cannot reach a node that is down, so
@@ -972,18 +924,15 @@ pub(crate) mod tests {
     /// says it is complete, which is what a node keys its removals off.
     #[tokio::test]
     async fn the_assignment_list_is_authoritative_so_a_deleted_app_leaves_the_node() {
-        let h = harness_with(true, vec!["node-psk".to_string()]).await;
+        let h = harness(true).await;
         let router = &h.router;
         deployed_app(router, "demo", Some(("API_KEY", "super-secret"))).await;
         deployed_app(router, "other", None).await;
 
-        let (status, headers, body) =
-            get_as_node_full(router, "/api/nodes/node-a/assignments", Some("node-psk")).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_array().unwrap().len(), 2);
-        assert_eq!(
-            completeness(&headers),
-            (true, 0),
+        let answer = assignment_answer(&h.state, "node-a").await;
+        assert_eq!(answer.views.len(), 2);
+        assert!(
+            answer.complete && answer.withheld == 0,
             "every assignment could be described, so this answer is the whole expected set"
         );
 
@@ -993,24 +942,21 @@ pub(crate) mod tests {
         // The deleted application is simply absent, and the answer still
         // claims to be complete - which is what turns that absence into
         // "stop serving it" on a node that missed the unload push.
-        let (_, headers, body) =
-            get_as_node_full(router, "/api/nodes/node-a/assignments", Some("node-psk")).await;
-        let apps: Vec<&str> = body
-            .as_array()
-            .unwrap()
+        let answer = assignment_answer(&h.state, "node-a").await;
+        let apps: Vec<&str> = answer
+            .views
             .iter()
-            .map(|a| a["app_id"].as_str().unwrap())
+            .map(|view| view.app_id.as_str())
             .collect();
         assert_eq!(apps, ["other"]);
-        assert_eq!(completeness(&headers), (true, 0));
+        assert!(answer.complete && answer.withheld == 0);
 
         // An empty list is an instruction too, not a "nothing to say".
         let (status, _) = json(router, "DELETE", "/api/apps/other", Value::Null).await;
         assert_eq!(status, StatusCode::OK);
-        let (_, headers, body) =
-            get_as_node_full(router, "/api/nodes/node-a/assignments", Some("node-psk")).await;
-        assert_eq!(body.as_array().unwrap().len(), 0);
-        assert_eq!(completeness(&headers), (true, 0));
+        let answer = assignment_answer(&h.state, "node-a").await;
+        assert!(answer.views.is_empty());
+        assert!(answer.complete && answer.withheld == 0);
     }
 
     /// The whole loop the acceptance criteria describe: create an app,
@@ -1110,9 +1056,7 @@ pub(crate) mod tests {
         canonical_id(&environment_body);
 
         // Nothing is deployed yet, so no assignment exists.
-        let (status, body) =
-            get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
-        assert_eq!(status, StatusCode::OK);
+        let body = assignments_of(&h.state, "node-a").await;
         assert_eq!(body.as_array().unwrap().len(), 0);
 
         let (status, body) = json(
@@ -1146,9 +1090,7 @@ pub(crate) mod tests {
         assert_eq!(body["version"]["number"], 2);
 
         // The assignment list points at v2 with a downloadable bundle URL.
-        let (status, body) =
-            get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
-        assert_eq!(status, StatusCode::OK);
+        let body = assignments_of(&h.state, "node-a").await;
         let assignments = body.as_array().unwrap();
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0]["app_id"], "demo");
@@ -1192,9 +1134,7 @@ pub(crate) mod tests {
             "rollback must append, never rewrite"
         );
 
-        let (status, body) =
-            get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
-        assert_eq!(status, StatusCode::OK);
+        let body = assignments_of(&h.state, "node-a").await;
         assert_eq!(body[0]["version_id"], v1);
     }
 
@@ -1784,13 +1724,22 @@ pub(crate) mod tests {
         .await;
         let version_id = body["version"]["id"].as_str().unwrap().to_string();
 
+        // The bundle route is no longer part of the human router: a node
+        // downloads it from the machine listener instead, over the same
+        // mutual-TLS connection `RuntimeNodeManager` now requires for
+        // everything else. Mounted here exactly as `crate::machine::listen`
+        // mounts it, so what is under test is the handler's own behaviour -
+        // the handshake that gates it in production is covered where that
+        // handshake is built, not here.
+        let bundle_router = Router::new()
+            .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
+            .with_state(h.state.clone());
         let request = Request::builder()
             .method("GET")
             .uri(format!("/api/apps/demo/versions/{version_id}/bundle"))
-            .header("Authorization", format!("Bearer {TEST_NODE_KEY}"))
             .body(Body::empty())
             .unwrap();
-        let response = router.clone().oneshot(request).await.unwrap();
+        let response = bundle_router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get("content-type").unwrap(),
@@ -2259,9 +2208,8 @@ pub(crate) mod tests {
         let (status, _) = json(router, "GET", "/api/apps/demo", Value::Null).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let (_, body) =
-            get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
-        assert_eq!(body.as_array().unwrap().len(), 0);
+        let assignments = assignments_of(&h.state, "node-a").await;
+        assert_eq!(assignments.as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

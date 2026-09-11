@@ -2,7 +2,7 @@ use crate::command::{CommandExecutor, CommandResponse};
 use crate::config::ControlConfig;
 use crate::database::{Database, Event, EventSeverity, HeartbeatEntry};
 use crate::message::{
-    AuthData, AuthResponse, HeartbeatAck, HeartbeatRequest, RegisterRequest, RegisterResponse,
+    HeartbeatAck, HeartbeatRequest, RegisterRequest, RegisterResponse,
 };
 use crate::session::{NodeEvent, NodeSession, NodeState, SessionManager};
 use chrono::Utc;
@@ -38,53 +38,6 @@ impl MessageHandler {
 
     pub fn config(&self) -> &ControlConfig {
         &self.config
-    }
-
-    pub async fn handle_auth(&self, data: AuthData) -> AuthResponse {
-        let associated_id = &data.associated_id;
-
-        // No key means this control plane cannot tell a node from anyone
-        // else, so it admits neither. The loop below refuses on its own; the
-        // branch is here only to say why in the log, because "invalid
-        // signature" would send an operator looking at the node.
-        if self.config.node_preshared_keys.is_empty() {
-            tracing::error!(
-                associated_id = %associated_id,
-                "Refused a node because node_preshared_keys is empty; this control plane has no node credential, so no node can attach until one is configured"
-            );
-            return AuthResponse {
-                authenticated: false,
-                message: "Authentication failed".to_string(),
-                error: Some(
-                    "This control plane has no node_preshared_keys configured, so it accepts no node"
-                        .to_string(),
-                ),
-            };
-        }
-
-        for psk in &self.config.node_preshared_keys {
-            if data.validate(psk) {
-                tracing::info!(
-                    associated_id = %associated_id,
-                    "Node authenticated successfully"
-                );
-                return AuthResponse {
-                    authenticated: true,
-                    message: format!("Auth OK for {}", associated_id),
-                    error: None,
-                };
-            }
-        }
-
-        tracing::warn!(
-            associated_id = %associated_id,
-            "Authentication failed"
-        );
-        AuthResponse {
-            authenticated: false,
-            message: "Authentication failed".to_string(),
-            error: Some("Invalid signature or expired timestamp".to_string()),
-        }
     }
 
     pub async fn handle_register(

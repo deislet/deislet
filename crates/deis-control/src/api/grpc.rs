@@ -224,27 +224,15 @@ async fn handle_payload(
     } = state;
     match payload {
         Payload::Authenticate(req) => {
-            // A caller that reached this service over the machine channel has
-            // already proved, during the handshake, that it holds the private
-            // key for a certificate this fleet signed. There is nothing a
-            // string in this message could add to that, and asking for one
-            // anyway would keep a shared secret load-bearing on a connection
-            // that does not need it. So the name is the answer, and whatever
-            // `secret` carries is ignored.
+            // The connection proved a name during its handshake, or it did
+            // not exist. There is nothing in this message that could add to
+            // that, and there is no longer any shared value to fall back to:
+            // `secret` is whatever the caller put there and is not read.
             //
-            // On the other listener there is no proved name, and the fleet key
-            // is all there is. An empty key list is not "no check required"
-            // there: it means this control plane cannot tell a node from
-            // anyone else, so it admits neither.
-            let valid = match proved {
-                Some(_) => true,
-                None => {
-                    let preshared_keys = &handler.config().node_preshared_keys;
-                    preshared_keys
-                        .iter()
-                        .any(|key| crate::api::middleware::secret_eq(key, &req.secret))
-                }
-            };
+            // The field itself stays on the wire because removing a proto
+            // field is a change both sides have to make in the same instant;
+            // what it is worth is nothing.
+            let valid = proved.is_some();
             *authenticated = valid;
             if valid {
                 // Kept, because this is the only place the node ever says who
@@ -254,35 +242,25 @@ async fn handle_payload(
                 *announced_id = Some(req.instance_id.clone());
             }
 
-            let no_keys_configured = handler.config().node_preshared_keys.is_empty();
             let message = if valid {
                 format!("Authenticated: {}", req.instance_id)
-            } else if no_keys_configured {
-                "This control plane has no node_preshared_keys configured, and this connection \
-                 proved no name either, so there is nothing to authenticate it by. Reach it on \
-                 the machine channel with a certificate this fleet signed"
-                    .to_string()
             } else {
-                "Invalid secret".to_string()
+                "This connection proved no name. Reach this control plane on its machine channel \
+                 with a certificate this fleet signed; there is no secret that opens this \
+                 instead"
+                    .to_string()
             };
 
-            match (valid, proved) {
-                (true, Some(name)) => info!(
+            match proved {
+                Some(name) => info!(
                     instance = %req.instance_id,
                     proved = %name,
-                    "A machine attached its control channel, admitted by the name it proved rather than by any secret it sent"
+                    "A machine attached its control channel, admitted by the name it proved"
                 ),
-                (true, None) => info!(
+                None => warn!(
                     instance = %req.instance_id,
-                    "A machine attached its control channel on the human listener, admitted by the fleet key"
-                ),
-                (false, _) if no_keys_configured => error!(
-                    instance = %req.instance_id,
-                    "Refused a control channel: it proved no name and this control plane has no node_preshared_keys, so it can tell nobody from anybody"
-                ),
-                (false, _) => warn!(
-                    instance = %req.instance_id,
-                    "Refused a control channel on the human listener: the secret it sent is not one of this control plane's node keys"
+                    "Refused a control channel that proved no name; this listener has no \
+                     credential that would have admitted it"
                 ),
             }
 
@@ -460,17 +438,13 @@ mod tests {
     /// A connection that proved a name is admitted on the strength of that
     /// name, and what it put in `secret` is not read.
     ///
-    /// This is the last place a shared secret decided anything on the machine
-    /// channel. Until it changed, a proxy that had proved a certificate still
-    /// had to send the fleet key or be refused - which meant the key could not
-    /// be taken out of its configuration, however well it had authenticated.
+    /// The name the connection proved is the whole of the decision, and the
+    /// `secret` field is not read - which is why a caller may send anything
+    /// there, including nothing.
     #[tokio::test]
-    async fn a_proved_name_is_admitted_without_a_secret() {
+    async fn a_proved_name_is_what_admits_a_channel() {
         let handler = MessageHandler::new(
-            Arc::new(crate::config::ControlConfig {
-                node_preshared_keys: vec!["the-fleet-key".to_string()],
-                ..Default::default()
-            }),
+            Arc::new(crate::config::ControlConfig::default()),
             Arc::new(SessionManager::new()),
         );
         let proxy = deis_identity::names::proxy("deis.internal", "edge-1").expect("a proxy name");
@@ -510,12 +484,9 @@ mod tests {
     /// And the other listener, where there is no name and the key is all there
     /// is: the same wrong secret is refused.
     #[tokio::test]
-    async fn without_a_proved_name_the_fleet_key_still_decides() {
+    async fn without_a_proved_name_nothing_is_admitted() {
         let handler = MessageHandler::new(
-            Arc::new(crate::config::ControlConfig {
-                node_preshared_keys: vec!["the-fleet-key".to_string()],
-                ..Default::default()
-            }),
+            Arc::new(crate::config::ControlConfig::default()),
             Arc::new(SessionManager::new()),
         );
         let (tx, mut rx) = mpsc::channel(4);
@@ -529,7 +500,10 @@ mod tests {
             None,
             Payload::Authenticate(deis_wire::pb::AuthenticateRequest {
                 instance_id: "edge-1".to_string(),
-                secret: "not-the-fleet-key".to_string(),
+                // Whatever a caller puts here. This one is the value this
+                // installation's fleet key used to be, sent deliberately: it
+                // opens nothing, because nothing reads it.
+                secret: "the-fleet-key".to_string(),
             }),
             &tx,
             &Arc::new(SessionManager::new()),
@@ -553,6 +527,33 @@ mod tests {
     use deis_wire::pb::control_service_client::ControlServiceClient;
     use deis_wire::pb::{AuthenticateRequest, control_message::Payload as ClientPayload};
 
+    /// Mark every request on this server as having arrived over a connection
+    /// that proved `name`.
+    ///
+    /// This is what `crate::machine::accept` does after a mutual-TLS
+    /// handshake, and it is the whole of what the service reads about a
+    /// caller. Injected here rather than run through a real handshake because
+    /// the tests below are about what the channel does once a machine is
+    /// admitted - names kept across a reconnect, a second channel refused, a
+    /// stop closing an open stream - and a TLS listener would test the
+    /// acceptor a third time instead.
+    // The `Result` is tonic's `Interceptor` signature, not a choice this
+    // makes: an interceptor may refuse a request, and this one never does.
+    // `Status` is large, which is what clippy is pointing at, and it is not
+    // ours to shrink.
+    #[allow(clippy::result_large_err)]
+    fn proving(
+        name: &str,
+    ) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, Status> + Clone {
+        let identity = deis_identity::names::node("deis.internal", name).expect("a node name");
+        move |mut request: tonic::Request<()>| {
+            request
+                .extensions_mut()
+                .insert(crate::machine::PeerIdentity(identity.clone()));
+            Ok(request)
+        }
+    }
+
     /// A node keeps its `EstablishChannel` stream open for its whole life, so
     /// nothing about the node ends it. Until the stop signal was wired into
     /// this service, a control plane with nodes attached therefore sat out its
@@ -565,10 +566,7 @@ mod tests {
     async fn a_stop_closes_an_open_node_channel_instead_of_waiting_it_out() {
         let shutdown = Shutdown::new();
         let service = GrpcControlService::new(
-            Arc::new(ControlConfig {
-                node_preshared_keys: vec!["node-psk".to_string()],
-                ..ControlConfig::default()
-            }),
+            Arc::new(ControlConfig::default()),
             Arc::new(SessionManager::new()),
         )
         .with_shutdown(shutdown.clone());
@@ -578,7 +576,12 @@ mod tests {
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(
-                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                    tonic::service::interceptor::InterceptedService::new(
+                        deis_wire::pb::control_service_server::ControlServiceServer::new(
+                            service,
+                        ),
+                        proving("node-a"),
+                    ),
                 )
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
@@ -632,11 +635,11 @@ mod tests {
         );
     }
 
-    /// The gRPC half of "unconfigured is not unguarded": with no node key
-    /// this control plane cannot tell a node from anyone else, so it admits
-    /// neither instead of admitting everyone.
+    /// The same refusal end to end, through a real server and a real client:
+    /// a connection that proved no name is admitted by nothing, and there is
+    /// no configuration under which it would be.
     #[tokio::test]
-    async fn a_control_plane_without_a_node_key_admits_no_node_channel() {
+    async fn a_plaintext_channel_is_admitted_by_nothing() {
         let service = GrpcControlService::new(
             Arc::new(ControlConfig::default()),
             Arc::new(SessionManager::new()),
@@ -693,10 +696,7 @@ mod tests {
         let sessions = Arc::new(SessionManager::new());
         let database = Arc::new(Database::init(":memory:").await.unwrap());
         let service = GrpcControlService::new(
-            Arc::new(ControlConfig {
-                node_preshared_keys: vec!["node-psk".to_string()],
-                ..ControlConfig::default()
-            }),
+            Arc::new(ControlConfig::default()),
             Arc::clone(&sessions),
         )
         .with_database(Arc::clone(&database));
@@ -706,7 +706,12 @@ mod tests {
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(
-                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                    tonic::service::interceptor::InterceptedService::new(
+                        deis_wire::pb::control_service_server::ControlServiceServer::new(
+                            service,
+                        ),
+                        proving("node-a"),
+                    ),
                 )
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
@@ -809,7 +814,6 @@ mod tests {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
         let service = GrpcControlService::new(
             Arc::new(ControlConfig {
-                node_preshared_keys: vec!["node-psk".to_string()],
                 heartbeat_timeout: 90,
                 ..ControlConfig::default()
             }),
@@ -822,7 +826,12 @@ mod tests {
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(
-                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                    tonic::service::interceptor::InterceptedService::new(
+                        deis_wire::pb::control_service_server::ControlServiceServer::new(
+                            service,
+                        ),
+                        proving("node-a"),
+                    ),
                 )
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
@@ -951,7 +960,6 @@ mod tests {
         // One second of grace, so the test waits on the real clock the
         // shipped default reads, only a shorter one.
         let config = Arc::new(ControlConfig {
-            node_preshared_keys: vec!["node-psk".to_string()],
             heartbeat_interval: 1,
             heartbeat_timeout: 2,
             ..ControlConfig::default()
@@ -964,7 +972,12 @@ mod tests {
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(
-                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                    tonic::service::interceptor::InterceptedService::new(
+                        deis_wire::pb::control_service_server::ControlServiceServer::new(
+                            service,
+                        ),
+                        proving("node-a"),
+                    ),
                 )
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );

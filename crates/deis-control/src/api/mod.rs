@@ -12,7 +12,6 @@ pub mod grpc;
 pub mod headers;
 pub mod identity;
 pub mod metrics;
-pub mod middleware;
 pub mod migrations;
 pub mod nodes;
 pub mod openapi;
@@ -63,7 +62,6 @@ pub struct ApiRouter {
     /// handle through the bounded drain. Absent when verified driver execution
     /// is disabled.
     pub provider_deployment_reconciler: Option<ProviderDeploymentReconciler>,
-    pub auth_config: middleware::AuthConfig,
     /// Accounts, scopes and the audit log, as the gate in front of the human
     /// API sees them. Handed back so the binary can complete the startup that
     /// needs a running async runtime - recording the configured `api_keys`,
@@ -73,7 +71,6 @@ pub struct ApiRouter {
     /// The node channel's credential, reported at startup next to the API
     /// key so an operator sees both, rather than only the one that
     /// `api_auth_enabled` controls.
-    pub node_auth: middleware::NodeAuthConfig,
     /// The browser origins allowed to read this API's answers, empty for the
     /// default, which is none. Reported at startup next to the two
     /// credentials because it is the third thing that decides who gets in.
@@ -120,17 +117,10 @@ pub async fn build_api_router(
         metrics_collector: Arc::clone(&metrics_collector),
     };
 
-    // One credential object for the whole node channel: the assignment
-    // list, the bundle download and the registration endpoint must accept
-    // exactly the same keys, and building it three times would let them
-    // drift.
-    let node_auth = middleware::NodeAuthConfig::from_control_config(&config);
-
     let catalog_state = build_catalog_state(
         Arc::clone(&database),
         Arc::clone(&deis_runtime_manager),
         Arc::clone(&sessions),
-        node_auth.clone(),
         &config,
     )
     .await;
@@ -164,7 +154,6 @@ pub async fn build_api_router(
     let restore_state = restores::RestoreApiState::new(Arc::clone(&catalog_state.store), &config);
     restore_state.resume_on_start();
 
-    let auth_config = middleware::AuthConfig::from_control_config(&config);
 
     // One gate for the whole human surface. It resolves the credential into
     // an account, checks the scope the route needs, and writes the audit
@@ -254,9 +243,7 @@ pub async fn build_api_router(
         catalog_state: catalog_state.clone(),
         router: app,
         provider_deployment_reconciler,
-        auth_config,
         authz: authz_state,
-        node_auth,
         cors_origins: cors.origins,
         tls_enabled,
     }
@@ -599,7 +586,6 @@ async fn build_catalog_state(
     database: Arc<Database>,
     nodes: Arc<RuntimeNodeManager>,
     sessions: Arc<SessionManager>,
-    node_auth: middleware::NodeAuthConfig,
     config: &ControlConfig,
 ) -> catalog::CatalogState {
     let bundles = BundleStore::new(config.bundle_dir.clone());
@@ -688,18 +674,13 @@ async fn build_catalog_state(
         );
     }
 
-    if node_auth.key_count() == 0 && config.machine.is_some() {
+    if config.machine.is_some() {
         info!(
-            "No node credential, and none is wanted: this control plane admits machines on its machine channel by the certificate each one proves, which names a single machine. The HTTP endpoints that used to serve nodes over a shared value are not mounted, and nothing in this fleet holds a credential that would let its holder stand in for another machine"
-        );
-    } else if node_auth.key_count() == 0 {
-        error!(
-            "No node credential: the endpoints that serve nodes answer 503 to everyone, so no node can register, fetch its assignments or download a bundle, and nothing this platform holds will run. Set node_preshared_keys, configure a [machine] channel, or start through the binary, which mints a key when the file names none"
+            "Machines are admitted on the machine channel, by the certificate each one proves - which names one machine rather than an installation. This is the only path on which secret values leave this process, and there is no credential anywhere in this fleet whose holder could stand in for a different machine"
         );
     } else {
-        info!(
-            node_keys = node_auth.key_count(),
-            "The endpoints that serve nodes require one of the node keys, whatever api_auth_enabled says; they are the only path on which secret values leave this process"
+        error!(
+            "No [machine] channel: nothing a node or a proxy calls is served at all, so no machine can register, fetch its assignments or download a bundle, and nothing this platform holds will run"
         );
     }
 
@@ -824,7 +805,6 @@ async fn build_catalog_state(
             address,
             storage,
         )),
-        node_auth,
         sessions,
         nodes,
         abandon_departed_target_after: std::time::Duration::from_secs(
@@ -914,8 +894,8 @@ pub async fn serve(
 pub fn log_api_ready(
     port: u16,
     tls_enabled: bool,
-    auth_config: &middleware::AuthConfig,
-    node_auth: &middleware::NodeAuthConfig,
+    auth_enabled: bool,
+    configured_api_keys: usize,
     cors_origins: &[String],
     grpc_shared: bool,
     machine_channel: bool,
@@ -944,10 +924,9 @@ pub fn log_api_ready(
         if tls_enabled { "ENABLED" } else { "DISABLED" }
     );
 
-    if auth_config.enabled {
+    if auth_enabled {
         info!(
-            "🔐 Human API: AUTHENTICATED - accounts and scoped tokens, plus {} unscoped api_keys entries from the configuration file (`deis token list`)",
-            auth_config.api_keys.len()
+            "🔐 Human API: AUTHENTICATED - accounts and scoped tokens, plus {configured_api_keys} unscoped api_keys entries from the configuration file (`deis token list`)"
         );
     } else {
         info!(
@@ -969,30 +948,20 @@ pub fn log_api_ready(
             cors_origins.join(", ")
         );
     }
-    // Said separately because it is a separate credential: this one is not
+    // Said separately because it is a separate listener: this one is not
     // governed by api_auth_enabled, and it is the one that guards secrets.
-    let (node_mark, node_state) = match (node_auth.key_count() > 0, machine_channel) {
-        // Both live. That is a migration in progress, not a stronger fleet:
-        // whoever holds the shared value is admitted without proving a name,
-        // so the weaker of the two regimes is the one that decides.
-        (true, true) => (
-            "\u{26a0}",
-            "authenticated with node_preshared_keys, and a machine channel is also serving - the \
-             shared value is still accepted, so it is still what an attacker needs",
-        ),
-        (true, false) => ("\u{1f510}", "authenticated with node_preshared_keys"),
-        // No shared value and nothing that needs one: machines are admitted
-        // on the machine channel by a certificate naming one machine each.
-        (false, true) => (
+    let (node_mark, node_state) = if machine_channel {
+        (
             "\u{1f6e1}",
-            "not served here at all - machines are admitted on the machine channel by the \
-             certificate each one proves, and this installation holds no fleet-wide value",
-        ),
-        (false, false) => (
+            "not served on this port at all - registration, the assignment list, the bundle \
+             download and the routing table are on the machine channel, where a caller proves a \
+             certificate naming one machine",
+        )
+    } else {
+        (
             "\u{26d4}",
-            "SHUT - no node key and no machine channel, so every caller gets 503 and no node can \
-             join or load anything",
-        ),
+            "SHUT - there is no machine channel, so no node can join or load anything",
+        )
     };
     info!("{node_mark} Node endpoints (registration, assignments, bundle download): {node_state}");
     info!("====================================");
@@ -1013,18 +982,15 @@ pub async fn start_api_server(
     config_manager: Arc<ConfigManager>,
     command_executor: Arc<CommandExecutor>,
     metrics_collector: Arc<MetricsCollector>,
-    mut config: ControlConfig,
+    config: ControlConfig,
     port: u16,
 ) -> anyhow::Result<()> {
-    if let crate::config::NodeCredentialSource::Generated(_) = config.ensure_node_credential() {
-        warn!(
-            "No node_preshared_keys configured and no [machine] channel, so a node credential was generated for this run; nothing can register or fetch assignments without it"
-        );
-    }
     // Read before the configuration is shared and later moved: which regime
     // admits machines is a startup fact, and taking it here keeps the
     // readiness log from depending on where `config` happens to have got to.
     let machine_channel = config.machine.is_some();
+    let auth_enabled = config.api_auth_enabled;
+    let configured_api_keys = config.api_keys.len();
     let config = Arc::new(config);
     let tls_config = config.tls.clone();
     let deis_runtime_manager = Arc::new(
@@ -1033,12 +999,6 @@ pub async fn start_api_server(
             config.deis_runtime_poll_interval,
             config.node_registration_ttl_secs,
         )
-        // A node's management plane can unload an application, list every
-        // tenant on the node and replace one tenant's code, so it is served
-        // only to a caller that presents a node key. The same list the node
-        // endpoints authenticate against, so a node is driven with the very
-        // value it proved when it registered.
-        .with_node_keys(&config.node_preshared_keys),
     );
     // One stop signal for the server and the health poller, so the poller
     // stops probing at the same moment the listener stops accepting rather
@@ -1072,8 +1032,8 @@ pub async fn start_api_server(
     log_api_ready(
         port,
         api.tls_enabled,
-        &api.auth_config,
-        &api.node_auth,
+        auth_enabled,
+        configured_api_keys,
         &api.cors_origins,
         false,
         machine_channel,

@@ -1,58 +1,57 @@
-//! Fetching the routing table from the control plane, over whichever channel
-//! this proxy is configured to reach it on.
+//! Fetching the routing table from the control plane.
 //!
-//! # Two transports, one document
+//! # One transport
 //!
-//! Without a `[machine_identity]` table, the routing table is fetched with an
-//! HTTP GET on the control plane's human listener, authenticated with the
-//! fleet-wide `node_preshared_keys` value - a secret every process in the
-//! fleet holds a copy of. With one, the same table is fetched as
-//! `deis.machine.MachineChannel/FetchRoutingTable` on the machine channel,
-//! authenticated by a certificate that names this proxy and nothing else, and
-//! answered by a control plane that has proved its own name back.
+//! The table is fetched as `deis.machine.MachineChannel/FetchRoutingTable` on
+//! the control plane's machine channel, authenticated by a certificate that
+//! names this proxy and nothing else, and answered by a control plane that has
+//! proved its own name back.
 //!
-//! Only the transport differs. The document is the same JSON either way and
-//! is parsed and validated by the same [`super::wire::RoutingTableDocument`]
-//! code, under the same all-or-nothing rule, so a platform halfway through
-//! the migration cannot end up running two subtly different notions of what a
-//! route is. The two values that used to be request headers - which proxy is
-//! asking, and which version of the table it is already running - are fields
-//! on the RPC and carry exactly what the headers carried.
+//! There used to be a second way: an HTTP GET on the control plane's human
+//! listener, carrying the fleet-wide `node_preshared_keys` value that every
+//! process in the fleet held a copy of. Both the value and the route are gone.
+//! What is left of that arm here is one error: a proxy configured without a
+//! `[machine_identity]` table has nothing to prove and no route to ask, and
+//! says so rather than dialling something that would answer 404 for the life
+//! of the process. `SystemConfig::validate` refuses such a configuration at
+//! startup, so in practice that error is only reachable by assembling a client
+//! by hand.
 //!
-//! # What each transport costs the process
+//! The document did not change when the transport did. It is the same JSON,
+//! parsed and validated by the same [`super::wire::RoutingTableDocument`] code
+//! under the same all-or-nothing rule. The two values that used to be request
+//! headers - which proxy is asking, and which version of the table it is
+//! already running - are fields on the RPC and carry exactly what the headers
+//! carried.
 //!
-//! The HTTP path is made with pingora's own connector, the same machinery the
-//! data plane uses to reach an upstream, so it adds no HTTP stack of its own
-//! and inherits pingora's TLS behaviour, certificate verification included.
+//! # What this costs the process
 //!
 //! The machine channel is tonic over hyper, and that is not a second stack
-//! this module introduces either: deis-wire's control client is tonic, so
-//! this binary has linked tonic and hyper since the day it grew a control
-//! channel - `cargo tree -p deis-proxy -e normal -i tonic` shows the edge, and
-//! `-i hyper` shows that the only hyper in the tree comes in behind it, not
-//! behind pingora. What is new here is that the catalog poller uses them too,
-//! not that they are present.
+//! this module introduces: deis-wire's control client is tonic, so this binary
+//! has linked tonic and hyper since the day it grew a control channel -
+//! `cargo tree -p deis-proxy -e normal -i tonic` shows the edge, and `-i hyper`
+//! shows that the only hyper in the tree comes in behind it, not behind
+//! pingora. What is new here is that the catalog poller uses them too, not that
+//! they are present.
 //!
-//! One connection is opened per poll and dropped when the table has been
-//! read, on both transports. Nothing is pooled on purpose: a poll happens
-//! every few seconds, and a pooled connection to the control plane would be
-//! one more socket to carry across a zero-downtime upgrade for no measurable
-//! saving. On the machine channel it has a second effect worth having - the
-//! handshake is made again on every poll, so a certificate renewed on disk is
-//! presented by the next poll without anything having to be told it changed.
+//! One connection is opened per poll and dropped when the table has been read.
+//! Nothing is pooled on purpose: a poll happens every few seconds, and a pooled
+//! connection to the control plane would be one more socket to carry across a
+//! zero-downtime upgrade for no measurable saving. It has a second effect worth
+//! having - the handshake is made again on every poll, so a certificate renewed
+//! on disk is presented by the next poll without anything having to be told it
+//! changed.
 //!
-//! The whole exchange is under one timeout on both. A control plane that
-//! accepts the TCP connection and then says nothing is the failure mode that
-//! would otherwise park the poll loop for ever, and a parked poll loop is a
-//! data plane that stops noticing route changes while looking perfectly
-//! healthy. [`CatalogClient::fetch`] is the bound, and it wraps either
-//! transport whole - connect, handshake, request and body alike. The gRPC
-//! path hands tonic the same duration again as its connect timeout and its
-//! per-request timeout, which changes no guarantee but reports the ordinary
-//! failures as what they are instead of delivering all of them as one
-//! stopwatch running out.
+//! The whole exchange is under one timeout. A control plane that accepts the
+//! TCP connection and then says nothing is the failure mode that would
+//! otherwise park the poll loop for ever, and a parked poll loop is a data
+//! plane that stops noticing route changes while looking perfectly healthy.
+//! [`CatalogClient::fetch`] is the bound, and it wraps connect, handshake,
+//! request and body alike. It hands tonic the same duration again as its
+//! connect timeout and its per-request timeout, which changes no guarantee but
+//! reports the ordinary failures as what they are instead of delivering all of
+//! them as one stopwatch running out.
 
-use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -61,14 +60,11 @@ use deis_identity::{Dialler, MachineIdentity, Protocol};
 use deis_wire::ControlConfig;
 use deis_wire::machine::FetchRoutingTableRequest;
 use deis_wire::machine::machine_channel_client::MachineChannelClient;
-use pingora::connectors::http::Connector;
-use pingora::http::RequestHeader;
-use pingora::upstreams::peer::HttpPeer;
 use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint};
 use tracing::debug;
 
-use super::wire::{DocumentError, ROUTING_TABLE_PATH, RoutingTableDocument};
+use super::wire::{DocumentError, RoutingTableDocument};
 use crate::config::system::MachineIdentityConfig;
 
 /// The gRPC method, spelled out for log lines only.
@@ -119,76 +115,7 @@ pub enum FetchError {
     Invalid(#[from] DocumentError),
 }
 
-/// Where the control plane is and how to prove we may ask it.
-#[derive(Debug, Clone)]
-pub struct ControlEndpoint {
-    /// Host as written in the configuration, used for the `Host` header and
-    /// as the TLS server name.
-    host: String,
-    port: u16,
-    tls: bool,
-}
 
-impl ControlEndpoint {
-    /// Split a `http://host:port` / `https://host:port` address, the form
-    /// `deis_wire::ControlConfig` validates.
-    pub fn parse(addr: &str) -> Result<Self, FetchError> {
-        let reject = |reason: &str| FetchError::Address {
-            addr: addr.to_string(),
-            reason: reason.to_string(),
-        };
-        let (tls, rest) = if let Some(rest) = addr.strip_prefix("https://") {
-            (true, rest)
-        } else if let Some(rest) = addr.strip_prefix("http://") {
-            (false, rest)
-        } else {
-            return Err(reject("it must start with http:// or https://"));
-        };
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-        if authority.is_empty() {
-            return Err(reject("it names no host"));
-        }
-        // An IPv6 literal is bracketed; anything else splits on the last
-        // colon, so a bare `host` keeps the scheme's default port.
-        let (host, port) = if let Some(end) = authority.strip_prefix('[') {
-            let mut parts = end.splitn(2, ']');
-            let host = parts.next().unwrap_or_default().to_string();
-            let port = match parts.next().and_then(|p| p.strip_prefix(':')) {
-                Some(port) => port
-                    .parse()
-                    .map_err(|_| reject("the port after the IPv6 literal is not a number"))?,
-                None => default_port(tls),
-            };
-            (host, port)
-        } else {
-            match authority.rsplit_once(':') {
-                Some((host, port)) => (
-                    host.to_string(),
-                    port.parse()
-                        .map_err(|_| reject("the part after the last ':' is not a port number"))?,
-                ),
-                None => (authority.to_string(), default_port(tls)),
-            }
-        };
-        if host.is_empty() {
-            return Err(reject("it names no host"));
-        }
-        Ok(Self { host, port, tls })
-    }
-
-    /// `host:port`, as it goes in the `Host` header and into the resolver.
-    pub fn authority(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-}
-
-fn default_port(tls: bool) -> u16 {
-    if tls { 443 } else { 80 }
-}
 
 /// How a connection to the machine channel is opened.
 ///
@@ -245,20 +172,6 @@ impl MachineConnect for DialTheControlPlane {
 
 /// One of the two ways the same document is fetched.
 enum Transport {
-    /// HTTP on the control plane's human listener, with the fleet secret.
-    Http {
-        endpoint: ControlEndpoint,
-        /// A `node_preshared_keys` value: the same credential the gRPC
-        /// control channel presents. See `deis-control`'s
-        /// `api::catalog::routing_table` for why the table is on that channel
-        /// rather than the human API.
-        credential: String,
-        // Boxed because pingora's connector carries its whole pool
-        // configuration inline - some 450 bytes - and an enum is as large as
-        // its largest variant, so leaving it unboxed would make every
-        // machine-channel client pay for a pool it does not have.
-        connector: Box<Connector>,
-    },
     /// The machine channel, with this proxy's own certificate.
     Machine {
         /// `host:port`, for logs. What the connection is actually made to is
@@ -278,24 +191,6 @@ pub struct CatalogClient {
 }
 
 impl CatalogClient {
-    /// Fetch over HTTP, with the fleet secret. What a proxy with no
-    /// `[machine_identity]` table does, unchanged.
-    pub fn new(
-        endpoint: ControlEndpoint,
-        credential: String,
-        request_timeout: Duration,
-        max_table_bytes: usize,
-    ) -> Self {
-        Self::with_transport(
-            Transport::Http {
-                endpoint,
-                credential,
-                connector: Box::new(Connector::new(None)),
-            },
-            request_timeout,
-            max_table_bytes,
-        )
-    }
 
     /// Fetch over the machine channel, proving `identity` and requiring
     /// `control` to be proved back.
@@ -368,7 +263,6 @@ impl CatalogClient {
     /// `host:port` of whatever this client asks, for log lines.
     pub fn authority(&self) -> String {
         match &self.transport {
-            Transport::Http { endpoint, .. } => endpoint.authority(),
             Transport::Machine { authority, .. } => authority.clone(),
         }
     }
@@ -378,7 +272,6 @@ impl CatalogClient {
     /// the configuration asked for.
     pub fn transport(&self) -> &'static str {
         match &self.transport {
-            Transport::Http { .. } => "http",
             Transport::Machine { .. } => "machine channel",
         }
     }
@@ -387,7 +280,6 @@ impl CatalogClient {
     /// on the other.
     pub fn path(&self) -> &'static str {
         match &self.transport {
-            Transport::Http { .. } => ROUTING_TABLE_PATH,
             Transport::Machine { .. } => FETCH_ROUTING_TABLE_METHOD,
         }
     }
@@ -410,16 +302,8 @@ impl CatalogClient {
     /// the document is parsed and validated whole before it is handed back.
     pub async fn fetch(&self) -> Result<RoutingTableDocument, FetchError> {
         let exchange = async {
-            match &self.transport {
-                Transport::Http {
-                    endpoint,
-                    credential,
-                    connector,
-                } => self.fetch_over_http(endpoint, credential, connector).await,
-                Transport::Machine { connect, .. } => {
-                    self.fetch_over_machine_channel(connect.as_ref()).await
-                }
-            }
+            let Transport::Machine { connect, .. } = &self.transport;
+            self.fetch_over_machine_channel(connect.as_ref()).await
         };
         match timeout(self.request_timeout, exchange).await {
             Ok(result) => result,
@@ -491,146 +375,18 @@ impl CatalogClient {
         self.accept(answer.into_inner().routing_table_json.as_bytes())
     }
 
-    async fn fetch_over_http(
-        &self,
-        endpoint: &ControlEndpoint,
-        credential: &str,
-        connector: &Connector,
-    ) -> Result<RoutingTableDocument, FetchError> {
-        let authority = endpoint.authority();
-        let addr: SocketAddr = tokio::net::lookup_host(authority.as_str())
-            .await
-            .map_err(|source| FetchError::Resolve {
-                addr: authority.clone(),
-                source,
-            })?
-            .next()
-            .ok_or_else(|| FetchError::Address {
-                addr: authority.clone(),
-                reason: "it resolved to no address".to_string(),
-            })?;
-
-        let sni = if endpoint.tls {
-            endpoint.host.clone()
-        } else {
-            String::new()
-        };
-        let mut peer = HttpPeer::new(addr, endpoint.tls, sni);
-        peer.options.connection_timeout = Some(self.request_timeout);
-        peer.options.read_timeout = Some(self.request_timeout);
-        peer.options.write_timeout = Some(self.request_timeout);
-
-        let (mut session, _reused) = connector
-            .get_http_session(&peer)
-            .await
-            .map_err(|e| FetchError::Transport(format!("connecting to {authority}: {e}")))?;
-
-        let mut request = RequestHeader::build("GET", ROUTING_TABLE_PATH.as_bytes(), None)
-            .map_err(|e| FetchError::Transport(format!("building the request: {e}")))?;
-        let set = |request: &mut RequestHeader, name: &str, value: &str| {
-            request
-                .insert_header(name.to_string(), value)
-                .map_err(|e| FetchError::Transport(format!("setting {name}: {e}")))
-        };
-        set(&mut request, "Host", &authority)?;
-        set(&mut request, "Accept", "application/json")?;
-        set(
-            &mut request,
-            "Authorization",
-            &format!("Bearer {credential}"),
-        )?;
-        if let Some(proxy_id) = &self.proxy_id {
-            set(
-                &mut request,
-                deis_wire::conventions::PROXY_ID_HEADER,
-                proxy_id,
-            )?;
-        }
-        if let Some(version) = self.observed().as_deref() {
-            set(
-                &mut request,
-                deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER,
-                version,
-            )?;
-        }
-
-        session
-            .write_request_header(Box::new(request))
-            .await
-            .map_err(|e| FetchError::Transport(format!("sending the request: {e}")))?;
-        session
-            .finish_request_body()
-            .await
-            .map_err(|e| FetchError::Transport(format!("finishing the request: {e}")))?;
-        session
-            .read_response_header()
-            .await
-            .map_err(|e| FetchError::Transport(format!("reading the response header: {e}")))?;
-
-        let header = session
-            .response_header()
-            .ok_or_else(|| FetchError::Transport("the response carried no header".to_string()))?;
-        let status = header.status.as_u16();
-        let declared: Option<usize> = header
-            .headers
-            .get("content-length")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse().ok());
-
-        let mut body = Vec::new();
-        while let Some(chunk) = session
-            .read_response_body()
-            .await
-            .map_err(|e| FetchError::Transport(format!("reading the response body: {e}")))?
-        {
-            if body.len() + chunk.len() > self.max_table_bytes {
-                return Err(FetchError::TooLarge {
-                    limit: self.max_table_bytes,
-                });
-            }
-            body.extend_from_slice(&chunk);
-        }
-
-        if status != 200 {
-            let detail = String::from_utf8_lossy(&body[..body.len().min(200)]).to_string();
-            return Err(FetchError::Status {
-                status,
-                path: ROUTING_TABLE_PATH,
-                detail: if detail.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", detail.trim())
-                },
-            });
-        }
-
-        // A body that stopped early is the one way a half-written table
-        // could reach the parser and still be valid JSON prefix-wise, so it
-        // is checked against what the control plane said it was sending
-        // rather than trusted to fail later.
-        if let Some(declared) = declared
-            && body.len() < declared
-        {
-            return Err(FetchError::Truncated {
-                got: body.len(),
-                declared,
-            });
-        }
-
-        self.accept(&body)
-    }
 }
 
-/// Build the client this configuration asks for: the machine channel if this
-/// proxy has an identity, HTTP with the fleet secret if it has not.
+/// Build the client this configuration asks for: the machine channel, proving
+/// the identity this proxy was given. There is no fallback for a proxy with
+/// none - the routing table is served nowhere else.
 ///
 /// The choice lives here rather than at the call site in `main` so that it is
 /// one function with one rule in it, and so a test can ask what a given
 /// configuration produces without starting a proxy. It is also the one place
 /// that knows the id this proxy asks for a table as: `control.associated_id`,
-/// the same value the HTTP path has always sent in the `x-deis-proxy-id`
-/// header, and the same one the control plane checks against the name the
-/// connection proved before it answers at all.
+/// the same one the control plane checks against the name the connection
+/// proved before it answers at all.
 pub fn routing_table_client(
     control: &ControlConfig,
     identity: Option<(&Arc<MachineIdentity>, &MachineIdentityConfig)>,
@@ -653,20 +409,20 @@ pub fn routing_table_client(
                 max_table_bytes,
             )
         }
-        // No identity, so the only thing left to prove with is the fleet
-        // secret - and a proxy that has neither cannot ask for the table at
-        // all. Saying so here, by name, beats sending an empty bearer value
-        // and reporting whatever the control plane answers to it.
-        None => CatalogClient::new(
-            ControlEndpoint::parse(&control.addr)?,
-            control.secret.clone().ok_or_else(|| FetchError::Address {
+        // Unreachable through a configuration this build accepts:
+        // `SystemConfig::validate` refuses a proxy that names a control
+        // plane without a [machine_identity] table, because the routing
+        // table is served nowhere else. Kept as an error rather than an
+        // `unreachable!()` so a caller assembling a client by hand gets an
+        // answer instead of a panic.
+        None => {
+            return Err(FetchError::Address {
                 addr: control.addr.clone(),
-                reason: "this proxy has neither a [machine_identity] table nor a [control] secret,                          so it can prove nothing to the control plane and the routing table cannot                          be fetched. Give it an identity, which names this one proxy, or a secret,                          which the whole fleet shares"
+                reason: "this proxy has no [machine_identity] table, so it can prove nothing \
+                         to the control plane and the routing table is served nowhere else"
                     .to_string(),
-            })?,
-            control.request_timeout_duration(),
-            max_table_bytes,
-        ),
+            });
+        }
     };
     Ok(client.with_proxy_id(control.associated_id.clone()))
 }
@@ -688,47 +444,6 @@ mod tests {
     const V1: &str = r#"{"version":"v1","generated_at":11,"routes":[
         {"app_id":"shop","environment":"production","host":"shop.test","path_prefix":"/","priority":0}
     ],"environments":[]}"#;
-
-    #[test]
-    fn addresses_are_split_into_host_port_and_scheme() {
-        let plain = ControlEndpoint::parse("http://127.0.0.1:8085").unwrap();
-        assert_eq!(plain.authority(), "127.0.0.1:8085");
-        assert!(!plain.tls);
-
-        let tls = ControlEndpoint::parse("https://control.internal").unwrap();
-        assert_eq!(tls.authority(), "control.internal:443");
-        assert!(tls.tls);
-
-        assert_eq!(
-            ControlEndpoint::parse("http://control.internal")
-                .unwrap()
-                .authority(),
-            "control.internal:80"
-        );
-        assert_eq!(
-            ControlEndpoint::parse("http://[::1]:8085")
-                .unwrap()
-                .authority(),
-            "[::1]:8085"
-        );
-        // A trailing path is not part of the authority.
-        assert_eq!(
-            ControlEndpoint::parse("http://host:9/anything")
-                .unwrap()
-                .authority(),
-            "host:9"
-        );
-    }
-
-    #[test]
-    fn unusable_addresses_are_refused_rather_than_guessed() {
-        for bad in ["", "127.0.0.1:8085", "http://", "http://host:port"] {
-            assert!(
-                ControlEndpoint::parse(bad).is_err(),
-                "accepted {bad:?}, which would have been dialled as something else"
-            );
-        }
-    }
 
     /// A stand-in for the control plane's machine channel: it answers with
     /// whatever the test set and keeps what the last request carried.
@@ -958,7 +673,6 @@ mod tests {
     fn control() -> ControlConfig {
         ControlConfig::new(
             "edge-1".to_string(),
-            "fleet-secret".to_string(),
             "http://control.internal:8080".to_string(),
         )
     }
@@ -990,15 +704,6 @@ mod tests {
             "the control plane refuses a proxy_id that is not the one the connection proved, and \
              control.associated_id is what this proxy is registered as"
         );
-    }
-
-    #[test]
-    fn no_identity_leaves_the_fetch_exactly_where_it_was() {
-        let client = routing_table_client(&control(), None, 1024).unwrap();
-        assert_eq!(client.transport(), "http");
-        assert_eq!(client.authority(), "control.internal:8080");
-        assert_eq!(client.path(), ROUTING_TABLE_PATH);
-        assert_eq!(client.proxy_id.as_deref(), Some("edge-1"));
     }
 
     #[test]

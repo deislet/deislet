@@ -2143,6 +2143,7 @@ mod tests {
     };
     use super::{deployment_plan_location, reconcile_plan};
     use crate::api::catalog::MAX_BUNDLE_BYTES;
+    use crate::api::catalog::routing_table;
     use crate::api::paths::ApiPaths;
     use crate::api::versioning::ApiSurface;
     use crate::catalog::DeploymentPlanSpec;
@@ -2960,41 +2961,27 @@ mod tests {
         );
         let plan_id = deployed["plan"]["id"].as_str().unwrap().to_string();
 
-        let first = Request::builder()
-            .method("GET")
-            .uri(deis_wire::conventions::ROUTING_TABLE_ROUTE)
-            .header("authorization", "Bearer node-psk")
-            .header(deis_wire::conventions::PROXY_ID_HEADER, "proxy-a")
-            .body(Body::empty())
-            .unwrap();
-        let response = h.router.clone().oneshot(first).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let table: Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), MAX_BUNDLE_BYTES)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let table_version = table["version"].as_str().unwrap();
+        // The routing table used to be served over HTTP, with the node key
+        // and a proxy id header standing in for who was asking; a proxy now
+        // reaches it over the machine channel's mutual TLS instead, where
+        // the peer's proved name is the proxy id and there is nothing left
+        // to carry in a header. `routing_table_for` is what both the old
+        // handler and the machine channel's RPC call underneath, so calling
+        // it directly here tests the same acknowledgement bookkeeping
+        // without standing up a second mTLS listener beside the one already
+        // built for `RuntimeNodeManager` above.
+        let table = routing_table::routing_table_for(&h.state, Some("proxy-a"), None)
+            .await
+            .expect("the routing table is built");
+        let table_version = table.version.clone();
 
-        let forged = Request::builder()
-            .method("GET")
-            .uri(deis_wire::conventions::ROUTING_TABLE_ROUTE)
-            .header("authorization", "Bearer node-psk")
-            .header(
-                deis_wire::conventions::PROXY_ID_HEADER,
-                "proxy-a-impersonator",
-            )
-            .header(
-                deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER,
-                table_version,
-            )
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            h.router.clone().oneshot(forged).await.unwrap().status(),
-            StatusCode::OK
-        );
+        routing_table::routing_table_for(
+            &h.state,
+            Some("proxy-a-impersonator"),
+            Some(table_version.as_str()),
+        )
+        .await
+        .expect("the routing table is built");
         let (_, not_yet_observed) = json(
             &h.router,
             "GET",
@@ -3004,21 +2991,9 @@ mod tests {
         .await;
         assert_eq!(not_yet_observed["plan"]["state"], "activating");
 
-        let ack = Request::builder()
-            .method("GET")
-            .uri(deis_wire::conventions::ROUTING_TABLE_ROUTE)
-            .header("authorization", "Bearer node-psk")
-            .header(deis_wire::conventions::PROXY_ID_HEADER, "proxy-a")
-            .header(
-                deis_wire::conventions::OBSERVED_ROUTING_TABLE_HEADER,
-                table_version,
-            )
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            h.router.clone().oneshot(ack).await.unwrap().status(),
-            StatusCode::OK
-        );
+        routing_table::routing_table_for(&h.state, Some("proxy-a"), Some(table_version.as_str()))
+            .await
+            .expect("the routing table is built");
         let mut observed = Value::Null;
         let mut status = StatusCode::ACCEPTED;
         for _ in 0..100 {

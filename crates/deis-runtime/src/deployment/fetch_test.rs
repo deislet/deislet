@@ -66,7 +66,7 @@ impl BundleServer {
 }
 
 fn fetcher(max_bytes: u64) -> BundleFetcher {
-    BundleFetcher::new(Duration::from_secs(10), max_bytes, None).unwrap()
+    BundleFetcher::new(Duration::from_secs(10), max_bytes).unwrap()
 }
 
 #[tokio::test]
@@ -278,7 +278,7 @@ async fn machine_listener(identity: Arc<MachineIdentity>, body: Vec<u8>) -> Mach
 }
 
 fn machine_fetcher(fleet: &Fleet, machine_endpoint: &str, max_bytes: u64) -> BundleFetcher {
-    BundleFetcher::new(Duration::from_secs(10), max_bytes, None)
+    BundleFetcher::new(Duration::from_secs(10), max_bytes)
         .unwrap()
         .over_machine_channel(
             MachineTransport::new(

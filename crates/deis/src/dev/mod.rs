@@ -18,6 +18,7 @@
 //! never given their addresses.
 
 pub mod node;
+pub mod pki;
 pub mod proxy;
 pub mod watcher;
 

@@ -278,13 +278,12 @@ impl IdentityMigrationCoordinator {
             ));
         }
         if config
-            .node_preshared_keys
+            .api_keys
             .iter()
-            .chain(config.api_keys.iter())
             .any(|secret| distinct_tokens.contains(secret.as_str()))
         {
             return Err(MigrationCoordinatorError::Configuration(
-                "migration administrator credentials must not reuse a node or human API credential"
+                "migration administrator credentials must not reuse a human API credential"
                     .to_string(),
             ));
         }

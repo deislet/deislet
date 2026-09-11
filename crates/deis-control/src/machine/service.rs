@@ -19,7 +19,6 @@
 //! who chooses a node's id is the same person who has its certificate issued -
 //! so the id is in the certificate already, and reading it there is free.
 
-use crate::node_key::NodeProof;
 use deis_identity::{SpiffeId, names};
 use deis_wire::machine::machine_channel_server::MachineChannel;
 use deis_wire::machine::{
@@ -124,7 +123,7 @@ impl MachineChannel for MachineChannelService {
                     addr: announced.address.clone(),
                     machine_addr: announced.machine_address.clone(),
                     version: announced.version.clone(),
-                    proof: NodeProof::Certificate(proved.clone()),
+                    identity: proved.clone(),
                 },
                 chrono::Utc::now(),
             )
@@ -314,7 +313,6 @@ mod tests {
             Some("spiffe://deis.internal/deislet/node/runtime-test"),
             "the fleet records the name that was proved"
         );
-        assert_eq!(listed.key_fingerprint, None);
     }
 
     /// The refusal that a shared key could not express, on the call that

@@ -124,7 +124,7 @@ use crate::audit::{AuditRecord, AuditStore, Outcome};
 use crate::identity::store::Resolution;
 use crate::identity::{Demand, IdentityStore, Principal, Selector, Verb};
 
-use super::middleware::{presented_credentials, secret_eq};
+use crate::identity::token::secret_eq;
 
 /// Largest request body the gate will read in order to learn which
 /// application or environment a call is about. The two routes it applies to
@@ -1712,6 +1712,27 @@ fn anonymous_from(
 /// holds no copy of it and cannot admit anyone. Anything shaped like a minted
 /// token is looked up by its public id and its secret compared against a
 /// stored digest.
+/// The credentials a request carries, in the two forms this API accepts:
+/// `Authorization: Bearer <key>` (or the bare key) and `X-API-Key: <key>`.
+///
+/// Private to this module because this module is the only thing that reads a
+/// caller's credential. It was shared while the endpoints that served nodes
+/// read one the same way; those are gone, and a helper kept visible for a
+/// caller that no longer exists is an invitation to add a second gate.
+fn presented_credentials(headers: &HeaderMap) -> Vec<&str> {
+    let mut found = Vec::with_capacity(2);
+    if let Some(value) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        found.push(value.strip_prefix("Bearer ").unwrap_or(value));
+    }
+    if let Some(value) = headers.get("X-API-Key").and_then(|v| v.to_str().ok()) {
+        found.push(value);
+    }
+    found
+}
+
 async fn resolve(
     state: &AuthzState,
     headers: &HeaderMap,

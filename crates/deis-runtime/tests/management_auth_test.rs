@@ -1,4 +1,4 @@
-//! The node's management plane must not serve a caller with no credential.
+//! The node's public data port must not carry its management plane at all.
 //!
 //! Two independent reviews reached `GetStatus`, `UnloadApp` and
 //! `StartInspect` on a running node over its public data port with no
@@ -6,6 +6,15 @@
 //! their handlers, so anything that could reach an application on the node
 //! could also list every tenant on it, take one offline, or hand
 //! `ApplyDeployment` a bundle URL of its own.
+//!
+//! The first answer to that was a credential in front of the dispatch - a
+//! value the whole fleet shared. The answer now is that those services are
+//! not on this listener, so there is no credential to get wrong and no
+//! request to refuse: the paths fall through to the application router and
+//! are answered as any request naming no application is. What does serve them
+//! is `[machine_identity] management_listen`, where the caller proved a
+//! certificate before the connection existed; `dispatcher::machine_test`
+//! covers that side.
 //!
 //! These tests drive `dispatcher::start_server` itself - the same listener,
 //! the same router, the same dispatch - because the hole was in how the two
@@ -17,7 +26,6 @@ use deis_runtime::deployment::DeploymentManager;
 use deis_runtime::dispatcher::{self, ServerOptions};
 use deis_runtime::health::NodeHealth;
 use reqwest::StatusCode;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,11 +55,7 @@ async fn free_port() -> u16 {
 }
 
 /// A node with a data listener, and optionally a management plane of its own.
-async fn start_node(
-    port: u16,
-    management_keys: Vec<String>,
-    management_listen: Option<SocketAddr>,
-) -> tokio::task::JoinHandle<()> {
+async fn start_node(port: u16) -> tokio::task::JoinHandle<()> {
     let app_manager = Arc::new(ApplicationManager::new());
     let data_dir = std::env::temp_dir().join(format!("deis-management-auth-{port}"));
     let config = RuntimeConfig {
@@ -74,11 +78,10 @@ async fn start_node(
             started_at: std::time::Instant::now(),
             shutdown_grace: Duration::from_secs(1),
             max_request_body_bytes: deis_runtime::config::default_max_request_body_bytes(),
-            management_keys,
-            management_listen,
-            // This harness is about the fleet key's rules, which are what a
-            // node with no identity is held to; the mutually authenticated
-            // plane has its own tests beside the module that serves it.
+            // None on purpose: this harness is about what the *data* port
+            // does, and a node with no machine management plane is the
+            // sharpest version of that question - there is nowhere else on
+            // this process for a management call to have gone.
             machine_management: None,
         })
         .await;
@@ -145,64 +148,66 @@ fn grpc_status(response: &reqwest::Response) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Ask the data port until it answers.
+///
+/// The node builds a V8 snapshot before it binds, which takes seconds, so a
+/// request made the instant `start_node` returns is refused by nothing having
+/// opened the socket yet. `grpc_call` above carries the same retry for the
+/// same reason; this is its plain-HTTP twin.
+///
+/// A retry and not a sleep: the wait is over when the node answers, which is
+/// the condition actually being waited for, and a fixed pause would be either
+/// too short on a loaded machine or wasted on an idle one.
+async fn get_until_answered(addr: &str, path: &str) -> reqwest::Response {
+    let client = reqwest::Client::new();
+    for attempt in 0..200 {
+        match client
+            .get(format!("http://{addr}{path}"))
+            .header("x-deis-app-id", "_system")
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+        {
+            Ok(response) => return response,
+            Err(e) if attempt == 199 => panic!("{path} never answered: {e}"),
+            Err(_) => tokio::task::yield_now().await,
+        }
+    }
+    unreachable!("the loop above either answers or panics")
+}
+
 #[tokio::test]
-async fn an_unauthenticated_caller_gets_nothing_from_the_management_plane() {
+async fn the_data_port_does_not_dispatch_a_management_call_at_all() {
     let port = free_port().await;
-    let node = start_node(port, vec!["node-psk".to_string()], None).await;
+    let node = start_node(port).await;
     let addr = format!("127.0.0.1:{port}");
     let client = client();
 
     // GetStatus listed every tenant's applications, environments and op
-    // metrics to a caller with no credential.
-    let response = grpc_call(&client, &addr, GET_STATUS, None).await;
-    assert_eq!(
-        grpc_status(&response).as_deref(),
-        Some("16"),
-        "GetStatus must be refused as UNAUTHENTICATED, got {:?}",
-        response.headers()
-    );
-    assert!(
-        response.bytes().await.unwrap().is_empty(),
-        "a refused call must not carry a message"
-    );
-
-    // The trigger service is the same management plane and was equally open:
-    // OnScheduled runs an application's handler with that environment's
-    // secrets.
-    let response = grpc_call(&client, &addr, ON_SCHEDULED, None).await;
-    assert_eq!(
-        grpc_status(&response).as_deref(),
-        Some("16"),
-        "OnScheduled must be refused as UNAUTHENTICATED, got {:?}",
-        response.headers()
-    );
-
-    // A wrong key is refused the same way a missing one is.
-    let response = grpc_call(&client, &addr, GET_STATUS, Some("not-the-key")).await;
-    assert_eq!(grpc_status(&response).as_deref(), Some("16"));
-
-    node.abort();
-}
-
-#[tokio::test]
-async fn a_node_with_no_key_on_the_public_port_serves_no_management_call() {
-    // An empty key list is not a mode. A node that cannot tell its control
-    // plane from anyone else serves neither, and says which setting is
-    // missing - the same answer deis-control's node endpoints give when
-    // `node_preshared_keys` is empty. Its public traffic is untouched,
-    // because that is not what the missing key guards.
-    let port = free_port().await;
-    let node = start_node(port, Vec::new(), None).await;
-    let addr = format!("127.0.0.1:{port}");
-    let client = client();
-
+    // metrics to a caller with no credential. OnScheduled is the same plane:
+    // it runs an application's handler with that environment's secrets.
+    //
+    // Neither is refused now - which is a stronger statement than being
+    // refused. They are not here: the request reaches the application router,
+    // which answers a request that names no application, so there is no
+    // credential a caller could bring that would change the answer.
     for path in [GET_STATUS, ON_SCHEDULED] {
-        for credential in [None, Some("guessed-key")] {
+        for credential in [None, Some("any-string-at-all")] {
             let response = grpc_call(&client, &addr, path, credential).await;
+            assert!(
+                response.status().is_client_error(),
+                "{path} must fall through to the application router, got {}",
+                response.status()
+            );
             assert_eq!(
-                grpc_status(&response).as_deref(),
-                Some("14"),
-                "{path} must be refused as UNAVAILABLE with no key configured"
+                grpc_status(&response),
+                None,
+                "{path} must not be answered as gRPC on the data port at all"
+            );
+            let body = response.bytes().await.unwrap();
+            assert!(
+                !String::from_utf8_lossy(&body).contains("auth-test-node"),
+                "{path} must not report this node's status"
             );
         }
     }
@@ -211,43 +216,18 @@ async fn a_node_with_no_key_on_the_public_port_serves_no_management_call() {
 }
 
 #[tokio::test]
-async fn the_control_plane_is_still_served() {
-    // The other half of the fix: a node that refuses everything is not a
-    // node. The credential the control plane presents has to get through, or
-    // no deployment lands and no cron fires.
+async fn public_traffic_is_untouched_by_the_management_plane_moving() {
+    // The other half of the change: a node that serves nothing is not a node.
+    // Moving the management services off this listener must not have taken
+    // application traffic with them.
     let port = free_port().await;
-    let node = start_node(port, vec!["node-psk".to_string()], None).await;
+    let node = start_node(port).await;
     let addr = format!("127.0.0.1:{port}");
-    let client = client();
 
-    let response = grpc_call(&client, &addr, GET_STATUS, Some("node-psk")).await;
-    assert_eq!(
-        grpc_status(&response),
-        None,
-        "a served call reports its status in the trailers, not the headers"
-    );
-    let body = response.bytes().await.unwrap();
-    assert!(
-        !body.is_empty(),
-        "an authenticated GetStatus must answer with a message"
-    );
-    assert!(
-        String::from_utf8_lossy(&body).contains("auth-test-node"),
-        "the answer should be this node's status"
-    );
-
-    // And public application traffic is untouched: the credential guards the
-    // two gRPC prefixes and nothing else on the port.
-    let public = reqwest::Client::new()
-        .get(format!("http://{addr}/health"))
-        .header("x-deis-app-id", "_system")
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await
-        .expect("the data path must still answer");
+    let public = get_until_answered(&addr, "/health").await;
     assert!(
         public.status() != StatusCode::UNAUTHORIZED && public.status() != StatusCode::FORBIDDEN,
-        "public traffic must not need a node key: {}",
+        "public traffic must not be asked for a credential: {}",
         public.status()
     );
     // 503 and not 200, and that is the answer being asserted: this node has no
@@ -268,52 +248,6 @@ async fn the_control_plane_is_still_served() {
         Some("starting"),
         "the edge reads its rotation decision off this header"
     );
-
-    node.abort();
-}
-
-#[tokio::test]
-async fn a_separate_management_listener_takes_the_plane_off_the_public_port() {
-    // What an operator gets for setting `[management] listen`: the public
-    // port no longer carries the management plane at all, so a caller that
-    // can reach an application cannot even address it.
-    let port = free_port().await;
-    let management_port = free_port().await;
-    let management_addr = SocketAddr::from(([127, 0, 0, 1], management_port));
-    let node = start_node(port, vec!["node-psk".to_string()], Some(management_addr)).await;
-    let client = client();
-
-    let response = grpc_call(&client, &format!("127.0.0.1:{port}"), GET_STATUS, None).await;
-    // The gRPC prefixes are no longer mounted here, so the call falls through
-    // to the application router and is answered as what it now is: a request
-    // for a path on an application nobody named. Whatever the code, what
-    // matters is that it is not a gRPC answer and carries no status.
-    assert!(
-        response.status().is_client_error(),
-        "the public port must not serve the management plane: {}",
-        response.status()
-    );
-    assert_eq!(
-        grpc_status(&response),
-        None,
-        "the public port must not answer as gRPC at all"
-    );
-    let body = response.bytes().await.unwrap();
-    assert!(
-        !String::from_utf8_lossy(&body).contains("auth-test-node"),
-        "the public port must not report this node's status"
-    );
-
-    // It is served on its own listener, and still only to a caller with the
-    // key: separating the two is defence in depth, not a substitute for the
-    // credential.
-    let addr = management_addr.to_string();
-    let refused = grpc_call(&client, &addr, GET_STATUS, None).await;
-    assert_eq!(grpc_status(&refused).as_deref(), Some("16"));
-
-    let served = grpc_call(&client, &addr, GET_STATUS, Some("node-psk")).await;
-    assert_eq!(grpc_status(&served), None);
-    assert!(!served.bytes().await.unwrap().is_empty());
 
     node.abort();
 }

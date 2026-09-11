@@ -1945,22 +1945,26 @@ start_demo() {
     "${DEIS_TELEMETRY_METRICS_PORT:-$DEFAULT_DEIS_TELEMETRY_METRICS_PORT}"
   claim_port DEIS_ORIGIN_PORT "${DEIS_ORIGIN_PORT:-$DEFAULT_DEIS_ORIGIN_PORT}"
 
+  # A retired value, generated so that checks have a plausible string to
+  # bring. It authenticated a node to the control plane once; nothing is
+  # configured with it now, and two checks send it precisely to show that the
+  # doors it used to open are not locked against it but absent.
   SECRET=${SECRET:-$(generate_secret)}
 
   # The shared secret deis-store's, deis-queue's and deis-control's
   # per-tenant capability tokens are all derived from - see
-  # crates/deis-store/src/auth.rs. A separate value from SECRET on purpose:
-  # SECRET authenticates a *node* to the control plane, this one authenticates
-  # a *storage call* to whichever tenant it claims, and the two channels have
-  # nothing to do with each other. Configured on all three of deis-store,
+  # crates/deis-store/src/auth.rs. This one is live, and it authenticates a
+  # *storage call* to whichever tenant it claims - a fleet-wide value still,
+  # which is the next thing to go the way the node key went. Configured on all
+  # three of deis-store,
   # deis-queue and deis-control below - see check_storage_capability_token for
   # what it looks like when only some of the three carry it.
   STORAGE_AUTH_SECRET=${STORAGE_AUTH_SECRET:-$(generate_secret)}
 
   # The credential a person - the `deis` CLI, a dashboard - presents to the
-  # control plane's human API. A third value, and a third channel: SECRET
-  # authenticates a *node*, STORAGE_AUTH_SECRET authenticates a *storage call*,
-  # and this one authenticates *a caller who may deploy*. It is generated
+  # control plane's human API. A different channel again:
+  # STORAGE_AUTH_SECRET authenticates a *storage call*, and this one
+  # authenticates *a caller who may deploy*. It is generated
   # rather than left out because `api_auth_enabled` defaults to off, and a demo
   # that left it off would leave every catalog route - the deploy, the version
   # upload, the storage-token mint - open to anyone who can reach the port,
@@ -2121,9 +2125,9 @@ trust_root = "${PKI_DIR}/ca.crt"
 trust_domain = "${FLEET_TRUST_DOMAIN}"
 # And the other direction: what the control plane pushes into this node
 # arrives here, admitted only if the connection proved the control plane's own
-# name. The plaintext management plane is still bound on the data port, but
-# with no node key configured it now serves nothing at all - which `verify`
-# asks about directly.
+# name. There is no second way in - the data port has no management dispatcher
+# on it at all, so a management path there is read as a request for a page the
+# application does not have, which verify asks about directly.
 management_listen = "127.0.0.1:${DEIS_RUNTIME_MACHINE_PORT}"
 
 [fetch]
@@ -8226,37 +8230,45 @@ node_grpc_status() {
 # refused there. This one goes at the node directly, the way anything that can
 # route to the node's port can.
 #
-# The node serves the control plane over gRPC on that same port:
-# ApplyDeployment, UnloadApp, GetStatus, StartInspect, PushConfig and the
-# trigger service's OnQueue and OnScheduled. Every one of them is
-# administrative control of the node rather than application traffic, and they
-# used to be dispatched with no credential checked at all - so GetStatus
-# listed every tenant's applications on the node, UnloadApp took one offline
-# and the next request to it answered 500, StartInspect minted an inspector
-# session for another tenant's isolate, and ApplyDeployment would have run a
-# bundle of the caller's choosing under that tenant's endpoint.
+# The node serves the control plane over gRPC: ApplyDeployment, UnloadApp,
+# GetStatus, StartInspect, PushConfig and the trigger service's OnQueue and
+# OnScheduled. Every one of them is administrative control of the node rather
+# than application traffic, and all of them used to be dispatched on this
+# port, the one that carries public traffic, with no credential checked at all
+# - so GetStatus listed every tenant's applications on the node, UnloadApp
+# took one offline and the next request to it answered 500, StartInspect
+# minted an inspector session for another tenant's isolate, and
+# ApplyDeployment would have run a bundle of the caller's choosing under that
+# tenant's endpoint.
 #
-# For a while the answer was a shared value: whoever held the fleet key was
-# taken for the control plane. Nothing in this demo configures one any more,
-# and that has a consequence on this port worth stating plainly. A node with
-# no key cannot tell its control plane from anyone else, so it serves neither:
-# every management call on the data port is refused with UNAVAILABLE, with or
-# without a credential, because there is no credential left that would mean
-# anything. This is `Guard::Shut` in `deis-runtime::dispatcher::auth`, and it
-# is the reason the check below no longer has a "and the right key is served"
-# arm - there is no right key.
+# Then for a while they were refused here, on a shared value: whoever held the
+# fleet key was taken for the control plane. Both of those states are gone,
+# and what replaced the second one is worth stating precisely, because it is
+# not a stricter refusal - it is nothing to refuse. This port has no
+# management dispatcher on it at all. A POST to a management path is ordinary
+# application traffic and is answered as such: without an `x-deis-app-id`
+# header the node asks for one, and with a real one the path is handed to that
+# tenant's own code, which has no such route and says 404 with a trace id on
+# it. Neither answer carries a grpc-status, because no gRPC service saw the
+# request.
 #
-# What drives the node instead is the third socket, the one
+# That distinction is the whole check. "Refused" is a door with a lock, and a
+# lock is a thing that can be picked, misconfigured, or quietly opened by a
+# later change. "Not dispatched" is no door. So this asserts the shape of the
+# answers rather than a status code: a management path here looks exactly like
+# a request for a page the application does not have.
+#
+# What drives the node instead is the second socket, the one
 # `[machine_identity] management_listen` binds, where the caller proves a
 # certificate naming this node's control plane before it sends a request. A
-# plaintext caller does not get a connection to it at all, which is the second
-# probe below.
+# plaintext caller does not get a connection to it at all, which is the next
+# probe.
 #
 # The last two assertions are the other half - the platform still works -
 # because the control plane's own health poll has to reach the node somehow,
 # and a node it cannot reach is reported unhealthy. They are what says the
 # management plane moved rather than simply closed.
-check_the_node_management_plane_needs_the_node_key() {
+check_the_node_management_plane_is_not_on_the_data_port() {
   local title="a node is driven only over the socket where its control plane proves its name"
   local frame="${LOG_DIR}/verify-grpc-empty-frame.bin"
   # One uncompressed, zero-length message: a complete GetStatusRequest and a
@@ -8264,14 +8276,37 @@ check_the_node_management_plane_needs_the_node_key() {
   # bytes come from /dev/zero because a shell variable cannot carry a NUL.
   head -c 5 /dev/zero > "$frame"
 
-  local status_none status_wrong trigger_none status_key
-  status_none=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "" "$frame")
-  status_wrong=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "not-the-node-key" "$frame")
-  trigger_none=$(node_grpc_status "/deis.trigger.Trigger/OnScheduled" "" "$frame")
+  # No grpc-status on any of them, which is the assertion: a status would mean
+  # a gRPC service had seen the request and decided something about it.
+  local grpc_none grpc_wrong grpc_key grpc_trigger
+  grpc_none=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "" "$frame")
+  grpc_wrong=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "not-the-node-key" "$frame")
   # The value this demo used to configure everywhere, sent now that nothing
-  # configures it. It buys exactly as much as the wrong one above, which is
-  # the point: the door it used to open is not ajar, it is gone.
-  status_key=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "$SECRET" "$frame")
+  # configures it. It buys exactly as much as the wrong one above, and as much
+  # as bringing nothing: the door it used to open is not locked, it is gone.
+  grpc_key=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "$SECRET" "$frame")
+  grpc_trigger=$(node_grpc_status "/deis.trigger.Trigger/OnScheduled" "" "$frame")
+
+  # And what the port does answer, which is what says these are being read as
+  # application traffic rather than refused as management calls.
+  local without_app_id with_app_id trigger_with_app_id traced
+  without_app_id=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "content-type: application/grpc" -H "te: trailers" \
+    --data-binary "@${frame}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/deis.management.RuntimeManagement/GetStatus" 2>/dev/null || true)
+
+  local traced_headers="${LOG_DIR}/verify-node-management-path.headers"
+  with_app_id=$(curl -s -o /dev/null -D "$traced_headers" -w '%{http_code}' -X POST \
+    -H "content-type: application/grpc" -H "te: trailers" -H "x-deis-app-id: ${APP_ID}" \
+    --data-binary "@${frame}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/deis.management.RuntimeManagement/GetStatus" 2>/dev/null || true)
+  traced=$(tr -d '\r' < "$traced_headers" 2>/dev/null \
+    | awk 'tolower($1) == "x-deis-trace-id:" {print $2}' | head -n 1)
+
+  trigger_with_app_id=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "content-type: application/grpc" -H "te: trailers" -H "x-deis-app-id: ${APP_ID}" \
+    --data-binary "@${frame}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/deis.trigger.Trigger/OnScheduled" 2>/dev/null || true)
 
   # And the socket that does drive this node, asked in plaintext. A caller
   # that cannot prove the control plane's name never completes a handshake,
@@ -8295,14 +8330,16 @@ check_the_node_management_plane_needs_the_node_key() {
   healthy=$(jq -r --arg id "$NODE_ID" \
     '.nodes[] | select(.id == $id) | .healthy' < "$fleet" 2>/dev/null || true)
 
-  if [ "$status_none" = "14" ] && [ "$status_wrong" = "14" ] && [ "$trigger_none" = "14" ] \
-    && [ "$status_key" = "14" ] && [ "$plaintext_at_machine_plane" -ne 0 ] \
+  if [ -z "$grpc_none" ] && [ -z "$grpc_wrong" ] && [ -z "$grpc_key" ] && [ -z "$grpc_trigger" ] \
+    && [ "$without_app_id" = "400" ] && [ "$with_app_id" = "404" ] \
+    && [ "$trigger_with_app_id" = "404" ] && [ -n "$traced" ] \
+    && [ "$plaintext_at_machine_plane" -ne 0 ] \
     && [ "$still_serving" = "200" ] && [ "$healthy" = "true" ]; then
     pass_check "$title" \
-      "GetStatus at the node's own port answered grpc-status ${status_none} (UNAVAILABLE) with no credential, ${status_wrong} with a wrong one and ${status_key} with the fleet secret this demo used to configure everywhere - so nothing that can merely reach ${APP_ID} on this node can list its tenants, unload it or fire its cron, and there is no string that would change that. The trigger service's OnScheduled answered ${trigger_none} likewise. A plaintext call at the mutually authenticated plane on port ${DEIS_RUNTIME_MACHINE_PORT} got no response at all (curl exited ${plaintext_at_machine_plane}), because a caller that has not proved this node's control plane's name does not get a connection. ${APP_ID} still answers HTTP ${still_serving}, and the control plane reports ${NODE_ID} healthy, which is its own health poll getting through the one door that is open"
+      "GetStatus at the node's data port answered no grpc-status at all - with no credential, with a wrong one, and with the fleet secret this demo used to configure everywhere - and neither did the trigger service's OnScheduled. What it did answer is HTTP ${without_app_id} asking for an x-deis-app-id header, and with ${APP_ID}'s header on it, HTTP ${with_app_id} carrying trace id ${traced}: the path was handed to the application's own router, which has no such route. So there is no management call to refuse here and no string that would change that. A plaintext call at the mutually authenticated plane on port ${DEIS_RUNTIME_MACHINE_PORT} got no response at all (curl exited ${plaintext_at_machine_plane}), because a caller that has not proved this node's control plane's name does not get a connection. ${APP_ID} still answers HTTP ${still_serving}, and the control plane reports ${NODE_ID} healthy, which is its own health poll getting through the one door that is open"
   else
     fail_check "$title" \
-      "expected grpc-status 14 with no credential (got \"${status_none:-none}\"), with a wrong one (got \"${status_wrong:-none}\"), on OnScheduled (got \"${trigger_none:-none}\") and with the retired fleet secret (got \"${status_key:-none}\"), and a plaintext call at port ${DEIS_RUNTIME_MACHINE_PORT} to be refused at the handshake (curl exited ${plaintext_at_machine_plane}, expected non-zero). ${APP_ID} answered ${still_serving} (expected 200) and the control plane reports ${NODE_ID} healthy=${healthy:-unknown}"
+      "expected no grpc-status on the data port with no credential (got \"${grpc_none:-none}\"), a wrong one (got \"${grpc_wrong:-none}\"), the retired fleet secret (got \"${grpc_key:-none}\") or on OnScheduled (got \"${grpc_trigger:-none}\"); HTTP 400 without an app id (got ${without_app_id:-none}), 404 with one (got ${with_app_id:-none}) carrying a trace id (got \"${traced:-none}\"), and 404 for OnScheduled with one (got ${trigger_with_app_id:-none}); a plaintext call at port ${DEIS_RUNTIME_MACHINE_PORT} refused at the handshake (curl exited ${plaintext_at_machine_plane}, expected non-zero). ${APP_ID} answered ${still_serving} (expected 200) and the control plane reports ${NODE_ID} healthy=${healthy:-unknown}"
   fi
 }
 
@@ -9509,7 +9546,7 @@ verify_demo() {
   check_a_scoped_token_reaches_one_environment_and_no_other
   check_a_credential_cannot_wire_an_app_to_one_it_cannot_see
   check_a_scoped_token_cannot_unload_an_application_from_a_node
-  check_the_node_management_plane_needs_the_node_key
+  check_the_node_management_plane_is_not_on_the_data_port
   check_a_wide_credential_cannot_mint_a_storage_token
   check_a_revoked_token_stops_at_its_next_call
   check_the_audit_log_names_who_changed_what

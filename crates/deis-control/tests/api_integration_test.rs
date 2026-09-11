@@ -248,14 +248,22 @@ async fn wait_for_port_closed(addr: std::net::SocketAddr) -> bool {
 /// The two credentials of the assembled router, checked where they are
 /// actually composed rather than one middleware at a time.
 ///
-/// `api_auth_enabled` governs the dashboard and the human API. It must not
-/// reach the endpoints that serve nodes: one of them answers with every
-/// environment's decrypted secrets, so it authenticates with
-/// `node_preshared_keys` whatever that flag says - and it does not accept a
-/// dashboard key, because the dashboard is deliberately unable to read a
-/// secret back.
+/// The value this installation's fleet key used to be. Nothing configures it
+/// any more; it is passed where a node credential used to be passed, so that
+/// the tests say "whatever string a caller brings" rather than leaving the
+/// case untested.
+const RETIRED_FLEET_KEY: &str = "node-psk";
+
+/// `api_auth_enabled` governs the dashboard and the human API, and that is
+/// the whole of what this listener has. The paths a node used to call are not
+/// mounted here at all, so the question "does the dashboard flag reach them"
+/// has no subject: there is nothing on this port for any credential to open.
+///
+/// The string below is the value this installation's fleet key used to be. It
+/// is passed deliberately, because what is being asserted is that it is now
+/// just a string - one more credential this listener has never heard of.
 #[tokio::test]
-async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_else() {
+async fn the_human_listener_serves_the_api_key_and_nothing_a_node_used_to_call() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -263,7 +271,6 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
     let config = ControlConfig {
         api_auth_enabled: true,
         api_keys: vec!["dashboard-key".to_string()],
-        node_preshared_keys: vec!["node-psk".to_string()],
         ..Default::default()
     };
     let database = Arc::new(Database::init(":memory:").await.unwrap());
@@ -323,7 +330,8 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
     // The other two never reach the routing table to find that out: this
     // listener authenticates before it looks, so no credential and a
     // credential that is not an operator's are both refused at the gate.
-    for credential in [None, Some("node-psk")] {
+    // `RETIRED_FLEET_KEY` is in that second class now, which is the point.
+    for credential in [None, Some(RETIRED_FLEET_KEY)] {
         assert_eq!(
             status_of(ASSIGNMENTS, credential).await,
             StatusCode::UNAUTHORIZED,
@@ -338,7 +346,7 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
         StatusCode::OK
     );
     assert_eq!(
-        status_of("/api/apps", Some("node-psk")).await,
+        status_of("/api/apps", Some(RETIRED_FLEET_KEY)).await,
         StatusCode::UNAUTHORIZED
     );
 
@@ -367,7 +375,7 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
     // What used to be the interesting line, the fleet key answering 200, is
     // gone with the route.
     assert_eq!(register(Some("dashboard-key")).await, StatusCode::NOT_FOUND);
-    for credential in [None, Some("node-psk")] {
+    for credential in [None, Some(RETIRED_FLEET_KEY)] {
         assert_eq!(
             register(credential).await,
             StatusCode::UNAUTHORIZED,
@@ -396,7 +404,6 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
     let config = ControlConfig {
         api_auth_enabled: true,
         api_keys: vec!["the-operators-old-key".to_string()],
-        node_preshared_keys: vec!["node-psk".to_string()],
         ..Default::default()
     };
     let database = Arc::new(Database::init(":memory:").await.unwrap());
@@ -658,21 +665,23 @@ async fn the_dashboards_restart_body_is_the_one_the_control_plane_accepts() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// The blocker in its own right: a control plane assembled from a
-/// configuration that names no node key must not serve the node endpoints to
-/// anyone. "Unconfigured" used to mean "unguarded" here, so anyone who could
-/// reach the port could inject a node into the fleet.
+/// The listener a browser reaches must not be a way onto the fleet, whatever
+/// it answers.
+///
+/// This began as a narrower claim - that a control plane naming no node key
+/// must not serve the node endpoints, because "unconfigured" used to mean
+/// "unguarded" and anyone who could reach the port could inject a node. Both
+/// the key and those endpoints are gone, so the narrow claim has no subject.
+/// The wide one is what mattered and is asserted below: a machine gets onto
+/// the fleet by proving a certificate on the machine channel, and there is no
+/// second door.
 #[tokio::test]
-async fn a_router_built_without_a_node_key_registers_nobody() {
+async fn nothing_joins_the_fleet_through_the_human_listener() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     let config = ControlConfig::default();
-    assert!(
-        config.node_preshared_keys.is_empty(),
-        "the default is the case this test is about"
-    );
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
     let config_manager = Arc::new(ConfigManager::new(
@@ -819,10 +828,22 @@ async fn a_stop_signal_drains_in_flight_requests_before_the_server_stops() {
         .expect("the server reported an error while stopping");
 }
 
-/// The REST API and the node gRPC channel share one port, and the node
-/// side speaks HTTP/2 without TLS. This is the round trip that proves the
-/// serving path still carries both: a REST call and a gRPC handshake
-/// against the same address, with the drain wired in.
+/// One port carries two protocols, and admits a machine on neither.
+///
+/// The REST API and the control gRPC service are mounted on the same
+/// listener, and hyper tells them apart by sniffing the HTTP/2 preface rather
+/// than by anything configured. This is the round trip that proves the
+/// serving path still carries both - a REST call and a full gRPC handshake
+/// against one address, with the drain wired in.
+///
+/// It used to end by asserting the handshake succeeded, because a fleet key
+/// in that message was what admitted a node. What admits one now is a
+/// certificate proved on the connection, and this connection is plaintext on
+/// the listener a browser reaches, so the handshake is answered and refused.
+/// Asserted here as well as in `api::grpc`'s own tests because this is the
+/// assembled router - the shape the binary serves - and a shared port is
+/// exactly where a second way in would appear without anyone deciding to add
+/// one.
 #[tokio::test]
 async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
     use deis_wire::pb::{
@@ -831,7 +852,6 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
     };
 
     let config = ControlConfig {
-        node_preshared_keys: vec!["node-psk".to_string()],
         ..Default::default()
     };
     let database = Arc::new(Database::init(":memory:").await.unwrap());
@@ -887,7 +907,7 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
         .send(ControlMessage {
             payload: Some(Payload::Authenticate(AuthenticateRequest {
                 instance_id: "test-node".to_string(),
-                secret: "node-psk".to_string(),
+                secret: RETIRED_FLEET_KEY.to_string(),
             })),
         })
         .await
@@ -904,7 +924,11 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
         .expect("the node channel failed")
         .expect("the node channel closed without answering");
     match reply.payload {
-        Some(Payload::AuthResponse(response)) => assert!(response.success),
+        Some(Payload::AuthResponse(response)) => assert!(
+            !response.success,
+            "the shared port carries the protocol but admits nobody on it: {}",
+            response.message
+        ),
         other => panic!("expected an auth response, got {other:?}"),
     }
 

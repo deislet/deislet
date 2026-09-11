@@ -261,15 +261,14 @@ fn announce_acme(system: &SystemConfig, settings: &deis_proxy::config::system::A
 /// Load this proxy's machine-channel identity: the certificate it presents on
 /// that channel, and the material behind it kept fresh on disk.
 ///
-/// Two things use it once this table is present. The routing-table poller
-/// fetches the catalog's table over the machine channel instead of over HTTP
-/// with the fleet secret (`deis_proxy::catalog::client`), and the long-lived
-/// gRPC control channel - registration, heartbeats, commands, configuration
-/// pushes - runs on a mutual-TLS connection to the same listener instead of a
-/// plaintext dial of `[control] addr` (`deis_proxy::control::client`). Neither
-/// needs `control.secret`: the control plane admits both by the name this
-/// certificate proves, so a proxy with this table can leave that line out of
-/// its file. See `control::client::machine_channel`.
+/// Two things use it, and neither has another way to work. The routing-table
+/// poller fetches the catalog's table over the machine channel
+/// (`deis_proxy::catalog::client`), and the long-lived gRPC control channel -
+/// registration, heartbeats, commands, configuration pushes - runs on a
+/// mutual-TLS connection to the same listener (`deis_proxy::control::client`).
+/// The control plane admits both by the name this certificate proves; there is
+/// no `control.secret` any more and nothing a caller could bring instead. See
+/// `control::client::machine_channel`.
 ///
 /// Fails rather than starting with a `[machine_identity]` table that cannot
 /// load. Starting anyway would leave [`MachineIdentityWatch`] re-reading
@@ -529,10 +528,10 @@ fn main() -> Result<()> {
         )),
         None => {
             info!(
-                "no machine_identity configured; this proxy holds no certificate on the machine \
-                 channel and authenticates to the control plane exactly as it does today - the \
-                 routing table fetched over HTTP with the fleet-wide secret, and the control \
-                 channel a plaintext dial of [control] addr presenting the same secret"
+                "no machine_identity configured; this proxy holds no certificate and so reaches \
+                 no control plane at all - it serves whatever its own file routes and fetches no \
+                 routing table. A configuration naming [control] without [machine_identity] is \
+                 refused before this point, so reaching here means standalone was asked for"
             );
             None
         }

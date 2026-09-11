@@ -3,8 +3,8 @@
 //! # What this is for
 //!
 //! The control plane, the runtime nodes and the proxy have to recognise each
-//! other. Until now they did it with `node_preshared_keys`: one secret, shared
-//! by the whole fleet, presented as a bearer token. Any holder of that one
+//! other. They used to do it with `node_preshared_keys`: one secret, shared by
+//! the whole installation, presented as a bearer token. Any holder of that one
 //! value could register as any node, pull every application's decrypted
 //! secrets, download any bundle, read the whole routing table and drive a
 //! node's management plane as if it were the control plane. A copy of a

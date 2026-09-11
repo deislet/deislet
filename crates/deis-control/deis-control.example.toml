@@ -20,34 +20,57 @@ port = 8080
 heartbeat_interval = 30
 heartbeat_timeout = 90
 
-# Node pre-shared keys.
+# ========================================
+# The machine channel
+# ========================================
 #
-# One credential, used on every channel the platform's own processes talk on:
-#   - the gRPC registration handshake, which both a runtime node and
-#     deis-proxy open,
-#   - PUT/DELETE /api/nodes/{node_id}/registration, by which a node puts
-#     itself on the fleet list,
-#   - the two HTTP endpoints a runtime node reads from,
-#     GET /api/nodes/{node_id}/assignments and the bundle download, and
-#   - GET /api/routing-table, which deis-proxy polls for the whole routing
-#     table (see the section on routing below).
+# Deislet's own processes - runtime nodes and deis-proxy - do not talk to the
+# port above. They talk here, and they prove who they are with a certificate
+# rather than with a password.
 #
-# The assignment list answers with every environment's DECRYPTED secrets,
-# because a node that restarts has to come back with the environment it
-# had. So those endpoints authenticate with this list whatever
-# api_auth_enabled says below, and an API key is not accepted on them.
+# Why a listener of its own: the answers served on it are the platform's most
+# sensitive. An assignment list carries every environment's DECRYPTED secrets,
+# because a node that restarts has to come back with the environment it had,
+# and the routing table is a map of every hostname on the platform. This used
+# to ride on the same socket as the dashboard, guarded by one string that
+# every node in the fleet held a copy of - so whoever held that one string
+# could read all of it. Bind this to an interface your nodes reach and nothing
+# else does.
 #
-# Leave this empty and the control plane cannot tell a node from any other
-# caller, so it serves none of them: those endpoints answer 503 and no node
-# can register, fetch assignments or download a bundle. Rather than start
-# that way, the control plane generates a key on startup and prints it once
-# in a WARN line - copy it into this list and into every node, because it is
-# a different key after the next restart.
+# Leave the whole section out and this control plane serves no machine channel
+# at all: no node can register, fetch assignments or download a bundle, and no
+# proxy can fetch a routing table. It will still serve the dashboard.
 #
-#   openssl rand -hex 32
-node_preshared_keys = [
-    "your-node-psk-here-change-this-in-production"
-]
+# [machine]
+# bind_addr = "10.0.0.1"
+# port = 8443
+#
+# This control plane's own certificate chain, end-entity certificate first,
+# and the private key belonging to it. The certificate must carry a SPIFFE URI
+# in its subjectAltName naming this control plane, e.g.
+# spiffe://deis.internal/control.
+# certificate = "/etc/deislet/control.crt.pem"
+# private_key = "/etc/deislet/control.key.pem"
+#
+# What every caller's certificate must chain to. A node or proxy that cannot
+# chain to this, or whose certificate names something other than a machine of
+# this installation, has its connection closed during the handshake - before
+# any request exists to answer.
+# trust_root = "/etc/deislet/fleet-ca.crt.pem"
+#
+# How often the three files above are re-read, in seconds. This is the longest
+# a renewal can go unnoticed, so it wants to be far shorter than the shortest
+# certificate lifetime in use. A rotation needs no restart.
+# identity_reload_seconds = 60
+#
+# The address nodes reach this listener at. Bundle URLs in an assignment are
+# built from it, and it is served here rather than on the dashboard port, so
+# public_base_url - which names where a browser finds the dashboard - is the
+# wrong address to hand a node.
+# public_base_url = "https://10.0.0.1:8443"
+#
+# Nothing here issues, renews or revokes certificates; that is your PKI's job.
+# Any CA that can mint a certificate with a URI subjectAltName will do.
 
 # ========================================
 # API authentication configuration
@@ -81,9 +104,10 @@ node_preshared_keys = [
 # that IS presented is held to its scopes whatever this setting says. The audit
 # log is written either way, attributing an unauthenticated call to "anonymous".
 #
-# It does NOT cover the node endpoints, which always use
-# node_preshared_keys - see above. Turning this off makes a dashboard
-# convenient; it must never be able to publish the platform's secrets.
+# It does not reach the machine channel at all: that is a different listener
+# on a different port, and what admits a caller there is a certificate, not
+# anything set here. Turning this off makes a dashboard convenient; it must
+# never be able to publish the platform's secrets.
 api_auth_enabled = true
 
 # Origins a web page may read this control plane's answers from
@@ -149,10 +173,10 @@ api_keys = [
 # Which runtime nodes exist
 # ========================================
 
-# A node normally puts itself on the fleet list: it calls
-#   PUT /api/nodes/{node_id}/registration  {"address": "http://host:8086"}
-# with a node_preshared_keys value, and from then on it receives deployment
-# pushes and is eligible to run cron occurrences. So this list is a
+# A node normally puts itself on the fleet list: it opens a connection to the
+# machine channel, proves a certificate naming itself, and calls Register with
+# the address it can be driven at. From then on it receives deployment pushes
+# and is eligible to run cron occurrences. So this list is a
 # fallback, not the source of truth, and a machine can join a running
 # platform without this file being edited.
 #
@@ -265,8 +289,9 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # only a new name needs a decision. GET /api/domains is then the list of who
 # holds what.
 #
-# deis-proxy reads the whole table from GET /api/routing-table, with a
-# node_preshared_keys value, and swaps it in as one piece. There is nothing
+# deis-proxy reads the whole table over the machine channel, on a connection
+# where it proved a certificate naming itself as a proxy of this installation,
+# and swaps the table in as one piece. There is nothing
 # to configure here: the polling interval belongs to the edge, in
 # deis-proxy's own [routing] section, together with preview_zone - the
 # domain under which every environment gets an automatic address. Those two
@@ -405,7 +430,8 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # ========================================
 
 # 1. Copy this file to deis-control.toml
-# 2. Change node_preshared_keys and api_keys to secure random strings
+# 2. Change api_keys to secure random strings, and fill in the [machine]
+#    section with this control plane's certificate, key and trust root
 # 3. To enable the API key requirement, set api_auth_enabled = true
 # 3a. Then create accounts and scoped tokens with `deis account create` and
 #     `deis token create`, and empty api_keys - see the note above it
@@ -423,13 +449,11 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # Endpoints that do not require an API key:
 # - /health - Health check, and the only one. It answers a constant, so a
 #   prober learns nothing a TCP connect had not already told it.
-# - the node endpoints, which require a node_preshared_keys value
-#   instead:
-#     PUT    /api/nodes/{node_id}/registration
-#     DELETE /api/nodes/{node_id}/registration
-#     GET    /api/nodes/{node_id}/assignments
-#     GET    /api/apps/{app_id}/versions/{version_id}/bundle
-#     GET    /api/routing-table
+#
+# The calls Deislet's own processes make are not on this port at all. They are
+# served on the [machine] listener, which demands a certificate: Register and
+# Deregister, FetchAssignments, FetchRoutingTable, and the bundle download at
+# GET /api/apps/{app_id}/versions/{version_id}/bundle.
 
 # ========================================
 # Security recommendations

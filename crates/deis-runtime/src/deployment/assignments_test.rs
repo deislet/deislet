@@ -3,12 +3,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::get;
-use axum::Json;
 use axum::Router;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+use deis_identity::{names, MachineIdentity, Protocol, SpiffeId};
+use deis_identity_test_pki::{write_files, TestCa};
+use deis_wire::machine::machine_channel_server::{MachineChannel, MachineChannelServer};
+use deis_wire::machine::{
+    DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
+    FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
+    RegisterNodeRequest, RegisterNodeResponse,
+};
+use tonic::service::Routes;
+use tonic::transport::Endpoint;
+use tonic::Status;
 
 use super::*;
 use crate::app::{AppKey, ApplicationManager};
@@ -17,6 +27,13 @@ use crate::deployment::sha256_hex;
 use crate::deployment::NodeRegistration;
 
 const HANDLER: &str = "export default function handler() { return new Response('ok'); }";
+
+/// The trust domain every certificate minted in this file is issued into.
+/// Arbitrary - nothing here talks to a real fleet - but shared by every
+/// stand-in control plane and every node identity a test mints, because a
+/// certificate naming the wrong trust domain is refused at the handshake
+/// exactly the way one naming the wrong machine is.
+const TRUST_DOMAIN: &str = "deis.internal";
 
 fn bundle(app: &str) -> (Vec<u8>, String) {
     let manifest = serde_json::json!({
@@ -49,83 +66,203 @@ fn bundle(app: &str) -> (Vec<u8>, String) {
     (buf, sha)
 }
 
-/// A stand-in control plane that serves an assignment list and the bundle it
-/// points at, exactly as deis-control does.
+/// A node identity `ca` signed, so a client built from it completes a real
+/// handshake against a listener the same authority signed.
 ///
-/// The listener is bound before the router is built so that the assignment
-/// list can name this server's own address, which is what the node has to
-/// download from.
-struct ControlPlane {
-    base: String,
-    /// The list this plane serves. Behind a lock so a test can change what
-    /// the control plane says between two reconciliations, which is the whole
-    /// point of reconciling.
-    assignments: Arc<parking_lot::Mutex<serde_json::Value>>,
-    /// Whether the plane claims its answer is the whole truth, and how many
-    /// assignments it says it left out. Real deis-control sends both headers
-    /// on every answer.
-    completeness: Arc<parking_lot::Mutex<(bool, u32)>>,
-    /// One permit per time the assignments route has been entered, so a test
-    /// can wait for the request to be in flight without a timer.
-    asked: Arc<tokio::sync::Semaphore>,
-    /// The assignments route answers only while this is true. Starts true, so
-    /// a test that does not care about the timing never notices it.
-    open: tokio::sync::watch::Sender<bool>,
-    _task: tokio::task::JoinHandle<()>,
+/// Nothing keeps the directory the files were written to: an identity reads
+/// its files once at load and only again on an explicit reload, which
+/// nothing in this module asks for.
+fn node_identity(ca: &TestCa, node_id: &str) -> Arc<MachineIdentity> {
+    let directory = tempfile::tempdir().unwrap();
+    let name = names::node(TRUST_DOMAIN, node_id).unwrap();
+    let files = write_files(directory.path(), "node", &ca.issue(&name), &ca.root_pem);
+    let identity = Arc::new(MachineIdentity::load(files.as_identity_files(), &[]).unwrap());
+    drop(directory);
+    identity
 }
 
-#[derive(Clone)]
-struct PlaneState {
+/// Serve `service` as `deis.machine.MachineChannel` over mutual TLS on a
+/// fresh loopback port, presenting a certificate `ca` issues for this
+/// fleet's control name, and hand back the endpoint to dial and the name it
+/// proves.
+///
+/// Every stand-in control plane in this file needs this same wiring, so that
+/// driving a test through [`AssignmentClient::over_machine_channel`] or
+/// [`NodeRegistrar::over_machine_channel`] completes the same connector and
+/// the same mutual TLS handshake a real node uses. What
+/// `node_preshared_keys` used to prove - that the caller is a node - is now
+/// this handshake, and a stand-in that skipped it would no longer be
+/// exercising the thing that replaced the fleet key.
+fn serve_machine_channel(ca: &TestCa, service: impl MachineChannel) -> (String, SpiffeId) {
+    let control_name = names::control(TRUST_DOMAIN).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let files = write_files(
+        directory.path(),
+        "control",
+        &ca.issue(&control_name),
+        &ca.root_pem,
+    );
+    let identity =
+        Arc::new(MachineIdentity::load(files.as_identity_files(), &[Protocol::Http2]).unwrap());
+    drop(directory);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let tls = RustlsConfig::from_config(identity.server_config());
+    let acceptor = RustlsAcceptor::new(tls);
+    let app = Routes::default()
+        .add_service(MachineChannelServer::new(service))
+        .into_axum_router();
+    tokio::spawn(async move {
+        let _ = axum_server::from_tcp(listener)
+            .acceptor(acceptor)
+            .serve(app.into_make_service())
+            .await;
+    });
+
+    (format!("https://{address}"), control_name)
+}
+
+/// What `FetchAssignments` answers with, shared by every dynamic case below.
+///
+/// Behind locks so a test can change what the control plane says between two
+/// reconciliations - the whole point of reconciling - and behind a watch
+/// channel so a test can hold an answer open and make something happen on
+/// the node while the request is in flight.
+struct AssignmentsService {
     assignments: Arc<parking_lot::Mutex<serde_json::Value>>,
+    /// Whether this plane claims its answer is the whole truth, and how many
+    /// assignments it says it left out. Real deis-control sends both on
+    /// every answer.
     completeness: Arc<parking_lot::Mutex<(bool, u32)>>,
-    bundle: Arc<Vec<u8>>,
-    status: StatusCode,
-    /// When set, both routes answer 401 unless the request presents it, the
-    /// way deis-control does once `node_preshared_keys` is configured.
-    required_key: Option<String>,
+    /// Set instead of an answer for the one case a node has to tell apart
+    /// from an empty fleet: the control plane refusing the call outright.
+    refusal: Arc<parking_lot::Mutex<Option<Status>>>,
+    /// One permit per time the route has been entered, so a test can wait
+    /// for the request to be in flight without a timer.
     asked: Arc<tokio::sync::Semaphore>,
+    /// The route answers only while this is true. Starts true, so a test
+    /// that does not care about the timing never notices it.
     open: tokio::sync::watch::Receiver<bool>,
 }
 
-impl PlaneState {
-    fn authorised(&self, headers: &axum::http::HeaderMap) -> bool {
-        let Some(required) = &self.required_key else {
-            return true;
-        };
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == format!("Bearer {required}"))
+#[tonic::async_trait]
+impl MachineChannel for AssignmentsService {
+    async fn fetch_assignments(
+        &self,
+        _request: tonic::Request<FetchAssignmentsRequest>,
+    ) -> Result<tonic::Response<FetchAssignmentsResponse>, Status> {
+        if let Some(status) = self.refusal.lock().clone() {
+            return Err(status);
+        }
+
+        self.asked.add_permits(1);
+        let mut open = self.open.clone();
+        while !*open.borrow_and_update() {
+            if open.changed().await.is_err() {
+                break;
+            }
+        }
+
+        let (complete, withheld) = *self.completeness.lock();
+        Ok(tonic::Response::new(FetchAssignmentsResponse {
+            assignments_json: self.assignments.lock().to_string(),
+            complete,
+            withheld,
+        }))
+    }
+
+    // Registration and deregistration are on this channel too, and nothing
+    // under test through this stand-in makes either call: these cases cover
+    // reconciliation, which only ever fetches assignments. Answered rather
+    // than left out because the trait requires every RPC of the service, and
+    // a stand-in that answered one of them with something plausible would
+    // let a test start depending on an answer no control plane gave.
+    async fn register(
+        &self,
+        _request: tonic::Request<RegisterNodeRequest>,
+    ) -> Result<tonic::Response<RegisterNodeResponse>, Status> {
+        Err(Status::unimplemented(
+            "this stand-in only serves FetchAssignments",
+        ))
+    }
+
+    async fn deregister(
+        &self,
+        _request: tonic::Request<DeregisterNodeRequest>,
+    ) -> Result<tonic::Response<DeregisterNodeResponse>, Status> {
+        Err(Status::unimplemented(
+            "this stand-in only serves FetchAssignments",
+        ))
+    }
+
+    async fn fetch_routing_table(
+        &self,
+        _request: tonic::Request<FetchRoutingTableRequest>,
+    ) -> Result<tonic::Response<FetchRoutingTableResponse>, Status> {
+        Err(Status::unimplemented(
+            "this stand-in only serves FetchAssignments",
+        ))
     }
 }
 
+/// A stand-in control plane that serves an assignment list over the machine
+/// channel, under mutual TLS, and the bundle it points at over plain HTTP -
+/// exactly as deis-control does: one door for the list, mutually
+/// authenticated because it carries every environment's decrypted secrets,
+/// and one for the bytes, addressed by whatever URL the list names and never
+/// guarded by how that list arrived (see `deis_runtime::deployment::fetch`).
+///
+/// Both listeners are bound before either router is built, so the assignment
+/// list can name this server's own bundle address, which is what the node
+/// has to download from.
+struct ControlPlane {
+    /// Where this plane serves `/bundle`, over plain HTTP.
+    base: String,
+    /// Where this plane serves `deis.machine.MachineChannel`, over mutual
+    /// TLS.
+    machine_endpoint: String,
+    /// The authority that signed this plane's own certificate and every node
+    /// identity [`Self::node_identity`] hands out - the same one, so a node
+    /// built from it completes a real handshake against this plane's
+    /// listener.
+    ca: TestCa,
+    /// The name this plane's own machine listener proves.
+    control_identity: SpiffeId,
+    assignments: Arc<parking_lot::Mutex<serde_json::Value>>,
+    completeness: Arc<parking_lot::Mutex<(bool, u32)>>,
+    refusal: Arc<parking_lot::Mutex<Option<Status>>>,
+    asked: Arc<tokio::sync::Semaphore>,
+    open: tokio::sync::watch::Sender<bool>,
+    _bundle_task: tokio::task::JoinHandle<()>,
+}
+
 impl ControlPlane {
-    /// `entries` are `(app_id, version_id, bundle_path)`; every one of them is
-    /// pointed at this server's `bundle_path`, so a path other than `/bundle`
-    /// stands for a URL that does not resolve.
-    async fn serving(
-        entries: &[(&str, &str, &str)],
-        bundle: Vec<u8>,
-        bundle_sha: &str,
-        status: StatusCode,
-    ) -> Self {
-        Self::guarded(entries, bundle, bundle_sha, status, None).await
-    }
+    /// `entries` are `(app_id, version_id, bundle_path)`; every one of them
+    /// is pointed at this server's `bundle_path`, so a path other than
+    /// `/bundle` stands for a URL that does not resolve.
+    async fn serving(entries: &[(&str, &str, &str)], bundle: Vec<u8>, bundle_sha: &str) -> Self {
+        let bundle_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", bundle_listener.local_addr().unwrap());
+        let bundle = Arc::new(bundle);
+        let bundle_router = Router::new().route(
+            "/bundle",
+            get(move || {
+                let bundle = Arc::clone(&bundle);
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(bundle.as_ref().clone()))
+                        .unwrap()
+                }
+            }),
+        );
+        let bundle_task = tokio::spawn(async move {
+            let _ = axum::serve(bundle_listener, bundle_router).await;
+        });
 
-    /// The same, but demanding a node key on both routes.
-    async fn guarded(
-        entries: &[(&str, &str, &str)],
-        bundle: Vec<u8>,
-        bundle_sha: &str,
-        status: StatusCode,
-        required_key: Option<&str>,
-    ) -> Self {
-        let required_key = required_key.map(str::to_string);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base = format!("http://{addr}");
-
-        let assignments = serde_json::Value::Array(
+        let assignments = Arc::new(parking_lot::Mutex::new(serde_json::Value::Array(
             entries
                 .iter()
                 .map(|(app_id, version_id, path)| {
@@ -138,88 +275,64 @@ impl ControlPlane {
                     })
                 })
                 .collect(),
-        );
-
-        let assignments = Arc::new(parking_lot::Mutex::new(assignments));
+        )));
         let completeness = Arc::new(parking_lot::Mutex::new((true, 0u32)));
+        let refusal: Arc<parking_lot::Mutex<Option<Status>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         let asked = Arc::new(tokio::sync::Semaphore::new(0));
         let (open, open_rx) = tokio::sync::watch::channel(true);
-        let state = PlaneState {
-            assignments: assignments.clone(),
-            completeness: completeness.clone(),
-            bundle: Arc::new(bundle),
-            status,
-            required_key,
-            asked: asked.clone(),
-            open: open_rx,
-        };
-        let router = Router::new()
-            .route(
-                "/api/nodes/:id/assignments",
-                get(
-                    |State(state): State<PlaneState>,
-                     AxumPath(_id): AxumPath<String>,
-                     headers: axum::http::HeaderMap| async move {
-                        if !state.authorised(&headers) {
-                            return StatusCode::UNAUTHORIZED.into_response();
-                        }
-                        state.asked.add_permits(1);
-                        let mut open = state.open.clone();
-                        while !*open.borrow_and_update() {
-                            if open.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                        if state.status != StatusCode::OK {
-                            return state.status.into_response();
-                        }
-                        let (complete, withheld) = *state.completeness.lock();
-                        let mut response = Json(state.assignments.lock().clone()).into_response();
-                        let headers = response.headers_mut();
-                        headers.insert(
-                            "x-deis-assignments-complete",
-                            if complete { "true" } else { "false" }.parse().unwrap(),
-                        );
-                        headers.insert(
-                            "x-deis-assignments-withheld",
-                            withheld.to_string().parse().unwrap(),
-                        );
-                        response
-                    },
-                ),
-            )
-            .route(
-                "/bundle",
-                get(
-                    |State(state): State<PlaneState>, headers: axum::http::HeaderMap| async move {
-                        if !state.authorised(&headers) {
-                            return StatusCode::UNAUTHORIZED.into_response();
-                        }
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .body(Body::from(state.bundle.as_ref().clone()))
-                            .unwrap()
-                            .into_response()
-                    },
-                ),
-            )
-            .with_state(state);
 
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
-        });
+        let ca = TestCa::new();
+        let (machine_endpoint, control_identity) = serve_machine_channel(
+            &ca,
+            AssignmentsService {
+                assignments: assignments.clone(),
+                completeness: completeness.clone(),
+                refusal: refusal.clone(),
+                asked: asked.clone(),
+                open: open_rx,
+            },
+        );
+
         Self {
             base,
+            machine_endpoint,
+            ca,
+            control_identity,
             assignments,
             completeness,
+            refusal,
             asked,
             open,
-            _task: task,
+            _bundle_task: bundle_task,
         }
+    }
+
+    /// A plane that refuses every `FetchAssignments` call with `status`,
+    /// instead of answering with a list - for the one case a node has to
+    /// tell apart from an empty fleet: the control plane refusing outright.
+    async fn refusing(status: Status) -> Self {
+        let plane = Self::serving(&[], Vec::new(), "").await;
+        *plane.refusal.lock() = Some(status);
+        plane
     }
 
     fn base(&self) -> &str {
         &self.base
+    }
+
+    fn machine_endpoint(&self) -> &str {
+        &self.machine_endpoint
+    }
+
+    /// A node identity this plane's own authority signed, so a client built
+    /// from it completes a real handshake against this plane's listener.
+    fn node_identity(&self, node_id: &str) -> Arc<MachineIdentity> {
+        node_identity(&self.ca, node_id)
+    }
+
+    fn control_identity(&self) -> SpiffeId {
+        self.control_identity.clone()
     }
 
     /// Replace the list this plane serves, as a deploy, a rollback or a
@@ -235,20 +348,21 @@ impl ControlPlane {
         *self.completeness.lock() = (false, withheld);
     }
 
-    /// Answer completely again, as a control plane does once whatever stopped
-    /// it describing an assignment is fixed.
+    /// Answer completely again, as a control plane does once whatever
+    /// stopped it describing an assignment is fixed.
     fn answers_completely(&self) {
         *self.completeness.lock() = (true, 0);
     }
 
-    /// Hold the assignments answer open until [`Self::answers_now`], so a test
-    /// can make something happen on the node while the request is in flight.
+    /// Hold the assignments answer open until [`Self::answers_now`], so a
+    /// test can make something happen on the node while the request is in
+    /// flight.
     fn holds_its_answer(&self) {
         self.open.send(false).unwrap();
     }
 
-    /// Wait until the assignments route has been entered. No timer: the route
-    /// hands out a permit as it is entered.
+    /// Wait until the assignments route has been entered. No timer: the
+    /// route hands out a permit as it is entered.
     async fn was_asked(&self) {
         self.asked.acquire().await.unwrap().forget();
     }
@@ -277,24 +391,11 @@ impl ControlPlane {
 }
 
 async fn deployer(dir: &std::path::Path, apps: Arc<ApplicationManager>) -> Arc<DeploymentManager> {
-    deployer_for(dir, apps, None, None).await
-}
-
-/// A deployment manager configured the way a node's TOML would configure it,
-/// so the bundle download presents the same credential the real one does.
-async fn deployer_for(
-    dir: &std::path::Path,
-    apps: Arc<ApplicationManager>,
-    endpoint: Option<&str>,
-    secret: Option<&str>,
-) -> Arc<DeploymentManager> {
     let mut config = RuntimeConfig {
         data_dir: dir.to_path_buf(),
         ..Default::default()
     };
     config.bundles.dir = Some(dir.join("bundles"));
-    config.control.endpoint = endpoint.map(str::to_string);
-    config.control.secret = secret.map(str::to_string);
     Arc::new(
         DeploymentManager::from_config(apps, &config, None)
             .await
@@ -302,8 +403,31 @@ async fn deployer_for(
     )
 }
 
-fn client(base: &str, node_id: &str) -> AssignmentClient {
-    AssignmentClient::new(base, node_id, Duration::from_secs(10), None).unwrap()
+fn client(plane: &ControlPlane, node_id: &str) -> AssignmentClient {
+    AssignmentClient::over_machine_channel(
+        plane.machine_endpoint(),
+        node_id,
+        Duration::from_secs(10),
+        plane.node_identity(node_id),
+        plane.control_identity(),
+    )
+    .unwrap()
+}
+
+/// A client pointed at a machine endpoint nothing answers on, for the tests
+/// that check what a node does when it cannot reach its control plane at
+/// all. The identity is real but signed by its own throwaway authority: the
+/// connection never gets far enough for that to matter, because nothing is
+/// listening at all.
+fn unreachable_client(machine_endpoint: &str, node_id: &str) -> AssignmentClient {
+    AssignmentClient::over_machine_channel(
+        machine_endpoint,
+        node_id,
+        Duration::from_secs(10),
+        test_identity(node_id),
+        names::control(TRUST_DOMAIN).unwrap(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -311,11 +435,11 @@ async fn a_node_loads_everything_the_control_plane_assigned_it() {
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let outcome = Reconciler::new(&client, &deployer).once().await.unwrap();
 
     assert_eq!(outcome.assigned, 1);
@@ -333,7 +457,7 @@ async fn an_inflight_assignment_prepares_without_starting_the_current_version() 
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
     plane.now_assigns(serde_json::json!([{
         "app_id": "demo",
         "version_id": "v1",
@@ -347,7 +471,7 @@ async fn an_inflight_assignment_prepares_without_starting_the_current_version() 
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let mut reconciler = Reconciler::new(&client, &deployer);
     let prepared = reconciler.once().await.unwrap();
     let key = AppKey::production("demo");
@@ -476,11 +600,11 @@ fn debugging_an_assignment_never_prints_a_secret() {
 #[tokio::test]
 async fn an_empty_assignment_list_is_a_valid_answer() {
     let dir = tempfile::tempdir().unwrap();
-    let plane = ControlPlane::serving(&[], Vec::new(), "", StatusCode::OK).await;
+    let plane = ControlPlane::serving(&[], Vec::new(), "").await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let outcome = Reconciler::new(&client, &deployer).once().await.unwrap();
 
     assert_eq!(outcome, SyncOutcome::default());
@@ -494,13 +618,12 @@ async fn one_unusable_assignment_does_not_stop_the_others() {
         &[("broken", "v1", "/nowhere"), ("demo", "v1", "/bundle")],
         bytes,
         &sha,
-        StatusCode::OK,
     )
     .await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let outcome = Reconciler::new(&client, &deployer).once().await.unwrap();
 
     assert_eq!(outcome.failed, 1);
@@ -516,11 +639,11 @@ async fn one_unusable_assignment_does_not_stop_the_others() {
 #[tokio::test]
 async fn a_control_plane_that_refuses_is_reported_rather_than_treated_as_empty() {
     let dir = tempfile::tempdir().unwrap();
-    let plane = ControlPlane::serving(&[], Vec::new(), "", StatusCode::INTERNAL_SERVER_ERROR).await;
+    let plane = ControlPlane::refusing(Status::internal("the catalog is down")).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let err = Reconciler::new(&client, &deployer)
         .once()
         .await
@@ -538,7 +661,7 @@ async fn a_control_plane_that_is_not_there_is_a_transport_failure() {
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
 
-    let unreachable = client("http://127.0.0.1:0", "node-a");
+    let unreachable = unreachable_client("https://127.0.0.1:0", "node-a");
     let err = Reconciler::new(&unreachable, &deployer)
         .once()
         .await
@@ -566,7 +689,7 @@ async fn the_unreachable_reason_names_the_class_not_the_control_plane_address() 
 
     // A control plane at a port nothing answers on, so every reconcile pass is
     // a transport failure carrying this address.
-    let unreachable = client("http://127.0.0.1:1", "node-a");
+    let unreachable = unreachable_client("https://127.0.0.1:1", "node-a");
     let health_for_loop = health.clone();
     let loop_task = tokio::spawn(async move {
         run_control_loop(
@@ -602,18 +725,9 @@ async fn the_unreachable_reason_names_the_class_not_the_control_plane_address() 
          {degraded}"
     );
     assert!(
-        !degraded.contains("127.0.0.1:1") && !degraded.contains("http://"),
+        !degraded.contains("127.0.0.1:1") && !degraded.contains("https://"),
         "the control plane's own address must not travel on the header the node answers \
          unauthenticated on its data port; it belongs in the node's log: {degraded}"
-    );
-}
-
-#[test]
-fn the_node_id_is_escaped_into_the_path_it_addresses() {
-    let client = client("http://control:8080/", "node/../other");
-    assert_eq!(
-        client.url(),
-        "http://control:8080/api/nodes/node%2F..%2Fother/assignments"
     );
 }
 
@@ -729,66 +843,6 @@ fn retries_back_off_but_never_stop() {
     assert_eq!(retry_delay(base, 40), Duration::from_secs(300));
 }
 
-/// The control plane will not hand a node its assignment list - which carries
-/// every environment's decrypted secrets - to a caller that cannot prove it
-/// is a node. A node that sends no credential gets 401 and installs nothing;
-/// with `control.secret` set it gets the list and the bundle behind it.
-#[tokio::test]
-async fn a_node_presents_its_key_to_the_control_plane() {
-    let dir = tempfile::tempdir().unwrap();
-    let (bytes, sha) = bundle("demo");
-    let plane = ControlPlane::guarded(
-        &[("demo", "v1", "/bundle")],
-        bytes,
-        &sha,
-        StatusCode::OK,
-        Some("node-key"),
-    )
-    .await;
-
-    let apps = Arc::new(ApplicationManager::new());
-    let deployer = deployer_for(
-        dir.path(),
-        apps.clone(),
-        Some(plane.base()),
-        Some("node-key"),
-    )
-    .await;
-
-    let anonymous = AssignmentClient::new(plane.base(), "node-a", Duration::from_secs(10), None)
-        .unwrap()
-        .fetch()
-        .await;
-    assert!(
-        matches!(anonymous, Err(AssignmentError::Status { code: 401, .. })),
-        "expected a refusal without a credential, got {anonymous:?}"
-    );
-
-    let authenticated = AssignmentClient::new(
-        plane.base(),
-        "node-a",
-        Duration::from_secs(10),
-        Some(NodeCredential::new("node-key", Some(plane.base()))),
-    )
-    .unwrap();
-    let outcome = Reconciler::new(&authenticated, &deployer)
-        .once()
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.assigned, 1);
-    assert_eq!(
-        outcome.installed, 1,
-        "the bundle download has to carry the key too, or the version never installs"
-    );
-    assert_eq!(
-        apps.installed_version(&AppKey::production("demo"))
-            .unwrap()
-            .version_id,
-        "v1"
-    );
-}
-
 #[tokio::test]
 async fn an_environment_the_control_plane_no_longer_assigns_stops_serving() {
     // The failure this closes: an application deleted from the catalog, or a
@@ -799,11 +853,11 @@ async fn an_environment_the_control_plane_no_longer_assigns_stops_serving() {
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let mut reconciler = Reconciler::new(&client, &deployer);
 
     let outcome = reconciler.once().await.unwrap();
@@ -847,11 +901,11 @@ async fn one_short_answer_alone_never_stops_an_application() {
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let mut reconciler = Reconciler::new(&client, &deployer);
 
     reconciler.once().await.unwrap();
@@ -882,7 +936,7 @@ async fn removing_a_preview_leaves_production_serving() {
     // Taking a preview down must not touch the production copy beside it.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane = ControlPlane::serving(&[], bytes, &sha, StatusCode::OK).await;
+    let plane = ControlPlane::serving(&[], bytes, &sha).await;
     plane.now_assigns(serde_json::json!([
         plane.line("demo", "production", "v1", &sha),
         plane.line("demo", "preview-7", "v1", &sha),
@@ -890,7 +944,7 @@ async fn removing_a_preview_leaves_production_serving() {
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let mut reconciler = Reconciler::new(&client, &deployer);
 
     let outcome = reconciler.once().await.unwrap();
@@ -925,11 +979,11 @@ async fn reconciling_a_node_that_already_matches_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
 
     let mut reconciler = Reconciler::new(&client, &deployer);
     reconciler.once().await.unwrap();
@@ -953,11 +1007,11 @@ async fn a_new_version_in_the_list_replaces_the_running_one() {
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
 
     let mut reconciler = Reconciler::new(&client, &deployer);
     reconciler.once().await.unwrap();
@@ -996,11 +1050,11 @@ async fn an_incomplete_answer_loads_but_never_removes() {
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
 
     let mut reconciler = Reconciler::new(&client, &deployer);
     reconciler.once().await.unwrap();
@@ -1034,11 +1088,11 @@ async fn an_incomplete_answer_neither_counts_towards_a_removal_nor_undoes_one() 
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let mut reconciler = Reconciler::new(&client, &deployer);
 
     reconciler.once().await.unwrap();
@@ -1063,65 +1117,74 @@ async fn an_incomplete_answer_neither_counts_towards_a_removal_nor_undoes_one() 
         .is_none());
 }
 
-#[tokio::test]
-async fn a_control_plane_that_cannot_say_is_treated_as_unable_to_say() {
-    // No header at all is a control plane older than the completeness
-    // contract. It cannot promise its list is the whole truth, so this node
-    // must not remove on the strength of it - the same fail-safe direction as
-    // an explicit "false".
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            Router::new().route(
-                "/api/nodes/:id/assignments",
-                get(|| async { Json(serde_json::json!([])) }),
-            ),
-        )
-        .await;
-    });
-
-    let list = client(&base, "node-a").fetch().await.unwrap();
-    assert!(
-        !list.complete,
-        "an answer with no completeness header cannot be acted on for removal"
-    );
-    assert_eq!(list.withheld, 0);
-    task.abort();
-}
-
 /// A stand-in control plane that only counts registrations, so a test can ask
 /// how many times a node said it was there.
 async fn counting_registrar() -> (NodeRegistrar, Arc<std::sync::atomic::AtomicUsize>) {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl MachineChannel for CountingService {
+        async fn register(
+            &self,
+            _request: tonic::Request<RegisterNodeRequest>,
+        ) -> Result<tonic::Response<RegisterNodeResponse>, Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(tonic::Response::new(RegisterNodeResponse {
+                registration_json: serde_json::json!({ "refresh_after_seconds": 30 }).to_string(),
+            }))
+        }
+
+        async fn deregister(
+            &self,
+            _request: tonic::Request<DeregisterNodeRequest>,
+        ) -> Result<tonic::Response<DeregisterNodeResponse>, Status> {
+            Err(Status::unimplemented(
+                "this stand-in only counts registrations",
+            ))
+        }
+
+        async fn fetch_assignments(
+            &self,
+            _request: tonic::Request<FetchAssignmentsRequest>,
+        ) -> Result<tonic::Response<FetchAssignmentsResponse>, Status> {
+            Err(Status::unimplemented(
+                "this stand-in only counts registrations",
+            ))
+        }
+
+        async fn fetch_routing_table(
+            &self,
+            _request: tonic::Request<FetchRoutingTableRequest>,
+        ) -> Result<tonic::Response<FetchRoutingTableResponse>, Status> {
+            Err(Status::unimplemented(
+                "this stand-in only counts registrations",
+            ))
+        }
+    }
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let seen = calls.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = Router::new()
-        .route(
-            deis_wire::conventions::NODE_REGISTRATION_ROUTE,
-            axum::routing::put(|State(calls): State<Arc<AtomicUsize>>| async move {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Json(serde_json::json!({ "refresh_after_seconds": 30 }))
-            }),
-        )
-        .with_state(calls);
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
+    let ca = TestCa::new();
+    let (machine_endpoint, control_identity) = serve_machine_channel(
+        &ca,
+        CountingService {
+            calls: calls.clone(),
+        },
+    );
 
-    let registrar = NodeRegistrar::new(
-        &base,
+    let registrar = NodeRegistrar::over_machine_channel(
+        &machine_endpoint,
         NodeRegistration::of_this_node("node-a", 8123),
         Duration::from_secs(5),
-        None,
+        node_identity(&ca, "node-a"),
+        control_identity,
         None,
     )
     .expect("the registrar is built");
-    (registrar, seen)
+    (registrar, calls)
 }
 
 #[tokio::test]
@@ -1228,11 +1291,11 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let mut reconciler = Reconciler::new(&client, &deployer);
 
     reconciler.once().await.unwrap();
@@ -1289,11 +1352,11 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
     let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let client = client(plane.base(), "node-a");
+    let client = client(&plane, "node-a");
     let mut reconciler = Reconciler::new(&client, &deployer);
 
     reconciler.once().await.unwrap();
@@ -1344,19 +1407,6 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
 // the runbooks are written around. The handshake itself is not here - it is
 // covered against the control plane's own listener, in deis-control, which is
 // the only place both ends of it exist.
-
-use deis_identity::{names, MachineIdentity};
-use deis_identity_test_pki::{write_files, TestCa};
-use deis_wire::machine::machine_channel_server::{MachineChannel, MachineChannelServer};
-use deis_wire::machine::{
-    DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
-    FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
-    RegisterNodeRequest, RegisterNodeResponse,
-};
-use tonic::transport::Endpoint;
-use tonic::Status;
-
-const TRUST_DOMAIN: &str = "deis.internal";
 
 /// A stand-in machine channel that answers `FetchAssignments` with whatever it
 /// was built with.
@@ -1440,19 +1490,12 @@ async fn machine_client(answer: Result<FetchAssignmentsResponse, Status>) -> Ass
     )
 }
 
-/// A real identity for a node of this name, from a real certificate. Nothing
-/// dials with it in these tests; it is what a refusal names.
+/// A real identity for a node of this name, signed by its own throwaway
+/// authority. Nothing dials with it in most of these tests; it is only what a
+/// refusal names, or - in [`unreachable_client`] - an identity for a
+/// connection that never gets far enough for its authority to matter.
 fn test_identity(node_id: &str) -> Arc<MachineIdentity> {
-    let ca = TestCa::new();
-    let directory = tempfile::tempdir().unwrap();
-    let name = names::node(TRUST_DOMAIN, node_id).unwrap();
-    let files = write_files(directory.path(), "node", &ca.issue(&name), &ca.root_pem);
-    let identity = Arc::new(MachineIdentity::load(files.as_identity_files(), &[]).unwrap());
-    // The files are read at load and never again unless a reload asks, so the
-    // directory can go now; keeping it alive would mean plumbing a guard
-    // through every test that wants an identity.
-    drop(directory);
-    identity
+    node_identity(&TestCa::new(), node_id)
 }
 
 fn one_assignment_json() -> String {
@@ -1607,26 +1650,6 @@ async fn a_node_with_an_identity_asks_over_the_machine_channel() {
 }
 
 #[tokio::test]
-async fn a_node_with_no_identity_asks_the_way_it_always_did() {
-    let mut config = RuntimeConfig::default();
-    config.control.endpoint = Some("http://127.0.0.1:8080".to_string());
-
-    let client = AssignmentClient::from_config(&config, "node-a", None)
-        .expect("an ordinary configuration must build a client")
-        .expect("a configured node has a client");
-
-    assert!(
-        client.transport_name().contains("HTTP"),
-        "{}",
-        client.transport_name()
-    );
-    assert_eq!(
-        client.url(),
-        "http://127.0.0.1:8080/api/nodes/node-a/assignments"
-    );
-}
-
-#[tokio::test]
 async fn a_node_told_about_no_control_plane_at_all_asks_nobody() {
     let config = RuntimeConfig::default();
     assert!(AssignmentClient::from_config(&config, "node-a", None)
@@ -1634,28 +1657,56 @@ async fn a_node_told_about_no_control_plane_at_all_asks_nobody() {
         .is_none());
 }
 
-/// Half a machine channel is refused rather than quietly demoted to the old
-/// path. `RuntimeConfig::validate` refuses both halves of this before startup
-/// gets here, so reaching it means the check was skipped - and falling back
-/// silently would mean a node configured for mutual TLS going on using the
-/// fleet key with nothing in any log to say so.
+/// The two halves of a machine channel mean different things on their own,
+/// and the difference is the whole of this test.
+///
+/// An identity with no address is a node that serves its management plane and
+/// asks nobody - `deis dev` runs exactly that, and `RuntimeConfig::validate`
+/// accepts it alongside a `management_listen`. It builds no client, which is
+/// the same answer a node with no identity at all gets.
+///
+/// An address with no identity is not a configuration: the address and the
+/// files are one table, so it can only come from a caller that loaded no
+/// identity for a table that has one. That is refused rather than quietly
+/// returning `None`, because a `None` there would be a node that fetches
+/// nothing while every other part of it looks configured.
 #[tokio::test]
-async fn neither_half_of_the_machine_channel_works_on_its_own() {
+async fn an_address_without_an_identity_is_refused_and_an_identity_without_one_asks_nobody() {
     let (mut config, identity) = machine_config();
-    // A table with no address in it. Startup refuses this, so reaching it
-    // means the check was skipped, and falling back to the old path silently
-    // would mean a node configured for mutual TLS going on using the fleet
-    // key with nothing in any log to say so.
     config
         .machine_identity
         .as_mut()
         .expect("the fixture configures one")
         .control_endpoint = None;
-    assert!(AssignmentClient::from_config(&config, "node-a", Some(Arc::clone(&identity))).is_err());
+    assert!(
+        AssignmentClient::from_config(&config, "node-a", Some(Arc::clone(&identity)))
+            .expect("an identity with nowhere to ask is a configuration, not an error")
+            .is_none()
+    );
 
-    // The mirror image cannot come from a configuration file - the address
-    // and the files are one table - but it can come from a caller that loaded
-    // no identity for a table that has one, which is the same refusal.
     let (config, _) = machine_config();
     assert!(AssignmentClient::from_config(&config, "node-a", None).is_err());
+}
+
+/// A node configured to ask nobody builds no client at all, and that is a
+/// supported way to run one rather than a misconfiguration.
+///
+/// It serves whatever its local store already holds and nothing changes it.
+/// The arm exists because `from_config` has three refusals around it - a
+/// machine endpoint with no identity, an identity with no endpoint, and a
+/// `[control] endpoint` with no `[machine_identity]`, which
+/// `RuntimeConfig::validate` catches first - and "nothing configured" has to
+/// stay distinguishable from all of them.
+#[tokio::test]
+async fn a_node_that_names_no_control_plane_builds_no_client() {
+    let config = RuntimeConfig::default();
+    assert!(config.control.endpoint.is_none());
+    assert!(config.machine_identity.is_none());
+
+    let client = AssignmentClient::from_config(&config, "node-a", None)
+        .expect("asking nobody is a configuration, not an error");
+    assert!(
+        client.is_none(),
+        "a node with no control plane must not be handed a client that would dial one"
+    );
 }
