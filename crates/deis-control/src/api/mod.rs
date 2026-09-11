@@ -206,16 +206,19 @@ pub async fn build_api_router(
         authz::authorize,
     ));
 
-    // The endpoints nodes call carry their own authentication and must not be
-    // layered with the API key middleware: `api_auth_enabled` is a dashboard
-    // setting, and one of these hands out decrypted secrets while another
-    // decides which machines are delivery targets at all.
-    let node_routes = catalog::node_router(catalog_state.clone()).merge(registration::node_router(
-        registration::RegistrationState {
-            nodes: Arc::clone(&deis_runtime_manager),
-            node_auth: node_auth.clone(),
-        },
-    ));
+    // Nothing a node calls is mounted here any more.
+    //
+    // Registration, the assignment list, the bundle download and the routing
+    // table were all served on this listener, guarded by a secret every
+    // machine in the fleet held a copy of - which meant the answer carrying
+    // every environment's decrypted secrets was reachable from wherever the
+    // dashboard was. They are on the machine channel now, where the caller
+    // proves one name and may only ask for its own. What is left on this
+    // listener is what a person or their browser calls.
+    //
+    // A request for one of the old paths gets a 404 from here, which is the
+    // right answer: this listener does not serve them, and saying 401 would
+    // suggest a credential could change that.
 
     let human = Router::new()
         .route("/", get(static_files::serve_index))
@@ -239,7 +242,7 @@ pub async fn build_api_router(
         None => human,
     };
 
-    let app = human.merge(node_routes).layer(TraceLayer::new_for_http());
+    let app = human.layer(TraceLayer::new_for_http());
 
     let tls_enabled = config
         .tls
@@ -1433,21 +1436,25 @@ pub(crate) mod tests {
             "kept, but still on the legacy mount and so still carries the request context"
         );
 
-        // The node channel is outside every surface: no deprecation, no
-        // request context, and its hand-written body untouched.
+        // The node channel is not here at all. These three used to be served
+        // on this listener behind their own credential, and they are on the
+        // machine channel now - so what this listener says about them is 404,
+        // and it says it the way it says it about any path it does not have.
+        // Not 401: a credential cannot bring them back.
+        //
+        // Asserted here rather than left to the machine channel's own tests
+        // because this is the listener a browser and an operator's token can
+        // reach, and "did they really leave" is a question about this side.
         for uri in [
             "/api/nodes/n1/assignments",
             "/api/routing-table",
             "/api/apps/demo/versions/v1/bundle",
         ] {
             let response = call(&router, "GET", uri).await;
-            assert!(
-                matches!(
-                    response.status(),
-                    StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
-                ),
-                "{uri}: {}",
-                response.status()
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} is still served on the human listener"
             );
             assert!(header_str(&response, DEPRECATION).is_none(), "{uri}");
             assert!(header_str(&response, SUNSET).is_none(), "{uri}");
@@ -1455,9 +1462,13 @@ pub(crate) mod tests {
                 header_str(&response, header::LINK.as_str()).is_none(),
                 "{uri}"
             );
-            assert!(header_str(&response, REQUEST_ID_HEADER).is_none(), "{uri}");
-            let body = body_json(response).await;
-            assert!(body["error"].is_string(), "{uri}: {body}");
+            // It still carries a request id, and should: the context layer
+            // wraps this whole listener, and an operator asking why a path
+            // they used to call now answers 404 wants that id as much as for
+            // any other answer. What it does not carry is a successor - see
+            // the three assertions above - because a path this listener does
+            // not have is not a path that moved somewhere a browser can go.
+            assert!(header_str(&response, REQUEST_ID_HEADER).is_some(), "{uri}");
         }
     }
 

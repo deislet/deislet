@@ -37,7 +37,9 @@ use axum::{
     routing::{delete, get, post, put},
 };
 
-use crate::api::middleware::{NodeAuthConfig, node_auth};
+use crate::api::middleware::NodeAuthConfig;
+#[cfg(test)]
+use crate::api::middleware::node_auth;
 use crate::catalog::{
     ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore,
     ProviderDriverDispatcher, SecretsBackend,
@@ -362,7 +364,8 @@ pub(super) fn actor_subject(principal: &crate::identity::Principal) -> String {
 ///   of every application and hostname on the platform to anyone who can
 ///   reach the port. deis-proxy already holds a `node_preshared_keys` value
 ///   for its gRPC control channel, so this costs it no second credential.
-pub fn node_router(state: CatalogState) -> Router {
+#[cfg(test)]
+pub(crate) fn node_router(state: CatalogState) -> Router {
     let auth = state.node_auth.clone();
     Router::new()
         // The path parameter is named `:id` to match the node routes it

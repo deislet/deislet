@@ -1032,44 +1032,41 @@ fresh_case 4 "$marker" 999999 "2099-01-01T00:00:00.000Z" yes \
   "a forged record passes this decision, which is why the check does not rest on it alone"
 
 # ----------------------------------------------------------------------
-# 12. The node-channel check says no when anybody may join the fleet
+# 12. The node-channel check says no when a node route is still on the
+#     human listener
 # ----------------------------------------------------------------------
 #
-# `check_the_node_channel_needs_the_node_key` is the only thing in `verify`
-# that asks the control plane's node channel a question with no node key in
-# it. A demo can only ever show it saying yes: the running control plane has
-# `node_preshared_keys` configured, and configuring none closes the channel
-# rather than opening it, so there is no way to arrange the failure it exists
-# to catch by starting a second one.
+# `check_the_node_channel_is_not_on_the_human_listener` is the canary that
+# the node routes really moved. It asks the listener that serves the
+# dashboard for the three things a node used to ask it for - registration,
+# the assignment list, the routing table - carrying the fleet key that used
+# to open all three, and every one of them has to answer 404.
+#
+# A demo can only ever show it saying yes: the running control plane does not
+# mount those routes, and there is no way to arrange the failure it exists to
+# catch by starting a second one.
 #
 # So it is run here against stand-ins, and `curl` and `control_api` are the
 # only two doors it uses, so both are replaced; nothing here reaches a
-# network. The first stand-in answers the way an ungated control plane
-# answers - every registration accepted, the invented node then on the fleet -
-# and the check has to say ✗.
+# network.
 #
-# One such stand-in is not enough, and the reason is worth keeping. The check
-# asks three questions of one endpoint - no credential, a wrong one, the
-# deploy API key - and against a stand-in that admits everybody, a check that
-# had quietly stopped asking *one* of them still goes red on the other two.
-# That was measured: with the no-credential comparison relaxed to "answered
-# anything", and separately with the API-key one, this file still said "all
-# witness tests passed". So there is one stand-in per probe below, each
-# admitting exactly one kind of caller and refusing the other two, and each
-# has to make the check fail *for that probe*. The fleet listing is kept
-# clean in those three: it is the check's second line of evidence, and a
-# check that needs the fleet to notice an accepted registration is a check
-# that has stopped reading the answer to its own question.
+# One stand-in is not enough, and the reason is the same one this file
+# already learned once: the check asks three questions, and against a
+# stand-in that still serves all three, a check that had quietly stopped
+# asking one of them still goes red on the other two. So there is one
+# stand-in per route below, each still serving exactly one of them and 404ing
+# the other two, and each has to make the check fail *for that route*.
 
-# $1 says who the stand-in control plane admits to the node channel:
-#   everyone   every registration accepted and the invented node on the fleet
-#   anonymous  a PUT with no Authorization header is accepted
-#   any-bearer a PUT with a bearer token that is not a node key is accepted
-#   api-key    a PUT carrying the deploy API key is accepted
-#   nobody     the gate the real control plane has
+# $1 says which route the stand-in control plane still serves on the human
+# listener:
+#   all          every node route still mounted there, as before the cutover
+#   registration only PUT /api/nodes/{id}/registration
+#   assignments  only GET /api/nodes/{id}/assignments
+#   routing      only GET /api/routing-table
+#   none         what the real control plane does now
 node_channel_probe() {
-  local admits=$1
-  local probe="${WORK_DIR}/node-channel-${admits}.sh"
+  local serves=$1
+  local probe="${WORK_DIR}/node-channel-${serves}.sh"
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
@@ -1080,99 +1077,89 @@ node_channel_probe() {
     echo 'NODE_ID=deis-runtime-demo-01'
     echo 'DEIS_RUNTIME_PORT=9'
     echo 'API_KEY=the-deploy-credential'
-    printf 'ADMITS=%q\n' "$admits"
+    echo 'SECRET=the-fleet-key'
+    printf 'SERVES=%q\n' "$serves"
     echo 'control_url() { echo "http://127.0.0.1:9"; }'
     definition_of pass_check
     definition_of fail_check
     cat <<'STUB'
-# The stand-in. It reads the credential off the request the check made, the
-# way the real middleware does, and admits or refuses by ADMITS. Which caller
-# it is talking to is decided by the Authorization header alone: none,
-# a bearer that is not the node key, or the deploy API key.
+# The stand-in. It decides which of the three routes it still serves from the
+# URL the check asked for, and answers 200 for that one and 404 for the rest -
+# which is what a control plane that had moved only some of them would do.
 curl() {
-  local out="" caller="anonymous" i args=("$@")
+  local out="" route="other" i args=("$@")
   for ((i = 0; i < ${#args[@]}; i++)); do
     if [ "${args[i]}" = "-o" ]; then out=${args[i + 1]}; fi
-    if [ "${args[i]}" = "-H" ]; then
-      case "${args[i + 1]}" in
-        "Authorization: Bearer ${API_KEY}") caller="api-key" ;;
-        "Authorization: Bearer "*) caller="any-bearer" ;;
-      esac
-    fi
+    case "${args[i]}" in
+      *"/registration") route="registration" ;;
+      *"/assignments") route="assignments" ;;
+      *"/api/routing-table") route="routing" ;;
+    esac
   done
-  local admitted=no
-  if [ "$ADMITS" = "everyone" ] || [ "$ADMITS" = "$caller" ]; then
-    admitted=yes
+  local served=no
+  if [ "$SERVES" = "all" ] || [ "$SERVES" = "$route" ]; then
+    served=yes
   fi
-  if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then
-    if [ "$admitted" = "yes" ]; then
-      printf '{"details":"registered"}' > "$out"
-    else
-      printf '{"error":"Unauthorized","details":"This endpoint serves runtime nodes. Provide one of the control plane%s node_preshared_keys."}' "'s" > "$out"
-    fi
-  fi
-  if [ "$admitted" = "yes" ]; then printf '200'; else printf '401'; fi
+  if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then : > "$out"; fi
+  if [ "$served" = "yes" ]; then printf '200'; else printf '404'; fi
 }
 control_api() {
-  if [ "$ADMITS" = "everyone" ]; then
-    printf '{"nodes":[{"id":"%s","healthy":true},{"id":"%s-uninvited-%s","healthy":true}]}' \
-      "$NODE_ID" "$NODE_ID" "$$"
+  # The fleet as it stands with the real node registered by certificate. An
+  # invented node appears only where the stand-in still accepts registrations,
+  # because that is what getting through would leave behind.
+  if [ "$SERVES" = "all" ] || [ "$SERVES" = "registration" ]; then
+    printf '{"nodes":[{"id":"%s","healthy":true,"identity":"spiffe://demo/deislet/node/%s"},{"id":"%s-uninvited-%s","healthy":true}]}' \
+      "$NODE_ID" "$NODE_ID" "$NODE_ID" "$$"
   else
-    printf '{"nodes":[{"id":"%s","healthy":true}]}' "$NODE_ID"
+    printf '{"nodes":[{"id":"%s","healthy":true,"identity":"spiffe://demo/deislet/node/%s"}]}' \
+      "$NODE_ID" "$NODE_ID"
   fi
 }
 STUB
-    definition_of check_the_node_channel_needs_the_node_key
-    echo 'check_the_node_channel_needs_the_node_key'
+    definition_of check_the_node_channel_is_not_on_the_human_listener
+    echo 'check_the_node_channel_is_not_on_the_human_listener'
     echo 'echo "verdicts: ${CHECKS_PASSED} passed ${CHECKS_FAILED} failed"'
   } > "$probe"
   bash "$probe" 2>&1
 }
 
-out=$(node_channel_probe everyone)
-if [ "${out#*verdicts: 0 passed 1 failed}" != "$out" ] \
-  && [ "${out#*expected 401 with no credential (got 200)}" != "$out" ]; then
-  pass "the node-channel check fails when an uncredentialed caller may join the fleet"
+out=$(node_channel_probe all)
+if [ "${out#*verdicts: 0 passed 1 failed}" != "$out" ]; then
+  pass "the node-channel check fails when every node route is still on the human listener"
 else
-  fail "the node-channel check fails when an uncredentialed caller may join the fleet" \
-    "against a control plane that accepts anybody it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
+  fail "the node-channel check fails when every node route is still on the human listener" \
+    "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
 fi
 
-# One probe at a time. Each case names, in the check's own failure text, the
-# probe that was admitted and the two that were not, so a check that dropped
-# one comparison is seen to pass here where it must not.
-# $1 who the stand-in admits; $2 the phrase the check's report must carry for
-# the admitted probe; $3 and $4 the phrases for the two it still refused.
-one_probe_case() {
-  local admits=$1 admitted=$2 refused_a=$3 refused_b=$4
-  local name="the node-channel check fails when only the ${admits} caller may join"
+# One route at a time. Each case names, in the check's own failure text, the
+# route that was still served, so a check that dropped one comparison is seen
+# to pass here where it must not.
+one_route_case() {
+  local serves=$1 phrase=$2
+  local name="the node-channel check fails when only ${serves} is still on the human listener"
   local out
-  out=$(node_channel_probe "$admits")
+  out=$(node_channel_probe "$serves")
   if [ "${out#*verdicts: 0 passed 1 failed}" != "$out" ] \
-    && [ "${out#*"$admitted"}" != "$out" ] \
-    && [ "${out#*"$refused_a"}" != "$out" ] \
-    && [ "${out#*"$refused_b"}" != "$out" ]; then
+    && [ "${out#*"$phrase"}" != "$out" ]; then
     pass "$name"
   else
     fail "$name" \
-      "a control plane that admits the ${admits} caller and nobody else, with nothing new on the fleet, must fail the check on that one probe alone (wanted \"${admitted}\"); it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
+      "a control plane that still serves ${serves} and nothing else must fail the check on that route alone (wanted \"${phrase}\"); it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
   fi
 }
 
-one_probe_case anonymous \
-  "with no credential (got 200)" "with a wrong one (got 401)" "with the deploy API key (got 401)"
-one_probe_case any-bearer \
-  "with a wrong one (got 200)" "with no credential (got 401)" "with the deploy API key (got 401)"
-one_probe_case api-key \
-  "with the deploy API key (got 200)" "with no credential (got 401)" "with a wrong one (got 401)"
+one_route_case registration "registration (got 200)"
+one_route_case assignments "assignments (got 200)"
+one_route_case routing "routing table (got 200)"
 
-out=$(node_channel_probe nobody)
+out=$(node_channel_probe none)
 if [ "${out#*verdicts: 1 passed 0 failed}" != "$out" ]; then
-  pass "the node-channel check passes when the registration endpoint refuses all three"
+  pass "the node-channel check passes when the human listener serves none of the three"
 else
-  fail "the node-channel check passes when the registration endpoint refuses all three" \
+  fail "the node-channel check passes when the human listener serves none of the three" \
     "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
 fi
+
 
 # ----------------------------------------------------------------------
 # 13. The log the readers are tested against looks like the node's log today

@@ -298,18 +298,38 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
         async move { router.oneshot(request).await.unwrap().status() }
     };
 
+    // The assignment list is not on this listener at all any more. It carries
+    // every environment's decrypted secrets, and it is served on the machine
+    // channel, where a caller proves a name and may only ask for its own.
+    //
+    // 404 and not 401 is the assertion that matters: 401 would say a
+    // credential could open it, and none can - there is nothing here to open.
+    // That holds for the dashboard key, for the fleet key that used to work,
+    // and for no credential at all.
     const ASSIGNMENTS: &str = "/api/nodes/node-a/assignments";
-    assert_eq!(status_of(ASSIGNMENTS, None).await, StatusCode::UNAUTHORIZED);
+
+    // Authenticated as an operator, and the path is simply not here: 404 from
+    // the fallback. That is the assertion that matters, and it is stronger
+    // than the 401 this used to make - a 401 says a credential could open it,
+    // and this says there is nothing to open. The list carries every
+    // environment's decrypted secrets and is served on the machine channel,
+    // where a caller proves a name and may only ask for its own.
     assert_eq!(
         status_of(ASSIGNMENTS, Some("dashboard-key")).await,
-        StatusCode::UNAUTHORIZED,
-        "an API key must not be able to read the fleet's secrets"
+        StatusCode::NOT_FOUND,
+        "the fleet's secrets are still reachable from the listener a browser can reach"
     );
-    assert_eq!(
-        status_of(ASSIGNMENTS, Some("node-psk")).await,
-        StatusCode::OK,
-        "a node must reach its assignments while the API key requirement is on"
-    );
+
+    // The other two never reach the routing table to find that out: this
+    // listener authenticates before it looks, so no credential and a
+    // credential that is not an operator's are both refused at the gate.
+    for credential in [None, Some("node-psk")] {
+        assert_eq!(
+            status_of(ASSIGNMENTS, credential).await,
+            StatusCode::UNAUTHORIZED,
+            "with credential {credential:?}"
+        );
+    }
 
     // And the other way round: the human API is the API key's, not the
     // node's.
@@ -340,12 +360,20 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
             .unwrap();
         async move { router.oneshot(request).await.unwrap().status() }
     };
-    assert_eq!(register(None).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        register(Some("dashboard-key")).await,
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(register(Some("node-psk")).await, StatusCode::OK);
+    // Registration is what makes a machine a delivery target, and it is not
+    // on this listener either. An operator's own credential gets 404 - there
+    // is nothing here to be authorised for - and the two that are not an
+    // operator's are refused at the gate before that question is reached.
+    // What used to be the interesting line, the fleet key answering 200, is
+    // gone with the route.
+    assert_eq!(register(Some("dashboard-key")).await, StatusCode::NOT_FOUND);
+    for credential in [None, Some("node-psk")] {
+        assert_eq!(
+            register(credential).await,
+            StatusCode::UNAUTHORIZED,
+            "with credential {credential:?}"
+        );
+    }
 }
 
 /// Accounts, tokens and the audit log on the router the binary actually
@@ -675,7 +703,12 @@ async fn a_router_built_without_a_node_key_registers_nobody() {
         .body(Body::from(r#"{"address":"http://10.0.0.7:8086"}"#))
         .unwrap();
     let status = api.router.clone().oneshot(request).await.unwrap().status();
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // Refused at the gate, before any question of which route this is: the
+    // registration endpoint is not on this listener at all now, and an
+    // unauthenticated caller does not get far enough to be told so. What the
+    // test is really about is the line below - whatever this listener
+    // answers, nothing joined the fleet through it.
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(
         fleet.is_empty(),
         "nothing may join the fleet through an unauthenticated call"

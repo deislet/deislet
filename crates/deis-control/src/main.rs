@@ -179,12 +179,18 @@ async fn main() -> Result<(), anyhow::Error> {
         Some(machine_config) => Some(deis_control::machine::listen::load_identity(
             machine_config,
         )?),
-        None => {
-            info!(
-                "No [machine] section, so this control plane serves no machine channel of its own; nodes and the proxy reach it on the same listener as the dashboard, presenting the fleet key"
-            );
-            None
-        }
+        // Nothing a node calls is served on the human listener any more, so a
+        // control plane with no machine channel is a control plane no node can
+        // register with, fetch an assignment from or download a bundle from.
+        // It would start, answer a dashboard, and be dead to its fleet -
+        // diagnosed one timeout at a time from the nodes' own logs, with
+        // nothing here saying why. Said once, at startup, instead.
+        None => anyhow::bail!(
+            "this control plane has no [machine] section, and everything a node or a proxy calls \
+             is served there: registration, the assignment list, the bundle download and the \
+             routing table. Without it no machine can reach this control plane at all. Add the \
+             section with the three identity files and the address to serve them on"
+        ),
     };
 
     // The configured list is the seed, not the whole fleet: nodes register

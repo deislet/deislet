@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::api::middleware::{NodeAuthConfig, node_auth};
+use crate::api::middleware::NodeAuthConfig;
+#[cfg(test)]
+use crate::api::middleware::node_auth;
 use crate::node_key::ProvedNodeKey;
 use crate::runtime_client::{
     Deregistered, NodeSource, Registered, RegistrationError, RuntimeNodeManager,
@@ -296,7 +298,8 @@ pub async fn deregister(
 
 /// The node-facing registration routes, with their own authentication layer
 /// applied here so there is no way to mount them without it.
-pub fn node_router(state: RegistrationState) -> axum::Router {
+#[cfg(test)]
+pub(crate) fn node_router(state: RegistrationState) -> axum::Router {
     let auth = state.node_auth.clone();
     axum::Router::new()
         .route(

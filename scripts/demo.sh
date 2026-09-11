@@ -969,7 +969,7 @@ acme_ca_stats() {
 #
 # `PUT /api/nodes/<id>/registration` is the one path here that is none of
 # this. It is the channel a node itself calls, it is not part of the Control
-# API, and it is not versioned; see check_the_node_channel_needs_the_node_key.
+# API, and it is not versioned; see check_the_node_channel_is_not_on_the_human_listener.
 control_url() {
   echo "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 }
@@ -8571,47 +8571,44 @@ check_dynamic_node_registration() {
 # says so in a comment; this is where that separation is observed rather than
 # asserted. Nothing here can succeed, so nothing here leaves a node behind -
 # and the fleet is read afterwards to say so.
-check_the_node_channel_needs_the_node_key() {
-  local title="a node joins the fleet only with the node key, and the deploy credential is not one"
+check_the_node_channel_is_not_on_the_human_listener() {
+  local title="nothing a node calls is served where the dashboard is"
   local invented="${NODE_ID}-uninvited-$$"
-  local route
-  route="$(control_url)/api/nodes/${invented}/registration"
-  local body="{\"address\":\"http://127.0.0.1:${DEIS_RUNTIME_PORT}\"}"
-  local answer="${LOG_DIR}/verify-node-channel.json"
 
-  local none wrong human
-  none=$(curl -s -o "$answer" -w '%{http_code}' -X PUT \
-    -H 'content-type: application/json' -d "$body" "$route" || true)
-  wrong=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
-    -H "Authorization: Bearer not-the-node-key" \
-    -H 'content-type: application/json' -d "$body" "$route" || true)
-  human=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
-    -H "Authorization: Bearer ${API_KEY}" \
-    -H 'content-type: application/json' -d "$body" "$route" || true)
+  # The three that used to be here, asked exactly as a node used to ask them.
+  # A 404 is the whole point: this listener does not serve them at all, and a
+  # 401 would have said a credential could change that.
+  local registration assignments routing
+  registration=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "Authorization: Bearer ${SECRET}" -H 'content-type: application/json' \
+    -d "{\"address\":\"http://127.0.0.1:${DEIS_RUNTIME_PORT}\"}" \
+    "$(control_url)/api/nodes/${invented}/registration" || true)
+  assignments=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${SECRET}" \
+    "$(control_url)/api/nodes/${NODE_ID}/assignments" || true)
+  routing=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${SECRET}" \
+    "$(control_url)/api/routing-table" || true)
 
-  # What the refusal says. A 401 that named nothing would leave an operator
-  # with a working node and no way to tell which of the three credentials
-  # this endpoint wanted.
-  local told
-  told=$(jq -r '.details // empty' < "$answer" 2>/dev/null || true)
-
-  # And the fleet, which is where a caller that got through would show up.
+  # And the fleet, which is where anything that got through would show up.
   local fleet="${LOG_DIR}/verify-node-channel-fleet.json"
   control_api /api/platform/runtime > "$fleet" 2>/dev/null || true
-  local joined healthy
+  local joined healthy identity
   joined=$(jq -r --arg id "$invented" \
     '[.nodes[] | select(.id == $id)] | length' < "$fleet" 2>/dev/null || echo "?")
   healthy=$(jq -r --arg id "$NODE_ID" \
     '.nodes[] | select(.id == $id) | .healthy' < "$fleet" 2>/dev/null || true)
+  identity=$(jq -r --arg id "$NODE_ID" \
+    '.nodes[] | select(.id == $id) | .identity // "none"' < "$fleet" 2>/dev/null || true)
 
-  if [ "$none" = "401" ] && [ "$wrong" = "401" ] && [ "$human" = "401" ] \
+  if [ "$registration" = "404" ] && [ "$assignments" = "404" ] && [ "$routing" = "404" ] \
     && [ "$joined" = "0" ] && [ "$healthy" = "true" ] \
-    && printf '%s' "$told" | grep -q "node_preshared_keys"; then
+    && [ "$identity" != "none" ]; then
     pass_check "$title" \
-      "PUT /api/nodes/${invented}/registration answered ${none} with no credential, ${wrong} with a wrong one and ${human} carrying the API key this demo deploys with - which is a different channel and not a node key - and it says which credential it wants: \"$(printf '%s' "$told" | head -c 140)\". The fleet lists ${joined} node(s) under that id afterwards, so nothing joined and nothing is now being sent deployments, cron fires or decrypted secrets; ${NODE_ID}, which does hold the key, is still healthy"
+      "PUT .../registration, GET .../assignments and GET the routing table all answered ${registration}/${assignments}/${routing} on the listener that serves the dashboard - carrying the fleet key, which used to open all three. They are not refused here, they are not here: the machine channel serves them and a caller there proves a name. The fleet lists ${joined} node(s) under ${invented}, and ${NODE_ID} is healthy and known by the name it proved (${identity}), so the fleet is being run from the other socket"
   else
     fail_check "$title" \
-      "expected 401 with no credential (got ${none}), with a wrong one (got ${wrong}) and with the deploy API key (got ${human}), a refusal naming node_preshared_keys (it said \"${told:-nothing}\"), no fleet entry for ${invented} (found ${joined}) and ${NODE_ID} still healthy (healthy=${healthy:-unknown})"
+      "expected 404 from the human listener for registration (got ${registration}), assignments (got ${assignments}) and the routing table (got ${routing}), no fleet entry for ${invented} (found ${joined}), ${NODE_ID} healthy (healthy=${healthy:-unknown}) and known by a proved name (identity=${identity:-unknown})"
   fi
 }
 
@@ -9344,7 +9341,7 @@ verify_demo() {
   # Straight after it: the same endpoint asked by a caller with no node key,
   # which is what says the two above were served for a reason. It leaves no
   # node behind, so it can run either side of them.
-  check_the_node_channel_needs_the_node_key
+  check_the_node_channel_is_not_on_the_human_listener
   # The same question asked of the channel that replaces that key: what a
   # machine has to prove to reach the answers only machines may have.
   check_the_machine_channel_refuses_a_caller_with_no_certificate
