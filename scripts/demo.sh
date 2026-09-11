@@ -8717,19 +8717,26 @@ check_a_fleet_certificate_only_speaks_for_the_machine_it_names() {
 
   # And the same call made by the machine that certificate does name, so the
   # refusal above is about who asked rather than about the RPC being broken.
-  local own="${LOG_DIR}/verify-machine-own.log"
+  #
+  # Only whether it was answered is kept. That answer carries this
+  # environment's decrypted secrets - it is the whole reason this channel
+  # exists - so writing it to a file under .demo/logs would put the secret on
+  # disk in the clear, which is what `check_no_secret_in_logs` is there to
+  # refuse. It caught exactly that when this check was first written.
+  local own="${LOG_DIR}/verify-machine-own.count"
   grpcurl -max-time 10 \
     -cacert "${PKI_DIR}/ca.crt" \
     -cert "${PKI_DIR}/node.crt" -key "${PKI_DIR}/node.key" \
     -import-path "${ROOT_DIR}/crates/deis-wire/proto" -proto machine.proto \
     -d "{\"node_id\":\"${NODE_ID}\"}" \
     "127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}" \
-    deis.machine.MachineChannel/FetchAssignments > "$own" 2>&1 || true
+    deis.machine.MachineChannel/FetchAssignments 2>&1 \
+    | grep -c "assignmentsJson" > "$own" || true
 
   local refused told served
   refused=$(grep -c "PermissionDenied" "$answer" 2>/dev/null || echo 0)
   told=$(grep -m1 "Message:" "$answer" 2>/dev/null | sed 's/^ *Message: *//' || true)
-  served=$(grep -c "assignmentsJson" "$own" 2>/dev/null || echo 0)
+  served=$(cat "$own" 2>/dev/null || echo 0)
 
   # The refusal has to name both machines. "Denied" on its own leaves an
   # operator with a node that cannot start and no way to tell a misissued
