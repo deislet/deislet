@@ -2402,7 +2402,7 @@ CHECKS_FAILED=0
 # So the list has a length, it is written down, and a run that does not reach
 # it fails. Adding a check means changing this number, which is the point:
 # the number is the roll call.
-VERIFY_EXPECTED_CHECKS=94
+VERIFY_EXPECTED_CHECKS=97
 
 # Every claim a verdict has been printed for, one per line.
 #
@@ -8601,6 +8601,136 @@ check_the_node_channel_needs_the_node_key() {
   fi
 }
 
+
+# ----------------------------------------------------------------------
+# the machine channel
+# ----------------------------------------------------------------------
+#
+# The three checks below are about the socket only Deislet's own processes
+# talk on. What it answers with is every listed environment's decrypted
+# secrets, a map of every hostname on the platform, and the code of every
+# deployed version - so what may not reach it is as much the point as what
+# may, and the first two checks are the only ones in this file whose expected
+# outcome is that no request happens at all.
+#
+# The third is the one that could not have been written before. Under a
+# fleet-wide key every machine presented the same credential, so "a valid
+# credential held by the wrong machine" was not a thing that existed: a wrong
+# credential was a bad string. It now has to be minted - a real certificate,
+# signed by this fleet's own authority, naming a node that is not the one
+# running here - and the refusal it earns is the whole reason this channel
+# was built.
+
+# Call the machine channel with whatever certificate is named, and report only
+# whether a request happened. `--max-time` is generous because the answer this
+# asks for is "nothing at all", and a slow refusal and a hang are different
+# verdicts.
+machine_channel_http() {
+  local label=$1
+  shift
+  curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+    --cacert "${PKI_DIR}/ca.crt" "$@" \
+    "https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}${MACHINE_PROBE_PATH}" 2>/dev/null
+  printf ' %s' "$?"
+}
+
+# A path on the machine listener that exists. The version id is nonsense on
+# purpose: a caller that gets through is answered 404 by the route, which is
+# how this tells "the handshake succeeded and the route said no" from "there
+# was never a connection".
+MACHINE_PROBE_PATH="/api/apps/demo/versions/00000000-0000-0000-0000-000000000000/bundle"
+
+check_the_machine_channel_refuses_a_caller_with_no_certificate() {
+  local title="the machine channel will not talk to a caller that proves nothing"
+
+  local anonymous named
+  anonymous=$(machine_channel_http anonymous)
+  named=$(machine_channel_http node \
+    --cert "${PKI_DIR}/node.crt" --key "${PKI_DIR}/node.key")
+
+  # `000` is curl reporting that no HTTP status was ever received, and the
+  # non-zero exit beside it is the transport failing. The node's own
+  # certificate gets 404 from the same path, which is what says the listener
+  # is there and answering - so the refusal above is about the credential and
+  # not about the address being wrong.
+  if [ "$anonymous" = "000 56" ] || [ "${anonymous%% *}" = "000" ]; then
+    if [ "${named%% *}" = "404" ]; then
+      pass_check "$title" \
+        "a request to the machine listener with no client certificate got no HTTP status at all (curl reported \"${anonymous}\", status then exit code) - the connection ended during the handshake, so no request was ever served. The same path with ${NODE_ID}'s own certificate answered ${named%% *}, which is the route refusing a version id that does not exist: the listener is there, it answers, and what it would not do is talk to a caller that proved nothing"
+    else
+      fail_check "$title" \
+        "the anonymous caller was refused (${anonymous}) but the node's own certificate did not reach the route either (got ${named}), so this check proved nothing about the credential"
+    fi
+  else
+    fail_check "$title" \
+      "a caller with no client certificate reached the machine listener and got ${anonymous}; every environment's decrypted secrets are served on that socket"
+  fi
+}
+
+check_the_machine_channel_refuses_a_certificate_this_fleet_did_not_sign() {
+  local title="a certificate this fleet did not sign does not open the machine channel"
+
+  local rogue
+  rogue=$(machine_channel_http rogue \
+    --cert "${PKI_DIR}/rogue.crt" --key "${PKI_DIR}/rogue.key")
+
+  if [ "${rogue%% *}" = "000" ]; then
+    pass_check "$title" \
+      "a certificate naming spiffe://${FLEET_TRUST_DOMAIN}/deislet/node/${NODE_ID} - the right name, correctly spelled, signed by an authority this fleet has never heard of - got no HTTP status at all (curl reported \"${rogue}\"). Being able to spell a machine's name is not the same as being that machine, and the handshake is where the difference is decided"
+  else
+    fail_check "$title" \
+      "a certificate signed by an authority outside this fleet reached the machine listener and got ${rogue}"
+  fi
+}
+
+check_a_fleet_certificate_only_speaks_for_the_machine_it_names() {
+  local title="a real fleet certificate cannot ask for another machine's secrets"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" \
+      "grpcurl is not installed, so the machine channel's own RPC could not be called and the check that a certificate speaks only for the machine it names did not run"
+    return
+  fi
+
+  local answer="${LOG_DIR}/verify-machine-impostor.log"
+  grpcurl -max-time 10 \
+    -cacert "${PKI_DIR}/ca.crt" \
+    -cert "${PKI_DIR}/impostor.crt" -key "${PKI_DIR}/impostor.key" \
+    -import-path "${ROOT_DIR}/crates/deis-wire/proto" -proto machine.proto \
+    -d "{\"node_id\":\"${NODE_ID}\"}" \
+    "127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}" \
+    deis.machine.MachineChannel/FetchAssignments > "$answer" 2>&1 || true
+
+  # And the same call made by the machine that certificate does name, so the
+  # refusal above is about who asked rather than about the RPC being broken.
+  local own="${LOG_DIR}/verify-machine-own.log"
+  grpcurl -max-time 10 \
+    -cacert "${PKI_DIR}/ca.crt" \
+    -cert "${PKI_DIR}/node.crt" -key "${PKI_DIR}/node.key" \
+    -import-path "${ROOT_DIR}/crates/deis-wire/proto" -proto machine.proto \
+    -d "{\"node_id\":\"${NODE_ID}\"}" \
+    "127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}" \
+    deis.machine.MachineChannel/FetchAssignments > "$own" 2>&1 || true
+
+  local refused told served
+  refused=$(grep -c "PermissionDenied" "$answer" 2>/dev/null || echo 0)
+  told=$(grep -m1 "Message:" "$answer" 2>/dev/null | sed 's/^ *Message: *//' || true)
+  served=$(grep -c "assignmentsJson" "$own" 2>/dev/null || echo 0)
+
+  # The refusal has to name both machines. "Denied" on its own leaves an
+  # operator with a node that cannot start and no way to tell a misissued
+  # certificate from a mistyped node id.
+  if [ "$refused" != "0" ] && [ "$served" != "0" ] \
+    && printf '%s' "$told" | grep -q "deis-runtime-demo-99" \
+    && printf '%s' "$told" | grep -q "${NODE_ID}"; then
+    pass_check "$title" \
+      "a certificate this fleet really issued, naming deis-runtime-demo-99, asked for ${NODE_ID}'s assignment list - the answer that carries that environment's decrypted secrets - and was refused PermissionDenied: \"$(printf '%s' "$told" | head -c 160)\". The same call with ${NODE_ID}'s own certificate was answered. Under one shared fleet key this refusal could not be expressed at all: both callers would have presented the same credential"
+    else
+    fail_check "$title" \
+      "expected PermissionDenied naming both machines for the impostor (found ${refused} such line(s), message \"${told:-nothing}\") and an answer for ${NODE_ID}'s own certificate (found ${served} answer(s))"
+  fi
+}
+
 # ----------------------------------------------------------------------
 # `deis trace`
 # ----------------------------------------------------------------------
@@ -9194,6 +9324,11 @@ verify_demo() {
   # which is what says the two above were served for a reason. It leaves no
   # node behind, so it can run either side of them.
   check_the_node_channel_needs_the_node_key
+  # The same question asked of the channel that replaces that key: what a
+  # machine has to prove to reach the answers only machines may have.
+  check_the_machine_channel_refuses_a_caller_with_no_certificate
+  check_the_machine_channel_refuses_a_certificate_this_fleet_did_not_sign
+  check_a_fleet_certificate_only_speaks_for_the_machine_it_names
   check_cli_status
   echo "-- accounts, scopes and the audit log --"
   # After every check that expects a particular version on the preview
