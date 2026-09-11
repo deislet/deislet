@@ -298,7 +298,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let app = grpc_routes
         .into_axum_router()
         .merge(api.router)
-        .fallback(axum::routing::get(
+        // Every method, not only GET.
+        //
+        // A GET-only fallback means a path this listener does not have answers
+        // 405 to a PUT - "wrong method" - when the method was never the
+        // problem. That reads as "try again differently" to whoever is on the
+        // other end, and the four node routes that left this listener are
+        // exactly the paths somebody will PUT to out of habit. The handler
+        // itself already tells a browser's GET apart from a call to a path
+        // that is not here.
+        .fallback(axum::routing::any(
             deis_control::api::static_files::serve_fallback,
         ));
 

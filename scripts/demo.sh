@@ -420,6 +420,11 @@ mint_fleet_identities() {
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/proxy" \
     "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/${PROXY_ID}"
 
+  # A second real machine of this fleet: the node that joins by registering,
+  # which it can only do by proving a name of its own.
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/unlisted" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/node/${NODE_ID}-unlisted" "IP:127.0.0.1"
+
   # Signed by this fleet, naming a node that is not the one running here.
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/impostor" \
     "spiffe://${FLEET_TRUST_DOMAIN}/deislet/node/deis-runtime-demo-99" "IP:127.0.0.1"
@@ -8498,15 +8503,28 @@ check_dynamic_node_registration() {
   local dynamic_id="${NODE_ID}-unlisted"
   local fleet="${LOG_DIR}/verify-fleet-dynamic.json"
 
-  local status
-  status=$(curl -s -o /dev/null -w '%{http_code}' \
-    -X PUT -H "Authorization: Bearer ${SECRET}" -H 'content-type: application/json' \
-    -d "{\"address\":\"http://127.0.0.1:${DEIS_RUNTIME_PORT}\"}" \
-    "$(control_url)/api/nodes/${dynamic_id}/registration" || true)
-
-  if [ "$status" != "200" ]; then
+  # Over the machine channel, proving a certificate that names this machine
+  # and no other - which is the only way to join now. A registration is a
+  # claim about which machine is at an address, and the control plane holds
+  # that claim against the name the connection proved.
+  if ! command -v grpcurl >/dev/null 2>&1; then
     fail_check "$title" \
-      "PUT /api/nodes/${dynamic_id}/registration, presenting the node credential, answered HTTP ${status}"
+      "grpcurl is not installed, so a node could not be registered the way a node registers"
+    return
+  fi
+
+  local answer="${LOG_DIR}/verify-dynamic-register.log"
+  grpcurl -max-time 10 \
+    -cacert "${PKI_DIR}/ca.crt" \
+    -cert "${PKI_DIR}/unlisted.crt" -key "${PKI_DIR}/unlisted.key" \
+    -import-path "${ROOT_DIR}/crates/deis-wire/proto" -proto machine.proto \
+    -d "{\"node_id\":\"${dynamic_id}\",\"registration_json\":\"{\\\"address\\\":\\\"http://127.0.0.1:${DEIS_RUNTIME_PORT}\\\"}\"}" \
+    "127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}" \
+    deis.machine.MachineChannel/Register > "$answer" 2>&1 || true
+
+  if ! grep -q "registrationJson" "$answer"; then
+    fail_check "$title" \
+      "Register over the machine channel, proving ${dynamic_id}'s own certificate, was not answered: $(tr '\n' ' ' < "$answer" | head -c 200)"
     return
   fi
 
@@ -8534,21 +8552,27 @@ check_dynamic_node_registration() {
   # ✓, and the run after it inherited a node nobody could explain. It is also
   # the only exercise `DELETE .../registration` gets anywhere in this file, so
   # discarding the answer left half the endpoint unchecked as well.
-  local removed_status still_listed
-  removed_status=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-    -H "Authorization: Bearer ${SECRET}" \
-    "$(control_url)/api/nodes/${dynamic_id}/registration" || true)
+  local removed still_listed
+  local removed_answer="${LOG_DIR}/verify-dynamic-deregister.log"
+  grpcurl -max-time 10 \
+    -cacert "${PKI_DIR}/ca.crt" \
+    -cert "${PKI_DIR}/unlisted.crt" -key "${PKI_DIR}/unlisted.key" \
+    -import-path "${ROOT_DIR}/crates/deis-wire/proto" -proto machine.proto \
+    -d "{\"node_id\":\"${dynamic_id}\"}" \
+    "127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}" \
+    deis.machine.MachineChannel/Deregister > "$removed_answer" 2>&1 || true
+  removed=$(grep -c '"removed": true' "$removed_answer" 2>/dev/null || echo 0)
   control_api /api/platform/runtime > "$fleet" 2>/dev/null || true
   still_listed=$(jq -r --arg id "$dynamic_id" \
     '[.nodes[] | select(.id == $id)] | length' < "$fleet" 2>/dev/null || echo "?")
 
   if [ "$source" = "registered" ] && [ -n "$registered_at" ] \
-    && [ "$removed_status" = "200" ] && [ "$still_listed" = "0" ]; then
+    && [ "$removed" != "0" ] && [ "$still_listed" = "0" ]; then
     pass_check "$title" \
-      "${dynamic_id} is not in deis_runtime_nodes; PUT .../registration alone put it on the fleet, with source=registered since ${registered_at}. DELETE .../registration then answered HTTP ${removed_status} and the fleet no longer lists it, so the run leaves behind exactly the nodes the configuration file names"
+      "${dynamic_id} is not in deis_runtime_nodes; it joined the fleet by proving a certificate that names it and nothing else, with source=registered since ${registered_at}. Deregister, proving the same certificate, then reported it removed and the fleet no longer lists it - so the run leaves behind exactly the nodes the configuration file names. Joining used to be a PUT carrying a string every machine in the fleet held; it now takes an identity somebody had to issue"
   else
     fail_check "$title" \
-      "PUT .../registration for ${dynamic_id} answered HTTP ${status} and the fleet showed source='${source:-<absent>}' registered_at='${registered_at:-<none>}'; the DELETE that takes the invented identity away again answered HTTP ${removed_status} and left ${still_listed} entry/entries for it on the fleet"
+      "Register over the machine channel for ${dynamic_id} left the fleet showing source='${source:-<absent>}' registered_at='${registered_at:-<none>}'; the Deregister that takes the invented identity away again reported removed=${removed} and left ${still_listed} entry/entries for it on the fleet"
   fi
 }
 
