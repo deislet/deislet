@@ -68,6 +68,14 @@ impl ControlService for GrpcControlService {
         &self,
         request: Request<Streaming<ControlMessage>>,
     ) -> Result<Response<Self::EstablishChannelStream>, Status> {
+        // Read before the stream is taken: on the machine listener the
+        // acceptor put the name this connection proved on every request, and
+        // on the human listener there is none. Which of the two it is decides
+        // how the handshake below is judged.
+        let proved = request
+            .extensions()
+            .get::<crate::machine::PeerIdentity>()
+            .map(|crate::machine::PeerIdentity(identity)| identity.clone());
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
 
@@ -94,12 +102,15 @@ impl ControlService for GrpcControlService {
         tokio::spawn({
             let shutdown = shutdown.clone();
             async move {
-                let mut current_session: Option<Arc<NodeSession>> = None;
-                let mut authenticated = false;
-                // The name the node gave for itself in the handshake. It is
-                // the node's identity for as long as this stream lives, and
-                // across every stream it ever opens.
-                let mut announced_id: Option<String> = None;
+                // The three facts this stream accumulates about itself. The
+                // name the node gives in the handshake is its identity for as
+                // long as this stream lives, and across every stream it ever
+                // opens.
+                let mut state = ChannelState {
+                    authenticated: false,
+                    announced_id: None,
+                    session: None,
+                };
                 // Told apart in the log and in the recorded event, because
                 // the two mean opposite things to whoever reads them: a node
                 // that went away is a node to go looking for, while a channel
@@ -126,13 +137,12 @@ impl ControlService for GrpcControlService {
                         Ok(msg) => {
                             if let Some(payload) = msg.payload {
                                 handle_payload(
+                                    proved.as_ref(),
                                     payload,
                                     &tx,
                                     &sessions,
                                     &handler,
-                                    &mut current_session,
-                                    &mut authenticated,
-                                    &mut announced_id,
+                                    &mut state,
                                 )
                                 .await;
                             }
@@ -145,7 +155,7 @@ impl ControlService for GrpcControlService {
                 }
 
                 // Cleanup
-                if let Some(session) = current_session {
+                if let Some(session) = state.session {
                     let reason = if stopped_for_shutdown {
                         "Control plane shutting down"
                     } else {
@@ -186,27 +196,55 @@ impl ControlService for GrpcControlService {
     }
 }
 
+/// What one control channel has become, as its messages are handled.
+///
+/// Three facts about one connection that are always read and written
+/// together: whether its handshake was accepted, the name it gave for itself
+/// once it was, and the session it ended up attached to. Passed as one value
+/// because they only make sense as one - an announced id on an unauthenticated
+/// channel would be a claim nobody checked.
+struct ChannelState {
+    authenticated: bool,
+    announced_id: Option<String>,
+    session: Option<Arc<NodeSession>>,
+}
+
 async fn handle_payload(
+    proved: Option<&deis_identity::SpiffeId>,
     payload: Payload,
     tx: &mpsc::Sender<Result<ControlMessage, Status>>,
     _sessions: &Arc<SessionManager>,
     handler: &MessageHandler,
-    current_session: &mut Option<Arc<NodeSession>>,
-    authenticated: &mut bool,
-    announced_id: &mut Option<String>,
+    state: &mut ChannelState,
 ) {
+    let ChannelState {
+        authenticated,
+        announced_id,
+        session: current_session,
+    } = state;
     match payload {
         Payload::Authenticate(req) => {
-            // An empty key list is not "no check required": it means this
-            // control plane cannot tell a node from anyone else, so it
-            // admits neither. The binary never starts in that state - see
-            // `ControlConfig::ensure_node_credential` - and a caller that
-            // assembles the service by hand gets a closed channel rather
-            // than an open one.
-            let preshared_keys = &handler.config().node_preshared_keys;
-            let valid = preshared_keys
-                .iter()
-                .any(|key| crate::api::middleware::secret_eq(key, &req.secret));
+            // A caller that reached this service over the machine channel has
+            // already proved, during the handshake, that it holds the private
+            // key for a certificate this fleet signed. There is nothing a
+            // string in this message could add to that, and asking for one
+            // anyway would keep a shared secret load-bearing on a connection
+            // that does not need it. So the name is the answer, and whatever
+            // `secret` carries is ignored.
+            //
+            // On the other listener there is no proved name, and the fleet key
+            // is all there is. An empty key list is not "no check required"
+            // there: it means this control plane cannot tell a node from
+            // anyone else, so it admits neither.
+            let valid = match proved {
+                Some(_) => true,
+                None => {
+                    let preshared_keys = &handler.config().node_preshared_keys;
+                    preshared_keys
+                        .iter()
+                        .any(|key| crate::api::middleware::secret_eq(key, &req.secret))
+                }
+            };
             *authenticated = valid;
             if valid {
                 // Kept, because this is the only place the node ever says who
@@ -216,24 +254,36 @@ async fn handle_payload(
                 *announced_id = Some(req.instance_id.clone());
             }
 
+            let no_keys_configured = handler.config().node_preshared_keys.is_empty();
             let message = if valid {
                 format!("Authenticated: {}", req.instance_id)
-            } else if preshared_keys.is_empty() {
-                "This control plane has no node_preshared_keys configured, so it accepts no node"
+            } else if no_keys_configured {
+                "This control plane has no node_preshared_keys configured, and this connection \
+                 proved no name either, so there is nothing to authenticate it by. Reach it on \
+                 the machine channel with a certificate this fleet signed"
                     .to_string()
             } else {
                 "Invalid secret".to_string()
             };
 
-            if valid {
-                info!("gRPC auth success for {}", req.instance_id);
-            } else if preshared_keys.is_empty() {
-                error!(
+            match (valid, proved) {
+                (true, Some(name)) => info!(
                     instance = %req.instance_id,
-                    "Refused a node control channel because node_preshared_keys is empty; no node can attach until one is configured"
-                );
-            } else {
-                warn!("gRPC auth failed for {}: invalid secret", req.instance_id);
+                    proved = %name,
+                    "A machine attached its control channel, admitted by the name it proved rather than by any secret it sent"
+                ),
+                (true, None) => info!(
+                    instance = %req.instance_id,
+                    "A machine attached its control channel on the human listener, admitted by the fleet key"
+                ),
+                (false, _) if no_keys_configured => error!(
+                    instance = %req.instance_id,
+                    "Refused a control channel: it proved no name and this control plane has no node_preshared_keys, so it can tell nobody from anybody"
+                ),
+                (false, _) => warn!(
+                    instance = %req.instance_id,
+                    "Refused a control channel on the human listener: the secret it sent is not one of this control plane's node keys"
+                ),
             }
 
             let reply = Payload::AuthResponse(AuthResponse {
@@ -406,6 +456,99 @@ async fn send_payload(tx: &mpsc::Sender<Result<ControlMessage, Status>>, payload
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection that proved a name is admitted on the strength of that
+    /// name, and what it put in `secret` is not read.
+    ///
+    /// This is the last place a shared secret decided anything on the machine
+    /// channel. Until it changed, a proxy that had proved a certificate still
+    /// had to send the fleet key or be refused - which meant the key could not
+    /// be taken out of its configuration, however well it had authenticated.
+    #[tokio::test]
+    async fn a_proved_name_is_admitted_without_a_secret() {
+        let handler = MessageHandler::new(
+            Arc::new(crate::config::ControlConfig {
+                node_preshared_keys: vec!["the-fleet-key".to_string()],
+                ..Default::default()
+            }),
+            Arc::new(SessionManager::new()),
+        );
+        let proxy = deis_identity::names::proxy("deis.internal", "edge-1").expect("a proxy name");
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ChannelState {
+            authenticated: false,
+            announced_id: None,
+            session: None,
+        };
+
+        handle_payload(
+            Some(&proxy),
+            Payload::Authenticate(deis_wire::pb::AuthenticateRequest {
+                instance_id: "edge-1".to_string(),
+                // Deliberately wrong. On this connection nothing reads it.
+                secret: "not-the-fleet-key".to_string(),
+            }),
+            &tx,
+            &Arc::new(SessionManager::new()),
+            &handler,
+            &mut state,
+        )
+        .await;
+
+        assert!(
+            state.authenticated,
+            "a connection that proved a name was refused for the contents of a field nothing should have read"
+        );
+        assert_eq!(state.announced_id.as_deref(), Some("edge-1"));
+        let answered = rx.recv().await.expect("an answer").expect("not an error");
+        match answered.payload {
+            Some(Payload::AuthResponse(response)) => assert!(response.success),
+            other => panic!("expected an auth response, got {other:?}"),
+        }
+    }
+
+    /// And the other listener, where there is no name and the key is all there
+    /// is: the same wrong secret is refused.
+    #[tokio::test]
+    async fn without_a_proved_name_the_fleet_key_still_decides() {
+        let handler = MessageHandler::new(
+            Arc::new(crate::config::ControlConfig {
+                node_preshared_keys: vec!["the-fleet-key".to_string()],
+                ..Default::default()
+            }),
+            Arc::new(SessionManager::new()),
+        );
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ChannelState {
+            authenticated: false,
+            announced_id: None,
+            session: None,
+        };
+
+        handle_payload(
+            None,
+            Payload::Authenticate(deis_wire::pb::AuthenticateRequest {
+                instance_id: "edge-1".to_string(),
+                secret: "not-the-fleet-key".to_string(),
+            }),
+            &tx,
+            &Arc::new(SessionManager::new()),
+            &handler,
+            &mut state,
+        )
+        .await;
+
+        assert!(!state.authenticated);
+        assert!(
+            state.announced_id.is_none(),
+            "a refused caller said nothing about itself"
+        );
+        let answered = rx.recv().await.expect("an answer").expect("not an error");
+        match answered.payload {
+            Some(Payload::AuthResponse(response)) => assert!(!response.success),
+            other => panic!("expected an auth response, got {other:?}"),
+        }
+    }
 
     use deis_wire::pb::control_service_client::ControlServiceClient;
     use deis_wire::pb::{AuthenticateRequest, control_message::Payload as ClientPayload};
