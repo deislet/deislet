@@ -223,6 +223,19 @@ interval is the longest a renewal can go unnoticed, so it wants to be far
 shorter than the shortest certificate lifetime in use. Three things are worth
 knowing:
 
+- **Expiry is announced, not discovered.** Nothing here issues or renews a
+  certificate, so forgetting to renew one would otherwise be invisible right
+  up to the instant it expires - and then every connection on the machine
+  channel fails at the same moment, for a reason none of the processes would
+  name. So each process logs, at startup and on every reload tick, how long
+  its own certificate has left
+  (`MachineIdentity::announce_expiry` / `report_expiry`). The threshold is a
+  fraction of the certificate's own lifetime - `warn` at four fifths spent,
+  `error` at nineteen twentieths - rather than a number of days, because this
+  platform is handed both two-day certificates and multi-year ones, and a
+  fixed threshold would either say nothing useful on one or fire on every
+  correct startup on the other. A warning that fires when nothing is wrong is
+  how an operator learns to skip the one that matters.
 - A re-read that fails leaves the material already in force in use, and says
   so at `warn`. If it keeps failing until the current certificate expires,
   every connection on the machine channel starts failing at once.

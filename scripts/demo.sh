@@ -2440,7 +2440,7 @@ CHECKS_FAILED=0
 # So the list has a length, it is written down, and a run that does not reach
 # it fails. Adding a check means changing this number, which is the point:
 # the number is the roll call.
-VERIFY_EXPECTED_CHECKS=98
+VERIFY_EXPECTED_CHECKS=99
 
 # Every claim a verdict has been printed for, one per line.
 #
@@ -8226,6 +8226,67 @@ node_grpc_status() {
     | tr -d '\r' | awk 'tolower($1) == "grpc-status:" {print $2}' | head -n 1
 }
 
+# Nothing in Deislet issues, renews or revokes a certificate - that is the
+# installation's own authority, and keeping it out is what lets any PKI be
+# substituted for any other. The cost of that decision is that expiry becomes
+# somebody else's job, and nothing would notice it being forgotten: an
+# expiring certificate is invisible right up to the moment it expires, and
+# then every connection on the machine channel fails at the same instant.
+# Nodes stop fetching assignments, the control plane stops being able to drive
+# them, the proxy stops seeing route changes - all at once, for a reason none
+# of those processes would name.
+#
+# So each process says, at startup, when its own certificate runs out. This
+# asks whether it really did. The date is the useful half: an operator reading
+# a healthy process's log should be able to find out when somebody has to act,
+# rather than finding out when it has already become urgent.
+#
+# This demo's certificates are minted for two days, so none of them is close
+# enough to expiry for the warning to fire - which is the other half of the
+# rule and is checked here too. A threshold that fired on a certificate issued
+# minutes ago would teach an operator that these warnings are noise, on the
+# way to the one that is not.
+check_every_process_says_when_its_certificate_runs_out() {
+  local title="each process says at startup when its own certificate expires"
+  local phrase="certificate is good for that long"
+
+  # deis-proxy's own tracing goes to the error log pingora is configured with,
+  # not to the file its stdout is redirected into - that one carries pingora's
+  # own lines. Reading the wrong one here would report the proxy as silent
+  # while it was saying exactly what was asked of it.
+  local control node proxy
+  control=$(grep -c "$phrase" "${LOG_DIR}/deis-control.log" 2>/dev/null) || control=0
+  node=$(grep -c "$phrase" "${LOG_DIR}/deis-runtime.log" 2>/dev/null) || node=0
+  proxy=$(grep -c "$phrase" "${LOG_DIR}/deis_proxy_error.log" 2>/dev/null) || proxy=0
+
+  # The name and the remaining time have to be on the line itself. A line that
+  # said only "expires soon" would send the reader back to openssl to find out
+  # which of three machines it was about.
+  local named remaining
+  named=$(grep "$phrase" "${LOG_DIR}/deis-control.log" 2>/dev/null \
+    | grep -c "identity=spiffe://${FLEET_TRUST_DOMAIN}/deislet/control") || named=0
+  remaining=$(grep "$phrase" "${LOG_DIR}/deis-control.log" 2>/dev/null \
+    | grep -oE 'remaining_secs=[0-9]+' | head -n 1 | cut -d= -f2)
+
+  # And nothing is warning about it, because nothing should be: every
+  # certificate here was minted minutes ago for two days.
+  local premature=0
+  premature=$(cat "${LOG_DIR}/deis-control.log" "${LOG_DIR}/deis-runtime.log" \
+    "${LOG_DIR}/deis_proxy_error.log" 2>/dev/null \
+    | grep -c "has used four fifths of its life\|in the last twentieth of its life\|certificate has expired") || premature=0
+
+  if [ "$control" -ge 1 ] && [ "$node" -ge 1 ] && [ "$proxy" -ge 1 ] \
+    && [ "$named" -ge 1 ] && [ -n "$remaining" ] && [ "$remaining" -gt 0 ] \
+    && [ "$premature" -eq 0 ]; then
+    pass_check "$title" \
+      "the control plane, the node and the proxy each logged when their own certificate runs out at startup, and the control plane's line names spiffe://${FLEET_TRUST_DOMAIN}/deislet/control with ${remaining} second(s) left - so an operator reading a healthy process's log learns the date rather than learning it from every connection failing at once. None of the three warned, which is correct: these were minted minutes ago for two days, and a threshold that fired on a fresh certificate would teach an operator that this warning is noise"
+    return
+  fi
+
+  fail_check "$title" \
+    "expected all three to say when their certificate expires (control ${control}, node ${node}, proxy ${proxy} line(s)), the control plane's line to name its own identity (${named}) and carry a positive remaining_secs (got \"${remaining:-none}\"), and nothing to be warning yet (found ${premature})"
+}
+
 # The check above asks the control plane to unload an application and is
 # refused there. This one goes at the node directly, the way anything that can
 # route to the node's port can.
@@ -9547,6 +9608,7 @@ verify_demo() {
   check_a_credential_cannot_wire_an_app_to_one_it_cannot_see
   check_a_scoped_token_cannot_unload_an_application_from_a_node
   check_the_node_management_plane_is_not_on_the_data_port
+  check_every_process_says_when_its_certificate_runs_out
   check_a_wide_credential_cannot_mint_a_storage_token
   check_a_revoked_token_stops_at_its_next_call
   check_the_audit_log_names_who_changed_what

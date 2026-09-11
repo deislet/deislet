@@ -69,7 +69,7 @@ use arc_swap::ArcSwap;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, ServerConfig};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub use crate::cert::name_in_certificate;
 pub use crate::dial::Dialler;
@@ -204,6 +204,110 @@ impl MachineIdentity {
         &self.files
     }
 
+    /// Seconds since the epoch, as the expiry report measures them.
+    ///
+    /// A saturating conversion rather than an unwrap: a clock set before 1970
+    /// is a broken machine, and a panic in a background watcher would take the
+    /// reload with it - which is the one thing that still has to keep working
+    /// on a machine whose clock is wrong.
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// When the certificate currently in force stops being valid.
+    pub fn validity(&self) -> crate::cert::Validity {
+        self.current.load().validity
+    }
+
+    /// State when the certificate in force expires, whether or not that is
+    /// soon.
+    ///
+    /// Separate from [`Self::report_expiry`] because the two answer different
+    /// questions. This one is a fact an operator should be able to find in the
+    /// log of a healthy process; that one is a call to act. Merging them would
+    /// mean either saying nothing while everything is fine - leaving nowhere
+    /// to look up the date - or warning on every correct startup.
+    pub fn announce_expiry(&self, now: i64) {
+        let validity = self.validity();
+        info!(
+            identity = %self.id(),
+            certificate = %self.files.certificate.display(),
+            remaining_secs = validity.remaining_at(now),
+            lifetime_secs = validity.not_after - validity.not_before,
+            "This machine's certificate is good for that long. Nothing here renews it; when it \
+             expires, every connection on the machine channel fails at once"
+        );
+    }
+
+    /// Report how much of the current certificate's life is left, at whatever
+    /// level that deserves.
+    ///
+    /// # Why this exists at all
+    ///
+    /// Nothing in Deislet issues, renews or revokes a certificate - that is
+    /// the installation's own authority, and keeping it out is what lets any
+    /// PKI be substituted for any other. The cost of that decision is that
+    /// expiry is somebody else's job and nothing here would notice it being
+    /// forgotten. An expiring certificate is invisible right up to the moment
+    /// it expires, and then every connection on the machine channel fails at
+    /// once: nodes stop fetching assignments, the control plane stops being
+    /// able to drive them, and the proxy stops seeing route changes - all of
+    /// it at the same instant, for a reason none of those processes will name.
+    ///
+    /// So this crate cannot fix expiry and must not be silent about it.
+    ///
+    /// # Why the threshold is a fraction and not a number of days
+    ///
+    /// Deislet is handed both two-day certificates (its own demo) and
+    /// multi-year ones. A week's notice is early on one and already too late
+    /// on the other, and a fixed threshold would either say nothing useful or
+    /// fire on every correct startup - which teaches an operator that this
+    /// crate's warnings are noise, on the way to the one that is not. Measured
+    /// against the certificate's own lifetime, one rule fits every issuer and
+    /// a freshly issued certificate never trips it.
+    pub fn report_expiry(&self, now: i64) {
+        let validity = self.validity();
+        let spent = validity.spent_by(now);
+        let remaining = validity.remaining_at(now);
+        let id = self.id();
+        let certificate = self.files.certificate.display();
+        if remaining <= 0 {
+            error!(
+                identity = %id,
+                certificate = %certificate,
+                expired_secs_ago = -remaining,
+                "This machine's certificate has expired. Every connection it makes or accepts on \
+                 the machine channel is refused during the handshake, so this process can neither \
+                 reach its peers nor be reached by them. Nothing here can renew it: issue a new \
+                 certificate for this name and write it to the same path, and it is picked up \
+                 without a restart"
+            );
+        } else if spent >= 0.95 {
+            error!(
+                identity = %id,
+                certificate = %certificate,
+                remaining_secs = remaining,
+                "This machine's certificate is in the last twentieth of its life. When it \
+                 expires, every connection on the machine channel starts failing at the same \
+                 instant - this process will neither reach its peers nor be reachable. Issue a \
+                 replacement for this name at the same path; it is picked up without a restart"
+            );
+        } else if spent >= 0.80 {
+            warn!(
+                identity = %id,
+                certificate = %certificate,
+                remaining_secs = remaining,
+                "This machine's certificate has used four fifths of its life. Nothing here renews \
+                 it, and when it expires every connection on the machine channel fails at once. \
+                 Issue a replacement for this name at the same path; it is picked up without a \
+                 restart"
+            );
+        }
+    }
+
     /// A listener configuration that requires the peer to prove a name in our
     /// trust domain before the connection exists at all.
     pub fn server_config(&self) -> Arc<ServerConfig> {
@@ -291,9 +395,20 @@ impl MachineIdentity {
             // files were just read; skip it so the first real look is one
             // interval from now.
             ticker.tick().await;
+            // Said once at startup even when there is nothing wrong. An
+            // operator reads the startup lines and rarely reads anything else
+            // until something breaks, so the one moment this crate is
+            // guaranteed an audience is the moment to say when somebody has to
+            // act - not the moment it has become urgent.
+            identity.announce_expiry(Self::now_unix());
+            identity.report_expiry(Self::now_unix());
             loop {
                 ticker.tick().await;
                 identity.reload_and_report();
+                // Checked on the same tick as the reload, because the two
+                // questions are one: a renewal that happened is what stops
+                // this from having anything to say.
+                identity.report_expiry(Self::now_unix());
             }
         })
     }

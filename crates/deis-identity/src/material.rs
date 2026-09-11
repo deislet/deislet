@@ -26,7 +26,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 
 use crate::IdentityFiles;
-use crate::cert::name_in_certificate;
+use crate::cert::{name_in_certificate, validity_of};
 use crate::error::{FileRole, IdentityError};
 use crate::spiffe::SpiffeId;
 use crate::verify::{VerifyPeerIs, VerifyPeerIsInTrustDomain};
@@ -43,6 +43,12 @@ pub(crate) struct Material {
     pub(crate) roots: Arc<RootCertStore>,
     pub(crate) server: Arc<ServerConfig>,
     pub(crate) provider: Arc<CryptoProvider>,
+    /// When the end-entity certificate in `chain` stops being valid.
+    ///
+    /// Kept beside the material rather than re-read on demand because the
+    /// question is asked on a timer and the answer only changes when the
+    /// material does.
+    pub(crate) validity: crate::cert::Validity,
     /// What the three files hashed to when this set was built.
     ///
     /// Compared on the next look to answer "is there anything new here" without
@@ -80,6 +86,9 @@ impl Material {
         // of a chain: everything after it is there to get a verifier from it up
         // to the root.
         let id = name_in_certificate(&chain[0])?;
+        // The same certificate, read twice for two different questions: who
+        // this machine is, and how long it may go on saying so.
+        let validity = validity_of(&chain[0])?;
 
         let peer_verifier =
             WebPkiClientVerifier::builder_with_provider(Arc::clone(&roots), Arc::clone(&provider))
@@ -112,6 +121,7 @@ impl Material {
             roots,
             server: Arc::new(server),
             provider,
+            validity,
             digest,
         })
     }
