@@ -59,6 +59,7 @@ use utoipa::ToSchema;
 
 use crate::config::RuntimeNodeConfig;
 use crate::node_key::{NodeKeyFingerprint, NodeProof};
+use deis_identity::{Dialler, MachineIdentity, Protocol};
 use proto::runtime_management_client::RuntimeManagementClient;
 use trigger::trigger_client::TriggerClient;
 
@@ -462,6 +463,11 @@ struct NodeEntry {
     registered_at: Option<DateTime<Utc>>,
     /// Last time it registered or refreshed. What expiry measures.
     last_registered_at: Option<DateTime<Utc>>,
+    /// Where this node serves its management plane over mutual TLS, if it
+    /// serves one. Reported at registration beside the plaintext address,
+    /// because the two are different sockets and the node is the only thing
+    /// that knows whether it bound the second.
+    machine_addr: Option<String>,
     /// What the most recent registration proved: a fleet key, or a name on a
     /// certificate. `None` only for a configured node nothing has registered
     /// yet. See [`NodeKeyStatus`] for what follows from it.
@@ -582,6 +588,26 @@ fn check_node_address(addr: &str) -> Result<(), RegistrationError> {
         .map_err(|e| invalid(&e.to_string()))
 }
 
+/// What a node says about itself when it registers.
+///
+/// One struct rather than five parameters because they arrive together, are
+/// recorded together, and mean nothing apart: an address with no proof is a
+/// claim nobody made, and a proof with no address is a machine that cannot be
+/// dialled. Passing them separately also let a caller transpose two of them
+/// silently, which is the kind of mistake a registration is the worst place
+/// to make.
+pub struct NodeClaim {
+    /// The plaintext management address, where the fleet key still guards.
+    pub addr: String,
+    /// Where this node serves the same plane over mutual TLS, when it does.
+    pub machine_addr: Option<String>,
+    /// Version of the node process, for display until a health probe confirms
+    /// it.
+    pub version: Option<String>,
+    /// What the caller proved to make this claim.
+    pub proof: NodeProof,
+}
+
 /// The fleet: which nodes exist, how to reach them, and how they are doing.
 ///
 /// Two sources feed it, and the difference matters at startup. Nodes named in
@@ -604,6 +630,11 @@ pub struct RuntimeNodeManager {
     /// registration or an expiry - and every read is a short, non-async
     /// snapshot.
     nodes: std::sync::RwLock<std::collections::BTreeMap<String, NodeEntry>>,
+    /// What this control plane proves when it dials a node's authenticated
+    /// management plane. `None` on an installation with no machine channel,
+    /// where every call goes out over the plaintext plane with a bearer
+    /// credential exactly as it always did.
+    identity: Option<Arc<MachineIdentity>>,
     /// Registered nodes whose lease ran out, kept so that a fleet-wide
     /// operation can say it did not reach them. See [`DepartedNode`].
     departed: std::sync::RwLock<std::collections::BTreeMap<String, DepartedNode>>,
@@ -660,12 +691,14 @@ impl RuntimeNodeManager {
                     version: None,
                     registered_at: None,
                     last_registered_at: None,
+                    machine_addr: None,
                     proof: None,
                 },
             );
         }
         Self {
             nodes: std::sync::RwLock::new(entries),
+            identity: None,
             departed: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             contested: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             health,
@@ -690,6 +723,19 @@ impl RuntimeNodeManager {
     /// credential would say the credential matters there, which it does not.
     /// What matters is that the two places which do serve a live fleet, the
     /// binary and [`crate::api::start_api_server`], both call this.
+    /// Give this fleet manager the identity this control plane proves when it
+    /// dials a node.
+    ///
+    /// Without one, every call goes out over the plaintext management plane
+    /// with a bearer credential, which is what every installation did before
+    /// the machine channel existed. With one, a node that registered by
+    /// certificate and reported an authenticated management address is dialled
+    /// there instead, and nothing about that call is a shared secret.
+    pub fn with_machine_identity(mut self, identity: Option<Arc<MachineIdentity>>) -> Self {
+        self.identity = identity;
+        self
+    }
+
     pub fn with_node_keys(mut self, keys: &[String]) -> Self {
         self.keys = keys
             .iter()
@@ -919,11 +965,16 @@ impl RuntimeNodeManager {
     pub fn register(
         &self,
         id: &str,
-        addr: &str,
-        version: Option<String>,
+        claim: NodeClaim,
         now: DateTime<Utc>,
-        proof: NodeProof,
     ) -> Result<Registered, RegistrationError> {
+        let NodeClaim {
+            addr,
+            machine_addr,
+            version,
+            proof,
+        } = claim;
+        let addr = addr.as_str();
         let id = id.trim();
         if id.is_empty() {
             return Err(RegistrationError::EmptyId);
@@ -971,6 +1022,10 @@ impl RuntimeNodeManager {
                     Registered::AddressChanged
                 };
                 entry.version = version;
+                // Re-read on every registration: a node that grew a machine
+                // management plane, or lost one, says so by registering, and
+                // the control plane dials whichever it last reported.
+                entry.machine_addr = machine_addr.clone();
                 entry.registered_at.get_or_insert(now);
                 entry.last_registered_at = Some(now);
                 if entry.proof.as_ref() != Some(&proof) {
@@ -995,6 +1050,7 @@ impl RuntimeNodeManager {
                         version,
                         registered_at: Some(now),
                         last_registered_at: Some(now),
+                        machine_addr: machine_addr.clone(),
                         proof: Some(proof),
                     },
                 );
@@ -1030,10 +1086,8 @@ impl RuntimeNodeManager {
     pub async fn register_claim(
         &self,
         id: &str,
-        addr: &str,
-        version: Option<String>,
+        claim: NodeClaim,
         now: DateTime<Utc>,
-        proof: NodeProof,
     ) -> Result<Registered, RegistrationError> {
         // The holder is asked with the key *it* proved, which may not be the
         // one this claimant just proved. A holder whose key has since left
@@ -1041,7 +1095,7 @@ impl RuntimeNodeManager {
         // answers there": the claim goes through and the address moves, which
         // is the eviction a retired key is meant to cause.
         let holder_credential = self.credential_for(id.trim()).ok();
-        self.register_claim_with(id, addr, version, now, proof, |holder_addr| async move {
+        self.register_claim_with(id, claim, now, |holder_addr| async move {
             match holder_credential {
                 Some(credential) => self.identify_at(&holder_addr, credential).await,
                 None => None,
@@ -1061,10 +1115,8 @@ impl RuntimeNodeManager {
     pub(crate) async fn register_claim_with<F, Fut>(
         &self,
         id: &str,
-        addr: &str,
-        version: Option<String>,
+        claim: NodeClaim,
         now: DateTime<Utc>,
-        proof: NodeProof,
         probe: F,
     ) -> Result<Registered, RegistrationError>
     where
@@ -1072,7 +1124,7 @@ impl RuntimeNodeManager {
         Fut: std::future::Future<Output = Option<NodeIdentity>>,
     {
         let trimmed = id.trim();
-        let claimed = addr.trim().to_string();
+        let claimed = claim.addr.trim().to_string();
 
         // Refuse what [`Self::register`] would refuse, before anything is
         // dialled. Without this a node reporting an address nothing can parse
@@ -1161,7 +1213,14 @@ impl RuntimeNodeManager {
             );
         }
 
-        let outcome = self.register(trimmed, &claimed, version, now, proof)?;
+        let outcome = self.register(
+            trimmed,
+            NodeClaim {
+                addr: claimed.clone(),
+                ..claim
+            },
+            now,
+        )?;
         // The claim was granted, so this machine is not being refused
         // anything and there is nothing left to report as unreached for it.
         self.contested_write()
@@ -1471,6 +1530,15 @@ impl RuntimeNodeManager {
     /// channel is built in this module, so no RPC can be added that goes out
     /// anonymous or with a key the node never proved.
     async fn channel(&self, id: &str, rpc_timeout: Duration) -> Result<NodeChannel, NodeError> {
+        // The authenticated plane when everything needed for it is true at
+        // once: this control plane has an identity to prove, and this node
+        // registered by proving a name and reported a socket where it will
+        // check ours. Anything less and the call goes out the way it always
+        // did - there is no half of this that works.
+        if let Some(dialled) = self.machine_channel(id, rpc_timeout).await? {
+            return Ok(dialled);
+        }
+
         let credential = self.credential_for(id)?;
         let node = self.node(id).ok_or(NodeError::UnknownNode)?;
         let channel = Endpoint::from_shared(node.addr.clone())
@@ -1481,6 +1549,43 @@ impl RuntimeNodeManager {
             .await
             .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))?;
         Ok(InterceptedService::new(channel, credential))
+    }
+
+    /// The same channel over mutual TLS, or `None` if this node is not reached
+    /// that way.
+    ///
+    /// No bearer credential rides along: the node knows who is calling because
+    /// the handshake said so, and a call that also carried a shared secret
+    /// would suggest the secret was doing something. It is not.
+    async fn machine_channel(
+        &self,
+        id: &str,
+        rpc_timeout: Duration,
+    ) -> Result<Option<NodeChannel>, NodeError> {
+        let Some(identity) = self.identity.as_ref() else {
+            return Ok(None);
+        };
+        let (expected, addr) = {
+            let nodes = self.read();
+            let entry = nodes.get(id).ok_or(NodeError::UnknownNode)?;
+            match (&entry.proof, &entry.machine_addr) {
+                (Some(NodeProof::Certificate(name)), Some(addr)) => (name.clone(), addr.clone()),
+                _ => return Ok(None),
+            }
+        };
+
+        let dialler = Dialler::new(Arc::clone(identity), expected, &[Protocol::Http2]);
+        let channel = Endpoint::from_shared(addr.clone())
+            .map_err(|e| NodeError::Transport(format!("invalid endpoint {addr}: {e}")))?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(rpc_timeout)
+            .connect_with_connector(dialler)
+            .await
+            .map_err(|e| NodeError::Transport(format!("connect {addr}: {e}")))?;
+        Ok(Some(InterceptedService::new(
+            channel,
+            NodeCallCredential::new(None),
+        )))
     }
 
     async fn connect(&self, id: &str) -> Result<RuntimeManagementClient<NodeChannel>, NodeError> {
@@ -2049,28 +2154,37 @@ mod tests {
         fleet
             .register(
                 "on-old",
-                "http://10.0.0.5:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.5:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key_named("old-key"),
+                },
                 now,
-                key_named("old-key"),
             )
             .unwrap();
         fleet
             .register(
                 "on-new",
-                "http://10.0.0.6:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.6:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key_named("new-key"),
+                },
                 now,
-                key_named("new-key"),
             )
             .unwrap();
         fleet
             .register(
                 "gone",
-                "http://10.0.0.7:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key_named("dropped-key"),
+                },
                 now,
-                key_named("dropped-key"),
             )
             .unwrap();
 
@@ -2128,10 +2242,13 @@ mod tests {
         fleet
             .register(
                 "from-file",
-                "http://10.0.0.9:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.9:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key_named("old-key"),
+                },
                 now,
-                key_named("old-key"),
             )
             .unwrap();
         assert_eq!(
@@ -2215,10 +2332,13 @@ mod tests {
             manager
                 .register(
                     "joined",
-                    "http://10.0.0.5:8086",
-                    Some("0.1.0".into()),
+                    NodeClaim {
+                        addr: "http://10.0.0.5:8086".to_string(),
+                        machine_addr: None,
+                        version: Some("0.1.0".into()),
+                        proof: key(),
+                    },
                     now,
-                    key()
                 )
                 .unwrap(),
             Registered::New
@@ -2259,7 +2379,16 @@ mod tests {
 
         assert_eq!(
             manager
-                .register("from-file", "http://short-hostname:8086", None, now, key())
+                .register(
+                    "from-file",
+                    NodeClaim {
+                        addr: "http://short-hostname:8086".to_string(),
+                        machine_addr: None,
+                        version: None,
+                        proof: key(),
+                    },
+                    now,
+                )
                 .unwrap(),
             Registered::Refreshed,
             "the lease is refreshed; the address is not adopted"
@@ -2289,11 +2418,29 @@ mod tests {
         let now = Utc::now();
 
         manager
-            .register("joined", "http://10.0.0.5:8086", None, now, key())
+            .register(
+                "joined",
+                NodeClaim {
+                    addr: "http://10.0.0.5:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
+                now,
+            )
             .unwrap();
         assert_eq!(
             manager
-                .register("joined", "http://10.0.0.9:8086", None, now, key())
+                .register(
+                    "joined",
+                    NodeClaim {
+                        addr: "http://10.0.0.9:8086".to_string(),
+                        machine_addr: None,
+                        version: None,
+                        proof: key()
+                    },
+                    now
+                )
                 .unwrap(),
             Registered::AddressChanged
         );
@@ -2309,15 +2456,42 @@ mod tests {
         let now = Utc::now();
 
         assert!(matches!(
-            manager.register("  ", "http://10.0.0.5:8086", None, now, key()),
+            manager.register(
+                "  ",
+                NodeClaim {
+                    addr: "http://10.0.0.5:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key()
+                },
+                now
+            ),
             Err(RegistrationError::EmptyId)
         ));
         assert!(matches!(
-            manager.register("a b", "http://10.0.0.5:8086", None, now, key()),
+            manager.register(
+                "a b",
+                NodeClaim {
+                    addr: "http://10.0.0.5:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key()
+                },
+                now
+            ),
             Err(RegistrationError::InvalidId)
         ));
         assert!(matches!(
-            manager.register("node", "10.0.0.5:8086", None, now, key()),
+            manager.register(
+                "node",
+                NodeClaim {
+                    addr: "10.0.0.5:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key()
+                },
+                now
+            ),
             Err(RegistrationError::InvalidAddress { .. })
         ));
         assert!(manager.is_empty());
@@ -2338,12 +2512,30 @@ mod tests {
         );
         let start = Utc::now();
         manager
-            .register("joined", "http://10.0.0.5:8086", None, start, key())
+            .register(
+                "joined",
+                NodeClaim {
+                    addr: "http://10.0.0.5:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
+                start,
+            )
             .unwrap();
         // A node the operator also wrote into the file: registering must not
         // turn it into something that can expire.
         manager
-            .register("from-file", "http://10.0.0.9:8086", None, start, key())
+            .register(
+                "from-file",
+                NodeClaim {
+                    addr: "http://10.0.0.9:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
+                start,
+            )
             .unwrap();
 
         // Inside the lifetime nothing is dropped.
@@ -2359,10 +2551,13 @@ mod tests {
             manager
                 .register(
                     "joined",
-                    "http://10.0.0.5:8086",
-                    None,
+                    NodeClaim {
+                        addr: "http://10.0.0.5:8086".to_string(),
+                        machine_addr: None,
+                        version: None,
+                        proof: key(),
+                    },
                     start + chrono::Duration::seconds(80),
-                    key(),
                 )
                 .unwrap(),
             Registered::Refreshed
@@ -2405,7 +2600,16 @@ mod tests {
     fn deregistering_takes_a_node_off_at_once() {
         let manager = manager(&["from-file"]);
         manager
-            .register("joined", "http://10.0.0.5:8086", None, Utc::now(), key())
+            .register(
+                "joined",
+                NodeClaim {
+                    addr: "http://10.0.0.5:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
+                Utc::now(),
+            )
             .unwrap();
 
         assert_eq!(manager.deregister("joined"), Some(Deregistered::FromFleet));
@@ -2437,10 +2641,20 @@ mod tests {
         // The first machine. Nothing holds the id, so nothing is probed.
         let probed = std::sync::Mutex::new(Vec::<String>::new());
         manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, key(), |addr| {
-                probed.lock().unwrap().push(addr);
-                async { None }
-            })
+            .register_claim_with(
+                "node-a",
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
+                now,
+                |addr| {
+                    probed.lock().unwrap().push(addr);
+                    async { None }
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -2450,10 +2664,20 @@ mod tests {
 
         // The second machine, while the first is up and answering for the id.
         let error = manager
-            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, key(), |addr| {
-                probed.lock().unwrap().push(addr);
-                async { answering_as("node-a", "box-one") }
-            })
+            .register_claim_with(
+                "node-a",
+                NodeClaim {
+                    addr: "http://10.0.0.9:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
+                now,
+                |addr| {
+                    probed.lock().unwrap().push(addr);
+                    async { answering_as("node-a", "box-one") }
+                },
+            )
             .await
             .unwrap_err();
 
@@ -2499,10 +2723,13 @@ mod tests {
         manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.7:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 now,
-                key(),
                 |_| async { None },
             )
             .await
@@ -2510,10 +2737,13 @@ mod tests {
         let outcome = manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.9:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.9:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 now,
-                key(),
                 |_| async { None },
             )
             .await
@@ -2528,10 +2758,13 @@ mod tests {
         manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.7:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 now,
-                key(),
                 |_| async { None },
             )
             .await
@@ -2539,10 +2772,13 @@ mod tests {
         let outcome = manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.9:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.9:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 now,
-                key(),
                 |_| async { answering_as("node-b", "box-two") },
             )
             .await
@@ -2561,10 +2797,13 @@ mod tests {
         manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.7:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 now,
-                key(),
                 |_| async { None },
             )
             .await
@@ -2572,10 +2811,20 @@ mod tests {
 
         let probed = std::sync::Mutex::new(0usize);
         let outcome = manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, key(), |_| {
-                *probed.lock().unwrap() += 1;
-                async { answering_as("node-a", "box-one") }
-            })
+            .register_claim_with(
+                "node-a",
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
+                now,
+                |_| {
+                    *probed.lock().unwrap() += 1;
+                    async { answering_as("node-a", "box-one") }
+                },
+            )
             .await
             .unwrap();
         assert_eq!(outcome, Registered::Refreshed);
@@ -2593,10 +2842,13 @@ mod tests {
         manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.7:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 start,
-                key(),
                 |_| async { None },
             )
             .await
@@ -2604,10 +2856,13 @@ mod tests {
         manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.9:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.9:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 start,
-                key(),
                 |_| async { answering_as("node-a", "box-one") },
             )
             .await
@@ -2633,10 +2888,13 @@ mod tests {
         manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.7:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 now,
-                key(),
                 |_| async { None },
             )
             .await
@@ -2644,10 +2902,13 @@ mod tests {
         manager
             .register_claim_with(
                 "node-a",
-                "http://10.0.0.9:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.9:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: key(),
+                },
                 now,
-                key(),
                 |_| async { answering_as("node-a", "box-one") },
             )
             .await
@@ -2668,10 +2929,13 @@ mod tests {
         fleet
             .register(
                 "node-a",
-                "http://10.0.0.7:8086",
-                None,
+                NodeClaim {
+                    addr: "http://10.0.0.7:8086".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: certificate("node-a"),
+                },
                 Utc::now(),
-                certificate("node-a"),
             )
             .expect("a node may register with a certificate");
 

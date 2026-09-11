@@ -171,6 +171,22 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let metrics_collector = Arc::new(deis_control::MetricsCollector::new(Arc::clone(&sessions)));
 
+    // Loaded before the fleet manager, because both need it and there must be
+    // exactly one: the listener presents it, and the manager proves it when it
+    // dials a node. Two would be two identities for one process, and the
+    // second one to be renewed would go on presenting the first.
+    let machine_identity = match api_config.machine.as_ref() {
+        Some(machine_config) => Some(deis_control::machine::listen::load_identity(
+            machine_config,
+        )?),
+        None => {
+            info!(
+                "No [machine] section, so this control plane serves no machine channel of its own; nodes and the proxy reach it on the same listener as the dashboard, presenting the fleet key"
+            );
+            None
+        }
+    };
+
     // The configured list is the seed, not the whole fleet: nodes register
     // themselves at `PUT /api/nodes/{id}/registration` and are added as they
     // call in, which is what lets a machine join without this file being
@@ -186,7 +202,11 @@ async fn main() -> Result<(), anyhow::Error> {
         // only to a caller that presents a node key. The same list the node
         // endpoints authenticate against, so a node is driven with the very
         // value it proved when it registered.
-        .with_node_keys(&api_config.node_preshared_keys),
+        .with_node_keys(&api_config.node_preshared_keys)
+        // And the identity this control plane proves when it dials a node that
+        // registered by proving one of its own. Without it every call goes out
+        // over the plaintext management plane with that same node key.
+        .with_machine_identity(machine_identity.clone()),
     );
     let runtime_poll_task =
         tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop(shutdown.clone()));
@@ -312,9 +332,8 @@ async fn main() -> Result<(), anyhow::Error> {
     // Started before the human listener so that a bad certificate is a
     // startup failure rather than something discovered after the dashboard is
     // already answering.
-    let machine = match api_config.machine.as_ref() {
-        Some(machine_config) => {
-            let identity = deis_control::machine::listen::load_identity(machine_config)?;
+    let machine = match (api_config.machine.as_ref(), machine_identity.clone()) {
+        (Some(machine_config), Some(identity)) => {
             let machine_addr = format!("{}:{}", machine_config.bind_addr, machine_config.port);
             let machine_listener = std::net::TcpListener::bind(&machine_addr)?;
             machine_listener.set_nonblocking(true)?;
@@ -330,12 +349,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 .await
             }))
         }
-        None => {
-            info!(
-                "No [machine] section, so this control plane serves no machine channel of its own; nodes and the proxy reach it on the same listener as the dashboard, presenting the fleet key"
-            );
-            None
-        }
+        _ => None,
     };
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

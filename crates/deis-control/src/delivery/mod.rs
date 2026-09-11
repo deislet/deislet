@@ -3084,12 +3084,15 @@ mod tests {
         nodes
             .register(
                 "node-b",
-                "http://127.0.0.1:1",
-                None,
+                crate::runtime_client::NodeClaim {
+                    addr: "http://127.0.0.1:1".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: crate::node_key::NodeProof::PresharedKey(
+                        crate::node_key::NodeKeyFingerprint::of("node-psk"),
+                    ),
+                },
                 Utc::now() - chrono::Duration::hours(1),
-                crate::node_key::NodeProof::PresharedKey(crate::node_key::NodeKeyFingerprint::of(
-                    "node-psk",
-                )),
             )
             .unwrap();
         assert_eq!(nodes.expire_stale_registrations(Utc::now()), ["node-b"]);
@@ -3106,12 +3109,15 @@ mod tests {
         nodes
             .register_claim_with(
                 "node-a",
-                "http://127.0.0.1:1",
-                None,
+                crate::runtime_client::NodeClaim {
+                    addr: "http://127.0.0.1:1".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: crate::node_key::NodeProof::PresharedKey(
+                        crate::node_key::NodeKeyFingerprint::of("node-psk"),
+                    ),
+                },
                 now,
-                crate::node_key::NodeProof::PresharedKey(crate::node_key::NodeKeyFingerprint::of(
-                    "node-psk",
-                )),
                 |_| async { None },
             )
             .await
@@ -3119,12 +3125,15 @@ mod tests {
         nodes
             .register_claim_with(
                 "node-a",
-                "http://127.0.0.2:1",
-                None,
+                crate::runtime_client::NodeClaim {
+                    addr: "http://127.0.0.2:1".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: crate::node_key::NodeProof::PresharedKey(
+                        crate::node_key::NodeKeyFingerprint::of("node-psk"),
+                    ),
+                },
                 now,
-                crate::node_key::NodeProof::PresharedKey(crate::node_key::NodeKeyFingerprint::of(
-                    "node-psk",
-                )),
                 |_| async {
                     Some(crate::runtime_client::NodeIdentity {
                         node_id: "node-a".to_string(),
@@ -3258,12 +3267,15 @@ mod tests {
         nodes
             .register(
                 "node-b",
-                "http://127.0.0.1:1",
-                None,
+                crate::runtime_client::NodeClaim {
+                    addr: "http://127.0.0.1:1".to_string(),
+                    machine_addr: None,
+                    version: None,
+                    proof: crate::node_key::NodeProof::PresharedKey(
+                        crate::node_key::NodeKeyFingerprint::of("node-psk"),
+                    ),
+                },
                 Utc::now(),
-                crate::node_key::NodeProof::PresharedKey(crate::node_key::NodeKeyFingerprint::of(
-                    "node-psk",
-                )),
             )
             .unwrap();
         assert!(nodes.departed().is_empty());

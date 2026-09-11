@@ -62,6 +62,16 @@ pub struct RegisterRequest {
     /// health probe confirms it.
     #[serde(default)]
     pub version: Option<String>,
+    /// Where this node serves its management plane over mutual TLS, if it
+    /// serves one: `https://host:port`.
+    ///
+    /// A different socket from `address`, which is the plaintext plane the
+    /// fleet key guards. The node reports both because only the node knows
+    /// whether it bound the second, and the control plane dials the
+    /// authenticated one when it has an identity of its own to prove and this
+    /// node registered by certificate.
+    #[serde(default)]
+    pub machine_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,10 +119,13 @@ pub async fn register(
         .nodes
         .register_claim(
             &node_id,
-            &request.address,
-            request.version.clone(),
+            crate::runtime_client::NodeClaim {
+                addr: request.address.clone(),
+                machine_addr: request.machine_address.clone(),
+                version: request.version.clone(),
+                proof: crate::node_key::NodeProof::PresharedKey(proved),
+            },
             Utc::now(),
-            crate::node_key::NodeProof::PresharedKey(proved),
         )
         .await
     {

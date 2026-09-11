@@ -120,10 +120,13 @@ impl MachineChannel for MachineChannelService {
             .nodes()
             .register_claim(
                 &node_id,
-                &announced.address,
-                announced.version.clone(),
+                crate::runtime_client::NodeClaim {
+                    addr: announced.address.clone(),
+                    machine_addr: announced.machine_address.clone(),
+                    version: announced.version.clone(),
+                    proof: NodeProof::Certificate(proved.clone()),
+                },
                 chrono::Utc::now(),
-                NodeProof::Certificate(proved.clone()),
             )
             .await
             .map_err(crate::api::registration::registration_refusal)?;
