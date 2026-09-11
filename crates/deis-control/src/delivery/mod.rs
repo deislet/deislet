@@ -937,6 +937,16 @@ impl DeploymentDeliverer {
         }
     }
 
+    /// The fleet this deliverer pushes to.
+    ///
+    /// Handed out so the machine channel can register a node against the same
+    /// manager the pushes read, rather than a second one built from the same
+    /// configuration: two would be two fleets that could disagree about which
+    /// addresses exist.
+    pub fn nodes(&self) -> &Arc<RuntimeNodeManager> {
+        &self.nodes
+    }
+
     /// The base URL bundle links in this delivery should carry.
     ///
     /// Everything this deliverer sends is read by a node, so this is what

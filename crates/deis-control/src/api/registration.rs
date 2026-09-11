@@ -139,16 +139,6 @@ pub async fn register(
         }
     };
 
-    let source = state
-        .nodes
-        .list()
-        .into_iter()
-        .find(|view| view.id == node_id)
-        .map(|view| view.source)
-        // Only a deregistration racing this call gets here; the node was
-        // registered a moment ago, so that is what it is told.
-        .unwrap_or(NodeSource::Registered);
-
     match outcome {
         Registered::New => info!(
             node = %node_id,
@@ -169,24 +159,69 @@ pub async fn register(
         ),
     }
 
-    let refresh = state.nodes.registration_refresh_interval().as_secs();
     (
         StatusCode::OK,
-        Json(RegisterResponse {
-            node_id,
-            address: request.address,
-            outcome: match outcome {
-                Registered::New => "new",
-                Registered::AddressChanged => "address_changed",
-                Registered::Refreshed => "refreshed",
-            },
-            source,
-            refresh_after_seconds: refresh,
-            registration_ttl_seconds: state.nodes.registration_ttl().as_secs(),
-            assignment_refresh_seconds: refresh,
-        }),
+        Json(registration_answer(
+            &state.nodes,
+            &node_id,
+            request.address,
+            outcome,
+        )),
     )
         .into_response()
+}
+
+/// The answer a node gets when its registration was accepted.
+///
+/// Built here and not at each caller because the two channels that register a
+/// node - this HTTP route and the machine channel's `Register` - must tell a
+/// node the same thing about how often to come back. Two copies would drift,
+/// and the symptom would be a fleet where half the nodes refresh on a cadence
+/// nobody chose.
+pub fn registration_answer(
+    nodes: &crate::runtime_client::RuntimeNodeManager,
+    node_id: &str,
+    address: String,
+    outcome: Registered,
+) -> RegisterResponse {
+    let refresh = nodes.registration_refresh_interval().as_secs();
+    RegisterResponse {
+        node_id: node_id.to_string(),
+        address,
+        outcome: match outcome {
+            Registered::New => "new",
+            Registered::AddressChanged => "address_changed",
+            Registered::Refreshed => "refreshed",
+        },
+        source: nodes
+            .list()
+            .into_iter()
+            .find(|view| view.id == node_id)
+            .map(|view| view.source)
+            .unwrap_or(crate::runtime_client::NodeSource::Registered),
+        refresh_after_seconds: refresh,
+        registration_ttl_seconds: nodes.registration_ttl().as_secs(),
+        assignment_refresh_seconds: refresh,
+    }
+}
+
+/// How a registration refusal reads on the machine channel.
+///
+/// The HTTP route answers these with a status code; an RPC has its own codes,
+/// and mapping them by hand keeps the distinction the HTTP side already makes:
+/// a malformed request is the caller's mistake, an id already held by another
+/// machine is a conflict, and neither is an internal failure.
+pub fn registration_refusal(error: RegistrationError) -> tonic::Status {
+    match error {
+        RegistrationError::EmptyId
+        | RegistrationError::InvalidId
+        | RegistrationError::InvalidAddress { .. } => {
+            tonic::Status::invalid_argument(error.to_string())
+        }
+        RegistrationError::IdHeldByAnotherMachine { .. } => {
+            tonic::Status::already_exists(error.to_string())
+        }
+    }
 }
 
 /// DELETE /api/nodes/:id/registration

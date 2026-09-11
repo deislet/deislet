@@ -19,11 +19,13 @@
 //! who chooses a node's id is the same person who has its certificate issued -
 //! so the id is in the certificate already, and reading it there is free.
 
+use crate::node_key::NodeProof;
 use deis_identity::{SpiffeId, names};
 use deis_wire::machine::machine_channel_server::MachineChannel;
 use deis_wire::machine::{
-    FetchAssignmentsRequest, FetchAssignmentsResponse, FetchRoutingTableRequest,
-    FetchRoutingTableResponse,
+    DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
+    FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
+    RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
@@ -88,6 +90,83 @@ fn refuse_mismatch(kind: &str, proved: &SpiffeId, claimed: &str) -> Status {
 
 #[tonic::async_trait]
 impl MachineChannel for MachineChannelService {
+    async fn register(
+        &self,
+        request: Request<RegisterNodeRequest>,
+    ) -> Result<Response<RegisterNodeResponse>, Status> {
+        let proved = Self::caller(&request)
+            .ok_or_else(no_proved_identity)?
+            .clone();
+        let asked = request.into_inner();
+        let node_id = names::node_id_of(&proved)
+            .filter(|node_id| *node_id == asked.node_id)
+            .ok_or_else(|| refuse_mismatch("node", &proved, &asked.node_id))?
+            .to_string();
+
+        let announced: crate::api::registration::RegisterRequest =
+            serde_json::from_str(&asked.registration_json).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "this registration is not a registration: {error}"
+                ))
+            })?;
+
+        // The name is what is recorded, not a key. A node that registered this
+        // way cannot be evicted by taking a value out of a list of secrets,
+        // and the fleet listing shows who it is rather than which of two
+        // rotating values it happened to hold.
+        let outcome = self
+            .state
+            .deliverer
+            .nodes()
+            .register_claim(
+                &node_id,
+                &announced.address,
+                announced.version.clone(),
+                chrono::Utc::now(),
+                NodeProof::Certificate(proved.clone()),
+            )
+            .await
+            .map_err(crate::api::registration::registration_refusal)?;
+
+        let answer = crate::api::registration::registration_answer(
+            self.state.deliverer.nodes(),
+            &node_id,
+            announced.address,
+            outcome,
+        );
+        let registration_json = serde_json::to_string(&answer).map_err(|error| {
+            Status::internal(format!(
+                "the registration answer could not be encoded: {error}"
+            ))
+        })?;
+
+        debug!(node = %proved, outcome = ?outcome, "A node registered over the machine channel");
+        Ok(Response::new(RegisterNodeResponse { registration_json }))
+    }
+
+    async fn deregister(
+        &self,
+        request: Request<DeregisterNodeRequest>,
+    ) -> Result<Response<DeregisterNodeResponse>, Status> {
+        let proved = Self::caller(&request)
+            .ok_or_else(no_proved_identity)?
+            .clone();
+        let asked = request.into_inner();
+        let node_id = names::node_id_of(&proved)
+            .filter(|node_id| *node_id == asked.node_id)
+            .ok_or_else(|| refuse_mismatch("node", &proved, &asked.node_id))?
+            .to_string();
+
+        let removed = self.state.deliverer.nodes().deregister(&node_id);
+        debug!(node = %proved, removed = ?removed, "A node deregistered over the machine channel");
+        Ok(Response::new(DeregisterNodeResponse {
+            removed: matches!(
+                removed,
+                Some(crate::runtime_client::Deregistered::FromFleet)
+            ),
+        }))
+    }
+
     async fn fetch_assignments(
         &self,
         request: Request<FetchAssignmentsRequest>,
@@ -195,6 +274,94 @@ mod tests {
 
     fn proxy(id: &str) -> SpiffeId {
         names::proxy(TRUST_DOMAIN, id).expect("a proxy name")
+    }
+
+    /// Registration, over the channel where the caller has proved a name. The
+    /// answer records the name, so the fleet listing afterwards shows who the
+    /// node is rather than which of a list of shared values it held.
+    #[tokio::test]
+    async fn a_node_registers_itself_and_is_recorded_by_name() {
+        let harness = harness(true).await;
+        let service = MachineChannelService::new(harness.state.clone());
+
+        let answer = service
+            .register(from(
+                &node("runtime-test"),
+                RegisterNodeRequest {
+                    node_id: "runtime-test".to_string(),
+                    registration_json: r#"{"address":"http://10.0.0.7:8086"}"#.to_string(),
+                },
+            ))
+            .await
+            .expect("a node may register itself");
+        let answered: serde_json::Value =
+            serde_json::from_str(&answer.get_ref().registration_json).expect("a JSON object");
+        assert_eq!(answered["node_id"], "runtime-test");
+
+        let listed = harness
+            .state
+            .deliverer
+            .nodes()
+            .list()
+            .into_iter()
+            .find(|view| view.id == "runtime-test")
+            .expect("the node is in the fleet");
+        assert_eq!(
+            listed.identity.as_deref(),
+            Some("spiffe://deis.internal/deislet/node/runtime-test"),
+            "the fleet records the name that was proved"
+        );
+        assert_eq!(listed.key_fingerprint, None);
+    }
+
+    /// The refusal that a shared key could not express, on the call that
+    /// makes a machine a delivery target: injecting a node is how a caller
+    /// gets deployments and decrypted secrets pushed to it.
+    #[tokio::test]
+    async fn a_node_cannot_register_a_machine_it_is_not() {
+        let harness = harness(true).await;
+        let service = MachineChannelService::new(harness.state.clone());
+
+        let refusal = service
+            .register(from(
+                &node("runtime-test"),
+                RegisterNodeRequest {
+                    node_id: "somebody-else".to_string(),
+                    registration_json: r#"{"address":"http://10.0.0.9:8086"}"#.to_string(),
+                },
+            ))
+            .await
+            .expect_err("one machine registered another");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        assert!(
+            harness
+                .state
+                .deliverer
+                .nodes()
+                .list()
+                .into_iter()
+                .all(|view| view.id != "somebody-else"),
+            "the refused registration still put a node in the fleet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registration_that_is_not_one_is_a_bad_request_rather_than_a_failure() {
+        let harness = harness(true).await;
+        let service = MachineChannelService::new(harness.state.clone());
+
+        let refusal = service
+            .register(from(
+                &node("runtime-test"),
+                RegisterNodeRequest {
+                    node_id: "runtime-test".to_string(),
+                    registration_json: "not json at all".to_string(),
+                },
+            ))
+            .await
+            .expect_err("a malformed registration was accepted");
+        assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

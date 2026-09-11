@@ -17,6 +17,12 @@ package deis.machine;
 // and is served on the same listener. It stays in its own file because moving
 // it would rename an RPC path for no gain.
 service MachineChannel {
+  // A node says it exists and is ready to be given work.
+  rpc Register(RegisterNodeRequest) returns (RegisterNodeResponse);
+
+  // A node says it is going away.
+  rpc Deregister(DeregisterNodeRequest) returns (DeregisterNodeResponse);
+
   // What a node should be running. Carries decrypted secrets, which is why
   // this channel exists at all.
   rpc FetchAssignments(FetchAssignmentsRequest) returns (FetchAssignmentsResponse);
@@ -26,15 +32,6 @@ service MachineChannel {
 }
 
 // ---- what is deliberately not here --------------------------------------
-//
-// Registration and deregistration. They are still HTTP routes on the other
-// listener, guarded by the fleet key, and they move here in the change that
-// stops a node's recorded proof from being the fingerprint of a shared
-// secret. Until then the control plane has nowhere to put "this address
-// proved this name" - it records which of the rotating fleet keys an address
-// held - so an RPC here could authenticate a caller and then have to throw
-// away what it learned. Declaring one before it can keep that promise would
-// be a contract that lies.
 //
 // Downloading a bundle stays an HTTP route, served on the same listener as
 // these RPCs and behind the same mutual TLS. It is a file transfer with a
@@ -64,6 +61,33 @@ service MachineChannel {
 
 
 
+
+message RegisterNodeRequest {
+  // Which node is registering. Checked against the name the connection
+  // proved, so this is a statement the control plane can refuse rather than a
+  // claim it has to take.
+  string node_id = 1;
+  // A `deis_control::api::registration::RegisterRequest` as JSON: the address
+  // this node serves its management plane on, and optionally its version.
+  string registration_json = 2;
+}
+
+message RegisterNodeResponse {
+  // A `deis_control::api::registration::RegisterResponse` as JSON.
+  string registration_json = 1;
+}
+
+message DeregisterNodeRequest {
+  string node_id = 1;
+}
+
+message DeregisterNodeResponse {
+  // Whether this call removed anything. False for a node named in the
+  // configuration file, which is not removed by deregistering: the file says
+  // it exists, and a running fleet that disagrees with the file until
+  // somebody restarts the process is worse than one stale entry.
+  bool removed = 1;
+}
 
 message FetchAssignmentsRequest {
   string node_id = 1;
