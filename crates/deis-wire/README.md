@@ -51,7 +51,6 @@ use deis_wire::{ControlConfig, NodeInfo, NodeRole, WireClient};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ControlConfig::new(
         "node-001".to_string(),
-        "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
         "http://127.0.0.1:8085".to_string(),
     );
 
@@ -79,27 +78,45 @@ work; it is a leftover, not a supported form.
 
 ### Authentication, stated precisely
 
-[`ControlConfig::secret`] is optional. Whatever it holds - a real value or
-nothing - the node sends `sha256(secret ‖ node_id ‖ timestamp)` along with the
-timestamp; the control plane recomputes it and rejects anything more than 300
-seconds old, unless the connection has already proved a certificate identity,
-in which case what this field carries is not read at all (see below).
+[`ControlConfig`] carries no secret. Its fields are `associated_id`, `addr`,
+`heartbeat_interval`, `request_timeout` and `retry_count`, and that is the
+whole struct - there is nothing here for a caller to configure a credential
+into. What admits a channel is decided beneath this crate entirely, at the
+handshake of the connection the caller built, before this crate's own
+protocol messages exist.
 
-That is a secret-prefix SHA-256 construction. It is **not** HMAC-SHA256, even
-though the comment next to it in `src/models/auth.rs` says "HMAC" and the
-documentation used to repeat that. The distinction matters to anyone reasoning
-about length-extension resistance, and changing it is a protocol change on both
-sides.
+[`WireClient::authenticate`] still sends an `AuthenticateRequest` with a
+`secret` field on it, and always sends that field empty: there is no longer
+anything to put there. The field stays on the wire because dropping it from
+the proto is a change both ends have to make in the same instant, and this
+crate cannot know when the other side has made it. The control plane does
+not read it either way - its whole admission decision is
+`let valid = proved.is_some();`, where `proved` is the name (a SPIFFE ID,
+such as `spiffe://<trust domain>/deislet/node/<id>`) the connection's own
+certificate proved during its mutual-TLS handshake. A connection that proved
+no name is refused, whatever it sent in `secret`; one that proved a name is
+admitted on that name alone. There is no second path left to fall back to.
 
-The `secret`, when a caller carries one, is a `node_preshared_keys` value,
-which is one credential for the whole fleet rather than one node's identity -
-what it opens and how it is rotated is stated once, in
-[docs/trust-boundaries.md](../../docs/trust-boundaries.md). A caller with no
-`secret` configured sends the field empty; if the connection it opened also
-carried a certificate this fleet signed - a mutual-TLS dial made with a
-`[machine_identity]` table, on the caller's side - the control plane admits
-the channel on the name that certificate proved instead, and there is nothing
-left for a shared value to add. A caller with neither is refused.
+[`AuthData::new`] and [`AuthData::validate`], in
+[`src/models/auth.rs`](src/models/auth.rs), still implement
+`sha256(secret ‖ associated_id ‖ timestamp)`: `new` computes it, `validate`
+recomputes it and rejects anything more than 300 seconds old. Read on their
+own, that is a secret-prefix SHA-256 construction - **not** HMAC-SHA256, and
+the comment beside the hasher says so explicitly, since the construction has
+no inner/outer pad. But neither function sits on the real wire path any
+more: nothing outside this module calls either one, and the only callers
+left are this module's own unit tests. The algorithm is described
+accurately here; describing it as how a node is admitted today would not
+be.
+
+The fleet-wide preshared key this section used to describe no longer exists
+as something a caller here can carry: `ControlConfig` has no field for it,
+and deis-control refuses to start if a configuration file still sets
+`node_preshared_keys`. A machine is admitted by certificate or not admitted
+at all. What each certificate opens, which ports must be kept off the public
+internet, and which credentials this installation still shares between
+machines are stated once, in
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 
 ### Message types
 

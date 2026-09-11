@@ -7,10 +7,10 @@ should serve, and pushes every change out to the fleet. It never carries data
 plane traffic.
 
 One process, two listeners. The human one serves HTTP (REST + the web
-console) and the gRPC control channel deis-proxy holds open; the machine one
-- its own `[machine]` table, `bind_addr` and `port` - serves everything only
-a node or a proxy calls, over mutual TLS, and is not optional - see
-*Two audiences, two credentials* below.
+console); the machine one - its own `[machine]` table, `bind_addr` and
+`port` - serves everything only a node or a proxy calls, over mutual TLS,
+including the gRPC control channel deis-proxy holds open, and is not
+optional - see *Two audiences, two credentials* below.
 
 ## What it owns
 
@@ -61,10 +61,15 @@ private_key = "/etc/deis-control/certs/control-key.pem"
 trust_root = "/etc/deis-control/certs/trust-root.pem"
 ```
 
-`node_preshared_keys` is optional now: with `[machine]` configured and the
-list left empty, no fleet-wide value is minted at all, because every peer
-proves a certificate instead. It still matters for a fleet mid-migration -
-see *Two audiences, two credentials* below.
+There used to be a second setting alongside `[machine]`: a fleet-wide
+`node_preshared_keys` list every node and proxy proved instead of a
+certificate. It is gone - not merely empty, but not a field on this
+configuration at all - and a configuration file that still sets it is
+refused at startup rather than silently ignored, with a message naming both
+what is retired and the `[machine]` section to write instead (see
+`ControlConfig::refuse_a_retired_fleet_key`). There is no fallback left for
+it to fall back to: every node and every proxy now proves a certificate, or
+it is not admitted.
 
 ### The console in development
 
@@ -101,19 +106,25 @@ This is the part worth reading before changing anything about authentication.
   that is exactly why it moved off the listener a dashboard reaches. See
   [docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 
-`node_preshared_keys` is optional and does less than it used to: it is the
-credential deis-proxy's gRPC control channel (`EstablishChannel`, still on
-this human listener) falls back to when that proxy has no
-`[machine_identity]` of its own yet, and it is the bearer this control plane
-presents on a node's plaintext management plane when that node has none
-either. It no longer opens the machine surface at all - not even when a value
-is presented there, since nothing on that listener reads it.
+There is no `node_preshared_keys` here either, and nothing on this listener
+substitutes for it. `EstablishChannel` - the RPC deis-proxy holds open,
+defined in `control.proto` - is registered on both listeners, but admission
+comes from exactly one thing: a certificate proved during the TLS
+handshake, and only the machine listener's mTLS acceptor ever records one.
+A proxy that dials the machine listener with a `[machine_identity]` of its
+own is authenticated on the strength of the name its certificate carries;
+`Authenticate` on the human listener fails every single time, because this
+listener sets no proof for it to check - whatever the caller puts in the
+request's `secret` field is not read at all. A proxy with no
+`[machine_identity]` has no fallback: it is not admitted on either
+listener.
 
-An API key opens nothing on the machine surface, and neither a node key nor
-a certificate opens the product or platform API on the human one - the one
-thing a node key still does on the human listener is authenticate deis-proxy's
-control channel, described above, which is a different thing from either
-surface's own data.
+An API key opens nothing on the machine surface, and a certificate opens
+nothing on the human one's product or platform API - the two surfaces share
+no credential in either direction. The human listener checks only an API
+key (or nothing at all, when `api_auth_enabled` is off); the machine
+listener checks only a certificate, at the TLS handshake, before a request
+even exists.
 
 The machine channel's RPCs are not written out here on purpose: they are
 `deis.machine.MachineChannel`'s `Register`, `Deregister`, `FetchAssignments`

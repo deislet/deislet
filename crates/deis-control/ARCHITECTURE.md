@@ -79,8 +79,9 @@ the `deis-wire` SDK.
 
 **Responsibilities**
 - Accept node gRPC streams
-- Authenticate (see *Security* below — a proved certificate on the machine
-  channel, a plain secret comparison on the human one)
+- Authenticate (see *Security* below — a proved certificate is what admits a
+  channel; the human listener's copy of this same channel proves none and
+  admits nobody)
 - Manage session lifecycle
 - Receive heartbeats and status updates
 - Handle command responses
@@ -106,7 +107,7 @@ two credentials*.
 | `nodes.rs` | open gRPC control channels (`/api/sessions`) |
 | `registration.rs` | unused: a node used to put itself on the fleet list here; that RPC is `src/machine/service.rs`'s `Register` now |
 | `configs.rs`, `commands.rs`, `events.rs`, `metrics.rs` | operations |
-| `middleware.rs` | API-key auth for humans; the fallback node-key check on the human listener's copy of the gRPC control channel |
+| `authz.rs` | API-key auth for humans (see *Security* below) |
 | `static_files.rs` | the embedded console |
 
 `src/machine/` (`listen.rs`, `accept.rs`, `service.rs`) is the other listener:
@@ -347,23 +348,23 @@ The one thing still reachable on both listeners is the gRPC control channel
 deis-proxy holds open (`EstablishChannel`). Arriving over the machine channel,
 a connection is admitted by the certificate name it already proved during the
 TLS handshake, and whatever it sends as `secret` in the `Authenticate` message
-is not read. Arriving on the human listener there is no certificate, so that
-`secret` is compared with a constant-time equality check against every value
-in `node_preshared_keys` - a plain comparison, with no signature and no
-timestamp step. An empty `node_preshared_keys` there is not "no check
-required": it means this control plane cannot tell a node from anyone else, so
-it admits neither.
+is not read. Arriving on the human listener there is no certificate to prove,
+so the connection carries no proved name at all; `Authenticate` admits it on
+that basis alone and refuses it outright, and `secret` is not consulted there
+either - there is nothing left on either listener for that field to be
+compared against.
 
-**`node_preshared_keys` is optional now**, and does less than it used to: with
-`[machine]` configured and the list left empty, no fleet-wide value is minted
-at all, because every peer proves a certificate instead and there is nothing
-left for a shared value to decide. What the list still does, only while a
-fleet is mid-migration: the fallback above for a proxy with no
-`[machine_identity]` yet, and the bearer this control plane presents on a
-node's own plaintext management plane when that node has none either. The
-node-facing HTTP endpoints it used to guard - registration, the assignment
-list, the bundle download - are not served on the human listener at all any
-more; they answer `404` there regardless of what is presented.
+**There used to be a fallback here.** A `node_preshared_keys` list let the
+human listener's copy of this channel admit a caller instead by a
+constant-time comparison of `secret` against a shared value, for a proxy that
+had not yet been given a certificate. That field no longer exists anywhere in
+the configuration - `ControlConfig::refuse_a_retired_fleet_key` makes the
+control plane refuse to start if a configuration file still sets it - and
+`Authenticate`'s handler reads no secret list of any kind any more. The
+node-facing HTTP endpoints a value from that list used to guard -
+registration, the assignment list, the bundle download - are not served on
+the human listener at all any more either; they answer `404` there regardless
+of what is presented.
 
 **Human API authentication.** An API key (`Authorization: Bearer` or
 `X-API-Key`), enabled by `api_auth_enabled`, which defaults to **off**. It
@@ -421,9 +422,9 @@ deis-proxy                   deis-control
   │                                │
   │── gRPC EstablishChannel ──────→│
   │── authenticate ───────────────→│  a proved certificate name is admitted
-  │                                │  outright; on the human listener with no
-  │                                │  certificate, the secret it sent is
-  │                                │  checked against node_preshared_keys
+  │                                │  outright; on the human listener there
+  │                                │  is no certificate to prove, so this
+  │                                │  always fails
   │←── auth response ──────────────│
   │── register ───────────────────→│  create session, persist, record an event
   │←── register response ──────────│

@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-07T22:00:00+08:00",
+  "updatedAt": "2026-09-12T00:40:00+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -1197,7 +1197,7 @@
           "id": "P3-SEC-001",
           "title": "实现默认安全 production、per-node identity 与短期 capability",
           "owner": "deislet",
-          "status": "queued",
+          "status": "active",
           "dependsOn": [
             "P0-MODEL-001"
           ],
@@ -1211,7 +1211,7 @@
               "value": "mTLS, RBAC, envelope secrets and security gates"
             }
           ],
-          "verification": "ADR-025 M1/M2 acceptance matrix 全绿；strict 模式移除 fleet PSK/shared HMAC/static backend bearer，非 dev 配置缺少身份、认证、密钥、撤销或隔离条件时 fail closed"
+          "verification": "ADR-025 M1 已落地并可外部检验：node_preshared_keys 与 [control] secret 在代码中已不存在，控制面读到仍设置该项的配置文件直接拒绝启动；节点与 proxy 在配置了控制面地址却没有 [machine_identity] 时拒绝启动；节点管理面只在 mTLS socket 上服务，数据端口上的管理路径按普通应用流量处理。demo.sh verify 的 98 项在全场零共享口令下通过。剩余：ADR-025 M2/stage 5 —— assignment 列表仍未按节点裁剪（一台节点的证书仍读到全部租户的明文 secret），storage/queue/telemetry 的 auth_secret 与 storage token 仍是全场通用值，短期持有证明能力券与 dual→strict 退出门槛尚未实现。"
         },
         {
           "id": "P3-HA-001",

@@ -28,9 +28,9 @@ version of this document said and is no longer true.
                           │
    ┌──── node dials out ──┴── control dials in ────┐
    │                                               │
-   │  PUT   registration   (HTTP, node credential) │  ApplyDeployment
-   │  GET   assignments    (HTTP, node credential) │  UnloadApp / GetStatus
-   │  GET   bundle_url     (HTTP, streamed to disk)│  HealthCheck / StartInspect
+   │  Register          (gRPC, machine channel)    │  ApplyDeployment
+   │  FetchAssignments  (gRPC, machine channel)    │  UnloadApp / GetStatus
+   │  bundle download   (HTTP, see note below)     │  HealthCheck / StartInspect
    │                                               │  Trigger.OnScheduled
    ▼                                               ▼
 ┌──────────────────────────────────────────────────────┐
@@ -53,12 +53,26 @@ shipping, and the queue polling. What survived is the property that mattered —
 once the pull has happened, local SQLite and the bundles on disk are enough to
 keep serving.
 
-Registration and the assignment fetch go over one of two doors: HTTP with the
-node credential, labelled above, when this node has none configured — or,
-with a `[machine_identity]` table configured, the mutually authenticated
-`deis.machine.MachineChannel`, which proves a certificate naming this node
-instead and needs no credential at all. See the `[control]` and
-`[machine_identity]` keys below.
+Registration and the assignment fetch go over the mutually authenticated
+`deis.machine.MachineChannel`: a `[machine_identity]` table gives this node a
+certificate, private key and trust root, and the connection proves that
+certificate before any request is read — there is no credential to send or
+check. A bundle download follows the same certificate when the URL names this
+node's own control plane's machine listener; a URL naming anywhere else goes
+out as an ordinary anonymous HTTP request, because sending a fleet secret to
+a third-party host would be a leak — and there is no fleet secret to send any
+more regardless. The right-hand side — `ApplyDeployment`, `UnloadApp` /
+`GetStatus`, `HealthCheck` / `StartInspect`, `Trigger.OnScheduled` — is the
+same mutual TLS, served only on `[machine_identity] management_listen`, a
+listener separate from the HTTP port above: that port answers a management
+path as ordinary application traffic and nothing else, so a node that never
+sets `management_listen` serves no management API at all.
+
+An HTTP door guarded by a shared node credential used to stand beside all of
+this. It is gone: its routes are not mounted any more, and a node still
+pointed at `[control] endpoint` with no `[machine_identity]` table refuses to
+start rather than retry a route that would answer 404 for the life of the
+process. See the `[control]` and `[machine_identity]` keys below.
 
 - ✅ Survives a control plane that is down or unreachable (reports UNHEALTHY,
   retries with backoff, keeps serving what it recovered)
@@ -94,7 +108,11 @@ instead and needs no credential at all. See the `[control]` and
 
 ### 3. Management Interface (`src/management/`)
 - **Protocol**: gRPC over HTTP/2.
-- **Port Sharing**: Multiplexes standard HTTP traffic and gRPC management on the same port.
+- **Serving**: Mutual TLS only, on `[machine_identity] management_listen` — a
+  listener separate from the HTTP data port. The data port answers a
+  management path as ordinary application traffic and nothing else; a node
+  with no `management_listen` configured serves no management API at all, so
+  its control plane has nowhere to push a deployment or fire a cron.
 - **Capabilities**:
     - `PushConfig`: Update system/app config.
     - `ApplyDeployment`: Point this node at a version - app, environment,
@@ -144,12 +162,15 @@ instead and needs no credential at all. See the `[control]` and
 2. **Init Subsystems**: Start Log Buffer, Config Store.
 3. **Serve**: Open HTTP/gRPC port, reporting *not ready*, so the control plane
    can reach this node while it is still working out what to run.
-4. **Register**: Say what this node is - `PUT` its registration
-   (`deis_wire::conventions::NODE_REGISTRATION_ROUTE`) with the node
-   credential, or, with `[machine_identity]` configured, register over the
-   mutually authenticated machine channel instead, which proves a certificate
-   and carries no credential. Either way it is a statement of what this node
-   is, so a node that lost contact and came back simply says it again.
+4. **Register**: Say what this node is - call `Register` on the mutually
+   authenticated machine channel, proving this node's certificate; the
+   control plane records it under the name that certificate carries and
+   refuses a `node_id` that does not match. This is the only door: a node
+   that names a control plane but has no `[machine_identity]` table refuses
+   to start, and a node with neither registers with nobody and simply serves
+   what is already in its own bundle directory. Either way it is a statement
+   of what this node is, so a node that lost contact and came back simply
+   says it again.
 5. **Reconcile**: Fetch the assignment list and load every version in it. Only
    then report ready. Stopping is deliberately slower than starting: an
    environment is unloaded only when the control plane says the answer is
@@ -180,7 +201,8 @@ there is no `--config` flag. Every key is documented inline in the checked-in
 below is only the shape:
 
 ```toml
-http_port = 8000            # HTTP traffic and the gRPC management plane share it
+http_port = 8000            # application HTTP traffic only - the management
+                             # plane is on [machine_identity] management_listen
 data_dir = "./data"         # this node's SQLite database and local state
 
 [default_execution_limits]
@@ -197,13 +219,20 @@ batch_size = 100
 
 [control]                   # how this node reaches deis-control
 # endpoint = "http://127.0.0.1:8080"
-# secret = "one of the control plane's node_preshared_keys"
-#   (a fleet-wide credential: it reads every tenant's secrets and drives every
-#   node - see docs/trust-boundaries.md before you write it anywhere. Leaving
-#   this line out entirely is also a configuration, not an omission: it says
-#   this node proves a certificate instead, via a [machine_identity] table -
-#   see the checked-in deis-runtime.toml)
+#   informational now - not what registration, the assignment fetch or a
+#   bundle download actually dial; see below
 reconcile_interval_secs = 60
+
+# What actually authenticates this node to deis-control: a certificate,
+# private key and trust root, proved on the mutually authenticated machine
+# channel. There is no shared-secret alternative any more - a node that names
+# a control plane above and has no [machine_identity] table refuses to start.
+# See the checked-in deis-runtime.toml for every key.
+[machine_identity]
+# certificate = "..."
+# private_key = "..."
+# trust_root = "..."
+# control_endpoint = "https://127.0.0.1:8443"
 
 [bundles]                   # downloaded application bundles
 max_bytes = 268435456
@@ -225,7 +254,10 @@ max_bytes = 134217728
 ## ✅ Verification
 
 - **Health Check**: `curl http://localhost:8000/health`
-- **Management**: `grpcurl -plaintext localhost:8000 deis.management.ManagementService/GetStatus`
+- **Management**: mutual TLS only, on `[machine_identity] management_listen` -
+  not plaintext, and not the port above:
+  `grpcurl -cacert <trust_root> -cert <certificate> -key <private_key>
+  <management_listen> deis.management.RuntimeManagement/GetStatus`
 
 ---
 
