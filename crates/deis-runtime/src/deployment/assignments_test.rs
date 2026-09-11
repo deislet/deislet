@@ -1118,6 +1118,7 @@ async fn counting_registrar() -> (NodeRegistrar, Arc<std::sync::atomic::AtomicUs
         NodeRegistration::of_this_node("node-a", 8123),
         Duration::from_secs(5),
         None,
+        None,
     )
     .expect("the registrar is built");
     (registrar, seen)

@@ -21,9 +21,12 @@
 //! management API gives.
 //!
 //! The node's own side of the control-plane channel lives here too, because it
-//! is the same connection and the same credential: [`registration`] announces
-//! that this node exists and [`assignments`] asks what it should be running
-//! and keeps it matching the answer.
+//! is the same connection and the same proof of who this node is:
+//! [`registration`] announces that this node exists and [`assignments`] asks
+//! what it should be running and keeps it matching the answer. Both go over
+//! the machine channel on a node that has an identity, and over HTTP with the
+//! fleet key on a node that has none - one decision, taken once at startup for
+//! both of them.
 
 mod assignments;
 mod credential;
@@ -54,7 +57,9 @@ pub use assignments::{
 };
 pub use credential::NodeCredential;
 pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle, MachineTransport};
-pub use registration::{NodeRegistrar, NodeRegistration, Registered, RegistrationError};
+pub use registration::{
+    Deregistered, NodeRegistrar, NodeRegistration, Registered, RegistrationError,
+};
 pub use store::{
     check_identifier, BundleStore, CanonicalTenantConflict, InstalledRecord, InvalidIdentifier,
 };

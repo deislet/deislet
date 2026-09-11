@@ -380,17 +380,17 @@ async fn run(
     // answer that says "starting" rather than a refused connection.
     let health = NodeHealth::starting();
 
-    // Only about the HTTP path. With a machine channel configured the
-    // assignment list is fetched over mutual TLS and needs no key at all, but
-    // registration has not moved yet and still does, so the warning is worth
-    // making either way -- with the consequence named for the case at hand.
+    // Only about the HTTP path. With a machine channel configured both the
+    // assignment list and the registration go over mutual TLS and need no key
+    // at all, so the warning is worth making either way -- with the
+    // consequence named for the case at hand.
     if config.control.endpoint.is_some() && config.control.secret.is_none() {
         if config.machine_identity.is_some() {
             warn!(
-                "No control.secret is configured. The assignment list comes over the machine \
-                 channel and does not need one, but registration is still an HTTP route guarded \
-                 by the fleet key, so this node cannot announce itself and the control plane \
-                 will not know how to push a deployment to it"
+                "No control.secret is configured. This node asks what to run and announces \
+                 itself over the machine channel, and neither needs one; what still presents it \
+                 is a bundle download from the control plane's human listener, so an application \
+                 whose bundle URL points there will fail to install on this node"
             );
         } else {
             warn!(
@@ -401,7 +401,6 @@ async fn run(
         }
     }
 
-    let request_timeout = std::time::Duration::from_secs(config.control.request_timeout_secs);
     let assignment_client =
         AssignmentClient::from_config(&config, &node_id, machine_identity.clone())
             .context("building the control plane client")?;
@@ -417,24 +416,27 @@ async fn run(
         ),
     }
 
-    // Without an endpoint there is nobody to register with, which is the
-    // standalone case; the loop below says so and reports the node ready.
-    let registrar = match config.control.endpoint.as_deref() {
-        Some(endpoint) => Some(
-            NodeRegistrar::new(
-                endpoint,
-                // The management port, not the data port: a registration is
-                // the address the control plane dials ApplyDeployment and
-                // OnScheduled at, and `[management] listen` may have moved
-                // that plane off the public listener.
-                NodeRegistration::of_this_node(node_id.clone(), management_port),
-                request_timeout,
-                config.control.credential(),
-            )
-            .context("building the node registration client")?,
-        ),
-        None => None,
-    };
+    // Which door this node announces itself at is the configuration's to
+    // decide, the same way the assignment fetch's is; without an endpoint of
+    // either kind there is nobody to register with, which is the standalone
+    // case the loop below says out loud before reporting the node ready.
+    //
+    // The management port, not the data port: a registration is the address
+    // the control plane dials ApplyDeployment and OnScheduled at, and
+    // `[management] listen` may have moved that plane off the public listener.
+    let registrar = NodeRegistrar::from_config(
+        &config,
+        NodeRegistration::of_this_node(node_id.clone(), management_port),
+        machine_identity.clone(),
+    )
+    .context("building the node registration client")?;
+    if let Some(registrar) = &registrar {
+        info!(
+            url = registrar.url(),
+            "This node announces itself to the control plane over {}",
+            registrar.transport_name()
+        );
+    }
 
     // Runs for the life of the process: it registers this node, keeps it
     // matching the control plane's assignment list, and reports readiness.

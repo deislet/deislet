@@ -415,10 +415,12 @@ pub struct MachineIdentityConfig {
     /// that has to remember to cross-check.
     ///
     /// It is a different port from `[control] endpoint`, which is the human
-    /// listener. Registration and deregistration stay there either way: they
-    /// are still HTTP routes guarded by the fleet key and have not moved, so
-    /// a node with a machine channel configured uses it for what is on it and
-    /// the old path for what is not.
+    /// listener. A node that has this dialled announces itself here too -
+    /// registering over this channel is what gets it recorded by name rather
+    /// than by a fleet-wide key, and a node recorded by name is the only kind
+    /// the control plane dials back by certificate. What has not moved off the
+    /// human listener is the bundle download, which still presents the fleet
+    /// key when a bundle URL points there.
     #[serde(default)]
     pub control_endpoint: Option<String>,
 

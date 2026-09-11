@@ -25,6 +25,12 @@ DEFAULT_DEIS_PROXY_TLS_PORT=8088
 # from both ends. Separate from the port above so that what a browser reaches
 # and what a node reaches are two sockets an operator can bind apart.
 DEFAULT_DEIS_CONTROL_MACHINE_PORT=8089
+# The node's own authenticated management plane: where the control plane
+# pushes deployments and fires cron once it dials by certificate. A third
+# socket on the node, beside its data port and the plaintext management
+# plane, because a client-certificate demand on either of those would end
+# every browser request or break the door the control plane drives today.
+DEFAULT_DEIS_RUNTIME_MACHINE_PORT=8097
 DEFAULT_DEIS_STORE_PORT=8090
 DEFAULT_DEIS_QUEUE_PORT=8091
 DEFAULT_DEIS_TELEMETRY_PORT=8092
@@ -590,6 +596,7 @@ DEIS_TELEMETRY_PORT=$DEIS_TELEMETRY_PORT
 DEIS_TELEMETRY_METRICS_PORT=$DEIS_TELEMETRY_METRICS_PORT
 DEIS_ORIGIN_PORT=$DEIS_ORIGIN_PORT
 DEIS_CONTROL_MACHINE_PORT=$DEIS_CONTROL_MACHINE_PORT
+DEIS_RUNTIME_MACHINE_PORT=$DEIS_RUNTIME_MACHINE_PORT
 PKI_DIR=$PKI_DIR
 FLEET_TRUST_DOMAIN=$FLEET_TRUST_DOMAIN
 PROXY_ID=$PROXY_ID
@@ -1916,6 +1923,8 @@ start_demo() {
   claim_port DEIS_PROXY_TLS_PORT "${DEIS_PROXY_TLS_PORT:-$DEFAULT_DEIS_PROXY_TLS_PORT}"
   claim_port DEIS_CONTROL_MACHINE_PORT \
     "${DEIS_CONTROL_MACHINE_PORT:-$DEFAULT_DEIS_CONTROL_MACHINE_PORT}"
+  claim_port DEIS_RUNTIME_MACHINE_PORT \
+    "${DEIS_RUNTIME_MACHINE_PORT:-$DEFAULT_DEIS_RUNTIME_MACHINE_PORT}"
   claim_port ACME_CA_PORT "${ACME_CA_PORT:-$DEFAULT_ACME_CA_PORT}"
   claim_port DEIS_STORE_PORT "${DEIS_STORE_PORT:-$DEFAULT_DEIS_STORE_PORT}"
   claim_port DEIS_QUEUE_PORT "${DEIS_QUEUE_PORT:-$DEFAULT_DEIS_QUEUE_PORT}"
@@ -2090,6 +2099,11 @@ certificate = "${PKI_DIR}/node.crt"
 private_key = "${PKI_DIR}/node.key"
 trust_root = "${PKI_DIR}/ca.crt"
 trust_domain = "${FLEET_TRUST_DOMAIN}"
+# And the other direction: what the control plane pushes into this node
+# arrives here, admitted only if the connection proved the control plane's own
+# name. The plaintext management plane stays bound beside it while the fleet
+# is moving, so nothing breaks on the way.
+management_listen = "127.0.0.1:${DEIS_RUNTIME_MACHINE_PORT}"
 
 [fetch]
 allow = ["127.0.0.1:${DEIS_ORIGIN_PORT}"]
