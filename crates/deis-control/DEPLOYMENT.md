@@ -73,6 +73,9 @@ starts:
 # parse time by name, and the fifth is what makes secrets work at all. A
 # file missing `heartbeat_interval` does not start with a warning, it does
 # not start at all: "TOML parse error ... missing field heartbeat_interval".
+# The [machine] table further down is required too, for a different reason:
+# it is not one key with a default, it is the whole listener a node or a
+# proxy reaches, and a file with no [machine] table refuses to start.
 bind_addr = "0.0.0.0"
 port = 8080
 
@@ -83,25 +86,45 @@ port = 8080
 heartbeat_interval = 15
 heartbeat_timeout = 90
 
-# The credential every runtime node presents: on the gRPC handshake, and
-# on the two HTTP endpoints that serve nodes. Required in practice - with
-# no key here the assignment list refuses to hand a node the decrypted
-# secrets of any application, so applications with secrets do not run.
-# Any non-blank value is accepted, here and on every node and proxy; make
-# it `openssl rand -hex 32` all the same - a short value is one a caller
-# at the node endpoints can guess, and deis-proxy warns about one under
-# 32 characters. The control plane shows the first 12 hex characters of
-# each value's SHA-256 (as `key_fingerprint` on /api/runtime and in a
-# retired-key error) to tell values apart during a rotation; that prefix
-# confirms an offline guess of a weak value, which is one more reason the
-# value has to be random. More than one value means a rotation is in progress; see
-# docs/trust-boundaries.md.
-node_preshared_keys = [
-    "your-random-key-here-change-me-in-production"
-]
+# This control plane's own certificate, private key and trust root, and
+# where a node or a proxy reaches them. Not optional: registration, the
+# assignment list, the bundle download and the routing table are served
+# only here, over mutual TLS, and a file with no [machine] table refuses to
+# start rather than come up dead to its fleet. Issuing, renewing and
+# revoking the three files is outside this process - deis-control only
+# re-reads them, every identity_reload_seconds, so a renewal needs no
+# restart. Each peer's certificate carries one URI subject alternative
+# name, a SPIFFE name - spiffe://<trust domain>/deislet/node/<id> for a
+# runtime node, spiffe://<trust domain>/deislet/proxy/<id> for deis-proxy -
+# and that proved name, not a value in this file, is what says which
+# machine is calling.
+[machine]
+bind_addr = "127.0.0.1"
+port = 8443
+certificate = "/etc/deis-control/certs/control.pem"
+private_key = "/etc/deis-control/certs/control-key.pem"
+trust_root = "/etc/deis-control/certs/trust-root.pem"
+
+# node_preshared_keys is OPTIONAL now, and does less than it used to: it no
+# longer reaches the assignment list, the bundle download or registration -
+# those answer only to the certificate above, on the [machine] listener.
+# With [machine] configured, leaving this empty (or leaving it out
+# entirely) is the finished state: no fleet-wide value is minted in its
+# place, because every peer proves a certificate instead and there is
+# nothing left for a shared value to decide. What the list still does,
+# only while a fleet is mid-migration: it is the credential deis-proxy's
+# own gRPC control channel falls back to when that proxy has no
+# certificate of its own yet, and the bearer this control plane presents
+# on a node's plaintext management plane when that node has none either.
+# Where it is still set, make it `openssl rand -hex 32` - deis-proxy warns
+# about a value under 32 characters. The control plane shows the first 12
+# hex characters of each value's SHA-256 (as `key_fingerprint` on
+# /api/runtime and in a retired-key error) to tell values apart during a
+# rotation. See docs/trust-boundaries.md.
+node_preshared_keys = []
 
 # Require an API key on the dashboard and the human API (recommended).
-# This setting does not reach the node endpoints above.
+# This setting does not reach the machine channel above.
 api_auth_enabled = true
 api_keys = [
     "your-api-key-change-me"
@@ -126,6 +149,15 @@ The database is created on first start. The two things that are *not*
 created for you are the directory it lives in and the secret master key -
 and a control plane started without the key runs, and is unusable for every
 application that has a secret.
+
+The `[machine]` certificate, private key and trust root are a harder
+precondition than the master key: they are not generated and not optional,
+and a control plane started with any of the three missing or unreadable does
+not run at all rather than run degraded. Provisioning them - an operator's
+own certificate authority, or an existing one - is outside this document's
+script; what deis-control needs is three PEM files at the paths named in
+`[machine]`, the leaf carrying one URI subject alternative name,
+`spiffe://<trust domain>/deislet/control`.
 
 ```bash
 # Database and bundle store. bundle_dir is under this path, and it is the
@@ -220,10 +252,11 @@ RUN apt-get update && \
 
 COPY --from=builder /app/target/release/deis-control /usr/local/bin/
 
-# The configuration and the master key are mounted at run time, not baked in:
-# a key in an image layer is a key in every registry that image reaches.
+# The configuration, the master key and the [machine] certificate/private
+# key/trust root are mounted at run time, not baked in: a key in an image
+# layer is a key in every registry that image reaches.
 VOLUME ["/var/lib/deis-control"]
-EXPOSE 8080
+EXPOSE 8080 8443
 
 CMD ["deis-control", "-c", "/etc/deis-control/config.toml", "--database", "/var/lib/deis-control/deis-control.db"]
 ```
@@ -235,7 +268,8 @@ services:
   deis-control:
     build: .
     ports:
-      - "8080:8080"  # HTTP API + the node gRPC channel, one port
+      - "8080:8080"  # HTTP API + the gRPC control channel deis-proxy holds open
+      - "8443:8443"  # [machine]: registration, assignments, bundle download, routing table
     volumes:
       # Database and bundle store. The bundle store has to be on this volume:
       # it is the only copy of every version's code, and a container that
@@ -247,6 +281,10 @@ services:
       # answers /health with OK, and withholds every application that has a
       # secret from every node.
       - ./secret.key:/etc/deis-control/secret.key:ro
+      # [machine]'s certificate, private key and trust root. Without this
+      # mount the container does not start at all - unlike the master key
+      # above, this is not a degraded run, it is a refusal.
+      - ./certs:/etc/deis-control/certs:ro
     restart: unless-stopped
     environment:
       - RUST_LOG=info
@@ -256,11 +294,18 @@ volumes:
 ```
 
 The `config.toml` beside the compose file is the minimal configuration from
-above, with the two paths pointing inside the container:
+above, with the paths pointing inside the container:
 
 ```toml
 secret_key_file = "/etc/deis-control/secret.key"
 bundle_dir = "/var/lib/deis-control/bundles"
+
+[machine]
+bind_addr = "0.0.0.0"
+port = 8443
+certificate = "/etc/deis-control/certs/control.pem"
+private_key = "/etc/deis-control/certs/control-key.pem"
+trust_root = "/etc/deis-control/certs/trust-root.pem"
 ```
 
 `docker compose down -v` deletes that volume, and with it the database **and**
@@ -271,6 +316,11 @@ the bundle store. Take a backup first; see **Backup and Recovery** below.
 ```bash
 # Create the master key once, beside the compose file, before the first start.
 openssl rand -hex 32 > secret.key && chmod 600 secret.key
+
+# The [machine] certificate, private key and trust root, in ./certs/.
+# Provisioning them is outside this document's script - an operator's own
+# certificate authority, or an existing one - but without the three files at
+# the paths above, this container will not start at all.
 
 docker compose up -d
 
@@ -449,6 +499,16 @@ sudo openssl rand -hex 32 | sudo tee /etc/deis-control/secret.key > /dev/null
 sudo chown deis-control:deis-control /etc/deis-control/secret.key
 sudo chmod 600 /etc/deis-control/secret.key
 
+# The [machine] certificate, private key and trust root - see "Initialize
+# Database" above for why this one is not optional. Provisioning them is
+# outside this document's script; place the three files this operator's
+# certificate authority issued at the paths [machine] names, then lock the
+# private key down the same way as the master key.
+sudo mkdir -p /etc/deis-control/certs
+# sudo cp control.pem control-key.pem trust-root.pem /etc/deis-control/certs/
+sudo chown -R deis-control:deis-control /etc/deis-control/certs
+sudo chmod 600 /etc/deis-control/certs/control-key.pem
+
 # Install binary file
 sudo cp target/release/deis-control /usr/local/bin/
 sudo chown root:root /usr/local/bin/deis-control
@@ -475,24 +535,31 @@ sudo journalctl -u deis-control -f
 
 ```bash
 # UFW (Ubuntu)
-sudo ufw allow 8080/tcp  # HTTP API + the node gRPC channel
+sudo ufw allow 8080/tcp  # HTTP API + the gRPC control channel
+sudo ufw allow 8443/tcp  # The [machine] channel: registration, assignments,
+                         # the bundle download, the routing table
 sudo ufw allow 443/tcp   # HTTPS (if using Nginx)
 sudo ufw enable
 
 # firewalld (CentOS)
 sudo firewall-cmd --permanent --add-port=8080/tcp
+sudo firewall-cmd --permanent --add-port=8443/tcp
 sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --reload
 ```
 
-Open 8080 to the nodes, to deis-proxy and to the operators' network - not to
-the internet. It serves the assignment list, which hands out every
-environment's decrypted secrets to any caller holding a `node_preshared_keys`
-value. The node data ports need a rule of their own, on the node hosts, for
-the same kind of reason.
+Open 8080 to deis-proxy and to the operators' network - not to the internet,
+and not to the nodes, which have no reason to reach it any more. Open the
+`[machine]` port (8443 above) to the nodes and to deis-proxy instead: it
+serves the assignment list, which hands out every environment's decrypted
+secrets, but only to a caller that completes a mutual TLS handshake proving a
+certificate this fleet signed - a plain connection, or one presenting the
+wrong certificate, is refused before either port answers with anything. The
+node data ports need a rule of their own, on the node hosts, for the same
+kind of reason.
 [docs/trust-boundaries.md](../../docs/trust-boundaries.md) states which port
 may be reached from where, the file permissions each configuration needs, and
-how to rotate the credential without an outage.
+how to rotate a credential without an outage.
 
 ---
 
@@ -635,9 +702,15 @@ these, so this belongs in an alert, not in a restart policy:
 
 ```bash
 #!/bin/bash
-# readiness.sh <api-key> <node-key>
+# readiness.sh <api-key> <machine-base-url> <client-cert> <client-key> <ca-cert>
+#
+# The bundle download used to answer a node-key bearer token on this same
+# port; it is on the [machine] listener now and answers only a caller that
+# completes a mutual TLS handshake with a certificate this fleet signed, so
+# this probe needs one of the certificates minted for that trust root - a
+# short-lived one issued for this check is fine, it never touches secrets.
 set -u
-API=$1; NODE=$2; BASE=http://localhost:8080
+API=$1; MACHINE_BASE=$2; CERT=$3; KEY=$4; CA=$5; BASE=http://localhost:8080
 fail=0
 
 # 1. Every version's bundle is on disk. A version whose file is missing
@@ -646,8 +719,9 @@ for row in $(curl -sf -H "Authorization: Bearer $API" "$BASE/api/apps" \
              | jq -r '.apps[].id'); do
   for vid in $(curl -sf -H "Authorization: Bearer $API" "$BASE/api/apps/$row/versions" \
                | jq -r '.versions[].id'); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $NODE" \
-           "$BASE/api/apps/$row/versions/$vid/bundle")
+    code=$(curl -s -o /dev/null -w '%{http_code}' \
+           --cert "$CERT" --key "$KEY" --cacert "$CA" \
+           "$MACHINE_BASE/api/apps/$row/versions/$vid/bundle")
     [ "$code" = 200 ] || { echo "bundle missing: $row $vid (HTTP $code)"; fail=1; }
   done
 done
@@ -701,9 +775,15 @@ RUST_LOG=debug deis-control -c /etc/deis-control/config.toml
 
 #### 2. Node cannot connect
 
-- Check network connectivity: `telnet deis-control-host 8080`
-- Check firewall rules
-- Verify consistent PSK configuration
+- Check network connectivity to the `[machine]` port, not 8080: a node no
+  longer reaches this control plane on the human listener at all -
+  `telnet deis-control-host 8443` (or whatever `[machine].port` is)
+- Check firewall rules on that port
+- Verify the node's `[machine_identity]` certificate, private key and trust
+  root are readable, current, and chain to the same trust root this control
+  plane's `[machine]` table names - a mismatched or expired certificate is
+  refused during the TLS handshake, before this control plane's own logs see
+  the connection at all
 - View node-side logs
 
 #### 3. Database locked
@@ -780,7 +860,17 @@ the console, and cannot run a single one of them.
 | The catalog database | `--database`, e.g. `/var/lib/deis-control/deis-control.db` | Applications, versions, environments, deployment pointers, routes, accounts, scoped tokens, the encrypted secrets and the audit log. |
 | **The bundle store** | `bundle_dir`, e.g. `/var/lib/deis-control/bundles` | Every version's code. The database keeps a *path*, not the bytes. A node fetching a version whose file is gone gets `500 bundle ... is recorded but missing on disk`, and re-uploading cannot repair it: the manifest is inside the archive whose sha256 **is** the version id, so an upload of the same source produces a different version. Rollback to any earlier version becomes impossible. |
 | **The secret master key** | `secret_key_file`, e.g. `/etc/deis-control/secret.key` | Every environment secret. The values in the database are encrypted with this key and decrypt with no other. Without the file, secret endpoints answer 503 and **every application that has a secret is withheld from each node's assignment list** - the list comes back marked incomplete, so a node reconciling against it keeps whatever it is already running and starts none of them. On a node that was rebuilt with the platform, that is nothing at all. |
-| The configuration file | `-c`, e.g. `/etc/deis-control/config.toml` | `node_preshared_keys`, `api_keys` and `storage_auth_secret` are shared with the rest of the fleet. A restored control plane with new values is one no node and no CLI can talk to. |
+| The configuration file | `-c`, e.g. `/etc/deis-control/config.toml` | `api_keys` and `storage_auth_secret` are shared with the rest of the fleet; a restored control plane with new values is one the CLI and the data-plane services can't talk to. `node_preshared_keys` matters the same way only for a fleet still mid-migration - a node or a proxy that already has a `[machine_identity]` certificate does not read this file's values at all, because it authenticates by the name on its certificate instead. |
+
+Not in this table, and not covered by this document's backup script: the
+`[machine]` table's own certificate, private key and trust root. This file
+only names their paths; the three PEM files themselves are the operator's own
+public-key infrastructure, issued and rotated outside this process, so their
+backup is that system's concern rather than this one's. What is worth
+remembering here is what is lost without them - not the data, but the
+listener: a control plane restored with a `[machine]` table pointing at
+files that are not on the restored host refuses to start, the same as a
+first install with none provisioned yet.
 
 The other components hold state of their own and are not covered by this
 document's script. In the order it matters:
@@ -981,7 +1071,7 @@ sudo systemctl start deis-control
 #    readiness script is what says it can serve.
 curl http://localhost:8080/health
 sudo journalctl -u deis-control -n 50
-./readiness.sh "$API_KEY" "$NODE_KEY"
+./readiness.sh "$API_KEY" "https://localhost:8443" "$CLIENT_CERT" "$CLIENT_KEY" "$CA_CERT"
 ```
 
 ---

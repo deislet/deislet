@@ -285,13 +285,18 @@ the control pushes. Notable behaviour:
   feature, so no response is stored and no `X-Cache-Status` is emitted.
 - `[routing]` is where the catalog's routing table is configured:
   `control_poll_interval_secs` (5 by default), `max_table_bytes`, and
-  `preview_zone`. The poll uses the `[control]` address and secret. That
-  secret is a `node_preshared_keys` value, and it is not specific to the
-  routing table: the same value reads every environment's decrypted secrets
-  from the control plane and drives every node's management plane, so this
-  file is as sensitive as the control plane's own. See
-  [docs/trust-boundaries.md](../../docs/trust-boundaries.md). Leaving
-  `preview_zone` unset turns automatic addresses off entirely; setting it to,
+  `preview_zone`. The poll uses the `[control]` address, over one of two
+  transports. Without a `[machine_identity]` table it is an HTTP `GET` on the
+  control plane's human listener, carrying `[control] secret`, a
+  `node_preshared_keys` value that is not specific to the routing table: the
+  same value reads every environment's decrypted secrets from the control
+  plane and drives every node's management plane, so a file that sets it is
+  as sensitive as the control plane's own. See
+  [docs/trust-boundaries.md](../../docs/trust-boundaries.md). With a
+  `[machine_identity]` table configured, the poll instead runs on the
+  mutually authenticated machine channel, proving a certificate that names
+  this proxy and nothing else, and `[control] secret` need not be set at all.
+  Leaving `preview_zone` unset turns automatic addresses off entirely; setting it to,
   say, `preview.example.com` puts every environment at
   `<env>--<app>.preview.example.com`, with the default environment also at
   `<app>.preview.example.com`. The separator is `--` inside one DNS label

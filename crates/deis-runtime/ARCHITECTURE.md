@@ -53,6 +53,13 @@ shipping, and the queue polling. What survived is the property that mattered —
 once the pull has happened, local SQLite and the bundles on disk are enough to
 keep serving.
 
+Registration and the assignment fetch go over one of two doors: HTTP with the
+node credential, labelled above, when this node has none configured — or,
+with a `[machine_identity]` table configured, the mutually authenticated
+`deis.machine.MachineChannel`, which proves a certificate naming this node
+instead and needs no credential at all. See the `[control]` and
+`[machine_identity]` keys below.
+
 - ✅ Survives a control plane that is down or unreachable (reports UNHEALTHY,
   retries with backoff, keeps serving what it recovered)
 - ✅ Lock-free configuration reads
@@ -137,10 +144,12 @@ keep serving.
 2. **Init Subsystems**: Start Log Buffer, Config Store.
 3. **Serve**: Open HTTP/gRPC port, reporting *not ready*, so the control plane
    can reach this node while it is still working out what to run.
-4. **Register**: `PUT` this node's registration
-   (`deis_wire::conventions::NODE_REGISTRATION_ROUTE`), with the node
-   credential. It is a statement of what this node is, so a node that lost
-   contact and came back simply says it again.
+4. **Register**: Say what this node is - `PUT` its registration
+   (`deis_wire::conventions::NODE_REGISTRATION_ROUTE`) with the node
+   credential, or, with `[machine_identity]` configured, register over the
+   mutually authenticated machine channel instead, which proves a certificate
+   and carries no credential. Either way it is a statement of what this node
+   is, so a node that lost contact and came back simply says it again.
 5. **Reconcile**: Fetch the assignment list and load every version in it. Only
    then report ready. Stopping is deliberately slower than starting: an
    environment is unloaded only when the control plane says the answer is
@@ -190,7 +199,10 @@ batch_size = 100
 # endpoint = "http://127.0.0.1:8080"
 # secret = "one of the control plane's node_preshared_keys"
 #   (a fleet-wide credential: it reads every tenant's secrets and drives every
-#   node - see docs/trust-boundaries.md before you write it anywhere)
+#   node - see docs/trust-boundaries.md before you write it anywhere. Leaving
+#   this line out entirely is also a configuration, not an omission: it says
+#   this node proves a certificate instead, via a [machine_identity] table -
+#   see the checked-in deis-runtime.toml)
 reconcile_interval_secs = 60
 
 [bundles]                   # downloaded application bundles

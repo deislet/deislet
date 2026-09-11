@@ -142,8 +142,9 @@ canonical artifact。当前 Edge Canon 锁仍是 proposal，因而 catalog recor
 - 按 manifest 声明的队列，定期向 deis-queue 拉消息
 
 自治性本身没变——拉完之后本地 SQLite 就能撑住，deis-control 挂了照常服务。但
-「deis-runtime 从不外连」这条不再成立，配置里必须有 deis-control 的地址与节点凭据
-（`[control] endpoint` 与 `[control] secret`）。
+「deis-runtime 从不外连」这条不再成立，配置里必须有 deis-control 的地址与证明自己
+身份的手段：`[control] endpoint` 配上 `[machine_identity]`（一张只署名这一台机器的
+证书），或者，在一支还没切完 mTLS 的机队上，`[control] secret`。
 
 ---
 
@@ -227,7 +228,7 @@ deis-runtime 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪�
 | ENVIRONMENT | 有。`environments` 表；名字必须满足 `is_valid_tenant_part`（不许含 `.` `/` `\`，半边不超 64 字节），否则存储租户会被拆成三段而全废 |
 | VERSION | 有。`versions` 表，写入后永不修改；包体存控制面本地，`bundle_sha` 是内容哈希 |
 | DEPLOYMENT | 有。`deployments` 表只追加；某环境的当前版本 = 该 env 下最新一行。schema-2 行同时固定 immutable environment snapshot identity |
-| ROUTE | 有，且被消费了。`routes` 表存 host + path_prefix + priority；`GET /api/routes` 给控制台看，另一条 `GET /api/routing-table` 给数据面看（多带环境名、所有存在的环境、整表版本号），deis-proxy 每 5 秒拉一次并按它选应用（见 §4） |
+| ROUTE | 有，且被消费了。`routes` 表存 host + path_prefix + priority；`GET /api/routes` 给控制台看，另有一份给数据面看的路由表（多带环境名、所有存在的环境、整表版本号），deis-proxy 每 5 秒经机队通道的 `FetchRoutingTable` 拉一次并按它选应用，没配机队身份的 proxy 仍走 `GET /api/routing-table`（见 §4） |
 | SECRET | 有。AES-256-GCM immutable revision + 每环境/name head；主密钥从 `secret_key_file` 读。面板与 CLI 只能写、列 metadata 和删 head，明文读不回来 |
 | CRON | 有，且挂对了对象：调度器按 `(app_id, environment)` 维护，到点调某一个节点的 `Trigger.OnScheduled` |
 | ASSET | 有。打进包里，节点建内存索引，命中直接返回并带 ETag。同一份包里还带着这个站点自己的规则——`_redirects`、`_headers` 和「路径谁都没认领时答什么」，构建期解析、装载时编译（见 §4） |
@@ -279,7 +280,7 @@ sequenceDiagram
     CLI-->>Dev: 没落到的节点单独红色列出，命令以非零退出
 
     Note over Dev,X: —— 节点重启 ——
-    X->>R: GET 清单（NODE_ASSIGNMENTS_ROUTE，带节点凭据）
+    X->>R: FetchAssignments（机队通道，证明这台节点自己的证书）
     R-->>X: 每个 (应用, 环境) 的版本 + bundle_url + 精确 snapshot（含按 revision 索引的密钥值）
     X->>R: 逐个自取、校验、加载
     X->>X: 全部装好之后才报 healthy
@@ -351,9 +352,11 @@ flowchart TB
 
 **原来卡住的两件事已经通了**：
 
-- **路径级路由**。deis-proxy 现在每 5 秒向控制面拉一次 `GET /api/routing-table`，
-  按拉到的表选应用，所以 `example.com/api/*` 给 API 应用、`example.com/*` 给站点
-  应用可以共存了。这条链路的三个关键取舍：**用轮询不用推送**，因为轮询自愈——不管
+- **路径级路由**。deis-proxy 现在每 5 秒向控制面要一次整张路由表，按拉到的表选应用，
+  所以 `example.com/api/*` 给 API 应用、`example.com/*` 给站点应用可以共存了。配了
+  `[machine_identity]` 的 proxy 走机队通道，`deis.machine.MachineChannel/FetchRoutingTable`，
+  证明一张只属于这个 proxy 自己的证书；没配的仍走老路，`GET /api/routing-table`
+  带 `node_preshared_keys`。这条链路的三个关键取舍：**用轮询不用推送**，因为轮询自愈——不管
   是断连、控制面重启还是某次校验没过，下一次拉取都会修好，而推送方案最后都得再配
   一个周期性全量对齐才敢信；**控制面不可达时最后一张表无限期继续生效**，一次管理面
   故障不该变成一次用户可见的故障（只有从来没拉成功过的 proxy 例外，它退回本机配置里
@@ -395,9 +398,9 @@ sequenceDiagram
     end
 
     rect rgb(232, 245, 233)
-    Note over X,R: ② deis-runtime 启动自举（两条路径都带 [control] secret）
-    X->>R: PUT 登记（NODE_REGISTRATION_ROUTE）
-    X->>R: GET 清单（NODE_ASSIGNMENTS_ROUTE）
+    Note over X,R: ② deis-runtime 启动自举（机队通道，证明一张只署名这台节点的证书）
+    X->>R: Register
+    X->>R: FetchAssignments
     R-->>X: 清单（app, environment, version, bundle_url, bundle_sha, env）
     loop 逐个自取
         X->>R: HTTP GET bundle_url，校验 sha256
@@ -449,27 +452,35 @@ sequenceDiagram
 `deis_runtime::trigger::HANDLER_FAILED_PREFIX` 这个错误前缀表达这一区分，因为
 `TriggerResponse` 里没有「处理函数已被调用」这一位。
 
-**节点注册**：节点凭 `node_preshared_keys` 里的凭据向控制面登记自己，登记过期就要
-再来一次。方法是 `PUT`：登记是在陈述「这个节点是什么」，不是请求创建一条记录，所以
-掉线又回来的节点原样再说一遍就行；同一条路径上的 `DELETE` 是节点主动离场。注册不是
-拿活的方式——没注册的节点照样自取并服务它拉到的每个应用，只是收不到推送、也不会被
-选中跑 cron。
+**节点注册**：节点经机队通道证明一张只署名它自己的证书向控制面登记，登记过期就要
+再来一次。RPC 叫 `Register`：登记是在陈述「这个节点是什么」，不是请求创建一条记录，
+所以掉线又回来的节点原样再证一次就行；同一个通道上的 `Deregister` 是节点主动离场。
+注册不是拿活的方式——没注册的节点照样自取并服务它拉到的每个应用，只是收不到推送、
+也不会被选中跑 cron。`node_preshared_keys` 这个字段仍然存在，是给一支还没把每台
+机器都换上证书的机队留的兼容路径；配了 `[machine_identity]` 的节点，登记认的是证书。
 
-**这把凭据是整支机队共用的一把，不是每个节点一把。** 拿到其中任意一个值，就能读到
-任意节点的 assignments（也就是全部环境的明文密钥与每个租户的存储 capability token）、
-下载任意 bundle、以及驱动每个节点的管理面；deis-proxy 也持有同一个值。节点的数据端口
-绑在 `0.0.0.0`，本身就是一道信任边界。这些事实、各端口该对谁开放、每个配置文件的权限
-要求、以及不停机轮换的步骤，只在一处写全：
+**「一把凭据整支机队共用」已经不是现状了。** 现在每台机器——deis-control、每个
+deis-runtime 节点、每个 deis-proxy——都持有自己的一张证书，证书上唯一的 URI SAN 是
+一个 SPIFFE 名字：`spiffe://<信任域>/deislet/control`、`.../deislet/node/<节点 id>`、
+`.../deislet/proxy/<proxy id>`。签发、续期、吊销都在产品之外：运维给一份证书、一把
+私钥、一份信任根，进程按周期重新读这三个文件，续期不必重启。机队通道认的是这张
+证书，拿到一张节点证书的人只能代表它命名的那一台节点说话，读不到别的节点的
+assignments（全部环境的明文密钥、每个租户的存储 capability token）、下载不了跟它无关
+的 bundle、也驱动不了别的节点的管理面。`node_preshared_keys` 若还配着，`[machine]`
+留空这个列表时这次运行干脆不铸一把机队共用的值；旧模型下「一个值等于全部机队」那种
+风险仍是残留在还没切完 mTLS 的部分该防的东西，节点数据端口 `0.0.0.0` 这道信任边界
+也仍然存在。这些细节、各端口该对谁开放、每个配置文件的权限要求，写在
 [docs/trust-boundaries.md](trust-boundaries.md)（英文）。
 
-**这两条路径不在文档里写死。** 它们是
-`deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`
-（服务端注册路由用的 `:id` 模板）与 `node_registration_path` /
-`node_assignments_path`（客户端拼一个具体节点的路径）。放进 deis-wire 是因为没有
-任何东西会检查两个 crate 有没有把同一条 HTTP 路径拼成一样：节点请求 `/register`
-而控制面提供 `/registration`，两边都编译得过，唯一的症状是一支永远学不会自己有哪些
-节点的机队——这件事已经发生过一次。上面时序图里的中文标注是为了看得懂，真值以那两个
-常量为准。
+**协议名字不在这份文档里写死。** 机队通道认的是 `deis_wire::machine::MachineChannel`
+里的 `Register`、`Deregister`、`FetchAssignments`、`FetchRoutingTable`，定义在
+`crates/deis-wire/proto/machine.proto`。放进 deis-wire 是因为没有任何东西会检查
+两个 crate 有没有把同一个方法名对上——这正是从前这里的坑：`deis_wire::conventions::
+{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}` 这两个 HTTP 路径常量当年就因为
+两边拼得不一样（节点请求 `/register`、控制面提供 `/registration`）造成过一支永远
+学不会自己有哪些节点的机队。那两个 HTTP 常量还在 deis-wire 里，但现在只挂在测试用的
+路由上；真正跑起来的节点和 proxy 走的是上面那几个 RPC 名字。上面时序图里的中文标注
+是为了看得懂，真值以 `machine.proto` 为准。
 
 ---
 
@@ -577,8 +588,11 @@ sequenceDiagram
   把「现在保护数据的只有这一层」原样写出来。这是单机自用的默认状态，受支持。
 - **非回环地址 + 未配置**：**拒绝启动**，不是打 warn 放行。未配置不能悄悄等于
   「不设防也照样监听公网」——一旦真的绑定到别处，曾经顶替鉴权的那层收敛就不存在了。
-  这一条和控制面的节点通道是同一个形状：预共享密钥列表一旦为空，那条通道直接关闭，
-  而不是打开。
+  这一条曾经和控制面的节点通道是同一个形状：预共享密钥列表一旦为空，那条通道直接
+  关闭，而不是打开。现在两者分岔了——配了 `[machine]` 机队身份之后，这条通道认的
+  是证书，`node_preshared_keys` 留空是常态，不是关闭的理由；没配 `[machine]` 时才
+  回到旧形状：一个空列表会当场铸一把只在这次运行内有效的值，而不是打开一条谁都能
+  冒充节点的路。
 
 配了 `auth_secret` 却没带令牌、令牌对不上租户、或者干脆没带 `x-deis-tenant`，三种
 情况都在拿到任何数据**之前**被拒——tonic 拦截器挡在每个 handler 前面
@@ -769,13 +783,17 @@ fence，不把这种管理能力交给普通 producer/reader。
   非 echo stdin 读取；`deis dev` 只接受受限文件或 stdin secret document，明文不进入 argv/env。
 - 某个环境的 snapshot 或密钥解不开时，该行被整条剔出 assignments 并标记 incomplete，而不是
   发一份残缺环境下去。
-- **因此** 清单接口（`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`）与 bundle
-  下载挂在独立的 `node_auth` 上，凭据是 `node_preshared_keys`，不受面板的
-  `api_auth_enabled` 影响，也不接受面板 API Key。这条路会把全部环境的明文密钥当 JSON 返回，早前它只挂在默认关闭的
-  面板鉴权上，等于任何能连到控制面 HTTP 端口的人 curl 一次就能拿走整个平台的密钥。
+- **因此** 清单（`FetchAssignments`）与 bundle 下载现在挂在机队自己的监听口上
+  （`[machine] listen`），凭一张只署名调用者自己的证书认，不受面板的
+  `api_auth_enabled` 影响，也不接受面板 API Key。这条路会把全部环境的明文密钥当
+  JSON 返回，所以它根本不在人用的那个监听口上——早前它挂在那儿，靠的是默认关闭的
+  面板鉴权管不着的另一把凭据（`node_preshared_keys`），等于任何能连到控制面 HTTP
+  端口、又握着这把值的人 curl 一次就能拿走整个平台的密钥；`node_preshared_keys` 这
+  个字段还在，是给还没切完 mTLS 的机队留的兼容路径。
 - 本版**没有**做按租户分密钥（信封加密）：全部环境的密钥都用 `secret_key_file` 里的
-  同一把主密钥加密，清单接口再明文发下去。所以一个 `node_preshared_keys` 值等于全部
-  租户的明文。这条结论连同它要求的端口边界与轮换步骤见
+  同一把主密钥加密，清单接口再明文发下去。所以一张能代表某台机器的证书，或者一支
+  机队里仍在起作用的 `node_preshared_keys` 值，打开的都是全部租户的明文。这条结论
+  连同它要求的端口边界与轮换步骤见
   [docs/trust-boundaries.md](trust-boundaries.md)（英文）。
 
 ---

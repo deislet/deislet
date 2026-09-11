@@ -15,6 +15,13 @@
 //! or per-tenant keys arrive, these tests are what has to be rewritten
 //! alongside the document, deliberately.
 //!
+//! Two of them were rewritten that way on 2026-09-11, when the fleet-wide
+//! value stopped being what opens the assignment list and a per-machine
+//! certificate took its place. Both sentences they held had become false. What
+//! each was protecting had not: see the comments on those two tests for what
+//! survived the change and why a weaker sentence would have been worse than no
+//! sentence at all.
+//!
 //! Paths are relative to this file, so a document that moves fails to compile
 //! rather than silently stopping being checked.
 
@@ -48,14 +55,25 @@ fn assert_says(document: &str, name: &str, phrase: &str) {
     );
 }
 
+/// This test used to hold the sentence "the credential equals every tenant's
+/// plaintext", about the fleet-wide shared value. That value no longer opens
+/// the assignment list at all - a certificate naming one machine does - so the
+/// sentence was rewritten in the same change that made it false.
+///
+/// What it was protecting did not change, and that is why there is still a
+/// test here. The assignment list is still not scoped to the machine that
+/// asked for it: `assignments_for` takes a `node_id`, uses it for log lines,
+/// and returns the whole catalog. So one machine's private key still reads
+/// every tenant's plaintext. The credential got narrower - it names a machine
+/// now, and cannot be copied out of a configuration file - and what it opens
+/// did not get narrower at all. A document that said "each machine has its own
+/// identity" and stopped there would read as isolation, which this is not.
 #[test]
-fn the_credential_is_still_said_to_equal_every_tenants_plaintext() {
-    // The join, not one of its halves. Every other document is allowed to
-    // describe only the endpoint it is about; this one is not.
+fn one_machines_certificate_is_still_said_to_read_every_tenants_plaintext() {
     assert_says(
         TRUST_BOUNDARIES,
         "docs/trust-boundaries.md",
-        "the credential equals every tenant's plaintext",
+        "every tenant's plaintext, not only that node's own",
     );
 }
 
@@ -80,17 +98,25 @@ fn the_missing_per_tenant_key_separation_is_still_stated() {
     );
 }
 
+/// deis-proxy is the internet-facing process, and it used to hold the fleet
+/// key - so a compromised proxy was every tenant's secrets and every node.
+/// That is no longer what a bare `[control] secret` buys it, and the sentence
+/// this test used to hold was rewritten with the change that made it false.
+///
+/// The reason a test stays here is that the tempting conclusion - "the proxy
+/// is safe to put in a DMZ now" - is wrong. A proxy with a `[machine_identity]`
+/// table holds a private key, and a private key on an internet-facing host is
+/// a credential on an internet-facing host whatever shape it has. The document
+/// has to keep saying which side of the boundary such a host is on.
 #[test]
-fn the_proxy_is_still_named_as_a_holder() {
-    // deis-proxy is the internet-facing process, and its credential used to be
-    // described by the one endpoint it calls. A document that stopped naming
-    // it would be back to that half-truth.
+fn a_host_holding_a_private_key_is_still_named_as_inside_the_boundary() {
     let document = unwrapped(TRUST_BOUNDARIES);
     assert!(
-        document.contains("Compromise of the deis-proxy process"),
-        "docs/trust-boundaries.md no longer says what a compromised deis-proxy \
-         costs. It holds a node credential, so the answer is every tenant's \
-         secrets and every node; put it back."
+        document.contains("proxy included, as inside the control plane's trust boundary"),
+        "docs/trust-boundaries.md no longer says which side of the trust \
+         boundary a machine holding a [machine_identity] private key is on. \
+         The proxy is the one that matters: it faces the internet and it holds \
+         a key. Put it back."
     );
 }
 

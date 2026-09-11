@@ -117,7 +117,7 @@ consecutive checks:
 | minting a storage token needs that exact tenant written down | `deploy:*/* secrets:*/*` is refused; `storage:demo/production` is served; `storage:*/*` cannot even be created |
 | a service binding needs authority over the application it names | naming another app in a manifest claims a call on it, so the upload is refused without `read:<callee>/*` and the refusal names what was missing |
 | a token for one environment cannot take the application off a node | deploying and unloading are different authorities |
-| a node is driven only by a caller holding the node key | the node management plane does not answer the human API's credential |
+| a node is driven only over the socket where its control plane proves its name | the plaintext management port answers no administrative call, with or without a credential; `[machine_identity] management_listen` admits only the one certificate naming this node's control plane |
 | a revoked token is refused at its next call | and the caller cannot tell it from a token that never existed, while the control plane's log can |
 | the audit log names the secret that was written | its application, environment, author and source address — never the value |
 | a refused call is recorded as fully as an accepted one | with the scope that would have been enough |
@@ -180,20 +180,22 @@ preview writing to its KV therefore cannot overwrite production's, which
 matters because rolling back returns the code and not the data.
 
 **Nodes pull, the control plane also pushes.** A node fetches its assignment
-list on startup, fetches each bundle over HTTP, verifies its sha256, loads it,
-and only then reports healthy. It also states its own existence to the control
-plane, which is what makes it a push target and a candidate for cron. After
-that a new deployment reaches it as a push. Both of those node-facing endpoints
-need a node credential from `node_preshared_keys`, independently of whether the
-human-facing API has authentication turned on at all — the assignment list
-contains decrypted secrets. That credential is one value for the whole fleet,
-deis-proxy holds one too, and a node's data port is a trust boundary that has
-to be firewalled: [docs/trust-boundaries.md](docs/trust-boundaries.md) states
-all of it in one place, with the rotation procedure.
+list on startup over `deis.machine.MachineChannel`, fetches each bundle over
+HTTP, verifies its sha256, loads it, and only then reports healthy. It also
+states its own existence to the control plane over the same channel (`Register`),
+which is what makes it a push target and a candidate for cron. After that a new
+deployment reaches it as a push. The machine channel is mutually authenticated
+by certificate, on its own listener (`[machine] listen`) rather than the port
+a browser or the console reaches — each machine's certificate carries one URI
+SAN, a SPIFFE name naming exactly it, so a holder of one machine's certificate
+cannot present itself as another. `node_preshared_keys` still exists for a
+fleet part-way through the migration off the old fleet-wide value; where it is
+still configured, [docs/trust-boundaries.md](docs/trust-boundaries.md) states
+what it opens and how to rotate it.
 
-The two paths are not spelled out here on purpose. They are
-`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE` and `NODE_REGISTRATION_ROUTE`
-(with `node_assignments_path` / `node_registration_path` for the client side),
+The gRPC methods and the bundle download path are not spelled out here on
+purpose. They are `deis.machine.MachineChannel`'s `Register`, `Deregister`,
+`FetchAssignments` and `FetchRoutingTable`, plus the bundle download route,
 and a path copied into prose is a path that goes stale the next time one moves
 — which has already happened once.
 
@@ -344,8 +346,9 @@ Everything in the table above runs end to end. What is not there yet, in the
 order it is likely to matter:
 
 - **A preview address still needs a wildcard DNS record placed by hand.** The
-  routing link itself is closed: deis-proxy polls `/api/routing-table` from the
-  control plane, so host routes, path prefixes and an automatic
+  routing link itself is closed: deis-proxy polls the routing table from the
+  control plane — over the machine channel when it has an identity, over
+  `/api/routing-table` when it does not — so host routes, path prefixes and an automatic
   per-environment address (`<env>--<app>.<zone>`, plus the shorter
   `<app>.<zone>` for the default environment) all work. Certificates are
   closed too: `[tls.acme]` turns on an RFC 8555 client that takes its names

@@ -79,8 +79,11 @@ work; it is a leftover, not a supported form.
 
 ### Authentication, stated precisely
 
-The node sends `sha256(secret ‖ node_id ‖ timestamp)` along with the timestamp;
-the control plane recomputes it and rejects anything more than 300 seconds old.
+[`ControlConfig::secret`] is optional. Whatever it holds - a real value or
+nothing - the node sends `sha256(secret ‖ node_id ‖ timestamp)` along with the
+timestamp; the control plane recomputes it and rejects anything more than 300
+seconds old, unless the connection has already proved a certificate identity,
+in which case what this field carries is not read at all (see below).
 
 That is a secret-prefix SHA-256 construction. It is **not** HMAC-SHA256, even
 though the comment next to it in `src/models/auth.rs` says "HMAC" and the
@@ -88,10 +91,15 @@ documentation used to repeat that. The distinction matters to anyone reasoning
 about length-extension resistance, and changing it is a protocol change on both
 sides.
 
-The `secret` here is a `node_preshared_keys` value, which is one credential
-for the whole fleet rather than one node's identity - what it opens and how it
-is rotated is stated once, in
-[docs/trust-boundaries.md](../../docs/trust-boundaries.md).
+The `secret`, when a caller carries one, is a `node_preshared_keys` value,
+which is one credential for the whole fleet rather than one node's identity -
+what it opens and how it is rotated is stated once, in
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md). A caller with no
+`secret` configured sends the field empty; if the connection it opened also
+carried a certificate this fleet signed - a mutual-TLS dial made with a
+`[machine_identity]` table, on the caller's side - the control plane admits
+the channel on the name that certificate proved instead, and there is nothing
+left for a shared value to add. A caller with neither is refused.
 
 ### Message types
 

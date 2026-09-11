@@ -1387,10 +1387,17 @@ fi
 # master key, has to have `chmod 600 "$FILE"` beside it - within three lines
 # before (state.env is chmod'ed before it is written) or twelve after its
 # terminator. A regex that stopped matching would report nothing to check,
-# so the number of writers found is asserted as well: eight today - state.env,
-# secret.key, the store, queue, control-plane, node and proxy configurations,
-# and the restart proxy's. (deis-telemetry's configuration carries no
-# credential and is 0600 anyway.)
+# so the number of writers found is asserted as well: five today - state.env,
+# secret.key, and the store, queue and control-plane configurations.
+#
+# It was eight. Three configurations - the node's, the proxy's and the restart
+# proxy's - stopped carrying a credential value because nothing in this demo
+# configures a fleet key any more: each of those machines proves a certificate
+# instead. What they carry now is the *path* to a private key, which is a path
+# and not a secret, so this check no longer has anything to say about them -
+# and the file that does hold the secret, the key itself, is held to 0600 by
+# the check below rather than by this one. (deis-telemetry's configuration
+# carries no credential and is 0600 anyway.)
 
 cat > "${WORK_DIR}/credential-writers.awk" <<'AWK'
 { lines[NR] = $0 }
@@ -1429,11 +1436,51 @@ writers=$(awk -v want='(^|[^_a-z])secret = "|auth_secret = "|node_preshared_keys
   -f "${WORK_DIR}/credential-writers.awk" "$DEMO_SH")
 found=$(printf '%s\n' "$writers" | grep -c . || true)
 unset_writers=$(printf '%s\n' "$writers" | grep ' UNSET$' || true)
-if [ "$found" -ge 8 ] && [ -z "$unset_writers" ]; then
+if [ "$found" -ge 5 ] && [ -z "$unset_writers" ]; then
   pass "every one of the ${found} credential-bearing files demo.sh writes is chmod 600 where it is written"
 else
   fail "every one of the ${found} credential-bearing files demo.sh writes is chmod 600 where it is written" \
-    "docs/trust-boundaries.md promises 0600 for all of them; found ${found} writer(s) (at least 8 expected), without a chmod: $(printf '%s' "$unset_writers" | tr '\n' ';')"
+    "docs/trust-boundaries.md promises 0600 for all of them; found ${found} writer(s) (at least 5 expected), without a chmod: $(printf '%s' "$unset_writers" | tr '\n' ';')"
+fi
+
+# ----------------------------------------------------------------------
+# 15b. Every private key demo.sh mints is written 0600
+# ----------------------------------------------------------------------
+#
+# The check above used to cover every credential this demo writes down,
+# because every credential was a string in a configuration file. It is not any
+# more: each machine now proves a certificate, and the thing that must not be
+# readable is the private key beside it. A key minted 0644 would be a demo
+# that hands any process on the box the identity of the control plane - the
+# same failure the fleet key was, with a longer name.
+#
+# Held statically, like the one above, because a permission is only observable
+# at the moment the file is made: openssl writes the key with the process
+# umask, so whether it is 0600 depends on the environment the demo happened to
+# run in unless the script says so itself. Every `-keyout "..."` in demo.sh
+# therefore has to have a `chmod 600` on the same path within twelve lines.
+key_writers=$(awk '
+  { lines[NR] = $0 }
+  END {
+    for (i = 1; i <= NR; i++) {
+      if (lines[i] !~ /-keyout "/) continue
+      v = lines[i]
+      sub(/.*-keyout "/, "", v)
+      sub(/".*/, "", v)
+      ok = 0
+      for (k = i; k <= i + 12 && k <= NR; k++) {
+        if (index(lines[k], "chmod 600 \"" v "\"")) ok = 1
+      }
+      printf "%d %s %s\n", i, v, (ok ? "0600" : "UNSET")
+    }
+  }' "$DEMO_SH")
+keys_found=$(printf '%s\n' "$key_writers" | grep -c . || true)
+keys_unset=$(printf '%s\n' "$key_writers" | grep ' UNSET$' || true)
+if [ "$keys_found" -ge 2 ] && [ -z "$keys_unset" ]; then
+  pass "every one of the ${keys_found} private keys demo.sh mints is chmod 600 where it is minted"
+else
+  fail "every one of the ${keys_found} private keys demo.sh mints is chmod 600 where it is minted" \
+    "a key readable by anything on the box is the identity it names, handed over; found ${keys_found} minting site(s) (at least 2 expected - the authority and the leaves), without a chmod: $(printf '%s' "$keys_unset" | tr '\n' ';')"
 fi
 
 # ----------------------------------------------------------------------
@@ -1623,13 +1670,31 @@ else
     "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
 fi
 
-# The node. `node_grpc_status` is the one door to the node's gRPC services;
-# `app_request` and `control_api` are the two that confirm nothing was
-# unloaded, and both answer as a healthy node's would, so that the verdict
-# rests on the probes alone.
-# $1 says who the stand-in node serves: everyone, none (GetStatus with no
-# credential), wrong (GetStatus with a wrong one), trigger (OnScheduled with
-# no credential), gated (the node key only) or closed (nobody).
+# The node. There are now two doors to hold the check to, and they fail in
+# opposite directions, so each stand-in below opens exactly one of them and the
+# check has to notice.
+#
+# `node_grpc_status` is the plaintext management plane on the node's data port.
+# With no node key configured anywhere in this fleet, every call there is
+# refused with grpc-status 14 (UNAVAILABLE) - the node cannot tell its control
+# plane from anyone else, so it serves neither. The interesting stand-ins are
+# the ones where it serves somebody: a node left unauthenticated, or one that
+# still honours the fleet secret this demo retired.
+#
+# `curl` is stubbed for the one call the check makes directly: a plaintext gRPC
+# request at `[machine_identity] management_listen`. A caller that cannot prove
+# the control plane's name never completes a handshake there, so curl comes
+# back non-zero with no HTTP response at all; the stand-in that answers it is a
+# node whose authenticated plane is not authenticating.
+#
+# `app_request` and `control_api` are the two that confirm nothing was unloaded
+# and the platform still works, and both answer as a healthy node's would, so
+# the verdict rests on the probes alone.
+#
+# $1 says what the stand-in node opens: shut (nothing - the state this fleet is
+# in), everyone, none (no credential on GetStatus), wrong (a wrong credential),
+# key (the retired fleet secret), trigger (OnScheduled with no credential), or
+# plaintext (the mutually authenticated plane answering a plaintext call).
 node_plane_probe() {
   local serves=$1
   local probe="${WORK_DIR}/node-plane-${serves}.sh"
@@ -1642,7 +1707,9 @@ node_plane_probe() {
     printf 'LOG_DIR=%q\n' "$WORK_DIR"
     echo 'APP_ID=demo'
     echo 'NODE_ID=deis-runtime-demo-01'
-    echo 'SECRET=the-node-key'
+    echo 'SECRET=the-retired-fleet-key'
+    echo 'DEIS_RUNTIME_PORT=8086'
+    echo 'DEIS_RUNTIME_MACHINE_PORT=8097'
     printf 'SERVES=%q\n' "$serves"
     definition_of pass_check
     definition_of fail_check
@@ -1656,17 +1723,23 @@ node_grpc_status() {
   case "${path}|${credential}" in
     *OnScheduled*"|") caller=trigger ;;
     *"|") caller=none ;;
-    *"|the-node-key") caller=real ;;
+    *"|the-retired-fleet-key") caller=key ;;
     *) caller=wrong ;;
   esac
   local served=no
   case "$SERVES" in
     everyone) served=yes ;;
-    closed) served=no ;;
-    gated) [ "$caller" = "real" ] && served=yes ;;
-    *) { [ "$caller" = "real" ] || [ "$caller" = "$SERVES" ]; } && served=yes ;;
+    none|wrong|key|trigger) [ "$caller" = "$SERVES" ] && served=yes ;;
+    *) served=no ;;
   esac
-  if [ "$served" = "yes" ]; then printf ''; else printf '16'; fi
+  if [ "$served" = "yes" ]; then printf ''; else printf '14'; fi
+}
+# The only curl the check makes itself: a plaintext call at the mutually
+# authenticated plane. Non-zero means no connection, which is the answer a
+# listener that demands a certificate gives.
+curl() {
+  if [ "$SERVES" = "plaintext" ]; then return 0; fi
+  return 52
 }
 app_request() { printf 'HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n' > "$1"; }
 control_api() { printf '{"nodes":[{"id":"%s","healthy":true}]}' "$NODE_ID"; }
@@ -1678,34 +1751,38 @@ STUB
   bash "$probe" 2>&1
 }
 
-# $1 who the node serves; $2 what the check's report must say about it.
+# $1 what the node opens; $2 what the check's report must say about it.
 # A served call has no header status, which the check prints as "none".
 node_plane_case() {
   local serves=$1 phrase=$2
   local name="the node-management check fails when the node serves the ${serves} caller"
-  [ "$serves" = "closed" ] && name="the node-management check fails when the node refuses even the node key"
+  [ "$serves" = "plaintext" ] \
+    && name="the node-management check fails when the mutually authenticated plane answers a plaintext call"
   local out
   out=$(node_plane_probe "$serves")
   if [ "${out#*verdicts: 0 passed 1 failed}" != "$out" ] && [ "${out#*"$phrase"}" != "$out" ]; then
     pass "$name"
   else
     fail "$name" \
-      "wanted a failure saying \"${phrase}\"; it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
+      "wanted a failure saying \"${phrase}\"; it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 400)"
   fi
 }
 
-node_plane_case everyone 'expected grpc-status 16 with no credential (got "none")'
-node_plane_case none 'expected grpc-status 16 with no credential (got "none"), 16 with a wrong one (got "16")'
-node_plane_case wrong '16 with a wrong one (got "none") and 16 on OnScheduled (got "16")'
-node_plane_case trigger '16 on OnScheduled (got "none"), and the node key to be served (header status was "none"'
-node_plane_case closed 'the node key to be served (header status was "16", expected none)'
+node_plane_case everyone 'expected grpc-status 14 with no credential (got "none")'
+node_plane_case none 'expected grpc-status 14 with no credential (got "none"), with a wrong one (got "14")'
+node_plane_case wrong 'with a wrong one (got "none"), on OnScheduled (got "14")'
+node_plane_case trigger 'on OnScheduled (got "none") and with the retired fleet secret (got "14")'
+# The one that matters most: a node that still honours the value this demo
+# stopped configuring. Nothing else in the run would notice it.
+node_plane_case key 'and with the retired fleet secret (got "none")'
+node_plane_case plaintext 'to be refused at the handshake (curl exited 0, expected non-zero)'
 
-out=$(node_plane_probe gated)
+out=$(node_plane_probe shut)
 if [ "${out#*verdicts: 1 passed 0 failed}" != "$out" ]; then
-  pass "the node-management check passes when only the node key is served"
+  pass "the node-management check passes when the plaintext plane serves nobody and the authenticated one refuses a plaintext caller"
 else
-  fail "the node-management check passes when only the node key is served" \
-    "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
+  fail "the node-management check passes when the plaintext plane serves nobody and the authenticated one refuses a plaintext caller" \
+    "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 400)"
 fi
 
 # ----------------------------------------------------------------------

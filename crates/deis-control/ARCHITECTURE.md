@@ -15,7 +15,10 @@ environments, deployment pointers, routes, encrypted secrets), keeps track of
 the fleet, pushes every change out to the nodes, and fires cron. It carries no
 data plane traffic — a request from a browser never passes through it.
 
-It is a single process on a single port, serving HTTP and gRPC together.
+It is a single process on two listeners: the human one serves HTTP and gRPC
+together, and a second, `[machine]`, serves nothing but what a node or
+a proxy calls, over mutual TLS - see *Security* below. That second listener
+is not optional; a control plane with no `[machine]` table refuses to start.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -56,9 +59,11 @@ the single most common misreading of this component:
   configuration and commands. Those open streams are what `/api/sessions`
   lists.
 - **A runtime node is dialled out to.** deis-control is the gRPC *client* of
-  the node's own management service. It also serves the node three HTTP
-  endpoints the node calls itself — registration, assignment list, bundle
-  download. The fleet those make up is what `/api/runtime` lists.
+  the node's own management service. What the node calls itself — its
+  registration, its assignment list, its bundle download — is answered on
+  the machine listener instead, where the node proves a certificate naming
+  itself rather than a value copied into a file. The fleet those make up is
+  what `/api/runtime` lists.
 
 WebSocket is not used anywhere in this component. Earlier versions of this
 document described the node link as WebSocket; it is gRPC over HTTP/2.
@@ -74,7 +79,8 @@ the `deis-wire` SDK.
 
 **Responsibilities**
 - Accept node gRPC streams
-- Authenticate (see *Security* below — it is a SHA-256 construction, not HMAC)
+- Authenticate (see *Security* below — a proved certificate on the machine
+  channel, a plain secret comparison on the human one)
 - Manage session lifecycle
 - Receive heartbeats and status updates
 - Handle command responses
@@ -89,7 +95,7 @@ Node ← gRPC stream ← Server ← CommandExecutor
 
 ### 2. HTTP API (`src/api/`)
 
-Two routers with two different credentials — see README.md, *Two audiences,
+Two listeners with two different credentials — see README.md, *Two audiences,
 two credentials*.
 
 | File | Surface |
@@ -98,10 +104,15 @@ two credentials*.
 | `catalog/` | apps, versions, environments, deployments, routes, secrets, assignments |
 | `apps.rs` | the runtime fleet (`/api/runtime`) |
 | `nodes.rs` | open gRPC control channels (`/api/sessions`) |
-| `registration.rs` | a node putting itself on the fleet list |
+| `registration.rs` | unused: a node used to put itself on the fleet list here; that RPC is `src/machine/service.rs`'s `Register` now |
 | `configs.rs`, `commands.rs`, `events.rs`, `metrics.rs` | operations |
-| `middleware.rs` | API-key auth for humans, node auth for nodes |
+| `middleware.rs` | API-key auth for humans; the fallback node-key check on the human listener's copy of the gRPC control channel |
 | `static_files.rs` | the embedded console |
+
+`src/machine/` (`listen.rs`, `accept.rs`, `service.rs`) is the other listener:
+it accepts only a connection that proves a certificate this fleet signed, and
+serves `Register`, `Deregister`, `FetchAssignments` and `FetchRoutingTable`
+plus the bundle download.
 
 Axum, Tower HTTP, axum-server (for TLS).
 
@@ -224,8 +235,10 @@ stopped refreshing is exactly a node that is still serving what it last
 received and is not reconciling either, so every fleet-wide answer — a deploy,
 an application deletion — names it as unreached instead of describing only the
 half of the fleet that still answers. It clears itself when the node registers
-again, or with a `DELETE` of `deis_wire::conventions::NODE_REGISTRATION_ROUTE`
-when the machine is gone.
+again, or when `node_registration_ttl_secs` passes with no refresh. There is
+no operator-initiated way to clear one sooner: `Deregister` on the machine
+channel only admits a caller proving the exact certificate of the node being
+withdrawn, which a machine that is really gone cannot present.
 
 ### 8. Configuration management (`src/config_manager/`)
 
@@ -317,37 +330,52 @@ Prometheus text format at `/api/metrics`, JSON summary at
 
 ## 🔒 Security
 
-**Node authentication.** A pre-shared key from `node_preshared_keys`. One
-value is one credential for the whole fleet - it reads every environment's
-decrypted secrets and drives every node - so what it opens and what has to be
-firewalled around it is stated once, in
+**Machine authentication.** Mutual TLS. A node or a deis-proxy proves a
+certificate whose one URI SAN is a SPIFFE name naming exactly itself
+(`spiffe://<trust domain>/deislet/node/<id>` or `.../proxy/<id>`); the name it
+proved is the only thing that decides which machine it may act as, and there
+is no field in a request that can ask for another one's. `[machine]` is not
+optional - a control plane started with no `[machine]` table refuses to start,
+because registration, the assignment list, the bundle download and the
+routing table are served nowhere else. The certificate, private key and trust
+root are re-read every `identity_reload_seconds`, so a renewal needs no
+restart. What that certificate reaches - every environment's decrypted
+secrets, every node's management plane - is stated once, in
 [docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 
-On the gRPC handshake the node sends `sha256(secret ‖ node_id ‖ timestamp)`
-together with the timestamp, and this side recomputes it; a timestamp more than
-300 seconds old is rejected. Note what that is and is not: it is a
-secret-prefix SHA-256, **not** HMAC-SHA256, even though the comment beside it
-in `deis-wire/src/models/auth.rs` says "HMAC". Documents here have called it
-HMAC before; they were wrong, and the difference matters if anyone ever reasons
-about its resistance to length extension. Changing the construction is a
-protocol change on both sides, so it is not something to do quietly.
+The one thing still reachable on both listeners is the gRPC control channel
+deis-proxy holds open (`EstablishChannel`). Arriving over the machine channel,
+a connection is admitted by the certificate name it already proved during the
+TLS handshake, and whatever it sends as `secret` in the `Authenticate` message
+is not read. Arriving on the human listener there is no certificate, so that
+`secret` is compared with a constant-time equality check against every value
+in `node_preshared_keys` - a plain comparison, with no signature and no
+timestamp step. An empty `node_preshared_keys` there is not "no check
+required": it means this control plane cannot tell a node from anyone else, so
+it admits neither.
 
-On the node-facing HTTP endpoints the same list is presented directly as a
-bearer credential, with no signature step.
-
-The process refuses to run without a credential: if the configuration names
-none, one is generated at startup and printed once, because an empty list would
-let anyone who can reach the port register a node — and a registered node is
-handed every environment's decrypted secrets.
+**`node_preshared_keys` is optional now**, and does less than it used to: with
+`[machine]` configured and the list left empty, no fleet-wide value is minted
+at all, because every peer proves a certificate instead and there is nothing
+left for a shared value to decide. What the list still does, only while a
+fleet is mid-migration: the fallback above for a proxy with no
+`[machine_identity]` yet, and the bearer this control plane presents on a
+node's own plaintext management plane when that node has none either. The
+node-facing HTTP endpoints it used to guard - registration, the assignment
+list, the bundle download - are not served on the human listener at all any
+more; they answer `404` there regardless of what is presented.
 
 **Human API authentication.** An API key (`Authorization: Bearer` or
-`X-API-Key`), enabled by `api_auth_enabled`, which defaults to **off**. It does
-not gate the node endpoints, on purpose.
+`X-API-Key`), enabled by `api_auth_enabled`, which defaults to **off**. It
+does not gate the machine channel, on purpose.
 
-**TLS.** Rustls, TLS 1.2/1.3, self-signed or a real certificate.
+**TLS.** Rustls, TLS 1.2/1.3, self-signed or a real certificate, on the human
+listener (`[tls]`). The machine listener runs its own mutual TLS, configured
+by `[machine]` rather than `[tls]`.
 
-**Authorization.** Flat: every API key has the same rights. There are no users
-and no roles.
+**Authorization.** Flat on the human surface: every API key has the same
+rights, and there are no users and no roles. The machine surface has one rule
+instead: a caller may only ask for the machine it proved.
 
 ---
 
@@ -356,29 +384,35 @@ and no roles.
 ### A runtime node joining and being fed
 
 ```
-Node                         deis-control
+Node                    deis-control (machine channel)
   │                                │
-  │── PUT  registration ──────────→│  (node credential)
+  │── mTLS handshake, naming ─────→│  certificate proved
+  │    itself                      │
+  │── Register ───────────────────→│
   │                                │  on the fleet list, eligible for
-  │←── 200 + lease ────────────────│  pushes and cron
+  │←── registration + lease ───────│  pushes and cron
   │                                │
-  │── GET  assignments ───────────→│  (node credential)
+  │── FetchAssignments ───────────→│
   │←── [ {app, env, version,       │  secrets decrypted at send time
   │       bundle_url, sha, env} ]  │
   │                                │
-  │── GET  bundle_url ────────────→│  streamed, sha256 verified by the node
+  │── GET bundle_url ─────────────→│  streamed, sha256 verified by the node
   │                                │
   │   (loads everything, only      │
   │    then reports healthy)       │
   │                                │
-  │←── ApplyDeployment ────────────│  every later deploy, as a push
+  │←── ApplyDeployment ────────────│  every later deploy, as a push - a
+  │                                │  separate call deis-control makes on the
+  │                                │  node's own management service, not on
+  │                                │  this channel
 ```
 
-The paths are `deis_wire::conventions::NODE_REGISTRATION_ROUTE` and
-`NODE_ASSIGNMENTS_ROUTE`. They live in deis-wire because nothing checks that
-two crates spell an HTTP path the same way, and they did not once: a node asked
-for `/register` while this control plane served `/registration`, both compiled,
-and the only symptom was a fleet that never learned about its own nodes.
+`Register`, `Deregister` and `FetchAssignments` are RPCs of
+`deis.machine.MachineChannel`, defined in `deis-wire`'s machine proto; the
+bundle download is the one HTTP call on this listener, built by
+`deis_control::delivery::bundle_url()`. All of it runs on the machine
+listener, over the mutual TLS handshake above - a connection that cannot
+prove a certificate this fleet signed never reaches any of these calls.
 
 ### deis-proxy connecting
 
@@ -386,7 +420,10 @@ and the only symptom was a fleet that never learned about its own nodes.
 deis-proxy                   deis-control
   │                                │
   │── gRPC EstablishChannel ──────→│
-  │── authenticate ───────────────→│  verify PSK
+  │── authenticate ───────────────→│  a proved certificate name is admitted
+  │                                │  outright; on the human listener with no
+  │                                │  certificate, the secret it sent is
+  │                                │  checked against node_preshared_keys
   │←── auth response ──────────────│
   │── register ───────────────────→│  create session, persist, record an event
   │←── register response ──────────│
@@ -449,12 +486,14 @@ non-zero: the pointer moved, but that machine is still serving what it had.
   overlap - a manual start beside a service unit, a cut-over - not
   leader election: the task list is not shared, and an occurrence that comes
   due during the hand-over is skipped, as it is when no control plane runs.
-- **RBAC, mTLS, audit log.**
-- **No ACME.** The routing table now reaches deis-proxy — see
-  `GET /api/routing-table` below — so path-prefix routing and an automatic
-  per-environment address both work. What this control plane cannot do is get
-  the certificate those addresses need: the `*.<zone>` record and the
-  `*.<zone>` certificate are placed and renewed by a person.
+- **RBAC, audit log.** Mutual TLS is done for the machine channel - see
+  *Security* above - but not for the human surface, which is still a flat API
+  key with no users or roles.
+- **No ACME.** The routing table now reaches deis-proxy — over
+  `FetchRoutingTable` on the machine channel — so path-prefix routing and an
+  automatic per-environment address both work. What this control plane cannot
+  do is get the certificate those addresses need: the `*.<zone>` record and
+  the `*.<zone>` certificate are placed and renewed by a person.
 - **Only deis-runtime ships logs to deis-telemetry.** This component still
   writes to its own stdout.
 

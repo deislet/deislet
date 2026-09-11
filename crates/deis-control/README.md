@@ -6,8 +6,11 @@ encrypted secrets in SQLite; it hands each node the list of what that node
 should serve, and pushes every change out to the fleet. It never carries data
 plane traffic.
 
-One process, one port. HTTP (REST + the web console) and gRPC (the node control
-channel) are served on the same listener.
+One process, two listeners. The human one serves HTTP (REST + the web
+console) and the gRPC control channel deis-proxy holds open; the machine one
+- its own `[machine]` table, `bind_addr` and `port` - serves everything only
+a node or a proxy calls, over mutual TLS, and is not optional - see
+*Two audiences, two credentials* below.
 
 ## What it owns
 
@@ -39,15 +42,29 @@ cargo run -p deis-control -- --config deis-control.toml
 `LOG_FORMAT=json` switches structured output; `RUST_LOG` sets the level.
 
 See [`deis-control.example.toml`](deis-control.example.toml) for every setting
-with its meaning. The one that is not optional in practice:
+with its meaning. The one table that is not optional at all - a control plane
+started without it refuses to run:
 
 ```toml
-# One credential, used on the node gRPC handshake and on every node-facing
-# HTTP endpoint. If the file names none, the process mints one at startup and
-# prints it once - which means it changes on every restart, so put it in the
-# file.
-node_preshared_keys = ["<openssl rand -hex 32>"]
+# This control plane's own certificate, private key and the trust root every
+# node and every deis-proxy must chain to. Issuing, renewing and revoking
+# those three files is outside this process; they are re-read on an
+# interval, so a renewal needs no restart. Everything a node or a proxy
+# calls - registration, the assignment list, the bundle download, the
+# routing table - is served only here, over mutual TLS, so a control plane
+# with no [machine] table is dead to its fleet and will not start at all.
+[machine]
+bind_addr = "127.0.0.1"
+port = 8443
+certificate = "/etc/deis-control/certs/control.pem"
+private_key = "/etc/deis-control/certs/control-key.pem"
+trust_root = "/etc/deis-control/certs/trust-root.pem"
 ```
+
+`node_preshared_keys` is optional now: with `[machine]` configured and the
+list left empty, no fleet-wide value is minted at all, because every peer
+proves a certificate instead. It still matters for a fleet mid-migration -
+see *Two audiences, two credentials* below.
 
 ### The console in development
 
@@ -70,29 +87,39 @@ This is the part worth reading before changing anything about authentication.
 
 - **The human surface** — everything the console and `deis` call — is guarded by
   an API key, and `api_auth_enabled` turns that on and off. It defaults to off.
-- **The node surface** — a node's registration, its assignment list, the bundle
-  download, and the routing table deis-proxy polls — carries its own
-  authentication, and `api_auth_enabled` does not reach it. The assignment list
-  answers with every environment's **decrypted** secrets, because a node that
-  restarts has to come back with the environment it had. A convenience flag for
-  a dashboard must not be able to open that. The routing table is on this
-  surface for a different reason: it names nothing secret, but it is a map of
-  every application and hostname this installation serves, and deis-proxy
-  already holds a node credential — the `[control] secret` in its own file is a
-  `node_preshared_keys` value, because that is what its gRPC control channel
-  authenticates with. That makes deis-proxy's configuration file as sensitive
-  as this one: the same value reads every environment's decrypted secrets from
-  the assignment list and drives every node's management plane. See
+- **The machine surface** — a node's registration, its assignment list, the
+  bundle download, and the routing table deis-proxy polls — is not on this
+  listener at all any more. It lives on `[machine]`, a socket of its
+  own that demands mutual TLS: a node or a proxy proves a certificate whose
+  one URI SAN is a SPIFFE name naming exactly itself
+  (`spiffe://<trust domain>/deislet/node/<id>` or `.../proxy/<id>`), and it
+  may only ask for its own registration and its own assignments. Asking this
+  listener for any of the four now gets `404`, not `401` - no credential
+  brings them back here, because none is accepted here for them at all. The
+  assignment list answers with every environment's **decrypted** secrets,
+  because a node that restarts has to come back with the environment it had;
+  that is exactly why it moved off the listener a dashboard reaches. See
   [docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 
-An API key is not accepted on the node endpoints, and a node credential is not
-accepted on the human ones.
+`node_preshared_keys` is optional and does less than it used to: it is the
+credential deis-proxy's gRPC control channel (`EstablishChannel`, still on
+this human listener) falls back to when that proxy has no
+`[machine_identity]` of its own yet, and it is the bearer this control plane
+presents on a node's plaintext management plane when that node has none
+either. It no longer opens the machine surface at all - not even when a value
+is presented there, since nothing on that listener reads it.
 
-The node paths are not written out here on purpose: they are
-`deis_wire::conventions::NODE_REGISTRATION_ROUTE` (PUT to register, DELETE to
-leave) and `NODE_ASSIGNMENTS_ROUTE`, plus
-`/api/apps/:app_id/versions/:version_id/bundle`. A path copied into prose is a
-path that goes stale.
+An API key opens nothing on the machine surface, and neither a node key nor
+a certificate opens the product or platform API on the human one - the one
+thing a node key still does on the human listener is authenticate deis-proxy's
+control channel, described above, which is a different thing from either
+surface's own data.
+
+The machine channel's RPCs are not written out here on purpose: they are
+`deis.machine.MachineChannel`'s `Register`, `Deregister`, `FetchAssignments`
+and `FetchRoutingTable`, defined in `deis-wire`'s machine proto, plus an HTTP
+bundle download built by `deis_control::delivery::bundle_url()`. A name
+copied into prose is a name that goes stale.
 
 ## HTTP API
 
@@ -123,9 +150,9 @@ Everything below is on the single configured port.
 An upload whose bytes are identical to an existing version reuses that version
 instead of burning a new number.
 
-Routes are consumed. deis-proxy polls a second view of the same table —
-`deis_wire::conventions::ROUTING_TABLE_ROUTE`, on the node surface — and
-resolves an application by host and path prefix from it. That view is a
+Routes are consumed. deis-proxy fetches a second view of the same table —
+`deis.machine.MachineChannel`'s `FetchRoutingTable`, on the machine surface —
+and resolves an application by host and path prefix from it. That view is a
 different shape from `/api/routes` on purpose: it carries the environment's
 **name** rather than its `env_id` (the name is what travels in
 `x-deis-environment`), it lists **every** environment whether or not it has a

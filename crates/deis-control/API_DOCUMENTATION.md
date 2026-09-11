@@ -2954,7 +2954,7 @@ read live from the node rather than from the catalog.
 
 A node is on this list because the control plane's configuration file names it or because it registered itself; whether it holds a control channel open has nothing to do with it, and the nodes that do that are a different list at `GET /api/platform/sessions` ([`crate::api::nodes`]).
 
-`lost` is the other half of the same question, and the reason it is served here rather than only appearing inside a deployment's answer: these are nodes that were on the list, stopped refreshing their registration and are presumed to be still running what they last received. Every deploy and every application deletion names them as unreached, so an operator has to be able to see which ones they are and clear the ones whose machine is really gone with a `DELETE` on `deis_wire::conventions::NODE_REGISTRATION_ROUTE`.
+`lost` is the other half of the same question, and the reason it is served here rather than only appearing inside a deployment's answer: these are nodes that were on the list, stopped refreshing their registration and are presumed to be still running what they last received. Every deploy and every application deletion names them as unreached, so an operator has to be able to see which ones they are. There is no operator-initiated way to clear one any more: `Deregister` on the machine channel (see [Node-facing routes](#node-facing-routes)) only admits a caller who proves the exact certificate of the node being withdrawn, which a machine that is really gone cannot present. A lost registration clears itself once `node_registration_ttl_secs` passes without a refresh, or when the machine comes back and registers again.
 
 `contested` is the third: machines that registered a node id another machine was already answering for and were refused it. They are running this platform's code, nothing can be sent to them, and they are on no other list - so this is where an operator finds out that two machines were given one name. See `crate::runtime_client::ContestedNodeId`.
 
@@ -2975,7 +2975,7 @@ Example answer (`200`, `FleetResponse`):
 
 #### `DELETE /api/platform/runtime/{node}/apps/{app_id}`
 
-This is a node-local operation and changes nothing in the catalog, which is why it is **refused** while the catalog still deploys the application: a node reconciles against its assignment list (`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`) on its own timer, that list is built from the catalog and names the same application, and the node loads it straight back. The endpoint used to send the unload anyway and answer `200 {"success": true}`, so an operator was told the application was off a node while the node was already putting it back - and there was nothing in the answer, or anywhere else, to say so. An operation that reports success and then reverses itself is worse than one that refuses, because the refusal is the only version of it an operator can act on.
+This is a node-local operation and changes nothing in the catalog, which is why it is **refused** while the catalog still deploys the application: a node reconciles against its assignment list (`FetchAssignments` on the machine channel, see [Node-facing routes](#node-facing-routes)) on its own timer, that list is built from the catalog and names the same application, and the node loads it straight back. The endpoint used to send the unload anyway and answer `200 {"success": true}`, so an operator was told the application was off a node while the node was already putting it back - and there was nothing in the answer, or anywhere else, to say so. An operation that reports success and then reverses itself is worse than one that refuses, because the refusal is the only version of it an operator can act on.
 
 What it is still for: an application the catalog no longer names but a node is still running - a node that was unreachable when the application was deleted, or one that has drifted. That case is the one where the unload sticks, because the next assignment list will not contain it either.
 
@@ -3105,51 +3105,68 @@ next section.
 
 ## Node-facing routes
 
-Four routes exist for runtime nodes and for deis-proxy rather than for
-people. They are authenticated with `node_preshared_keys` - the same
-credential a node uses on its gRPC control channel - and **`api_auth_enabled`
-has no effect on them**. They are flat, unversioned and permanently exempt:
-no request-context headers, no deprecation headers, no structured error body,
-and nothing in the OpenAPI document.
+Four calls exist for runtime nodes and for deis-proxy rather than for people,
+and none of them are HTTP routes on this listener any more. They are not
+mounted here at all: asking this listener for one of them answers `404`, the
+same as any other path it does not have, and not `401` - a credential cannot
+bring them back, because none is accepted here for them. They live on a
+second listener, `[machine]`, which is not optional - a control plane
+started with no `[machine]` table refuses to run - and which demands mutual
+TLS: a node or a proxy proves a certificate whose one URI SAN is a SPIFFE name
+naming exactly itself (`spiffe://<trust domain>/deislet/node/<id>` or
+`.../proxy/<id>`), issued and rotated outside this process. `api_auth_enabled`
+has no effect on this listener either way - it is a human-listener setting,
+and this is not the human listener.
 
-Their paths have exactly one definition, in
-`crates/deis-wire/src/conventions.rs`, because nothing in the compiler checks
-that two crates spell an HTTP path the same way - a node that asked for the
-wrong last segment compiled perfectly and simply never joined the fleet. Read
-them there rather than from this document:
+Three of the four are RPCs of `deis.machine.MachineChannel`, defined in
+`deis-wire`'s machine proto, because nothing in the compiler checks that two
+crates agree on a message shape the way it checks a function signature - a
+caller that got a field wrong compiled perfectly and simply never joined the
+fleet. Read them there rather than from this document:
 
 | What | Where it is defined |
 |---|---|
-| Register a node, and withdraw it (`PUT`, `DELETE`) | `deis_wire::conventions::NODE_REGISTRATION_ROUTE`; client side `deis_wire::conventions::node_registration_path()` |
-| What a node should be running (`GET`) | `deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`; client side `deis_wire::conventions::node_assignments_path()` |
-| The whole routing table (`GET`) | `deis_wire::conventions::ROUTING_TABLE_ROUTE` |
-| Download one version's bundle (`GET`) | built by `deis_control::delivery::bundle_url()` from the control plane's public base URL |
+| Register a node, and withdraw it | `deis.machine.MachineChannel`'s `Register` and `Deregister` |
+| What a node should be running | `deis.machine.MachineChannel`'s `FetchAssignments` |
+| The whole routing table | `deis.machine.MachineChannel`'s `FetchRoutingTable` |
+| Download one version's bundle (`GET`, HTTP) | built by `deis_control::delivery::bundle_url()` from `[machine] public_base_url` |
 
-Two of them decide how much that credential is worth, which is why none of
-them may be opened by a dashboard convenience setting:
+Every one of these RPCs starts by holding the `node_id` (or `proxy_id`) in the
+request against the name the caller's certificate proved, and refuses when
+the two disagree - a certificate naming one node cannot ask for another's
+anything.
+That is new: under the fleet-wide value this replaced, a `node_id` in a path
+was never checked against who was asking, because one credential answered for
+every machine that held it.
+
+Two of the four decide how much that certificate is worth, which is why none
+of them may be opened by a dashboard convenience setting:
 
 - The **assignment list** is what a node should be running: one entry per
   environment that has a deployment, carrying the manifest's variables and
   that environment's **decrypted** secrets, because a node that restarts has
-  to come back with the environment it had. The `node_id` in the path is not
-  checked against a registered node and does not narrow the answer - the list
-  is currently identical for every node - so one credential reads every
-  tenant's plaintext here. An environment whose secrets will not decrypt is
-  left out of the list entirely rather than sent with a hole in it; the node
-  then does not run it and an `ERROR` line says which application and why.
+  to come back with the environment it had. Once a caller has proved which
+  node it is, the list itself is still identical for every node - it is not
+  filtered to what that node happens to be running - so a working certificate
+  reads every tenant's plaintext, same as the fleet key did; what changed is
+  that reading it now needs a certificate naming that one machine rather than
+  a value copied into any node's file. An environment whose secrets will not
+  decrypt is left out of the list entirely rather than sent with a hole in
+  it; the node then does not run it and an `ERROR` line says which
+  application and why.
 - **Registration** decides which machines are delivery targets in the first
   place.
 
 The **routing table** carries nothing secret - hostnames, path prefixes, app
 ids and environment names, all of which anyone who can make a request through
 the edge already sees - but together they are a map of the whole
-installation, so it stays behind the credential that cannot be switched off.
-deis-proxy polls it every `routing.control_poll_interval_secs` seconds (5 by
-default) and resolves an application from it by host and path prefix. It has
-three things `GET /api/platform/routes` next door does not: every
-environment's **name** (never its `env_id`, because the name is what travels
-in `x-deis-environment`), **every** environment whether or not it has a route
-of its own, and a **version** for the table as a whole, a digest of
+installation, so it stays behind the same certificate check as the rest of
+this channel. deis-proxy fetches it every `routing.control_poll_interval_secs`
+seconds (5 by default) and resolves an application from it by host and path
+prefix. It has three things `GET /api/platform/routes` next door does not:
+every environment's **name** (never its `env_id`, because the name is what
+travels in `x-deis-environment`), **every** environment whether or not it has
+a route of its own, and a **version** for the table as a whole, a digest of
 everything except `generated_at`, so a poller can tell "unchanged" from
 "changed" without diffing. The consumer treats the document as all or
 nothing: deis-proxy compiles the whole table and swaps it in with one pointer
@@ -3158,13 +3175,15 @@ applying it with that entry skipped. Half a routing table sends live requests
 to the wrong application, which is worse than an old one - which is also why
 a failed poll changes nothing and the last accepted table keeps serving.
 
-**A `node_preshared_keys` value is one credential for the whole fleet.** The
-same bearer that reads the routing table reads every environment's decrypted
-secrets from the assignment list and drives every node's management plane, so
-the internet-facing proxy process holds a credential as valuable as the
-control plane's own configuration file. See
-[docs/trust-boundaries.md](../../docs/trust-boundaries.md) for what it opens
-in full, which ports must be firewalled, and how to rotate it.
+**`node_preshared_keys` opens none of this any more.** It is optional now,
+and while a fleet is still mid-migration it does two smaller things
+elsewhere: it is what deis-proxy's gRPC control channel falls back to when
+that proxy has no certificate of its own yet, and it is the bearer this
+control plane presents on a node's plaintext management plane when that node
+has none either. Neither is read on this machine channel - a caller here is
+either proved by certificate or refused outright. See
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md) for what a proved
+certificate opens in full and how the three identity files are rotated.
 
 ---
 

@@ -395,13 +395,17 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
 环境、部署、回滚、路由、密钥；账号、token 与审计日志在 `api/` 下自己的模块里。
 
 **这里曾经有一处例外**：`routes` 表建了、REST 有了，却没有任何消费方。现在有了——
-控制面在 `deis_wire::conventions::ROUTING_TABLE_ROUTE`（`GET /api/routing-table`）上
-另供一份给数据面用的路由表，deis-proxy 每 5 秒拉一次并按它选应用，`path_prefix` 真的
-影响请求的去向。这条路径和给控制台看的 `GET /api/routes` 形状不同：带环境的**名字**
+控制面另供一份给数据面用的路由表，deis-proxy 每 5 秒拉一次并按它选应用，`path_prefix`
+真的影响请求的去向。这份表和给控制台看的 `GET /api/routes` 形状不同：带环境的**名字**
 而不是内部主键（名字才是 `x-deis-environment` 上传的值）、带上**所有存在的环境**（哪怕
 它一条路由都没有，前门才好给它一个自动地址）、带一个整表版本号（拉的人不必逐行比对）。
 它挂在节点用的那套鉴权下面而不是人用的那套——一张不鉴权的路由表等于把这套装机的应用
-清单和域名清单发给任何能连上端口的人。
+清单和域名清单发给任何能连上端口的人。**这条路径本身后来又搬了一次家**：最初是控制面
+人侧端口上的一条 `GET /api/routing-table`（`deis_wire::conventions::ROUTING_TABLE_ROUTE`），
+认的是节点与代理共用的那把 `node_preshared_keys`；2026-09-11 起改成挂在控制面独立的机器
+监听端口（`[machine] listen`）上的 `deis.machine.MachineChannel/FetchRoutingTable`，
+双方各自出示证书（mTLS），人侧端口上不再挂这条路径。载荷的 JSON 形状没有变，变的只是
+搬运它的那一层，细节见 `docs/adr/025-machine-identity-and-capabilities.md`。
 
 同一轮还加了一条给数据面 CLI 用的端点：
 `GET /api/apps/:app_id/environments/:env/storage-token`，凭部署用的那把 API key，答出
@@ -434,21 +438,28 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
    ```
 2. 节点自己 HTTP GET `bundle_url`，流式落盘，校验 sha256，解包加载。
 
-节点启动时先拉一次清单（原则 8）：
+节点启动时先拉一次清单（原则 8），走的是控制面机器监听端口（`[machine] listen`）上的
+`deis.machine.MachineChannel/FetchAssignments`，节点出示自己的证书（SPIFFE 名
+`spiffe://<信任域>/deislet/node/<节点 id>`）：
 
 ```
-GET  deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE   // "/api/nodes/:id/assignments"
-→ [ { app_id, version_id, environment, bundle_url, bundle_sha, env,
+FetchAssignments(node_id)
+→ assignments_json: [ { app_id, version_id, environment, bundle_url, bundle_sha, env,
       environment_declarations, environment_snapshot,
       environment_snapshot_id, secret_values_by_revision,
       deployment_id, routing_generation, deployment_action } ]
 ```
 
-**路径写常量，不写字面量。** 服务端注册路由用 `NODE_ASSIGNMENTS_ROUTE` /
-`NODE_REGISTRATION_ROUTE`（axum 的 `:id` 模板），客户端拼具体节点的路径用
-`node_assignments_path(id)` / `node_registration_path(id)`。上面注释里那串是给读的人
-看的，会不会过期以 `crates/deis-wire/src/conventions.rs` 为准——本文档此前把登记接口
-写成 `POST .../register`，而代码里一直是 `PUT .../registration`，正是这类抄写造成的。
+2026-09-11 之前，这一步是控制面人侧端口上的一条 `GET deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`
+（`/api/nodes/:id/assignments`），认的是节点与控制面共用的那把 `node_preshared_keys`；
+现在这条路径已经不再挂在人侧端口上，整份 JSON 改成装进 `FetchAssignmentsResponse.assignments_json`
+这一个字段，由 gRPC 承运而不是 HTTP。**路径（现在是 RPC 名）写常量，不写字面量**这件事没
+变：服务端与客户端仍然共用同一份定义（`deis_wire::machine` 里由 proto 生成的类型），不再
+各自拼字符串。历史上吃过这个亏：本文档此前把登记接口写成 `POST .../register`，而代码里
+一直是 `PUT .../registration`——这正是当初把这类名字单独放进 `deis-wire` 共用的理由，
+传输层换了，理由本身没变。`NODE_ASSIGNMENTS_ROUTE` / `NODE_REGISTRATION_ROUTE` /
+`node_assignments_path` / `node_registration_path` 这几个符号仍在
+`crates/deis-wire/src/conventions.rs` 里，但生产的控制面路由已经不再注册它们，只留给测试用。
 
 schema-1 的 `env` 与 `ApplyDeployment.env` 仍是同一张字符串表。schema-2 则传 declaration、精确
 snapshot identity 与按 immutable revision 索引的 secret plaintext；config/string、config/json 和
@@ -674,6 +685,8 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 
 **二、节点通道单独鉴权。** `GET /api/nodes/{id}/assignments` 会把全部环境的明文密钥当 JSON 返回，而它原先只挂在面板的 `api_key_auth` 上，`api_auth_enabled` 默认 false——默认配置下任何能连到控制面 HTTP 端口的人 curl 一次就能拿走整个平台的密钥。现在它和 bundle 下载一起挂在独立的 `node_auth` 上，凭据复用节点注册时已在用的 `node_preshared_keys`，不受 `api_auth_enabled` 影响，也不接受面板 API Key。节点侧对应加了 `[control] secret`，只发往配置里那个控制面地址。
 
+**这一段后来又往前走了一步（2026-09-11）**：`GET /api/nodes/{id}/assignments`、bundle 下载、`GET /api/routing-table` 和注册接口一起搬出了控制面人侧端口，改在控制面独立的机器监听端口（`[machine] listen`）上用双向证书（mTLS）作答——每台机器持一张证书，唯一的 URI SAN 是一个 SPIFFE 名字。`node_preshared_keys` 因此从必需变成了可选（`#[serde(default)]`）：配了 `[machine]` 之后，把它留空就是这套装机不再持有任何机队共享的值；不配 `[machine]` 时，空列表仍会为这次运行铸一把，否则谁都能自称是节点。节点侧的 `[control] secret` 同样从必填变成了可选（`Option<String>`）——不写这一行，意味着这个进程改用证书证明自己是谁；写了却留空仍然被拒绝，因为那大概率是一处遗漏而不是选择。细节见 `docs/adr/025-machine-identity-and-capabilities.md`；`node_preshared_keys` 与 `[control] secret` 仍然存在，是给还没完成迁移的机队用的过渡态，不代表两条路今天同样是首选。
+
 **三、一条运行时线程只放一个 Isolate。** `v8::OwnedIsolate` 在创建时进入、销毁时退出它那个 isolate，所以同一条 OS 线程上建第二个会把第一个盖住：先建的那个再被用到就 panic（"…and Context do not belong to the same Isolate"），线程当场死掉，它上面所有应用一起停；两个 isolate 析构顺序反了还会直接 abort 进程。原先的线程池按「最少应用」把多个应用摊到固定几条线程上，应用数一超过线程数就踩中，而这一波正好让一台节点常态跑两个环境。现在线程与应用一一对应：不够就再起一条，应用卸载后线程留着给下一个用。
 
 **四、可观测的环境维度。** 隔离是存储的事，观测不需要：能连到 deis-telemetry 端口的人本来就能读写任何应用的日志，把租户串原样当 `app_id` 只会让「给我看这个应用的日志」查不到任何东西。所以节点在投递时把租户拆开——日志的 `app_id` 是应用、`fields.environment` 是环境；指标的 `app_id` 是应用、`environment` 是普通标签，于是 `sum by (app_id)` 能把一个应用的各环境加起来，也能单挑一个。
@@ -686,7 +699,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 
 - **队列租约令牌与死信 RPC**：`Pull` 现在返回 `lease_token`，`Ack` / `Nack` 必须原样带回，租约过期后旧消费者的 Ack 不再作数；死信有 `ListDeadLetters` / `ReplayDeadLetters` 两个 RPC。
 - **控制面的数据库访问**：全部走 `Database::with_connection`，rusqlite 在 `spawn_blocking` 上跑，不再在异步线程上执行同步 SQL。
-- **节点自己向控制面登记**：路径是 `deis_wire::conventions::NODE_REGISTRATION_ROUTE`（客户端侧 `node_registration_path(id)`），方法是 `PUT`——登记是在陈述「这个节点是什么」，掉线又回来原样再说一遍即可；同一路径上的 `DELETE` 是主动离场。凭据与 assignments 同一套。登记只决定「收不收推送、会不会被选去跑 cron」，不登记的节点照样自取并服务。
+- **节点自己向控制面登记**：2026-09-11 之前走的是 `deis_wire::conventions::NODE_REGISTRATION_ROUTE`（客户端侧 `node_registration_path(id)`）这条人侧端口上的 HTTP 路径，`PUT` 登记、同一路径 `DELETE` 主动离场，凭据与 assignments 同一套（`node_preshared_keys`）。现在走机器监听端口上的 `deis.machine.MachineChannel.Register` / `Deregister` 两个 RPC，凭据是节点自己的证书；控制面还会核对调用方证书里的 SPIFFE 名和请求里自报的节点 id 是否一致，不一致就拒绝——这一步在共享密钥下说不出来，因为所有节点长得一样。登记仍然是在陈述「这个节点是什么」，掉线又回来原样再调一次 `Register` 即可。登记只决定「收不收推送、会不会被选去跑 cron」，不登记的节点照样自取并服务。
 - **KV 的 metadata 能读回来了**：`GetResponse` 带 `metadata`，`ListRequest` 有 `include_metadata`，JS 侧的 `getWithMetadata()` 就是读它。
 - **`ScheduledEvent` 带上了 `environment`**：控制面按 `(应用, 环境)` 调度，节点也按这对值找处理函数；空值仍按 `production` 解释，与 HTTP 数据面同一条规则。
 - **换版先装好再切**：`RuntimePool::stage_app` 在另一条线程上把新版本建好预热，`activate` 才切流量，旧版本全程在应答，没有不可用窗口。
@@ -696,7 +709,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 ### 仍然开着的
 
 - ~~**`UpdateApp` 仍带 `bytes package_data`**~~ **已关闭**：字段删了，字段号和名字都写成 `reserved`，免得将来有人拿同一个号装别的东西、和旧客户端悄悄对不上。RPC 本身仍是 `Unimplemented` 并指向 `ApplyDeployment`。
-- ~~**控制面的 `routes` 表没人消费**~~ **已关闭**：控制面另供 `GET /api/routing-table`，deis-proxy 每 5 秒拉一次，路径前缀真的影响去向；每个环境还多了一个自动地址 `<环境>--<应用>.<域>`（默认环境另有短名 `<应用>.<域>`），由 proxy 配置里的 `routing.preview_zone` 打开。分隔符是标签内的 `--` 而不是点，因为一张通配证书只覆盖一层标签。**仍要人手做的**：那条通配 DNS 记录。通配证书这一半后来有了两条路——`crates/deis-proxy/src/acme/` 的 ACME（RFC 8555）客户端默认关、`[tls.acme]` 打开，把 `include_preview_addresses` 一开就给每个环境地址各签一张；或者仍然人手放一张 `*.<区>`，因为 `http-01` 签不出通配（那要 `dns-01`）。
+- ~~**控制面的 `routes` 表没人消费**~~ **已关闭**：控制面另供一份路由表（2026-09-11 之前是人侧端口上的 `GET /api/routing-table`，之后改到机器监听端口的 `MachineChannel/FetchRoutingTable`，见 §3），deis-proxy 每 5 秒拉一次，路径前缀真的影响去向；每个环境还多了一个自动地址 `<环境>--<应用>.<域>`（默认环境另有短名 `<应用>.<域>`），由 proxy 配置里的 `routing.preview_zone` 打开。分隔符是标签内的 `--` 而不是点，因为一张通配证书只覆盖一层标签。**仍要人手做的**：那条通配 DNS 记录。通配证书这一半后来有了两条路——`crates/deis-proxy/src/acme/` 的 ACME（RFC 8555）客户端默认关、`[tls.acme]` 打开，把 `include_preview_addresses` 一开就给每个环境地址各签一张；或者仍然人手放一张 `*.<区>`，因为 `http-01` 签不出通配（那要 `dns-01`）。
 - **只有 deis-runtime 在往 deis-telemetry 投递**：deis-proxy / deis-store / deis-queue / deis-control 都还只写自己的 stdout。
 - **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent` 已经有了），而且它的 `QueueMessage.body` 还是 `string`，与真正在用的 `queue.proto`（已改成 `bytes`）不一致。队列消费目前由节点自己按 `(应用, 环境)` 轮询，走的是 `queue.proto`，不走这个消息，所以两处都还没被踩到；一旦有别的调用方用 `Trigger/OnQueue` 投递批次，就会既指不准环境、又损坏二进制消息体。
 - ~~**Web 标准的全局大半没装上，`fetch` 也在其中**~~ **已关闭**：这一条记的是
@@ -753,7 +766,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 | 编号 | 内容 | 状态 |
 |---|---|---|
 | D1 | 静态站点规则：`_redirects` / `_headers` / SPA 兜底 / 自定义 404，加 `env.ASSETS.fetch()` | 完成。格式定义在 `deis-bundle`，编译器与节点共用；构建期解析、写错就构建失败并报行号；节点装载一版时编译成表，请求路径上应用 |
-| D2 | 控制面的路由接到 deis-proxy | 完成。`GET /api/routing-table` + 5 秒轮询；控制面不可达时最后一张表无限期继续生效；一张表要么整份换上要么整份不要 |
+| D2 | 控制面的路由接到 deis-proxy | 完成。路由表下发 + 5 秒轮询（2026-09-11 起走机器监听端口的 `MachineChannel/FetchRoutingTable`，见 §3）；控制面不可达时最后一张表无限期继续生效；一张表要么整份换上要么整份不要 |
 | D3 | 数据面 CLI：`deis kv` / `deis db` / `deis blob` | 完成。配套的存储令牌端点也已提供 |
 | D4 | 按次调用的轨迹与延迟直方图 | 完成。deis-telemetry 的 `TraceService`，读的一头是 `deis trace`（可按结局、类型、状态码、时间段、耗时下限、轨迹号筛，也能 `--follow`） |
 | D5 | CPU 时间上限 | 完成，但只在能读 `/proc` 的机器上成立；读不到的机器启动时以 error 级别说明 |
