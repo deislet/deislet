@@ -2440,7 +2440,7 @@ CHECKS_FAILED=0
 # So the list has a length, it is written down, and a run that does not reach
 # it fails. Adding a check means changing this number, which is the point:
 # the number is the roll call.
-VERIFY_EXPECTED_CHECKS=100
+VERIFY_EXPECTED_CHECKS=101
 
 # Every claim a verdict has been printed for, one per line.
 #
@@ -8226,6 +8226,118 @@ node_grpc_status() {
     | tr -d '\r' | awk 'tolower($1) == "grpc-status:" {print $2}' | head -n 1
 }
 
+# The other half of the same claim, and the one that decides whether the
+# control plane is a single point of failure.
+#
+# A node asks the control plane what to run. If it also needed it to *serve*,
+# then the machine holding the catalog would be in the path of every request
+# on the platform, and a reboot of it would be an outage for every tenant.
+# The design says otherwise: a node serves what it has loaded, and the control
+# plane's absence costs it only the ability to learn about changes.
+#
+# Said is not shown. This takes the control plane away while traffic is
+# flowing, asks whether the application still answers - which is the assertion
+# that matters, and the one with the worst consequence if it is ever wrong -
+# and then puts it back and asks whether the fleet reconverges without anybody
+# doing anything.
+#
+# Reconvergence is not automatic in the sense of being free: a node's
+# registration expires, and a control plane that came back with an empty
+# fleet list would not drive anyone until each node called in again. That is
+# the node's own re-registration loop, and it is what the second half here
+# asks about.
+check_the_platform_serves_while_its_control_plane_is_away() {
+  local title="applications keep serving while the control plane is away, and the fleet reconverges when it returns"
+
+  local before_headers="${LOG_DIR}/verify-control-away-before.headers"
+  app_request "$before_headers" "/" > /dev/null
+  local before_status
+  before_status=$(http_status "$before_headers")
+
+  local old_pid="${DEIS_CONTROL_PID:-}"
+  if [ -z "$old_pid" ]; then
+    fail_check "$title" "this run has no control-plane pid recorded, so there is nothing to stop"
+    return
+  fi
+
+  kill "$old_pid" 2>/dev/null || true
+  local waited=0
+  while kill -0 "$old_pid" 2>/dev/null && [ "$waited" -lt 60 ]; do
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  if kill -0 "$old_pid" 2>/dev/null; then
+    fail_check "$title" "the control plane did not exit within 30s of SIGTERM"
+    return
+  fi
+
+  # It really is gone: its own port answers nothing.
+  local control_down
+  control_down=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    "http://127.0.0.1:${DEIS_CONTROL_PORT}/health" 2>/dev/null) || control_down="000"
+
+  # The assertion this check exists for. Asked several times over a few
+  # seconds rather than once: a node that only failed on its next
+  # reconciliation would pass a single probe taken immediately.
+  local serving_while_away=1 probe=0 away_status="000"
+  while [ "$probe" -lt 12 ]; do
+    local away_headers="${LOG_DIR}/verify-control-away-${probe}.headers"
+    app_request "$away_headers" "/" > /dev/null 2>&1 || true
+    away_status=$(http_status "$away_headers")
+    if [ "$away_status" != "200" ]; then
+      serving_while_away=0
+      break
+    fi
+    probe=$((probe + 1))
+    sleep 0.5
+  done
+
+  # Back, on the same database and the same configuration.
+  "${BIN_DIR}/deis-control" \
+    --config "$DEIS_CONTROL_CONFIG" \
+    --port "$DEIS_CONTROL_PORT" \
+    --database "${DEMO_DIR}/deis-control.db" \
+    >> "${LOG_DIR}/deis-control.log" 2>&1 &
+  DEIS_CONTROL_PID=$!
+  if [ -n "${STATE_FILE:-}" ] && [ -f "$STATE_FILE" ]; then
+    local rewritten="${STATE_FILE}.tmp"
+    sed "s/^DEIS_CONTROL_PID=.*/DEIS_CONTROL_PID=${DEIS_CONTROL_PID}/" \
+      "$STATE_FILE" > "$rewritten" && mv "$rewritten" "$STATE_FILE"
+  fi
+
+  # Waited for by asking. The fleet reconverging is the node calling in and
+  # the control plane polling it back to healthy, and neither is instant.
+  local healthy="" back=0 attempt=0
+  while [ "$attempt" -lt 240 ]; do
+    if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:${DEIS_CONTROL_PORT}/health" 2>/dev/null; then
+      back=1
+      healthy=$(control_api /api/platform/runtime 2>/dev/null \
+        | jq -r --arg id "$NODE_ID" '.nodes[] | select(.id == $id) | .healthy' 2>/dev/null) || healthy=""
+      if [ "$healthy" = "true" ]; then
+        break
+      fi
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+
+  local after_headers="${LOG_DIR}/verify-control-away-after.headers"
+  app_request "$after_headers" "/" > /dev/null
+  local after_status
+  after_status=$(http_status "$after_headers")
+
+  if [ "$before_status" = "200" ] && [ "$control_down" != "200" ] \
+    && [ "$serving_while_away" = "1" ] && [ "$back" = "1" ] \
+    && [ "$healthy" = "true" ] && [ "$after_status" = "200" ]; then
+    pass_check "$title" \
+      "the control plane was stopped - its own /health answered ${control_down} - and ${APP_ID} went on answering 200 to ${probe} request(s) spread over the seconds it was gone, which is what says the machine holding the catalog is not in the path of a request. It was started again on the same database, and ${NODE_ID} is reported healthy again without anybody registering it by hand; ${APP_ID} answers ${after_status}"
+    return
+  fi
+
+  fail_check "$title" \
+    "expected 200 before (got ${before_status}), the control plane's health to stop answering (got ${control_down}), ${APP_ID} to keep answering 200 while it was away (last was ${away_status} after ${probe} probe(s)), the control plane to come back (back=${back}), ${NODE_ID} to be healthy again (got ${healthy:-unknown}) and ${APP_ID} to answer 200 after (got ${after_status})"
+}
+
 # The claim the whole pull-based design exists to make, asked of real
 # processes for the first time.
 #
@@ -9779,6 +9891,7 @@ verify_demo() {
   # anything after it would be asking its questions of a node that is still
   # loading. The log check below reads a file the restart appends to, which is
   # why it stays after this rather than before it.
+  check_the_platform_serves_while_its_control_plane_is_away
   check_a_restarted_node_comes_back_with_what_it_had
   check_the_node_log_this_run_read_was_whole
 
