@@ -149,6 +149,17 @@ impl IdentityFiles {
 #[derive(Debug)]
 pub struct MachineIdentity {
     files: IdentityFiles,
+    /// Bumped every time new material is adopted.
+    ///
+    /// Anything that took a copy of [`Self::server_config`] holds a snapshot
+    /// of the material in force when it asked, and a listener built from one
+    /// would go on presenting the certificate the process started with - past
+    /// a renewal, and up to the moment the old certificate expired, when
+    /// every handshake would fail at once. A dialler avoids that by resolving
+    /// per connection; a listener cannot, because the configuration is handed
+    /// to the serving stack before any connection exists. So it is told
+    /// instead: see [`Self::renewals`].
+    generation: tokio::sync::watch::Sender<u64>,
     /// What this process's listener advertises, kept so a reload rebuilds the
     /// server configuration with the same answer it started with.
     serves: Vec<Vec<u8>>,
@@ -178,6 +189,7 @@ impl MachineIdentity {
         Ok(Self {
             files,
             serves,
+            generation: tokio::sync::watch::Sender::new(0),
             current: ArcSwap::from_pointee(material),
         })
     }
@@ -196,6 +208,21 @@ impl MachineIdentity {
     /// trust domain before the connection exists at all.
     pub fn server_config(&self) -> Arc<ServerConfig> {
         Arc::clone(&self.current.load().server)
+    }
+
+    /// A signal that new material has been adopted.
+    ///
+    /// For the serving side, which cannot resolve per connection: the
+    /// configuration is handed to the listener before any connection exists,
+    /// so a listener has to be told when to take a fresh one. Every change
+    /// bumps the value; a receiver that has been away sees one change rather
+    /// than a queue of them, which is right - what matters is that the
+    /// material is different now, not how many times it became so.
+    ///
+    /// A caller that ignores this is a caller whose listener will present the
+    /// certificate this process started with for as long as it runs.
+    pub fn renewals(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.generation.subscribe()
     }
 
     /// A dialler configuration for reaching exactly one other machine.
@@ -234,6 +261,9 @@ impl MachineIdentity {
             to: candidate.id.clone(),
         };
         self.current.store(Arc::new(candidate));
+        // After the swap, so anything woken by this finds the new material
+        // rather than racing the store it was told about.
+        self.generation.send_modify(|generation| *generation += 1);
         Ok(outcome)
     }
 

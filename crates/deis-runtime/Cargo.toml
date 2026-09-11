@@ -28,6 +28,25 @@ axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
+# The serving stack for this node's machine listener, and only for that one.
+#
+# `axum::serve` takes a plain TCP listener and gives no way to reach the
+# connection a request arrived on, which is where the peer's certificate is -
+# so the one listener that authenticates by certificate cannot be served by
+# it. `axum_server`'s `Accept` hands an acceptor both the accepted stream and
+# the service that will run on it, which is what lets the handshake be
+# completed and inspected before anything is served. deis-control's machine
+# listener is served the same way for the same reason; this is the version it
+# already uses, so the graph gains no second copy.
+#
+# The data listener keeps `axum::serve`: it carries public application traffic
+# in the clear and has no handshake to look at.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Named directly for the stream type the acceptor above hands back, which is
+# what the peer certificate is read from. Already in this graph through
+# deis-identity, so this pins nothing new.
+tokio-rustls = "0.26"
+
 # Deno Runtime
 deno_runtime = { version = "0.266", features = ["transpile"] }
 
@@ -173,10 +192,6 @@ sha2 = "0.10"
 # A certificate authority small enough to hand a test, so the machine-channel
 # transports can be exercised against real material rather than mocked.
 deis-identity-test-pki = { path = "../deis-identity-test-pki" }
-# Only the test listener needs to accept a TLS connection; nothing in this
-# crate's own build does. This is the version deis-identity already links, so
-# it adds nothing to the graph.
-tokio-rustls = "0.26"
 # Test dependencies
 # V8 requires one process-wide parent for its isolate thread families. The
 # pre-main hook also serializes independent libtest bodies; concurrency inside

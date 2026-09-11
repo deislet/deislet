@@ -754,3 +754,50 @@ async fn a_protocol_the_listener_does_not_serve_ends_the_handshake() {
         outcome.server
     );
 }
+
+/// A listener cannot resolve its configuration per connection - the serving
+/// stack is handed one before any connection exists - so it has to be told
+/// when to take a fresh one. This is that telling.
+///
+/// Without it a listener presents the certificate its process started with
+/// for as long as it runs: through a renewal, past it, and up to the moment
+/// the old certificate expires, when every handshake fails at once on a
+/// process whose own log says its identity is current.
+#[tokio::test]
+async fn a_listener_is_told_when_there_is_new_material_to_present() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let id = id("spiffe://deis.internal/machine/control/01");
+
+    let files = write_files(directory.path(), "control", &ca.issue(&id), &ca.root_pem);
+    let identity = MachineIdentity::load(files.as_identity_files(), SERVES).expect("an identity");
+    let mut renewals = identity.renewals();
+
+    // Nothing has changed, so nothing is waiting.
+    assert!(
+        !renewals.has_changed().expect("the sender is alive"),
+        "a renewal was announced before anything was renewed"
+    );
+
+    let before = identity.server_config();
+    let renewed = ca.issue(&id);
+    std::fs::write(&files.certificate, &renewed.certificate_pem).expect("certificate");
+    std::fs::write(&files.private_key, &renewed.key_pem).expect("key");
+    identity.reload().expect("the renewal loads");
+
+    assert!(
+        renewals.has_changed().expect("the sender is alive"),
+        "material was replaced and nothing told the listener"
+    );
+    let after = identity.server_config();
+    assert!(
+        !std::sync::Arc::ptr_eq(&before, &after),
+        "the configuration a listener would take is the same object it already had"
+    );
+
+    // A look that finds nothing new announces nothing, so a listener is not
+    // woken to install what it is already presenting.
+    renewals.borrow_and_update();
+    identity.reload().expect("a look at unchanged files");
+    assert!(!renewals.has_changed().expect("the sender is alive"));
+}

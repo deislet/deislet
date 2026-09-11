@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod handlers;
+pub mod machine;
 
 use crate::app::ApplicationManager;
 use crate::deployment::DeploymentManager;
@@ -11,6 +12,7 @@ use crate::trigger::TriggerServer;
 use anyhow::{Context, Result};
 use auth::ManagementAuth;
 use axum::Router;
+pub use machine::MachineManagement;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -92,6 +94,18 @@ pub struct ServerOptions {
     /// `Some` gives it a socket of its own and takes it off the public port
     /// entirely, so nothing that can reach an application can reach it.
     pub management_listen: Option<SocketAddr>,
+
+    /// The mutually authenticated management plane, when this node has an
+    /// identity and an address to serve it on.
+    ///
+    /// `None` - the default, and every node configured before
+    /// `[machine_identity] management_listen` existed - means the management
+    /// plane is only what the two fields above describe: the fleet key, on a
+    /// plaintext socket. `Some` binds a third listener beside them that
+    /// admits one machine by certificate and asks nothing of the request.
+    /// The two coexist on purpose while the control plane is still dialling
+    /// nodes by key; see [`machine`] and [`auth::ManagementAuth::for_machine_listener`].
+    pub machine_management: Option<MachineManagement>,
 }
 
 /// Wait for the first shutdown signal and name it.
@@ -162,6 +176,7 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         max_request_body_bytes,
         management_keys,
         management_listen,
+        machine_management,
     } = options;
 
     let state = AppState::new(app_manager.clone(), max_request_body_bytes);
@@ -191,61 +206,76 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         management_listen.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], port)));
     let management_auth = ManagementAuth::for_listener(management_keys, management_addr);
 
-    // Combine gRPC services
-    let grpc_service = tower::service_fn(move |req: axum::extract::Request| {
-        let mut management_service = management_service.clone();
-        let mut trigger_service = trigger_service.clone();
-        let management_auth = management_auth.clone();
-        async move {
-            let path = req.uri().path();
-            if let Err(status) = management_auth.check(path, req.headers()) {
-                // Answered as gRPC rather than as an HTTP 401: a caller that
-                // gets a bare status code with no `grpc-status` reports
-                // "unknown error", which would send whoever debugs a key
-                // mismatch looking at the transport instead of at the
-                // credential.
-                let (parts, body) = status.into_http().into_parts();
-                return Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
-                    parts,
-                    axum::body::Body::new(body),
-                ));
-            }
-            if path.starts_with("/deis.management.") {
-                match tower::Service::call(&mut management_service, req).await {
-                    Ok(res) => {
-                        let (parts, body) = res.into_parts();
-                        let body = axum::body::Body::new(body);
-                        Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
-                            parts, body,
-                        ))
-                    }
-                    Err(_) => Ok(axum::http::Response::builder()
-                        .status(500)
-                        .body(axum::body::Body::empty())
-                        .unwrap()),
+    // The entrance both gRPC services are dispatched from, built once per
+    // listener that carries them.
+    //
+    // It is a factory rather than a single value because a node may have two
+    // management listeners at once, admitting callers on different terms: the
+    // plaintext one guarded by the fleet key, and - while an identity is
+    // configured - one that admitted its caller by certificate before the
+    // request existed. What is behind the door is the same in both cases and
+    // must stay that way, so the dispatch below is written once and the guard
+    // is the only thing that differs.
+    let entrance = |auth: ManagementAuth| {
+        let management_service = management_service.clone();
+        let trigger_service = trigger_service.clone();
+        tower::service_fn(move |req: axum::extract::Request| {
+            let mut management_service = management_service.clone();
+            let mut trigger_service = trigger_service.clone();
+            let management_auth = auth.clone();
+            async move {
+                let path = req.uri().path();
+                if let Err(status) = management_auth.check(path, req.headers()) {
+                    // Answered as gRPC rather than as an HTTP 401: a caller that
+                    // gets a bare status code with no `grpc-status` reports
+                    // "unknown error", which would send whoever debugs a key
+                    // mismatch looking at the transport instead of at the
+                    // credential.
+                    let (parts, body) = status.into_http().into_parts();
+                    return Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
+                        parts,
+                        axum::body::Body::new(body),
+                    ));
                 }
-            } else if path.starts_with("/deis.trigger.") {
-                match tower::Service::call(&mut trigger_service, req).await {
-                    Ok(res) => {
-                        let (parts, body) = res.into_parts();
-                        let body = axum::body::Body::new(body);
-                        Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
-                            parts, body,
-                        ))
+                if path.starts_with("/deis.management.") {
+                    match tower::Service::call(&mut management_service, req).await {
+                        Ok(res) => {
+                            let (parts, body) = res.into_parts();
+                            let body = axum::body::Body::new(body);
+                            Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
+                                parts, body,
+                            ))
+                        }
+                        Err(_) => Ok(axum::http::Response::builder()
+                            .status(500)
+                            .body(axum::body::Body::empty())
+                            .unwrap()),
                     }
-                    Err(_) => Ok(axum::http::Response::builder()
-                        .status(500)
+                } else if path.starts_with("/deis.trigger.") {
+                    match tower::Service::call(&mut trigger_service, req).await {
+                        Ok(res) => {
+                            let (parts, body) = res.into_parts();
+                            let body = axum::body::Body::new(body);
+                            Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
+                                parts, body,
+                            ))
+                        }
+                        Err(_) => Ok(axum::http::Response::builder()
+                            .status(500)
+                            .body(axum::body::Body::empty())
+                            .unwrap()),
+                    }
+                } else {
+                    Ok(axum::http::Response::builder()
+                        .status(404)
                         .body(axum::body::Body::empty())
-                        .unwrap()),
+                        .unwrap())
                 }
-            } else {
-                Ok(axum::http::Response::builder()
-                    .status(404)
-                    .body(axum::body::Body::empty())
-                    .unwrap())
             }
-        }
-    });
+        })
+    };
+
+    let grpc_service = entrance(management_auth);
 
     // Build HTTP routes - every request is routed by the x-deis-app-id and
     // x-deis-environment headers.
@@ -295,9 +325,43 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
                     "/deis.management.RuntimeManagement/*rpc",
                     grpc_service.clone(),
                 )
-                .route_service("/deis.trigger.Trigger/*rpc", grpc_service)
+                .route_service("/deis.trigger.Trigger/*rpc", grpc_service.clone())
                 .layer(TraceLayer::new_for_http()),
         )),
+        None => None,
+    };
+
+    // The mutually authenticated management plane's socket, when this node
+    // has one. Bound here for the same reason as the one above: before any
+    // application is loaded, so an address already in use ends startup rather
+    // than leaving a node that looks healthy while its control plane's
+    // connections are refused by whatever else holds the port.
+    //
+    // Its entrance is built with a guard of its own. The caller on this
+    // socket proved a certificate naming exactly this node's control plane
+    // before the connection existed, so the node key is not asked for - see
+    // `auth::ManagementAuth::for_machine_listener` for what that decides
+    // about the key and what has to change for it to be refused outright.
+    let machine_serving = match machine_management {
+        Some(machine) => {
+            let listener = std::net::TcpListener::bind(machine.listen).with_context(|| {
+                format!(
+                    "cannot bind the mutually authenticated management plane on \
+                     machine_identity.management_listen {}",
+                    machine.listen
+                )
+            })?;
+            let auth = ManagementAuth::for_machine_listener(
+                machine.expected_control.clone(),
+                machine.listen,
+            );
+            let entrance = entrance(auth);
+            let app = Router::new()
+                .route_service("/deis.management.RuntimeManagement/*rpc", entrance.clone())
+                .route_service("/deis.trigger.Trigger/*rpc", entrance)
+                .layer(TraceLayer::new_for_http());
+            Some((listener, app, machine))
+        }
         None => None,
     };
 
@@ -396,6 +460,33 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         }));
     }
 
+    // The mutually authenticated plane drains on the same edge, and for the
+    // same reason: a node that had stopped taking public traffic but kept
+    // accepting deployment pushes would apply a version it is on its way to
+    // not serving.
+    let mut machine_drain = None;
+    let mut machine_task = None;
+    if let Some((listener, app, machine)) = machine_serving {
+        let (tx, rx) = oneshot::channel::<()>();
+        machine_drain = Some(tx);
+        machine_task = Some(tokio::spawn(async move {
+            // The outcome, good or bad, is logged inside `machine::serve`
+            // against the address it was serving, which is more than could be
+            // said here.
+            let _ = machine::serve(
+                listener,
+                app,
+                machine.identity,
+                machine.expected_control,
+                shutdown_grace,
+                async move {
+                    let _ = rx.await;
+                },
+            )
+            .await;
+        }));
+    }
+
     tokio::select! {
         result = &mut server => {
             result?;
@@ -410,6 +501,9 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
             );
             let _ = drain_tx.send(());
             if let Some(tx) = management_drain.take() {
+                let _ = tx.send(());
+            }
+            if let Some(tx) = machine_drain.take() {
                 let _ = tx.send(());
             }
 
@@ -435,6 +529,9 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     if let Some(tx) = management_drain.take() {
         let _ = tx.send(());
     }
+    if let Some(tx) = machine_drain.take() {
+        let _ = tx.send(());
+    }
     if let Some(task) = management_task {
         match tokio::time::timeout(shutdown_grace, task).await {
             Ok(Ok(())) => info!("The management listener drained"),
@@ -448,6 +545,23 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
                 grace_secs = shutdown_grace.as_secs(),
                 "The management listener was still busy when the grace period expired; a \
                  deployment being applied on this node is being cut off mid-way"
+            ),
+        }
+    }
+    if let Some(task) = machine_task {
+        // Awaited without a timeout of its own, which is where this differs
+        // from the two listeners above. Their graceful shutdown is unbounded,
+        // so the deadline has to be imposed from out here; `machine::serve`
+        // is handed the grace period and stops on it from the inside. A
+        // second deadline here would expire on the same edge as that one and
+        // report, roughly half the time, a listener that had in fact drained.
+        match task.await {
+            Ok(()) => info!("The mutually authenticated management listener drained"),
+            Err(e) => warn!(
+                error = %e,
+                "The mutually authenticated management listener did not finish cleanly; a \
+                 deployment push or cron fire that was in flight may have been cut off, and the \
+                 control plane will see it as a failure and retry"
             ),
         }
     }

@@ -100,10 +100,29 @@ pub async fn serve(
         }
     });
 
-    // The configuration is read fresh here rather than held from startup, so
-    // a connection accepted after a renewal is accepted with the renewed
-    // certificate.
-    let acceptor = identity_acceptor(RustlsConfig::from_config(identity.server_config()));
+    // The listener's configuration is a snapshot, and it has to be replaced
+    // when the identity changes rather than resolved per connection: the
+    // serving stack is handed the configuration before any connection exists.
+    // Left alone it would present the certificate this process started with
+    // for as long as it ran - through a renewal, past it, and up to the
+    // moment the old certificate expired, when every handshake would fail at
+    // once on a process whose own log said its identity was current.
+    let tls = RustlsConfig::from_config(identity.server_config());
+    tokio::spawn({
+        let tls = tls.clone();
+        let identity = Arc::clone(&identity);
+        let mut renewals = identity.renewals();
+        async move {
+            while renewals.changed().await.is_ok() {
+                tls.reload_from_config(identity.server_config());
+                info!(
+                    identity = %identity.id(),
+                    "The machine listener is presenting renewed certificate material; connections already open keep the one they were made with"
+                );
+            }
+        }
+    });
+    let acceptor = identity_acceptor(tls);
 
     info!(
         %addr,

@@ -13,7 +13,7 @@ use deis_runtime::config::RuntimeConfig;
 use deis_runtime::deployment::{
     AssignmentClient, DeploymentManager, NodeRegistrar, NodeRegistration,
 };
-use deis_runtime::dispatcher::{self, ServerOptions};
+use deis_runtime::dispatcher::{self, MachineManagement, ServerOptions};
 use deis_runtime::egress_proxy::{self, ProxyDecision};
 use deis_runtime::health::NodeHealth;
 use deis_runtime::logging::{LogBuffer, LogShipper, RuntimeLayer, ShipperConfig};
@@ -98,12 +98,24 @@ fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIde
         return Ok(None);
     };
 
-    // This process only dials the machine channel; it does not serve one of
-    // its own, so it advertises no protocol of its own to negotiate. What a
-    // *dialler* wants is decided per call - HTTP/2 for the assignment RPC,
-    // HTTP/1.1 for the bundle download - see `MachineIdentity::client_config`.
+    // What this node's own listener will advertise, if it has one.
+    //
+    // `machine_identity.management_listen` is what decides that: with it set,
+    // this node serves its management plane over this identity and has to say
+    // during the handshake that the socket carries HTTP/2, because a gRPC
+    // client offering `h2` to a listener that advertised nothing leaves the
+    // two with no agreed protocol - which happens to work with hyper on both
+    // ends and stops working the moment anything stricter is in the path.
+    // Without it this process only dials, and a process that only dials
+    // advertises nothing. Either way what a *dialler* wants is decided per
+    // call - HTTP/2 for the assignment RPC, HTTP/1.1 for the bundle download
+    // - see `MachineIdentity::client_config`.
+    let serves: &[deis_identity::Protocol] = match identity_config.management_listen_addr()? {
+        Some(_) => dispatcher::machine::SERVES,
+        None => &[],
+    };
     let identity = Arc::new(
-        MachineIdentity::load(identity_config.identity_files(), &[])
+        MachineIdentity::load(identity_config.identity_files(), serves)
             .context("loading this node's machine identity")?,
     );
     identity.watch(std::time::Duration::from_secs(
@@ -127,6 +139,32 @@ fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIde
          and downloads bundles from that listener over mutual TLS; registration still goes to \
          [control] endpoint with the fleet key"
     );
+
+    // The direction that has not moved, said out loud on every node that has
+    // not moved it. An identity makes this node's *outbound* half mutual TLS;
+    // what the control plane pushes *into* this node still arrives on the
+    // plaintext management plane, authenticated by a string every machine in
+    // the fleet holds, until this names a socket.
+    match identity_config.management_listen_addr()? {
+        Some(listen) => info!(
+            %listen,
+            "This node also serves its management plane over mutual TLS on that address, and \
+             admits only the control plane named above. The plaintext management plane is still \
+             bound beside it, because the control plane has not moved to dialling nodes by \
+             certificate yet"
+        ),
+        // Said at info and not at warn on purpose. This is the state of every
+        // node in this fleet today, and a warning that is always present is a
+        // warning nobody reads - including the day one appears that matters.
+        None => info!(
+            "No machine_identity.management_listen is set, so only this node's outbound half is \
+             authenticated by certificate. What the control plane pushes into this node - a \
+             deployment, an unload, an inspector session, a cron fire - still arrives on the \
+             plaintext management plane and is admitted by the fleet key, which every machine in \
+             this fleet holds and which names none of them. Set it to an ip:port to serve that \
+             plane to one machine only"
+        ),
+    }
 
     Ok(Some(identity))
 }
@@ -418,6 +456,28 @@ async fn run(
     }
     info!("====================================");
 
+    // The mutually authenticated management plane, when this node has both
+    // an identity and an address to serve it on. The identity is the same one
+    // the assignment client and the bundle fetcher dial with, so one renewal
+    // reaches everything this node proves itself with.
+    let machine_management = match (&machine_identity, config.machine_identity.as_ref()) {
+        (Some(identity), Some(identity_config)) => identity_config
+            .management_listen_addr()?
+            .map(|listen| -> Result<MachineManagement> {
+                Ok(MachineManagement {
+                    identity: identity.clone(),
+                    listen,
+                    // The same name this node dials, and for the same reason:
+                    // a node takes its instructions from the control plane it
+                    // was configured to expect, and a certificate naming some
+                    // other machine of the fleet is not that.
+                    expected_control: identity_config.expected_control_identity()?,
+                })
+            })
+            .transpose()?,
+        _ => None,
+    };
+
     // Start HTTP + gRPC server (reuse same port). Returns once a shutdown
     // signal has arrived and the in-flight requests have drained.
     dispatcher::start_server(ServerOptions {
@@ -431,6 +491,7 @@ async fn run(
         max_request_body_bytes: config.max_request_body_bytes,
         management_keys: config.management_keys(),
         management_listen: config.management.listen_addr()?,
+        machine_management,
     })
     .await?;
 

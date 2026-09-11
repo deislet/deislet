@@ -743,6 +743,20 @@ mod tests {
 
     #[tonic::async_trait]
     impl MachineChannel for MockService {
+        async fn register(
+            &self,
+            _request: Request<deis_wire::machine::RegisterNodeRequest>,
+        ) -> Result<Response<deis_wire::machine::RegisterNodeResponse>, Status> {
+            Err(Status::unimplemented("a proxy never registers as a node"))
+        }
+
+        async fn deregister(
+            &self,
+            _request: Request<deis_wire::machine::DeregisterNodeRequest>,
+        ) -> Result<Response<deis_wire::machine::DeregisterNodeResponse>, Status> {
+            Err(Status::unimplemented("a proxy never registers as a node"))
+        }
+
         async fn fetch_assignments(
             &self,
             _request: Request<deis_wire::machine::FetchAssignmentsRequest>,

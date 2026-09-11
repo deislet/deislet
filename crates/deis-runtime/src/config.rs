@@ -427,6 +427,38 @@ pub struct MachineIdentityConfig {
     /// when both are set.
     #[serde(default)]
     pub control_identity: Option<String>,
+
+    /// Where this node serves the other half of the machine channel: its own
+    /// management plane, under mutual TLS, for the control plane to drive it
+    /// through. An `ip:port` literal, e.g. `0.0.0.0:8187`.
+    ///
+    /// # Why this is a third socket and not one of the two the node already has
+    ///
+    /// Neither existing listener can be the one that demands a certificate.
+    /// The data listener carries public application traffic, so a demand for
+    /// a client certificate there would end every browser request during the
+    /// handshake. `[management] listen` is the plaintext door the control
+    /// plane drives today, and it has to keep working until the control plane
+    /// dials its nodes by certificate - a change being made separately, on
+    /// the other side of this channel. So the authenticated plane arrives
+    /// beside them rather than on top of one of them, and is the only socket
+    /// on this node whose caller is known by name rather than by a string the
+    /// whole fleet holds.
+    ///
+    /// Unset - the default - means this node dials the machine channel and
+    /// does not serve one, which is what every node configured before this
+    /// setting existed does. That is not a half-filled section: the direction
+    /// that has moved to certificates is node-to-control, and serving is the
+    /// direction that has not. A node in that state logs, at warn, that its
+    /// management plane is still the fleet key's.
+    ///
+    /// It must be an `ip:port` literal and not a hostname, for the reason
+    /// `[management] listen` must be: which interface a management plane
+    /// binds is not a question DNS should be answering at startup, and an
+    /// address that resolved differently on two nodes would be a fleet whose
+    /// exposure nobody can read off the file.
+    #[serde(default)]
+    pub management_listen: Option<String>,
 }
 
 fn default_identity_reload_seconds() -> u64 {
@@ -443,6 +475,7 @@ impl Default for MachineIdentityConfig {
             control_endpoint: None,
             trust_domain: None,
             control_identity: None,
+            management_listen: None,
         }
     }
 }
@@ -1305,6 +1338,12 @@ impl RuntimeConfig {
                 .control_identity = Some(value);
         }
 
+        if let Some(value) = env_var("DEIS_RUNTIME_MACHINE_IDENTITY_MANAGEMENT_LISTEN") {
+            self.machine_identity
+                .get_or_insert_with(MachineIdentityConfig::default)
+                .management_listen = Some(value);
+        }
+
         if let Some(value) = env_var("DEIS_RUNTIME_MANAGEMENT_LISTEN") {
             self.management.listen = Some(value);
         }
@@ -1542,6 +1581,39 @@ impl RuntimeConfig {
                      healthy throughout. Set control.endpoint as well"
                 ));
             }
+
+            // Three listeners, three sockets. The data listener binds
+            // `0.0.0.0:http_port`, which covers every address on this host,
+            // so a machine listener sharing that port could not bind at all
+            // and would take the node's startup down with it. Sharing a port
+            // with the plaintext management plane is the worse failure of the
+            // two: the two doors authenticate their callers differently, and
+            // which of them a control plane met would be decided by which
+            // bound first. Refused here rather than discovered from an
+            // "address already in use" that names a port and neither setting.
+            if let Some(machine) = identity.management_listen_addr()? {
+                if machine.port() == self.http_port {
+                    return Err(anyhow!(
+                        "machine_identity.management_listen {machine} names the same port as \
+                         http_port ({}), which the data listener binds on every address of this \
+                         host. Give the mutually authenticated management plane a port of its \
+                         own",
+                        self.http_port
+                    ));
+                }
+                if let Some(plain) = self.management.listen_addr()? {
+                    if plain.port() == machine.port() {
+                        return Err(anyhow!(
+                            "machine_identity.management_listen {machine} and management.listen \
+                             {plain} name the same port. They are two doors into the same \
+                             management plane that authenticate their callers differently - one \
+                             by certificate, one by the fleet key - and only one of them can \
+                             have that port, so which regime the control plane met would depend \
+                             on which listener bound first"
+                        ));
+                    }
+                }
+            }
         }
 
         self.management.validate()?;
@@ -1671,6 +1743,33 @@ impl MachineIdentityConfig {
         })
     }
 
+    /// Where this node serves its own machine channel, parsed.
+    ///
+    /// `Ok(None)` - the default - means it serves none: this node dials the
+    /// control plane by certificate and is still driven over the plaintext
+    /// management plane guarded by the fleet key.
+    pub fn management_listen_addr(&self) -> Result<Option<std::net::SocketAddr>> {
+        let Some(listen) = self
+            .management_listen
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        listen
+            .parse::<std::net::SocketAddr>()
+            .map(Some)
+            .map_err(|e| {
+                anyhow!(
+                    "machine_identity.management_listen {listen:?} is not an ip:port address \
+                     ({e}); write it as 0.0.0.0:8187 or 127.0.0.1:8187. A hostname is refused \
+                     because which interface this node offers its management plane on is not a \
+                     question DNS should be answering at startup"
+                )
+            })
+    }
+
     /// Reject a section that cannot be loaded or that names no one.
     ///
     /// Every rule here is the same shape: a value that would otherwise turn
@@ -1745,6 +1844,36 @@ impl MachineIdentityConfig {
                 "machine_identity.identity_reload_seconds must be greater than 0; 0 re-reads the \
                  three files in a hot loop instead of on the interval an operator meant to set"
             ));
+        }
+
+        // An address that was meant to be filled in and was not. Left as an
+        // empty string it would read, to `management_listen_addr`, exactly
+        // like the section that never asked to serve at all - so the node
+        // would come up dialling happily, with its management plane still on
+        // the fleet key, and the setting an operator wrote would be the thing
+        // that said otherwise.
+        if let Some(listen) = self.management_listen.as_deref() {
+            if listen.trim().is_empty() {
+                return Err(anyhow!(
+                    "machine_identity.management_listen is empty; either remove it, which leaves \
+                     this node's management plane where it is today - the fleet key on the \
+                     plaintext listener - or set it to the ip:port this node should serve its \
+                     mutually authenticated management plane on, e.g. 0.0.0.0:8187"
+                ));
+            }
+        }
+
+        // Also refuses a hostname, and it is parsed here as well as where it
+        // is used so a typo is a startup error naming the setting rather than
+        // a node that quietly never bound the listener it was told to.
+        if let Some(addr) = self.management_listen_addr()? {
+            if addr.port() == 0 {
+                return Err(anyhow!(
+                    "machine_identity.management_listen {addr} asks the OS for an arbitrary port; \
+                     the control plane reaches this node at an address it was told about, so a \
+                     port that changes on every restart is a management plane nothing can find"
+                ));
+            }
         }
 
         // Also confirms trust_domain/control_identity resolve to something
@@ -2866,6 +2995,97 @@ mod tests {
             control_endpoint: Some("https://control.internal:8443".to_string()),
             ..MachineIdentityConfig::default()
         }
+    }
+
+    #[test]
+    fn test_a_machine_identity_serves_no_management_plane_unless_told_where() {
+        // The default, and every node configured before the setting existed.
+        // It has to stay a complete configuration: the direction that has
+        // moved to certificates is this node's outbound half, and refusing a
+        // section for not also serving would turn a staged migration into a
+        // startup failure on nodes that are dialling correctly.
+        let identity = complete_identity();
+        assert!(identity.management_listen.is_none());
+        assert!(identity.management_listen_addr().unwrap().is_none());
+        with_machine_channel(identity).validate().unwrap();
+    }
+
+    #[test]
+    fn test_a_machine_management_listener_is_read_as_an_address() {
+        let identity = MachineIdentityConfig {
+            management_listen: Some("0.0.0.0:8187".to_string()),
+            ..complete_identity()
+        };
+        assert_eq!(
+            identity.management_listen_addr().unwrap(),
+            Some("0.0.0.0:8187".parse().unwrap())
+        );
+        with_machine_channel(identity).validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_a_machine_management_listener_that_says_nothing() {
+        // Empty reads exactly like absent to `management_listen_addr`, so an
+        // operator who meant to fill it in would get a node that came up
+        // dialling happily with its management plane still on the fleet key.
+        for listen in ["", "   "] {
+            let config = with_machine_channel(MachineIdentityConfig {
+                management_listen: Some(listen.to_string()),
+                ..complete_identity()
+            });
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("machine_identity.management_listen"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_a_machine_management_listener_that_is_not_an_address() {
+        // A hostname is refused for the reason management.listen refuses one:
+        // which interface a management plane binds must be readable off the
+        // file and not off whatever DNS answered at startup.
+        for listen in ["node.internal:8187", "8187", "0.0.0.0"] {
+            let config = with_machine_channel(MachineIdentityConfig {
+                management_listen: Some(listen.to_string()),
+                ..complete_identity()
+            });
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("machine_identity.management_listen"),
+                "{listen} must be refused by name: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_a_machine_management_listener_on_an_arbitrary_port() {
+        let config = with_machine_channel(MachineIdentityConfig {
+            management_listen: Some("0.0.0.0:0".to_string()),
+            ..complete_identity()
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("machine_identity.management_listen"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_a_machine_management_listener_sharing_a_port() {
+        // The data port. `0.0.0.0:http_port` covers every address on this
+        // host, so any spelling of this port is the same socket.
+        let mut config = with_machine_channel(MachineIdentityConfig {
+            management_listen: Some(format!("127.0.0.1:{}", RuntimeConfig::default().http_port)),
+            ..complete_identity()
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("http_port"), "{err}");
+
+        // And the plaintext management plane, which is the worse of the two:
+        // the two doors admit their callers on different terms, so sharing a
+        // port would leave which regime a control plane met to whichever
+        // listener bound first.
+        config.machine_identity.as_mut().unwrap().management_listen =
+            Some("0.0.0.0:8187".to_string());
+        config.management.listen = Some("127.0.0.1:8187".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("management.listen"), "{err}");
     }
 
     #[test]

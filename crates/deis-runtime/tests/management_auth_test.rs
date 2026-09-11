@@ -76,6 +76,10 @@ async fn start_node(
             max_request_body_bytes: deis_runtime::config::default_max_request_body_bytes(),
             management_keys,
             management_listen,
+            // This harness is about the fleet key's rules, which are what a
+            // node with no identity is held to; the mutually authenticated
+            // plane has its own tests beside the module that serves it.
+            machine_management: None,
         })
         .await;
         // Only reached when the node is torn down at the end of a test, or

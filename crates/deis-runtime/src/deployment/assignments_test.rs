@@ -1348,8 +1348,9 @@ use deis_identity::{names, MachineIdentity};
 use deis_identity_test_pki::{write_files, TestCa};
 use deis_wire::machine::machine_channel_server::{MachineChannel, MachineChannelServer};
 use deis_wire::machine::{
-    FetchAssignmentsRequest, FetchAssignmentsResponse, FetchRoutingTableRequest,
-    FetchRoutingTableResponse,
+    DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
+    FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
+    RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::transport::Endpoint;
 use tonic::Status;
@@ -1380,6 +1381,31 @@ impl MachineChannel for MachineControlPlane {
     ) -> Result<tonic::Response<FetchRoutingTableResponse>, Status> {
         Err(Status::unimplemented(
             "this node never asks for the routing table",
+        ))
+    }
+
+    // Registration and deregistration are on this channel too, and nothing
+    // under test here makes either call: what these cases cover is the path
+    // between `FetchAssignments` and an `AssignmentList`. They are answered
+    // rather than left out because the trait requires every RPC of the
+    // service, and a stand-in that answered one of them with something
+    // plausible would let a test start depending on an answer no control
+    // plane gave.
+    async fn register(
+        &self,
+        _request: tonic::Request<RegisterNodeRequest>,
+    ) -> Result<tonic::Response<RegisterNodeResponse>, Status> {
+        Err(Status::unimplemented(
+            "these cases do not register this node",
+        ))
+    }
+
+    async fn deregister(
+        &self,
+        _request: tonic::Request<DeregisterNodeRequest>,
+    ) -> Result<tonic::Response<DeregisterNodeResponse>, Status> {
+        Err(Status::unimplemented(
+            "these cases do not deregister this node",
         ))
     }
 }

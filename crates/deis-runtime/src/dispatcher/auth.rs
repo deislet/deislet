@@ -28,7 +28,7 @@
 //!
 //! # What an unconfigured node does
 //!
-//! Three states, and there is deliberately no fourth in which a routable
+//! Four states, and there is deliberately no fifth in which a routable
 //! management plane serves a caller that proves nothing:
 //!
 //! * **A key configured** - the normal case, and the one every node that
@@ -43,6 +43,12 @@
 //!   and nothing behind it runs. An empty key list is not a mode - it means
 //!   this node cannot tell the control plane from anyone else, so it serves
 //!   neither.
+//! * **A caller that proved a certificate** - the listener
+//!   `[machine_identity] management_listen` binds. Nothing in the request is
+//!   checked there, because the caller was already identified by name during
+//!   the TLS handshake and refused if that name was not this node's control
+//!   plane; see [`crate::dispatcher::machine`]. This is the state the other
+//!   three are on their way to.
 //!
 //! Shut rather than a refusal to start, which is where this differs from
 //! deis-store. deis-store is nothing but that one channel, so a process that
@@ -79,6 +85,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
+use deis_identity::SpiffeId;
 use deis_wire::conventions::{node_auth_secret, node_secret_matches, NODE_AUTH_METADATA};
 use tonic::Status;
 
@@ -102,6 +109,12 @@ enum Guard {
     /// reachable from other hosts, so this node cannot tell its control plane
     /// from anyone else and serves neither.
     Shut,
+    /// The caller proved, during the TLS handshake, that it holds a
+    /// certificate this fleet signed naming the one machine this node takes
+    /// management instructions from. Held for the log and for
+    /// [`ManagementAuth::expected_peer`]; nothing per request is checked
+    /// against it, because nothing per request could add to it.
+    ProvedByCertificate(SpiffeId),
 }
 
 /// What this node checks on every management and trigger call.
@@ -181,6 +194,74 @@ impl ManagementAuth {
         }
     }
 
+    /// What guards the listener `[machine_identity] management_listen` binds:
+    /// the caller's certificate, and nothing in the request at all.
+    ///
+    /// # What happens to the fleet key here
+    ///
+    /// Nothing. On this listener the key is neither required nor refused: a
+    /// call that carries one is served, and so is a call that carries none.
+    ///
+    /// It is not required because it could not add anything. By the time a
+    /// request exists on this listener its connection has completed a mutual
+    /// TLS handshake against this fleet's own root and proved the name in
+    /// `expected`, which is one machine; the key proves membership of a fleet
+    /// and names nobody. A check that can only ever narrow "the control
+    /// plane" down to "the control plane" is a check whose failure would
+    /// always be a misconfiguration and never an intruder.
+    ///
+    /// It is not refused because the control plane still sends it. Its client
+    /// puts the node credential on every management call it makes, and that
+    /// has not changed - the work to make it dial nodes by certificate is
+    /// being done separately - so a node that answered `UNAUTHENTICATED` to a
+    /// request merely for carrying a key would refuse the first control plane
+    /// that ever reached this listener.
+    ///
+    /// For the key to be refused outright - both senses: a caller holding
+    /// only the key gets nothing, and a caller presenting one is told so -
+    /// three things have to have happened. The control plane has to dial its
+    /// nodes by certificate, every node in the fleet has to have an identity
+    /// and this listener bound, and the plaintext door has to be closed. The
+    /// last of those takes more care than it looks. Dropping `[management]
+    /// keys` shuts the plaintext plane only where it is bound to a routable
+    /// address: [`Self::for_listener`] reads no keys on a routable bind as
+    /// [`Guard::Shut`], and no keys on a **loopback** bind as [`Guard::Open`],
+    /// which is the `deis dev` exemption and serves ApplyDeployment,
+    /// UnloadApp, StartInspect and the trigger RPCs to any process on the host
+    /// with no credential at all. The shipped example binds it to loopback, so
+    /// on an ordinary node dropping the keys alone would open that door rather
+    /// than close it. Closing it means removing `[management] listen`
+    /// altogether, or moving the plane off loopback first and then dropping
+    /// the keys.
+    ///
+    /// What holds the whole step up today is that registration is still an
+    /// HTTP route guarded by the fleet key, so a node cannot yet give the key
+    /// up at all.
+    pub fn for_machine_listener(expected: SpiffeId, addr: SocketAddr) -> Self {
+        tracing::info!(
+            %addr,
+            expected_peer = %expected,
+            "This node's mutually authenticated management plane is open: a caller gets a \
+             connection only by proving a certificate this fleet signed that names exactly this \
+             machine, so ApplyDeployment, UnloadApp, GetStatus, StartInspect, PushConfig, \
+             OnQueue and OnScheduled are served on it with nothing further asked of the request. \
+             The node key is neither required nor refused here"
+        );
+        Self {
+            guard: Guard::ProvedByCertificate(expected),
+        }
+    }
+
+    /// The one name this management plane answers to, when a certificate is
+    /// what admits a caller. `None` on every key-guarded listener, which
+    /// names nobody by construction.
+    pub fn expected_peer(&self) -> Option<&SpiffeId> {
+        match &self.guard {
+            Guard::ProvedByCertificate(expected) => Some(expected),
+            _ => None,
+        }
+    }
+
     /// A management plane that requires one of `keys`. For tests and for
     /// callers that have already made the binding decision.
     pub fn with_keys(keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -198,7 +279,7 @@ impl ManagementAuth {
     /// Whether a credential is required. Reported at startup so the log says
     /// which regime is in force rather than leaving it to be inferred.
     pub fn is_enforcing(&self) -> bool {
-        matches!(self.guard, Guard::Keys(_))
+        matches!(self.guard, Guard::Keys(_) | Guard::ProvedByCertificate(_))
     }
 
     /// Whether this node refuses every management call because it has no
@@ -222,6 +303,11 @@ impl ManagementAuth {
         let keys = match &self.guard {
             Guard::Keys(keys) => keys.as_slice(),
             Guard::Open => return Ok(()),
+            // The caller was identified before this request existed, by a
+            // certificate, and refused at the connection if the name in it
+            // was not this node's control plane. Reading a header here would
+            // be asking a proven caller to also say who it is.
+            Guard::ProvedByCertificate(_) => return Ok(()),
             Guard::Shut => {
                 tracing::error!(
                     rpc = %path,
@@ -293,6 +379,10 @@ impl std::fmt::Debug for ManagementAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManagementAuth")
             .field("enforcing", &self.is_enforcing())
+            // A SPIFFE name is not a credential - it is what a certificate
+            // says out loud - so unlike the key list it is safe to print, and
+            // it is the only thing that tells the two enforcing states apart.
+            .field("expected_peer", &self.expected_peer().map(SpiffeId::as_str))
             .finish()
     }
 }
