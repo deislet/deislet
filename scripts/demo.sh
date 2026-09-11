@@ -2440,7 +2440,7 @@ CHECKS_FAILED=0
 # So the list has a length, it is written down, and a run that does not reach
 # it fails. Adding a check means changing this number, which is the point:
 # the number is the roll call.
-VERIFY_EXPECTED_CHECKS=99
+VERIFY_EXPECTED_CHECKS=100
 
 # Every claim a verdict has been printed for, one per line.
 #
@@ -8226,6 +8226,155 @@ node_grpc_status() {
     | tr -d '\r' | awk 'tolower($1) == "grpc-status:" {print $2}' | head -n 1
 }
 
+# The claim the whole pull-based design exists to make, asked of real
+# processes for the first time.
+#
+# Architecture principle 8: a node is not told what to run and then trusted to
+# remember it. On startup it asks the control plane what it should be running,
+# downloads each bundle itself, and only reports healthy once they are loaded.
+# The control plane still pushes new deployments at it; the pull is what makes
+# a *restarted* node come back with what it had.
+#
+# Every other check in this file exercises that on a node that has been up the
+# whole time, which is exactly the case where the claim costs nothing. On a
+# local network machines reboot - for a kernel update, for a power cut, for a
+# careless `systemctl restart` - and the difference between a platform that
+# survives that and one that needs a human to redeploy afterwards is this one
+# behaviour. So: take the node away and put it back, touch nothing else, and
+# ask whether the application is serving again.
+#
+# What makes this a real answer rather than a coincidence: the node's data
+# directory survives the restart, so a node that merely reloaded its local
+# bundle store would look identical from outside. The log line asserted below
+# is what separates them - the node says it has the control plane's list, by
+# which point it has dialled the machine channel, proved its certificate and
+# been answered. Nothing redeploys anything in between, and the check fails if
+# the version serving afterwards is not the one that was serving before.
+check_a_restarted_node_comes_back_with_what_it_had() {
+  local title="a node that is taken away and put back comes back serving what it had"
+
+  # What it serves now, and under which version.
+  local before_headers="${LOG_DIR}/verify-restart-before.headers"
+  app_request "$before_headers" "/" > /dev/null
+  local before_status version_before
+  before_status=$(http_status "$before_headers")
+  version_before=$(control_api "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/deployment" \
+    2>/dev/null | jq -r '.deployment.version_id // empty')
+
+  # The marker the restarted node has to write after this point, so a line
+  # left over from the first start cannot be mistaken for the new one.
+  local lines_before
+  lines_before=$(grep -c "it has the control plane.s assignment list" \
+    "${LOG_DIR}/deis-runtime.log" 2>/dev/null) || lines_before=0
+
+  # Away. SIGTERM and not SIGKILL: this is a reboot, not a crash, and a node
+  # given no chance to shut down cleanly would be testing something else.
+  local old_pid="${DEIS_RUNTIME_PID:-}"
+  if [ -z "$old_pid" ]; then
+    fail_check "$title" "this run has no runtime pid recorded, so there is nothing to restart"
+    return
+  fi
+  kill "$old_pid" 2>/dev/null || true
+  local waited=0
+  while kill -0 "$old_pid" 2>/dev/null && [ "$waited" -lt 60 ]; do
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  if kill -0 "$old_pid" 2>/dev/null; then
+    fail_check "$title" "the node did not exit within 30s of SIGTERM, so the restart never happened"
+    return
+  fi
+
+  # While it is down, the application must not be served by anything else -
+  # otherwise "it came back" would be a sentence about the proxy's cache.
+  local down_status
+  down_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" 2>/dev/null) || down_status="000"
+
+  # And back. The same configuration and the same data directory: this is the
+  # machine coming up again, not a new one joining.
+  DEIS_RUNTIME_CONFIG="$DEIS_RUNTIME_CONFIG" \
+    DEIS_RUNTIME_HTTP_PORT="$DEIS_RUNTIME_PORT" \
+    "${BIN_DIR}/deis-runtime" \
+    >> "${LOG_DIR}/deis-runtime.log" 2>&1 &
+  DEIS_RUNTIME_PID=$!
+
+  # The state file has to learn the new pid. `verify` runs in its own shell,
+  # so the variable set here dies with it, and `stop` reads the file - which
+  # would still name the process this check just killed. The node started here
+  # would then survive `stop`, hold the port, and the next `start` would refuse
+  # to run at all, naming a pid nobody can account for. That is a worse failure
+  # than the one this check was written to catch, and it is caused by the check
+  # itself, so it is this check's to prevent.
+  if [ -n "${STATE_FILE:-}" ] && [ -f "$STATE_FILE" ]; then
+    local rewritten="${STATE_FILE}.tmp"
+    sed "s/^DEIS_RUNTIME_PID=.*/DEIS_RUNTIME_PID=${DEIS_RUNTIME_PID}/" \
+      "$STATE_FILE" > "$rewritten" && mv "$rewritten" "$STATE_FILE"
+  fi
+
+  # Waited for by asking, not by sleeping: the node loads a V8 snapshot and
+  # then its applications, and how long that takes is the machine's business.
+  local ready=0 attempt=0 after_status="000"
+  while [ "$attempt" -lt 240 ]; do
+    after_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+      -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" 2>/dev/null) || after_status="000"
+    if [ "$after_status" = "200" ]; then
+      ready=1
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+
+  # Waited for, not read once. The node answers on its data port as soon as
+  # the application is loaded, and the line that says it had the control
+  # plane's list is written by another thread - so reading the count at the
+  # moment the first 200 arrives catches the file before that line reaches it,
+  # and reports the node as having reloaded from local disk when it had not.
+  local lines_after="$lines_before" line_attempt=0
+  while [ "$line_attempt" -lt 120 ]; do
+    lines_after=$(grep -c "it has the control plane.s assignment list" \
+      "${LOG_DIR}/deis-runtime.log" 2>/dev/null) || lines_after=0
+    if [ "$lines_after" -gt "$lines_before" ]; then
+      break
+    fi
+    line_attempt=$((line_attempt + 1))
+    sleep 0.5
+  done
+
+  local version_after
+  version_after=$(control_api "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/deployment" \
+    2>/dev/null | jq -r '.deployment.version_id // empty')
+
+  # The control plane learns a node is back by polling it, and that poll runs
+  # on its own interval. Asked once, the answer here would be "not healthy" -
+  # true at that instant and about the poller rather than about the node. So
+  # this waits for the fleet to agree, which is the thing actually being
+  # claimed: the platform, not just the process, came back.
+  local healthy="" health_attempt=0
+  while [ "$health_attempt" -lt 120 ]; do
+    healthy=$(control_api /api/platform/runtime 2>/dev/null \
+      | jq -r --arg id "$NODE_ID" '.nodes[] | select(.id == $id) | .healthy' 2>/dev/null) || healthy=""
+    if [ "$healthy" = "true" ]; then
+      break
+    fi
+    health_attempt=$((health_attempt + 1))
+    sleep 0.5
+  done
+
+  if [ "$ready" = "1" ] && [ "$before_status" = "200" ] && [ "$down_status" != "200" ] \
+    && [ "$lines_after" -gt "$lines_before" ] \
+    && [ -n "$version_before" ] && [ "$version_after" = "$version_before" ] \
+    && [ "$healthy" = "true" ]; then
+    pass_check "$title" \
+      "${APP_ID} answered 200 before the restart and ${down_status} while the node was gone - so nothing else was serving it - and 200 again afterwards, on the same version ${version_before}, with nobody deploying anything in between. The node said it had the control plane's assignment list ${lines_after} time(s) against ${lines_before} before, which means it dialled the machine channel, proved its certificate and was answered rather than quietly reloading its own bundle directory. The control plane reports ${NODE_ID} healthy again"
+    return
+  fi
+
+  fail_check "$title" \
+    "expected 200 before (got ${before_status}), no answer while down (got ${down_status}), 200 after (got ${after_status}, ready=${ready}), a new assignment-list line (${lines_before} -> ${lines_after}), the same version (${version_before:-none} -> ${version_after:-none}) and ${NODE_ID} healthy (got ${healthy:-unknown})"
+}
+
 # Nothing in Deislet issues, renews or revokes a certificate - that is the
 # installation's own authority, and keeping it out is what lets any PKI be
 # substituted for any other. The cost of that decision is that expiry becomes
@@ -9626,6 +9775,11 @@ verify_demo() {
   echo "-- the evidence this run rests on --"
   # Last, and about the run rather than about the platform: whether the file
   # the log-reading checks above quoted was whole while they quoted it.
+  # Last, and deliberately: this one takes the node away and puts it back, so
+  # anything after it would be asking its questions of a node that is still
+  # loading. The log check below reads a file the restart appends to, which is
+  # why it stays after this rather than before it.
+  check_a_restarted_node_comes_back_with_what_it_had
   check_the_node_log_this_run_read_was_whole
 
   # Before the summary, so the traps above stand down only once the whole
