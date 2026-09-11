@@ -8254,6 +8254,16 @@ check_the_platform_serves_while_its_control_plane_is_away() {
   local before_status
   before_status=$(http_status "$before_headers")
 
+  # What the edge answers for this route while everything is up. Recorded
+  # rather than assumed: the assertion below is "the same answer as before",
+  # which is the actual claim, and a hardcoded 200 would fail the moment a
+  # route legitimately answered anything else - reporting the edge as having
+  # gone dark when it had routed perfectly.
+  local edge_before_headers="${LOG_DIR}/verify-control-away-edge-before.headers"
+  routed_request "$ROUTED_HOST" "$ROUTED_PREFIX" "$edge_before_headers" > /dev/null
+  local edge_before
+  edge_before=$(http_status "$edge_before_headers")
+
   local old_pid="${DEIS_CONTROL_PID:-}"
   if [ -z "$old_pid" ]; then
     fail_check "$title" "this run has no control-plane pid recorded, so there is nothing to stop"
@@ -8276,15 +8286,29 @@ check_the_platform_serves_while_its_control_plane_is_away() {
   control_down=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
     "http://127.0.0.1:${DEIS_CONTROL_PORT}/health" 2>/dev/null) || control_down="000"
 
-  # The assertion this check exists for. Asked several times over a few
-  # seconds rather than once: a node that only failed on its next
-  # reconciliation would pass a single probe taken immediately.
-  local serving_while_away=1 probe=0 away_status="000"
+  # The assertion this check exists for, made on both hops a real request
+  # takes. Asked several times over a few seconds rather than once: a node
+  # that only failed on its next reconciliation, or a proxy that only dropped
+  # its table on its next poll, would both pass a single probe taken
+  # immediately.
+  #
+  # The edge is the half that is easy to forget and the worse one to get
+  # wrong. deis-proxy polls the routing table every few seconds; if a poll
+  # that could not reach the control plane emptied the table, the edge would
+  # go dark a few seconds after the control plane did - which would make the
+  # control plane a single point of failure after all, one hop further out,
+  # and the node answering perfectly well behind it.
+  local serving_while_away=1 probe=0 away_status="000" edge_status="000"
   while [ "$probe" -lt 12 ]; do
     local away_headers="${LOG_DIR}/verify-control-away-${probe}.headers"
     app_request "$away_headers" "/" > /dev/null 2>&1 || true
     away_status=$(http_status "$away_headers")
-    if [ "$away_status" != "200" ]; then
+
+    local edge_headers="${LOG_DIR}/verify-control-away-edge-${probe}.headers"
+    routed_request "$ROUTED_HOST" "$ROUTED_PREFIX" "$edge_headers" > /dev/null 2>&1 || true
+    edge_status=$(http_status "$edge_headers")
+
+    if [ "$away_status" != "200" ] || [ "$edge_status" != "$edge_before" ]; then
       serving_while_away=0
       break
     fi
@@ -8326,16 +8350,16 @@ check_the_platform_serves_while_its_control_plane_is_away() {
   local after_status
   after_status=$(http_status "$after_headers")
 
-  if [ "$before_status" = "200" ] && [ "$control_down" != "200" ] \
+  if [ "$before_status" = "200" ] && [ -n "$edge_before" ] && [ "$control_down" != "200" ] \
     && [ "$serving_while_away" = "1" ] && [ "$back" = "1" ] \
     && [ "$healthy" = "true" ] && [ "$after_status" = "200" ]; then
     pass_check "$title" \
-      "the control plane was stopped - its own /health answered ${control_down} - and ${APP_ID} went on answering 200 to ${probe} request(s) spread over the seconds it was gone, which is what says the machine holding the catalog is not in the path of a request. It was started again on the same database, and ${NODE_ID} is reported healthy again without anybody registering it by hand; ${APP_ID} answers ${after_status}"
+      "the control plane was stopped - its own /health answered ${control_down} - and both hops a real request takes went on answering as they did before, ${probe} request(s) each, spread over the seconds it was gone: the node directly, and http://${ROUTED_HOST}${ROUTED_PREFIX} through deis-proxy answering ${edge_before} exactly as it did before - so the edge went on routing from the table it already had rather than emptying it when a poll could not be answered. That is what says the machine holding the catalog is not in the path of a request. It was started again on the same database, and ${NODE_ID} is reported healthy again without anybody registering it by hand; ${APP_ID} answers ${after_status}"
     return
   fi
 
   fail_check "$title" \
-    "expected 200 before (got ${before_status}), the control plane's health to stop answering (got ${control_down}), ${APP_ID} to keep answering 200 while it was away (last was ${away_status} after ${probe} probe(s)), the control plane to come back (back=${back}), ${NODE_ID} to be healthy again (got ${healthy:-unknown}) and ${APP_ID} to answer 200 after (got ${after_status})"
+    "expected 200 before (got ${before_status}), the control plane's health to stop answering (got ${control_down}), both hops to answer while it was away as they did before (node ${away_status} wanted 200, edge ${edge_status} wanted ${edge_before:-none}, after ${probe} probe(s)), the control plane to come back (back=${back}), ${NODE_ID} to be healthy again (got ${healthy:-unknown}) and ${APP_ID} to answer 200 after (got ${after_status})"
 }
 
 # The claim the whole pull-based design exists to make, asked of real
