@@ -304,7 +304,7 @@ max_pending_entries = 10000
 
 # On startup the node asks the control plane which applications and versions
 # it should be running, downloads each bundle itself, and only reports healthy
-# once they are loaded. There is no `secret` line and that is the finished
+# once they are loaded. There is no secret line and that is the finished
 # state rather than an omission: the assignment list carries every
 # environment's decrypted secrets, and what entitles this node to it is the
 # certificate below, which names this one node.
@@ -522,6 +522,31 @@ ensure_hosts() {
   fi
 }
 
+# Ask each binary whether the file just written to it is usable, before
+# anything is started against it.
+#
+# The failure this closes is the quiet one. These TOML files are written by
+# hand, by the heredocs above, and serde ignores a field it does not know - so
+# a setting spelled wrong is not an error, it is an absence, and the service
+# starts on a default nobody chose. Under the machine channel that is
+# expensive: a control plane whose `[machine]` section did not parse serves no
+# node at all, and it says so only as six other services failing to attach for
+# reasons none of them can name.
+#
+# Run before `start_stack` so an install that would not have worked stops here,
+# at the file, rather than after six `systemctl restart` calls.
+check_configs() {
+  local failed=0
+  /usr/local/bin/deis-control --config /etc/deis/control.toml --check-config \
+    || { log "error: /etc/deis/control.toml is not usable"; failed=1; }
+  /usr/local/bin/deis-runtime --config /etc/deis/runtime.toml --check-config \
+    || { log "error: /etc/deis/runtime.toml is not usable"; failed=1; }
+  if ((failed)); then
+    die "the configuration written by this installer does not load; nothing was started"
+  fi
+  log "configuration checks passed"
+}
+
 start_stack() {
   systemctl restart deis-telemetry deis-store deis-queue
   systemctl restart deis-control
@@ -625,6 +650,7 @@ install_units
 install_runtime_fs
 write_release_stamp
 ensure_hosts
+check_configs
 start_stack
 wait_http "http://127.0.0.1:${CONTROL_PORT}/health" deis-control
 wait_http "http://127.0.0.1:${RUNTIME_PORT}/health" deis-runtime -H "x-deis-app-id: _system"

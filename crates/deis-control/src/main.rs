@@ -13,6 +13,16 @@ struct Opts {
     port: Option<u16>,
     #[structopt(long, default_value = "deis-control.db")]
     database: String,
+    /// Load the configuration, say whether it is usable, and exit without
+    /// binding anything.
+    ///
+    /// What it is for: an installer that has just written this file, and an
+    /// operator who has just edited one. Without it the only way to find out
+    /// whether a configuration loads is to start the process, which on a
+    /// machine already running one means a port clash reported instead of the
+    /// answer that was wanted.
+    #[structopt(long)]
+    check_config: bool,
 }
 
 /// Initialize logging system
@@ -72,13 +82,46 @@ async fn main() -> Result<(), anyhow::Error> {
     info!("Starting Control v{}", deis_control::VERSION);
 
     let mut config = deis_control::ControlConfig::default();
-    if let Some(path) = opts.config
-        && path.exists()
-    {
+    if let Some(path) = opts.config {
+        // A path that was given and is not there is an error, not a shrug.
+        // Ignoring it silently started this process on the built-in defaults
+        // - port 8080, no API authentication, no machine channel - which is a
+        // control plane nobody configured, looking exactly like the one they
+        // thought they had configured.
+        if !path.exists() {
+            anyhow::bail!(
+                "no configuration file at {}. Check the path given to --config; \
+                 starting on the built-in defaults instead would be a control \
+                 plane with no machine channel and no API authentication",
+                path.display()
+            );
+        }
         config = deis_control::ControlConfig::load(path)?;
     }
     if let Some(port) = opts.port {
         config.port = port;
+    }
+
+    if opts.check_config {
+        // Every rule startup would apply, applied here. A check that only
+        // parsed would pass a file this process then refuses to start on -
+        // and this flag exists to be a gate, so passing something that cannot
+        // run would be worse than having no gate at all.
+        let machine = config.machine.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this control plane has no [machine] section, and everything a node or a proxy \
+                 calls is served there: registration, the assignment list, the bundle download \
+                 and the routing table. Without it no machine can reach this control plane at all"
+            )
+        })?;
+        println!(
+            "configuration is usable: port {}, machine channel {}:{}, api auth {}",
+            config.port,
+            machine.bind_addr,
+            machine.port,
+            if config.api_auth_enabled { "on" } else { "off" }
+        );
+        return Ok(());
     }
 
     let bind_addr = config.bind_addr.clone();
@@ -176,9 +219,9 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     // The configured list is the seed, not the whole fleet: nodes register
-    // themselves at `PUT /api/nodes/{id}/registration` and are added as they
-    // call in, which is what lets a machine join without this file being
-    // edited. A registration expires after this lifetime without a refresh.
+    // themselves over the machine channel, proving a certificate that names
+    // them, and are added as they call in - which is what lets a machine join
+    // without this file being edited. A registration expires after this lifetime without a refresh.
     let deis_runtime_manager = Arc::new(
         deis_control::RuntimeNodeManager::new_with_ttl(
             api_config.deis_runtime_nodes.clone(),

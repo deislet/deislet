@@ -52,6 +52,17 @@ struct Cli {
     /// the built-in defaults.
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Load the configuration, say whether it is usable, and exit without
+    /// binding anything or starting an isolate.
+    ///
+    /// What it is for: an installer that has just written this file, and an
+    /// operator who has just edited one. Without it the only way to find out
+    /// whether a configuration is usable is to start the node, which takes
+    /// several seconds of V8 snapshot work and, on a machine already running
+    /// one, reports a port clash instead of the answer that was wanted.
+    #[arg(long)]
+    check_config: bool,
 }
 
 /// The log level filter for this node: `RUST_LOG` when it is set, `info`
@@ -204,6 +215,32 @@ fn main() -> Result<()> {
 
     let (config, config_source) = RuntimeConfig::load(cli.config.as_deref())
         .context("loading the deis-runtime configuration")?;
+
+    if cli.check_config {
+        // `validate` and not just the parse: a file that deserializes and is
+        // then refused at startup - a half-filled [machine_identity], a
+        // management plane on the data port - is exactly the file this flag
+        // exists to catch before six services are started against it.
+        config
+            .validate()
+            .context("the configuration loaded but is not usable")?;
+        println!(
+            "configuration is usable ({:?}): http port {}, machine channel {}, management plane {}",
+            config_source,
+            config.http_port,
+            config
+                .machine_identity
+                .as_ref()
+                .and_then(|identity| identity.control_endpoint.clone())
+                .unwrap_or_else(|| "not configured - this node asks nobody".to_string()),
+            config
+                .machine_identity
+                .as_ref()
+                .and_then(|identity| identity.management_listen.clone())
+                .unwrap_or_else(|| "not configured - nothing can drive this node".to_string()),
+        );
+        return Ok(());
+    }
 
     // Whether an HTTP proxy named in this node's environment gets to carry
     // applications' outbound calls. `deno_fetch` reads those variables
