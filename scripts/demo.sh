@@ -2026,6 +2026,16 @@ api_keys = ["${API_KEY}"]
 heartbeat_interval = 30
 heartbeat_timeout = 90
 deis_runtime_poll_interval = 5
+# Far below the product default of 600, and set here for a reason this script
+# has met: a check that registers an extra node and is interrupted before it
+# deregisters leaves a machine on the fleet that never answers again. A
+# deployment that froze it as a target then cannot finish, and every following
+# deployment to that environment is refused - which has poisoned not just the
+# interrupted run but the two after it. Two minutes is long enough that nothing
+# in this demo is given up on while it is merely busy, and short enough that a
+# run which does leave a ghost behind recovers inside the next one instead of
+# handing the failure forward.
+deployment_target_abandon_after_secs = 120
 bundle_dir = "${DEMO_DIR}/bundles"
 public_base_url = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 secret_key_file = "${SECRET_KEY_FILE}"
@@ -2426,7 +2436,7 @@ CHECKS_FAILED=0
 # So the list has a length, it is written down, and a run that does not reach
 # it fails. Adding a check means changing this number, which is the point:
 # the number is the roll call.
-VERIFY_EXPECTED_CHECKS=97
+VERIFY_EXPECTED_CHECKS=98
 
 # Every claim a verdict has been printed for, one per line.
 #
@@ -8717,6 +8727,79 @@ machine_channel_http() {
 # was never a connection".
 MACHINE_PROBE_PATH="/api/apps/demo/versions/00000000-0000-0000-0000-000000000000/bundle"
 
+# The trap this closes is not a refusal, it is the absence of one.
+#
+# Registration, the assignment list, the bundle download and the routing table
+# are served only on the machine channel now. A control plane of this version
+# does not serve their HTTP forms at all - the checks above prove those paths
+# answer 404 - so a node or a proxy configured the old way has nowhere to ask.
+#
+# It does not fail, though. It starts, binds its ports, reports itself up, and
+# then retries a 404 for as long as it runs: the node loads nothing and
+# announces nothing, the proxy routes on whatever it can work out from its own
+# file. Both look alive from outside and neither says why it is useless.
+#
+# So both refuse to start without a `[machine_identity]` table, and this is
+# what holds them to it. The configurations below are the old shape exactly -
+# an address to reach the control plane at, and nothing to prove - and what is
+# asserted is that the process is gone and said which table is missing. A
+# message that named neither would leave an operator reading a stack of 404s.
+check_a_process_with_no_certificate_refuses_to_start() {
+  local title="a process told where its control plane is, and given nothing to prove, refuses to start"
+  local dir="${DEMO_DIR}/no-identity"
+  mkdir -p "$dir"
+
+  local node_config="${dir}/deis-runtime.toml"
+  cat > "$node_config" <<EOF
+node_id = "deis-runtime-demo-no-identity"
+http_port = 1
+data_dir = "${dir}/runtime-data"
+
+[control]
+endpoint = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
+EOF
+
+  local proxy_config="${dir}/deis-proxy.toml"
+  cat > "$proxy_config" <<EOF
+listen_addr = ["127.0.0.1"]
+listen_ports = [1]
+database = "${dir}/deis-proxy.db"
+pid_file = "${dir}/deis-proxy.pid"
+
+[[upstreams]]
+host = "127.0.0.1"
+port = ${DEIS_RUNTIME_PORT}
+
+[control]
+addr = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
+associated_id = "deis-proxy-demo-no-identity"
+EOF
+
+  local node_out proxy_out node_rc proxy_rc
+  node_rc=0
+  node_out=$(DEIS_RUNTIME_CONFIG="$node_config" timeout 20 "${BIN_DIR}/deis-runtime" 2>&1) || node_rc=$?
+  proxy_rc=0
+  proxy_out=$(timeout 20 "${BIN_DIR}/deis-proxy" -c "$proxy_config" 2>&1) || proxy_rc=$?
+
+  local node_named proxy_named
+  node_named=no
+  proxy_named=no
+  case "$node_out" in *machine_identity*) node_named=yes ;; esac
+  case "$proxy_out" in *machine_identity*) proxy_named=yes ;; esac
+
+  # A port of 1 cannot be bound by an unprivileged process, so a run that got
+  # as far as binding would also exit non-zero. The message is what tells the
+  # two apart, which is why both halves are asserted and neither alone.
+  if [ "$node_rc" -ne 0 ] && [ "$proxy_rc" -ne 0 ] \
+    && [ "$node_named" = yes ] && [ "$proxy_named" = yes ]; then
+    pass_check "$title" \
+      "deis-runtime exited ${node_rc} and deis-proxy exited ${proxy_rc}, each naming [machine_identity] as what is missing - so a machine that could only have polled a 404 for the life of the process never gets that far. Everything either of them asks its control plane for is served on the machine channel, where a shared value opens nothing, and a process that started without a certificate would have looked healthy while doing nothing at all"
+  else
+    fail_check "$title" \
+      "expected both to exit non-zero naming [machine_identity]: deis-runtime exited ${node_rc} (named it: ${node_named}) saying \"$(printf '%s' "$node_out" | tr '\n' ' ' | head -c 200)\"; deis-proxy exited ${proxy_rc} (named it: ${proxy_named}) saying \"$(printf '%s' "$proxy_out" | tr '\n' ' ' | head -c 200)\""
+  fi
+}
+
 check_the_machine_channel_refuses_a_caller_with_no_certificate() {
   local title="the machine channel will not talk to a caller that proves nothing"
 
@@ -9412,6 +9495,9 @@ verify_demo() {
   # machine has to prove to reach the answers only machines may have.
   check_the_machine_channel_refuses_a_caller_with_no_certificate
   check_the_machine_channel_refuses_a_certificate_this_fleet_did_not_sign
+  # And the other side of the same sentence: what happens to a machine that
+  # has no certificate to prove. It is not refused at a door, it never starts.
+  check_a_process_with_no_certificate_refuses_to_start
   check_a_fleet_certificate_only_speaks_for_the_machine_it_names
   check_cli_status
   echo "-- accounts, scopes and the audit log --"

@@ -943,6 +943,21 @@ impl RuntimeNodeManager {
         departed
     }
 
+    /// When this control plane dropped `id` from the fleet, if it remembers
+    /// doing so.
+    ///
+    /// `None` means two different things that read the same from here: a
+    /// machine this control plane never lost, and one it lost before this
+    /// process started. Callers that need "how long has it been gone" have to
+    /// have a second clock for the second case.
+    pub fn departed_at(&self, id: &str) -> Option<DateTime<Utc>> {
+        self.departed
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|node| node.departed_at)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.read().is_empty()
     }

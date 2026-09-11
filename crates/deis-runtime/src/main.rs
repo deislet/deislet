@@ -380,26 +380,43 @@ async fn run(
     // answer that says "starting" rather than a refused connection.
     let health = NodeHealth::starting();
 
-    // Only about the HTTP path. With a machine channel configured both the
-    // assignment list and the registration go over mutual TLS and need no key
-    // at all, so the warning is worth making either way -- with the
-    // consequence named for the case at hand.
-    if config.control.endpoint.is_some() && config.control.secret.is_none() {
-        if config.machine_identity.is_some() {
-            warn!(
-                "No control.secret is configured. This node asks what to run and announces \
-                 itself over the machine channel, and neither needs one; what still presents it \
-                 is a bundle download from the control plane's human listener, so an application \
-                 whose bundle URL points there will fail to install on this node"
-            );
-        } else {
-            warn!(
-                "No control.secret is configured, so this node asks the control plane for its \
-                 assignments anonymously. A control plane with node_preshared_keys set answers \
-                 401 and this node will never load a version it was assigned"
-            );
-        }
+    // What `control.secret` is for, now that a node cannot be attached to a
+    // control plane without a certificate.
+    //
+    // It no longer gets this node anything: registering, asking what to run
+    // and fetching a bundle all go over the machine channel and are admitted
+    // by the name this node proves. What it still does is the other
+    // direction - it is folded into `management_keys()`, so a value here
+    // opens the *plaintext* management plane to whoever holds it. That plane
+    // shares the data port unless `[management] listen` moves it, and the
+    // data port is `0.0.0.0`.
+    //
+    // Which makes a leftover `control.secret` the opposite of what an
+    // operator reading the name would expect: not a credential this node
+    // presents, a door it opens. Said at warn, with the address, because
+    // nothing else in a startup log distinguishes "the node key I have always
+    // set" from "an administrative plane on my public port".
+    if config.machine_identity.is_some() && config.control.secret.is_some() {
+        warn!(
+            management_plane = %config
+                .management_bind_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| "unparsable".to_string()),
+            "control.secret is set and this node has a machine identity. The secret gets this \
+             node nothing any more - it registers, asks what to run and downloads its bundles \
+             over the machine channel, admitted by the certificate it proves - but it is still \
+             accepted on the plaintext management plane, which means anything that can reach \
+             that address and holds this string can list every tenant's applications here, \
+             unload one, replace it, or open an inspector session into a running isolate. \
+             Remove the line unless something still drives this node with it"
+        );
     }
+    // There is no warning for the other case. A node with an identity and no
+    // `control.secret` is the finished configuration, and a line at warn on
+    // every correct startup is a line operators stop reading. The one thing
+    // that value would still have been for - a bundle whose URL is not on the
+    // machine listener - is reported by the fetcher, at the moment it happens,
+    // naming the URL and the endpoint that disagree with it.
 
     let assignment_client =
         AssignmentClient::from_config(&config, &node_id, machine_identity.clone())

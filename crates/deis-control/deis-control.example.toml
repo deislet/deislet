@@ -182,6 +182,29 @@ api_keys = [
 # listed above are not subject to any of this.
 # node_registration_ttl_secs = 90
 
+# How long a deployment whose pointer has already moved waits for a target
+# that has left the fleet, before recording it as abandoned and letting the
+# plan finish. Default 600 seconds.
+#
+# It exists because a plan freezes its target list and reaches its terminal
+# state only when every name in it has confirmed the exact generation. That is
+# right for a machine that is merely quiet, and it means a machine that never
+# comes back holds the environment for ever: every following deployment to it
+# is refused with "a deployment plan is already in progress", and no operator
+# action clears it.
+#
+# Only a target that is not on the fleet list at that moment is ever given up
+# on. A target that is listed and failing is waited for indefinitely, which is
+# a machine with a problem and has to stay visible as one.
+#
+# Make it comfortably longer than node_registration_ttl_secs plus however long
+# a machine here takes to reboot: a restarting node is off the list for the
+# rest of its registration lifetime plus its boot time. Giving up on it early
+# costs nothing permanent - a node asks what it should be running every time
+# it starts, so one that returns loads the current version on its own - but it
+# does put an "abandoned" row in that plan where a confirmation should be.
+# deployment_target_abandon_after_secs = 600
+
 # ========================================
 # Product model: bundles and secrets
 # ========================================

@@ -18,7 +18,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 use super::CatalogState;
@@ -914,22 +914,35 @@ async fn finalize_if_observed(
     ) {
         return Ok(plan);
     }
+    let generation = plan.routing_generation.to_string();
+    abandon_departed_participants(state, &plan, &generation, lease).await?;
     let targets = state.store.deployment_target_observations(plan_id).await?;
     let proxies = state.store.deployment_proxy_observations(plan_id).await?;
-    let generation = plan.routing_generation.to_string();
-    let all_targets_active = plan.target_ids.iter().all(|target| {
+    // Counted rather than folded into the `all` below, because `all` stops at
+    // the first target that is not settled: a count taken inside it would be
+    // whatever the iteration happened to reach, which is right only in the
+    // case where it is not needed.
+    let abandoned = plan
+        .target_ids
+        .iter()
+        .filter(|target| {
+            targets
+                .iter()
+                .any(|observation| target_is(observation, target, ABANDONED, &plan, &generation))
+        })
+        .count();
+    let all_targets_settled = plan.target_ids.iter().all(|target| {
         targets.iter().any(|observation| {
-            observation.node_id == *target
-                && observation.observed_state == "active"
-                && observation.version_id.as_deref() == Some(plan.version_id.as_str())
-                && observation.routing_generation.as_deref() == Some(generation.as_str())
+            target_is(observation, target, "active", &plan, &generation)
+                || target_is(observation, target, ABANDONED, &plan, &generation)
         })
     });
     let all_proxies_applied = plan.proxy_ids.iter().all(|proxy| {
         proxies.iter().any(|observation| {
             observation.proxy_id == *proxy
-                && observation.observed_state == "routing_applied"
                 && observation.routing_generation == generation
+                && (observation.observed_state == "routing_applied"
+                    || observation.observed_state == ABANDONED)
         })
     });
     let queue_active = if plan_requires_queue_fence(&plan)? {
@@ -947,19 +960,343 @@ async fn finalize_if_observed(
     } else {
         true
     };
-    if all_targets_active && all_proxies_applied && queue_active {
+    if all_targets_settled && all_proxies_applied && queue_active {
+        let detail = if abandoned == 0 {
+            "all frozen runtime and proxy targets report the exact production generation"
+                .to_string()
+        } else {
+            // Said in the plan's own note, not only in the observation rows,
+            // because this is the one place a reader looking at why the plan
+            // ended would otherwise see nothing but "active".
+            format!(
+                "every frozen proxy target and every runtime target still on the fleet reports \
+                 the exact production generation; {abandoned} runtime target(s) left the fleet \
+                 before confirming and were recorded as abandoned rather than confirmed"
+            )
+        };
         return Ok(state
             .store
             .transition_deployment_plan(
                 &plan.id,
                 &plan.state,
                 "active",
-                Some("all frozen runtime and proxy targets report the exact production generation"),
+                Some(&detail),
                 lease.coordinator_id(),
             )
             .await?);
     }
     Ok(plan)
+}
+
+/// Whether `observation` is this target's row for this plan, in `wanted`
+/// state, about the exact version and generation this plan committed.
+///
+/// One predicate for both readers of that question - the finaliser deciding
+/// whether a plan may end, and the abandoner deciding whether a target still
+/// needs a verdict - because two spellings of it that drifted apart would
+/// produce a plan that the finaliser says is unsettled and the abandoner says
+/// needs nothing, which is the wedge this work exists to remove, reintroduced.
+fn target_is(
+    observation: &DeploymentTargetObservation,
+    target: &str,
+    wanted: &str,
+    plan: &DeploymentPlan,
+    generation: &str,
+) -> bool {
+    observation.node_id == target
+        && observation.observed_state == wanted
+        && observation.version_id.as_deref() == Some(plan.version_id.as_str())
+        && observation.routing_generation.as_deref() == Some(generation)
+}
+
+/// What a target is recorded as when it left the fleet before confirming.
+///
+/// Deliberately not `active`: nothing observed this machine running this
+/// version, and a plan that wrote `active` here would be answering a question
+/// nobody asked it. It is also not `unconfirmed`, which is what a failed push
+/// to a machine that is still on the fleet records - that one is expected to
+/// be retried and to change. This one will not change, because there is
+/// nothing left to retry against.
+const ABANDONED: &str = "abandoned";
+
+/// Whether the only targets that did not take the abort are machines that have
+/// left the fleet, and have been gone long enough to give up on.
+///
+/// The compensation path has the same shape of hole the post-commit path had,
+/// reached from the other side. A plan in `aborting` is pre-commit: nothing of
+/// it is live, and finishing it costs nothing but the acknowledgement. But
+/// `abort_prepared_plan` only transitions to `failed` when every frozen target
+/// took the abort, and a machine that has gone takes nothing - so the plan
+/// stays in `aborting`, which is in the set that refuses the next deployment
+/// to that environment. The same environment held for the same reason, by a
+/// plan that never even changed anything.
+///
+/// A target that is still on the fleet and refusing is not covered, exactly as
+/// on the other path: that is a machine with a problem, and it must keep being
+/// retried and keep being visible.
+///
+/// The row written here says `abandoned` rather than `aborted`, because
+/// nothing observed this machine dropping the prepared version. What it
+/// actually has is a staged version that was never activated, which its own
+/// next reconcile discards - so the compensation does happen, just not where
+/// this plan could watch it.
+async fn only_departed_targets_are_left(
+    state: &CatalogState,
+    plan: &DeploymentPlan,
+    report: &DeliveryReport,
+    lease: &DeploymentPlanLease,
+) -> ApiResult<bool> {
+    if report.failed.is_empty() {
+        return Ok(false);
+    }
+    let deadline = state.abandon_departed_target_after.as_secs() as i64;
+    let now = now_secs();
+    let age = now.saturating_sub(plan.created_at);
+    // The same two clocks the post-commit path uses, and the same reason: the
+    // fleet's own record of when it dropped a machine answers "how long has it
+    // been gone", and the plan's age is the fallback for a name there is no
+    // such record for.
+    let gone_for = |node: &str| match state.nodes.departed_at(node) {
+        Some(at) => now.saturating_sub(at.timestamp()),
+        None => age,
+    };
+    if report
+        .failed
+        .iter()
+        .any(|failure| state.nodes.node(&failure.node).is_some() || gone_for(&failure.node) < deadline)
+    {
+        return Ok(false);
+    }
+
+    for failure in &report.failed {
+        error!(
+            plan = %plan.id,
+            node = %failure.node,
+            app_id = %plan.app_id,
+            env_id = %plan.env_id,
+            gone_for_secs = gone_for(&failure.node),
+            error = %failure.error,
+            "A target this deployment had already prepared left the fleet before acknowledging \
+             the abort, and has not come back within the deadline, so it is recorded as abandoned \
+             and this plan is allowed to fail rather than stay in aborting for ever. Nothing was \
+             activated on that machine - the plan never committed - and a node discards a staged \
+             version it is not assigned the next time it reconciles, so the compensation still \
+             happens; what is given up here is watching it happen"
+        );
+        state
+            .store
+            .record_deployment_target_observation(
+                DeploymentTargetObservation {
+                    plan_id: plan.id.clone(),
+                    node_id: failure.node.clone(),
+                    observed_state: ABANDONED.to_string(),
+                    version_id: Some(plan.version_id.clone()),
+                    routing_generation: Some(plan.routing_generation.to_string()),
+                    message: Some(format!(
+                        "off the fleet for {}s, past the {deadline}s deadline; never acknowledged \
+                         the abort",
+                        gone_for(&failure.node)
+                    )),
+                    observed_at: now_secs(),
+                },
+                lease.coordinator_id(),
+            )
+            .await?;
+    }
+    Ok(true)
+}
+
+/// The same rule for the other half of a plan's frozen participants: a proxy
+/// that is no longer a live session.
+///
+/// It is a separate function only because a proxy's presence is a different
+/// question - a live gRPC session rather than a row on the fleet list - and
+/// the answer is read from a different place. The hole it closes is the same
+/// one, and closing only the runtime half would have left a plan that can be
+/// held for ever by a proxy instead of by a node, which is not a fix.
+///
+/// A proxy's frozen list is taken from the sessions that were live when the
+/// plan was made, so "not a live session now" is exactly the negation of what
+/// put the name there. A restarting proxy reconnects and reports, which is why
+/// the same deadline applies here: it is the interval that separates "gone for
+/// a moment" from "gone".
+async fn abandon_departed_proxies(
+    state: &CatalogState,
+    plan: &DeploymentPlan,
+    generation: &str,
+    age: i64,
+) -> ApiResult<()> {
+    if plan.proxy_ids.is_empty() {
+        return Ok(());
+    }
+    let live: std::collections::HashSet<String> = state
+        .sessions
+        .snapshot()
+        .into_iter()
+        .filter(|session| matches!(&session.node_role, NodeRole::Proxy(_)))
+        .map(|session| session.node_id.clone())
+        .collect();
+    let observations = state.store.deployment_proxy_observations(&plan.id).await?;
+
+    for proxy in &plan.proxy_ids {
+        let settled = observations.iter().any(|observation| {
+            observation.proxy_id == *proxy
+                && observation.routing_generation == generation
+                && (observation.observed_state == "routing_applied"
+                    || observation.observed_state == ABANDONED)
+        });
+        if settled || live.contains(proxy) {
+            continue;
+        }
+
+        error!(
+            plan = %plan.id,
+            proxy = %proxy,
+            app_id = %plan.app_id,
+            env_id = %plan.env_id,
+            generation = %generation,
+            waited_secs = age,
+            "A proxy this deployment froze as a participant is no longer connected and has not \
+             reported this routing generation within the deadline, so it is recorded as abandoned \
+             and this plan is allowed to finish. Nothing observed that proxy publishing this \
+             table. A proxy that reconnects fetches the whole routing table on its next poll, so \
+             what was lost here is the confirmation and not the table itself; a proxy that never \
+             reconnects was not going to serve this generation whatever this plan did"
+        );
+
+        state
+            .store
+            .record_deployment_proxy_observation(
+                DeploymentProxyObservation {
+                    plan_id: plan.id.clone(),
+                    proxy_id: proxy.clone(),
+                    observed_state: ABANDONED.to_string(),
+                    routing_table_version: String::new(),
+                    routing_generation: generation.to_string(),
+                    observed_at: now_secs(),
+                })
+            .await?;
+    }
+    Ok(())
+}
+
+/// Record every frozen target that has left the fleet and run out of time, so
+/// a committed plan can reach a terminal state instead of holding its
+/// environment for ever.
+///
+/// # Why a plan could not finish at all
+///
+/// `finalize_if_observed` advances to `active` only when *every* frozen target
+/// has reported the exact generation. The target list is frozen when the plan
+/// is created and keeps names that have since gone quiet, which is right: a
+/// node that is rebooting must still be pushed to when it answers. But a
+/// machine that never answers again can never report anything, so that
+/// universal quantifier is never satisfied, and the plan stays in
+/// `activating`, `reconciling` or `degraded` - all three of which are in the
+/// set that refuses the next deployment to that environment with "a deployment
+/// plan is already in progress". No operator action clears it: the coordinator
+/// does not die, it succeeds at an impossible action every two seconds, and
+/// deregistering the node turns the push failure from a transport error into
+/// an unknown-node error without making it any less of a failure.
+///
+/// # What this does and does not decide
+///
+/// Only a target that is **not on the fleet at this moment** is eligible. A
+/// target that is listed and failing is waited for indefinitely, unchanged: it
+/// is a machine with a problem, and giving up on it would be this function
+/// papering over exactly what an operator needs to see.
+///
+/// The deadline is measured against how long the machine has been gone, taken
+/// from the fleet's own record of when it dropped it, and against the plan's
+/// age only when there is no such record. See the comment at the measurement
+/// for why the plan's clock alone would make every deployment after a machine
+/// was switched off take the whole deadline.
+async fn abandon_departed_participants(
+    state: &CatalogState,
+    plan: &DeploymentPlan,
+    generation: &str,
+    lease: &DeploymentPlanLease,
+) -> ApiResult<()> {
+    let deadline = state.abandon_departed_target_after.as_secs() as i64;
+    let now = now_secs();
+    let age = now.saturating_sub(plan.created_at);
+
+    // The proxy half has only the plan's own clock to measure with, so it is
+    // still gated on the plan being old enough.
+    if age >= deadline {
+        abandon_departed_proxies(state, plan, generation, age).await?;
+    }
+
+    let observations = state.store.deployment_target_observations(&plan.id).await?;
+    for target in &plan.target_ids {
+        let settled = observations.iter().any(|observation| {
+            target_is(observation, target, "active", plan, generation)
+                || target_is(observation, target, ABANDONED, plan, generation)
+        });
+        if settled || state.nodes.node(target).is_some() {
+            continue;
+        }
+
+        // How long this machine has been gone, from the better of two clocks.
+        //
+        // The fleet remembers when it dropped a node, and that is the clock
+        // that answers the question actually being asked. Measuring from the
+        // plan instead would restart the wait at every deployment: a machine
+        // that has been gone since Tuesday is frozen into every plan made
+        // since - `serving_target_ids` keeps naming it on purpose, so that a
+        // deploy says which machine it could not reach - and each of those
+        // plans would sit out the whole deadline again before it could end.
+        // One machine switched off would make every deployment take ten
+        // minutes, for ever.
+        //
+        // The plan's own age is the fallback, for a name the fleet has no
+        // departure record for: one lost before this process started, or
+        // cleared by `DELETE .../registration` while a plan still named it.
+        let gone_for = match state.nodes.departed_at(target) {
+            Some(at) => now.saturating_sub(at.timestamp()),
+            None => age,
+        };
+        if gone_for < deadline {
+            continue;
+        }
+
+        error!(
+            plan = %plan.id,
+            node = %target,
+            app_id = %plan.app_id,
+            env_id = %plan.env_id,
+            generation = %generation,
+            gone_for_secs = gone_for,
+            "A deployment target left the fleet before confirming this generation and has not \
+             come back within the deadline, so it is recorded as abandoned and this plan is \
+             allowed to finish. Nothing observed this machine running this version, and nothing \
+             will: the plan's target list keeps the name, and the observation row says abandoned \
+             rather than active. If that machine returns it asks the control plane what it \
+             should be running and loads the current version from the answer, so what was lost \
+             here is the confirmation and not the delivery. Raise              deployment_target_abandon_after_secs if machines on this installation take longer \
+             than this to come back"
+        );
+
+        state
+            .store
+            .record_deployment_target_observation(
+                DeploymentTargetObservation {
+                    plan_id: plan.id.clone(),
+                    node_id: target.clone(),
+                    observed_state: ABANDONED.to_string(),
+                    version_id: Some(plan.version_id.clone()),
+                    routing_generation: Some(generation.to_string()),
+                    message: Some(format!(
+                        "off the fleet for {gone_for}s, past the {deadline}s deadline; never \
+                         confirmed this generation"
+                    )),
+                    observed_at: now_secs(),
+                },
+                lease.coordinator_id(),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 /// Resume every plan whose outcome was not durably terminal. All wire actions
@@ -1339,6 +1676,18 @@ async fn reconcile_claimed_plan(
             let _ = abort_prepared_plan(state, &env, &plan, &mut payload, reason, lease).await?;
         }
         "activating" | "reconciling" | "degraded" => {
+            // Before the proxy gate, not after it. A plan waiting on a proxy
+            // that has gone returns from that gate and never reaches
+            // `finalize_if_observed`, so an abandonment that only happened
+            // there would close the runtime half of the hole and leave the
+            // proxy half exactly as it was.
+            abandon_departed_participants(
+                state,
+                &plan,
+                &plan.routing_generation.to_string(),
+                lease,
+            )
+            .await?;
             if !all_proxies_observed(state, &plan).await? {
                 return Ok(());
             }
@@ -1641,7 +1990,7 @@ async fn abort_prepared_plan(
         .push_to(payload, reason, &plan.target_ids)
         .await;
     record_target_report(state, plan, &report, "aborted", lease).await?;
-    if !report.fully_delivered() {
+    if !report.fully_delivered() && !only_departed_targets_are_left(state, plan, &report, lease).await? {
         return Ok(false);
     }
     let terminal = state
@@ -1704,8 +2053,12 @@ async fn all_proxies_observed(state: &CatalogState, plan: &DeploymentPlan) -> Ap
     Ok(plan.proxy_ids.iter().all(|proxy| {
         observations.iter().any(|observation| {
             observation.proxy_id == *proxy
-                && observation.observed_state == "routing_applied"
                 && observation.routing_generation == generation
+                // Abandoned counts as settled here for the same reason it does
+                // for a runtime target: this proxy is not going to report, and
+                // a gate that waits for it is a gate that never opens.
+                && (observation.observed_state == "routing_applied"
+                    || observation.observed_state == ABANDONED)
         })
     }))
 }
@@ -2117,6 +2470,431 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{plan_status}");
         assert_eq!(plan_status["queue"]["active_deployment_id"], plan_id);
         assert!(plan_status["queue"].get("pending_deployment_id").is_none());
+    }
+
+    /// A committed plan whose only runtime target left the fleet used to hold
+    /// its environment for ever.
+    ///
+    /// The mechanism, reproduced below: the plan's pointer has already moved,
+    /// so it is past every state that can be aborted; reaching `active`
+    /// requires every frozen target to report the exact generation; and a
+    /// machine that is no longer on the fleet reports nothing, ever. Every
+    /// state it can be in is in the set that refuses the next deployment to
+    /// that environment, so the environment is undeployable and no operator
+    /// action clears it - `DELETE .../registration` turns the push failure
+    /// from one kind into another without making it less of a failure.
+    ///
+    /// What the test asserts, in order: the environment really is held; the
+    /// deadline is not applied early; once it passes the plan finishes; the
+    /// target is recorded as abandoned rather than as active, because nothing
+    /// observed it running this version; and the environment takes a
+    /// deployment again.
+    #[tokio::test]
+    async fn a_committed_plan_whose_target_left_the_fleet_stops_holding_its_environment() {
+        let mut h = harness(true).await;
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let (_, uploaded) = call(
+            &h.router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(sample_bundle("demo")),
+            "application/zip",
+        )
+        .await;
+        let version_id = uploaded["version"]["id"].as_str().unwrap().to_string();
+        json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+
+        let env = h
+            .state
+            .store
+            .get_environment("demo", "production")
+            .await
+            .unwrap();
+        let version = h.state.store.get_version("demo", &version_id).await.unwrap();
+
+        // A machine that was on the fleet when the plan was made and is not on
+        // it now. Never registered here, which is the same thing this control
+        // plane sees once a registration has expired: the name is in the
+        // plan's frozen target list and nowhere else.
+        let owner = CanonicalId::new_v7();
+        let plan = h
+            .state
+            .store
+            .create_deployment_plan(
+                &env,
+                &version,
+                crate::catalog::store::DeploymentPlanSpec {
+                    snapshot: None,
+                    expected_secret_heads: Default::default(),
+                    compare_secret_heads: false,
+                    target_ids: vec!["runtime-gone".to_string()],
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: None,
+                },
+                owner,
+                30,
+            )
+            .await
+            .unwrap();
+        let prepared = h
+            .state
+            .store
+            .transition_deployment_plan(&plan.id, "preparing", "prepared", None, owner)
+            .await
+            .unwrap();
+        h.state
+            .store
+            .commit_deployment_plan(&prepared, &env, None, owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            h.state.store.deployment_plan(&plan.id).await.unwrap().state,
+            "activating",
+            "the pointer has moved, so the plan is past anything that can be aborted"
+        );
+
+        // The symptom an operator meets: not a slow deployment, a refused one.
+        let (status, refused) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({"version_id": version_id}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the held environment is the whole reason this matters: {refused}"
+        );
+
+        let lease =
+            super::DeploymentPlanLease::start(h.state.store.clone(), plan.id.clone(), owner);
+
+        // Before the deadline, nothing is given up on. A target that is merely
+        // late must not be abandoned because a coordinator happened to look.
+        let waited = super::finalize_if_observed(&h.state, &plan.id, &lease)
+            .await
+            .unwrap();
+        assert_eq!(
+            waited.state, "activating",
+            "a plan seconds old must still be waiting for its target"
+        );
+
+        h.state.abandon_departed_target_after = std::time::Duration::ZERO;
+        let finished = super::finalize_if_observed(&h.state, &plan.id, &lease)
+            .await
+            .unwrap();
+        lease.finish().await;
+        assert_eq!(
+            finished.state, "active",
+            "past the deadline, a target that is no longer a machine must not hold the plan"
+        );
+        assert!(
+            finished
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("abandoned"),
+            "the plan's own note has to say a target was given up on, or the only \
+             record of it is a row nobody reads: {:?}",
+            finished.last_error
+        );
+
+        let observations = h
+            .state
+            .store
+            .deployment_target_observations(&plan.id)
+            .await
+            .unwrap();
+        let observed = observations
+            .iter()
+            .find(|observation| observation.node_id == "runtime-gone")
+            .expect("the abandoned target keeps a row of its own");
+        assert_eq!(
+            observed.observed_state, "abandoned",
+            "nothing observed this machine running this version, so nothing may record that it did"
+        );
+
+        // And the point of all of it: the environment is deployable again.
+        let (status, accepted) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({"version_id": version_id}),
+        )
+        .await;
+        // 201 here rather than 202 because this one has a live target that
+        // confirms inside the request; what is being asserted is that it was
+        // taken at all, not which of the two successes it got.
+        assert!(
+            status.is_success(),
+            "the environment must take a deployment once the held plan has ended, and it \
+             answered {status}: {accepted}"
+        );
+        assert_eq!(
+            accepted["plan"]["target_ids"],
+            serde_json::json!(["runtime-test"]),
+            "the new plan freezes the fleet as it is now, which no longer includes the machine \
+             that left"
+        );
+    }
+
+    /// The third way in, and the one that is easiest to dismiss: a plan that
+    /// never committed anything.
+    ///
+    /// `aborting` is pre-commit compensation - the production pointer never
+    /// moved - so it is tempting to think a stuck one is harmless. It is not:
+    /// `aborting` is in the same set of states that refuses the next
+    /// deployment to that environment, so a plan that changed nothing can hold
+    /// the environment exactly as firmly as one that changed everything.
+    #[tokio::test]
+    async fn an_aborting_plan_whose_target_left_the_fleet_stops_holding_its_environment() {
+        let mut h = harness(true).await;
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let (_, uploaded) = call(
+            &h.router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(sample_bundle("demo")),
+            "application/zip",
+        )
+        .await;
+        let version_id = uploaded["version"]["id"].as_str().unwrap().to_string();
+        json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+
+        let env = h
+            .state
+            .store
+            .get_environment("demo", "production")
+            .await
+            .unwrap();
+        let version = h.state.store.get_version("demo", &version_id).await.unwrap();
+        let owner = CanonicalId::new_v7();
+        let plan = h
+            .state
+            .store
+            .create_deployment_plan(
+                &env,
+                &version,
+                crate::catalog::store::DeploymentPlanSpec {
+                    snapshot: None,
+                    expected_secret_heads: Default::default(),
+                    compare_secret_heads: false,
+                    target_ids: vec!["runtime-gone".to_string()],
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: None,
+                },
+                owner,
+                30,
+            )
+            .await
+            .unwrap();
+        let aborting = h
+            .state
+            .store
+            .transition_deployment_plan(
+                &plan.id,
+                "preparing",
+                "aborting",
+                Some("prepare did not reach every target"),
+                owner,
+            )
+            .await
+            .unwrap();
+        h.state
+            .store
+            .release_deployment_plan_lease(&plan.id, owner)
+            .await
+            .unwrap();
+
+        // Nothing changed and the environment is held anyway.
+        let (status, refused) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({"version_id": version_id}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a plan that committed nothing holds the environment just as hard: {refused}"
+        );
+
+        h.state.abandon_departed_target_after = std::time::Duration::ZERO;
+        super::reconcile_plan(&h.state, aborting).await.unwrap();
+
+        let finished = h.state.store.deployment_plan(&plan.id).await.unwrap();
+        assert_eq!(
+            finished.state, "failed",
+            "the compensation has to reach a terminal state even when the machine it was aimed \
+             at is gone"
+        );
+        let observations = h
+            .state
+            .store
+            .deployment_target_observations(&plan.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .find(|observation| observation.node_id == "runtime-gone")
+                .expect("the abandoned target keeps a row of its own")
+                .observed_state,
+            "abandoned",
+            "nobody watched that machine drop the prepared version, so nothing may record that \
+             it acknowledged the abort"
+        );
+
+        let (status, accepted) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({"version_id": version_id}),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "the environment must take a deployment again, and it answered {status}: {accepted}"
+        );
+    }
+
+    /// The same hole on the other half of a plan's participants, and the
+    /// reason it needed its own answer: a plan waiting on a proxy returns from
+    /// the proxy gate in `reconcile_plan` and never reaches the finaliser, so
+    /// an abandonment written only into the finaliser would have left this
+    /// case exactly as it was.
+    #[tokio::test]
+    async fn a_committed_plan_whose_proxy_disconnected_stops_holding_its_environment() {
+        let mut h = harness(true).await;
+        let proxy = std::sync::Arc::new(crate::session::NodeSession::new(
+            "proxy-gone".to_string(),
+            crate::message::NodeInfo {
+                node_role: crate::message::NodeRole::Proxy("test".to_string()),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: vec![8443],
+            },
+        ));
+        proxy
+            .apply(crate::session::NodeEvent::Registered)
+            .await
+            .unwrap();
+        proxy
+            .apply(crate::session::NodeEvent::Heartbeat)
+            .await
+            .unwrap();
+        // Sessions are keyed by their own id, not by the node id they
+        // announce, so the handle to take it away with is this one.
+        let session_id = proxy.id.clone();
+        h.sessions.add(proxy);
+
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let (_, uploaded) = call(
+            &h.router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(sample_bundle("demo")),
+            "application/zip",
+        )
+        .await;
+        let version_id = uploaded["version"]["id"].as_str().unwrap().to_string();
+        json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+
+        // The proxy is frozen into the plan because it is connected now.
+        let (status, deployed) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({"version_id": version_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{deployed}");
+        assert_eq!(
+            deployed["plan"]["proxy_ids"],
+            serde_json::json!(["proxy-gone"])
+        );
+        let plan_id = deployed["plan"]["id"].as_str().unwrap().to_string();
+
+        // And then it is gone, before it ever reported the table.
+        assert!(
+            h.sessions.remove(&session_id).is_some(),
+            "the proxy has to actually leave, or this test asserts nothing"
+        );
+
+        // Through the entry point the resume loop uses, which claims the
+        // plan's lease for itself - the deploy request that made the plan has
+        // already released it.
+        let plan = h.state.store.deployment_plan(&plan_id).await.unwrap();
+        assert_eq!(
+            plan.state, "activating",
+            "the plan is waiting on a proxy that is not there any more"
+        );
+        h.state.abandon_departed_target_after = std::time::Duration::ZERO;
+        super::reconcile_plan(&h.state, plan).await.unwrap();
+
+        let finished = h.state.store.deployment_plan(&plan_id).await.unwrap();
+        assert_eq!(
+            finished.state, "active",
+            "a proxy that is no longer connected must not hold the environment for ever"
+        );
+        let observations = h
+            .state
+            .store
+            .deployment_proxy_observations(&plan_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .find(|observation| observation.proxy_id == "proxy-gone")
+                .expect("the abandoned proxy keeps a row of its own")
+                .observed_state,
+            "abandoned",
+            "nothing observed this proxy publishing this table, so nothing may record that it did"
+        );
     }
 
     #[tokio::test]

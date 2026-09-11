@@ -14,24 +14,57 @@ mod harness;
 
 use harness::{BACKEND_BODY, Backend, Proxy, ProxyOptions, TlsOptions};
 
-/// A syntactically valid `control.secret`. Nothing listens at the address it
-/// is presented to; it only has to pass the configuration file's own check.
-const NODE_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// The trust domain the certificate below is issued in. Any name will do:
+/// nothing on the other end ever reads it, because nothing on the other end
+/// exists.
+const TRUST_DOMAIN: &str = "edge-authority.test";
 
-/// A control plane address on a port nothing is listening on.
+/// A control plane address on a port nothing is listening on, and the identity
+/// this proxy would prove to it.
 ///
 /// The state a proxy is in whenever it starts before its control plane, or
 /// while the control plane is being upgraded, or when the address is simply
 /// wrong. It is not exotic: it is the first few seconds of every deployment
 /// where the two come up together.
-fn unreachable_control() -> String {
+///
+/// The certificate has to be real even though no handshake will ever happen
+/// with it: a proxy attached to a control plane refuses to start without a
+/// `[machine_identity]` table, because everything it would ask that control
+/// plane for is served only on the machine channel, and one that started
+/// without a certificate would poll a route that answers 404 for as long as it
+/// ran. The files are minted here rather than checked in so that an expiry
+/// cannot make this test fail on a date rather than on a behaviour.
+///
+/// The directory comes back with the configuration because deleting it would
+/// take the certificate out from under the running process.
+fn unreachable_control() -> (String, tempfile::TempDir) {
     let port = Proxy::pick_port();
-    format!(
+    let directory = tempfile::tempdir().expect("a directory for this proxy's identity");
+    let authority = deis_identity_test_pki::TestCa::new();
+    let issued = authority.issue(
+        &deis_identity::names::proxy(TRUST_DOMAIN, "deis-proxy-test").expect("a proxy name"),
+    );
+    let files = deis_identity_test_pki::write_files(
+        directory.path(),
+        "proxy",
+        &issued,
+        &authority.root_pem,
+    );
+    let config = format!(
         "\n[control]\n\
          addr = \"http://127.0.0.1:{port}\"\n\
          associated_id = \"deis-proxy-test\"\n\
-         secret = \"{NODE_SECRET}\"\n"
-    )
+         \n[machine_identity]\n\
+         control_endpoint = \"https://127.0.0.1:{port}\"\n\
+         certificate = \"{}\"\n\
+         private_key = \"{}\"\n\
+         trust_root = \"{}\"\n\
+         trust_domain = \"{TRUST_DOMAIN}\"\n",
+        files.certificate.display(),
+        files.private_key.display(),
+        files.trust_root.display(),
+    );
+    (config, directory)
 }
 
 fn status_line(answer: &str) -> &str {
@@ -41,9 +74,13 @@ fn status_line(answer: &str) -> &str {
 #[tokio::test]
 async fn a_control_plane_that_never_answered_refuses_instead_of_forwarding() {
     let backend = Backend::start().await;
+    // Held for the life of the test: the proxy reads these files on an
+    // interval, so a directory dropped here would be one the process watches
+    // disappear.
+    let (control_config, _identity) = unreachable_control();
     let proxy = Proxy::launch(ProxyOptions {
         upstream: backend.addr,
-        extra_config: unreachable_control(),
+        extra_config: control_config,
         // A proxy in this state forwards nothing at all, so "the backend's
         // body came back" is not a readiness signal it can ever produce.
         wait_for_forwarding: false,

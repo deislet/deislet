@@ -905,13 +905,18 @@ document's script. In the order it matters:
 
 ```bash
 #!/bin/bash
-# backup.sh - the four things a control plane cannot be rebuilt without.
+# backup.sh - the things a control plane cannot be rebuilt without.
 set -euo pipefail
 
 DB=/var/lib/deis-control/deis-control.db
 BUNDLES=/var/lib/deis-control/bundles
 KEY=/etc/deis-control/secret.key
 CONF=/etc/deis-control/config.toml
+# The machine identity from [machine], which is what every node and every
+# proxy in this fleet checks before it will talk to this control plane. See
+# the note under the archive line for when these belong in here and when they
+# do not.
+CERTS=/etc/deis-control/certs
 
 BACKUP_DIR=/var/backups/deis-control
 DATE=$(date +%Y%m%d_%H%M%S)
@@ -942,6 +947,22 @@ cp -a "$BUNDLES" "$STAGE/bundles"
 # fleet. Both hold credentials, so the archive is written 0600.
 cp -a "$KEY" "$STAGE/secret.key"
 cp -a "$CONF" "$STAGE/config.toml"
+
+# The machine identity. A restored control plane with the database, the key
+# and the bundles but no certificate comes up, answers /health, serves the
+# console - and no node or proxy in the fleet will complete a handshake with
+# it, so nothing is deployed, nothing registers, and no routing table is
+# fetched. It looks healthier than a restore that failed outright.
+#
+# Whether these three files belong in this archive is the one judgement call
+# in this script. They are not derived state and nothing rebuilds them, so if
+# the authority that issued them is a one-off on somebody's laptop, this
+# archive is the only copy and it has to carry them - and the archive is then
+# as sensitive as the private key in it, which is why the whole thing is 0600
+# already. If the fleet has a real issuer, re-issue on the restored host
+# instead and drop this line: a backup that carries a private key around is
+# one more place that key can be read from.
+cp -a "$CERTS" "$STAGE/certs"
 
 # The absolute path the bundle store lived at. The restore needs it; see
 # below for why.
@@ -977,6 +998,7 @@ DB=/var/lib/deis-control/deis-control.db
 BUNDLES=/var/lib/deis-control/bundles
 KEY=/etc/deis-control/secret.key
 CONF=/etc/deis-control/config.toml
+CERTS=/etc/deis-control/certs
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
@@ -987,6 +1009,22 @@ sudo systemctl stop deis-control
 install -o deis-control -g deis-control -m 600 "$STAGE/deis-control.db" "$DB"
 install -o deis-control -g deis-control -m 600 "$STAGE/secret.key"       "$KEY"
 install -o deis-control -g deis-control -m 600 "$STAGE/config.toml"      "$CONF"
+
+# The machine identity, if this archive carries one. Restored 0600 and owned
+# by the service user, like the master key: a private key readable by anything
+# else on the host is that machine's identity handed over, and this one names
+# the control plane.
+if [ -d "$STAGE/certs" ]; then
+    rm -rf "$CERTS"
+    cp -a "$STAGE/certs" "$CERTS"
+    chown -R deis-control:deis-control "$CERTS"
+    chmod 700 "$CERTS"
+    chmod 600 "$CERTS"/*
+else
+    echo "no machine identity in this archive; re-issue one at $CERTS before" \
+         "starting, or no node or proxy will complete a handshake with this" \
+         "control plane" >&2
+fi
 
 rm -rf "$BUNDLES"
 cp -a "$STAGE/bundles" "$BUNDLES"
@@ -1030,6 +1068,15 @@ This procedure was checked by restoring, on a control plane holding one
 application, one version, one deployment and one secret. What each restore
 produced:
 
+Every row below was produced before the fleet moved to mutual TLS, so each of
+them assumes a control plane a node can reach at all. Since that move there is
+a row above all of them: **no machine identity restored** - `/health` answers
+`200 OK`, the console lists everything, and not one node or proxy completes a
+handshake, so nothing registers, nothing is deployed and no routing table is
+fetched. That failure is invisible to every check in this table, which is why
+the identity is in the script above and why the readiness script, not
+`/health`, is what says a restore worked.
+
 | Restore | `/health` | Versions listed | Node fetches the bundle | Node's assignment list |
 |---|---|---|---|---|
 | Database + configuration only (what this document used to say) | `200 OK` | yes | `500 recorded but missing on disk` | `[]` - the application is withheld, because the master key is gone and its environment cannot be built |
@@ -1047,9 +1094,9 @@ machine it named.
 ### Upgrade Steps
 
 ```bash
-# 1. Backup - all four things, not just the database. An upgrade that has to
-#    be rolled back needs the bundle store and the master key as much as a
-#    restore from a lost machine does.
+# 1. Backup - everything backup.sh takes, not just the database. An upgrade
+#    that has to be rolled back needs the bundle store, the master key and
+#    the machine identity as much as a restore from a lost machine does.
 ./backup.sh
 
 # 2. Download new version

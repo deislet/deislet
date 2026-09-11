@@ -541,30 +541,39 @@ impl Validatable for SystemConfig {
         if let Some(machine_identity) = &self.machine_identity {
             machine_identity.validate()?;
         }
-        // A proxy that is attached to a control plane has to be able to prove
-        // something to it, and there are exactly two things it can prove: a
-        // certificate naming this one proxy, or the value the whole fleet
-        // shares. With neither, the process starts, binds its listeners and
-        // then fails every registration and every routing-table fetch for as
-        // long as it runs - serving whatever stale table it had, which on a
-        // first start is none at all.
+        // A proxy that is attached to a control plane has to be able to reach
+        // it, and there is one way left. The routing table moved to the
+        // control plane's machine channel, and a control plane of this version
+        // does not serve the HTTP form of it on the listener `[control] addr`
+        // names - that listener answers 404 to it, the same as to any path it
+        // does not have. A fleet secret opens nothing there, because there is
+        // nothing there to open.
+        //
+        // So a proxy configured the old way does not fail, which is the
+        // problem. It starts, binds every listener, and then polls a route
+        // that answers 404 for as long as it runs - serving whatever table it
+        // last had, which on a first start is none at all, so every request
+        // falls back to the applications named in its own file. Refusing here
+        // turns an internet-facing process that is permanently and quietly
+        // wrong into a startup error an operator reads once.
         //
         // The check lives here rather than in either section because neither
         // section can see the other: `[control]` cannot know a
-        // `[machine_identity]` table was written, and vice versa. It is also
-        // why a missing `secret` is not an error inside `[control]` itself -
-        // it is only an error together with the absence of the other table.
+        // `[machine_identity]` table was written, and vice versa.
         if let Some(control) = &self.control
-            && control.secret.is_none()
             && self.machine_identity.is_none()
         {
             return Err(ConfigError::ValidationError {
                 message: format!(
-                    "[control] names {} but this proxy can prove nothing to it: there is no \
-                     [control] secret and no [machine_identity] table. It would start, listen, \
-                     and have every registration and every routing-table fetch refused. Add a \
-                     [machine_identity] table, which proves a certificate naming this one proxy, \
-                     or set [control] secret to one of the control plane's node_preshared_keys",
+                    "[control] names {} but there is no [machine_identity] table. The routing \
+                     table this proxy exists to serve is fetched over the control plane's machine \
+                     channel now, proving a certificate that names this one proxy, and a control \
+                     plane of this version does not serve the HTTP form of it at all - a \
+                     [control] secret opens nothing there. Without a certificate this proxy would \
+                     poll a route that answers 404 for as long as it ran and route on whatever it \
+                     could work out from its own file. Add a [machine_identity] table naming this \
+                     proxy's certificate, private key, trust root and the control plane's machine \
+                     endpoint",
                     control.addr
                 ),
             });

@@ -1564,25 +1564,41 @@ impl RuntimeConfig {
 
         self.logging.validate()?;
         self.control.validate()?;
+
+        // A node that is attached to a control plane must be able to reach it,
+        // and there is one way left: the machine channel. Registration, the
+        // assignment list and the bundle download all moved there, and a
+        // control plane of this version does not serve their HTTP forms on the
+        // listener `control.endpoint` names - that listener answers 404 to
+        // them, the same as to any path it does not have.
+        //
+        // So a node configured the old way does not fail, which is the problem.
+        // It starts, binds its data port, asks for its assignments, is told the
+        // route does not exist, and retries for the life of the process - never
+        // loading a version, never announcing itself, and never saying anything
+        // that names the cause. Refusing here turns a fleet member that is
+        // permanently and quietly useless into a startup error an operator
+        // reads once.
+        //
+        // A node with no `control.endpoint` at all is a different thing and is
+        // left alone: it asks nobody what to run and serves what is already in
+        // its local store, which is a supported way to run one.
+        if self.control.endpoint.is_some() && self.machine_identity.is_none() {
+            return Err(anyhow!(
+                "control.endpoint is set but [machine_identity] is not. Everything this node \
+                 asks its control plane for - registering itself, fetching its assignment list, \
+                 downloading a bundle - is served on the control plane's machine channel now, \
+                 over mutual TLS, and a control plane of this version does not serve the HTTP \
+                 forms of them at all. Without a certificate this node would retry a route that \
+                 answers 404 for as long as it ran, loading nothing and announcing nothing. Give \
+                 it a [machine_identity] table naming its certificate, private key, trust root \
+                 and the control plane's machine endpoint, or remove control.endpoint and let it \
+                 serve only what is already in its local store"
+            ));
+        }
+
         if let Some(identity) = &self.machine_identity {
             identity.validate()?;
-
-            // Registration has not moved to the machine channel yet: it is
-            // still an HTTP route on the human listener, guarded by the fleet
-            // key. A node with only a machine channel would therefore fetch
-            // its assignments perfectly well and never announce itself, so
-            // the control plane would never push it a deployment and never
-            // fire it a cron occurrence - and nothing about that looks like a
-            // failure from either side.
-            if self.control.endpoint.is_none() {
-                return Err(anyhow!(
-                    "[machine_identity] is configured but control.endpoint is not. Registration \
-                     is still an HTTP route on the control plane's human listener, so without \
-                     that address this node can fetch what it is assigned but can never announce \
-                     itself - it would take no deployment push and no cron fire, while looking \
-                     healthy throughout. Set control.endpoint as well"
-                ));
-            }
 
             // Three listeners, three sockets. The data listener binds
             // `0.0.0.0:http_port`, which covers every address on this host,
@@ -2626,6 +2642,16 @@ mod tests {
             request_timeout_secs = 5
             retry_interval_secs = 3
 
+            # A node that names a control plane has to be able to prove itself
+            # to it; this section is not what the test is about, it is what
+            # makes the configuration a legal one.
+            [machine_identity]
+            certificate = "/etc/deislet/node.crt"
+            private_key = "/etc/deislet/node.key"
+            trust_root = "/etc/deislet/root.pem"
+            trust_domain = "deis.internal"
+            control_endpoint = "https://127.0.0.1:8443"
+
             [bundles]
             dir = "/var/lib/deis/bundles"
             max_bytes = 1048576
@@ -2893,16 +2919,14 @@ mod tests {
         assert!(err.contains("machine_identity.control_endpoint"), "{err}");
     }
 
-    /// The mirror image - an address to dial with nothing to prove when it
-    /// gets there - cannot be written down at all, which is why there is no
-    /// test for it and why the address lives in this table. It used to be a
-    /// key on `[control]`, where the two halves could be configured apart
-    /// and a rule somewhere else had to remember to compare them.
-    /// A node that can be told what to run but can never say it exists.
-    /// Registration has not moved to the machine channel, so the old address
-    /// is still required alongside it.
+    /// A machine channel with no `control.endpoint` beside it used to be
+    /// refused, because registration was still an HTTP route on the human
+    /// listener and a node with only a certificate could be told what to run
+    /// and never say it exists. Registration moved, so that stopped being
+    /// true, and `control.endpoint` is now read only by a node that has no
+    /// identity at all - it must not be demanded of one that does.
     #[test]
-    fn test_validate_rejects_a_machine_channel_with_no_way_to_register() {
+    fn a_machine_channel_needs_no_second_address_beside_it() {
         let config = RuntimeConfig {
             machine_identity: Some(complete_identity()),
             control: ControlPlaneConfig {
@@ -2911,9 +2935,40 @@ mod tests {
             },
             ..RuntimeConfig::default()
         };
+        config
+            .validate()
+            .expect("everything this node asks for is on the machine channel");
+    }
+
+    /// And the mirror image, which is the quieter of the two.
+    ///
+    /// An address to dial with nothing to prove when it gets there used to be
+    /// unwritable: the endpoint and the certificate that goes with it live in
+    /// one table, so they could not be configured apart. `[control]` is the
+    /// older spelling and still has an address of its own, so the pair can be
+    /// split there - and a node that splits them does not fail.
+    ///
+    /// It starts, binds its data port and retries a route that answers 404 for
+    /// as long as it runs: no version loaded, nothing announced, and nothing
+    /// in its log that names the cause. Refusing at startup is the whole
+    /// point, so the message has to name the table that is missing.
+    #[test]
+    fn a_node_that_names_a_control_plane_and_can_prove_nothing_is_refused() {
+        let config = RuntimeConfig {
+            machine_identity: None,
+            control: ControlPlaneConfig {
+                endpoint: Some("http://control.internal:8080".to_string()),
+                secret: Some("node-psk".to_string()),
+                ..ControlPlaneConfig::default()
+            },
+            ..RuntimeConfig::default()
+        };
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("control.endpoint"), "{err}");
-        assert!(err.contains("announce itself"), "{err}");
+        assert!(err.contains("machine_identity"), "{err}");
+        assert!(
+            err.contains("404"),
+            "the message has to say what would have happened instead: {err}"
+        );
     }
 
     #[test]
@@ -3254,10 +3309,17 @@ mod tests {
         }
     }
 
-    /// A node as an existing installation has it: the management plane on the
-    /// data port, and one node key already present for the assignment fetch.
+    /// A node attached to a control plane, with the management plane on the
+    /// data port and `secret` either set or not.
+    ///
+    /// The identity is here because a node that names a control plane has to
+    /// have one - everything it would ask that control plane for is served on
+    /// the machine channel. `secret` no longer takes part in any of that: what
+    /// it still does is open the plaintext management plane, which is what the
+    /// tests below are about.
     fn node_with_secret(secret: Option<&str>) -> RuntimeConfig {
         RuntimeConfig {
+            machine_identity: Some(complete_identity()),
             control: ControlPlaneConfig {
                 endpoint: Some("http://127.0.0.1:8080".to_string()),
                 secret: secret.map(str::to_string),
@@ -3287,12 +3349,23 @@ mod tests {
         );
     }
 
+    /// This test used to say that an operator upgrading had to do nothing,
+    /// because the key the node already held was the one it needed to fetch
+    /// its assignments. That stopped being true when the assignment fetch
+    /// moved to the machine channel, and the value left behind turned into
+    /// something else entirely.
+    ///
+    /// It is not a credential this node presents any more. It is a door it
+    /// opens: `management_keys` still folds it in, so whoever holds that
+    /// string can drive the plaintext management plane - which shares the data
+    /// port, on `0.0.0.0`, unless `[management] listen` has moved it. The name
+    /// `control.secret` reads like the first thing and does the second, which
+    /// is why `main` warns about it at startup and why this test holds the
+    /// behaviour in place rather than letting it be discovered.
     #[test]
-    fn the_node_key_an_existing_installation_already_has_is_enough() {
-        // What an operator upgrading has to do: nothing, as long as the node
-        // already holds the key it needs to fetch its assignments.
+    fn a_control_secret_left_behind_opens_the_plaintext_management_plane() {
         let config = node_with_secret(Some("node-psk"));
-        config.validate().expect("a configured node key is enough");
+        config.validate().expect("a leftover key is not a startup error");
         assert_eq!(config.management_keys(), vec!["node-psk".to_string()]);
         assert_eq!(
             config.management_bind_addr().unwrap().to_string(),

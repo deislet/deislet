@@ -30,6 +30,7 @@ pub mod storage;
 pub mod versions;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -45,6 +46,7 @@ use crate::catalog::{
     ProviderDriverDispatcher, SecretsBackend,
 };
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
+use crate::runtime_client::RuntimeNodeManager;
 use crate::session::SessionManager;
 
 /// Largest bundle the control plane will accept in one upload. Bundles
@@ -91,6 +93,19 @@ pub struct CatalogState {
     /// Live proxy identities are frozen into deployment plans and checked
     /// again when a proxy reports that a routing table is applied.
     pub sessions: Arc<SessionManager>,
+    /// The fleet as it is right now, for the one question a deployment plan
+    /// cannot answer from its own rows: is this target still a machine at all?
+    ///
+    /// A plan's target list is frozen when it is created and keeps every name
+    /// in it. That is right for a node that has gone quiet and will answer
+    /// again, and it is what makes a committed plan unable to finish when a
+    /// node leaves for good - nothing in the plan distinguishes the two.
+    /// Here is where the difference is looked up.
+    pub nodes: Arc<RuntimeNodeManager>,
+    /// How long a committed plan waits for a target that is no longer on the
+    /// fleet before recording it as abandoned, from
+    /// `deployment_target_abandon_after_secs`.
+    pub abandon_departed_target_after: Duration,
 }
 
 /// Build the product half of the catalog router: everything the dashboard
@@ -391,7 +406,6 @@ pub(crate) mod tests {
     use crate::catalog::{SecretCipher, secrets::MASTER_KEY_LEN};
     use crate::database::Database;
     use crate::delivery::PublicAddress;
-    use crate::runtime_client::RuntimeNodeManager;
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -665,6 +679,7 @@ pub(crate) mod tests {
             });
         }
         let runtime_nodes = Arc::new(RuntimeNodeManager::new(node_configs, 15));
+        let runtime_nodes_for_state = Arc::clone(&runtime_nodes);
         let sessions = Arc::new(SessionManager::new());
         let state = CatalogState {
             store: Arc::clone(&store),
@@ -683,6 +698,12 @@ pub(crate) mod tests {
             )),
             node_auth: NodeAuthConfig::new(node_keys),
             sessions: Arc::clone(&sessions),
+            nodes: Arc::clone(&runtime_nodes_for_state),
+            // Long enough that no test reaches it by accident; a test about
+            // abandonment sets its own.
+            abandon_departed_target_after: Duration::from_secs(
+                crate::config::default_deployment_target_abandon_after_secs(),
+            ),
         };
         Harness {
             // Both halves, mounted the way the API mounts them: the node

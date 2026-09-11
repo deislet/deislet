@@ -274,6 +274,51 @@ pub struct ControlConfig {
     /// says they exist.
     #[serde(default = "default_node_registration_ttl")]
     pub node_registration_ttl_secs: u64,
+    /// Seconds a committed deployment waits for a target that has left the
+    /// fleet before recording it as abandoned and letting the plan finish
+    /// (default: 600).
+    ///
+    /// A plan freezes its target list when it is created and keeps every name
+    /// in it, deliberately: a node that is merely quiet must still be pushed
+    /// to when it answers again. But a plan whose pointer has already moved
+    /// reaches its terminal state only when *every* frozen target has
+    /// confirmed the exact generation, and a machine that never comes back
+    /// cannot confirm anything. Without a deadline that plan stays
+    /// non-terminal for ever, which holds the environment: the next deployment
+    /// to it is refused with "a deployment plan is already in progress", and
+    /// no operator action clears it.
+    ///
+    /// So the deadline exists, and it is only ever applied to a target that is
+    /// **not on the fleet list at this moment**. A target that is listed and
+    /// failing is a different thing and is waited for indefinitely, as before -
+    /// that is a node with a problem, not a node that is gone.
+    ///
+    /// It must be comfortably longer than `node_registration_ttl_secs` plus
+    /// however long a machine on this installation takes to reboot: a node
+    /// that is restarting is off the list for the remainder of its
+    /// registration lifetime plus its boot time, and abandoning it because it
+    /// took ninety seconds too long would be this platform giving up on a
+    /// machine that was coming back.
+    ///
+    /// Abandoning a push is not abandoning the deployment. A node asks the
+    /// control plane what it should be running every time it starts, so a
+    /// machine that returns after its plan has finished loads the current
+    /// version from the assignment list on its own. What is lost by the
+    /// deadline is the confirmation, not the delivery - which is why the
+    /// target is recorded as `abandoned` rather than as active, and stays that
+    /// way in the plan's observations for anyone asking later why a machine
+    /// briefly ran something else.
+    #[serde(default = "default_deployment_target_abandon_after_secs")]
+    pub deployment_target_abandon_after_secs: u64,
+}
+
+/// Default deadline for a committed deployment's departed target.
+///
+/// Ten minutes: long enough for a machine to reboot and re-register several
+/// times over, short enough that an environment is not held for an afternoon
+/// by one machine that was decommissioned mid-deployment.
+pub fn default_deployment_target_abandon_after_secs() -> u64 {
+    600
 }
 
 /// Default lifetime of a node registration, in seconds.
@@ -423,6 +468,7 @@ impl Default for ControlConfig {
             provider_deployment_max_concurrency: default_provider_deployment_max_concurrency(),
             cron_tick_seconds: default_cron_tick_seconds(),
             node_registration_ttl_secs: default_node_registration_ttl(),
+            deployment_target_abandon_after_secs: default_deployment_target_abandon_after_secs(),
         }
     }
 }
@@ -522,6 +568,10 @@ impl std::fmt::Debug for ControlConfig {
             .field(
                 "node_registration_ttl_secs",
                 &self.node_registration_ttl_secs,
+            )
+            .field(
+                "deployment_target_abandon_after_secs",
+                &self.deployment_target_abandon_after_secs,
             )
             .finish()
     }

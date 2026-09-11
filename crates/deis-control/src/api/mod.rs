@@ -818,10 +818,18 @@ async fn build_catalog_state(
         // own storage calls carry.
         storage: storage.clone(),
         deliverer: Arc::new(DeploymentDeliverer::new(
-            store, secrets, nodes, address, storage,
+            store,
+            secrets,
+            Arc::clone(&nodes),
+            address,
+            storage,
         )),
         node_auth,
         sessions,
+        nodes,
+        abandon_departed_target_after: std::time::Duration::from_secs(
+            config.deployment_target_abandon_after_secs,
+        ),
     }
 }
 
