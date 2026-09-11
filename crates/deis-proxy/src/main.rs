@@ -24,7 +24,7 @@ use deis_proxy::cli::CliConfig;
 use deis_proxy::config::system::acme::{LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING};
 use deis_proxy::config::system::{LogLevel, MachineIdentityConfig};
 use deis_proxy::config::{ConfigManager, SystemConfig};
-use deis_proxy::control::{ControlService, ProxyControlClient};
+use deis_proxy::control::{ControlService, control_client};
 use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic, InheritedListeners};
 use deis_proxy::restart::{
     ProcessControl, RelaunchArgs, announce_ready, check_upgrade_socket_path, executable_path,
@@ -261,11 +261,16 @@ fn announce_acme(system: &SystemConfig, settings: &deis_proxy::config::system::A
 /// Load this proxy's machine-channel identity: the certificate it presents on
 /// that channel, and the material behind it kept fresh on disk.
 ///
-/// What uses it today is the routing-table poller, which fetches the catalog's
-/// table over the machine channel instead of over HTTP with the fleet secret
-/// whenever this table is present; see `deis_proxy::catalog::client`.
-/// Registration, heartbeats and the gRPC control channel have not moved and
-/// still dial with `control.secret`.
+/// Two things use it once this table is present. The routing-table poller
+/// fetches the catalog's table over the machine channel instead of over HTTP
+/// with the fleet secret (`deis_proxy::catalog::client`), and the long-lived
+/// gRPC control channel - registration, heartbeats, commands, configuration
+/// pushes - runs on a mutual-TLS connection to the same listener instead of a
+/// plaintext dial of `[control] addr` (`deis_proxy::control::client`). The
+/// handshake on that channel still carries `control.secret`, because the
+/// control plane still decides authentication by comparing it; see
+/// `control::client::machine_channel` for why sending it is right until that
+/// changes.
 ///
 /// Fails rather than starting with a `[machine_identity]` table that cannot
 /// load. Starting anyway would leave [`MachineIdentityWatch`] re-reading
@@ -297,9 +302,10 @@ fn load_machine_identity(config: &MachineIdentityConfig) -> Result<Arc<MachineId
         control_endpoint = %config.control_endpoint,
         reload_secs = config.identity_reload_seconds,
         "loaded this proxy's machine-channel identity; the files are re-read on that interval, \
-         so a renewal needs no restart. The routing table is fetched over the machine channel \
-         with it. Registration, heartbeats and the control channel still dial with \
-         control.secret, because those routes have not moved yet"
+         so a renewal needs no restart and is presented by the next connection either channel \
+         makes. The routing table and the long-lived control channel both run on the machine \
+         channel with it. The control channel's handshake still carries control.secret, because \
+         the control plane still authenticates by comparing it"
     );
     Ok(Arc::new(identity))
 }
@@ -526,7 +532,8 @@ fn main() -> Result<()> {
             info!(
                 "no machine_identity configured; this proxy holds no certificate on the machine \
                  channel and authenticates to the control plane exactly as it does today - the \
-                 routing table included, fetched over HTTP with the fleet-wide secret"
+                 routing table fetched over HTTP with the fleet-wide secret, and the control \
+                 channel a plaintext dial of [control] addr presenting the same secret"
             );
             None
         }
@@ -652,13 +659,32 @@ fn main() -> Result<()> {
 
     match &system.control {
         Some(control) => {
-            info!(addr = %control.addr, instance = %control.associated_id, "control configured");
+            // Paired here because the two halves live in two places: the
+            // loaded material above, and the table that says where to take it
+            // and whose name to expect there. Both or neither - a
+            // `[machine_identity]` table that failed to load has already
+            // stopped this process. One pairing for both clients below: the
+            // control channel and the routing table are two users of one
+            // identity, and a proxy that moved one of them and not the other
+            // would be the half-migrated state this table exists to avoid.
+            let identity = machine_identity
+                .as_ref()
+                .map(|(identity, _)| identity)
+                .zip(system.machine_identity.as_ref());
             let mut ports = system.listen_ports();
             ports.extend(tls_ports.iter().copied());
-            let mut client = ProxyControlClient::new(control.clone())
+            let mut client = control_client(control, identity)
                 .map_err(|e| anyhow::anyhow!("creating control client: {e}"))?
                 .with_listen_ports(ports)
                 .with_config_manager(Arc::clone(&config));
+            // `addr` is what this process actually connects to, which is not
+            // `[control] addr` once the machine channel is in use.
+            info!(
+                addr = %client.dialled(),
+                transport = client.transport(),
+                instance = %control.associated_id,
+                "control configured"
+            );
             client.set_process_channel(commands.clone());
             server.add_service(background_service("control", ControlService::new(client)));
 
@@ -666,15 +692,6 @@ fn main() -> Result<()> {
             // the server, so an upgrade replaces it rather than stacking
             // another poll loop on top; see deis_proxy::catalog.
             let routing = system.routing();
-            // Paired here because the two halves live in two places: the
-            // loaded material above, and the table that says where to take it
-            // and whose name to expect there. Both or neither - a
-            // `[machine_identity]` table that failed to load has already
-            // stopped this process.
-            let identity = machine_identity
-                .as_ref()
-                .map(|(identity, _)| identity)
-                .zip(system.machine_identity.as_ref());
             match routing_table_client(control, identity, routing.max_table_bytes()) {
                 Ok(client) => {
                     match routing.preview_zone() {

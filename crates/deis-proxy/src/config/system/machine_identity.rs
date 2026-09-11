@@ -5,17 +5,28 @@
 //! # What this is, today
 //!
 //! Absent unless an operator writes a `[machine_identity]` table. With it
-//! present, one thing moves: the catalog's routing table is fetched over the
-//! control plane's machine channel, as a `FetchRoutingTable` call proving
-//! this certificate, instead of over HTTP with the fleet secret in the
-//! `Authorization` header (see [`crate::catalog::client`]). Everything else
-//! this proxy asks the control plane - registration, heartbeats, the gRPC
-//! control channel configured by `[control]` - still dials with that shared
-//! secret, because those routes have not moved yet.
+//! present, two things move onto the control plane's machine channel, both
+//! proving this certificate and both requiring the control plane to prove its
+//! own name back. The catalog's routing table is fetched as a
+//! `FetchRoutingTable` call instead of over HTTP with the fleet secret in the
+//! `Authorization` header (see [`crate::catalog::client`]); and the long-lived
+//! gRPC control channel - registration, heartbeats, commands, configuration
+//! pushes - is opened over a mutual-TLS connection to the same listener
+//! instead of a plaintext dial of `[control] addr` (see
+//! [`crate::control::client`]).
+//!
+//! One thing has not moved with it: the handshake on that control channel
+//! still carries `[control] secret`. The control plane decides authentication
+//! by comparing that value, so a proxy that sent none would be refused; what
+//! retires the secret is the control plane accepting the proved name in its
+//! place. Until then it travels inside a connection that is encrypted and
+//! whose far end has proved who it is, which is strictly better than where it
+//! travelled before.
 //!
 //! With the table absent, nothing changes at all: the routing table is
-//! fetched over HTTP exactly as it was. See `crates/deis-identity` for the
-//! certificate format and what carrying this identity lets a peer refuse.
+//! fetched over HTTP and the control channel is dialled in plaintext, exactly
+//! as they were. See `crates/deis-identity` for the certificate format and
+//! what carrying this identity lets a peer refuse.
 //!
 //! # Naming the control plane
 //!
@@ -39,9 +50,9 @@
 //! # Where the address is written, and why not beside the other one
 //!
 //! The machine channel is a listener of its own on a port of its own, so
-//! `[control] addr` - the human listener, where registration and the gRPC
-//! control channel still live - does not say where it is. Somewhere has to,
-//! and `control_endpoint` below is it.
+//! `[control] addr` - the human listener, which is still where a proxy
+//! without this table goes for everything - does not say where it is.
+//! Somewhere has to, and `control_endpoint` below is it.
 //!
 //! Next to the identity, because an address and the name that must be proved
 //! at it are one fact rather than two. A machine-channel address with no

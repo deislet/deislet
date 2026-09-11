@@ -23,6 +23,9 @@ use axum::routing::get;
 use axum_server::tls_rustls::RustlsConfig;
 use deis_identity::{IdentityFiles, MachineIdentity, Protocol};
 use deis_wire::machine::machine_channel_server::MachineChannelServer;
+use deis_wire::pb::control_service_server::ControlServiceServer;
+
+use crate::api::grpc::GrpcControlService;
 use tonic::service::Routes;
 use tracing::{error, info, warn};
 
@@ -65,10 +68,16 @@ pub fn load_identity(config: &MachineChannelConfig) -> anyhow::Result<Arc<Machin
 /// No CORS, no console fallback and no human authentication layer: none of
 /// them has a caller here, and a layer mounted where it has no caller is a
 /// layer nobody notices is misconfigured.
-pub fn router(state: CatalogState) -> Router {
-    let rpcs = Routes::default().add_service(MachineChannelServer::new(
-        MachineChannelService::new(state.clone()),
-    ));
+pub fn router(state: CatalogState, control: ControlServiceServer<GrpcControlService>) -> Router {
+    let rpcs = Routes::default()
+        .add_service(MachineChannelServer::new(MachineChannelService::new(
+            state.clone(),
+        )))
+        // The long-lived channel a proxy holds open. It belongs here for the
+        // same reason the rest does - it is a machine talking to a machine -
+        // and it is mounted here as well as on the human listener while the
+        // fleet moves, so a proxy can find it either way for one release.
+        .add_service(control);
     rpcs.into_axum_router().merge(
         Router::new()
             .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
@@ -194,7 +203,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
         let address = listener.local_addr().expect("an address");
-        let app = router(harness.state.clone());
+        let app = router(harness.state.clone(), test_control_service());
         tokio::spawn(async move {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });
@@ -251,7 +260,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
         let address = listener.local_addr().expect("an address");
-        let app = router(harness.state.clone());
+        let app = router(harness.state.clone(), test_control_service());
         tokio::spawn(async move {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });
@@ -293,6 +302,16 @@ mod tests {
             .await
             .expect_err("the old name was still accepted after the renewal");
         assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// The long-lived channel service, in the shape this listener mounts it.
+    /// These tests are about who is admitted rather than about that service,
+    /// so it is built with an empty configuration and never called.
+    fn test_control_service() -> ControlServiceServer<GrpcControlService> {
+        ControlServiceServer::new(GrpcControlService::new(
+            Arc::new(crate::config::ControlConfig::default()),
+            Arc::new(crate::session::SessionManager::new()),
+        ))
     }
 
     fn load_from(

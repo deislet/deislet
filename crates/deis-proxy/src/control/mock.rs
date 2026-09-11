@@ -1,67 +1,190 @@
 //! In-process control for client tests. It answers the handshake the way
 //! deis-control does and lets a test refuse connection attempts or cut the live
 //! streams, so retry behaviour can be exercised without a real outage.
+//!
+//! It listens either in plaintext, as the control plane's human listener does,
+//! or behind the same mutual TLS the machine channel demands - so one mock
+//! answers both of the transports `super::client::control_client` chooses
+//! between, and a test of the machine-channel path is a test of a real
+//! handshake rather than of a stand-in for one.
 
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Context, Poll};
 
+use deis_identity::MachineIdentity;
 use deis_wire::pb::control_message::Payload;
 use deis_wire::pb::control_service_server::{ControlService, ControlServiceServer};
 use deis_wire::pb::{AuthResponse, ControlMessage, RegisterResponse};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_stream::{Stream, StreamExt};
+use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 
 pub struct MockControl {
-    /// gRPC endpoint, ready to use as `ControlConfig::addr`.
+    /// gRPC endpoint, ready to use as `ControlConfig::addr` on the plaintext
+    /// listener, or as `machine_identity.control_endpoint` on the TLS one.
     pub addr: String,
     connections: Arc<AtomicU32>,
     refuse: Arc<AtomicU32>,
     cut: broadcast::Sender<()>,
+    secrets: Arc<Mutex<Vec<String>>>,
     registrations: mpsc::UnboundedReceiver<u32>,
-    server: JoinHandle<()>,
+    /// The serving task, and on the TLS listener the accept loop feeding it.
+    tasks: Vec<JoinHandle<()>>,
 }
 
 struct Service {
     connections: Arc<AtomicU32>,
     refuse: Arc<AtomicU32>,
     cut: broadcast::Sender<()>,
+    secrets: Arc<Mutex<Vec<String>>>,
     registered: mpsc::UnboundedSender<u32>,
 }
 
+/// A TLS connection tonic will serve on.
+///
+/// tonic implements its [`Connected`] trait for tokio-rustls' server stream
+/// only behind its own `tls` feature, and turning that on would pull a second
+/// TLS stack into this crate's tests beside the one `deis-identity` already
+/// builds, to gain an implementation whose whole content is connection
+/// metadata nothing here reads. So the wrapper states it instead: there is no
+/// connection information this mock consults, because what the peer proved was
+/// settled by the handshake before the stream reached tonic at all.
+struct TlsIo(tokio_rustls::server::TlsStream<TcpStream>);
+
+impl Connected for TlsIo {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl AsyncRead for TlsIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TlsIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
 impl MockControl {
+    /// The control plane's human listener: plaintext, as a proxy with no
+    /// identity reaches it.
     pub async fn start() -> Self {
+        Self::listen(None).await
+    }
+
+    /// The machine listener: the same service, behind a handshake that will
+    /// not complete for a caller who cannot prove a name this identity's
+    /// trust root signed.
+    pub async fn start_over_mutual_tls(identity: Arc<MachineIdentity>) -> Self {
+        Self::listen(Some(identity)).await
+    }
+
+    async fn listen(identity: Option<Arc<MachineIdentity>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let local = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicU32::new(0));
         let refuse = Arc::new(AtomicU32::new(0));
+        let secrets = Arc::new(Mutex::new(Vec::new()));
         let (cut, _) = broadcast::channel(4);
         let (registered, registrations) = mpsc::unbounded_channel();
         let service = Service {
             connections: Arc::clone(&connections),
             refuse: Arc::clone(&refuse),
             cut: cut.clone(),
+            secrets: Arc::clone(&secrets),
             registered,
         };
-        let server = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(ControlServiceServer::new(service))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .expect("mock control failed");
-        });
+        let server = ControlServiceServer::new(service);
+
+        let (addr, tasks) = match identity {
+            None => (
+                format!("http://{local}"),
+                vec![tokio::spawn(async move {
+                    let _ = tonic::transport::Server::builder()
+                        .add_service(server)
+                        .serve_with_incoming(TcpListenerStream::new(listener))
+                        .await;
+                })],
+            ),
+            Some(identity) => {
+                let acceptor = tokio_rustls::TlsAcceptor::from(identity.server_config());
+                // Buffered rather than handed over one at a time so a
+                // handshake that never completes - which is what a caller
+                // with no certificate looks like from here - cannot hold up
+                // the next connection.
+                let (accepted, incoming) = mpsc::channel(4);
+                let accepting = tokio::spawn(async move {
+                    loop {
+                        let Ok((stream, _)) = listener.accept().await else {
+                            return;
+                        };
+                        let acceptor = acceptor.clone();
+                        let accepted = accepted.clone();
+                        tokio::spawn(async move {
+                            // A caller that could not prove a name never
+                            // becomes a connection tonic sees, which is the
+                            // point of this listener.
+                            if let Ok(tls) = acceptor.accept(stream).await {
+                                let _ = accepted.send(Ok::<TlsIo, io::Error>(TlsIo(tls))).await;
+                            }
+                        });
+                    }
+                });
+                let serving = tokio::spawn(async move {
+                    let _ = tonic::transport::Server::builder()
+                        .add_service(server)
+                        .serve_with_incoming(ReceiverStream::new(incoming))
+                        .await;
+                });
+                (format!("https://{local}"), vec![accepting, serving])
+            }
+        };
+
         Self {
             addr,
             connections,
             refuse,
             cut,
+            secrets,
             registrations,
-            server,
+            tasks,
         }
+    }
+
+    /// Every secret this mock has been handed at `Authenticate`, in order.
+    /// What a test checks to see that the handshake above the connection did
+    /// not change when the connection did.
+    pub fn secrets(&self) -> Vec<String> {
+        self.secrets.lock().unwrap().clone()
     }
 
     /// Refuse the next `count` connection attempts.
@@ -91,7 +214,9 @@ impl MockControl {
 
 impl Drop for MockControl {
     fn drop(&mut self) {
-        self.server.abort();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -119,6 +244,7 @@ impl ControlService for Service {
         let (tx, rx) = mpsc::channel(16);
         let mut cut = self.cut.subscribe();
         let registered = self.registered.clone();
+        let secrets = Arc::clone(&self.secrets);
         tokio::spawn(async move {
             let mut authenticated = false;
             loop {
@@ -134,6 +260,7 @@ impl ControlService for Service {
                 };
                 let reply = match payload {
                     Payload::Authenticate(req) => {
+                        secrets.lock().unwrap().push(req.secret.clone());
                         authenticated = !req.secret.is_empty();
                         Payload::AuthResponse(AuthResponse {
                             success: authenticated,

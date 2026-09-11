@@ -7,6 +7,6 @@ mod mock;
 pub mod service;
 pub mod state;
 
-pub use client::ProxyControlClient;
+pub use client::{ProxyControlClient, control_client};
 pub use service::ControlService;
 pub use state::ProxyStateManager;

@@ -1,6 +1,33 @@
 //! Wire client implementation (gRPC)
 //!
 //! Async client based on gRPC unified message system
+//!
+//! # Who builds the connection, and why it is not this crate
+//!
+//! [`WireClient`] can either dial for itself or run on a channel its caller
+//! built. Dialling for itself is the original behaviour and still the default:
+//! `connect` opens a plaintext connection to [`ControlConfig::addr`] and the
+//! handshake presents [`ControlConfig::secret`], the fleet-wide value every
+//! process holds a copy of.
+//!
+//! A caller that has a machine identity wants the other thing - the same
+//! control channel over mutual TLS, on a connection where the control plane
+//! has proved its own name and this process has proved the one name it may
+//! speak for. That handshake needs a certificate, a private key, a trust root
+//! and an X.509 parser to read the peer's name back out, which is what
+//! `deis-identity` is; and `deis_identity::Dialler` is already exactly the
+//! `tower` connector `tonic::transport::Endpoint` asks for.
+//!
+//! It would be a mistake to reach for it from here. Fifteen crates depend on
+//! deis-wire, most of them for the message models and [`crate::conventions`]
+//! alone, and a dependency added here is added to all of them: a TLS stack and
+//! a certificate parser compiled into every one of those builds so that one
+//! client can be handed a connector. So the dependency runs the other way
+//! round. deis-wire knows what a `tonic::transport::Channel` is, because it is
+//! a gRPC client and cannot avoid knowing; the caller that has an identity
+//! builds the channel with it and hands it over through
+//! [`WireClient::on_channel`], and the callers that have none are not made to
+//! carry the machinery.
 
 use crate::config::{ControlConfig, NodeInfo};
 use crate::error::WireError;
@@ -22,6 +49,13 @@ pub struct WireClient {
     config: ControlConfig,
     /// Node information
     node_info: NodeInfo,
+    /// The channel this client runs on, when the caller built one.
+    ///
+    /// `None` is the original behaviour and what every caller without an
+    /// identity gets: [`Self::connect`] dials [`ControlConfig::addr`] in
+    /// plaintext itself. See the module note for why a caller with an
+    /// identity builds this rather than describing it to this crate.
+    channel: Option<Channel>,
     /// gRPC request sender
     request_tx: Option<mpsc::Sender<ControlMessage>>,
     /// gRPC response receiver
@@ -33,11 +67,12 @@ pub struct WireClient {
 }
 
 impl WireClient {
-    /// Create a new client instance
+    /// Create a new client instance, dialling [`ControlConfig::addr`] itself.
     pub fn new(config: ControlConfig, node_info: NodeInfo) -> Self {
         Self {
             config,
             node_info,
+            channel: None,
             request_tx: None,
             response_rx: None,
             authenticated: false,
@@ -45,15 +80,54 @@ impl WireClient {
         }
     }
 
+    /// Create a client that runs on a channel the caller has already built.
+    ///
+    /// Everything above the connection is unchanged: the same
+    /// `EstablishChannel` stream, the same handshake, the same
+    /// [`ControlConfig::secret`] in it. What the caller decides by building
+    /// the channel is only how the connection underneath is made - which host
+    /// it goes to, and what, if anything, is proved on it.
+    ///
+    /// The channel is expected to be one that reconnects on its own, which is
+    /// what `tonic` hands back: this client calls [`Self::connect`] again
+    /// after every break, and each call opens a fresh `EstablishChannel`
+    /// stream on the same channel rather than building a new one.
+    pub fn on_channel(config: ControlConfig, node_info: NodeInfo, channel: Channel) -> Self {
+        Self {
+            channel: Some(channel),
+            ..Self::new(config, node_info)
+        }
+    }
+
+    /// Whether this client runs on a channel its caller built, rather than
+    /// dialling [`ControlConfig::addr`] itself.
+    ///
+    /// For a caller that logs which of the two it ended up on, and for a test
+    /// that checks a configuration produced the transport it asked for.
+    pub fn runs_on_a_supplied_channel(&self) -> bool {
+        self.channel.is_some()
+    }
+
     /// Connect to control
     pub async fn connect(&mut self) -> Result<(), WireError> {
-        let url = self.config.grpc_endpoint();
-
-        let channel = Channel::from_shared(url.clone())
-            .map_err(|e| WireError::ConfigurationError(format!("Invalid URL: {e}")))?
-            .connect()
-            .await
-            .map_err(|e| WireError::ConnectionError(format!("Failed to connect to {url}: {e}")))?;
+        let channel = match &self.channel {
+            // Cloning a `tonic` channel does not open a second connection: it
+            // is a handle onto one connection and its reconnect logic, so
+            // every reconnection this client makes goes back through the same
+            // channel, and through whatever connector the caller built it
+            // with.
+            Some(channel) => channel.clone(),
+            None => {
+                let url = self.config.grpc_endpoint();
+                Channel::from_shared(url.clone())
+                    .map_err(|e| WireError::ConfigurationError(format!("Invalid URL: {e}")))?
+                    .connect()
+                    .await
+                    .map_err(|e| {
+                        WireError::ConnectionError(format!("Failed to connect to {url}: {e}"))
+                    })?
+            }
+        };
 
         let mut client = ControlServiceClient::new(channel);
         let (tx, rx) = mpsc::channel(128);
@@ -275,6 +349,17 @@ impl WireClient {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tokio_stream::{Stream, StreamExt};
+    use tonic::transport::Endpoint;
+    use tonic::{Response, Status, Streaming};
+
+    use crate::pb::control_service_server::{ControlService, ControlServiceServer};
+    use crate::pb::{AuthResponse, RegisterResponse};
+
     use super::*;
 
     fn create_test_config() -> ControlConfig {
@@ -302,5 +387,167 @@ mod tests {
         assert!(!client.is_connected());
         assert!(!client.is_authenticated());
         assert!(!client.is_registered());
+        assert!(
+            !client.runs_on_a_supplied_channel(),
+            "a client built the way it always was still dials for itself"
+        );
+    }
+
+    /// What the mock control plane was given, so a test can check that the
+    /// handshake above the connection did not change when the connection did.
+    #[derive(Default)]
+    struct Seen {
+        /// One per `EstablishChannel` call, which is one per connect.
+        streams: u32,
+        secret: Option<String>,
+        instance_id: Option<String>,
+        registered: bool,
+    }
+
+    /// A stand-in for deis-control's `EstablishChannel`: it answers the
+    /// handshake the way the real one does and keeps what arrived.
+    struct MockControl {
+        seen: Arc<Mutex<Seen>>,
+    }
+
+    #[tonic::async_trait]
+    impl ControlService for MockControl {
+        type EstablishChannelStream =
+            Pin<Box<dyn Stream<Item = Result<ControlMessage, Status>> + Send + 'static>>;
+
+        async fn establish_channel(
+            &self,
+            request: Request<Streaming<ControlMessage>>,
+        ) -> Result<Response<Self::EstablishChannelStream>, Status> {
+            self.seen.lock().unwrap().streams += 1;
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel(16);
+            let seen = Arc::clone(&self.seen);
+            tokio::spawn(async move {
+                while let Some(Ok(ControlMessage {
+                    payload: Some(payload),
+                })) = inbound.next().await
+                {
+                    let reply = match payload {
+                        Payload::Authenticate(request) => {
+                            let mut seen = seen.lock().unwrap();
+                            seen.secret = Some(request.secret.clone());
+                            seen.instance_id = Some(request.instance_id.clone());
+                            Payload::AuthResponse(AuthResponse {
+                                success: !request.secret.is_empty(),
+                                message: "welcome".to_string(),
+                            })
+                        }
+                        Payload::Register(_) => {
+                            seen.lock().unwrap().registered = true;
+                            Payload::RegisterResponse(RegisterResponse {
+                                success: true,
+                                message: "registered".to_string(),
+                            })
+                        }
+                        _ => continue,
+                    };
+                    let reply = ControlMessage {
+                        payload: Some(reply),
+                    };
+                    if tx.send(Ok(reply)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        }
+    }
+
+    /// Start the mock on a port of the operating system's choosing, and hand
+    /// back where it is and what it has seen.
+    async fn mock_control() -> (String, Arc<Mutex<Seen>>) {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let served = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(ControlServiceServer::new(MockControl { seen: served }))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        (addr, seen)
+    }
+
+    /// The unchanged path: no channel supplied, so the client dials
+    /// `ControlConfig::addr` itself, in plaintext, and presents the fleet
+    /// secret exactly as it always has.
+    #[tokio::test]
+    async fn a_client_with_no_channel_dials_the_configured_address_itself() {
+        let (addr, seen) = mock_control().await;
+        let mut config = create_test_config();
+        config.addr = addr;
+        let secret = config.secret.clone();
+
+        let mut client = WireClient::new(config, create_test_node_info());
+        client.connect().await.expect("a connection");
+        client.authenticate().await.expect("an authentication");
+        client.register().await.expect("a registration");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.secret.as_deref(), Some(secret.as_str()));
+        assert_eq!(seen.instance_id.as_deref(), Some("test_node"));
+        assert!(seen.registered);
+    }
+
+    /// The new path: the caller built the channel, so that is what the
+    /// exchange runs on. `addr` is left pointing somewhere nothing answers,
+    /// so a client that quietly went on dialling it could not pass this.
+    #[tokio::test]
+    async fn a_supplied_channel_carries_the_handshake_instead_of_the_configured_address() {
+        let (addr, seen) = mock_control().await;
+        let mut config = create_test_config();
+        config.addr = "http://127.0.0.1:1".to_string();
+        let secret = config.secret.clone();
+        // Lazy on purpose: this is the shape a caller with a connector of its
+        // own builds, and it means the channel exists before anything has
+        // been dialled - the connection is made by the first call on it.
+        let channel = Endpoint::from_shared(addr)
+            .expect("a usable endpoint")
+            .connect_lazy();
+
+        let mut client = WireClient::on_channel(config, create_test_node_info(), channel);
+        assert!(client.runs_on_a_supplied_channel());
+        client.connect().await.expect("a connection");
+        client.authenticate().await.expect("an authentication");
+        client.register().await.expect("a registration");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.secret.as_deref(),
+            Some(secret.as_str()),
+            "the handshake above the connection is the same one on either transport"
+        );
+        assert!(seen.registered);
+    }
+
+    /// A reconnection re-opens the stream on the channel it was given rather
+    /// than building a second one. This is what lets a caller hand over a
+    /// channel whose connector resolves a certificate per connection and have
+    /// a renewal reach a redial without anything being rebuilt.
+    #[tokio::test]
+    async fn reconnecting_re_opens_the_stream_on_the_same_supplied_channel() {
+        let (addr, seen) = mock_control().await;
+        let channel = Endpoint::from_shared(addr)
+            .expect("a usable endpoint")
+            .connect_lazy();
+
+        let mut client =
+            WireClient::on_channel(create_test_config(), create_test_node_info(), channel);
+        client.connect().await.expect("a connection");
+        client.disconnect().await.expect("a disconnection");
+        client.connect().await.expect("a second connection");
+
+        assert_eq!(
+            seen.lock().unwrap().streams,
+            2,
+            "each connect opens one EstablishChannel stream"
+        );
     }
 }

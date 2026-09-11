@@ -104,3 +104,9 @@ deis-identity-test-pki = { path = "../deis-identity-test-pki" }
 # Somewhere for tests/upgrade_framing_test.rs to put the configuration, the
 # database and the log of the proxy process it starts.
 tempfile = "3"
+# The mock control plane in src/control/mock.rs listens behind the same mutual
+# TLS the real machine channel demands, so the control-channel tests exercise
+# a real handshake. The version is the one deis-identity builds its
+# configurations for: the acceptor here is handed that crate's `ServerConfig`,
+# so two different tokio-rustls would not type-check.
+tokio-rustls = "0.26"

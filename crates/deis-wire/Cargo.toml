@@ -37,6 +37,12 @@ protoc-bin-vendored = "=3.2.0"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["json"] }
+# The in-process control plane `client`'s tests speak to is a real tonic
+# server on a real socket, and `TcpListenerStream` - the adapter that turns a
+# bound listener into the stream `serve_with_incoming` takes - is behind
+# tokio-stream's "net" feature. Named here rather than added to the dependency
+# above so a build that is not running tests does not carry it.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 # [[example]]
 # name = "extensible_messages"

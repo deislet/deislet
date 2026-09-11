@@ -337,7 +337,14 @@ async fn main() -> Result<(), anyhow::Error> {
             let machine_addr = format!("{}:{}", machine_config.bind_addr, machine_config.port);
             let machine_listener = std::net::TcpListener::bind(&machine_addr)?;
             machine_listener.set_nonblocking(true)?;
-            let machine_app = deis_control::machine::listen::router(api.catalog_state.clone());
+            let machine_app = deis_control::machine::listen::router(
+                api.catalog_state.clone(),
+                // A second server value, not the one merged into the human
+                // app: a tonic service is consumed by the router it is added
+                // to, and both listeners carry this service while the fleet
+                // moves off the shared key.
+                server.build_grpc_service(),
+            );
             let shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
                 deis_control::machine::listen::serve(

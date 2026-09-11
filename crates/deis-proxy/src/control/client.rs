@@ -12,19 +12,43 @@
 //! - `app.<id>`: one application, inserted or updated.
 //! - `system`: a system configuration overlay (traffic policy only, see
 //!   [`ControlSystemConfig`]).
+//!
+//! # Two transports, one channel
+//!
+//! The channel itself - `deis.control.ControlService/EstablishChannel`, the
+//! stream registration, heartbeats, commands and configuration pushes all run
+//! on - is the same either way. What differs is the connection under it, and
+//! [`control_client`] is the one place that chooses.
+//!
+//! Without a `[machine_identity]` table, the connection is a plaintext dial of
+//! `[control] addr`, the control plane's human listener, exactly as it has
+//! always been.
+//!
+//! With one, the connection is made by `deis_identity::Dialler` to
+//! `machine_identity.control_endpoint`: mutual TLS, this proxy proving the one
+//! name its certificate carries and refusing to talk to anything that cannot
+//! prove the control plane's name back. The same channel the routing-table
+//! poller already runs on; see [`crate::catalog::client`], which made the same
+//! move for the catalog first.
+//!
+//! The fleet secret is still presented in the handshake on both. See
+//! [`machine_channel`] for why that is not a leftover.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use deis_identity::{Dialler, MachineIdentity, Protocol};
 use deis_wire::pb::control_message::Payload;
 use deis_wire::pb::{CommandRequest, CommandResponse};
 use deis_wire::{ControlConfig, NodeInfo, NodeRole, SdkResult, WireClient, WireError};
 use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
 use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
+use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
+use crate::config::system::MachineIdentityConfig;
 use crate::config::{
     AppConfig, AppConfigEntry, ConfigError, ConfigManager, ControlAppsConfig, ControlSystemConfig,
     Validatable,
@@ -138,11 +162,139 @@ pub async fn release_control_channel_for_handover(patience: Duration) -> bool {
     .unwrap_or(false)
 }
 
+/// The mutual-TLS connection the control channel runs on when this proxy has
+/// an identity.
+struct MachineChannel {
+    /// What the channel is built from, rather than the channel itself.
+    ///
+    /// A `tonic` channel spawns a task of its own the moment it is built - the
+    /// worker behind the buffer every call goes through - so it belongs to the
+    /// runtime that built it. `main` builds this client on a throwaway
+    /// initialization runtime that is shut down before pingora takes over, so
+    /// a channel built there would lose that worker before the first
+    /// connection was ever made, and every call on it afterwards would fail
+    /// for a reason with nothing to do with the control plane. The two halves
+    /// below cost nothing to hold and are bound to no runtime; the channel is
+    /// made from them at the first connection, on the runtime that will serve
+    /// it. See [`ProxyControlClient::open_channel`].
+    endpoint: Endpoint,
+    dialler: Dialler,
+    /// `machine_identity.control_endpoint` exactly as it was written, for log
+    /// lines. `[control] addr` names the human listener and says nothing
+    /// about where this connection goes, so a log line that printed it would
+    /// name the wrong machine.
+    written: String,
+    /// Built at the first connection and kept for the life of the process.
+    ///
+    /// One channel, not one per attempt. A `tonic` channel reconnects on its
+    /// own - every break is followed by a redial through the connector it was
+    /// built with - and the connector here is a [`Dialler`], which resolves
+    /// the certificate material from the identity at the moment it dials
+    /// rather than capturing it when it was made. So a renewal that
+    /// `MachineIdentityWatch` picks up off disk is presented by the next
+    /// redial, with nothing here told that anything changed, and nothing here
+    /// left presenting a certificate that has quietly expired.
+    channel: Option<Channel>,
+}
+
+/// Work out what the control channel will be built from when
+/// `[machine_identity]` is configured: mutual TLS to
+/// `machine_identity.control_endpoint`, proving `identity`, requiring the
+/// control plane's own name to be proved back.
+///
+/// Everything that can be refused is refused here, at startup, where an
+/// operator is watching: an endpoint that is not a usable URI, and an identity
+/// that names no control plane to expect. What is left for the first
+/// connection is only the part that needs a runtime.
+///
+/// # Why the secret is still sent on it
+///
+/// The handshake on this channel still carries `[control] secret`, and that is
+/// deliberate rather than left over. Authentication on `EstablishChannel` is
+/// the control plane's decision, and today it makes it by comparing that
+/// secret; a proxy that proved a certificate and then sent no secret would be
+/// refused at `Authenticate` by every control plane now deployed. Sending it
+/// over this connection is also strictly better than sending it over the old
+/// one, because it now travels inside a connection that is encrypted and whose
+/// far end has proved it is the control plane. What removes it is the control
+/// plane accepting the proved name in its place, and on the day that lands the
+/// field can stop being filled in here; until then, not sending it would be a
+/// client deciding one half of a two-sided contract on its own.
+fn machine_channel(
+    control: &ControlConfig,
+    identity: &Arc<MachineIdentity>,
+    config: &MachineIdentityConfig,
+) -> SdkResult<MachineChannel> {
+    let expected = config.expected_control_identity().map_err(|error| {
+        WireError::ConfigurationError(format!(
+            "machine_identity does not name a control plane to expect: {error}. A connection that \
+             required no name would accept any certificate this trust root signed, which is the \
+             failure the machine channel exists to close"
+        ))
+    })?;
+    let endpoint = Endpoint::from_shared(config.control_endpoint.clone())
+        .map_err(|error| {
+            WireError::ConfigurationError(format!(
+                "machine_identity.control_endpoint {:?} is not a usable URI: {error}",
+                config.control_endpoint
+            ))
+        })?
+        // The connect only. Deliberately not `Endpoint::timeout`, which is a
+        // deadline on every call made on the channel: `EstablishChannel` is a
+        // stream that is meant to stay open for the life of the process, and a
+        // per-call deadline would tear it down on a schedule. What bounds a
+        // connection attempt as a whole is `connect_with_backoff` below.
+        .connect_timeout(control.request_timeout_duration());
+    Ok(MachineChannel {
+        endpoint,
+        dialler: Dialler::new(
+            Arc::clone(identity),
+            expected,
+            // HTTP/2 because that is what gRPC is, asked for by ALPN rather
+            // than hoped for, so a control plane that would only speak
+            // HTTP/1.1 fails at the handshake where the reason is legible.
+            &[Protocol::Http2],
+        ),
+        written: config.control_endpoint.clone(),
+        channel: None,
+    })
+}
+
+/// Build the control client this configuration asks for: the machine channel
+/// if this proxy has an identity, a plaintext dial of `[control] addr` if it
+/// has not.
+///
+/// The choice lives here rather than at the call site in `main` so that it is
+/// one function with one rule in it, and so a test can ask what a given
+/// configuration produces without starting a proxy. It is the same shape, for
+/// the same reasons, as [`crate::catalog::routing_table_client`].
+pub fn control_client(
+    control: &ControlConfig,
+    identity: Option<(&Arc<MachineIdentity>, &MachineIdentityConfig)>,
+) -> SdkResult<ProxyControlClient> {
+    let client = ProxyControlClient::new(control.clone())?;
+    match identity {
+        Some((identity, config)) => {
+            Ok(client.over_machine_channel(machine_channel(control, identity, config)?))
+        }
+        None => Ok(client),
+    }
+}
+
 pub struct ProxyControlClient {
     deis_wire_client: WireClient,
     state_manager: Arc<ProxyStateManager>,
     config: ControlConfig,
     backoff: Backoff,
+    /// The ports announced at registration. Kept rather than only handed to
+    /// the wire client, because the wire client is rebuilt whenever another
+    /// builder changes what it runs on, and a rebuild must not quietly go
+    /// back to announcing the defaults.
+    ports: Vec<u16>,
+    /// The connection the channel runs on, when this proxy has an identity.
+    /// `None` leaves the wire client dialling `[control] addr` itself, which
+    /// is what a proxy without one has always done.
+    channel: Option<MachineChannel>,
     /// Where commands that act on the whole process are sent.
     process_tx: Option<broadcast::Sender<ProcessCommand>>,
     /// Configuration store updated by pushes. Absent in tests.
@@ -167,31 +319,97 @@ impl ProxyControlClient {
             warn!(instance = %config.associated_id, "{advisory}");
         }
         let state_manager = Arc::new(ProxyStateManager::new(config.associated_id.clone()));
-        let deis_wire_client = Self::build_deis_wire_client(&config, vec![80, 443]);
+        let ports = vec![80, 443];
+        let deis_wire_client = Self::build_deis_wire_client(&config, ports.clone(), None);
         Ok(Self {
             deis_wire_client,
             state_manager,
             config,
             backoff: Backoff::default(),
+            ports,
+            channel: None,
             process_tx: None,
             config_manager: None,
             started_at: Instant::now(),
         })
     }
 
-    fn build_deis_wire_client(config: &ControlConfig, ports: Vec<u16>) -> WireClient {
+    fn build_deis_wire_client(
+        config: &ControlConfig,
+        ports: Vec<u16>,
+        channel: Option<Channel>,
+    ) -> WireClient {
         let node_info = NodeInfo::new(
             NodeRole::Proxy(env!("CARGO_PKG_VERSION").to_string()),
             "0.0.0.0".to_string(),
             ports,
         );
-        WireClient::new(config.clone(), node_info)
+        match channel {
+            Some(channel) => WireClient::on_channel(config.clone(), node_info, channel),
+            None => WireClient::new(config.clone(), node_info),
+        }
+    }
+
+    /// Rebuild the wire client from what this one is now configured with.
+    ///
+    /// Everything that changes an input goes through here, so the order it
+    /// happens in does not matter. That is not theoretical: the channel is
+    /// made at the first connection, long after `main` has announced the
+    /// listening ports, and a rebuild that read the ports from anywhere but
+    /// this client would quietly go back to announcing the defaults at the
+    /// moment the proxy moved onto the machine channel. Nothing live is
+    /// discarded either - the builders run before [`Self::run`], and
+    /// [`Self::open_channel`] rebuilds only on the attempt that has no
+    /// connection yet.
+    fn rebuild_deis_wire_client(&mut self) {
+        self.deis_wire_client = Self::build_deis_wire_client(
+            &self.config,
+            self.ports.clone(),
+            // Cloning a tonic channel shares one connection and its reconnect
+            // logic rather than opening a second.
+            self.channel
+                .as_ref()
+                .and_then(|machine| machine.channel.clone()),
+        );
     }
 
     /// Announce the ports this instance actually listens on.
     pub fn with_listen_ports(mut self, ports: Vec<u16>) -> Self {
-        self.deis_wire_client = Self::build_deis_wire_client(&self.config, ports);
+        self.ports = ports;
+        self.rebuild_deis_wire_client();
         self
+    }
+
+    /// Run the control channel on the machine channel, which is what a
+    /// `[machine_identity]` table asks for. See [`machine_channel`] for what
+    /// is settled here and what is left until the first connection, and
+    /// [`control_client`] for the choice itself.
+    ///
+    /// The wire client is not rebuilt here: there is no channel yet to give
+    /// it, only what one will be made from.
+    fn over_machine_channel(mut self, channel: MachineChannel) -> Self {
+        self.channel = Some(channel);
+        self
+    }
+
+    /// Which connection this client's channel runs on, in the words a log
+    /// line has room for. Also what a test asserts on to check the choice was
+    /// made the way the configuration asked for.
+    pub fn transport(&self) -> &'static str {
+        match &self.channel {
+            Some(_) => "machine channel",
+            None => "human listener",
+        }
+    }
+
+    /// Where this client actually connects, as the operator wrote it - which
+    /// is `machine_identity.control_endpoint` and not `[control] addr` once
+    /// the machine channel is in use.
+    pub fn dialled(&self) -> &str {
+        match &self.channel {
+            Some(machine) => &machine.written,
+            None => &self.config.addr,
+        }
     }
 
     /// Attach the configuration store that pushes are applied to.
@@ -293,7 +511,8 @@ impl ProxyControlClient {
             attempt += 1;
             info!(
                 instance = %self.config.associated_id,
-                addr = %self.config.addr,
+                addr = %self.dialled(),
+                transport = self.transport(),
                 attempt,
                 "connecting to control"
             );
@@ -342,6 +561,7 @@ impl ProxyControlClient {
             if rejected || attempt >= self.config.retry_count {
                 error!(
                     instance = %self.config.associated_id,
+                    transport = self.transport(),
                     attempt,
                     error = %error,
                     next_attempt_in = ?delay,
@@ -350,6 +570,7 @@ impl ProxyControlClient {
             } else {
                 warn!(
                     instance = %self.config.associated_id,
+                    transport = self.transport(),
                     attempt,
                     error = %error,
                     next_attempt_in = ?delay,
@@ -361,8 +582,32 @@ impl ProxyControlClient {
         }
     }
 
+    /// Open the channel, building it first if this is the first connection.
+    ///
+    /// The one place `WireClient::connect` is called from, and it must stay
+    /// that way: a call that skipped this would find a wire client that had no
+    /// channel yet and would quietly dial `[control] addr` in plaintext -
+    /// which is to say a proxy configured for mutual TLS would fall back to
+    /// the fleet secret without anything saying so.
+    ///
+    /// Building here rather than at construction is what keeps the channel on
+    /// the runtime that will serve it; see [`MachineChannel`].
+    async fn open_channel(&mut self) -> SdkResult<()> {
+        if let Some(machine) = &mut self.channel
+            && machine.channel.is_none()
+        {
+            machine.channel = Some(
+                machine
+                    .endpoint
+                    .connect_with_connector_lazy(machine.dialler.clone()),
+            );
+            self.rebuild_deis_wire_client();
+        }
+        self.deis_wire_client.connect().await
+    }
+
     async fn connect_and_register(&mut self) -> SdkResult<()> {
-        self.deis_wire_client.connect().await?;
+        self.open_channel().await?;
         self.deis_wire_client.authenticate().await?;
         self.deis_wire_client.register().await?;
         self.state_manager
@@ -595,6 +840,9 @@ impl ProxyControlClient {
 
 #[cfg(test)]
 mod tests {
+    use deis_identity::names;
+    use deis_identity_test_pki::{TestCa, write_files};
+
     use super::*;
     use crate::control::mock::MockControl;
 
@@ -637,6 +885,228 @@ mod tests {
         if !CLIENT_PRESENT.load(std::sync::atomic::Ordering::Acquire) {
             assert!(release_control_channel_for_handover(Duration::from_millis(10)).await);
         }
+    }
+
+    /// A loaded identity naming one machine in `deis.internal`, signed by
+    /// `ca`. `serves` is what that machine's own listener will advertise -
+    /// empty for the proxy, which only dials.
+    fn identity(
+        ca: &TestCa,
+        directory: &std::path::Path,
+        name: &str,
+        id: deis_identity::SpiffeId,
+        serves: &[Protocol],
+    ) -> (Arc<MachineIdentity>, MachineIdentityFiles) {
+        let files = write_files(directory, name, &ca.issue(&id), &ca.root_pem);
+        let identity = Arc::new(
+            MachineIdentity::load(files.as_identity_files(), serves).expect("an identity"),
+        );
+        let paths = MachineIdentityFiles {
+            certificate: files.certificate.display().to_string(),
+            private_key: files.private_key.display().to_string(),
+            trust_root: files.trust_root.display().to_string(),
+        };
+        (identity, paths)
+    }
+
+    /// The three paths as they are written in a configuration file.
+    struct MachineIdentityFiles {
+        certificate: String,
+        private_key: String,
+        trust_root: String,
+    }
+
+    fn machine_identity_config(
+        files: &MachineIdentityFiles,
+        control_endpoint: &str,
+    ) -> MachineIdentityConfig {
+        MachineIdentityConfig {
+            certificate: files.certificate.clone(),
+            private_key: files.private_key.clone(),
+            trust_root: files.trust_root.clone(),
+            identity_reload_seconds: 60,
+            trust_domain: TRUST_DOMAIN.to_string(),
+            control_endpoint: control_endpoint.to_string(),
+            ..Default::default()
+        }
+    }
+
+    const TRUST_DOMAIN: &str = "deis.internal";
+
+    #[test]
+    fn no_identity_leaves_the_control_channel_exactly_where_it_was() {
+        let client = control_client(&test_config(), None).unwrap();
+        assert_eq!(client.transport(), "human listener");
+        assert_eq!(
+            client.dialled(),
+            "http://localhost:8080",
+            "a proxy with no certificate still dials [control] addr"
+        );
+    }
+
+    /// Deliberately not a `#[tokio::test]`: this is how `main` builds the
+    /// client - on the initialization path, outside the throwaway runtime it
+    /// uses there and long before pingora's own runtime exists. A client that
+    /// made its channel at construction would spawn that channel's worker
+    /// onto a runtime that is shut down before the first connection, or, with
+    /// none running at all, panic here.
+    #[test]
+    fn an_identity_moves_the_control_channel_onto_the_machine_channel() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let ca = TestCa::new();
+        let (identity, files) = identity(
+            &ca,
+            directory.path(),
+            "proxy",
+            names::proxy(TRUST_DOMAIN, "test-worker").expect("a proxy name"),
+            &[],
+        );
+        let config = machine_identity_config(&files, "https://control.internal:8443");
+        config.validate().expect("a complete table");
+
+        let client = control_client(&test_config(), Some((&identity, &config))).unwrap();
+        assert_eq!(client.transport(), "machine channel");
+        assert_eq!(
+            client.dialled(),
+            "https://control.internal:8443",
+            "the machine channel is a listener of its own on a port of its own, not [control] addr"
+        );
+
+        // Order-independence: the builders that follow in `main` must not put
+        // the transport back, and the transport must not put the announced
+        // ports back to the defaults.
+        let client = client.with_listen_ports(vec![8080, 8443]);
+        assert_eq!(client.transport(), "machine channel");
+        assert_eq!(client.ports, vec![8080, 8443]);
+    }
+
+    #[test]
+    fn an_identity_whose_control_name_cannot_be_built_is_reported_rather_than_dialled() {
+        // Unreachable through a validated configuration - `[machine_identity]`
+        // refuses this at startup - but the two checks are in different files,
+        // and a client that quietly dialled a nameless peer would be trusting
+        // whatever certificate answered.
+        let directory = tempfile::tempdir().expect("a directory");
+        let ca = TestCa::new();
+        let (identity, files) = identity(
+            &ca,
+            directory.path(),
+            "proxy",
+            names::proxy(TRUST_DOMAIN, "test-worker").expect("a proxy name"),
+            &[],
+        );
+        let config = MachineIdentityConfig {
+            trust_domain: String::new(),
+            ..machine_identity_config(&files, "https://control.internal:8443")
+        };
+        // Matched rather than unwrapped: `ProxyControlClient` holds a channel
+        // and a state machine, neither of which has a `Debug`, so the success
+        // case cannot be printed by `expect_err`.
+        let error = match control_client(&test_config(), Some((&identity, &config))) {
+            Ok(_) => panic!("a peer with no name is not a peer"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, WireError::ConfigurationError(_)),
+            "{error:?}"
+        );
+    }
+
+    /// One fleet: a control plane that serves the machine channel, and a proxy
+    /// that dials it.
+    struct Fleet {
+        control: Arc<MachineIdentity>,
+        proxy: Arc<MachineIdentity>,
+        files: MachineIdentityFiles,
+        _directory: tempfile::TempDir,
+    }
+
+    fn fleet() -> Fleet {
+        let directory = tempfile::tempdir().expect("a directory");
+        let ca = TestCa::new();
+        let (control, _) = identity(
+            &ca,
+            directory.path(),
+            "control",
+            names::control(TRUST_DOMAIN).expect("a control name"),
+            // The machine listener carries gRPC, and saying so at the
+            // handshake is what the proxy's dialler asks for.
+            &[Protocol::Http2],
+        );
+        let (proxy, files) = identity(
+            &ca,
+            directory.path(),
+            "proxy",
+            names::proxy(TRUST_DOMAIN, "test-worker").expect("a proxy name"),
+            &[],
+        );
+        Fleet {
+            control,
+            proxy,
+            files,
+            _directory: directory,
+        }
+    }
+
+    /// The whole path: a listener that will not talk to an unnamed caller, a
+    /// proxy that proves a name to reach it, and a control channel that
+    /// registers over the connection they agreed on.
+    #[tokio::test]
+    async fn a_proxy_with_an_identity_registers_over_mutual_tls() {
+        let fleet = fleet();
+        let mut control = MockControl::start_over_mutual_tls(Arc::clone(&fleet.control)).await;
+        let config = machine_identity_config(&fleet.files, &control.addr);
+        config.validate().expect("a complete table");
+
+        let mut client = control_client(&test_config(), Some((&fleet.proxy, &config)))
+            .unwrap()
+            .with_backoff(fast_backoff());
+        assert_eq!(client.transport(), "machine channel");
+        // Bounded rather than left to `connect_with_backoff`, which retries
+        // for ever on purpose: a handshake that cannot complete has to end
+        // this test with the reason it failed, not by running out of time.
+        timeout(Duration::from_secs(10), client.connect_and_register())
+            .await
+            .expect("a handshake, a registration, or an error - not a hang")
+            .expect("the control plane proved its name and took the registration");
+
+        assert_eq!(control.next_registration().await, 1);
+        assert!(client.is_ready().await);
+        assert_eq!(client.current_state().await, State::Active);
+        assert_eq!(
+            control.secrets(),
+            vec![test_config().secret],
+            "the control plane still authenticates by comparing the fleet secret, so the \
+             handshake carries it on this connection too - see `machine_channel`"
+        );
+    }
+
+    /// The same client against a control plane that is not speaking TLS at
+    /// all: it must fail rather than quietly go on in plaintext, because a
+    /// fallback would mean this proxy's certificate proves nothing about the
+    /// connection its control channel actually runs on.
+    #[tokio::test]
+    async fn a_machine_channel_client_does_not_fall_back_to_plaintext() {
+        let fleet = fleet();
+        // The human listener's address, written where the machine channel's
+        // belongs - the mistake `check_control_endpoint` catches when the
+        // scheme gives it away, and cannot when the port is simply wrong.
+        let plaintext = MockControl::start().await;
+        let endpoint = plaintext.addr.replace("http://", "https://");
+        let config = machine_identity_config(&fleet.files, &endpoint);
+
+        let mut client = control_client(&test_config(), Some((&fleet.proxy, &config)))
+            .unwrap()
+            .with_backoff(fast_backoff());
+        let error = timeout(Duration::from_secs(10), client.connect_and_register())
+            .await
+            .expect("a refusal, not a hang")
+            .expect_err("a plaintext listener cannot prove the control plane's name");
+        assert!(matches!(error, WireError::ConnectionError(_)), "{error:?}");
+        assert!(
+            plaintext.secrets().is_empty(),
+            "nothing may be sent to a peer that never proved who it is"
+        );
     }
 
     fn test_config() -> ControlConfig {
