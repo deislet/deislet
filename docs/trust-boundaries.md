@@ -269,20 +269,37 @@ release.** Every environment's secrets are encrypted in the control plane's
 database with one master key from `secret_key_file`
 (`crates/deis-control/src/catalog/secrets.rs`).
 
-**An assignment list is not scoped per node.** `assignments_for` in
-`crates/deis-control/src/api/catalog/assignments.rs` takes a `node_id`, uses it
-for log lines, and builds the answer from `list_assignments()` - the whole
-catalog. The machine channel checks that a caller asks for its *own* id and
-refuses a mismatch, so a node cannot ask for another node's list; what it gets
-back for its own is still every application's decrypted secrets. The bundle
-download is not scoped either: any machine that completes the handshake may
+**Every node runs every application, so every node holds every
+application's secrets.** This is worth stating carefully, because the code
+looks like a missing filter and is not one.
+
+`assignments_for` in `crates/deis-control/src/api/catalog/assignments.rs`
+takes a `node_id`, uses it for log lines, and builds the answer from
+`list_assignments()` - the whole catalog. The machine channel does check that a
+caller asks for its *own* id and refuses a mismatch, so no node can ask for
+another node's list. But the list it gets for itself carries every
+application's decrypted secrets, and adding a filter there would change
+nothing: a deployment plan's `target_ids` comes from
+`Deliverer::serving_target_ids` (`crates/deis-control/src/delivery/mod.rs`),
+which is every node the control plane knows of. There is no placement model in
+this release - no way to say that an application runs on some nodes and not
+others - so there is nothing for a filter to filter by. The bundle download is
+unscoped for the same reason: any machine that completes the handshake may
 download any version of any application.
 
 So the shape of the risk changed and its size did not. A credential that named
-no machine became one that names exactly one, and cannot be copied out of a
+no machine became one that names exactly one and cannot be copied out of a
 configuration file; the answer that credential opens is still the whole
-platform's plaintext. Closing that gap means scoping the assignment list to
-what the identified machine actually runs, and it has not been done.
+platform's plaintext.
+
+**What this means for whether the platform is safe to run.** For an
+installation whose applications all belong to one organisation, this is a
+property and not a hole: every node is trusted with everything because
+everything is the same owner's. For an installation hosting tenants who do not
+trust each other, it is a hole, and closing it is not a patch to
+`assignments_for` - it needs a placement model first (which nodes may run this
+application), and then the scoping follows from it. See
+[ADR-025](adr/025-machine-identity-and-capabilities.md).
 
 ## Related
 
