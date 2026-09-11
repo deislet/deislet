@@ -70,6 +70,51 @@ impl serde::Serialize for NodeKeyFingerprint {
 #[derive(Debug, Clone)]
 pub struct ProvedNodeKey(pub NodeKeyFingerprint);
 
+/// What an address proved about itself when it last registered.
+///
+/// Two things can be proved, and they say different amounts. A fleet key says
+/// "whoever is here holds a secret every machine in this installation holds",
+/// which identifies the installation and not the machine. A certificate says
+/// "whoever is here holds the private key for this one name", which is the
+/// thing a shared secret could never say.
+///
+/// Both are recorded because both can happen while the fleet is moving from
+/// one to the other, and because what the control plane does next differs: a
+/// key has to be checked against the list it came from, and can be retired out
+/// from under a node; a name cannot be retired by editing a list, and is
+/// either still signed by this fleet's authority at the next handshake or is
+/// not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeProof {
+    /// The fleet key this address presented, named by fingerprint.
+    PresharedKey(NodeKeyFingerprint),
+    /// The name this address proved with a certificate on the machine channel.
+    Certificate(deis_identity::SpiffeId),
+}
+
+impl NodeProof {
+    /// The fingerprint, for the rules that are about a key and only a key.
+    ///
+    /// `None` for a certificate, which is not a weaker answer but a different
+    /// one: there is no key to compare against a rotating list, because
+    /// nothing was proved by holding a shared value.
+    pub fn fingerprint(&self) -> Option<&NodeKeyFingerprint> {
+        match self {
+            Self::PresharedKey(fingerprint) => Some(fingerprint),
+            Self::Certificate(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for NodeProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PresharedKey(fingerprint) => write!(f, "the fleet key {fingerprint}"),
+            Self::Certificate(name) => write!(f, "a certificate naming {name}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

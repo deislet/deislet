@@ -112,7 +112,7 @@ pub async fn register(
             &request.address,
             request.version.clone(),
             Utc::now(),
-            proved,
+            crate::node_key::NodeProof::PresharedKey(proved),
         )
         .await
     {

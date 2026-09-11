@@ -58,7 +58,7 @@ use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 
 use crate::config::RuntimeNodeConfig;
-use crate::node_key::NodeKeyFingerprint;
+use crate::node_key::{NodeKeyFingerprint, NodeProof};
 use proto::runtime_management_client::RuntimeManagementClient;
 use trigger::trigger_client::TriggerClient;
 
@@ -462,10 +462,10 @@ struct NodeEntry {
     registered_at: Option<DateTime<Utc>>,
     /// Last time it registered or refreshed. What expiry measures.
     last_registered_at: Option<DateTime<Utc>>,
-    /// The node key the most recent registration proved. `None` only for a
-    /// configured node nothing has registered yet. This is the credential
-    /// every call to this node is made with - see [`NodeKeyStatus`].
-    key: Option<NodeKeyFingerprint>,
+    /// What the most recent registration proved: a fleet key, or a name on a
+    /// certificate. `None` only for a configured node nothing has registered
+    /// yet. See [`NodeKeyStatus`] for what follows from it.
+    proof: Option<NodeProof>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -484,8 +484,18 @@ pub struct NodeView {
     pub key_status: NodeKeyStatus,
     /// Prefix of the SHA-256 of the key the node proved, so an operator can
     /// tell which value of a rotating list a node is on. Never the value.
+    ///
+    /// Null for a node that proved a certificate instead: there is no key to
+    /// name, and `identity` is what says who it is.
     #[schema(value_type = Option<String>)]
     pub key_fingerprint: Option<NodeKeyFingerprint>,
+    /// The name this node proved with a certificate, in full.
+    ///
+    /// Null for a node still registering with the fleet key. Shown whole
+    /// rather than as a prefix because it is a name and not a secret: knowing
+    /// it proves nothing, and an operator moving a fleet onto certificates
+    /// needs to see at a glance which machines have moved.
+    pub identity: Option<String>,
     #[serde(flatten)]
     pub health: NodeHealth,
 }
@@ -650,7 +660,7 @@ impl RuntimeNodeManager {
                     version: None,
                     registered_at: None,
                     last_registered_at: None,
-                    key: None,
+                    proof: None,
                 },
             );
         }
@@ -715,26 +725,38 @@ impl RuntimeNodeManager {
 
     /// The credential every call to `id` is made with.
     ///
-    /// A node that registered is driven with the key it proved; if that key
-    /// has since left the list, nothing is sent to it at all, which is what
-    /// makes dropping a value from `node_preshared_keys` evict whatever was
-    /// still on it instead of upgrading it. A configured node that has not
-    /// registered yet is driven with the first key: the file is the
-    /// operator's own statement that the address is theirs.
+    /// A node that registered with a key is driven with the key it proved; if
+    /// that key has since left the list, nothing is sent to it at all, which
+    /// is what makes dropping a value from `node_preshared_keys` evict
+    /// whatever was still on it instead of upgrading it. A configured node
+    /// that has not registered yet is driven with the first key: the file is
+    /// the operator's own statement that the address is theirs.
+    ///
+    /// A node that proved a certificate is driven with the first key too, and
+    /// that is temporary and is the weakest thing in this direction. Calls
+    /// into a node's management plane still present a bearer credential,
+    /// because the node still checks one; what a certificate has bought so
+    /// far is the other direction, where the node asks and the control plane
+    /// answers with secrets. It stops being temporary when this control plane
+    /// dials a node with its own certificate and the node refuses the key -
+    /// at which point this arm hands back nothing and the key leaves the
+    /// configuration entirely.
     fn credential_for(&self, id: &str) -> Result<NodeCallCredential, NodeError> {
         let proved = self
             .read()
             .get(id)
             .ok_or(NodeError::UnknownNode)?
-            .key
+            .proof
             .clone();
-        match proved {
-            None => Ok(self
-                .keys
+        let first_key = || {
+            self.keys
                 .first()
                 .map(|key| key.credential.clone())
-                .unwrap_or_default()),
-            Some(fingerprint) => self
+                .unwrap_or_default()
+        };
+        match proved {
+            None | Some(NodeProof::Certificate(_)) => Ok(first_key()),
+            Some(NodeProof::PresharedKey(fingerprint)) => self
                 .keys
                 .iter()
                 .find(|key| key.fingerprint == fingerprint)
@@ -744,13 +766,21 @@ impl RuntimeNodeManager {
     }
 
     /// How a node's key stands, for the fleet listing.
+    ///
+    /// A node that proved a certificate reports `Proved`: it proved something
+    /// current, and `Retired` means "the value this node holds has been taken
+    /// out of the list", which cannot happen to a name. Which of the two it
+    /// proved is `NodeView::identity`, not this.
     fn key_status(&self, entry: &NodeEntry) -> NodeKeyStatus {
-        match &entry.key {
+        match &entry.proof {
             None => NodeKeyStatus::FromFile,
-            Some(fingerprint) if self.keys.iter().any(|key| key.fingerprint == *fingerprint) => {
+            Some(NodeProof::Certificate(_)) => NodeKeyStatus::Proved,
+            Some(NodeProof::PresharedKey(fingerprint))
+                if self.keys.iter().any(|key| key.fingerprint == *fingerprint) =>
+            {
                 NodeKeyStatus::Proved
             }
-            Some(_) => NodeKeyStatus::Retired,
+            Some(NodeProof::PresharedKey(_)) => NodeKeyStatus::Retired,
         }
     }
 
@@ -892,7 +922,7 @@ impl RuntimeNodeManager {
         addr: &str,
         version: Option<String>,
         now: DateTime<Utc>,
-        key: NodeKeyFingerprint,
+        proof: NodeProof,
     ) -> Result<Registered, RegistrationError> {
         let id = id.trim();
         if id.is_empty() {
@@ -943,13 +973,13 @@ impl RuntimeNodeManager {
                 entry.version = version;
                 entry.registered_at.get_or_insert(now);
                 entry.last_registered_at = Some(now);
-                if entry.key.as_ref() != Some(&key) {
+                if entry.proof.as_ref() != Some(&proof) {
                     info!(
                         node = %id,
-                        key = %key,
-                        "This node registered with a different node key than before; every management call to it now carries the key it just proved"
+                        proved = %proof,
+                        "This node registered with a different credential than before; what it just proved is what this control plane records for it from now on"
                     );
-                    entry.key = Some(key);
+                    entry.proof = Some(proof);
                 }
                 Ok(outcome)
             }
@@ -965,7 +995,7 @@ impl RuntimeNodeManager {
                         version,
                         registered_at: Some(now),
                         last_registered_at: Some(now),
-                        key: Some(key),
+                        proof: Some(proof),
                     },
                 );
                 drop(nodes);
@@ -1003,7 +1033,7 @@ impl RuntimeNodeManager {
         addr: &str,
         version: Option<String>,
         now: DateTime<Utc>,
-        key: NodeKeyFingerprint,
+        proof: NodeProof,
     ) -> Result<Registered, RegistrationError> {
         // The holder is asked with the key *it* proved, which may not be the
         // one this claimant just proved. A holder whose key has since left
@@ -1011,7 +1041,7 @@ impl RuntimeNodeManager {
         // answers there": the claim goes through and the address moves, which
         // is the eviction a retired key is meant to cause.
         let holder_credential = self.credential_for(id.trim()).ok();
-        self.register_claim_with(id, addr, version, now, key, |holder_addr| async move {
+        self.register_claim_with(id, addr, version, now, proof, |holder_addr| async move {
             match holder_credential {
                 Some(credential) => self.identify_at(&holder_addr, credential).await,
                 None => None,
@@ -1034,7 +1064,7 @@ impl RuntimeNodeManager {
         addr: &str,
         version: Option<String>,
         now: DateTime<Utc>,
-        key: NodeKeyFingerprint,
+        proof: NodeProof,
         probe: F,
     ) -> Result<Registered, RegistrationError>
     where
@@ -1131,7 +1161,7 @@ impl RuntimeNodeManager {
             );
         }
 
-        let outcome = self.register(trimmed, &claimed, version, now, key)?;
+        let outcome = self.register(trimmed, &claimed, version, now, proof)?;
         // The claim was granted, so this machine is not being refused
         // anything and there is nothing left to report as unreached for it.
         self.contested_write()
@@ -1418,7 +1448,15 @@ impl RuntimeNodeManager {
                     registered_at: entry.registered_at,
                     last_registered_at: entry.last_registered_at,
                     key_status: self.key_status(entry),
-                    key_fingerprint: entry.key.clone(),
+                    key_fingerprint: entry
+                        .proof
+                        .as_ref()
+                        .and_then(crate::node_key::NodeProof::fingerprint)
+                        .cloned(),
+                    identity: match &entry.proof {
+                        Some(NodeProof::Certificate(name)) => Some(name.to_string()),
+                        _ => None,
+                    },
                     health,
                 }
             })
@@ -1950,8 +1988,20 @@ mod tests {
 
     /// The key the tests' registrations prove. What matters in most of them
     /// is the fleet bookkeeping, not which value it was.
-    fn key() -> NodeKeyFingerprint {
-        NodeKeyFingerprint::of("node-psk")
+    fn key() -> NodeProof {
+        NodeProof::PresharedKey(NodeKeyFingerprint::of("node-psk"))
+    }
+
+    /// The same, for a named key, so a test can say which of two a node held.
+    fn key_named(value: &str) -> NodeProof {
+        NodeProof::PresharedKey(NodeKeyFingerprint::of(value))
+    }
+
+    /// A node that registered over the machine channel instead.
+    fn certificate(node_id: &str) -> NodeProof {
+        NodeProof::Certificate(
+            deis_identity::names::node("deis.internal", node_id).expect("a node name"),
+        )
     }
 
     #[test]
@@ -2002,7 +2052,7 @@ mod tests {
                 "http://10.0.0.5:8086",
                 None,
                 now,
-                NodeKeyFingerprint::of("old-key"),
+                key_named("old-key"),
             )
             .unwrap();
         fleet
@@ -2011,7 +2061,7 @@ mod tests {
                 "http://10.0.0.6:8086",
                 None,
                 now,
-                NodeKeyFingerprint::of("new-key"),
+                key_named("new-key"),
             )
             .unwrap();
         fleet
@@ -2020,7 +2070,7 @@ mod tests {
                 "http://10.0.0.7:8086",
                 None,
                 now,
-                NodeKeyFingerprint::of("dropped-key"),
+                key_named("dropped-key"),
             )
             .unwrap();
 
@@ -2055,6 +2105,11 @@ mod tests {
         let status = |id: &str| fleet.list().into_iter().find(|v| v.id == id).unwrap();
         assert_eq!(status("on-old").key_status, NodeKeyStatus::Proved);
         assert_eq!(
+            status("on-old").identity,
+            None,
+            "a node that proved a key has no name to show"
+        );
+        assert_eq!(
             status("on-old").key_fingerprint,
             Some(NodeKeyFingerprint::of("old-key"))
         );
@@ -2076,7 +2131,7 @@ mod tests {
                 "http://10.0.0.9:8086",
                 None,
                 now,
-                NodeKeyFingerprint::of("old-key"),
+                key_named("old-key"),
             )
             .unwrap();
         assert_eq!(
@@ -2602,6 +2657,42 @@ mod tests {
         assert!(
             manager.contested().is_empty(),
             "the holder was taken off the fleet, so the refusal it caused is over too"
+        );
+    }
+
+    /// A node that registered over the machine channel is named rather than
+    /// fingerprinted, and cannot be evicted by editing a list of secrets.
+    #[test]
+    fn a_node_that_proved_a_certificate_is_shown_by_name() {
+        let fleet = manager(&[]).with_node_keys(&["only-key".to_string()]);
+        fleet
+            .register(
+                "node-a",
+                "http://10.0.0.7:8086",
+                None,
+                Utc::now(),
+                certificate("node-a"),
+            )
+            .expect("a node may register with a certificate");
+
+        let view = fleet
+            .list()
+            .into_iter()
+            .find(|v| v.id == "node-a")
+            .expect("the node is in the fleet");
+        assert_eq!(
+            view.identity.as_deref(),
+            Some("spiffe://deis.internal/deislet/node/node-a"),
+            "the whole name is shown: it is a name and not a secret"
+        );
+        assert_eq!(
+            view.key_fingerprint, None,
+            "there is no key to name, which is the point"
+        );
+        assert_eq!(
+            view.key_status,
+            NodeKeyStatus::Proved,
+            "a name cannot be retired by taking a value out of a list of secrets"
         );
     }
 }

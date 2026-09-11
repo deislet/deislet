@@ -5775,8 +5775,15 @@
               "id": {
                 "type": "string"
               },
+              "identity": {
+                "description": "The name this node proved with a certificate, in full.\n\nNull for a node still registering with the fleet key. Shown whole\nrather than as a prefix because it is a name and not a secret: knowing\nit proves nothing, and an operator moving a fleet onto certificates\nneeds to see at a glance which machines have moved.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "key_fingerprint": {
-                "description": "Prefix of the SHA-256 of the key the node proved, so an operator can\ntell which value of a rotating list a node is on. Never the value.",
+                "description": "Prefix of the SHA-256 of the key the node proved, so an operator can\ntell which value of a rotating list a node is on. Never the value.\n\nNull for a node that proved a certificate instead: there is no key to\nname, and `identity` is what says who it is.",
                 "type": [
                   "string",
                   "null"
