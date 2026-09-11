@@ -6,6 +6,12 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DEMO_DIR="${DEMO_DIR:-${ROOT_DIR}/.demo}"
 LOG_DIR="${LOG_DIR:-${DEMO_DIR}/logs}"
 STATE_FILE="${STATE_FILE:-${DEMO_DIR}/state.env}"
+# Minted fresh on every start and thrown away by the next one; see
+# `mint_fleet_identities`.
+PKI_DIR="${PKI_DIR:-${DEMO_DIR}/pki}"
+# The trust domain every name in this demo fleet belongs to. `.local` and a
+# `demo.` label so that nothing here could be mistaken for a real fleet.
+FLEET_TRUST_DOMAIN="${FLEET_TRUST_DOMAIN:-demo.deislet.local}"
 # Where `cargo build` leaves the demo binaries. CARGO_TARGET_DIR is honoured
 # because this repo is often built with a shared target directory.
 BIN_DIR="${CARGO_TARGET_DIR:-${ROOT_DIR}/target}/debug"
@@ -14,6 +20,11 @@ DEFAULT_DEIS_CONTROL_PORT=8085
 DEFAULT_DEIS_RUNTIME_PORT=8086
 DEFAULT_DEIS_PROXY_PORT=8087
 DEFAULT_DEIS_PROXY_TLS_PORT=8088
+# The control plane's machine channel: a second listener carrying what only
+# Deislet's own processes call, behind a handshake that demands a certificate
+# from both ends. Separate from the port above so that what a browser reaches
+# and what a node reaches are two sockets an operator can bind apart.
+DEFAULT_DEIS_CONTROL_MACHINE_PORT=8089
 DEFAULT_DEIS_STORE_PORT=8090
 DEFAULT_DEIS_QUEUE_PORT=8091
 DEFAULT_DEIS_TELEMETRY_PORT=8092
@@ -81,6 +92,11 @@ PREVIEW_ENV_NAME="${PREVIEW_ENV_NAME:-preview}"
 ACME_PRODUCTION_NAME="${APP_ID}.${ACME_ZONE}"
 ACME_PREVIEW_NAME="${PREVIEW_ENV_NAME}--${APP_ID}.${ACME_ZONE}"
 NODE_ID="${NODE_ID:-deis-runtime-demo-01}"
+# The proxy's own id. Spelled once because three things have to agree on it:
+# what the proxy calls itself on the control channel, the name in its
+# certificate, and the id it puts on a routing-table acknowledgement - which
+# the control plane now holds against the name the connection proved.
+PROXY_ID="${PROXY_ID:-deis-proxy-demo-01}"
 # Deliberately recognisable: `verify` greps the logs and the data directories
 # for it to prove a decrypted secret is never written down anywhere.
 DEMO_SECRET_VALUE="${DEMO_SECRET_VALUE:-demo-secret-do-not-log-me}"
@@ -259,7 +275,8 @@ reset_previous_run() {
     "${DEMO_DIR}/acme" \
     "${DEMO_DIR}/deis-control.db" \
     "${DEMO_DIR}/deis-proxy.db" \
-    "${DEMO_DIR}/deis-config"
+    "${DEMO_DIR}/deis-config" \
+    "${PKI_DIR}"
 }
 
 # `ss` is asked first on purpose: it lists every listening socket on the host,
@@ -303,6 +320,108 @@ claim_port() {
   done
   CLAIMED_PORTS="${CLAIMED_PORTS} ${port}"
   printf -v "$var" '%s' "$port"
+}
+
+# ---- the demo's own certificate authority ---------------------------------
+#
+# The machine channel authenticates both ends by certificate, so this script
+# has to issue some. openssl is already what `generate_secret` reaches for, so
+# this adds no tool; what it does add is the one shape of certificate the
+# platform will actually load, in a place where getting it wrong is visible.
+#
+# Nothing about this is how a real installation gets its certificates. A real
+# one has a certificate authority with a life longer than one script run, and
+# `deis-identity` deliberately knows nothing about where the three files came
+# from. Two days of validity is chosen so a `.demo` directory left over from
+# last week fails at load with something an operator can read, rather than at
+# a handshake days later.
+#
+# Two things here are easy to get wrong and expensive to diagnose:
+#
+#   * the extensions go in an `-extfile`, not `-addext`. `openssl x509 -req`
+#     does not carry extensions over from the signing request unless it is
+#     given `-copy_extensions`, which is not spelled the same way across the
+#     openssl versions this script runs on. Get it wrong and every certificate
+#     is signed with no URI subject alternative name at all, which surfaces
+#     much later as `MachineIdentity::load` reporting that a certificate names
+#     no machine, with nothing pointing back at this function.
+#   * every leaf carries both `serverAuth` and `clientAuth`, because each
+#     process here is a server on one connection and a client on another: the
+#     control plane serves the machine channel and dials its nodes, and a node
+#     serves its management plane and dials the control plane.
+mint_ca() {
+  local prefix=$1
+  local subject=$2
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout "${prefix}.key" -out "${prefix}.crt" -days 2 \
+    -subj "/CN=${subject}" >/dev/null 2>&1
+  chmod 600 "${prefix}.key"
+}
+
+# mint_leaf <ca-prefix> <leaf-prefix> <spiffe-name> [extra-san]
+mint_leaf() {
+  local ca=$1
+  local leaf=$2
+  local spiffe=$3
+  local extra=${4:-}
+  local san="URI:${spiffe}"
+  if [ -n "$extra" ]; then
+    san="${san},${extra}"
+  fi
+  # The subject is decoration and is deliberately not the SPIFFE name: the
+  # identity lives in the URI subject alternative name below, which is the only
+  # thing the platform reads, and openssl parses a `/` in a subject string as
+  # the separator between one relative distinguished name and the next - so a
+  # `spiffe://` subject is refused outright with a message about a missing `=`.
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout "${leaf}.key" -out "${leaf}.csr" -subj "/CN=${leaf##*/}" \
+    >/dev/null 2>&1
+  cat > "${leaf}.ext" <<EXT
+subjectAltName=${san}
+basicConstraints=CA:FALSE
+extendedKeyUsage=serverAuth,clientAuth
+EXT
+  openssl x509 -req -in "${leaf}.csr" -CA "${ca}.crt" -CAkey "${ca}.key" \
+    -CAcreateserial -days 2 -extfile "${leaf}.ext" -out "${leaf}.crt" \
+    >/dev/null 2>&1
+  chmod 600 "${leaf}.key"
+  rm -f "${leaf}.csr" "${leaf}.ext"
+}
+
+# One authority, three machines, and two certificates that must not work.
+#
+# The last two are the capability this script did not have before: a wrong
+# credential used to be a garbage string, and under a fleet-wide key that was
+# the only wrong credential expressible. Now it can be a second identity that
+# was really issued - by our own authority, naming a machine this one is not -
+# and one issued by an authority this fleet never heard of. Neither can be
+# faked with a bad string; both have to be minted.
+mint_fleet_identities() {
+  mkdir -p "$PKI_DIR"
+  mint_ca "${PKI_DIR}/ca" "deislet demo fleet CA"
+
+  # The control plane's own leaf carries an address as well as a name. Peers
+  # authenticate it by the SPIFFE name alone and would not need one, but this
+  # script's own probes are curl and grpcurl, which verify a server by host or
+  # address in the ordinary way before any of that. A leaf with only a URI SAN
+  # makes every probe fail hostname verification, and reaching for `-k` to get
+  # past it would throw away what the probe is there to prove. That is a demo
+  # harness concession, not a product requirement.
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/control" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/control" "IP:127.0.0.1"
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/node" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/node/${NODE_ID}" "IP:127.0.0.1"
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/proxy" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/${PROXY_ID}"
+
+  # Signed by this fleet, naming a node that is not the one running here.
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/impostor" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/node/deis-runtime-demo-99" "IP:127.0.0.1"
+
+  # Well formed, correctly named, and signed by nobody this fleet trusts.
+  mint_ca "${PKI_DIR}/rogue-ca" "somebody else entirely"
+  mint_leaf "${PKI_DIR}/rogue-ca" "${PKI_DIR}/rogue" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/node/${NODE_ID}" "IP:127.0.0.1"
 }
 
 generate_secret() {
@@ -470,6 +589,10 @@ DEIS_QUEUE_PORT=$DEIS_QUEUE_PORT
 DEIS_TELEMETRY_PORT=$DEIS_TELEMETRY_PORT
 DEIS_TELEMETRY_METRICS_PORT=$DEIS_TELEMETRY_METRICS_PORT
 DEIS_ORIGIN_PORT=$DEIS_ORIGIN_PORT
+DEIS_CONTROL_MACHINE_PORT=$DEIS_CONTROL_MACHINE_PORT
+PKI_DIR=$PKI_DIR
+FLEET_TRUST_DOMAIN=$FLEET_TRUST_DOMAIN
+PROXY_ID=$PROXY_ID
 DEIS_ORIGIN_PID=${DEIS_ORIGIN_PID:-}
 DEIS_CONTROL_PID=$DEIS_CONTROL_PID
 DEIS_RUNTIME_PID=$DEIS_RUNTIME_PID
@@ -1791,6 +1914,8 @@ start_demo() {
   claim_port DEIS_RUNTIME_PORT "${DEIS_RUNTIME_PORT:-$DEFAULT_DEIS_RUNTIME_PORT}"
   claim_port DEIS_PROXY_PORT "${DEIS_PROXY_PORT:-$DEFAULT_DEIS_PROXY_PORT}"
   claim_port DEIS_PROXY_TLS_PORT "${DEIS_PROXY_TLS_PORT:-$DEFAULT_DEIS_PROXY_TLS_PORT}"
+  claim_port DEIS_CONTROL_MACHINE_PORT \
+    "${DEIS_CONTROL_MACHINE_PORT:-$DEFAULT_DEIS_CONTROL_MACHINE_PORT}"
   claim_port ACME_CA_PORT "${ACME_CA_PORT:-$DEFAULT_ACME_CA_PORT}"
   claim_port DEIS_STORE_PORT "${DEIS_STORE_PORT:-$DEFAULT_DEIS_STORE_PORT}"
   claim_port DEIS_QUEUE_PORT "${DEIS_QUEUE_PORT:-$DEFAULT_DEIS_QUEUE_PORT}"
@@ -1843,6 +1968,11 @@ start_demo() {
   start_origin
   start_acme_ca
 
+  # Before any configuration names them: the three machines of this demo fleet
+  # each need a certificate, and two more have to exist for the checks that
+  # prove the wrong one does not work.
+  mint_fleet_identities
+
   local start_port
   start_port=${DEIS_CONTROL_PORT:-$DEFAULT_DEIS_CONTROL_PORT}
   local max_retries
@@ -1882,6 +2012,24 @@ secret_key_file = "${SECRET_KEY_FILE}"
 store_endpoint = "http://127.0.0.1:${DEIS_STORE_PORT}"
 queue_endpoint = "http://127.0.0.1:${DEIS_QUEUE_PORT}"
 storage_auth_secret = "${STORAGE_AUTH_SECRET}"
+
+# The machine channel. Everything only Deislet's own processes call is served
+# here and nowhere else: the assignment list, which carries every environment's
+# decrypted secrets; the routing table, which is a map of every hostname on the
+# platform; and the bundle download. A caller that cannot present a certificate
+# this fleet signed does not get a connection at all, so none of it is reachable
+# from where the dashboard is.
+#
+# public_base_url is what the bundle links in an assignment carry. It has to
+# name this listener rather than the one above, because this is where the
+# download is served.
+[machine]
+bind_addr = "127.0.0.1"
+port = ${DEIS_CONTROL_MACHINE_PORT}
+certificate = "${PKI_DIR}/control.crt"
+private_key = "${PKI_DIR}/control.key"
+trust_root = "${PKI_DIR}/ca.crt"
+public_base_url = "https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
 
 [[deis_runtime_nodes]]
 id = "${NODE_ID}"
@@ -1931,6 +2079,18 @@ endpoint = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 secret = "${SECRET}"
 retry_interval_secs = 2
 
+# This node's own identity, and where the machine channel is. With it the node
+# asks for its assignments as an RPC and downloads its bundles over mutual TLS,
+# proving a certificate that names this node and no other. The `secret` above
+# stays because registration has not moved: it is still an HTTP route on the
+# listener a browser reaches, guarded by the value the whole fleet shares.
+[machine_identity]
+control_endpoint = "https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
+certificate = "${PKI_DIR}/node.crt"
+private_key = "${PKI_DIR}/node.key"
+trust_root = "${PKI_DIR}/ca.crt"
+trust_domain = "${FLEET_TRUST_DOMAIN}"
+
 [fetch]
 allow = ["127.0.0.1:${DEIS_ORIGIN_PORT}"]
 
@@ -1965,8 +2125,20 @@ path = "${LOG_DIR}/deis_proxy_error.log"
 
 [control]
 addr = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
-associated_id = "deis-proxy-demo-01"
+associated_id = "${PROXY_ID}"
 secret = "${SECRET}"
+
+# The proxy's identity on the machine channel. With it the routing table is
+# fetched as an RPC over mutual TLS instead of over the address above with the
+# shared key, and the acknowledgement it sends - which table version this proxy
+# is already running - is held by the control plane against the name this
+# connection proved, so no proxy can acknowledge on another's behalf.
+[machine_identity]
+control_endpoint = "https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
+certificate = "${PKI_DIR}/proxy.crt"
+private_key = "${PKI_DIR}/proxy.key"
+trust_root = "${PKI_DIR}/ca.crt"
+trust_domain = "${FLEET_TRUST_DOMAIN}"
 
 # Every environment of every application gets an address under this zone,
 # synthesised from the routing table the control plane publishes. Those
