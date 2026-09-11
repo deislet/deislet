@@ -22,12 +22,13 @@
 //!
 //! # The two credentials this does not touch
 //!
-//! `node_preshared_keys` still guards the endpoints that serve runtime nodes,
-//! unchanged and still not subject to `api_auth_enabled`: that channel hands
-//! out decrypted secrets and answers to machines, not to people, so it has no
-//! account and no scope. `storage_auth_secret` still signs the capability
-//! tokens that talk to deis-store. Three credentials, three channels, and
-//! this module is only about the third one - the people.
+//! Machines are admitted on the machine channel by the certificate each one
+//! proves, which names one machine and is not subject to `api_auth_enabled`:
+//! that channel hands out decrypted secrets and answers to machines, not to
+//! people, so it has no account and no scope. `storage_auth_secret` still
+//! signs the capability tokens that talk to deis-store. Three ways of being
+//! admitted, three channels, and this module is only about the third one -
+//! the people.
 
 pub mod scope;
 pub mod store;

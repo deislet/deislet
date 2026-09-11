@@ -31,8 +31,9 @@
 //! poller already runs on; see [`crate::catalog::client`], which made the same
 //! move for the catalog first.
 //!
-//! The fleet secret is still presented in the handshake on both. See
-//! [`machine_channel`] for why that is not a leftover.
+//! The fleet secret is presented in the handshake only if the configuration
+//! still names one. See [`machine_channel`] for why a proxy with an identity
+//! no longer needs to.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -207,19 +208,20 @@ struct MachineChannel {
 /// that names no control plane to expect. What is left for the first
 /// connection is only the part that needs a runtime.
 ///
-/// # Why the secret is still sent on it
+/// # What happened to the secret on it
 ///
-/// The handshake on this channel still carries `[control] secret`, and that is
-/// deliberate rather than left over. Authentication on `EstablishChannel` is
-/// the control plane's decision, and today it makes it by comparing that
-/// secret; a proxy that proved a certificate and then sent no secret would be
-/// refused at `Authenticate` by every control plane now deployed. Sending it
-/// over this connection is also strictly better than sending it over the old
-/// one, because it now travels inside a connection that is encrypted and whose
-/// far end has proved it is the control plane. What removes it is the control
-/// plane accepting the proved name in its place, and on the day that lands the
-/// field can stop being filled in here; until then, not sending it would be a
-/// client deciding one half of a two-sided contract on its own.
+/// Nothing has to be put in the handshake's `secret` field on this channel any
+/// more. Authentication on `EstablishChannel` is the control plane's decision,
+/// and it now makes it by the name the connection proved: a proxy that
+/// completed this handshake has presented a certificate carrying exactly one
+/// name in the fleet's trust domain, which is more than any shared value could
+/// ever say about who is calling. So `[control] secret` can be left out of a
+/// proxy's file entirely, and the field goes out empty.
+///
+/// It is still sent when it is configured, because a fleet moves one process
+/// at a time and a control plane that has not yet been updated is still
+/// comparing it. That is the only reason left; a proxy with an identity and no
+/// secret is the finished state, not a degraded one.
 fn machine_channel(
     control: &ControlConfig,
     identity: &Arc<MachineIdentity>,
@@ -1075,9 +1077,45 @@ mod tests {
         assert_eq!(client.current_state().await, State::Active);
         assert_eq!(
             control.secrets(),
-            vec![test_config().secret],
-            "the control plane still authenticates by comparing the fleet secret, so the \
-             handshake carries it on this connection too - see `machine_channel`"
+            vec![test_config().secret.unwrap()],
+            "a secret that is configured is still put in the handshake; what changed is that it \
+             is no longer what admits the connection"
+        );
+    }
+
+    /// The point of the whole exercise: a proxy that proves a certificate
+    /// needs no fleet secret at all, so its configuration can stop naming
+    /// one, and it still registers.
+    ///
+    /// What the control plane receives in the handshake's `secret` field is
+    /// then the empty string - the honest encoding of "nothing presented" -
+    /// and it is admitted anyway, by the name it proved during the TLS
+    /// handshake. A control plane that still compared that field would refuse
+    /// this, which is why the mock admits a mutually authenticated connection
+    /// the way the real one does.
+    #[tokio::test]
+    async fn a_proxy_with_an_identity_registers_with_no_fleet_secret_at_all() {
+        let fleet = fleet();
+        let mut control = MockControl::start_over_mutual_tls(Arc::clone(&fleet.control)).await;
+        let config = machine_identity_config(&fleet.files, &control.addr);
+
+        let mut without = test_config();
+        without.secret = None;
+
+        let mut client = control_client(&without, Some((&fleet.proxy, &config)))
+            .unwrap()
+            .with_backoff(fast_backoff());
+        timeout(Duration::from_secs(10), client.connect_and_register())
+            .await
+            .expect("a handshake, a registration, or an error - not a hang")
+            .expect("a proved name is enough; nothing shared should be needed");
+
+        assert_eq!(control.next_registration().await, 1);
+        assert_eq!(client.current_state().await, State::Active);
+        assert_eq!(
+            control.secrets(),
+            vec![String::new()],
+            "nothing was presented, and nothing needed to be"
         );
     }
 
@@ -1116,7 +1154,9 @@ mod tests {
     fn config_for(addr: &str) -> ControlConfig {
         ControlConfig {
             associated_id: "test-worker".to_string(),
-            secret: "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
+            secret: Some(
+                "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
+            ),
             addr: addr.to_string(),
             heartbeat_interval: 30,
             request_timeout: 10,
@@ -1194,11 +1234,11 @@ mod tests {
     #[test]
     fn accepts_what_the_control_plane_accepts_and_refuses_only_a_blank_secret() {
         let mut config = test_config();
-        config.secret = "r9nodekey".to_string();
+        config.secret = Some("r9nodekey".to_string());
         assert!(ProxyControlClient::new(config).is_ok());
 
         let mut config = test_config();
-        config.secret = " ".to_string();
+        config.secret = Some(" ".to_string());
         assert!(ProxyControlClient::new(config).is_err());
     }
 

@@ -15,13 +15,15 @@
 //! instead of a plaintext dial of `[control] addr` (see
 //! [`crate::control::client`]).
 //!
-//! One thing has not moved with it: the handshake on that control channel
-//! still carries `[control] secret`. The control plane decides authentication
-//! by comparing that value, so a proxy that sent none would be refused; what
-//! retires the secret is the control plane accepting the proved name in its
-//! place. Until then it travels inside a connection that is encrypted and
-//! whose far end has proved who it is, which is strictly better than where it
-//! travelled before.
+//! With it, `[control] secret` can go. The control plane now admits the
+//! control channel by the name the connection proved rather than by comparing
+//! a shared value, so a proxy carrying this table has nothing left to put in
+//! that field and its configuration file need not name one at all. A secret
+//! that is still written is still sent, because a fleet is updated one process
+//! at a time and a control plane that has not been updated yet is still
+//! comparing it - but it is no longer what gets this proxy in, and the last
+//! copy of it can be deleted once every process in the installation carries a
+//! table like this one.
 //!
 //! With the table absent, nothing changes at all: the routing table is
 //! fetched over HTTP and the control channel is dialled in plaintext, exactly

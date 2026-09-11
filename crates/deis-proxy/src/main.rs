@@ -266,11 +266,10 @@ fn announce_acme(system: &SystemConfig, settings: &deis_proxy::config::system::A
 /// with the fleet secret (`deis_proxy::catalog::client`), and the long-lived
 /// gRPC control channel - registration, heartbeats, commands, configuration
 /// pushes - runs on a mutual-TLS connection to the same listener instead of a
-/// plaintext dial of `[control] addr` (`deis_proxy::control::client`). The
-/// handshake on that channel still carries `control.secret`, because the
-/// control plane still decides authentication by comparing it; see
-/// `control::client::machine_channel` for why sending it is right until that
-/// changes.
+/// plaintext dial of `[control] addr` (`deis_proxy::control::client`). Neither
+/// needs `control.secret`: the control plane admits both by the name this
+/// certificate proves, so a proxy with this table can leave that line out of
+/// its file. See `control::client::machine_channel`.
 ///
 /// Fails rather than starting with a `[machine_identity]` table that cannot
 /// load. Starting anyway would leave [`MachineIdentityWatch`] re-reading
@@ -304,8 +303,8 @@ fn load_machine_identity(config: &MachineIdentityConfig) -> Result<Arc<MachineId
         "loaded this proxy's machine-channel identity; the files are re-read on that interval, \
          so a renewal needs no restart and is presented by the next connection either channel \
          makes. The routing table and the long-lived control channel both run on the machine \
-         channel with it. The control channel's handshake still carries control.secret, because \
-         the control plane still authenticates by comparing it"
+         channel with it, and both are admitted by this name rather than by a shared value, so \
+         control.secret is not needed on either"
     );
     Ok(Arc::new(identity))
 }

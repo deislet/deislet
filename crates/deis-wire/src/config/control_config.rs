@@ -13,8 +13,22 @@ pub const SECRET_ADVISORY_LEN: usize = 32;
 pub struct ControlConfig {
     /// (Associated) Instance ID
     pub associated_id: String,
-    /// Pre-shared key
-    pub secret: String,
+    /// The fleet-wide pre-shared key this process presents in the control
+    /// channel's handshake, when it has one.
+    ///
+    /// Absent is a configuration, not an omission. A process that carries a
+    /// `[machine_identity]` table proves a certificate naming exactly itself
+    /// before a single byte of the handshake is sent, and the control plane
+    /// admits the channel by that name; there is then nothing for a shared
+    /// value to add, and every copy of it that is not written down is one
+    /// that cannot leak. A process without such a table has only this, and
+    /// must set it.
+    ///
+    /// Present but blank is refused: an operator who meant to fill it in and
+    /// did not is not a process that should start authenticating with `""`.
+    /// Removing the line is how you say "this process does not use one".
+    #[serde(default)]
+    pub secret: Option<String>,
     /// Control service address
     pub addr: String,
     /// Heartbeat interval in seconds
@@ -33,7 +47,7 @@ impl ControlConfig {
     pub fn new(associated_id: String, secret: String, addr: String) -> Self {
         Self {
             associated_id,
-            secret,
+            secret: Some(secret),
             addr,
             heartbeat_interval: default_heartbeat_interval(),
             request_timeout: default_request_timeout(),
@@ -53,7 +67,8 @@ impl ControlConfig {
 
     /// Validate configuration.
     ///
-    /// The secret is refused only when it is blank. It used to have to be
+    /// A missing secret is accepted: see the field. The secret is refused
+    /// only when it is present and blank. It used to have to be
     /// exactly 64 hex characters, which is the shape of a generated key and
     /// nothing else: deis-control accepts any non-blank value in
     /// `node_preshared_keys`, and so does every runtime node, so a fleet
@@ -67,8 +82,15 @@ impl ControlConfig {
             return Err("associated_id cannot be empty".to_string());
         }
 
-        if self.secret.trim().is_empty() {
-            return Err("secret cannot be empty".to_string());
+        if let Some(secret) = &self.secret
+            && secret.trim().is_empty()
+        {
+            return Err(
+                "secret is present but blank; either remove the line, which says this process \
+                 authenticates with the certificate in its [machine_identity] table, or set it to \
+                 one of the control plane's node_preshared_keys"
+                    .to_string(),
+            );
         }
 
         if self.addr.is_empty() {
@@ -90,7 +112,10 @@ impl ControlConfig {
     /// at the node endpoints. The documented way to make one is
     /// `openssl rand -hex 32`, which is 64 characters.
     pub fn secret_advisory(&self) -> Option<String> {
-        let len = self.secret.trim().chars().count();
+        // Nothing to advise about a secret that does not exist: a process
+        // with no `secret` line is not carrying a weak one, it is carrying
+        // none, and warning about its length would be a warning about zero.
+        let len = self.secret.as_deref()?.trim().chars().count();
         (len < SECRET_ADVISORY_LEN).then(|| {
             format!(
                 "the control secret is {len} characters long; it is accepted, but a value this short can be guessed at the control plane's node endpoints, which have no lockout - generate one with `openssl rand -hex 32` and set it on the control plane, every node and this proxy"
@@ -131,7 +156,7 @@ mod tests {
         );
 
         assert_eq!(config.associated_id, "test-id");
-        assert_eq!(config.secret, VALID_SECRET);
+        assert_eq!(config.secret.as_deref(), Some(VALID_SECRET));
         assert_eq!(config.addr, "http://localhost:8080");
         assert_eq!(config.heartbeat_interval, DEFAULT_HEARTBEAT_INTERVAL);
         assert_eq!(config.request_timeout, DEFAULT_REQUEST_TIMEOUT);
@@ -217,7 +242,33 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "secret cannot be empty");
+        assert!(
+            result.unwrap_err().contains("present but blank"),
+            "a blank secret must be refused, and the message must say what to do about it"
+        );
+    }
+
+    /// A process that proves a certificate has nothing to put here, and must
+    /// not be refused for leaving it out. The distinction the validator draws
+    /// is between "no line" and "a line someone forgot to fill in".
+    #[test]
+    fn no_secret_at_all_is_accepted_and_a_blank_one_is_not() {
+        let mut config = ControlConfig::new(
+            "test-id".to_string(),
+            VALID_SECRET.to_string(),
+            "http://localhost:8080".to_string(),
+        );
+
+        config.secret = None;
+        assert_eq!(config.validate(), Ok(()));
+        assert_eq!(
+            config.secret_advisory(),
+            None,
+            "an absent secret is not a short one"
+        );
+
+        config.secret = Some("   ".to_string());
+        assert!(config.validate().is_err());
     }
 
     /// The proxy accepts what the control plane accepts. deis-control takes
@@ -246,7 +297,7 @@ mod tests {
             "   ".to_string(),
             "http://localhost:8080".to_string(),
         );
-        assert_eq!(blank.validate(), Err("secret cannot be empty".to_string()));
+        assert!(blank.validate().is_err(), "a blank secret is not a secret");
     }
 
     /// A short value starts the process and is said out loud; a generated

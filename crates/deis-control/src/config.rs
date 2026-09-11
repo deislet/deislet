@@ -36,12 +36,17 @@ pub struct ControlConfig {
     /// see `crate::runtime_client::NodeKeyStatus`. Ordering therefore only
     /// matters for those configured-but-silent nodes.
     ///
-    /// It is never allowed to be empty on a running control plane: an empty
-    /// list would leave `PUT /api/nodes/{id}/registration` open to anyone who
-    /// can reach the port, and a caller that can inject a node becomes a
-    /// delivery target that is handed every environment's decrypted secrets.
-    /// [`ControlConfig::ensure_node_credential`] mints one when the file names
-    /// none, and the endpoints refuse everything while the list is empty.
+    /// Empty is allowed only when `[machine]` is configured. With a machine
+    /// channel, a node proves a certificate naming exactly itself before it
+    /// sends anything, and this list has nothing left to decide; leaving it
+    /// out is then the point of the exercise, because a value nobody writes
+    /// down is a value nobody can lose. Without a machine channel it is the
+    /// only thing standing in front of `PUT /api/nodes/{id}/registration`,
+    /// and a caller that can inject a node becomes a delivery target that is
+    /// handed every environment's decrypted secrets - so
+    /// [`ControlConfig::ensure_node_credential`] mints one for the run rather
+    /// than serve that endpoint to everybody.
+    #[serde(default)]
     pub node_preshared_keys: Vec<String>,
     /// API Keys for HTTP API authentication (optional)
     #[serde(default)]
@@ -531,6 +536,12 @@ pub enum NodeCredentialSource {
     /// The file named none, so one was minted for this run. The value is
     /// handed back so it can be printed once - it exists nowhere else.
     Generated(String),
+    /// The file named none and none is wanted: this control plane serves a
+    /// machine channel, where every peer is admitted by a certificate naming
+    /// exactly itself. Nothing was minted, because minting a value no node is
+    /// configured with would only produce a credential that authenticates
+    /// nobody and an operator wondering which of the two regimes is live.
+    NotNeeded,
 }
 
 /// Mint a node credential: 32 random bytes as hex, the same shape the
@@ -554,7 +565,12 @@ impl ControlConfig {
     /// not a credential, and treating it as one would make the fleet's
     /// authentication a formality.
     ///
-    /// If nothing is left, one key is generated for this run. That is
+    /// If nothing is left and `[machine]` is configured, nothing is minted:
+    /// this control plane has a stronger answer than a shared value and does
+    /// not want a weaker one beside it.
+    ///
+    /// If nothing is left and there is no machine channel either, then every
+    /// caller would be a node, so one key is generated for this run. That is
     /// deliberately not written to disk: the configuration file is where a
     /// node credential belongs, and a key quietly cached in a data directory
     /// would be a second source of truth that nobody edits and nobody
@@ -573,10 +589,17 @@ impl ControlConfig {
             return NodeCredentialSource::Configured { keys: count.get() };
         }
 
+        if self.machine.is_some() {
+            info!(
+                "node_preshared_keys is empty and this control plane serves a machine channel, so no fleet key is minted: a node is admitted by the certificate it proves, which names one machine rather than the whole installation. Nothing in this fleet needs to hold a shared value any more"
+            );
+            return NodeCredentialSource::NotNeeded;
+        }
+
         let key = generate_node_key();
         self.node_preshared_keys.push(key.clone());
         warn!(
-            "node_preshared_keys is empty, so a node credential was generated for this run only. Nothing can register, fetch assignments or download a bundle without it, and it changes on every restart until the configuration file names one"
+            "node_preshared_keys is empty and no [machine] channel is configured, so a node credential was generated for this run only. Nothing can register, fetch assignments or download a bundle without it, and it changes on every restart until the configuration file names one - or until [machine] is configured, after which no shared value is needed at all"
         );
         NodeCredentialSource::Generated(key)
     }

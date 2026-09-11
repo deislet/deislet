@@ -653,9 +653,17 @@ pub fn routing_table_client(
                 max_table_bytes,
             )
         }
+        // No identity, so the only thing left to prove with is the fleet
+        // secret - and a proxy that has neither cannot ask for the table at
+        // all. Saying so here, by name, beats sending an empty bearer value
+        // and reporting whatever the control plane answers to it.
         None => CatalogClient::new(
             ControlEndpoint::parse(&control.addr)?,
-            control.secret.clone(),
+            control.secret.clone().ok_or_else(|| FetchError::Address {
+                addr: control.addr.clone(),
+                reason: "this proxy has neither a [machine_identity] table nor a [control] secret,                          so it can prove nothing to the control plane and the routing table cannot                          be fetched. Give it an identity, which names this one proxy, or a secret,                          which the whole fleet shares"
+                    .to_string(),
+            })?,
             control.request_timeout_duration(),
             max_table_bytes,
         ),

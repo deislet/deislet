@@ -110,3 +110,37 @@ id 不会。运维手上唯一的杠杆 `DELETE .../registration` 反而把失�
 `scripts/demo.sh` 的 `check_dynamic_node_registration` 一旦在注册与注销之间中断，会把一个幽灵
 节点留在舰队上，让此后所有部署报「部分失败」。门禁运行被中断的代价因此不止是「这次没跑完」——
 它会把环境留在让后续运行都失真的状态里。
+
+---
+
+## 附二：舰队口令下线之后剩下的清理（2026-09-11）
+
+> 这一节是在「把 `node_preshared_keys` 从 demo 的每一份配置里彻底删掉、并让 97 项验收在
+> **全场没有任何一处配置过舰队口令**的前提下通过」这一步之后写的。到这一步为止，
+> 舰队口令**已经不再是任何一扇门的钥匙**；剩下的都是残留物的清理，不是安全问题。
+> 分开写，是因为把「清理没做完」读成「洞还在」会让人重复已经做过的工作。
+
+### 现在的真实状态
+
+- `deis-control` 的 `node_preshared_keys` 变成可选（`serde(default)`）。配了 `[machine]`
+  机器通道时，空列表**不再临时铸一把钥匙** —— 铸一把没有任何节点配置的钥匙，只会产出一个
+  谁也认证不了的凭证，外加一个搞不清当前生效的是哪套机制的运维。
+- `deis-wire` 的 `[control] secret` 变成 `Option<String>`。**不写**是一种配置（该进程用证书
+  证明自己）；**写了但留空**仍然被拒（那是运维忘了填，不是一种选择）。
+- deis-proxy 增加一条跨段校验：`[control]` 在、而 `secret` 与 `[machine_identity]` 两者都没有
+  的进程**启动即失败**。否则它会正常起来、正常监听，然后在整个生命周期里每一次注册和每一次
+  路由表拉取都被拒 —— 而没有任何一行日志会说这是为什么。
+
+### 还没做的清理
+
+1. **`node_preshared_keys` 这个字段本身**，连同 `NodeKeyStatus` / `key_fingerprint` 概念，
+   还在 control 的配置、舰队 API、已提交的 OpenAPI 文档和生成的 TypeScript 控制台客户端里。
+   删它是清理，不是加固。
+2. **HTTP 路由表回落路径已经没有对端了。** `deis-proxy` 在没有 `[machine_identity]` 时会去
+   `GET /api/routing-table`，而这一轮已经把节点路由整组从人用监听上摘掉了，所以这个请求现在
+   拿到的是 404。也就是说：**一个没有机器身份的 proxy 已经无法从当前版本的控制面取到路由表**。
+   要么删掉这条传输路径，要么明确写出「它只用于对接旧版本控制面」。同样的话对
+   `deis-runtime` 的 assignments / bundle HTTP 路径成立。
+3. **运维脚本与文档尾巴**：`backup.sh` / `restore.sh` 只复制四样东西、一样身份文件都不带；
+   `scripts/canary-release.sh`、`scripts/canary/remote-install.sh`、
+   `crates/deis-control/TLS_SETUP.md`，以及六份提到节点路由或舰队口令的文档。

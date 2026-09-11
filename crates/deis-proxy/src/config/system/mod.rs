@@ -541,6 +541,34 @@ impl Validatable for SystemConfig {
         if let Some(machine_identity) = &self.machine_identity {
             machine_identity.validate()?;
         }
+        // A proxy that is attached to a control plane has to be able to prove
+        // something to it, and there are exactly two things it can prove: a
+        // certificate naming this one proxy, or the value the whole fleet
+        // shares. With neither, the process starts, binds its listeners and
+        // then fails every registration and every routing-table fetch for as
+        // long as it runs - serving whatever stale table it had, which on a
+        // first start is none at all.
+        //
+        // The check lives here rather than in either section because neither
+        // section can see the other: `[control]` cannot know a
+        // `[machine_identity]` table was written, and vice versa. It is also
+        // why a missing `secret` is not an error inside `[control]` itself -
+        // it is only an error together with the absence of the other table.
+        if let Some(control) = &self.control
+            && control.secret.is_none()
+            && self.machine_identity.is_none()
+        {
+            return Err(ConfigError::ValidationError {
+                message: format!(
+                    "[control] names {} but this proxy can prove nothing to it: there is no \
+                     [control] secret and no [machine_identity] table. It would start, listen, \
+                     and have every registration and every routing-table fetch refused. Add a \
+                     [machine_identity] table, which proves a certificate naming this one proxy, \
+                     or set [control] secret to one of the control plane's node_preshared_keys",
+                    control.addr
+                ),
+            });
+        }
         Ok(())
     }
 }

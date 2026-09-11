@@ -8,7 +8,8 @@
 //! built. Dialling for itself is the original behaviour and still the default:
 //! `connect` opens a plaintext connection to [`ControlConfig::addr`] and the
 //! handshake presents [`ControlConfig::secret`], the fleet-wide value every
-//! process holds a copy of.
+//! process holds a copy of - if it has one. A process with a machine
+//! identity has no reason to hold one and the field is then absent.
 //!
 //! A caller that has a machine identity wants the other thing - the same
 //! control channel over mutual TLS, on a connection where the control plane
@@ -179,9 +180,16 @@ impl WireClient {
 
     /// Authenticate
     pub async fn authenticate(&mut self) -> Result<(), WireError> {
+        // An absent secret goes on the wire as the empty string, which is
+        // the honest encoding of "I am presenting nothing". The control
+        // plane compares it against its configured keys only when the
+        // connection proved no certificate, and no configured key is ever
+        // blank, so a process with neither is refused rather than admitted
+        // by an accidental match. A process that did prove one is admitted
+        // by the name it proved and this field is not read at all.
         let req = AuthenticateRequest {
             instance_id: self.config.associated_id.clone(),
-            secret: self.config.secret.clone(),
+            secret: self.config.secret.clone().unwrap_or_default(),
         };
 
         self.send_message(Payload::Authenticate(req)).await?;
@@ -483,7 +491,7 @@ mod tests {
         let (addr, seen) = mock_control().await;
         let mut config = create_test_config();
         config.addr = addr;
-        let secret = config.secret.clone();
+        let secret = config.secret.clone().expect("the test configuration names one");
 
         let mut client = WireClient::new(config, create_test_node_info());
         client.connect().await.expect("a connection");
@@ -504,7 +512,7 @@ mod tests {
         let (addr, seen) = mock_control().await;
         let mut config = create_test_config();
         config.addr = "http://127.0.0.1:1".to_string();
-        let secret = config.secret.clone();
+        let secret = config.secret.clone().expect("the test configuration names one");
         // Lazy on purpose: this is the shape a caller with a connector of its
         // own builds, and it means the channel exists before anything has
         // been dialled - the connection is made by the first call on it.

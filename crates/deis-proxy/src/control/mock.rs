@@ -47,6 +47,18 @@ struct Service {
     cut: broadcast::Sender<()>,
     secrets: Arc<Mutex<Vec<String>>>,
     registered: mpsc::UnboundedSender<u32>,
+    /// Whether a connection that reached this service has already proved a
+    /// certificate, which is true of the TLS listener and false of the
+    /// plaintext one.
+    ///
+    /// It decides authentication the way the real control plane decides it:
+    /// a peer that proved a name is admitted by that name and whatever it put
+    /// in the handshake's `secret` field is not consulted, while a peer that
+    /// proved nothing has only the shared value left and is refused without
+    /// one. Modelled by which listener took the connection rather than by a
+    /// switch a test sets, because that is exactly what distinguishes the two
+    /// in the real thing.
+    mutually_authenticated: bool,
 }
 
 /// A TLS connection tonic will serve on.
@@ -122,6 +134,7 @@ impl MockControl {
             cut: cut.clone(),
             secrets: Arc::clone(&secrets),
             registered,
+            mutually_authenticated: identity.is_some(),
         };
         let server = ControlServiceServer::new(service);
 
@@ -245,6 +258,7 @@ impl ControlService for Service {
         let mut cut = self.cut.subscribe();
         let registered = self.registered.clone();
         let secrets = Arc::clone(&self.secrets);
+        let mutually_authenticated = self.mutually_authenticated;
         tokio::spawn(async move {
             let mut authenticated = false;
             loop {
@@ -261,7 +275,7 @@ impl ControlService for Service {
                 let reply = match payload {
                     Payload::Authenticate(req) => {
                         secrets.lock().unwrap().push(req.secret.clone());
-                        authenticated = !req.secret.is_empty();
+                        authenticated = mutually_authenticated || !req.secret.is_empty();
                         Payload::AuthResponse(AuthResponse {
                             success: authenticated,
                             message: String::new(),

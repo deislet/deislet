@@ -688,9 +688,13 @@ async fn build_catalog_state(
         );
     }
 
-    if node_auth.key_count() == 0 {
+    if node_auth.key_count() == 0 && config.machine.is_some() {
+        info!(
+            "No node credential, and none is wanted: this control plane admits machines on its machine channel by the certificate each one proves, which names a single machine. The HTTP endpoints that used to serve nodes over a shared value are not mounted, and nothing in this fleet holds a credential that would let its holder stand in for another machine"
+        );
+    } else if node_auth.key_count() == 0 {
         error!(
-            "No node credential: the endpoints that serve nodes answer 503 to everyone, so no node can register, fetch its assignments or download a bundle, and nothing this platform holds will run. Set node_preshared_keys, or start through the binary, which mints a key when the file names none"
+            "No node credential: the endpoints that serve nodes answer 503 to everyone, so no node can register, fetch its assignments or download a bundle, and nothing this platform holds will run. Set node_preshared_keys, configure a [machine] channel, or start through the binary, which mints a key when the file names none"
         );
     } else {
         info!(
@@ -906,6 +910,7 @@ pub fn log_api_ready(
     node_auth: &middleware::NodeAuthConfig,
     cors_origins: &[String],
     grpc_shared: bool,
+    machine_channel: bool,
 ) {
     let scheme = if tls_enabled { "https" } else { "http" };
 
@@ -958,19 +963,30 @@ pub fn log_api_ready(
     }
     // Said separately because it is a separate credential: this one is not
     // governed by api_auth_enabled, and it is the one that guards secrets.
-    info!(
-        "{} Node endpoints (registration, assignments, bundle download): {}",
-        if node_auth.key_count() > 0 {
-            "🔐"
-        } else {
-            "⛔"
-        },
-        if node_auth.key_count() > 0 {
-            "authenticated with node_preshared_keys"
-        } else {
-            "SHUT - no node key at all, so every caller gets 503 and no node can join or load anything"
-        }
-    );
+    let (node_mark, node_state) = match (node_auth.key_count() > 0, machine_channel) {
+        // Both live. That is a migration in progress, not a stronger fleet:
+        // whoever holds the shared value is admitted without proving a name,
+        // so the weaker of the two regimes is the one that decides.
+        (true, true) => (
+            "\u{26a0}",
+            "authenticated with node_preshared_keys, and a machine channel is also serving - the \
+             shared value is still accepted, so it is still what an attacker needs",
+        ),
+        (true, false) => ("\u{1f510}", "authenticated with node_preshared_keys"),
+        // No shared value and nothing that needs one: machines are admitted
+        // on the machine channel by a certificate naming one machine each.
+        (false, true) => (
+            "\u{1f6e1}",
+            "not served here at all - machines are admitted on the machine channel by the \
+             certificate each one proves, and this installation holds no fleet-wide value",
+        ),
+        (false, false) => (
+            "\u{26d4}",
+            "SHUT - no node key and no machine channel, so every caller gets 503 and no node can \
+             join or load anything",
+        ),
+    };
+    info!("{node_mark} Node endpoints (registration, assignments, bundle download): {node_state}");
     info!("====================================");
 }
 
@@ -994,9 +1010,13 @@ pub async fn start_api_server(
 ) -> anyhow::Result<()> {
     if let crate::config::NodeCredentialSource::Generated(_) = config.ensure_node_credential() {
         warn!(
-            "No node_preshared_keys configured, so a node credential was generated for this run; nothing can register or fetch assignments without it"
+            "No node_preshared_keys configured and no [machine] channel, so a node credential was generated for this run; nothing can register or fetch assignments without it"
         );
     }
+    // Read before the configuration is shared and later moved: which regime
+    // admits machines is a startup fact, and taking it here keeps the
+    // readiness log from depending on where `config` happens to have got to.
+    let machine_channel = config.machine.is_some();
     let config = Arc::new(config);
     let tls_config = config.tls.clone();
     let deis_runtime_manager = Arc::new(
@@ -1048,6 +1068,7 @@ pub async fn start_api_server(
         &api.node_auth,
         &api.cors_origins,
         false,
+        machine_channel,
     );
 
     let tls = if api.tls_enabled {

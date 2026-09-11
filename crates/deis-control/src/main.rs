@@ -87,16 +87,33 @@ async fn main() -> Result<(), anyhow::Error> {
     // environment's decrypted secrets - would be open to whoever can reach
     // the port. A missing key is filled in here rather than left empty, and
     // the value is printed once because it exists nowhere else.
-    if let deis_control::config::NodeCredentialSource::Generated(key) =
-        config.ensure_node_credential()
-    {
-        warn!(
+    match config.ensure_node_credential() {
+        deis_control::config::NodeCredentialSource::Generated(key) => warn!(
             "No node_preshared_keys in the configuration, so one was generated for this run:\n\
              \n    node_preshared_keys = [\"{key}\"]\n\
              \nPut that line in the control plane's configuration file and the same value in \
              every node's [control] secret. Until then it changes on every restart, and a node \
-             holding the old value gets 401 and keeps serving whatever it already had."
-        );
+             holding the old value gets 401 and keeps serving whatever it already had. The way \
+             out of shared values altogether is a [machine] channel, after which this file needs \
+             no node_preshared_keys line at all."
+        ),
+        deis_control::config::NodeCredentialSource::NotNeeded => info!(
+            "No node_preshared_keys, and none is needed: every machine that reaches this control \
+             plane's machine channel is admitted by a certificate naming one machine, so there is \
+             no fleet-wide value left for a leak to hand over"
+        ),
+        deis_control::config::NodeCredentialSource::Configured { keys } => {
+            if config.machine.is_some() {
+                warn!(
+                    node_keys = keys,
+                    "This control plane serves a machine channel and still has node_preshared_keys \
+                     configured. Both regimes are live: a peer that proves a certificate is \
+                     admitted by its name, and a peer that proves nothing is still admitted by \
+                     holding the shared value, so the fleet is only as strong as that value. Once \
+                     every node and proxy carries a [machine_identity] table, remove the line"
+                );
+            }
+        }
     }
 
     let bind_addr = config.bind_addr.clone();
@@ -324,6 +341,7 @@ async fn main() -> Result<(), anyhow::Error> {
         &api.node_auth,
         &api.cors_origins,
         true,
+        api_config.machine.is_some(),
     );
 
     let addr = format!("{}:{}", bind_addr, port);

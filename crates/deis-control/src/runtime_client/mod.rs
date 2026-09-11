@@ -749,18 +749,49 @@ impl RuntimeNodeManager {
             // `NodeCallCredential::new` and is not a key this fleet has.
             .filter(|key| key.credential.is_present())
             .collect();
-        if self.keys.is_empty() {
-            error!(
-                "This control plane has no node key to present, so every deployment push, unload and cron fire it makes will be refused by any node that is not running unauthenticated on loopback. Set node_preshared_keys"
-            );
-        } else {
-            info!(
+        self
+    }
+
+    /// Say once, in the log, how this control plane reaches the nodes it
+    /// drives.
+    ///
+    /// Written here rather than in either builder because the answer needs
+    /// both halves at once, and a builder that logged what it had alone would
+    /// say the platform was broken whenever the two were called in the other
+    /// order. Called from [`Self::poll_loop`], which is the moment this
+    /// component starts doing the thing being described, so there is no step
+    /// a caller can forget.
+    fn announce_how_nodes_are_driven(&self) {
+        match (self.identity.is_some(), self.keys.is_empty()) {
+            (true, true) => info!(
+                "Calls into a node's management plane are made over mutual TLS, proving this \
+                 control plane's own certificate and requiring the node to prove one naming \
+                 itself. No shared value is presented, because there is none to present and none \
+                 is needed"
+            ),
+            (true, false) => info!(
                 header = NODE_AUTH_METADATA,
                 keys = self.keys.len(),
-                "Calls into a node's management plane carry this control plane's node key - the one that node proved when it registered, or the first configured one for a node from the file that has not registered yet; a node that does not accept it refuses the push and keeps serving the version it already had"
-            );
+                "Calls into a node's management plane go over mutual TLS to a node that \
+                 registered by proving a certificate and reported a machine address, and carry \
+                 this control plane's node key to every other node. Both regimes are live, so a \
+                 node still on the shared value is still driven by it"
+            ),
+            (false, false) => info!(
+                header = NODE_AUTH_METADATA,
+                keys = self.keys.len(),
+                "Calls into a node's management plane carry this control plane's node key - the \
+                 one that node proved when it registered, or the first configured one for a node \
+                 from the file that has not registered yet; a node that does not accept it \
+                 refuses the push and keeps serving the version it already had"
+            ),
+            (false, true) => error!(
+                "This control plane has neither a machine identity nor a node key, so every \
+                 deployment push, unload and cron fire it makes will be refused by any node that \
+                 is not running unauthenticated on loopback. Configure a [machine] channel, or \
+                 set node_preshared_keys"
+            ),
         }
-        self
     }
 
     /// Whether at least one key can be presented. Reported at startup rather
@@ -1816,6 +1847,7 @@ impl RuntimeNodeManager {
             registration_ttl_secs = self.registration_ttl.as_secs(),
             "Starting deis_runtime node health polling; nodes may also register themselves at any time"
         );
+        self.announce_how_nodes_are_driven();
         let mut ticker = tokio::time::interval(self.poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

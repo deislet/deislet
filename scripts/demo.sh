@@ -420,6 +420,13 @@ mint_fleet_identities() {
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/proxy" \
     "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/${PROXY_ID}"
 
+  # The replacement proxy the zero-downtime restart check starts. It is a
+  # second machine with a name of its own, not the same one twice: the
+  # handover is two processes alive at once, and each has to be able to say
+  # which it is.
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/proxy-restart" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/deis-proxy-demo-restart"
+
   # A second real machine of this fleet: the node that joins by registering,
   # which it can only do by proving a name of its own.
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/unlisted" \
@@ -2018,7 +2025,6 @@ api_auth_enabled = true
 api_keys = ["${API_KEY}"]
 heartbeat_interval = 30
 heartbeat_timeout = 90
-node_preshared_keys = ["${SECRET}"]
 deis_runtime_poll_interval = 5
 bundle_dir = "${DEMO_DIR}/bundles"
 public_base_url = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
@@ -2050,8 +2056,8 @@ id = "${NODE_ID}"
 addr = "http://127.0.0.1:${DEIS_RUNTIME_PORT}"
 EOF
     # Every generated configuration is the operator's alone: this one holds
-    # node_preshared_keys, api_keys and storage_auth_secret, and the node's
-    # and proxy's hold the fleet credential (docs/trust-boundaries.md).
+    # api_keys and storage_auth_secret, and every machine's names the private
+    # key behind its own certificate (docs/trust-boundaries.md).
     chmod 600 "$DEIS_CONTROL_CONFIG"
 
     # [control] is architecture principle 8: on startup the node asks the
@@ -2060,11 +2066,11 @@ EOF
     # loaded. The control plane still pushes new deployments at it; the pull
     # is what makes a restarted node come back with what it had.
     #
-    # `secret` is the same value as the control plane's node_preshared_keys.
-    # The assignment list carries every environment's decrypted secrets, so the
-    # control plane serves it - and the bundle download - only to a caller that
-    # presents a node key. Without this line the node gets 401 and never loads
-    # anything it was assigned.
+    # There is no `secret` line, and that is the finished state rather than an
+    # omission: the assignment list carries every environment's decrypted
+    # secrets, and what entitles this node to it is the certificate in
+    # [machine_identity] below, which names this one node. A shared value that
+    # said "some machine in this installation" could never have said that.
     #
     # [logging] is what makes the app's own log lines queryable: without it
     # they stop at this node's stdout and deis-telemetry has nothing to answer
@@ -2090,14 +2096,13 @@ flush_interval_secs = 1
 
 [control]
 endpoint = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
-secret = "${SECRET}"
 retry_interval_secs = 2
 
 # This node's own identity, and where the machine channel is. With it the node
-# asks for its assignments as an RPC and downloads its bundles over mutual TLS,
-# proving a certificate that names this node and no other. The `secret` above
-# stays because registration has not moved: it is still an HTTP route on the
-# listener a browser reaches, guarded by the value the whole fleet shares.
+# registers, asks for its assignments and downloads its bundles over mutual
+# TLS, proving a certificate that names this node and no other. All three used
+# to go to the listener a browser reaches, guarded by the value the whole fleet
+# shared; none of them do now, and there is no fleet value left to guard them.
 [machine_identity]
 control_endpoint = "https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
 certificate = "${PKI_DIR}/node.crt"
@@ -2106,8 +2111,9 @@ trust_root = "${PKI_DIR}/ca.crt"
 trust_domain = "${FLEET_TRUST_DOMAIN}"
 # And the other direction: what the control plane pushes into this node
 # arrives here, admitted only if the connection proved the control plane's own
-# name. The plaintext management plane stays bound beside it while the fleet
-# is moving, so nothing breaks on the way.
+# name. The plaintext management plane is still bound on the data port, but
+# with no node key configured it now serves nothing at all - which `verify`
+# asks about directly.
 management_listen = "127.0.0.1:${DEIS_RUNTIME_MACHINE_PORT}"
 
 [fetch]
@@ -2145,7 +2151,6 @@ path = "${LOG_DIR}/deis_proxy_error.log"
 [control]
 addr = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 associated_id = "${PROXY_ID}"
-secret = "${SECRET}"
 
 # The proxy's identity on the machine channel. With it the routing table is
 # fetched as an RPC over mutual TLS instead of over the address above with the
@@ -7295,7 +7300,13 @@ path = "${error_log}"
 [control]
 addr = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 associated_id = "deis-proxy-demo-restart"
-secret = "${SECRET}"
+
+[machine_identity]
+control_endpoint = "https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
+certificate = "${PKI_DIR}/proxy-restart.crt"
+private_key = "${PKI_DIR}/proxy-restart.key"
+trust_root = "${PKI_DIR}/ca.crt"
+trust_domain = "${FLEET_TRUST_DOMAIN}"
 
 [routing]
 preview_zone = "${ACME_ZONE}"
@@ -7315,8 +7326,9 @@ max_retry_backoff_secs = 4
 include_preview_addresses = true
 EOF
   # The same mode as every other generated file that carries a credential:
-  # this one holds the node key under [control], and docs/trust-boundaries.md
-  # says the demo writes every such file 0600. This one was the exception
+  # this one names the private key behind this proxy's own certificate under
+  # [machine_identity], and docs/trust-boundaries.md says the demo writes
+  # every such file 0600. This one was the exception
   # until a round read the directory listing against that sentence, and it
   # stays behind after the check (only the db and pid file are removed), so
   # the mode is for the life of .demo/ and not for the seconds the process
@@ -8214,14 +8226,28 @@ node_grpc_status() {
 # session for another tenant's isolate, and ApplyDeployment would have run a
 # bundle of the caller's choosing under that tenant's endpoint.
 #
-# The credential is the node key: one of the control plane's
-# node_preshared_keys, which is the same value this demo already puts in the
-# node's [control] secret for the assignment fetch. The last two assertions
-# are the other half - the platform still works - because the control plane's
-# own health poll rides this plane, and a node it cannot reach is reported
-# unhealthy.
+# For a while the answer was a shared value: whoever held the fleet key was
+# taken for the control plane. Nothing in this demo configures one any more,
+# and that has a consequence on this port worth stating plainly. A node with
+# no key cannot tell its control plane from anyone else, so it serves neither:
+# every management call on the data port is refused with UNAVAILABLE, with or
+# without a credential, because there is no credential left that would mean
+# anything. This is `Guard::Shut` in `deis-runtime::dispatcher::auth`, and it
+# is the reason the check below no longer has a "and the right key is served"
+# arm - there is no right key.
+#
+# What drives the node instead is the third socket, the one
+# `[machine_identity] management_listen` binds, where the caller proves a
+# certificate naming this node's control plane before it sends a request. A
+# plaintext caller does not get a connection to it at all, which is the second
+# probe below.
+#
+# The last two assertions are the other half - the platform still works -
+# because the control plane's own health poll has to reach the node somehow,
+# and a node it cannot reach is reported unhealthy. They are what says the
+# management plane moved rather than simply closed.
 check_the_node_management_plane_needs_the_node_key() {
-  local title="a node is driven only by a caller holding the node key"
+  local title="a node is driven only over the socket where its control plane proves its name"
   local frame="${LOG_DIR}/verify-grpc-empty-frame.bin"
   # One uncompressed, zero-length message: a complete GetStatusRequest and a
   # complete ScheduledEvent, both of which encode to nothing under proto3. The
@@ -8232,7 +8258,20 @@ check_the_node_management_plane_needs_the_node_key() {
   status_none=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "" "$frame")
   status_wrong=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "not-the-node-key" "$frame")
   trigger_none=$(node_grpc_status "/deis.trigger.Trigger/OnScheduled" "" "$frame")
+  # The value this demo used to configure everywhere, sent now that nothing
+  # configures it. It buys exactly as much as the wrong one above, which is
+  # the point: the door it used to open is not ajar, it is gone.
   status_key=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "$SECRET" "$frame")
+
+  # And the socket that does drive this node, asked in plaintext. A caller
+  # that cannot prove the control plane's name never completes a handshake,
+  # so there is no HTTP response at all and curl exits non-zero.
+  local plaintext_at_machine_plane=0
+  curl -s -o /dev/null -X POST \
+    -H "content-type: application/grpc" -H "te: trailers" \
+    --data-binary "@${frame}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_MACHINE_PORT}/deis.management.RuntimeManagement/GetStatus" \
+    >/dev/null 2>&1 || plaintext_at_machine_plane=$?
 
   # Nothing above unloaded anything, so the application is still there.
   local headers="${LOG_DIR}/verify-node-management-auth.headers"
@@ -8246,13 +8285,14 @@ check_the_node_management_plane_needs_the_node_key() {
   healthy=$(jq -r --arg id "$NODE_ID" \
     '.nodes[] | select(.id == $id) | .healthy' < "$fleet" 2>/dev/null || true)
 
-  if [ "$status_none" = "16" ] && [ "$status_wrong" = "16" ] && [ "$trigger_none" = "16" ] \
-    && [ -z "$status_key" ] && [ "$still_serving" = "200" ] && [ "$healthy" = "true" ]; then
+  if [ "$status_none" = "14" ] && [ "$status_wrong" = "14" ] && [ "$trigger_none" = "14" ] \
+    && [ "$status_key" = "14" ] && [ "$plaintext_at_machine_plane" -ne 0 ] \
+    && [ "$still_serving" = "200" ] && [ "$healthy" = "true" ]; then
     pass_check "$title" \
-      "GetStatus at the node's own port answered grpc-status ${status_none} (UNAUTHENTICATED) with no credential and ${status_wrong} with a wrong one, and the trigger service's OnScheduled answered ${trigger_none} - so nothing that can merely reach ${APP_ID} on this node can list its tenants, unload it or fire its cron. The same call carrying the node key was served (its status is in the trailers, not the headers). ${APP_ID} still answers HTTP ${still_serving}, and the control plane reports ${NODE_ID} healthy, which is its own health poll getting through the same door"
+      "GetStatus at the node's own port answered grpc-status ${status_none} (UNAVAILABLE) with no credential, ${status_wrong} with a wrong one and ${status_key} with the fleet secret this demo used to configure everywhere - so nothing that can merely reach ${APP_ID} on this node can list its tenants, unload it or fire its cron, and there is no string that would change that. The trigger service's OnScheduled answered ${trigger_none} likewise. A plaintext call at the mutually authenticated plane on port ${DEIS_RUNTIME_MACHINE_PORT} got no response at all (curl exited ${plaintext_at_machine_plane}), because a caller that has not proved this node's control plane's name does not get a connection. ${APP_ID} still answers HTTP ${still_serving}, and the control plane reports ${NODE_ID} healthy, which is its own health poll getting through the one door that is open"
   else
     fail_check "$title" \
-      "expected grpc-status 16 with no credential (got \"${status_none:-none}\"), 16 with a wrong one (got \"${status_wrong:-none}\") and 16 on OnScheduled (got \"${trigger_none:-none}\"), and the node key to be served (header status was \"${status_key:-none}\", expected none). ${APP_ID} answered ${still_serving} (expected 200) and the control plane reports ${NODE_ID} healthy=${healthy:-unknown}"
+      "expected grpc-status 14 with no credential (got \"${status_none:-none}\"), with a wrong one (got \"${status_wrong:-none}\"), on OnScheduled (got \"${trigger_none:-none}\") and with the retired fleet secret (got \"${status_key:-none}\"), and a plaintext call at port ${DEIS_RUNTIME_MACHINE_PORT} to be refused at the handshake (curl exited ${plaintext_at_machine_plane}, expected non-zero). ${APP_ID} answered ${still_serving} (expected 200) and the control plane reports ${NODE_ID} healthy=${healthy:-unknown}"
   fi
 }
 
@@ -8576,32 +8616,34 @@ check_dynamic_node_registration() {
   fi
 }
 
-# The other side of the check above: the same endpoint, dialled by a caller
-# that holds no node key.
+# The other side of the two checks above: the routes a node used to call, on
+# the listener a browser reaches.
 #
 # Self-registration is the one route on this control plane where an unlisted
 # machine can put itself on the fleet, and a node on the fleet receives
-# deployment pushes, cron fires and decrypted secrets. Both checks above
-# present `node_preshared_keys` and are served, so between them they show that
-# the credential works - and nothing showed that it is required. A control
-# plane with an empty key list, or with the node middleware left off this
-# router, would pass both of them and let anything that can reach the port
-# join the fleet.
+# deployment pushes, cron fires and decrypted secrets. The two checks above
+# register over the machine channel, proving a certificate that names one
+# machine. This one asks what happened to the old way in: the same three
+# requests, on the human listener, carrying a bearer value.
 #
-# The three probes are one gate asked three ways, and the third is the one
-# worth having: the demo's API key is the most powerful credential a person
-# holds here, and it must not be a node credential. SECRET authenticates a
-# node, API_KEY authenticates a caller who may deploy, and the start script
-# says so in a comment; this is where that separation is observed rather than
-# asserted. Nothing here can succeed, so nothing here leaves a node behind -
-# and the fleet is read afterwards to say so.
+# The answer is 404 rather than 401, and the difference is the whole point. A
+# 401 would say "these routes are here and a credential decides"; a 404 says
+# they are not served here at all, so there is no string a caller could bring
+# that would change the answer - including the fleet secret this demo used to
+# configure everywhere and now configures nowhere.
+#
+# Nothing here can succeed, so nothing here leaves a node behind - and the
+# fleet is read afterwards to say so.
 check_the_node_channel_is_not_on_the_human_listener() {
   local title="nothing a node calls is served where the dashboard is"
   local invented="${NODE_ID}-uninvited-$$"
 
-  # The three that used to be here, asked exactly as a node used to ask them.
-  # A 404 is the whole point: this listener does not serve them at all, and a
-  # 401 would have said a credential could change that.
+  # The three that used to be here, asked exactly as a node used to ask them,
+  # carrying the kind of credential that used to open them. Nothing in this
+  # demo configures a fleet key any more - that is the point of the value
+  # below still being sent: whatever string a caller brings, these paths are
+  # not here. A 404 says so; a 401 would have said a credential could change
+  # it.
   local registration assignments routing
   registration=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
     -H "Authorization: Bearer ${SECRET}" -H 'content-type: application/json' \
