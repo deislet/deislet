@@ -18,7 +18,8 @@ workspace, and the only npm project in it is the control plane's web console.
 
 ```bash
 # The console is embedded in deis-control at compile time and its output is
-# gitignored, so this comes first or `cargo build` fails.
+# gitignored. A missing web/dist does not fail the build (the build script
+# creates the directory), but the dashboard then answers 404, so build it first.
 cd crates/deis-control/web && npm ci && npm run build && cd -
 
 cargo build --workspace
@@ -86,6 +87,23 @@ it.
 | node | a registered `deis-runtime` process | a Worker |
 | control | the control plane, `deis-control` | supervisor, master |
 | env | an application's variables (`context.env`) | environment; that flag is always `-e, --environment` |
+
+## Comment style
+
+Doc comments state what a thing does, the contract and invariants it
+maintains, and the preconditions and side effects a caller must know. They do
+not narrate history ("It used to be…"), restate what the code below already
+says, or record how a decision was made — decisions belong in an ADR.
+
+- Keep module docs under roughly 30 lines. An argument that needs more space
+  belongs in an ADR or `docs/`; leave a link in the comment.
+- Error and log messages are one sentence. Put the diagnosis into structured
+  fields next to it instead of stretching the sentence into a paragraph —
+  `assignment dropped: app=demo env=production reason=stale generation` beats
+  three lines of prose a machine cannot grep.
+- Existing code is not swept in a dedicated cleanup pass: when you touch a
+  function or module, tighten its comments while you are there. Review new
+  narrative comments in PRs the same way you review dead code.
 
 ## Adding a build target
 

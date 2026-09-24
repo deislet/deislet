@@ -13,13 +13,17 @@ implemented it says so; a plan is not a boundary.
 **What changed, and what did not.** The platform's own processes -
 the control plane, every runtime node, deis-proxy - now recognise each other
 by a certificate held by one machine, proved during a TLS handshake, and the
-fleet-wide value they all used to hold does not exist any more. What did not
-change: `storage_auth_secret` and the matching `auth_secret` on deis-store,
-deis-queue and deis-telemetry, and `api_keys` for the human API, are still
-values copied between files, and whoever holds one holds everything it
-opens. A reader who concludes that everything moved to certificates will
-protect the wrong files, which is why this document says which is which before
-it says anything else.
+fleet-wide value they all used to hold does not exist any more. The human API
+changed with them: there is no anonymous path and no key shared through a
+configuration file any more - every caller presents a token, resolved against
+a hash in the control plane's database, and a control plane with no credential
+at all mints a one-time bootstrap token written to a file only its own host can
+read. What did not change: `storage_auth_secret` and the matching `auth_secret`
+on deis-store and deis-queue, the `auth_secret` shared between deis-telemetry
+and every node's `[logging]`, are still values copied between files, and whoever
+holds one holds everything it opens. A reader who concludes that everything
+moved to certificates will protect the wrong files, which is why this document
+says which is which before it says anything else.
 
 ## How a process proves who it is
 
@@ -95,6 +99,40 @@ call are not mounted anywhere - `deis_wire::conventions::NODE_REGISTRATION_ROUTE
 bundle download all answer **404** on the human listener, to every caller, with
 or without a credential. Not 401: a credential cannot bring them back.
 
+## How a person proves who they are
+
+The human API has one way in, and it is a token. There is no anonymous path:
+being a loopback peer proves nothing, coming from the dashboard's own origin
+proves nothing, having arrived through deis-proxy proves nothing - the checks
+an earlier release used to grant an anonymous principal are gone, and a
+request with no credential is refused with 401 whatever Host it names and
+whatever address it comes from (`crates/deis-control/src/api/authz.rs`). A
+control plane that used to run with authentication off has no setting left to
+do it with: `api_auth_enabled` and `api_keys` are not fields of the
+configuration any more, and a configuration file that still carries them is
+refused at startup like any unknown field. Development, the demo and a
+production installation take the same code path from the first request on -
+there is no dev branch of the authentication, and a build labelled as not
+production-ready wears that as a label, not as an exception.
+
+What is new on a first start is how the first token comes into existence. A
+control plane whose database holds no live credential at all mints a one-time
+bootstrap token and writes it to `<data_dir>/bootstrap.token`, mode `0600`,
+created exclusively - a file that already exists is never overwritten
+(`crates/deis-control/src/identity/store.rs`). The startup log names the file
+and the token's id, never the value. The bootstrap token can do exactly one
+thing: create the first owner account and a first token for it. The moment
+that succeeds the bootstrap token is revoked and the file is deleted; if it is
+never used it expires on its own, and the next restart mints a fresh one.
+`deis login --bootstrap <path>` is the way in, and on the same host it finds
+the file at its default path by itself.
+
+A headless install presets its own secret instead: `deis-control bootstrap
+--token-file <path>` installs the hash of the token the operator generated
+offline, and the same file logs in. Any previous bootstrap row stops working
+when a new one is installed - there is one way in, and it is the one just
+installed.
+
 ## What is still a shared secret
 
 None of these moved to certificates, and each is a value copied into more than
@@ -104,7 +142,6 @@ one file.
 |---|---|---|
 | `storage_auth_secret` on deis-control, the identical `auth_secret` on deis-store and deis-queue | three processes, one value | The control plane mints `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant and writes it into that tenant's deployment; the backend recomputes the expected token from the tenant the call itself claims (`crates/deis-store/src/auth.rs`, `crates/deis-control/src/delivery/mod.rs`). The secret mints a token for **any** tenant, so holding it is holding every tenant's data in both backends. A token does not expire; the only lever is changing the secret, which invalidates every token at once. |
 | `auth_secret` on deis-telemetry, the identical `[logging] auth_secret` on **every node** | deis-telemetry and every runtime node | One token for the whole service - `base64(HMAC-SHA256(auth_secret, "deis-telemetry"))`, the subject fixed - so it says "the holder is part of this platform" and names no tenant (`crates/deis-telemetry/src/auth.rs`, `crates/deis-runtime/src/telemetry.rs`). Holding it is reading every application's logs, traces and metric series. This is the one shared value a node's own configuration file still carries. |
-| `api_keys` on deis-control | the configuration file, the CLI, and anything scripted against the API | An entry resolves to an owner principal with unscoped authority, compared in constant time against the file; the database holds no copy of it and cannot admit anyone (`crates/deis-control/src/api/authz.rs`). Minted tokens (`deis token …`) are the scoped alternative and are stored as digests. |
 | `store_migration_admin_token`, `queue_migration_admin_token`, `telemetry_migration_admin_token` | deis-control and the backend it names | Freeze and inventory any tenant in that backend. Each is independent of the others and must not equal that backend's `auth_secret` - deis-store refuses to start its management service if it does (`crates/deis-store/src/server.rs`). |
 | the master key in `secret_key_file` | deis-control alone | Not shared between machines, but one key for every tenant: every environment's secrets in the database are encrypted with it (`crates/deis-control/src/catalog/secrets.rs`). The encrypted rows are worth nothing without it and everything with it. |
 
@@ -140,6 +177,23 @@ channel refuses a call that asks for another machine's answer - but what an
 answer contains did not narrow at the same time. See "What is not
 implemented".
 
+## What the platform assumes about the code it runs
+
+Deislet assumes that the application code within one installation is trusted;
+the V8 isolate is resource isolation, not a security sandbox. The same
+sentence appears in the README and in
+[ADR-018](adr/018-platform-support-boundary.md) on purpose: it is the trust
+model, not a caveat, and it is what decides which attacks this platform tries
+to stop. The platform defends against resource exhaustion and misuse - an
+application that allocates without bound, spins without ending, or calls an
+endpoint it was never pointed at - and every limit in this document exists for
+that. It does not defend against an application that sets out to escape its
+isolate, and a hostile tenant should not be hosted under this assumption. The
+corollary is stated under "What is not implemented": every node runs every
+application and holds every application's secrets, which is a property for an
+installation whose applications share an owner and a hole for one whose
+tenants do not trust each other.
+
 ## The node's data port is a trust boundary
 
 The node's data port binds `0.0.0.0:http_port`
@@ -155,14 +209,44 @@ What it can no longer reach is the management plane. Nothing administrative is
 mounted on this port: the two gRPC prefixes fall through to the wildcard and
 are answered as any request naming no application is.
 
-None of this is reachable *through* deis-proxy: it resolves an inbound
-`x-deis-app-id` against the applications it knows and refuses an id that names
-none of them - an `_inspect:` target names none - it drops the whole `x-deis-`
-header namespace from the client and stamps the routing headers itself
-(`crates/deis-proxy/src/proxy/mod.rs`). That is exactly why the node's own port
-has to be unreachable as well. The proxy is the only thing enforcing rules the
-node does not, so a request that arrives at the node directly is a request that
-skipped all of them.
+Nothing on this port authenticates its caller either - the certificate demand
+of the management listener is not repeated here. That is a known gap with a
+root fix planned (data-port mutual TLS, so that only a connection holding this
+installation's proxy identity may use routing headers at all, after which the
+stopgap described next is deleted); in this release the port's containment is
+the firewall table below, plus the node's own refusal of its own addresses.
+
+One path a firewall alone does not close is this node's own tenants reaching
+the port from inside. The data port binds every interface, so on a machine
+whose public address sits on the NIC - or is hairpinned by a provider's 1:1
+NAT - an application running on this node can open
+`http://<this node's public address>:<http_port>/` with routing headers of its
+own choosing and invoke another tenant's code on the same node, under exactly
+the private-address rules that were meant to keep it on its own side. The
+outbound fetch policy therefore refuses this node's own data port under every
+address it answers at: the loopback spellings, every interface address found
+at startup, and the addresses the operator lists under
+`node.advertised_addresses` for the ones NAT maps from outside onto this node
+(`crates/deis-runtime/src/main.rs`). Two limits are worth naming: the
+interface enumeration is a startup snapshot, so an address that appears later
+- a DHCP renewal, a hot-plugged NIC - is covered only once the operator adds
+it to `advertised_addresses`; and on a host running several nodes, only this
+node's own port is refused, because the enumeration carries this node's port
+alone.
+
+None of this is reachable *through* deis-proxy. The edge routes on the `Host`
+header and the path alone: the client's whole `x-deis-` header namespace is
+deleted at the very top of the request filter, before any routing input is
+read, and what was deleted is counted as forged, logged at debug and measured
+(`crates/deis-proxy/src/proxy/mod.rs`). A header does not name an application
+any more - there is no second routing entry left, so a request carrying
+`x-deis-app-id: other` for host A resolves A, and a host this edge has no
+table for is refused whatever headers accompany it. The node's `_system`
+application and its `_inspect:*` debugger channel were reachable only by
+header, so they are unreachable from the edge by name. That is exactly why the
+node's own port has to be unreachable as well. The proxy is the only thing
+enforcing rules the node does not, so a request that arrives at the node
+directly is a request that skipped all of them.
 
 **What must sit in front of it.** Every port below must be reachable only from
 the hosts that are supposed to talk to it, enforced by a firewall or a private
@@ -170,9 +254,9 @@ network - not by the absence of a published address:
 
 | Port | Who may reach it |
 |---|---|
-| Node data port (`http_port`) | deis-proxy, and whoever attaches an inspector session. Nothing else, and never the internet. The control plane no longer dials it: every call it makes into a node goes to the address below. |
+| Node data port (`http_port`) | deis-proxy, and whoever attaches an inspector session. Nothing else, and never the internet - and, per the fetch policy above, not this node's own applications under any address of this node either. The control plane no longer dials it: every call it makes into a node goes to the address below. |
 | Node `[machine_identity] management_listen` | The one machine this node's `[machine_identity]` names as its control plane, and nobody else this fleet has ever signed a certificate for - every other proved name is refused at the connection. |
-| Control plane's human listener (`bind_addr`, `port`) | The operators' network. Never the internet. It serves the dashboard and the API behind `api_keys` and minted tokens, and a control channel that admits nobody. |
+| Control plane's human listener (`bind_addr`, `port`) | The operators' network. Never the internet. It serves the dashboard and the API - every caller presents a token, and there is no anonymous path - plus a control channel that admits nobody. |
 | Control plane's `[machine]` listener | Machines holding a certificate this fleet signed. This is where the assignment list, the routing table and the bundle store live, so it must never be the internet either - the certificate demand is the authentication, not the containment. |
 | deis-store and deis-queue gRPC ports | Runtime nodes, the control plane and the operators' network only. Each binds loopback by default and refuses to start bound anywhere else with no `auth_secret`; the optional migration service shares the listener under its own independent token. |
 | deis-telemetry's gRPC port and its Prometheus port | The same set, and both count: one serves logs and traces, the other every application's metric series. |
@@ -194,8 +278,9 @@ Everything below is therefore the operator's to enforce:
 
 | File | Required |
 |---|---|
-| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `api_keys`, `storage_auth_secret`, `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`, and names the `[machine]` identity files. The three migration values must be different from each other and from every other credential. |
+| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `storage_auth_secret`, `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`, and names the `[machine]` identity files. The three migration values must be different from each other and from every other credential. |
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
+| The control plane's `<data_dir>/bootstrap.token` | `0600`, written by the control plane itself on a first start and deleted the moment the bootstrap token is used. Until then it is an operator credential - it exists to create the first owner account and nothing else - so treat it like one and do not let it out of the host. It is not part of a backup of the data directory: it is short-lived by design, and backing one up means carrying an unused way in. |
 | Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchAssignments` still answers with every environment's secrets. Issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. |
 | Every node's configuration | `0600`, owned by the node's service user. It no longer holds a fleet credential, but it is not free of secrets: `[logging] auth_secret` is deis-telemetry's own value, and the file also names the path of this node's private key and the one control plane this node obeys - which is what decides who may deploy to it. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same contents, same reasoning, on the one host that faces the internet. |
@@ -258,12 +343,11 @@ whoever reads it, and each has its own blast radius:
    node's `[logging] auth_secret` together. A node with the wrong value is not
    refused at startup: it serves requests normally and every push is rejected,
    so the symptom is empty `deis logs` and `deis trace` rather than a failure.
-3. `api_keys` are checked against the file, so removing an entry and
-   restarting is what withdraws it. A key removed from the file is marked
-   revoked in the database at the next startup, because the file is the
-   authority for these. Prefer minting scoped tokens and leaving `api_keys`
-   empty; the count of unscoped credentials is reported at startup and is the
-   number to drive to zero.
+3. Human credentials are tokens, resolved against hashes in the control
+   plane's database, so there is no file-held key to rotate: withdrawing one
+   is `deis token revoke`. An unused bootstrap token expires on its own, and a
+   used one is already revoked. The count of unscoped credentials is reported
+   at startup and is the number to drive to zero.
 4. The three migration admin tokens are independent of everything else by
    design. Change one without touching the others.
 5. `secret_key_file` is not rotatable by editing a line: every secret in the

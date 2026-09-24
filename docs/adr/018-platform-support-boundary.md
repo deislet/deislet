@@ -3,7 +3,7 @@
 - 状态：Accepted
 - 日期：2026-09-03
 - 决策者：产品负责人
-- 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-017
+- 关联：`../archive/phase-analysis-2026-09-03.zh.md` DEC-017
 - 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 决策
@@ -11,6 +11,18 @@
 Deislet 的生产服务端组件只正式支持 Linux。开发者 CLI、compiler、canonical artifact validator/provider packager 与 local development workflow 正式支持 Linux、macOS、Windows。
 
 这不是把应用标准分成不同平台版本。Edge Canon 应用语义、artifact、Control API 和 provider deployment contract 仍然统一；区别只在 Deislet 产品哪些二进制能在哪些操作系统承担生产职责。
+
+## 租户信任模型
+
+Deislet 定位为可信代码平台：平台假设同一安装内部署的应用代码是可信的。V8 isolate 是资源隔离，不是安全沙箱——它防的是资源失控与误用，不防恶意代码或 V8 逃逸。因此平台口径是「多应用」，不是「多租户」；应用之间的存储租户键（`x-deis-tenant`）是隔离与计账机制，不是对抗恶意租户的安全边界。
+
+配套的资源防线：
+
+- 进程内上限：每类可耗尽的资源都有调用级或应用级上限（调用超时、CPU 时间、子请求数、内存上限等，见 ADR-010 与 ADR-012 的相关章节）。
+- cgroup 兕底：进程级失控交给 cgroup v2。所有服务归入一个 `deislet.slice`；`deis-runtime` 设置 `MemoryHigh`、`MemoryMax`、`TasksMax`、`OOMPolicy=stop` 与 `CPUWeight`，其余服务各设 `MemoryMax`；容器部署给出对应的 `--memory`/`--pids-limit` 建议。上限估算公式与 ADR-010 的内存预算一致。
+- readiness 检测：启动时检测 cgroup v2 与自身的 `memory.max`；检测不到资源兑底时，readiness 报告「资源兑底缺失」（该检测由后续批次实现，本 ADR 先行约定行为）。
+
+若将来要运行不可信代码，必须重新评审所有 native op 的输入校验，并引入按应用的 worker 进程隔离（该抽象已在运行时设计中预留），不能把现有 isolate 当作充分防线。
 
 ## 组件支持矩阵
 

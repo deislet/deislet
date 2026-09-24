@@ -1,8 +1,20 @@
 # Deislet
 
 A self-hosted mini Cloudflare Workers and Pages: you write an edge function
-once, and either compile it for somebody else's platform or run it on your own
-machines. Both paths are first class.
+once, and either run it on your own machines or compile it for Cloudflare.
+
+**Supported targets.** Self-hosted (this platform) and Cloudflare are the
+supported deployment targets. Deno Deploy and Tencent EdgeOne are frozen:
+`deis build` still emits their stateless-function artifacts, but they get no
+authentication story, no binding support and no new work.
+
+**Trust model.** deislet assumes the application code deployed into one
+installation is trusted. The V8 isolate is resource isolation, not a security
+sandbox — it keeps one application from exhausting another's CPU and memory,
+and it does not defend against malicious code or a V8 escape. The platform is
+multi-application, not multi-tenant: the boundary it draws is between
+applications and their environments, never between mutually distrusting
+customers.
 
 The execution engine is Deno — `deno_core`, embedded, one V8 isolate per
 running application. The specification an application is written against is
@@ -45,7 +57,7 @@ consecutive checks:
 |---|---|
 | `deis deploy` takes a project from source to serving | one command builds, uploads a version, moves the pointer, and the app answers |
 | `deis versions` lists what was deployed | both versions, with the one production points at marked |
-| one project compiles for all four targets | `deis build -v all` writes a deislet bundle, a Cloudflare `index.js` with its `wrangler.toml`, a Deno handler with a generated router, and an EdgeOne `edge-functions/index.js` — each the shape that host expects, not one output copied four times |
+| one project compiles for all four build targets | `deis build -v all` writes a deislet bundle, a Cloudflare `index.js` with its `wrangler.toml`, a Deno handler with a generated router, and an EdgeOne `edge-functions/index.js` — each the shape that host expects, not one output copied four times; of the four, the deislet bundle and the Cloudflare artifact are the supported targets, the Deno and EdgeOne outputs are frozen stateless functions |
 | a handler that reaches for `WebSocketPair` is refused by the build | `deis deploy` stops at its first step with `EC_STREAM_WEBSOCKET_NONPORTABLE`, no bundle is written and no application is created — Edge Canon v1 has no portable server-side WebSocket API, so the refusal is the promise, not a 101 |
 | static asset served from the bundle | without entering an isolate |
 | `If-None-Match` answers 304 | the ETag is the asset's own sha256 |
@@ -141,7 +153,7 @@ protocol.
 | [`deis-queue`](crates/deis-queue) | A durable queue with lease-based consumption: `Send` and `SendBatch`, `Pull` under a lease, `Ack`, `Nack` with a delay, and a dead-letter table once a message has been tried too often - with the reason it was given up on, which `deis queue dead-letters` reads and `deis queue replay` acts on. Nodes poll it; it never pushes. Consistent, digest-verified backups use `deis-queue snapshot` / `restore`. |
 | [`deis-telemetry`](crates/deis-telemetry) | Logs, metrics and invocation traces, independent of everything else. Three services side by side: batched logs with `Query` and a streaming `Tail`; one trace per invocation with `QueryTraces` and `TailTraces`, which is what `deis trace` reads; and metrics exported in Prometheus format, latency among them as a histogram rather than a high-water mark. Only deis-runtime ships to it so far; the other components still log to their own stdout. |
 | [`deis`](crates/deis) | The developer CLI, and the only interface a person needs. `init`, `dev`, `validate` and `build` work on the project on disk; `targets` reads the locked registry-derived standard status embedded at build time; and `config` holds the CLI's own settings — the credential among them, which it will not write into the project. `deploy`, `versions`, `rollback`, `status`, `secret`, `logs`, `tail`, `trace`, `kv`, `db`, `blob`, `queue`, `account`, `token` and `audit` talk to a running platform. Delegates every bit of parsing and compiling to deis-build. |
-| [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four targets — Cloudflare Workers, Deno Deploy, Tencent EdgeOne, and this platform. Translation only: it never deploys. |
+| [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four build targets. This platform and Cloudflare Workers are the supported ones; Deno Deploy and Tencent EdgeOne are frozen at stateless-function artifacts — no authentication, no bindings, no new work. Translation only: it never deploys. |
 | [`deis-wire`](crates/deis-wire) | The gRPC toolkit and, in `deis_wire::conventions`, the names both sides of every wire agree on: the header names, the tenant id, the message ceiling, the reserved environment keys. |
 
 A few more crates carry contracts rather than behaviour:
@@ -230,21 +242,40 @@ reads exactly like a passing one at a glance. The whole run takes a minute or
 two, because the cron check waits for a real occurrence.
 
 On a fresh clone, build the web console first. Its output is gitignored and
-`deis-control` embeds it at compile time, so `cargo build` fails without it and
-`scripts/demo.sh` does not do this for you:
+`deis-control` embeds it at compile time. A missing `web/dist` does **not**
+fail the build — the build script creates the directory if it is absent — but
+the dashboard then answers 404, and `scripts/demo.sh` does not build it for
+you:
 
 ```bash
 cd crates/deis-control/web && npm ci && npm run build
 ```
 
+Three local-build pitfalls worth knowing:
+
+- **Distributed compilation breaks `deis-control`.** The `rust-embed` macro
+  that inlines `web/dist` runs inside the compile job; with sccache-dist that
+  job can run on a worker with no such path, and the build fails with
+  `folder … web/dist does not exist`. Keep the crate off distributed
+  compilation (`SCCACHE_NO_DIST_COMPILE=1`) or build it locally.
+- **A deleted `web/dist` stays deleted.** Once the build script has run, cargo
+  does not rerun it just because the directory vanished — rebuild the console
+  (or `touch` the crate's `build.rs`) to recreate it.
+- **A corrupt v8 cache fails with `Decompression error`.** The prebuilt v8
+  static library is cached after download; clear the cache (`~/.cache/rusty_v8`
+  or the file named by `RUSTY_V8_ARCHIVE`) and rebuild, or point
+  `RUSTY_V8_MIRROR` at a working mirror.
+
 The console is then served from the control plane's own port —
-`http://127.0.0.1:8085` for the demo. The demo runs with
-`api_auth_enabled = true`, which is the posture a real installation should be
-in, so the console asks for a key before it shows anything: paste the
-`API_KEY` line from `.demo/state.env`. A control plane with authentication off
-opens straight to the dashboard for a direct caller on its own machine,
-because that connection needs no credential and there is none to ask for. A
-reverse proxy must present a credential even when it connects over loopback.
+`http://127.0.0.1:8085` for the demo. Authentication is always on; there is no
+anonymous access, on loopback or anywhere else. On first start, a control
+plane that holds no valid token writes a one-shot bootstrap token to
+`<data_dir>/bootstrap.token` (mode 0600 — the log names the file, never the
+value). That token can do exactly one thing: create the first owner account
+and its token. The moment it succeeds it is revoked and the file deleted; an
+unused bootstrap token expires after 24 hours, and the next control-plane
+start issues a fresh one. The console asks for account credentials before it
+shows anything.
 
 The last line of a `verify` run is a tally and a roll call: `94 passed, 0
 failed, 94 of the 94 checks this file lists`. The second half is there because
@@ -273,9 +304,9 @@ construction, answer several other questions:
 * **Anything that needs two nodes.** There is one. Scheduling across a fleet,
   a cache or a route table that disagrees between nodes, and what a rolling
   deployment looks like from outside are all invisible here.
-* **Anything that needs two tenants at once.** The isolation checks compare
+* **Anything that needs two applications at once.** The isolation checks compare
   two *environments* of the same application and two named bindings; the
-  neighbour is never a second customer under load.
+  neighbour is never a second, independent application under load.
 * **Load, contention and time.** Every check is one request, or a handful.
   Nothing here runs long enough to find a leak, a lock held too long, or a
   ceiling that is only reached under concurrency.
@@ -295,10 +326,10 @@ fmt --check`, `cargo clippy -D warnings`, `cargo build --workspace`, `cargo
 test --workspace`, and a full `start` → `verify` → `stop`. Until it grew those
 jobs it held the document-path check alone, and nothing automatic had ever
 compiled this workspace, run its tests, or run the verification the project's
-claims are quoted from. Read that as a description of the file until a run of
-it has been seen: the version with those jobs has not yet been pushed, so no
-run has been observed, and every number quoted in this document is from a
-local run. The first push that carries it is the one to watch.
+claims are quoted from. Status: the last green run is `33848760058`,
+2026-09-04. Every run since then has failed within seconds — a GitHub billing
+problem, not a build failure — so changes landed after that date carry local
+evidence only. This paragraph is to be updated once CI is running again.
 
 ```bash
 bash scripts/test-demo-witnesses.sh    # unit tests for verify itself; no demo needed
@@ -447,7 +478,7 @@ Current evidence, compliance and support status comes only from the
 |---|---|
 | [edge-canon](https://github.com/deislet/edge-canon) | The versioned edge application standard, evidence and conformance registry. Public. |
 | coraza | A Rust port of the Coraza WAF engine, intended to run in front of deis-proxy. |
-| capkit | Capability-based multi-cloud abstraction, used for provisioning external resources. |
+| capkit | Capability-based abstraction for provisioning external resources. A proposal; not yet integrated. |
 
 ## LAN canary
 

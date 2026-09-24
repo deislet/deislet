@@ -3,10 +3,10 @@
 - 状态：Accepted
 - 日期：2026-09-05
 - 决策者：产品负责人已确认的默认安全、统一标准与产品级推进方向
-- 问题来源：[阶段分析](../product/phase-analysis-2026-09-03.zh.md)
+- 问题来源：[阶段分析](../archive/phase-analysis-2026-09-03.zh.md)
 - 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 - 关联：[ADR-009](009-deployment-activation.md)、[ADR-013](013-secure-by-default.md)、[ADR-019](019-coordinated-data-lifecycle.md)、[ADR-023](023-backend-migration-fence-and-inventory.md)、[ADR-024](024-coordinated-embedded-backend-restore.md)
-- 代码证据：[`deis-control.example.toml`](../../crates/deis-control/deis-control.example.toml)、[`api/middleware.rs`](../../crates/deis-control/src/api/middleware.rs)、[`api/catalog/assignments.rs`](../../crates/deis-control/src/api/catalog/assignments.rs)、[`api/catalog/routing_table.rs`](../../crates/deis-control/src/api/catalog/routing_table.rs)、[`runtime_client/mod.rs`](../../crates/deis-control/src/runtime_client/mod.rs)、[`deis-runtime/dispatcher/auth.rs`](../../crates/deis-runtime/src/dispatcher/auth.rs)、[`deis-runtime/config.rs`](../../crates/deis-runtime/src/config.rs)、[`deis-proxy/catalog/client.rs`](../../crates/deis-proxy/src/catalog/client.rs)
+- 代码证据：[`deis-control.example.toml`](../../crates/deis-control/deis-control.example.toml)、[`api/authz.rs`](../../crates/deis-control/src/api/authz.rs)、[`api/catalog/assignments.rs`](../../crates/deis-control/src/api/catalog/assignments.rs)、[`api/catalog/routing_table.rs`](../../crates/deis-control/src/api/catalog/routing_table.rs)、[`runtime_client/mod.rs`](../../crates/deis-control/src/runtime_client/mod.rs)、[`deis-runtime/dispatcher/auth.rs`](../../crates/deis-runtime/src/dispatcher/auth.rs)、[`deis-runtime/config.rs`](../../crates/deis-runtime/src/config.rs)、[`deis-proxy/catalog/client.rs`](../../crates/deis-proxy/src/catalog/client.rs)
 
 ## 背景与当前最严重风险
 

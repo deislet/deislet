@@ -7,13 +7,13 @@
 1. 已发布的 [Edge Canon](https://github.com/deislet/edge-canon) 版本定义应用可依赖的标准。
 2. `edge-canon.next` 当前只是[统一平台契约 proposal](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)，其[逐条要求](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/requirements.json)和[测试入口](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/conformance/kit.json)仍在起草，尚不是 normative release。
 3. [ADR 决策集](../adr/README.md)记录 Deislet 已接受的产品与架构方向；ADR 是标准提案的实现输入，不替代独立标准治理。
-4. [阶段分析](phase-analysis-2026-09-03.zh.md)保留审查发现和决策过程；[执行路线](roadmap.zh.md)维护工作状态与退出条件。
+4. [阶段分析](../archive/phase-analysis-2026-09-03.zh.md)保留审查发现和决策过程；[执行路线](roadmap.zh.md)维护工作状态与退出条件。
 5. `docs/implementation-plan.zh.md`、`docs/architecture.zh.md` 和代码描述当前实现。它们与新方向冲突时，应建立迁移任务，不能静默改写事实。
 
 ## 当前结论
 
 - 标准模型：一个版本化能力集合，没有 provider profile 或可选扩展层。
-- 首批一等后端：Deislet、Cloudflare Workers/Pages、Tencent EdgeOne Makers；Deno 暂为实验目标。
+- 支持目标：自托管（Deislet）与 Cloudflare Workers/Pages。Deno Deploy 与 Tencent EdgeOne 冻结：仅生成无状态函数产物，不做认证，不承诺绑定。
 - Canonical Build Output：标准锁定的 `edge-canon.build-output/v1` 目录和 `.edge-canon/output.json` 是唯一 payload 契约；Deislet 只保存控制面 artifact record，provider tar/zip/目录均为可替换的派生或传输实现。
 - 标准、证据、合规和支持状态只读取[自动生成的人类视图](target-status.zh.md)或其[机器 JSON](target-status.json)。这两个文件由锁定的 Edge Canon conformance registry 快照生成；本页不复制状态值，以免形成第二个事实源。
 
@@ -28,7 +28,7 @@
 - [provider driver 三平台可移植性证据](evidence/provider-driver-portability-db10a9c.json)及其[Schema](evidence/provider-driver-portability.schema.json)
 - [provider deployment 控制层三平台证据](evidence/provider-deployment-portability-80a4a35.json)及其[Schema](evidence/provider-deployment-portability.schema.json)
 - [provider driver release/installer 三平台证据](evidence/provider-driver-release-portability-9c9d209.json)及其[Schema](evidence/provider-driver-release-portability.schema.json)
-- [provider driver registry/dispatcher、发行透明度、Windows DACL、后台协调器、公平退避、release API 与 target grant 三平台证据](evidence/provider-driver-dispatcher-portability-69f1343.json)及其[Schema](evidence/provider-driver-dispatcher-portability.schema.json)
+- [provider driver registry/dispatcher、发行透明度、Windows DACL、后台协调器、公平退避、release API 与 target grant 三平台证据](evidence/provider-driver-dispatcher-portability-63870e3.json)及其[Schema](evidence/provider-driver-dispatcher-portability.schema.json)
 - [仓库校验器](../../scripts/check-product-governance.py)
 
 ## 更新规则

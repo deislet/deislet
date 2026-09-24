@@ -7,6 +7,8 @@
 
 > v0.4 · 2026-08-29
 > 定位：**mini 版 Cloudflare Workers + Pages，执行引擎换成 Deno（deno_core）**，面向自己/团队内部使用。
+> 信任模型：deislet 假设同一安装内的应用代码可信；V8 isolate 是资源隔离，不是安全沙箱。
+> 目标口径：自托管（deislet）与 Cloudflare 为支持的目标；Deno、EdgeOne 仅生成无状态函数产物，不做认证，不承诺绑定。
 > 配套 [`implementation-plan.zh.md`](implementation-plan.zh.md)：那份讲「照着写什么」，这份讲「为什么这么分」。
 
 **现在这套东西是通的。** 波次 A 与波次 B 已经合入：`deis build --vendor deislet`
@@ -57,14 +59,14 @@ flowchart TB
         平台侧：deploy / versions / rollback / status / secret<br/>logs / tail / trace / kv / db / blob"]
         deis-build["<b>deis-build</b> · 编译器
         SWC 解析 + rolldown 打包 + 目标产物实现检查
-        四个目标：cloudflare / deno / tencent / deislet"]
+        构建目标：deislet / cloudflare（支持）；deno / tencent（冻结，仅无状态函数）"]
     end
 
     subgraph third["线 B · 第三方平台"]
         direction LR
-        CFW["Cloudflare Workers"]
-        DD["Deno Deploy"]
-        EO["腾讯 EdgeOne"]
+        CFW["Cloudflare Workers（支持目标）"]
+        DD["Deno Deploy（冻结：仅无状态函数）"]
+        EO["腾讯 EdgeOne（冻结：仅无状态函数）"]
     end
 
     subgraph self["线 A · 自建平台"]
@@ -89,7 +91,7 @@ flowchart TB
     REST + React 面板 + Prometheus"]
 
     coraza["<b>coraza</b> · WAF"]
-    capkit["<b>capkit</b> · 多云能力"]
+    capkit["<b>capkit</b> · 外部资源供应（提案，未接入）"]
 
     canon -.规范.-> deis-build
     canon -.规范.-> deis-runtime
@@ -1221,7 +1223,7 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | WebAssembly | 成立 | V8 自带 |
 | WebSocket | 成立 | 服务端（`WebSocketPair` 桥接）与客户端（走 `fetch_policy.rs` 出网策略的 `WebSocket` 全局）都有；HTTP 升级、经过 deis-proxy 的一跳、文本帧与二进制帧都有真测试覆盖（`websocket_bridging_test.rs`、`websocket_through_proxy_test.rs`，见 §11） |
 | BroadcastChannel | **不成立** | `deno_web` 带着 `01_broadcast_channel.js` 被 import 进来了，但没有把 `BroadcastChannel` 装到 `globalThis` 上——8.1 节没要求它，`bootstrap.js` 补全局时就没带上。探针实测：`typeof BroadcastChannel === "undefined"`。真要开还有一层要想清楚：进程内广播是跨应用的，得先按 (应用, 环境) 隔离 |
-| 版本化 Node/npm 子集 | 部分成立，产品项仍 active | 构建器已按统一 Node 24.20.0 契约校验并内联锁定 npm 依赖；自建 runtime 以受限 façade 提供 18 个标准模块、`Buffer`、受限 `process` 与调度函数，且不暴露宿主 cwd/PID/Deno。运行时通用 `require`、文件系统和清单外 builtin 仍明确不可用；三个一等后端的同源 mandatory suite 与真实 provider evidence 尚未完成，不能据此宣称完整 Node runtime 或后端合规 |
+| 版本化 Node/npm 子集 | 部分成立，产品项仍 active | 构建器已按统一 Node 24.20.0 契约校验并内联锁定 npm 依赖；自建 runtime 以受限 façade 提供 18 个标准模块、`Buffer`、受限 `process` 与调度函数，且不暴露宿主 cwd/PID/Deno。运行时通用 `require`、文件系统和清单外 builtin 仍明确不可用；deislet 与 Cloudflare 两个支持目标的同源 mandatory suite 与真实 provider evidence 尚未完成，不能据此宣称完整 Node runtime 或后端合规 |
 | 服务端渲染 | 不成立（形态上没有） | 处理函数当然可以自己拼 HTML，但没有框架挂钩，也没有 npm 生态 |
 | 增量静态再生 | 不成立（形态上没有） | 同上 |
 | Durable Objects | 不成立（形态上没有） | 全量复制模型下没有「唯一可寻址实例」这回事 |
@@ -1298,7 +1300,7 @@ Workers AI 在项目配置里根本没有可声明的地方，所以编译器检
 - **可观测那一格加了按次调用的轨迹**：deis-telemetry 多了 `TraceService`，节点每处理
   完一次调用发一条，`deis trace` 读它；延迟从只升不降的高水位改成直方图，
   `histogram_quantile` 能直接算分位数。
-- **依赖**：前门从 pingora 0.5 升到 0.8.1（0.5 带两个请求走私漏洞，在多租户边缘上
+- **依赖**：前门从 pingora 0.5 升到 0.8.1（0.5 带两个请求走私漏洞，在多应用边缘上
   意味着一个租户的请求被交给另一个租户的应用），顺带堵上我们自己一个洞——请求体上限
   原来对任何带 `Upgrade` 头的请求一律放行，0.8 能看到节点到底有没有回 101，现在问的是
   这个。运行时离开 deno 私有分支改用发布版 `deno_runtime` 0.266，`cargo audit` 从 13

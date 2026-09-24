@@ -3,9 +3,10 @@
 - 状态：Accepted
 - 日期：2026-09-03
 - 决策者：产品负责人
-- 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-019
+- 关联：`../archive/phase-analysis-2026-09-03.zh.md` DEC-019
 - 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 - 关联决策：DEC-001（单一标准）、DEC-003（独立治理）、DEC-006（首批合规后端）
+- 修订：2026-09-24 决策 D-5 —— 首批 conformant targets 收缩为 Deislet 与 Cloudflare；EdgeOne、Deno 冻结，仅保留无状态函数产物，不承诺绑定
 
 ## 决策
 
@@ -19,7 +20,7 @@ Edge Canon 不追逐所有供应商产品功能，也不冻结在当前能力。
 
 - DEC-001 已确定只有一个统一标准，没有按供应商拆分的 capability profile。
 - DEC-003 已确定 Edge Canon 独立治理，Deislet 不能单方面重写标准。
-- DEC-006 已确定首批 conformant targets 是 Deislet、Cloudflare Workers、Tencent EdgeOne Makers；Deno 暂为实验/参考。
+- DEC-006 已确定首批 conformant targets；2026-09-24 决策 D-5 将其收缩为 Deislet 与 Cloudflare Workers，EdgeOne 与 Deno 冻结为无状态函数目标，不再列为首批合规目标。
 - 本 ADR 说明新能力从哪里获得行业证据、如何筛选、何时能成为 normative standard。
 
 Reference vendor 不是“标准所有者”，conformant backend 也不必进入 reference set。两者不能混淆。
@@ -32,7 +33,7 @@ Reference vendor 不是“标准所有者”，conformant backend 也不必进�
 
 ### Standard implementation/backend
 
-实现某一完整 Edge Canon version，并通过 shared conformance。可以是 Deislet 自建后端、Cloudflare/EdgeOne driver + native products/companions，或未来其他后端。
+实现某一完整 Edge Canon version，并通过 shared conformance。可以是 Deislet 自建后端、Cloudflare driver + native products/companions，或未来其他后端（EdgeOne 已冻结，决策 D-5，仅生成无状态函数产物，不在此列）。
 
 ### Application/framework
 
@@ -49,7 +50,7 @@ Released immutable standard version
         │
         ├── Deislet implementation
         ├── Cloudflare implementation/driver
-        ├── EdgeOne implementation/driver
+        ├── EdgeOne implementation/driver (frozen: stateless functions only)
         └── future conformant backends
 ```
 
@@ -65,6 +66,8 @@ Released immutable standard version
 - Deislet 是 Edge Canon reference implementation 与 self-hosted product，不应把自身现状当行业交集证据；它负责证明标准能被独立实现。
 - Deno 可提供 Web/Node/runtime 设计的补充证据并作为实验后端，但在 governance 正式纳入 reference set 前不拥有默认交集决定权。
 - Vercel、Netlify、Fastly、AWS Lambda@Edge/CloudFront、Bun 等可以按具体提案提供辅助行业证据；引用它们不等于扩大正式 reference set。
+
+EdgeOne 与 Deno 在实现侧冻结（2026-09-24 决策 D-5，仅无状态函数）不自动移除其 reference 资格；冻结约束的是 conformant target 承诺，reference set 的增删仍按 governance 流程处理。
 
 上述集合不是永久写死。每个 Edge Canon 标准周期记录 reference-set snapshot、版本/compatibility date、取证日期与调整 proposal。
 
@@ -229,11 +232,11 @@ Node compatibility subset、SSR/streaming/ISR、logical resources、queue、SQL/
 
 - 收集 reference/industry semantic evidence；
 - 定义 provider-neutral exact behavior；
-- Cloudflare、EdgeOne、Deislet 各给出 native/composed/companion mapping；
+- Cloudflare、Deislet 各给出 native/composed/companion mapping（EdgeOne 已冻结，决策 D-5，在解冻并重新准入前不参与 mapping）；
 - shared conformance 全绿；
 - 不能完整实现的 target 不标该标准版本合规。
 
-特别是 Stateful Object：某 provider 没有同名原生产品不构成 profile 理由。标准若最终接纳该语义，EdgeOne 等路径通过 companion service 完整实现；若 prototype 证明无法满足，则 proposal 不能晋级，而不是发布一个弱版本。
+特别是 Stateful Object：某 provider 没有同名原生产品不构成 profile 理由。标准若最终接纳该语义，由各未冻结的 conformant target 通过 native/composed/companion 路径完整实现；若 prototype 证明无法满足，则 proposal 不能晋级，而不是发布一个弱版本。
 
 ## 对当前代码与文档的影响
 
@@ -268,7 +271,7 @@ Edge Canon/Deislet 自动发布：
 - 每项新增 normative feature 都有 reference evidence、semantic overlap、multi-backend mapping 和 conformance tests。
 - Vendor 独有 API 不出现在合规应用 runtime/context/type definitions 中。
 - 同一 application artifact 不因 target 不同通过/拒绝不同 standard features。
-- Cloudflare、EdgeOne、Deislet implementation 可以内部不同，但行为/错误/保证/生命周期通过同一 oracle。
+- Cloudflare、Deislet implementation 可以内部不同，但行为/错误/保证/生命周期通过同一 oracle。
 - Reference vendor 文档/API 变化自动触发 evidence freshness/conformance review，不改变旧 standard version。
 - Reference set 的加入/移除有公开 proposal、版本边界和历史 snapshot。
 - 已确认战略能力在无法实现时阻止 standard proposal 晋级或 backend conformance，而不是退化为 optional profile。
