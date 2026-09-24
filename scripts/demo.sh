@@ -6,6 +6,11 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DEMO_DIR="${DEMO_DIR:-${ROOT_DIR}/.demo}"
 LOG_DIR="${LOG_DIR:-${DEMO_DIR}/logs}"
 STATE_FILE="${STATE_FILE:-${DEMO_DIR}/state.env}"
+# The control plane's own state directory, named `data_dir` in its
+# configuration: where the one-time bootstrap token a first start mints is
+# written. Cleared with everything else a new run throws away, so every
+# `start` mints a fresh bootstrap credential.
+CONTROL_DATA_DIR="${CONTROL_DATA_DIR:-${DEMO_DIR}/control-data}"
 # Minted fresh on every start and thrown away by the next one; see
 # `mint_fleet_identities`.
 PKI_DIR="${PKI_DIR:-${DEMO_DIR}/pki}"
@@ -276,6 +281,8 @@ reset_previous_run() {
     "${DEMO_DIR}/deis-queue-data" \
     "${DEMO_DIR}/deis-telemetry-data" \
     "${DEMO_DIR}/deis-runtime-data" \
+    "${CONTROL_DATA_DIR}" \
+    "${DEMO_DIR}/used-bootstrap.token" \
     "${DEMO_DIR}/bundles" \
     "${DEMO_DIR}/origin" \
     "${DEMO_DIR}/acme" \
@@ -508,12 +515,18 @@ wait_for_tcp() {
 # deployed, retried until the proxy answers it. curl paces its own retries and
 # `--retry-all-errors` covers the 503, so there is no shell-level sleeping and
 # nothing here waits for a guessed duration.
+#
+# The application is named the way a visitor names it: by the Host header.
+# The edge routes by host alone - a request header naming an application is
+# not a routing input anywhere - so the probe asks for the automatic address
+# the routing table synthesises for the default environment,
+# `<app>.<preview zone>`, which is the same name the checks below send.
 wait_for_proxy_routing() {
   local attempts=$1
   curl -sf -o /dev/null -m 2 \
     --retry "$attempts" --retry-delay 1 --retry-max-time $((attempts * 2)) \
     --retry-connrefused --retry-all-errors \
-    -H "x-deis-app-id: ${APP_ID}" \
+    -H "Host: ${ACME_PRODUCTION_NAME}" \
     "http://127.0.0.1:${DEIS_PROXY_PORT}/" >/dev/null 2>&1
 }
 
@@ -626,7 +639,7 @@ DEIS_STORE_CONFIG=$DEIS_STORE_CONFIG
 DEIS_QUEUE_CONFIG=$DEIS_QUEUE_CONFIG
 DEIS_TELEMETRY_CONFIG=$DEIS_TELEMETRY_CONFIG
 SECRET=$SECRET
-API_KEY=$API_KEY
+OPERATOR_TOKEN=$OPERATOR_TOKEN
 STORAGE_AUTH_SECRET=$STORAGE_AUTH_SECRET
 SECRET_KEY_FILE=$SECRET_KEY_FILE
 APP_ID=$APP_ID
@@ -986,14 +999,15 @@ control_url() {
   echo "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 }
 
-# GET one of the control plane's human endpoints, presenting the API key.
+# GET one of the control plane's human endpoints, presenting the demo's
+# operator token.
 #
 # Used only where there is no CLI command for the question - the fleet view is
 # an operator's, not a developer's. Everything a developer does goes through
-# `deis`. The key is required now that `start` turns `api_auth_enabled` on, so
-# a caller that forgets it gets 401 rather than an answer.
+# `deis`. A credential is required: the human API has no unauthenticated path,
+# so a caller that forgets it gets 401 rather than an answer.
 control_api() {
-  curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)$1" || true
+  curl -s -H "Authorization: Bearer ${OPERATOR_TOKEN}" "$(control_url)$1" || true
 }
 
 # Every item of one Control API list, whatever its size, as one JSON array.
@@ -1056,18 +1070,111 @@ deis_cli_env() {
     "DEIS_APP=${APP_ID}"
     "DEIS_ENVIRONMENT=${ENV_NAME}"
     "DEIS_CONFIG_HOME=${DEMO_DIR}/deis-config"
-    # The control plane requires it now, so the CLI has to carry it. In the
-    # environment rather than in a credentials file for the reason the endpoint
-    # is: the demo's key is minted at start time and a file committed to the
-    # repository cannot know it. A person stores theirs with
+    # The control plane requires a credential, so the CLI has to carry one. In
+    # the environment rather than in a credentials file for the reason the
+    # endpoint is: the token is minted at start time and a file committed to
+    # the repository cannot know it. It is the scoped operator token
+    # `bootstrap_operator_session` minted from the first owner account; the
+    # CLI's own login token from that same session sits beside it in the
+    # config home above. A person stores theirs with
     # `deis config set control.token`.
-    "DEIS_CONTROL_TOKEN=${API_KEY}"
+    "DEIS_CONTROL_TOKEN=${OPERATOR_TOKEN}"
   )
 }
 
 deis_cli() {
   deis_cli_env
   env "${DEIS_CLI_ENV[@]}" "${BIN_DIR}/deis" "$@"
+}
+
+# Trade the one-time bootstrap credential for the demo's operator credential.
+#
+# `start` writes no human credential into any configuration file. On a first
+# start with an empty database the control plane mints a one-time bootstrap
+# token, writes it 0600 into `<data_dir>/bootstrap.token`, and allows it
+# exactly one thing: creating the first owner account and its first token.
+# This is the same door every installation walks through, driven the way a
+# person drives it - `deis login --bootstrap`.
+#
+# Three things happen here:
+#
+# 1. the login. The CLI creates the owner account and stores its new token in
+#    the demo's own config home; the control plane revokes the bootstrap
+#    credential and deletes its file after that first successful use;
+# 2. from the owner account, the scoped operator token the rest of `start`
+#    and `verify` present. It is scoped rather than flat on purpose: a
+#    credential answered by no scope list is the shape this platform retired
+#    with `api_keys`. The verbs cover what the demo's own calls do - deploy
+#    and upload versions, write secrets, mint storage tokens, manage
+#    accounts, routes and the audit log;
+# 3. the spent bootstrap secret is kept in a 0600 file beside the demo state,
+#    so `verify` can present it once more and watch it be refused.
+bootstrap_operator_session() {
+  local bootstrap_file="${CONTROL_DATA_DIR}/bootstrap.token"
+  local spent_file="${DEMO_DIR}/used-bootstrap.token"
+
+  # The file is written during control's startup, after the database opens -
+  # /health answering is not a promise it exists yet, so this is polled.
+  local waited=0
+  while [ ! -f "$bootstrap_file" ] && [ "$waited" -lt 60 ]; do
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  if [ ! -f "$bootstrap_file" ]; then
+    echo "❌ Control wrote no bootstrap token at ${bootstrap_file}; there is no way to log in. Log: ${LOG_DIR}/deis-control.log"
+    exit 1
+  fi
+
+  # Read the secret out only to keep it for the one-time-use check; the login
+  # itself reads the file, exactly as a person points the CLI at it.
+  local spent
+  spent=$(cat "$bootstrap_file")
+
+  DEIS_CONTROL_ENDPOINT="$(control_url)" \
+    DEIS_CONFIG_HOME="${DEMO_DIR}/deis-config" \
+    "${BIN_DIR}/deis" login --bootstrap "$bootstrap_file" \
+    > "${LOG_DIR}/cli-login.log" 2>&1 || {
+      echo "❌ deis login --bootstrap failed; see ${LOG_DIR}/cli-login.log"
+      exit 1
+    }
+
+  # The owner's login token now lives in the CLI's config home, and the CLI
+  # presents it by itself - no DEIS_CONTROL_TOKEN here, which is also why
+  # these calls spell the environment out rather than going through
+  # `deis_cli_env`, whose array carries the operator token this step exists
+  # to mint.
+  local owner minted
+  owner=$(env \
+    DEIS_CONTROL_ENDPOINT="$(control_url)" \
+    DEIS_CONFIG_HOME="${DEMO_DIR}/deis-config" \
+    "${BIN_DIR}/deis" token list --json 2>/dev/null \
+    | jq -r '[.tokens[].account] | first // empty')
+  if [ -z "$owner" ]; then
+    echo "❌ could not read back the owner account the bootstrap login created; see ${LOG_DIR}/cli-login.log"
+    exit 1
+  fi
+
+  minted=$(env \
+    DEIS_CONTROL_ENDPOINT="$(control_url)" \
+    DEIS_CONFIG_HOME="${DEMO_DIR}/deis-config" \
+    "${BIN_DIR}/deis" token create --account "$owner" --name demo-operator \
+      --scope "admin:*/*" --scope "deploy:*/*" --scope "secrets:*/*" --scope "storage:*/*" \
+      --json 2>/dev/null || echo '{}')
+  OPERATOR_TOKEN=$(echo "$minted" | jq -r '.secret // empty')
+  if [ -z "$OPERATOR_TOKEN" ]; then
+    echo "❌ could not mint the demo's scoped operator token: ${minted}"
+    exit 1
+  fi
+
+  # The bootstrap credential is spent: the control plane revoked it and
+  # deleted its file when the login used it. What is kept here is a dead
+  # string, kept only so `verify` can show a second presentation being
+  # refused like one that never existed.
+  printf '%s\n' "$spent" > "$spent_file"
+  chmod 600 "$spent_file"
+  if [ -f "$bootstrap_file" ]; then
+    echo "⚠️  ${bootstrap_file} still exists after login; verify's single-use check will fail"
+  fi
 }
 
 # Lay down a copy of the example app's sources and echo the directory.
@@ -1867,7 +1974,7 @@ start_demo() {
   # is read in a subshell rather than sourced here.
   #
   # Sourcing it here is what this used to do, and the file is a complete
-  # settings dump: SECRET, API_KEY, STORAGE_AUTH_SECRET, APP_SRC_DIR, APP_ID,
+  # settings dump: SECRET, OPERATOR_TOKEN, STORAGE_AUTH_SECRET, APP_SRC_DIR, APP_ID,
   # ENV_NAME, NODE_ID, DEMO_SECRET_VALUE and every port. So every one of them
   # was silently replaced by the last run's value, and the option the person
   # typed on the command line lost to a file they had never opened:
@@ -1961,15 +2068,14 @@ start_demo() {
   # what it looks like when only some of the three carry it.
   STORAGE_AUTH_SECRET=${STORAGE_AUTH_SECRET:-$(generate_secret)}
 
-  # The credential a person - the `deis` CLI, a dashboard - presents to the
-  # control plane's human API. A different channel again:
-  # STORAGE_AUTH_SECRET authenticates a *storage call*, and this one
-  # authenticates *a caller who may deploy*. It is generated
-  # rather than left out because `api_auth_enabled` defaults to off, and a demo
-  # that left it off would leave every catalog route - the deploy, the version
-  # upload, the storage-token mint - open to anyone who can reach the port,
-  # while looking exactly like one where authentication works.
-  API_KEY=${API_KEY:-$(generate_secret)}
+  # No credential for a person is generated here, and none goes into any
+  # configuration file. The control plane's human API has no unauthenticated
+  # path, and a first start with an empty database mints a one-time bootstrap
+  # token into its data directory; `bootstrap_operator_session` below logs
+  # the first owner in through it and mints the scoped operator token the
+  # rest of this script presents. A different channel again:
+  # STORAGE_AUTH_SECRET authenticates a *storage call*, and the operator
+  # token authenticates *a caller who may deploy*.
 
   # The master key that encrypts environment secrets. 32 bytes as 64 hex
   # characters, which is what `openssl rand -hex 32` produces. It never enters
@@ -2025,8 +2131,11 @@ start_demo() {
     cat > "$DEIS_CONTROL_CONFIG" <<EOF
 bind_addr = "0.0.0.0"
 port = ${DEIS_CONTROL_PORT}
-api_auth_enabled = true
-api_keys = ["${API_KEY}"]
+# Where this installation keeps its own state. Notably the one-time
+# bootstrap token: a first start with no credential anywhere in the database
+# mints one here, 0600, and `bootstrap_operator_session` logs the first
+# owner in through it.
+data_dir = "${CONTROL_DATA_DIR}"
 heartbeat_interval = 30
 heartbeat_timeout = 90
 deis_runtime_poll_interval = 5
@@ -2070,7 +2179,7 @@ id = "${NODE_ID}"
 addr = "http://127.0.0.1:${DEIS_RUNTIME_PORT}"
 EOF
     # Every generated configuration is the operator's alone: this one holds
-    # api_keys and storage_auth_secret, and every machine's names the private
+    # storage_auth_secret, and every machine's names the private
     # key behind its own certificate (docs/trust-boundaries.md).
     chmod 600 "$DEIS_CONTROL_CONFIG"
 
@@ -2254,6 +2363,12 @@ EOF
     echo "❌ Could not find an available port to start Control"
     exit 1
   fi
+
+  # First things first, while the freshly minted bootstrap credential is
+  # still live: log the first owner in and mint the operator token every
+  # later step presents. Nothing else in this demo carries a human
+  # credential.
+  bootstrap_operator_session
 
   echo "🚀 Starting Runtime (HTTP: ${DEIS_RUNTIME_PORT})"
   # Through `bounded_log` rather than straight into the file: this is the one
@@ -3154,11 +3269,11 @@ check_route_parameter() {
 #
 # The README puts "host and path prefix" in bold, and until this check nothing
 # exercised the second half. Every request the demo sends through deis-proxy
-# either carries `x-deis-app-id` - which names an application outright and
-# never consults a route - or reaches an environment's automatic address under
-# `routing.preview_zone`, which is a host and nothing else. A proxy that
-# ignored `path_prefix` entirely, or matched it as a plain string prefix, left
-# all of that green.
+# reaches an environment's automatic address under `routing.preview_zone`, or
+# a host a catalog route claims - a host, and a path prefix where one is
+# claimed. No request header names an application to the edge: the host is
+# the whole of the choice. A proxy that ignored `path_prefix` entirely, or
+# matched it as a plain string prefix, left all of that green.
 #
 # The catalog is what this reads from, and it is reached with curl rather than
 # with `deis`: routes are an operator's object and the CLI has no verb for one
@@ -3205,7 +3320,7 @@ ensure_domain_grant() {
     return 0
   fi
   curl -s -o /dev/null -w '%{http_code}' -X POST \
-    -H "Authorization: Bearer ${API_KEY}" -H 'content-type: application/json' \
+    -H "Authorization: Bearer ${OPERATOR_TOKEN}" -H 'content-type: application/json' \
     -d "{\"pattern\":\"${pattern}\",\"app_id\":\"${app}\"}" \
     "$(control_url)/api/v1/domains" || true
 }
@@ -3218,7 +3333,7 @@ ensure_domain_grant() {
 ensure_catalog_route() {
   local app=$1 environment=$2 host=$3 prefix=$4
   local existing
-  existing=$(curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)/api/platform/routes" \
+  existing=$(curl -s -H "Authorization: Bearer ${OPERATOR_TOKEN}" "$(control_url)/api/platform/routes" \
     | jq -r --arg app "$app" --arg host "$host" --arg prefix "$prefix" \
       '[.routes[] | select(.app_id == $app and .host == $host and .path_prefix == $prefix)] | length' \
     2>/dev/null || echo 0)
@@ -3226,7 +3341,7 @@ ensure_catalog_route() {
     return 0
   fi
   curl -s -o /dev/null -w '%{http_code}' -X POST \
-    -H "Authorization: Bearer ${API_KEY}" -H 'content-type: application/json' \
+    -H "Authorization: Bearer ${OPERATOR_TOKEN}" -H 'content-type: application/json' \
     -d "{\"host\":\"${host}\",\"path_prefix\":\"${prefix}\",\"priority\":0}" \
     "$(control_url)/api/v1/apps/${app}/environments/${environment}/routes" || true
 }
@@ -3337,25 +3452,32 @@ check_the_proxy_routes_by_host_and_path_prefix() {
 # the body is chunked, and -- for the failure cases -- that the terminating
 # zero-length chunk never came. All four are visible here and nowhere else.
 #
-# Arguments: port, app id, request target, how long to keep reading (ms), how
-# many frames to stop after (0 = until the body ends), and what to offer in
-# Accept-Encoding.
+# Arguments: port, the value for the Host header, an app id or nothing, the
+# request target, how long to keep reading (ms), how many frames to stop
+# after (0 = until the body ends), and what to offer in Accept-Encoding.
+#
+# The Host value is what does the choosing on the proxy's port: the edge
+# routes by host alone, so a call through it names the application's
+# automatic address and carries no app id. A call to the node's data port
+# names the application with `x-deis-app-id`, which is what that port reads;
+# there the Host value is the address dialled, as any direct call's is.
 #
 # Stopping after N frames closes the socket where it stands, which is exactly
 # what a client hanging up looks like to the node.
 stream_exchange() {
-  python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PYSTREAM'
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYSTREAM'
 import json
 import socket
 import sys
 import time
 
 port = int(sys.argv[1])
-app_id = sys.argv[2]
-target = sys.argv[3]
-max_ms = int(sys.argv[4])
-stop_after = int(sys.argv[5])
-accept_encoding = sys.argv[6]
+host = sys.argv[2]
+app_id = sys.argv[3]
+target = sys.argv[4]
+max_ms = int(sys.argv[5])
+stop_after = int(sys.argv[6])
+accept_encoding = sys.argv[7]
 
 report = {
     "status_line": "",
@@ -3373,13 +3495,14 @@ def ms():
 
 try:
     sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    app_header = "x-deis-app-id: %s\r\n" % app_id if app_id else ""
     request = (
         "GET %s HTTP/1.1\r\n"
-        "Host: 127.0.0.1\r\n"
-        "x-deis-app-id: %s\r\n"
+        "Host: %s\r\n"
+        "%s"
         "Accept-Encoding: %s\r\n"
         "Accept: text/event-stream\r\n"
-        "Connection: close\r\n\r\n" % (target, app_id, accept_encoding)
+        "Connection: close\r\n\r\n" % (target, host, app_header, accept_encoding)
     )
     sock.sendall(request.encode("utf-8"))
     sock.settimeout(0.2)
@@ -3486,7 +3609,9 @@ check_server_sent_events_reach_the_client_frame_by_frame() {
     return
   fi
 
-  stream_exchange "$DEIS_PROXY_PORT" "$APP_ID" \
+  # Through the edge, named by Host like any visitor: the proxy routes by
+  # host, and no request header selects an application.
+  stream_exchange "$DEIS_PROXY_PORT" "${ACME_PRODUCTION_NAME}" "" \
     "${STREAM_ROUTE}?mode=sse&frames=${frames}&gapMs=${gap}&tag=sse" \
     6000 0 "gzip" > "$report" 2>"${LOG_DIR}/verify-sse.log" || true
 
@@ -3578,7 +3703,7 @@ check_a_stream_fed_from_fetch_is_not_collected() {
   # that read the body before answering could not send its first byte until the
   # upstream had sent its last, so the two timings below are the whole proof.
   local upstream="http%3A//127.0.0.1%3A${DEIS_ORIGIN_PORT}/slow%3Fpieces%3D${pieces}%26gapMs%3D${gap}"
-  stream_exchange "$DEIS_PROXY_PORT" "$APP_ID" \
+  stream_exchange "$DEIS_PROXY_PORT" "${ACME_PRODUCTION_NAME}" "" \
     "${STREAM_ROUTE}?mode=relay&url=${upstream}" \
     8000 0 "gzip" > "$report" 2>"${LOG_DIR}/verify-stream-relay.log" || true
 
@@ -3625,7 +3750,7 @@ check_a_stream_stops_when_the_client_hangs_up() {
   # Two frames and then the socket is closed where it stands, which is what a
   # visitor closing a tab looks like from inside the node.
   local gap=80
-  stream_exchange "$DEIS_RUNTIME_PORT" "$APP_ID" \
+  stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
     "${STREAM_ROUTE}?mode=endless&gapMs=${gap}&tag=${tag}" \
     6000 2 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-hangup.log" || true
 
@@ -3702,7 +3827,7 @@ check_a_producer_that_throws_leaves_a_failed_transfer() {
     return
   fi
 
-  stream_exchange "$DEIS_PROXY_PORT" "$APP_ID" \
+  stream_exchange "$DEIS_PROXY_PORT" "${ACME_PRODUCTION_NAME}" "" \
     "${STREAM_ROUTE}?mode=throw&after=2&gapMs=80&tag=throw" \
     6000 0 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-throw.log" || true
 
@@ -3780,7 +3905,7 @@ check_a_stream_past_its_budget_is_closed_by_the_node() {
   # Read for well past the ceiling. The node is what has to end this, and the
   # client keeps asking until it does.
   local patience=$(( DEMO_STREAM_TIMEOUT_MS * 3 ))
-  stream_exchange "$DEIS_RUNTIME_PORT" "$APP_ID" \
+  stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
     "${STREAM_ROUTE}?mode=endless&gapMs=120&tag=${tag}" \
     "$patience" 0 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-budget.log" || true
 
@@ -3855,7 +3980,7 @@ check_a_request_is_served_while_a_stream_is_open() {
   # underneath it. Both go to the same application, which on this node is one
   # isolate on one thread -- the arrangement that would let a slow reader block
   # everybody if a stream owned the isolate for its lifetime.
-  stream_exchange "$DEIS_RUNTIME_PORT" "$APP_ID" \
+  stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
     "${STREAM_ROUTE}?mode=endless&gapMs=200&tag=${tag}" \
     4000 0 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-parallel.log" &
   local holder=$!
@@ -4575,19 +4700,20 @@ check_data_cli_reads_the_apps_write() {
 
 # The token is a credential that works directly against deis-store, without
 # going through this control plane at all, and it does not expire. So the
-# route that mints one is gated exactly as the deploy route is - and this is
-# the check that the gate is really there rather than being a comment about
-# one. Without it, `start` could leave api_auth_enabled off and every other
-# check in this file would pass unchanged.
-check_storage_token_requires_the_api_key() {
-  local title="the storage-token route refuses a caller with no API key"
+# route that mints one sits on the human API, which has no unauthenticated
+# path anywhere - and this is the check that the gate is really there rather
+# than being a comment about one. Without it, a control plane that let a
+# credential-less caller through would pass every other check in this file
+# unchanged.
+check_storage_token_route_requires_a_credential() {
+  local title="the storage-token route refuses a caller with no credential"
   local route="/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/storage-token"
   local minted="${LOG_DIR}/verify-storage-token.json"
 
   local anonymous authorised
   anonymous=$(curl -s -o /dev/null -w '%{http_code}' "$(control_url)${route}" || true)
   authorised=$(curl -s -o "$minted" -w '%{http_code}' \
-    -H "Authorization: Bearer ${API_KEY}" "$(control_url)${route}" || true)
+    -H "Authorization: Bearer ${OPERATOR_TOKEN}" "$(control_url)${route}" || true)
 
   local tenant endpoint token_length
   tenant=$(jq -r '.tenant // empty' < "$minted" 2>/dev/null || true)
@@ -4597,7 +4723,7 @@ check_storage_token_requires_the_api_key() {
   if [ "$anonymous" = "401" ] && [ "$authorised" = "200" ] \
     && [ "$tenant" = "${APP_ID}.${ENV_NAME}" ] && [ "${token_length:-0}" -gt 0 ]; then
     pass_check "$title" \
-      "GET ${route} with no credential answered HTTP ${anonymous} and no token; the same request carrying the API key answered HTTP ${authorised} with tenant ${tenant}, store_endpoint ${endpoint} and a ${token_length}-character token, which is not printed here - it reads and writes that tenant's data directly against deis-store and does not expire"
+      "GET ${route} with no credential answered HTTP ${anonymous} and no token; the same request carrying the demo's operator credential answered HTTP ${authorised} with tenant ${tenant}, store_endpoint ${endpoint} and a ${token_length}-character token, which is not printed here - it reads and writes that tenant's data directly against deis-store and does not expire"
   else
     fail_check "$title" \
       "anonymous GET ${route} answered HTTP ${anonymous} (expected 401) and the authenticated one HTTP ${authorised} for tenant '${tenant:-<none>}' with a ${token_length:-0}-character token (expected 200 for ${APP_ID}.${ENV_NAME})"
@@ -6205,7 +6331,7 @@ with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out:
 ALTER
 
   curl -s -o "$body" -w '%{http_code}' -X POST \
-    -H "Authorization: Bearer ${API_KEY}" \
+    -H "Authorization: Bearer ${OPERATOR_TOKEN}" \
     -H "Content-Type: application/zip" \
     --data-binary "@${patched}" \
     "$(control_url)/api/v1/apps/${APP_ID}/versions"
@@ -7887,19 +8013,21 @@ check_cli_status() {
 # Accounts, scoped tokens and the audit log
 # ----------------------------------------------------------------------
 #
-# `start` turns api_auth_enabled on and puts exactly one entry in api_keys,
-# which is the shape of every installation that existed before there were
-# accounts. These checks mint accounts and narrow tokens beside that key and
-# watch the control plane tell them apart: the old flat key still does
-# everything, a narrow one reaches one environment and nothing else, and both
-# of them leave a line behind that names what they did.
+# `start` wrote no human credential into any configuration file. The first
+# owner logged in by trading the one-time bootstrap token the control plane
+# wrote into its data directory, and the operator credential the rest of
+# this file presents was minted from that account, scoped to the verbs the
+# demo uses. These checks watch the control plane tell credentials apart:
+# nothing at all gets in, the bootstrap credential is spent after its one
+# use, a narrow token reaches one environment and nothing else, and every
+# one of them leaves a line behind that names what it did.
 #
 # They run late on purpose. One of them re-points the preview environment at
 # the version it is already running, which is a real deploy made with a real
 # scoped credential; every check that expects a particular version on preview
 # has finished by then.
 
-# Run the CLI as somebody other than the demo's flat key.
+# Run the CLI as somebody other than the demo's operator.
 #
 # The assignment after the array is what does it: `env` applies assignments
 # left to right, so this second DEIS_CONTROL_TOKEN replaces the one
@@ -7960,23 +8088,66 @@ ensure_account() {
   deis_cli account create "$1" --role "$2" --json >/dev/null 2>&1 || true
 }
 
-check_the_configured_api_key_is_listed_as_unscoped() {
-  local title="the api_keys entry from the configuration file is visible, and visibly unscoped"
-  local listed
-  listed=$(deis_cli token list --json 2>/dev/null || echo '{}')
+# No credential at all, on any host. This is the property DNS rebinding used
+# to attack: a page that could reach the control plane's port while looking
+# like a local visitor. There is no visitor to look like any more - the gate
+# asks every caller for a credential before it asks anything else about
+# them - so the request below carries an attacker's Host header on purpose
+# and expects the same answer as the polite one.
+check_no_credential_gets_into_the_human_api() {
+  local title="the human API answers a caller with no credential 401, on every host"
 
-  local unscoped origin scopes id
-  unscoped=$(echo "$listed" | jq -r '.unscoped // 0')
-  origin=$(echo "$listed" | jq -r '[.tokens[] | select(.origin == "config")] | length')
-  scopes=$(echo "$listed" | jq -r 'first(.tokens[] | select(.origin == "config") | .scopes) // "none"')
-  id=$(echo "$listed" | jq -r 'first(.tokens[] | select(.origin == "config") | .id) // "none"')
+  local listed rebound write
+  listed=$(control_status GET "/api/v1/apps")
+  rebound=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Host: control-plane.attacker.example" "$(control_url)/api/v1/apps" || true)
+  write=$(control_status POST "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "" \
+    '{"version_id":"never-checked"}')
 
-  if [ "${origin:-0}" -ge 1 ] && [ "${unscoped:-0}" -ge 1 ] && [ "$scopes" = "unscoped" ]; then
+  if [ "$listed" = "401" ] && [ "$rebound" = "401" ] && [ "$write" = "401" ]; then
     pass_check "$title" \
-      "\`deis token list\` shows ${origin} credential(s) whose origin is the configuration file, filed under id ${id} with scopes \"${scopes}\", and reports ${unscoped} live unscoped credential(s) in total. That number is what an operator drives to zero; the key itself is not in the database at all, only this record of it"
+      "GET /api/v1/apps with no credential answered HTTP ${listed}; the same request under an attacker's Host header answered ${rebound}, which is the rebinding question and it has one answer now; and POSTing a deployment with no credential answered ${write}. There is no path into this API that does not present a token first - the operator's own calls pass because they carry one, not because of where they come from"
   else
     fail_check "$title" \
-      "the listing reports ${origin:-0} configuration credential(s) with scopes '${scopes}' and ${unscoped:-0} unscoped in total; expected the demo's single api_keys entry to be listed and counted"
+      "GET /api/v1/apps with no credential answered ${listed:-none}, the attacker-Host variant ${rebound:-none}, and the credential-less deploy POST ${write:-none} (expected 401 each)"
+  fi
+}
+
+# The bootstrap credential's whole life: minted by the control plane into its
+# data directory on a first start, traded for the first owner account by
+# `deis login --bootstrap`, revoked and its file deleted in the same breath.
+# `bootstrap_operator_session` kept the spent secret so this check can
+# present it a second time and watch it be refused like a token that never
+# existed.
+check_the_bootstrap_credential_worked_exactly_once() {
+  local title="the bootstrap credential logged the first owner in once and is spent"
+  local spent_file="${DEMO_DIR}/used-bootstrap.token"
+  local spent
+  spent=$(cat "$spent_file" 2>/dev/null || true)
+  if [ -z "$spent" ]; then
+    fail_check "$title" "no spent bootstrap credential was kept at ${spent_file}; either start did not log in through one or it was thrown away"
+    return
+  fi
+
+  local file_gone reused
+  file_gone=yes
+  [ -f "${CONTROL_DATA_DIR}/bootstrap.token" ] && file_gone=no
+  reused=$(control_status GET "/api/v1/apps" "$spent")
+
+  # The row the login created stays in the database as the record of what
+  # happened: origin `bootstrap`, and revoked. Listed with the revoked ones,
+  # because that is the half the claim is about.
+  local record
+  record=$(deis_cli token list --include-revoked --json 2>/dev/null \
+    | jq -r 'first(.tokens[] | select(.origin == "bootstrap") | "account=\(.account) revoked=\(.revoked_at != null)") // empty')
+
+  if [ "$file_gone" = "yes" ] && [ "$reused" = "401" ] \
+    && echo "$record" | grep -q 'account=bootstrap revoked=true'; then
+    pass_check "$title" \
+      "the file the control plane wrote the bootstrap token to is gone, revoked the moment the login used it; presenting the spent secret again answered HTTP ${reused}, byte for byte the answer a token that never existed gets; and \`deis token list --include-revoked\` still shows the row - ${record} - which is the audit trail of how this installation's first owner was made"
+  else
+    fail_check "$title" \
+      "the bootstrap file still present: ${file_gone}; presenting the spent secret answered ${reused:-none} (expected 401); the listing's bootstrap-origin row reads '${record:-none}' (expected account=bootstrap revoked=true)"
   fi
 }
 
@@ -8855,16 +9026,17 @@ check_the_audit_log_has_no_way_to_be_erased() {
   local before after removed created
 
   before=$(deis_cli audit --limit 500 --json 2>/dev/null | jq -r '.total // 0')
-  # The flat api_keys entry is the most powerful credential this control
-  # plane has - it is unscoped, so it passes every scope check there is. If
-  # anything could delete a line, this would.
-  removed=$(control_status DELETE "/api/v1/audit" "$API_KEY")
-  created=$(control_status POST "/api/v1/audit" "$API_KEY" '{"action":"forged"}')
+  # The demo's operator credential is the widest thing a caller holds here -
+  # admin:*/* among its scopes, minted from the first owner account - so it
+  # passes every admin scope check there is. If anything could delete a line,
+  # this would.
+  removed=$(control_status DELETE "/api/v1/audit" "$OPERATOR_TOKEN")
+  created=$(control_status POST "/api/v1/audit" "$OPERATOR_TOKEN" '{"action":"forged"}')
   after=$(deis_cli audit --limit 500 --json 2>/dev/null | jq -r '.total // 0')
 
   if [ "$removed" = "405" ] && [ "$created" = "405" ] && [ "${after:-0}" -ge "${before:-0}" ]; then
     pass_check "$title" \
-      "DELETE /api/v1/audit answered ${removed} and POST answered ${created} to the unscoped api_keys credential - the route is a read and there is no writing or deleting endpoint behind it. The log went from ${before} to ${after} line(s) across both attempts; removing one means holding the database file, which is the same access that holds the secret master key"
+      "DELETE /api/v1/audit answered ${removed} and POST answered ${created} to the demo's operator credential, which carries admin:*/* - the route is a read and there is no writing or deleting endpoint behind it. The log went from ${before} to ${after} line(s) across both attempts; removing one means holding the database file, which is the same access that holds the secret master key"
     else
     fail_check "$title" \
       "DELETE answered ${removed} and POST answered ${created} (expected 405 for both), and the log went from ${before:-?} to ${after:-?} lines"
@@ -9792,7 +9964,7 @@ verify_demo() {
   check_a_binding_cannot_reach_another_tenant
   check_cli_reads_a_named_binding
   check_storage_capability_token
-  check_storage_token_requires_the_api_key
+  check_storage_token_route_requires_a_credential
   check_data_cli_reads_the_apps_write
   # What a tenant's SQL may cost, as opposed to what it may touch. Both go
   # through `deis db query`, which is the same Database service the
@@ -9888,7 +10060,8 @@ verify_demo() {
   # environment: the scoped-token check re-deploys preview to the version it
   # is already running, which is what proves a narrow credential can really
   # ship rather than only be refused.
-  check_the_configured_api_key_is_listed_as_unscoped
+  check_no_credential_gets_into_the_human_api
+  check_the_bootstrap_credential_worked_exactly_once
   check_a_scoped_token_reaches_one_environment_and_no_other
   check_a_credential_cannot_wire_an_app_to_one_it_cannot_see
   check_a_scoped_token_cannot_unload_an_application_from_a_node

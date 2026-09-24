@@ -3,9 +3,15 @@
 # payload that canary-release.sh rsyncs over.
 #
 # Existing /etc/deis/secrets.env is reused: a release must not rotate the
-# master key or the API/node secrets out from under a live catalog. Pass
-# --rewrite-config to regenerate the TOML files from those secrets (ports,
-# bind addresses) without minting new keys.
+# master key or the storage/telemetry secrets out from under a live catalog.
+# Pass --rewrite-config to regenerate the TOML files from those secrets
+# (ports, bind addresses) without minting new keys.
+#
+# No human credential is configured anywhere. A first start of a control
+# plane whose database holds no live token mints a one-time bootstrap token
+# into /var/lib/deis/control/bootstrap.token; `bootstrap_login` below trades
+# it for the first owner account and mints the scoped operator token that
+# /etc/deis/operator.env and the CLI credentials carry.
 
 set -euo pipefail
 
@@ -112,7 +118,6 @@ ensure_secrets() {
     return
   fi
 
-  API_KEY="$(openssl rand -hex 32)"
   STORAGE_AUTH="$(openssl rand -hex 32)"
   TELEMETRY_AUTH="$(openssl rand -hex 32)"
   MASTER_KEY="$(openssl rand -hex 32)"
@@ -124,7 +129,6 @@ LAN_IP=${LAN_IP}
 ZONE=${ZONE}
 NODE_ID=${NODE_ID}
 PROXY_ID=${PROXY_ID}
-API_KEY=${API_KEY}
 STORAGE_AUTH=${STORAGE_AUTH}
 TELEMETRY_AUTH=${TELEMETRY_AUTH}
 MASTER_KEY=${MASTER_KEY}
@@ -239,8 +243,11 @@ bind_addr = "0.0.0.0"
 port = ${CONTROL_PORT}
 heartbeat_interval = 15
 heartbeat_timeout = 90
-api_auth_enabled = true
-api_keys = ["${API_KEY}"]
+# Where this installation keeps its own state. Notably the one-time
+# bootstrap token: a first start with no credential anywhere in the database
+# mints one here, 0600, and bootstrap_login below logs the first owner in
+# through it.
+data_dir = "/var/lib/deis/control"
 api_cors_allowed_origins = []
 bundle_dir = "/var/lib/deis/control/bundles"
 public_base_url = "http://${LAN_IP}:${CONTROL_PORT}"
@@ -466,12 +473,18 @@ install_runtime_fs() {
   log "installed isolate JS at compile-time paths"
 }
 
+# The credential a person - the `deis` CLI, a dashboard - presents to the
+# control plane's human API. It is minted, not configured: the operator token
+# this writes is a scoped one created from the first owner account, which the
+# bootstrap login below creates. Runs after the stack is up, because that is
+# when the bootstrap token exists.
 write_operator_env() {
+  local operator_token=$1
   umask 077
   cat >/etc/deis/operator.env <<EOF
 # Source this file to talk to this canary from a shell.
 export DEIS_CONTROL_ENDPOINT=http://${LAN_IP}:${CONTROL_PORT}
-export DEIS_CONTROL_TOKEN=${API_KEY}
+export DEIS_CONTROL_TOKEN=${operator_token}
 export DEIS_TELEMETRY_ENDPOINT=http://${LAN_IP}:${TELEMETRY_PORT}
 export DEIS_TELEMETRY_AUTH_SECRET=${TELEMETRY_AUTH}
 export DEIS_QUEUE_ENDPOINT=http://${LAN_IP}:${QUEUE_PORT}
@@ -483,14 +496,14 @@ EOF
     mkdir -p /home/leo/.config/deis
     cat >/home/leo/.config/deis/credentials.toml <<EOF
 [endpoints."http://${LAN_IP}:${CONTROL_PORT}"]
-token = "${API_KEY}"
+token = "${operator_token}"
 
 [telemetry."http://${LAN_IP}:${TELEMETRY_PORT}"]
 auth_secret = "${TELEMETRY_AUTH}"
 EOF
     cat >/home/leo/.config/deis/env <<EOF
 export DEIS_CONTROL_ENDPOINT=http://${LAN_IP}:${CONTROL_PORT}
-export DEIS_CONTROL_TOKEN=${API_KEY}
+export DEIS_CONTROL_TOKEN=${operator_token}
 export DEIS_TELEMETRY_ENDPOINT=http://${LAN_IP}:${TELEMETRY_PORT}
 export DEIS_TELEMETRY_AUTH_SECRET=${TELEMETRY_AUTH}
 export DEIS_QUEUE_ENDPOINT=http://${LAN_IP}:${QUEUE_PORT}
@@ -499,6 +512,61 @@ EOF
     chmod 700 /home/leo/.config/deis
     chmod 600 /home/leo/.config/deis/credentials.toml /home/leo/.config/deis/env
   fi
+}
+
+# Trade the one-time bootstrap credential for the operator credential.
+#
+# A first start with an empty database wrote /var/lib/deis/control/
+# bootstrap.token, 0600, good for exactly one thing: creating the first owner
+# account and its first token. `deis login --bootstrap` does that, and the
+# control plane revokes the bootstrap credential and deletes the file the
+# moment the login uses it. From the owner account this then mints the
+# scoped operator token the operator.env and CLI credentials carry - admin
+# over the platform plus the deploy, secrets and storage verbs, because an
+# installation's operator does all of those - and never writes the bootstrap
+# secret itself anywhere.
+#
+# Root's own login token stays in /root/.config/deis, which is why every CLI
+# call here names DEIS_CONFIG_HOME: the operator.env token is minted by the
+# CLI that holds the login credential, and spelling it out keeps the two
+# stores apart.
+bootstrap_login() {
+  local bootstrap_file=/var/lib/deis/control/bootstrap.token
+  local waited=0
+  while [[ ! -f ${bootstrap_file} && ${waited} -lt 60 ]]; do
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  if [[ ! -f ${bootstrap_file} ]]; then
+    dump_unit deis-control
+    die "control wrote no bootstrap token at ${bootstrap_file}; there is no way to log in"
+  fi
+
+  DEIS_CONTROL_ENDPOINT="http://${LAN_IP}:${CONTROL_PORT}" DEIS_CONFIG_HOME=/root/.config/deis \
+    /usr/local/bin/deis login --bootstrap "${bootstrap_file}" \
+    || die "deis login --bootstrap failed"
+
+  local owner operator_token
+  owner=$(DEIS_CONTROL_ENDPOINT="http://${LAN_IP}:${CONTROL_PORT}" DEIS_CONFIG_HOME=/root/.config/deis \
+    /usr/local/bin/deis token list --json 2>/dev/null \
+    | python3 -c 'import json,sys; tokens=json.load(sys.stdin).get("tokens",[]); print(tokens[0]["account"] if tokens else "")') \
+    || owner=""
+  [[ -n ${owner} ]] || die "could not read back the owner account the bootstrap login created"
+
+  operator_token=$(DEIS_CONTROL_ENDPOINT="http://${LAN_IP}:${CONTROL_PORT}" DEIS_CONFIG_HOME=/root/.config/deis \
+    /usr/local/bin/deis token create --account "${owner}" --name canary-operator \
+      --scope 'admin:*/*' --scope 'deploy:*/*' --scope 'secrets:*/*' --scope 'storage:*/*' \
+      --json 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("secret",""))') \
+    || operator_token=""
+  [[ -n ${operator_token} ]] || die "could not mint the scoped operator token"
+
+  write_operator_env "${operator_token}"
+
+  if [[ -f ${bootstrap_file} ]]; then
+    die "${bootstrap_file} still exists after login; the bootstrap credential should have been revoked and deleted by its first use"
+  fi
+  log "logged the first owner (${owner}) in through the bootstrap token and minted the scoped operator credential"
 }
 
 write_release_stamp() {
@@ -614,7 +682,8 @@ print_status() {
   log "  store gRPC  ${LAN_IP}:${STORE_PORT}"
   log "  queue gRPC  ${LAN_IP}:${QUEUE_PORT}"
   log "  telemetry   ${LAN_IP}:${TELEMETRY_PORT}  (metrics ${LAN_IP}:${TELEMETRY_METRICS_PORT})"
-  log "credentials:  /etc/deis/operator.env"
+  log "credentials:  /etc/deis/operator.env (minted through the bootstrap token;"
+  log "              a fresh database that has not been logged in yet keeps its token at /var/lib/deis/control/bootstrap.token)"
   if [[ -f /var/lib/deis/RELEASE ]]; then
     log "release:"
     sed 's/^/  /' /var/lib/deis/RELEASE
@@ -639,7 +708,6 @@ ensure_pki
 if ((FIRST_INSTALL)) || ((REWRITE_CONFIG)); then
   write_master_key
   write_configs
-  write_operator_env
   log "wrote configuration under /etc/deis"
 else
   log "keeping existing /etc/deis/*.toml (pass --rewrite-config to regenerate)"
@@ -658,4 +726,13 @@ wait_tcp 127.0.0.1 "${STORE_PORT}" deis-store
 wait_tcp 127.0.0.1 "${QUEUE_PORT}" deis-queue
 wait_tcp 127.0.0.1 "${TELEMETRY_PORT}" deis-telemetry
 wait_tcp 127.0.0.1 "${PROXY_PORT}" deis-proxy
+
+# Only a first install (or a config rewrite) has a fresh database behind the
+# control plane, and only a database with no live token gets a bootstrap
+# token. An upgrade keeps the database, and with it every credential it
+# issued - operator.env already holds a live token, so nothing is minted.
+if ((FIRST_INSTALL)) || ((REWRITE_CONFIG)); then
+  bootstrap_login
+fi
+
 print_status
