@@ -9,10 +9,12 @@
 //! key, and no node can do that any more. The human listener mounts no route
 //! a node calls; registration arrives on the machine listener, where the
 //! caller proves a SPIFFE name with a certificate, so every registration this
-//! control plane accepts in production records `NodeProof::Certificate`.
-//! `NodeProof::PresharedKey` survives only as the state a fleet in the middle
-//! of the move could still be in, with no production producer left to put a
-//! node into it. A test of the old rule would therefore be a test of a
+//! control plane accepts records the name the caller proved, carried as
+//! `NodeClaim::identity`, and nothing else. The weaker proof is not only
+//! unproduced but unreachable: `node_preshared_keys` is refused at startup
+//! by `ControlConfig::refuse_a_retired_fleet_key`, so the state a fleet in
+//! the middle of the move could once have been in cannot be configured back
+//! into existence. A test of the old rule would therefore be a test of a
 //! property nothing can reach.
 //!
 //! # What is guarded instead

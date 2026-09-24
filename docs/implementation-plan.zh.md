@@ -683,9 +683,11 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 - 存储面 `deis-runtime → deis-store / deis-queue` 走 `x-deis-tenant`，值是 `conventions::tenant_id(app, env)`（`demo.production`），见 §5。
 - 环境名不再允许 `.`（要满足 `is_valid_tenant_part`）：带点会让 `split_tenant` 切出三段被存储拒绝，应用能跑但 kv/db/blob/queue 全废。构造预览环境名请用 `-`（`pr-42-1` 而不是 `pr-42.1`）。
 
-**二、节点通道单独鉴权。** `GET /api/nodes/{id}/assignments` 会把全部环境的明文密钥当 JSON 返回，而它原先只挂在面板的 `api_key_auth` 上，`api_auth_enabled` 默认 false——默认配置下任何能连到控制面 HTTP 端口的人 curl 一次就能拿走整个平台的密钥。现在它和 bundle 下载一起挂在独立的 `node_auth` 上，凭据复用节点注册时已在用的 `node_preshared_keys`，不受 `api_auth_enabled` 影响，也不接受面板 API Key。节点侧对应加了 `[control] secret`，只发往配置里那个控制面地址。
+**二、节点通道单独鉴权。** `GET /api/nodes/{id}/assignments` 会把全部环境的明文密钥当 JSON 返回，而它原先只挂在面板的 `api_key_auth` 上，`api_auth_enabled` 默认 false——默认配置下任何能连到控制面 HTTP 端口的人 curl 一次就能拿走整个平台的密钥。后来它和 bundle 下载一起挂在独立的 `node_auth` 上（这个中间态凭据复用节点注册时已在用的 `node_preshared_keys`，不受 `api_auth_enabled` 影响，也不接受面板 API Key；节点侧对应加了 `[control] secret`，只发往配置里那个控制面地址）。
 
-**这一段后来又往前走了一步（2026-09-11）**：`GET /api/nodes/{id}/assignments`、bundle 下载、`GET /api/routing-table` 和注册接口一起搬出了控制面人侧端口，改在控制面独立的机器监听端口（`[machine] listen`）上用双向证书（mTLS）作答——每台机器持一张证书，唯一的 URI SAN 是一个 SPIFFE 名字。`node_preshared_keys` 因此从必需变成了可选（`#[serde(default)]`）：配了 `[machine]` 之后，把它留空就是这套装机不再持有任何机队共享的值；不配 `[machine]` 时，空列表仍会为这次运行铸一把，否则谁都能自称是节点。节点侧的 `[control] secret` 同样从必填变成了可选（`Option<String>`）——不写这一行，意味着这个进程改用证书证明自己是谁；写了却留空仍然被拒绝，因为那大概率是一处遗漏而不是选择。细节见 `docs/adr/025-machine-identity-and-capabilities.md`；`node_preshared_keys` 与 `[control] secret` 仍然存在，是给还没完成迁移的机队用的过渡态，不代表两条路今天同样是首选。
+**这一段后来又往前走了一步（2026-09-11）**：`GET /api/nodes/{id}/assignments`、bundle 下载、`GET /api/routing-table` 和注册接口一起搬出了控制面人侧端口，改在控制面独立的机器监听端口（`[machine] listen`）上用双向证书（mTLS）作答——每台机器持一张证书，唯一的 URI SAN 是一个 SPIFFE 名字。`node_preshared_keys` 因此从必需变成了可选（`#[serde(default)]`）：配了 `[machine]` 之后，把它留空就是这套装机不再持有任何机队共享的值；不配 `[machine]` 时，空列表仍会为这次运行铸一把，否则谁都能自称是节点。节点侧的 `[control] secret` 同样从必填变成了可选（`Option<String>`）——不写这一行，意味着这个进程改用证书证明自己是谁；写了却留空仍然被拒绝，因为那大概率是一处遗漏而不是选择。细节见 `docs/adr/025-machine-identity-and-capabilities.md`。
+
+**再后来（a7ba508）**：`node_preshared_keys` 字段与 `[control] secret` 彻底删除，`ControlConfig::refuse_a_retired_fleet_key` 在配置加载时拒绝任何残留；机队通道只认证书，没有第二条路了。
 
 **三、一条运行时线程只放一个 Isolate。** `v8::OwnedIsolate` 在创建时进入、销毁时退出它那个 isolate，所以同一条 OS 线程上建第二个会把第一个盖住：先建的那个再被用到就 panic（"…and Context do not belong to the same Isolate"），线程当场死掉，它上面所有应用一起停；两个 isolate 析构顺序反了还会直接 abort 进程。原先的线程池按「最少应用」把多个应用摊到固定几条线程上，应用数一超过线程数就踩中，而这一波正好让一台节点常态跑两个环境。现在线程与应用一一对应：不够就再起一条，应用卸载后线程留着给下一个用。
 

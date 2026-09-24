@@ -353,10 +353,10 @@ flowchart TB
 **原来卡住的两件事已经通了**：
 
 - **路径级路由**。deis-proxy 现在每 5 秒向控制面要一次整张路由表，按拉到的表选应用，
-  所以 `example.com/api/*` 给 API 应用、`example.com/*` 给站点应用可以共存了。配了
-  `[machine_identity]` 的 proxy 走机队通道，`deis.machine.MachineChannel/FetchRoutingTable`，
-  证明一张只属于这个 proxy 自己的证书；没配的仍走老路，`GET /api/routing-table`
-  带 `node_preshared_keys`。这条链路的三个关键取舍：**用轮询不用推送**，因为轮询自愈——不管
+  所以 `example.com/api/*` 给 API 应用、`example.com/*` 给站点应用可以共存了。proxy
+  走 `deis.machine.MachineChannel/FetchRoutingTable`，证明一张只属于这个 proxy 自己的
+  证书。老路（`GET /api/routing-table` 带 `node_preshared_keys`）在 a7ba508 起已关闭——
+  没配 `[machine_identity]` 的 proxy 启动即拒。这条链路的三个关键取舍：**用轮询不用推送**，因为轮询自愈——不管
   是断连、控制面重启还是某次校验没过，下一次拉取都会修好，而推送方案最后都得再配
   一个周期性全量对齐才敢信；**控制面不可达时最后一张表无限期继续生效**，一次管理面
   故障不该变成一次用户可见的故障（只有从来没拉成功过的 proxy 例外，它退回本机配置里
@@ -456,8 +456,8 @@ sequenceDiagram
 再来一次。RPC 叫 `Register`：登记是在陈述「这个节点是什么」，不是请求创建一条记录，
 所以掉线又回来的节点原样再证一次就行；同一个通道上的 `Deregister` 是节点主动离场。
 注册不是拿活的方式——没注册的节点照样自取并服务它拉到的每个应用，只是收不到推送、
-也不会被选中跑 cron。`node_preshared_keys` 这个字段仍然存在，是给一支还没把每台
-机器都换上证书的机队留的兼容路径；配了 `[machine_identity]` 的节点，登记认的是证书。
+也不会被选中跑 cron。`node_preshared_keys` 这个字段在 a7ba508 起已删除——
+现在根本没有机队共用的凭据了。配了 `[machine_identity]` 的节点，登记认的是证书。
 
 **「一把凭据整支机队共用」已经不是现状了。** 现在每台机器——deis-control、每个
 deis-runtime 节点、每个 deis-proxy——都持有自己的一张证书，证书上唯一的 URI SAN 是
@@ -466,9 +466,9 @@ deis-runtime 节点、每个 deis-proxy——都持有自己的一张证书，�
 私钥、一份信任根，进程按周期重新读这三个文件，续期不必重启。机队通道认的是这张
 证书，拿到一张节点证书的人只能代表它命名的那一台节点说话，读不到别的节点的
 assignments（全部环境的明文密钥、每个租户的存储 capability token）、下载不了跟它无关
-的 bundle、也驱动不了别的节点的管理面。`node_preshared_keys` 若还配着，`[machine]`
-留空这个列表时这次运行干脆不铸一把机队共用的值；旧模型下「一个值等于全部机队」那种
-风险仍是残留在还没切完 mTLS 的部分该防的东西，节点数据端口 `0.0.0.0` 这道信任边界
+的 bundle、也驱动不了别的节点的管理面。`node_preshared_keys` 在 a7ba508 起已删除——
+现在根本没有机队共用的凭据了，`[machine_identity]` 本身就是 entry 条件。旧模型下「一个值等于全部机队」那种
+风险在 mTLS 迁移完成后已不存在，节点数据端口 `0.0.0.0` 这道信任边界
 也仍然存在。这些细节、各端口该对谁开放、每个配置文件的权限要求，写在
 [docs/trust-boundaries.md](trust-boundaries.md)（英文）。
 
@@ -589,10 +589,9 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 - **非回环地址 + 未配置**：**拒绝启动**，不是打 warn 放行。未配置不能悄悄等于
   「不设防也照样监听公网」——一旦真的绑定到别处，曾经顶替鉴权的那层收敛就不存在了。
   这一条曾经和控制面的节点通道是同一个形状：预共享密钥列表一旦为空，那条通道直接
-  关闭，而不是打开。现在两者分岔了——配了 `[machine]` 机队身份之后，这条通道认的
-  是证书，`node_preshared_keys` 留空是常态，不是关闭的理由；没配 `[machine]` 时才
-  回到旧形状：一个空列表会当场铸一把只在这次运行内有效的值，而不是打开一条谁都能
-  冒充节点的路。
+  关闭，而不是打开。a7ba508 起两者已统一——这条通道只认证书；
+  `node_preshared_keys` 这个字段已删除，`[machine_identity]` 本身就是 entry 条件，
+  没配的直接拒绝启动。
 
 配了 `auth_secret` 却没带令牌、令牌对不上租户、或者干脆没带 `x-deis-tenant`，三种
 情况都在拿到任何数据**之前**被拒——tonic 拦截器挡在每个 handler 前面
@@ -788,11 +787,12 @@ fence，不把这种管理能力交给普通 producer/reader。
   `api_auth_enabled` 影响，也不接受面板 API Key。这条路会把全部环境的明文密钥当
   JSON 返回，所以它根本不在人用的那个监听口上——早前它挂在那儿，靠的是默认关闭的
   面板鉴权管不着的另一把凭据（`node_preshared_keys`），等于任何能连到控制面 HTTP
-  端口、又握着这把值的人 curl 一次就能拿走整个平台的密钥；`node_preshared_keys` 这
-  个字段还在，是给还没切完 mTLS 的机队留的兼容路径。
+  端口、又握着这把值的人 curl 一次就能拿走整个平台的密钥。`node_preshared_keys`
+  a7ba508 起已删除——这也是为什么 mTLS 一到位就立刻关掉老路的理由：留着这条路径
+  本身就是在留一把能打开整个平台的万能钥匙。
 - 本版**没有**做按租户分密钥（信封加密）：全部环境的密钥都用 `secret_key_file` 里的
-  同一把主密钥加密，清单接口再明文发下去。所以一张能代表某台机器的证书，或者一支
-  机队里仍在起作用的 `node_preshared_keys` 值，打开的都是全部租户的明文。这条结论
+  同一把主密钥加密，清单接口再明文发下去。所以一张能代表某台机器的证书打开的就是
+  全部租户的明文（`node_preshared_keys` 路径在 a7ba508 已关闭）。这条结论
   连同它要求的端口边界与轮换步骤见
   [docs/trust-boundaries.md](trust-boundaries.md)（英文）。
 
