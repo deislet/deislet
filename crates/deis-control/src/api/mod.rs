@@ -64,16 +64,14 @@ pub struct ApiRouter {
     pub provider_deployment_reconciler: Option<ProviderDeploymentReconciler>,
     /// Accounts, scopes and the audit log, as the gate in front of the human
     /// API sees them. Handed back so the binary can complete the startup that
-    /// needs a running async runtime - recording the configured `api_keys`,
-    /// minting a first credential when there is none, and saying out loud how
-    /// many credentials are still unscoped. See [`announce_authorization`].
+    /// needs a running async runtime - minting a first bootstrap credential
+    /// when there is none, and saying out loud how many credentials are
+    /// still unscoped. See [`announce_authorization`].
     pub authz: authz::AuthzState,
-    /// The node channel's credential, reported at startup next to the API
-    /// key so an operator sees both, rather than only the one that
-    /// `api_auth_enabled` controls.
     /// The browser origins allowed to read this API's answers, empty for the
-    /// default, which is none. Reported at startup next to the two
-    /// credentials because it is the third thing that decides who gets in.
+    /// default, which is none. Reported at startup because it is the third
+    /// thing that decides who gets in, next to the tokens and the machine
+    /// channel.
     pub cors_origins: Vec<String>,
     pub tls_enabled: bool,
     /// Everything the machine channel answers from, handed back so the binary
@@ -157,14 +155,17 @@ pub async fn build_api_router(
 
     // One gate for the whole human surface. It resolves the credential into
     // an account, checks the scope the route needs, and writes the audit
-    // line - so a route cannot be mounted here without all three.
+    // line - so a route cannot be mounted here without all three. There is
+    // no anonymous path on it: a caller without a credential is refused with
+    // 401 whatever their address.
     let identity = Arc::new(IdentityStore::new(Arc::clone(&database)));
     let audit_store = Arc::new(AuditStore::new(Arc::clone(&database)));
     let authz_state = authz::AuthzState {
-        enforced: config.api_auth_enabled,
-        config_keys: Arc::new(config.api_keys.clone()),
         identity: Arc::clone(&identity),
         audit: Arc::clone(&audit_store),
+        bootstrap_file: Some(Arc::new(
+            crate::identity::bootstrap::BootstrapFile::in_data_dir(&config.data_dir),
+        )),
     };
     let identity_state = identity::IdentityApiState {
         identity: Arc::clone(&identity),
@@ -217,10 +218,10 @@ pub async fn build_api_router(
         .merge(protected_routes);
 
     // Cross-origin access to the human API, which is off unless the file
-    // names the origins. It used to be `CorsLayer::permissive()`, and with
-    // `api_auth_enabled` off that meant any page the operator visited could
-    // drive this control plane *and read the answers*; see `api::cors`. The
-    // console this binary serves is same-origin, so it never needed it.
+    // names the origins. It used to be `CorsLayer::permissive()`, which let
+    // any page the operator visited read this control plane's answers; see
+    // `api::cors`. The console this binary serves is same-origin, so it never
+    // needed it.
     //
     // Where the layer stops is unchanged and still deliberate: nodes are not
     // browsers, and a page being able to read the assignment list is exactly
@@ -492,41 +493,50 @@ fn surfaced(surface: versioning::ApiSurface, mount: Router) -> Router {
 
 /// Finish the parts of startup that need the database.
 ///
-/// Three things, in this order, all of them so an operator can see what their
-/// control plane will accept before the first request arrives:
+/// Two things, in this order, both so an operator can see how to get in
+/// before the first request arrives:
 ///
-/// 1. every `api_keys` entry gets a row, so `deis token list` shows the flat
-///    keys next to the scoped ones and says which are unscoped; a key that
-///    left the file has its row marked revoked, because the file is the
-///    authority for those;
-/// 2. a control plane that demands authentication and has no credential at
-///    all mints one owner token and prints it once - that combination used to
-///    be a control plane nobody could get into;
-/// 3. the count of unscoped credentials is said out loud, because driving it
+/// 1. a control plane with no live credential at all mints a one-time
+///    bootstrap credential and writes it to `<data_dir>/bootstrap.token` -
+///    without it, a first start would be a platform nobody could log in to;
+/// 2. the count of unscoped credentials is said out loud, because driving it
 ///    to zero is what adopting this model means.
 pub async fn announce_authorization(authz: &authz::AuthzState) {
-    let configured = match authz.identity.sync_config_keys(&authz.config_keys).await {
-        Ok(count) => count,
-        Err(e) => {
-            error!(
-                error = %e,
-                "Could not record this control plane's api_keys; they still authenticate, because they are checked against the configuration file, but `deis token list` will not show them and audit lines will name the key rather than an account"
-            );
-            authz.config_keys.len()
-        }
-    };
-
-    if authz.enforced {
-        match authz.identity.ensure_bootstrap_credential(configured).await {
-            Ok(Some(secret)) => warn!(
-                "api_auth_enabled is on and this control plane had no credential at all, so an                  owner token was minted and is printed here once:\n\n    {secret}\n\nStore it                  now - it is kept only as a SHA-256 and cannot be shown again. Use it to create                  accounts and scoped tokens (`deis account create`, `deis token create`), then                  revoke it with `deis token revoke`."
+    match authz.identity.ensure_bootstrap_token().await {
+        Ok(Some((id, secret))) => match authz.bootstrap_file.as_ref() {
+            Some(file) => match file.write(&secret) {
+                Ok(()) => info!(
+                    path = %file.path().display(),
+                    token = %id,
+                    "This control plane had no live credential, so a one-time bootstrap \
+                     credential was written to the file at `path`. Log in with `deis login \
+                     --bootstrap <path>`: the first successful use creates the first owner \
+                     account, revokes the credential and deletes the file. The value is logged \
+                     nowhere and expires 24 hours after this start if never used"
+                ),
+                Err(e) => error!(
+                    error = %e,
+                    path = %file.path().display(),
+                    "Could not write the one-time bootstrap credential to its file; if this \
+                     control plane has no other credential, every call to the human API is \
+                     refused and there is no way in short of fixing the path and restarting, \
+                     which mints a fresh one"
+                ),
+            },
+            None => error!(
+                token = %id,
+                "A one-time bootstrap credential was minted but no bootstrap file is configured, \
+                 so its secret exists nowhere it can be read from and it can never be used; \
+                 restarting with a data directory configured mints a fresh one"
             ),
-            Ok(None) => {}
-            Err(e) => error!(
-                error = %e,
-                "Could not mint a first credential; if this control plane has no api_keys and no token either, every call to the human API is refused and there is no way in short of adding an api_keys entry to the configuration file"
-            ),
-        }
+        },
+        Ok(None) => {}
+        Err(e) => error!(
+            error = %e,
+            "Could not mint a first credential; if this control plane has no token either, \
+             every call to the human API is refused and there is no way in short of fixing the \
+             database and restarting, which mints a fresh one"
+        ),
     }
 
     let unscoped = authz.identity.unscoped_count().await.unwrap_or_else(|e| {
@@ -536,7 +546,7 @@ pub async fn announce_authorization(authz: &authz::AuthzState) {
         );
         0
     });
-    authz::log_authorization_ready(authz.enforced, configured, unscoped);
+    authz::log_authorization_ready(unscoped);
     authz.audit.announce().await;
 }
 
@@ -894,8 +904,6 @@ pub async fn serve(
 pub fn log_api_ready(
     port: u16,
     tls_enabled: bool,
-    auth_enabled: bool,
-    configured_api_keys: usize,
     cors_origins: &[String],
     grpc_shared: bool,
     machine_channel: bool,
@@ -910,12 +918,8 @@ pub fn log_api_ready(
     }
     info!("📡 API: {}://localhost:{}", scheme, port);
     info!("📊 Health: {}://localhost:{}/health", scheme, port);
-    // Said in its own line because it stopped being an exception. It used to
-    // be served to anyone who could route to the port, whatever
-    // api_auth_enabled said and whatever machine the caller was on; a scrape
-    // now follows the same two rules as every other read.
     info!(
-        "📈 Metrics: {}://localhost:{}/api/metrics - a scrape from another host or through a reverse proxy presents a credential (`deis token create --scopes 'read:*/*'`); a direct call from this machine needs none while api_auth_enabled is off",
+        "📈 Metrics: {}://localhost:{}/api/metrics - a scrape presents a credential (`deis token create --scopes 'read:*/*'`)",
         scheme, port
     );
     info!(
@@ -924,15 +928,14 @@ pub fn log_api_ready(
         if tls_enabled { "ENABLED" } else { "DISABLED" }
     );
 
-    if auth_enabled {
-        info!(
-            "🔐 Human API: AUTHENTICATED - accounts and scoped tokens, plus {configured_api_keys} unscoped api_keys entries from the configuration file (`deis token list`)"
-        );
-    } else {
-        info!(
-            "⚠️  Human API: NO CREDENTIAL REQUIRED FOR DIRECT LOCAL CALLS (api_auth_enabled is off, so the dashboard and every catalog route are served to this machine's directly connected tools as \"anonymous\"; callers from another host, through a reverse proxy, or from a web page loaded on another origin get 401, and a credential that is presented is still held to its scopes)"
-        );
-    }
+    // There is no unauthenticated regime to describe any more: every caller
+    // presents a token, whatever their address. The one thing worth saying
+    // here is where a first-time operator finds their first credential.
+    info!(
+        "🔐 Human API: AUTHENTICATED - every caller presents a token; a first start writes a \
+         one-time bootstrap credential to <data_dir>/bootstrap.token for `deis login --bootstrap` \
+         (`deis token list` shows what exists)"
+    );
     // The third thing that decides who gets in, and the one an operator
     // cannot see from either credential. Named here because turning it on is
     // the only way a console on another origin reads anything at all, and
@@ -948,8 +951,8 @@ pub fn log_api_ready(
             cors_origins.join(", ")
         );
     }
-    // Said separately because it is a separate listener: this one is not
-    // governed by api_auth_enabled, and it is the one that guards secrets.
+    // Said separately because it is a separate listener: this one carries no
+    // credential gate, and it is the one that guards secrets.
     let (node_mark, node_state) = if machine_channel {
         (
             "\u{1f6e1}",
@@ -989,8 +992,6 @@ pub async fn start_api_server(
     // admits machines is a startup fact, and taking it here keeps the
     // readiness log from depending on where `config` happens to have got to.
     let machine_channel = config.machine.is_some();
-    let auth_enabled = config.api_auth_enabled;
-    let configured_api_keys = config.api_keys.len();
     let config = Arc::new(config);
     let tls_config = config.tls.clone();
     let deis_runtime_manager = Arc::new(
@@ -1032,8 +1033,6 @@ pub async fn start_api_server(
     log_api_ready(
         port,
         api.tls_enabled,
-        auth_enabled,
-        configured_api_keys,
         &api.cors_origins,
         false,
         machine_channel,
@@ -1101,9 +1100,11 @@ pub(crate) mod tests {
 
     /// The whole router, built the way the binary builds it - every mount,
     /// the gate, the node channel - over an in-memory database and a
-    /// temporary bundle directory. `api_auth_enabled` is off, so a direct
-    /// local caller is admitted as anonymous and every route can be reached.
-    pub(crate) async fn full_router() -> (Router, tempfile::TempDir) {
+    /// temporary bundle directory. The gate admits only callers with a
+    /// credential, so this mints one unscoped owner token and hands its
+    /// secret back; [`call`] presents it, which is what a logged-in operator
+    /// is.
+    pub(crate) async fn full_router() -> (Router, tempfile::TempDir, String) {
         let bundle_dir = tempfile::tempdir().unwrap();
         let config = ControlConfig {
             bundle_dir: bundle_dir.path().to_path_buf(),
@@ -1122,7 +1123,7 @@ pub(crate) mod tests {
         let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
         let api = build_api_router(
             sessions,
-            database,
+            Arc::clone(&database),
             config_manager,
             command_executor,
             metrics_collector,
@@ -1130,6 +1131,23 @@ pub(crate) mod tests {
             Arc::new(config),
         )
         .await;
+        // The operator the tests act as: an unscoped owner token, which is
+        // what a fresh login ends up holding.
+        api.authz
+            .identity
+            .create_account("root", crate::identity::Role::Owner)
+            .await
+            .unwrap();
+        let (_, secret) = api
+            .authz
+            .identity
+            .create_token(
+                "root",
+                "operator",
+                crate::identity::Authority::Unscoped,
+            )
+            .await
+            .unwrap();
         // As the binary mounts it: the route fallback goes on last, over
         // the whole tree. Without it an unmatched path falls to the node
         // channel's default fallback - `Router::layer` wraps a router's
@@ -1137,15 +1155,23 @@ pub(crate) mod tests {
         let router = api
             .router
             .fallback(axum::routing::get(static_files::serve_fallback));
-        (router, bundle_dir)
+        (router, bundle_dir, secret)
     }
 
-    /// A call from the machine the control plane runs on, which is what the
-    /// gate admits without a credential while nothing is enforced.
-    async fn call(router: &Router, method: &str, uri: &str) -> Response {
+    /// A call from the machine the control plane runs on, with the operator
+    /// token [`full_router`] minted. The peer address no longer decides
+    /// anything - the gate refuses every caller without a credential - but
+    /// the real server always puts one on the request, so the test does too.
+    async fn call_with_token(
+        router: &Router,
+        secret: &str,
+        method: &str,
+        uri: &str,
+    ) -> Response {
         let mut request = Request::builder()
             .method(method)
             .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(
@@ -1171,7 +1197,7 @@ pub(crate) mod tests {
     /// pin which routes each mount serves and which it does not.
     #[tokio::test]
     async fn the_three_mounts_and_the_node_channel_build_together_and_serve_their_own_routes() {
-        let (router, _dir) = full_router().await;
+        let (router, _dir, secret) = full_router().await;
 
         for (uri, expected) in [
             // Product routes: legacy and v1, not platform.
@@ -1203,7 +1229,7 @@ pub(crate) mod tests {
             ("/api/v1", StatusCode::NOT_FOUND),
             ("/api/platform", StatusCode::NOT_FOUND),
         ] {
-            let response = call(&router, "GET", uri).await;
+            let response = call_with_token(&router, &secret, "GET", uri).await;
             assert_eq!(response.status(), expected, "GET {uri}");
         }
     }
@@ -1213,13 +1239,14 @@ pub(crate) mod tests {
     /// envelope, and all three echo the request id the client sent.
     #[tokio::test]
     async fn each_surface_renders_an_error_in_its_own_shape_and_echoes_the_request_id() {
-        let (router, _dir) = full_router().await;
+        let (router, _dir, secret) = full_router().await;
         const SENT: &str = "018f2518-7e38-7f80-8000-0000000000aa";
 
-        async fn call_with_id(router: &Router, uri: &str) -> Response {
+        async fn call_with_id(router: &Router, secret: &str, uri: &str) -> Response {
             let mut request = Request::builder()
                 .uri(uri)
                 .header(REQUEST_ID_HEADER, SENT)
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
                 .body(Body::empty())
                 .unwrap();
             request.extensions_mut().insert(ConnectInfo(
@@ -1230,7 +1257,7 @@ pub(crate) mod tests {
 
         // Legacy: `{"error": "<message>"}` and nothing else in the body.
         for uri in ["/api/apps/no-such-app", "/api/sessions/no-such-node"] {
-            let response = call_with_id(&router, uri).await;
+            let response = call_with_id(&router, &secret, uri).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
             assert_eq!(
                 header_str(&response, REQUEST_ID_HEADER),
@@ -1252,7 +1279,7 @@ pub(crate) mod tests {
             ("/api/v1/apps/no-such-app", ApiSurface::V1),
             ("/api/platform/sessions/no-such-node", ApiSurface::Platform),
         ] {
-            let response = call_with_id(&router, uri).await;
+            let response = call_with_id(&router, &secret, uri).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
             assert_eq!(
                 header_str(&response, REQUEST_ID_HEADER),
@@ -1278,7 +1305,7 @@ pub(crate) mod tests {
         // itself; it still echoes both, and a caller quoting either finds
         // the same answer in the log.
         for uri in ["/api/v1/nothing-of-the-kind", "/api/nothing-of-the-kind"] {
-            let response = call_with_id(&router, uri).await;
+            let response = call_with_id(&router, &secret, uri).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
             assert_eq!(
                 header_str(&response, REQUEST_ID_HEADER),
@@ -1294,7 +1321,7 @@ pub(crate) mod tests {
 
         // A success on every surface echoes the id too.
         for uri in ["/api/apps", "/api/v1/apps", "/api/platform/runtime"] {
-            let response = call_with_id(&router, uri).await;
+            let response = call_with_id(&router, &secret, uri).await;
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
             assert_eq!(
                 header_str(&response, REQUEST_ID_HEADER),
@@ -1309,7 +1336,7 @@ pub(crate) mod tests {
     /// channel say nothing of the kind.
     #[tokio::test]
     async fn every_legacy_route_points_at_the_surface_that_serves_it() {
-        let (router, _dir) = full_router().await;
+        let (router, _dir, secret) = full_router().await;
 
         // (method, legacy path, successor). Product routes move to /api/v1,
         // the platform diagnostics to /api/platform - one entry per legacy
@@ -1383,7 +1410,7 @@ pub(crate) mod tests {
             ("GET", "/api/routes", "/api/platform/routes"),
         ];
         for (method, legacy, successor) in moved {
-            let response = call(&router, method, legacy).await;
+            let response = call_with_token(&router, &secret, method, legacy).await;
             assert_eq!(
                 header_str(&response, DEPRECATION),
                 Some(versioning::deprecation_header_value().as_str()),
@@ -1401,7 +1428,7 @@ pub(crate) mod tests {
             );
             // The successor is the same route: whatever the legacy spelling
             // answered, the versioned one answers.
-            let moved = call(&router, method, successor).await;
+            let moved = call_with_token(&router, &secret, method, successor).await;
             assert_eq!(moved.status(), response.status(), "{method} {successor}");
             assert!(
                 header_str(&moved, DEPRECATION).is_none(),
@@ -1415,7 +1442,7 @@ pub(crate) mod tests {
         }
 
         // The Prometheus exposition never moves.
-        let response = call(&router, "GET", PROMETHEUS_ROUTE).await;
+        let response = call_with_token(&router, &secret, "GET", PROMETHEUS_ROUTE).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(header_str(&response, DEPRECATION).is_none());
         assert!(header_str(&response, SUNSET).is_none());
@@ -1439,7 +1466,7 @@ pub(crate) mod tests {
             "/api/routing-table",
             "/api/apps/demo/versions/v1/bundle",
         ] {
-            let response = call(&router, "GET", uri).await;
+            let response = call_with_token(&router, &secret, "GET", uri).await;
             assert_eq!(
                 response.status(),
                 StatusCode::NOT_FOUND,

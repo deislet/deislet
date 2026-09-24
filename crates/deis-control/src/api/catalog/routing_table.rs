@@ -19,10 +19,10 @@
 //! The table is served on the machine channel
 //! (`deis.machine.MachineChannel/FetchRoutingTable`) rather than the human
 //! API. deis-proxy authenticates with its own SPIFFE certificate (mutual
-//! TLS), and this is the channel whose authentication `api_auth_enabled`
-//! cannot switch off. An unauthenticated routing table would let anyone who
-//! can reach the port enumerate every application id and every hostname the
-//! platform serves, which is a map of the whole installation.
+//! TLS); the human API's credential gate does not reach this channel. An
+//! unauthenticated routing table would let anyone who can reach the port
+//! enumerate every application id and every hostname the platform serves,
+//! which is a map of the whole installation.
 //!
 //! Nothing secret is in the answer: hostnames, path prefixes, app ids and
 //! environment names, all of which are already visible to anyone who can

@@ -6,16 +6,15 @@
 //! It is built as two surfaces, because the two halves answer to different
 //! credentials:
 //!
-//! * [`router`] is the human surface — dashboard and CLI. It is merged into
-//!   the part of the API guarded by the API key, which `api_auth_enabled`
-//!   turns on and off.
+//! * [`router`] is the human surface — dashboard and CLI, behind the
+//!   credential gate (`super::authz`).
 //! * The machine channel (`[machine] listen`) is what the platform's own
 //!   processes call — a gRPC surface (`deis.machine.MachineChannel`) that
 //!   serves assignments, bundles, routing tables, and registration over
-//!   mutual TLS with per-instance SPIFFE certificates. It ignores
-//!   `api_auth_enabled` entirely: the assignment list hands out every
-//!   environment's decrypted secrets, so that channel cannot be left open by
-//!   a flag whose purpose is to make a dashboard convenient.
+//!   mutual TLS with per-instance SPIFFE certificates. The credential gate
+//!   does not reach it: the assignment list hands out every environment's
+//!   decrypted secrets, so admission there is a proved certificate, never a
+//!   configuration flag.
 
 pub mod apps;
 pub mod artifacts;
@@ -347,11 +346,10 @@ pub(super) fn actor_subject(principal: &crate::identity::Principal) -> String {
             "account:{}",
             principal.account.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::ConfigKey => format!(
-            "config-key:{}",
+        PrincipalKind::Bootstrap => format!(
+            "bootstrap:{}",
             principal.credential_id.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::Anonymous => "anonymous:direct-local".to_string(),
     }
 }
 
@@ -755,10 +753,7 @@ pub(crate) mod tests {
             // The human half, which since the node routes left this listener
             // is the whole of it. It is normally mounted behind
             // `crate::api::authz::authorize`, which resolves the caller and
-            // leaves a `Principal` in the request. These tests are about the
-            // catalog rather than about who may reach it, so the gate is not
-            // in the way - but the principal it would have left has to be,
-            // or a handler that names its caller would fail to extract one.
+            // leaves a `Principal` in the request.
             //
             // Mounted in the legacy `/api/*` spelling on purpose, and kept
             // so: that tree answers for the whole deprecation window, and
@@ -778,16 +773,30 @@ pub(crate) mod tests {
         }
     }
 
-    /// Stand in for the authorisation gate: an unauthenticated caller, which
-    /// is what a control plane with `api_auth_enabled` off resolves every
-    /// request to, and what these tests are.
+    /// Stand in for the authorisation gate: a caller the gate has admitted -
+    /// an unscoped owner token's principal, which is what a logged-in
+    /// operator holds. These tests are about the catalog rather than about
+    /// who may reach it, so the gate itself is not in the way, but the
+    /// principal it would have left has to be, or a handler that names its
+    /// caller would fail to extract one.
+    pub(crate) fn admitted_principal() -> crate::identity::Principal {
+        use crate::identity::{Authority, PrincipalKind, Role};
+        crate::identity::Principal {
+            kind: PrincipalKind::Account,
+            account: Some("root".to_string()),
+            role: Some(Role::Owner),
+            credential_id: Some("0000000000000000".to_string()),
+            authority: Authority::Unscoped,
+        }
+    }
+
     async fn supply_test_principal(
         mut request: axum::extract::Request,
         next: axum::middleware::Next,
     ) -> axum::response::Response {
         request
             .extensions_mut()
-            .insert(crate::identity::Principal::anonymous());
+            .insert(admitted_principal());
         next.run(request).await
     }
 

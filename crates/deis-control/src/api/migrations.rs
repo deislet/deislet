@@ -763,11 +763,10 @@ fn operation_context(
             "account:{}",
             principal.account.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::ConfigKey => format!(
-            "config-key:{}",
+        PrincipalKind::Bootstrap => format!(
+            "bootstrap:{}",
             principal.credential_id.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::Anonymous => "anonymous:direct-local".to_string(),
     };
     let fingerprint = format!("POST\n/api/apps/{application_name}/identity-migration\nv1");
     OperationRequestContext::new(
@@ -901,7 +900,7 @@ mod tests {
                     .uri("/api/apps/shop/identity-migration")
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -953,7 +952,7 @@ mod tests {
             builder
                 .body(Body::empty())
                 .map(|mut request| {
-                    request.extensions_mut().insert(Principal::anonymous());
+                    request.extensions_mut().insert(admitted_principal());
                     request
                 })
                 .unwrap()
@@ -1040,7 +1039,7 @@ mod tests {
                 .header(header::IF_MATCH, format!("\"{revision}\""))
                 .body(Body::empty())
                 .map(|mut request| {
-                    request.extensions_mut().insert(Principal::anonymous());
+                    request.extensions_mut().insert(admitted_principal());
                     request
                 })
                 .unwrap()
@@ -1094,7 +1093,7 @@ mod tests {
                     .header(header::IF_MATCH, format!("\"{revision}\""))
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1109,7 +1108,7 @@ mod tests {
                     .uri(location)
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1158,7 +1157,7 @@ mod tests {
                     .uri(&path)
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1179,7 +1178,7 @@ mod tests {
                     .header(IF_MATCH, "\"9\"")
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1197,7 +1196,7 @@ mod tests {
                     .header(IF_MATCH, "1")
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1214,7 +1213,7 @@ mod tests {
                     .header(IF_MATCH, "\"1\"")
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1259,6 +1258,19 @@ mod tests {
             cancelling: Arc::new(Mutex::new(BTreeSet::new())),
         };
         router("/api", state).layer(Extension(principal))
+    }
+
+    /// The principal the gate would leave for an admitted caller with every
+    /// authority - what an unscoped owner token resolves to. Tests here
+    /// insert it directly instead of mounting the real gate.
+    fn admitted_principal() -> Principal {
+        Principal {
+            kind: PrincipalKind::Account,
+            account: Some("root".to_string()),
+            role: Some(crate::identity::Role::Owner),
+            credential_id: Some("0000000000000000".to_string()),
+            authority: crate::identity::Authority::Unscoped,
+        }
     }
 
     fn scoped_principal(scopes: &str) -> Principal {
@@ -1613,7 +1625,7 @@ mod tests {
         let cancel_uri = format!("/api/operations/{operation_id}/cancel");
 
         // An administrator is told there is no controller, as before.
-        let api = generic_router(Arc::clone(&store), Principal::anonymous());
+        let api = generic_router(Arc::clone(&store), admitted_principal());
         let response = api
             .oneshot(cancel_request(&cancel_uri, Some("build-cancel"), "\"1\""))
             .await
@@ -1729,11 +1741,12 @@ mod gated_tests {
     use crate::identity::{Authority, Denial, IdentityStore, Role, Scope, Verb};
     use deis_wire::CanonicalId;
 
-    const ROOT_KEY: &str = "the-operators-root-key";
-
     struct Gated {
         router: Router,
         audit: Arc<AuditStore>,
+        /// The secret of the unscoped owner token standing in for the
+        /// administrator.
+        root_secret: String,
         /// The secret of a token scoped to `deploy:demo/production`.
         deploy_secret: String,
     }
@@ -1742,8 +1755,13 @@ mod gated_tests {
         let database = store.database();
         let identity = Arc::new(IdentityStore::new(Arc::clone(&database)));
         let audit = Arc::new(AuditStore::new(database));
-        let config_keys = vec![ROOT_KEY.to_string()];
-        identity.sync_config_keys(&config_keys).await.unwrap();
+        // The administrator of these tests is an unscoped owner token: the
+        // old flat configuration key no longer exists.
+        identity.create_account("root", Role::Owner).await.unwrap();
+        let (_, root_secret) = identity
+            .create_token("root", "operator", Authority::Unscoped)
+            .await
+            .unwrap();
         identity.create_account("ci", Role::Deployer).await.unwrap();
         let (_, deploy_secret) = identity
             .create_token(
@@ -1754,10 +1772,9 @@ mod gated_tests {
             .await
             .unwrap();
         let authz = AuthzState {
-            enforced: true,
-            config_keys: Arc::new(config_keys),
             identity,
             audit: Arc::clone(&audit),
+            bootstrap_file: None,
         };
         let state = MigrationApiState {
             store,
@@ -1779,6 +1796,7 @@ mod gated_tests {
         Gated {
             router,
             audit,
+            root_secret,
             deploy_secret,
         }
     }
@@ -2010,13 +2028,13 @@ mod gated_tests {
             (&elsewhere.to_string(), "deploy"),
             (&migration, "migrate"),
         ] {
-            let (status, answer) = get(&gated, &format!("/api/v1/operations/{id}"), ROOT_KEY).await;
+            let (status, answer) = get(&gated, &format!("/api/v1/operations/{id}"), &gated.root_secret).await;
             assert_eq!(status, StatusCode::OK, "{id}: {}", answer.text());
             assert_eq!(answer.json()["kind"], kind, "{id}");
             assert!(answer.headers.contains_key(header::ETAG), "{id}");
         }
         let (status, answer) =
-            get(&gated, &format!("/api/v1/operations/{unknown}"), ROOT_KEY).await;
+            get(&gated, &format!("/api/v1/operations/{unknown}"), &gated.root_secret).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{}", answer.text());
         assert_eq!(answer.json()["error"]["code"], codes::NOT_FOUND);
 

@@ -148,8 +148,8 @@ pub struct AssignmentView {
 /// GET /api/nodes/:id/assignments (machine channel)
 ///
 /// Served on the machine listener with mutual TLS — the handler receives
-/// the caller's SPIFFE identity from the peer certificate, and
-/// `api_auth_enabled` does not apply.
+/// the caller's SPIFFE identity from the peer certificate. The human API's
+/// credential gate does not reach this channel.
 pub async fn for_node(
     State(state): State<CatalogState>,
     Path(node_id): Path<String>,

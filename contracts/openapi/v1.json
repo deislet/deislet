@@ -376,21 +376,21 @@
             "type": "string"
           },
           "actor_account": {
-            "description": "The account's name. `None` only when the human API is unauthenticated.",
+            "description": "The account's name. `None` when no credential resolved.",
             "type": [
               "string",
               "null"
             ]
           },
           "actor_credential": {
-            "description": "The token's public id, or a configured key's fingerprint. Never any\npart of a credential.",
+            "description": "The token's public id. Never any\npart of a credential.",
             "type": [
               "string",
               "null"
             ]
           },
           "actor_kind": {
-            "description": "account, config_key or anonymous.",
+            "description": "`account`, `bootstrap`, or `unknown`.",
             "type": "string"
           },
           "app_id": {
@@ -1969,21 +1969,21 @@
                   "type": "string"
                 },
                 "actor_account": {
-                  "description": "The account's name. `None` only when the human API is unauthenticated.",
+                  "description": "The account's name. `None` when no credential resolved.",
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "actor_credential": {
-                  "description": "The token's public id, or a configured key's fingerprint. Never any\npart of a credential.",
+                  "description": "The token's public id. Never any\npart of a credential.",
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "actor_kind": {
-                  "description": "account, config_key or anonymous.",
+                  "description": "`account`, `bootstrap`, or `unknown`.",
                   "type": "string"
                 },
                 "app_id": {
@@ -4141,7 +4141,7 @@
             ]
           },
           "unscoped": {
-            "description": "Ask for a credential subject to no scope at all - the old flat\n`api_keys` behaviour. Spelled out rather than implied by an empty\nscope list, because \"everything\" and \"nothing\" must not be one typo\napart.",
+            "description": "Ask for a credential subject to no scope at all - everything its\naccount's role permits. Spelled out rather than implied by an empty\nscope list, because \"everything\" and \"nothing\" must not be one typo\napart.",
             "type": "boolean"
           }
         },
@@ -7549,7 +7549,7 @@
         "description": "Where a credential came from.",
         "enum": [
           "minted",
-          "config"
+          "bootstrap"
         ],
         "type": "string"
       },
@@ -7708,7 +7708,7 @@
         "type": "apiKey"
       },
       "bearerToken": {
-        "description": "`Authorization: Bearer <token>` with an API token minted by `POST /api/v1/accounts/{name}/tokens` or an `api_keys` entry of the configuration file.",
+        "description": "`Authorization: Bearer <token>` with an API token minted by `POST /api/v1/accounts/{name}/tokens`; on a fresh install, log in with `deis login --bootstrap` using the bootstrap.token file the control plane wrote to its data directory.",
         "scheme": "bearer",
         "type": "http"
       }

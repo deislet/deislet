@@ -1069,8 +1069,9 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     //
     // Added after the catalog and, like it, only ever created: an existing
     // database grows these three tables on the next start and keeps every
-    // row it had. A control plane that upgrades and never creates an account
-    // authenticates exactly as it did before, against `api_keys`.
+    // row it had. An installation upgrading from the flat configuration-file
+    // keys logs in through the one-time bootstrap credential and mints
+    // account tokens from there.
     // ------------------------------------------------------------------
 
     // An account is the thing an audit line blames. `role` is a ceiling on
@@ -1090,10 +1091,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     )?;
 
     // One credential. `secret_hash` is SHA-256 of the token's secret half
-    // and is the only thing about a minted token that is written down; for
-    // an `api_keys` entry from the configuration file it is NULL, because
-    // that key is checked against the file and nothing about it belongs
-    // here. Either way a reader of this table holds no working credential.
+    // and is the only thing about a minted token that is written down; a
+    // reader of this table holds no working credential.
     //
     // `unscoped` is a column of its own rather than "scopes is empty":
     // an empty scope list is a token that can do nothing, and an unscoped
@@ -1111,11 +1110,24 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             unscoped     INTEGER NOT NULL,
             created_at   INTEGER NOT NULL,
             last_used_at INTEGER,
-            revoked_at   INTEGER
+            revoked_at   INTEGER,
+            expires_at   INTEGER
         )
         "#,
         [],
     )?;
+
+    // Bootstrap tokens expire; nothing else does. A database created before
+    // the column existed receives it on its next start.
+    {
+        let columns = conn
+            .prepare("PRAGMA table_info(api_tokens)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?;
+        if !columns.iter().any(|name| name == "expires_at") {
+            conn.execute("ALTER TABLE api_tokens ADD COLUMN expires_at INTEGER", [])?;
+        }
+    }
 
     // Superseded by `idx_api_tokens_account_page_v1` below, whose leading
     // column is the same `account_id`: any plan that could seek this index

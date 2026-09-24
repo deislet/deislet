@@ -7,12 +7,9 @@
 //!
 //! Two rules shape the table layout:
 //!
-//! * **A row is not a credential.** A minted token stores its public id and
-//!   `SHA-256` of its secret half. A configured `api_keys` entry stores
-//!   *nothing* about the key itself, not even a full digest - only the
-//!   four-byte fingerprint that already appeared in the log, and it is
-//!   checked in memory against the configuration file exactly as it always
-//!   was. So a stolen copy of `deis-control.db` authenticates as nobody.
+//! * **A row is not a credential.** A token stores its public id and
+//!   `SHA-256` of its secret half. So a stolen copy of `deis-control.db`
+//!   authenticates as nobody.
 //! * **Revocation is a read, not a broadcast.** Every request looks the token
 //!   row up, so a revoked token stops working on its next call. There is no
 //!   cache to invalidate and no window to explain.
@@ -117,23 +114,24 @@ pub struct Account {
 pub enum TokenOrigin {
     /// Minted by this control plane, shown once, stored as a hash.
     Minted,
-    /// An `api_keys` entry in the configuration file. The row exists so the
-    /// key is visible in a listing and nameable in an audit line; the key
-    /// itself is checked against the file and is not in this database.
-    Config,
+    /// The one-time bootstrap credential minted for a control plane that had
+    /// no credential at all. It may only create the first owner account and a
+    /// first token for it; it is revoked after its first successful use and
+    /// expires 24 hours after it was minted if unused.
+    Bootstrap,
 }
 
 impl TokenOrigin {
     fn as_str(self) -> &'static str {
         match self {
             TokenOrigin::Minted => "minted",
-            TokenOrigin::Config => "config",
+            TokenOrigin::Bootstrap => "bootstrap",
         }
     }
 
     fn parse(text: &str) -> Self {
         match text {
-            "config" => TokenOrigin::Config,
+            "bootstrap" => TokenOrigin::Bootstrap,
             _ => TokenOrigin::Minted,
         }
     }
@@ -161,10 +159,10 @@ pub struct ApiToken {
 
 /// What resolving a presented credential produced.
 ///
-/// The three failures are separate because they are separate lines in the
+/// The failures are separate because they are separate lines in the
 /// log: an operator looking at "a revoked token was presented" knows a
 /// credential is still deployed somewhere, which "no such token" does not
-/// tell them. The *caller* is told the same thing in all three cases.
+/// tell them. The *caller* is told the same thing in every case.
 #[derive(Debug, Clone)]
 pub enum Resolution {
     Allowed(Principal),
@@ -172,6 +170,13 @@ pub enum Resolution {
     Unknown,
     /// The token exists and was revoked.
     Revoked {
+        token: String,
+        account: String,
+    },
+    /// The token exists, is not revoked, and stayed past its expiry: an
+    /// expired token is reported like a revoked one, because both mean a
+    /// credential that was withdrawn is still out there.
+    Expired {
         token: String,
         account: String,
     },
@@ -217,11 +222,40 @@ pub struct TokenListFilter {
 
 pub struct IdentityStore {
     db: Arc<Database>,
+    /// Where "now" comes from. `now_secs` in production; a fixed or shifted
+    /// clock in tests, which is how the 24-hour bootstrap expiry is verified
+    /// without waiting for it.
+    clock: Clock,
 }
+
+type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 impl IdentityStore {
     pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+        Self::with_clock(db, Arc::new(now_secs))
+    }
+
+    /// The same store over an injected clock. Test-only in practice, kept
+    /// `pub` so the binary's own wiring cannot silently grow a second
+    /// definition of "now".
+    pub fn with_clock(db: Arc<Database>, clock: Clock) -> Self {
+        Self { db, clock }
+    }
+
+    fn now(&self) -> i64 {
+        (self.clock)()
+    }
+
+    /// The database connection and the clock, for a closure that needs both.
+    /// The clock is read *before* the connection is entered, so a call cannot
+    /// observe two different "now"s in one resolution.
+    async fn with_conn_now<T, F>(&self, f: F) -> IdentityResult<T>
+    where
+        F: FnOnce(&Connection, i64) -> IdentityResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let now = self.now();
+        self.with_conn(move |conn| f(conn, now)).await
     }
 
     /// Opaque list-cursor persistence for the account and token lists,
@@ -413,8 +447,8 @@ impl IdentityStore {
             conn.execute(
                 "INSERT INTO api_tokens \
                  (id, account_id, name, origin, secret_hash, scopes, unscoped, created_at, \
-                  last_used_at, revoked_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
+                  last_used_at, revoked_at, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)",
                 params![
                     minted.id,
                     account.id,
@@ -432,7 +466,7 @@ impl IdentityStore {
                     account = %account.name,
                     token = %minted.id,
                     name = %token_name,
-                    "Minted an UNSCOPED token: it can do anything its account's role allows, to every application. This is the old flat api_keys behaviour; prefer a scoped token and retire this one"
+                    "Minted an UNSCOPED token: it can do anything its account's role allows, to every application. Prefer a scoped token and retire this one"
                 );
             } else {
                 info!(
@@ -555,24 +589,12 @@ impl IdentityStore {
 
     /// Revoke one token. Answers the row as it now stands so the caller can
     /// say whose credential just stopped working.
-    ///
-    /// A configured `api_keys` entry cannot be revoked here: it is not in
-    /// this database, it is in the configuration file, and a row saying it is
-    /// revoked while the file still names it would be a lie the next restart
-    /// would undo. The refusal says which file to edit.
     pub async fn revoke_token(&self, id: &str) -> IdentityResult<ApiToken> {
         let id = id.to_string();
         self.with_conn(move |conn| {
             let Some(token) = token_by_id(conn, &id)? else {
                 return Err(IdentityError::NotFound(format!("token {id}")));
             };
-            if token.origin == TokenOrigin::Config {
-                return Err(IdentityError::Invalid(format!(
-                    "token {id} is an api_keys entry from this control plane's configuration \
-                     file, not a minted token. Remove it from api_keys and restart deis-control; \
-                     until then it keeps working, and a row here saying otherwise would be wrong"
-                )));
-            }
             if token.revoked_at.is_some() {
                 return Ok(token);
             }
@@ -629,13 +651,12 @@ impl IdentityStore {
         };
         let id = parts.id.to_string();
         let secret_half = parts.secret_half.to_string();
-        let now = now_secs();
 
-        self.with_conn(move |conn| {
+        self.with_conn_now(move |conn, now| {
             let row = conn
                 .query_row(
                     "SELECT t.secret_hash, t.scopes, t.unscoped, t.revoked_at, \
-                            t.last_used_at, a.name, a.role, a.disabled_at \
+                            t.last_used_at, a.name, a.role, a.disabled_at, t.origin, t.expires_at \
                      FROM api_tokens t JOIN accounts a ON a.id = t.account_id \
                      WHERE t.id = ?1",
                     params![id],
@@ -659,6 +680,15 @@ impl IdentityStore {
                     account: credential.account,
                 });
             }
+            if credential
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= now)
+            {
+                return Ok(Resolution::Expired {
+                    token: id,
+                    account: credential.account,
+                });
+            }
             if credential.account_disabled {
                 return Ok(Resolution::AccountDisabled {
                     token: id,
@@ -669,7 +699,7 @@ impl IdentityStore {
             touch_last_used(conn, &id, credential.last_used_at, now)?;
 
             Ok(Resolution::Allowed(Principal {
-                kind: PrincipalKind::Account,
+                kind: credential.kind,
                 account: Some(credential.account),
                 role: Some(credential.role),
                 credential_id: Some(id),
@@ -679,172 +709,166 @@ impl IdentityStore {
         .await
     }
 
-    /// The caller behind an `api_keys` entry that the configuration file has
-    /// already accepted.
-    ///
-    /// The key itself never reaches this function; only its fingerprint,
-    /// which is the row's id. If the row is missing - a database wiped under
-    /// a running control plane, say - the caller is still admitted as the
-    /// unscoped credential the configuration says it is, because the
-    /// configuration file is the authority for these and this table is only
-    /// the record of them.
-    pub async fn resolve_config_key(&self, fingerprint: &str) -> IdentityResult<Principal> {
-        let id = fingerprint.to_string();
-        let now = now_secs();
-        self.with_conn(move |conn| {
-            let row: Option<(String, Option<i64>)> = conn
-                .query_row(
-                    "SELECT a.name, t.last_used_at FROM api_tokens t \
-                     JOIN accounts a ON a.id = t.account_id WHERE t.id = ?1",
-                    params![id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let account = match row {
-                Some((account, last_used_at)) => {
-                    touch_last_used(conn, &id, last_used_at, now)?;
-                    account
-                }
-                None => CONFIG_KEY_ACCOUNT.to_string(),
-            };
-            Ok(Principal {
-                kind: PrincipalKind::ConfigKey,
-                account: Some(account),
-                role: Some(Role::Owner),
-                credential_id: Some(id),
-                authority: Authority::Unscoped,
-            })
+    // ----------------------------------------------------------------
+    // Bootstrap
+    // ----------------------------------------------------------------
+
+    /// Whether any live credential exists: a token that is not revoked and
+    /// has not expired. This is the question a start-up asks before deciding
+    /// to mint a bootstrap credential - one working credential anywhere means
+    /// the platform is reachable and must not be handed a second root.
+    pub async fn has_live_credential(&self) -> IdentityResult<bool> {
+        self.with_conn_now(move |conn, now| {
+            let live: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM api_tokens \
+                 WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?1)",
+                params![now],
+                |row| row.get(0),
+            )?;
+            Ok(live > 0)
         })
         .await
     }
 
-    // ----------------------------------------------------------------
-    // Startup
-    // ----------------------------------------------------------------
-
-    /// Bring the record of the configured `api_keys` into line with the file,
-    /// and report how many there are.
+    /// Mint the one-time bootstrap credential, unless the platform already
+    /// has a live credential.
     ///
-    /// Three things happen, all of them so that an operator can *see* their
-    /// flat keys rather than only remember them: a row appears for every key
-    /// the file names, keys the file no longer names are marked revoked (the
-    /// file is the authority, so a key that left it has genuinely stopped
-    /// working and the listing must say so), and the whole set hangs off one
-    /// placeholder account whose role is `owner`, because that is what an
-    /// `api_keys` entry has always been.
-    pub async fn sync_config_keys(&self, keys: &[String]) -> IdentityResult<usize> {
-        let fingerprints: Vec<String> = keys
-            .iter()
-            .filter(|key| !key.trim().is_empty())
-            .map(|key| token::fingerprint(key))
-            .collect();
-        let present = fingerprints.len();
-        if present == 0 {
-            // Nothing in the file. Anything left over from a previous run has
-            // stopped working, and the listing has to stop showing it as live.
-            let revoked = self
-                .with_conn(move |conn| revoke_missing_config_keys(conn, &[]))
-                .await?;
-            if revoked > 0 {
-                warn!(
-                    revoked,
-                    "The configuration file no longer names any api_keys, so that many recorded configuration credentials were marked revoked; anything still presenting one now gets 401"
-                );
-            }
-            return Ok(0);
+    /// The case this exists for: a control plane with no accounts yet. Before
+    /// accounts existed that state was a brick - every request refused, and
+    /// no way in to create a way in. The bootstrap token can do one thing
+    /// (create the first owner account and a first token for it; the gate in
+    /// `crate::api::authz` enforces exactly that), is revoked after its first
+    /// successful use, and expires after [`BOOTSTRAP_TTL_SECS`] if never
+    /// used. The caller writes the secret to the bootstrap file; nothing here
+    /// ever logs it.
+    ///
+    /// Returns the token's public id and its secret, in that order. The
+    /// secret exists only in this return value and the file the caller
+    /// writes; the row keeps the hash.
+    pub async fn ensure_bootstrap_token(&self) -> IdentityResult<Option<(String, String)>> {
+        if self.has_live_credential().await? {
+            return Ok(None);
         }
-
-        let created_at = now_secs();
-        let wanted = fingerprints.clone();
+        let now = self.now();
+        let expires_at = now + BOOTSTRAP_TTL_SECS;
         self.with_conn(move |conn| {
-            let account_id = ensure_account_row(conn, CONFIG_KEY_ACCOUNT, Role::Owner, created_at)?;
-            for (index, fingerprint) in wanted.iter().enumerate() {
-                conn.execute(
-                    "INSERT INTO api_tokens \
-                     (id, account_id, name, origin, secret_hash, scopes, unscoped, created_at, \
-                      last_used_at, revoked_at) \
-                     VALUES (?1, ?2, ?3, ?4, NULL, '', 1, ?5, NULL, NULL) \
-                     ON CONFLICT(id) DO UPDATE SET revoked_at = NULL, account_id = ?2",
-                    params![
-                        fingerprint,
-                        account_id,
-                        format!("api_keys[{index}]"),
-                        TokenOrigin::Config.as_str(),
-                        created_at
-                    ],
-                )?;
-            }
-            let revoked = revoke_missing_config_keys(conn, &wanted)?;
-            if revoked > 0 {
-                warn!(
-                    revoked,
-                    "Configuration credentials that the file no longer names were marked revoked; anything still presenting one now gets 401"
-                );
-            }
+            ensure_account_row(conn, BOOTSTRAP_ACCOUNT, Role::Owner, now)
+        })
+        .await?;
+        let minted = token::mint();
+        let row_id = minted.id.clone();
+        let secret = minted.secret.clone();
+        let secret_hash = minted.secret_hash;
+        self.with_conn(move |conn| {
+            let account = account_by_name(conn, BOOTSTRAP_ACCOUNT)?
+                .expect("the bootstrap account was just ensured");
+            conn.execute(
+                "INSERT INTO api_tokens \
+                 (id, account_id, name, origin, secret_hash, scopes, unscoped, created_at, \
+                  last_used_at, revoked_at, expires_at) \
+                 VALUES (?1, ?2, 'bootstrap', ?3, ?4, '', 0, ?5, NULL, NULL, ?6)",
+                params![
+                    row_id,
+                    account.id,
+                    TokenOrigin::Bootstrap.as_str(),
+                    secret_hash,
+                    now,
+                    expires_at
+                ],
+            )?;
             Ok(())
         })
         .await?;
-
-        warn!(
-            api_keys = present,
-            account = CONFIG_KEY_ACCOUNT,
-            "This control plane's api_keys are UNSCOPED credentials: each one may deploy any application, rotate any secret, mint any tenant's storage token and delete anything. They keep working exactly as before and are listed by `deis token list`; replace them with scoped tokens and then take them out of the configuration file"
-        );
-        Ok(present)
+        Ok(Some((minted.id, secret)))
     }
 
-    /// Make sure this control plane has at least one credential a person can
-    /// use, and say so once when it had to invent one.
+    /// Install a preset bootstrap token: the operator's own secret, hashed
+    /// and stored the same way a minted one is, expiring
+    /// [`BOOTSTRAP_TTL_SECS`] from now.
     ///
-    /// The case this exists for: `api_auth_enabled = true` with an empty
-    /// `api_keys` and no accounts yet. Before accounts existed that
-    /// combination was a brick - every request refused, and no way in to
-    /// create a way in. Now it mints an owner account with one unscoped
-    /// token, printed once because it is stored only as a hash and cannot be
-    /// read back.
+    /// This is the headless path (`deis-control bootstrap --token-file`): the
+    /// operator generates the secret offline, hands this binary the file it
+    /// was written to, and logs in with the same file. Any previous bootstrap
+    /// row stops working: there is one way in, and it is the one just
+    /// installed.
     ///
-    /// It deliberately does nothing when any usable credential already
-    /// exists, so a restart never mints a second root token.
-    pub async fn ensure_bootstrap_credential(
-        &self,
-        configured_keys: usize,
-    ) -> IdentityResult<Option<String>> {
-        if configured_keys > 0 {
-            return Ok(None);
-        }
-        let live: i64 = self
-            .with_conn(move |conn| {
-                Ok(conn.query_row(
-                    "SELECT COUNT(*) FROM api_tokens WHERE revoked_at IS NULL",
-                    [],
-                    |row| row.get(0),
-                )?)
-            })
-            .await?;
-        if live > 0 {
-            return Ok(None);
-        }
-
-        let created_at = now_secs();
+    /// The secret must be a well-formed token string, because that is the
+    /// shape `resolve_token` recognises. Refusing anything else here beats
+    /// storing a credential that can never be presented.
+    pub async fn install_preset_bootstrap_token(&self, secret: &str) -> IdentityResult<String> {
+        let parts = token::split(secret).ok_or_else(|| {
+            IdentityError::Invalid(
+                "the bootstrap token is not a well-formed token string \
+                 (deis_pat_<16 hex>_<64 hex>); keep that shape when generating one offline"
+                    .to_string(),
+            )
+        })?;
+        let id = parts.id.to_string();
+        let secret_half = parts.secret_half.to_string();
+        let secret_hash = token::hash_secret(&secret_half);
+        let now = self.now();
+        let expires_at = now + BOOTSTRAP_TTL_SECS;
+        let row_id = id.clone();
         self.with_conn(move |conn| {
-            ensure_account_row(conn, BOOTSTRAP_ACCOUNT, Role::Owner, created_at)?;
+            let account_id = ensure_account_row(conn, BOOTSTRAP_ACCOUNT, Role::Owner, now)?;
+            conn.execute(
+                "UPDATE api_tokens SET revoked_at = ?2 \
+                 WHERE origin = 'bootstrap' AND revoked_at IS NULL AND id != ?1",
+                params![row_id, now],
+            )?;
+            conn.execute(
+                "INSERT INTO api_tokens \
+                 (id, account_id, name, origin, secret_hash, scopes, unscoped, created_at, \
+                  last_used_at, revoked_at, expires_at) \
+                 VALUES (?1, ?2, 'bootstrap', ?3, ?4, '', 0, ?5, NULL, NULL, ?6) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   account_id = ?2, secret_hash = ?4, revoked_at = NULL, expires_at = ?6",
+                params![
+                    row_id,
+                    account_id,
+                    TokenOrigin::Bootstrap.as_str(),
+                    secret_hash,
+                    now,
+                    expires_at
+                ],
+            )?;
             Ok(())
         })
         .await?;
-        let (_, secret) = self
-            .create_token(BOOTSTRAP_ACCOUNT, "bootstrap", Authority::Unscoped)
-            .await?;
-        Ok(Some(secret))
+        Ok(id)
+    }
+
+    /// Revoke the bootstrap credential and say which id stopped working.
+    /// Called by the gate right after the bootstrap token's first successful
+    /// use, so the one-time credential is one-time even though nothing on the
+    /// wire marks it as such.
+    pub async fn revoke_bootstrap_token(&self, id: &str) -> IdentityResult<()> {
+        let row_id = id.to_string();
+        let now = self.now();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE api_tokens SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+                params![row_id, now],
+            )?;
+            Ok(())
+        })
+        .await?;
+        info!(
+            token = %id,
+            "Revoked the bootstrap credential after its first successful use; the file that held it is deleted by the caller"
+        );
+        Ok(())
     }
 }
 
-/// The account every `api_keys` entry is filed under. A placeholder, not a
-/// person: it exists so an audit line has a name to print and so the listing
-/// can group them.
-pub const CONFIG_KEY_ACCOUNT: &str = "config-key";
-
-/// The account a first-run control plane mints for itself.
+/// The account a first-run control plane mints for itself, and the account
+/// every bootstrap credential belongs to.
 pub const BOOTSTRAP_ACCOUNT: &str = "bootstrap";
+
+/// How long a bootstrap credential lives if it is never used. Short, because
+/// the file holding it sits in the data directory; long enough for somebody
+/// to notice a fresh install and log in.
+pub const BOOTSTRAP_TTL_SECS: i64 = 24 * 60 * 60;
 
 fn authority_from_row(unscoped: bool, scopes: &str) -> Authority {
     if unscoped {
@@ -885,29 +909,6 @@ fn touch_last_used(
         )?;
     }
     Ok(())
-}
-
-fn revoke_missing_config_keys(conn: &Connection, keep: &[String]) -> IdentityResult<usize> {
-    let mut stmt =
-        conn.prepare("SELECT id FROM api_tokens WHERE origin = 'config' AND revoked_at IS NULL")?;
-    let existing: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
-
-    let now = now_secs();
-    let mut revoked = 0;
-    for id in existing {
-        if keep.contains(&id) {
-            continue;
-        }
-        conn.execute(
-            "UPDATE api_tokens SET revoked_at = ?1 WHERE id = ?2",
-            params![now, id],
-        )?;
-        revoked += 1;
-    }
-    Ok(revoked)
 }
 
 fn ensure_account_row(
@@ -967,15 +968,14 @@ struct Credential {
     account: String,
     role: Role,
     account_disabled: bool,
+    kind: PrincipalKind,
+    expires_at: Option<i64>,
 }
 
 fn read_credential(row: &Row<'_>) -> rusqlite::Result<Credential> {
     let role: String = row.get(6)?;
+    let origin: String = row.get(8)?;
     Ok(Credential {
-        // A configured key has no digest here at all, and an empty one
-        // matches no secret, so such a row can never authenticate through
-        // this path - which is the intent: those are checked against the
-        // configuration file.
         secret_hash: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
         scopes: row.get(1)?,
         unscoped: row.get::<_, i64>(2)? != 0,
@@ -985,6 +985,13 @@ fn read_credential(row: &Row<'_>) -> rusqlite::Result<Credential> {
         // An unreadable role is the least privileged one, never the most.
         role: Role::parse(&role).unwrap_or(Role::Viewer),
         account_disabled: row.get::<_, Option<i64>>(7)?.is_some(),
+        // An origin this build does not know is a minted token, which is
+        // the ordinary case: only the bootstrap credential is special.
+        kind: match TokenOrigin::parse(&origin) {
+            TokenOrigin::Bootstrap => PrincipalKind::Bootstrap,
+            TokenOrigin::Minted => PrincipalKind::Account,
+        },
+        expires_at: row.get(9)?,
     })
 }
 
@@ -1266,78 +1273,152 @@ mod tests {
         assert!(refused.contains("secrets:myapp/production"), "{refused}");
     }
 
-    /// A configured key is recorded so it can be seen, and the record holds
-    /// nothing that could be presented. Taking the key out of the file
-    /// revokes the record, because the file is the authority.
+    /// The first-run case: no credential anywhere. Exactly one bootstrap
+    /// credential is minted; it authenticates, it expires 24 hours after it
+    /// was minted (verified with an injected clock), a restart mints no
+    /// second one while it is live, and after it is revoked the platform
+    /// mints a fresh one on the next start - which is how an operator who
+    /// lost the file gets back in.
     #[tokio::test]
-    async fn configured_keys_are_visible_unscoped_and_follow_the_file() {
+    async fn a_control_plane_with_no_credential_at_all_mints_one_expiring_bootstrap_token() {
         let store = new_store().await;
-        let keys = vec!["first-config-key".to_string(), "second".to_string()];
-        assert_eq!(store.sync_config_keys(&keys).await.unwrap(), 2);
-        assert_eq!(store.unscoped_count().await.unwrap(), 2);
-
-        let listed = tokens(&store, None, false).await;
-        assert_eq!(listed.len(), 2);
-        for entry in &listed {
-            assert!(entry.unscoped);
-            assert_eq!(entry.scopes, "unscoped");
-            assert_eq!(entry.origin, TokenOrigin::Config);
-            assert_eq!(entry.account, CONFIG_KEY_ACCOUNT);
-        }
-
-        // The key itself is checked against the file, not here; this is the
-        // record of it, resolved by fingerprint.
-        let fingerprint = token::fingerprint(&keys[0]);
-        let principal = store.resolve_config_key(&fingerprint).await.unwrap();
-        assert!(principal.authority.is_unscoped());
-        assert_eq!(principal.kind, PrincipalKind::ConfigKey);
-
-        // Nothing stored about it can be presented as a credential.
-        assert!(matches!(
-            store.resolve_token(&fingerprint).await.unwrap(),
-            Resolution::Unknown
-        ));
-
-        // One key removed from the file: its record stops being live.
-        assert_eq!(store.sync_config_keys(&keys[1..]).await.unwrap(), 1);
-        assert_eq!(store.unscoped_count().await.unwrap(), 1);
-        let revoked = store.revoke_token(&fingerprint).await.unwrap_err();
-        assert!(revoked.to_string().contains("api_keys"), "{revoked}");
-    }
-
-    /// The first-run case: authentication demanded and no credential
-    /// anywhere. One owner token is minted and printed; a restart mints no
-    /// second one.
-    #[tokio::test]
-    async fn a_control_plane_with_no_credential_at_all_mints_exactly_one() {
-        let store = new_store().await;
-        let secret = store
-            .ensure_bootstrap_credential(0)
+        let (id, secret) = store
+            .ensure_bootstrap_token()
             .await
             .unwrap()
             .expect("a control plane with no credential has to mint one");
-        assert!(matches!(
-            store.resolve_token(&secret).await.unwrap(),
-            Resolution::Allowed(_)
-        ));
+
+        let Resolution::Allowed(principal) = store.resolve_token(&secret).await.unwrap() else {
+            panic!("a freshly minted bootstrap credential has to authenticate");
+        };
+        assert_eq!(principal.kind, PrincipalKind::Bootstrap);
+        assert_eq!(principal.account.as_deref(), Some(BOOTSTRAP_ACCOUNT));
+        assert_eq!(id.len(), 16, "the public half is eight bytes of hex");
+
+        // A restart while the bootstrap credential is live mints nothing:
+        // one way in at a time.
         assert!(
-            store
-                .ensure_bootstrap_credential(0)
-                .await
-                .unwrap()
-                .is_none(),
+            store.ensure_bootstrap_token().await.unwrap().is_none(),
             "a restart must not mint a second root credential"
         );
 
-        // And a control plane that has configured keys mints nothing.
-        let other = new_store().await;
+        // Expired, it is refused and reported like the withdrawn credential
+        // it now is. Two stores share one database and differ only in the
+        // clock: the same preset credential is live to the real clock and
+        // expired to one that has run past the TTL it was born with.
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let installer = Arc::new(IdentityStore::with_clock(
+            Arc::clone(&database),
+            Arc::new(now_secs),
+        ));
+        let shifted = Arc::new(IdentityStore::with_clock(
+            Arc::clone(&database),
+            Arc::new(|| now_secs() + BOOTSTRAP_TTL_SECS + 1),
+        ));
+        let preset = installer
+            .install_preset_bootstrap_token(&secret)
+            .await
+            .unwrap();
+        assert_eq!(preset, id, "the id comes from the token itself");
+        assert!(matches!(
+            installer.resolve_token(&secret).await.unwrap(),
+            Resolution::Allowed(_)
+        ));
+        assert!(matches!(
+            shifted.resolve_token(&secret).await.unwrap(),
+            Resolution::Expired { .. }
+        ));
+    }
+
+    /// A live account token stops the bootstrap mint, and once every
+    /// credential is gone a fresh start mints a new bootstrap credential
+    /// again - that is the recovery path for a lost bootstrap file.
+    #[tokio::test]
+    async fn a_live_token_prevents_a_bootstrap_mint_and_a_used_up_platform_gets_a_fresh_one() {
+        let store = new_store().await;
+        store.create_account("alice", Role::Owner).await.unwrap();
+        let (token, secret) = store
+            .create_token("alice", "laptop", Authority::Unscoped)
+            .await
+            .unwrap();
         assert!(
-            other
-                .ensure_bootstrap_credential(1)
-                .await
-                .unwrap()
-                .is_none()
+            store.ensure_bootstrap_token().await.unwrap().is_none(),
+            "a platform with a live credential must not be handed a second root"
         );
+
+        store.revoke_token(&token.id).await.unwrap();
+        let (new_id, new_secret) = store
+            .ensure_bootstrap_token()
+            .await
+            .unwrap()
+            .expect("no live credential is left, so a way in is minted");
+        assert!(matches!(
+            store.resolve_token(&new_secret).await.unwrap(),
+            Resolution::Allowed(_)
+        ));
+        assert_ne!(new_id, token.id);
+        assert!(matches!(
+            store.resolve_token(&secret).await.unwrap(),
+            Resolution::Revoked { .. }
+        ));
+    }
+
+    /// A preset bootstrap token replaces anything left over from an earlier
+    /// attempt, and a string that is not a token shape is refused rather
+    /// than stored as a credential nobody could ever present.
+    #[tokio::test]
+    async fn a_preset_bootstrap_token_replaces_the_previous_one_and_refuses_malformed_input() {
+        let store = new_store().await;
+        let (first_id, first_secret) = store
+            .ensure_bootstrap_token()
+            .await
+            .unwrap()
+            .expect("mint");
+
+        let replacement = format!(
+            "deis_pat_ffffffffffffffff_{}",
+            "a".repeat(64)
+        );
+        let second_id = store
+            .install_preset_bootstrap_token(&replacement)
+            .await
+            .unwrap();
+        assert_ne!(second_id, first_id);
+        assert!(matches!(
+            store.resolve_token(&first_secret).await.unwrap(),
+            Resolution::Revoked { .. }
+        ));
+        assert!(matches!(
+            store.resolve_token(&replacement).await.unwrap(),
+            Resolution::Allowed(p) if p.kind == PrincipalKind::Bootstrap
+        ));
+
+        let refused = store
+            .install_preset_bootstrap_token("not-a-token")
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("well-formed"),
+            "{refused}"
+        );
+    }
+
+    /// Revoking the bootstrap credential after its first use is the gate's
+    /// job, but the store does the database half: after it, the credential
+    /// reads as revoked and a second use of the same secret is refused.
+    #[tokio::test]
+    async fn a_bootstrap_token_revoked_after_use_is_refused_on_its_next_presentation() {
+        let store = new_store().await;
+        let (id, secret) = store
+            .ensure_bootstrap_token()
+            .await
+            .unwrap()
+            .expect("mint");
+        store.revoke_bootstrap_token(&id).await.unwrap();
+        assert!(matches!(
+            store.resolve_token(&secret).await.unwrap(),
+            Resolution::Revoked { .. }
+        ));
     }
 
     /// `last_used_at` answers "can I revoke this?", so it has to be written

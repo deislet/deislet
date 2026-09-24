@@ -26,7 +26,7 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::openapi;
 use crate::api::pagination::{ControlListPage, ListQuery, id_scope, list_page};
 use crate::catalog::{CatalogPage, PagePosition, ProviderDerivationSpec, StoredBundle, Version};
-use crate::identity::Principal;
+use crate::identity::{Principal, PrincipalKind};
 
 /// Version as seen from outside. `bundle_path` is deliberately absent: it
 /// is a control-plane local path and no client has any use for it.
@@ -299,9 +299,21 @@ async fn record_stored_bundle(
     // it is checked instead. Nothing has been written to the catalog yet - the
     // bundle file on disk is content-addressed and shared, so a refusal here
     // leaves no version anybody can deploy.
+    // The gate always leaves a principal on an admitted request, so this
+    // extension is present in production. If a request ever reaches this
+    // handler without one - a router mounted without the gate - the binding
+    // consent check runs against a principal with no authority at all and
+    // fails closed: a service binding is a claim of authority over another
+    // application, and "nobody here was admitted" is not a claimant.
     let principal = principal
         .map(|Extension(principal)| principal)
-        .unwrap_or_else(Principal::anonymous);
+        .unwrap_or_else(|| Principal {
+            kind: PrincipalKind::Account,
+            account: None,
+            role: None,
+            credential_id: None,
+            authority: crate::identity::Authority::Scoped(Vec::new()),
+        });
     if let Err(refusal) = check_service_bindings(&principal, &stored.manifest) {
         return Err(match &refusal {
             BindingRefusal::Unentitled {

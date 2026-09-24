@@ -207,8 +207,8 @@ pub struct CreateTokenRequest {
     /// means a token that can do nothing yet.
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
-    /// Ask for a credential subject to no scope at all - the old flat
-    /// `api_keys` behaviour. Spelled out rather than implied by an empty
+    /// Ask for a credential subject to no scope at all - everything its
+    /// account's role permits. Spelled out rather than implied by an empty
     /// scope list, because "everything" and "nothing" must not be one typo
     /// apart.
     #[serde(default)]
@@ -254,7 +254,7 @@ pub async fn create_token(
         (true, Some(scopes)) if !scopes.is_empty() => {
             return Err(ApiError::BadRequest(
                 "a token is either unscoped or carries scopes, not both: an unscoped credential is \
-                 the old flat api_keys behaviour and a scope list would say nothing about it"
+                 an unscoped credential and a scope list would say nothing about it"
                     .to_string(),
             ));
         }
@@ -519,7 +519,8 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let (router, _dir) = crate::api::tests::full_router().await;
+        let (router, _dir, secret) = crate::api::tests::full_router().await;
+        let secret = &secret;
         let post = |body: Value| {
             let router = router.clone();
             async move {
@@ -527,6 +528,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/accounts")
                     .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {secret}"))
                     .body(Body::from(body.to_string()))
                     .unwrap();
                 request.extensions_mut().insert(ConnectInfo(

@@ -23,6 +23,7 @@ interface TargetStatus {
     id: string
     displayName: string
     role: string
+    lifecycle: 'active' | 'frozen'
     implementation: {
       repository: string
       sourceCommit: string
@@ -100,6 +101,7 @@ export function Targets() {
           <CardTitle>Targets</CardTitle>
           <CardDescription>
             Artifact generation or deployment evidence does not mean compliant or supported.
+            Frozen targets ship stateless function artifacts only: no bindings, no certification.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -108,6 +110,7 @@ export function Targets() {
               <TableRow>
                 <TableHead>Target</TableHead>
                 <TableHead>Role</TableHead>
+                <TableHead>Lifecycle</TableHead>
                 <TableHead>Evidence</TableHead>
                 <TableHead>Certification</TableHead>
                 <TableHead>Compliant</TableHead>
@@ -123,6 +126,7 @@ export function Targets() {
                     <code className="text-xs text-muted-foreground">{backend.id}</code>
                   </TableCell>
                   <TableCell>{backend.role}</TableCell>
+                  <TableCell>{backend.lifecycle}</TableCell>
                   <TableCell>
                     <div>{backend.evidence.maturity}</div>
                     <div className="text-xs text-muted-foreground">{backend.evidence.outcome}</div>

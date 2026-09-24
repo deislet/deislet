@@ -47,7 +47,7 @@ use crate::catalog::model::now_secs;
 use crate::catalog::pagination::{KeysetBound, KeysetResume, finish_page, sqlite_fetch_limit};
 use crate::catalog::{CatalogError, CatalogPage, CatalogResult, PageCursorStore, PagePosition};
 use crate::database::{Database, DatabaseError};
-use crate::identity::{Principal, PrincipalKind};
+use crate::identity::Principal;
 
 const AUDIT_COLUMNS: &str = "id, at, actor_kind, actor_account, actor_credential, action, \
                              app_id, environment, target, method, path, peer, outcome, \
@@ -105,11 +105,11 @@ pub struct AuditEntry {
     pub id: i64,
     /// Unix seconds.
     pub at: i64,
-    /// account, config_key or anonymous.
+    /// `account`, `bootstrap`, or `unknown`.
     pub actor_kind: String,
-    /// The account's name. `None` only when the human API is unauthenticated.
+    /// The account's name. `None` when no credential resolved.
     pub actor_account: Option<String>,
-    /// The token's public id, or a configured key's fingerprint. Never any
+    /// The token's public id. Never any
     /// part of a credential.
     pub actor_credential: Option<String>,
     /// A stable name for the operation - `deploy`, `secret.write`,
@@ -194,7 +194,11 @@ impl AuditRecord {
     pub fn by_unknown_caller() -> AuditRecordBuilder {
         AuditRecordBuilder {
             record: AuditRecord {
-                actor_kind: PrincipalKind::Anonymous.as_str().to_string(),
+                // There is no principal here: nothing the caller presented
+                // resolved to one. "unknown" is not a kind of caller the
+                // identity model admits - it is the absence of one, which is
+                // what a refusal always is.
+                actor_kind: "unknown".to_string(),
                 actor_account: None,
                 actor_credential: None,
                 action: String::new(),
@@ -406,7 +410,7 @@ impl AuditStore {
             record.method,
             record.app_id.as_deref().unwrap_or("-"),
             record.environment.as_deref().unwrap_or("-"),
-            record.actor_account.as_deref().unwrap_or("anonymous"),
+            record.actor_account.as_deref().unwrap_or("unknown"),
             record.outcome.as_str(),
             record.status
         );
@@ -577,6 +581,7 @@ mod tests {
     }
 
     fn alice() -> Principal {
+        use crate::identity::PrincipalKind;
         Principal {
             kind: PrincipalKind::Account,
             account: Some("alice".to_string()),
@@ -740,7 +745,7 @@ mod tests {
         .items;
         assert_eq!(refusals.len(), 1);
         assert_eq!(refusals[0].target.as_deref(), Some("TOKEN"));
-        assert_eq!(refusals[0].actor_kind, "anonymous");
+        assert_eq!(refusals[0].actor_kind, "unknown");
         assert_eq!(
             refusals[0].detail.as_deref(),
             Some("no credential was presented")

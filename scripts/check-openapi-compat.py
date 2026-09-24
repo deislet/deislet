@@ -776,19 +776,20 @@ def self_check() -> None:
 # file still sets `node_preshared_keys` refuses to start - so "which of the
 # fleet's keys did this node prove" has no answer to report. Restoring the
 # members is not available; they would have to be filled with something
-# untrue. Removing a response property is refused on principle, so each
-# removal is named here in full: an entry that does not match a reported
-# change exactly does nothing, and a removal that is not listed is still
-# refused.
+# untrue. The same holds for the flat configuration-file API key: its
+# origin, `config`, is no longer a value the platform can answer with, so
+# the enum loses it. Removing a response property, or a value a response
+# enum may take, is refused on principle, so each removal is named here in
+# full: an entry that does not match a reported change exactly does
+# nothing, and a removal that is not listed is still refused.
 #
 # The list is meant to be emptied rather than grown. Once these are on
 # `origin/main` the baseline carries them and the comparison stops reporting
 # them, which the run says so that the entries can be deleted.
 PRERELEASE_CORRECTIONS = frozenset(
     {
-        "GET /api/platform/runtime 200 application/json.nodes[].allOf[1]: "
-        f"response property {member} removed"
-        for member in ["key_fingerprint", "key_status"]
+        "POST /api/v1/accounts/{account}/tokens 200 application/json.token.origin: "
+        "enum values removed: ['config']",
     }
 )
 

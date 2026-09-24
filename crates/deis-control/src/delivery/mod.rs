@@ -27,8 +27,8 @@
 //! * the answer to `GET /api/nodes/:id/assignments`, which a node that
 //!   restarts uses to come back with the environment it had.
 //!
-//! Both therefore authenticate the caller as a node - the assignment list
-//! through `api::middleware::node_auth`, whatever `api_auth_enabled` says.
+//! Both are served on the machine channel only: a caller proves a certificate
+//! there and may only ask for its own environment.
 //! No other read API returns a value: the dashboard and the CLI can write
 //! and delete a secret and list its name, never read it back
 //! (docs/architecture.zh.md section 8).

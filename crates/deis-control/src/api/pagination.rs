@@ -236,10 +236,14 @@ mod tests {
     /// control plane runs on - the shape `api::tests` builds, so these two
     /// refusals are asserted on the same mounts a client meets.
     async fn get(uri: &str) -> (StatusCode, Value) {
-        let (router, _dir) = crate::api::tests::full_router().await;
+        let (router, _dir, secret) = crate::api::tests::full_router().await;
         let mut request = Request::builder()
             .method("GET")
             .uri(uri)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {secret}"),
+            )
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(

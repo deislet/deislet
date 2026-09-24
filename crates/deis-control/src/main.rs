@@ -23,6 +23,26 @@ struct Opts {
     /// answer that was wanted.
     #[structopt(long)]
     check_config: bool,
+    #[structopt(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(StructOpt, Debug)]
+enum Command {
+    /// Install a bootstrap credential the operator generated offline, for a
+    /// headless install that cannot read a file the control plane wrote.
+    ///
+    /// The token string must be well formed (`deis_pat_<16 hex>_<64 hex>`);
+    /// its id and secret hash are stored, the value itself nowhere. It
+    /// expires 24 hours after it is installed if never used, and installing
+    /// a new one stops the previous one - there is one way in, and it is the
+    /// one just installed. The control plane must not be running: this opens
+    /// the same SQLite database by itself.
+    Bootstrap {
+        /// A file holding the token string and nothing else.
+        #[structopt(long, parse(from_os_str))]
+        token_file: PathBuf,
+    },
 }
 
 /// Initialize logging system
@@ -79,6 +99,26 @@ async fn main() -> Result<(), anyhow::Error> {
     init_logging();
 
     let opts = Opts::from_args();
+    init_logging();
+
+    if let Some(Command::Bootstrap { token_file }) = &opts.command {
+        let secret = std::fs::read_to_string(token_file)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", token_file.display()))?
+            .trim()
+            .to_string();
+        let database = Arc::new(deis_control::Database::init(&opts.database).await?);
+        let identity = deis_control::IdentityStore::new(database);
+        let id = identity
+            .install_preset_bootstrap_token(&secret)
+            .await
+            .map_err(|e| anyhow::anyhow!("the bootstrap token was not installed: {e}"))?;
+        info!(
+            token = %id,
+            "Installed the preset bootstrap credential; it expires 24 hours from now if never used, and any previous bootstrap credential has stopped working"
+        );
+        return Ok(());
+    }
+
     info!("Starting Control v{}", deis_control::VERSION);
 
     let mut config = deis_control::ControlConfig::default();
@@ -115,11 +155,12 @@ async fn main() -> Result<(), anyhow::Error> {
             )
         })?;
         println!(
-            "configuration is usable: port {}, machine channel {}:{}, api auth {}",
+            "configuration is usable: port {}, machine channel {}:{}, human API authenticated \
+             (bootstrap credential written to {} on a first start with no live token)",
             config.port,
             machine.bind_addr,
             machine.port,
-            if config.api_auth_enabled { "on" } else { "off" }
+            config.data_dir.join("bootstrap.token").display()
         );
         return Ok(());
     }
@@ -331,17 +372,14 @@ async fn main() -> Result<(), anyhow::Error> {
             deis_control::api::static_files::serve_fallback,
         ));
 
-    // Before the listener opens: record the configured api_keys so an
-    // operator can see which of their credentials are unscoped, mint a first
-    // owner token if this control plane demands authentication and has none,
-    // and say what the audit log already holds.
+    // Before the listener opens: mint a one-time bootstrap credential if
+    // this control plane has no live token, and say what the audit log
+    // already holds.
     deis_control::api::announce_authorization(&api.authz).await;
 
     deis_control::api::log_api_ready(
         port,
         api.tls_enabled,
-        api_config.api_auth_enabled,
-        api_config.api_keys.len(),
         &api.cors_origins,
         true,
         api_config.machine.is_some(),

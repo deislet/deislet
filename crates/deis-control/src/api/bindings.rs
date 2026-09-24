@@ -40,14 +40,13 @@
 //! the honest reading of what each declaration can reach, and it gives an
 //! author a way to need less authority - by writing the environment down.
 //!
-//! # When nothing is enforced
+//! # Consent is the protection, not the gate
 //!
-//! `api_auth_enabled = false` leaves every admitted caller that presents no
-//! credential anonymous and unscoped, so every demand here passes, exactly as
-//! it does in [`super::authz`]. Admission is still limited to direct local
-//! calls; the consent half is unaffected and remains the whole of the
-//! cross-application protection on such an install - which is the right half
-//! to keep, because it is the one the callee wrote.
+//! The credential gate in [`super::authz`] decides who may bind at all; what
+//! a binding may name is decided here, by the consent the callee wrote. The
+//! gate knowing a caller is entitled to read an application does not make its
+//! kind of binding readable to this control plane, and a node one release
+//! behind still cannot be talked into a kind it does not know (see below).
 //!
 //! # A binding this control plane cannot judge
 //!
@@ -333,6 +332,18 @@ mod tests {
         }
     }
 
+    /// An unscoped owner credential, which is what a fresh login ends up
+    /// holding: no scope list, so its account's role is the only limit.
+    fn unscoped_owner() -> Principal {
+        Principal {
+            kind: PrincipalKind::Account,
+            account: Some("root".to_string()),
+            role: Some(Role::Owner),
+            credential_id: Some("pub".to_string()),
+            authority: Authority::Unscoped,
+        }
+    }
+
     #[test]
     fn a_binding_kind_this_control_plane_cannot_read_is_refused_whatever_the_credential_holds() {
         // The hole this closes: `iter()` hides an entry whose kind this build
@@ -350,7 +361,7 @@ mod tests {
         for principal in [
             holding_everything(),
             scoped(&["read:other-team-api/*", "deploy:frontend/*"]),
-            Principal::anonymous(),
+            unscoped_owner(),
         ] {
             let refusal = check_service_bindings(&principal, &manifest).expect_err(
                 "a kind this control plane cannot read must be refused even by a credential that \
@@ -495,12 +506,13 @@ mod tests {
 
     #[test]
     fn an_unscoped_credential_passes_exactly_as_it_does_on_every_other_route() {
-        // The old flat key and the anonymous caller of an install with
-        // `api_auth_enabled = false`. Consent, which the callee wrote, is the
-        // whole of the protection there and is checked on the node.
+        // Consent, which the callee wrote, is the whole of the protection
+        // there and is checked on the node; the consent check itself asks
+        // only that the caller be entitled to read what it binds to, and an
+        // unscoped owner is.
         let manifest = manifest_with(r#"{"AUTH":{"kind":"service","app":"auth-api"}}"#);
         assert_eq!(
-            check_service_bindings(&Principal::anonymous(), &manifest),
+            check_service_bindings(&unscoped_owner(), &manifest),
             Ok(())
         );
     }

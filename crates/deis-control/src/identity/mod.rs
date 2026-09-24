@@ -1,7 +1,7 @@
 //! Who is calling, and what they are allowed to do.
 //!
 //! Before this module the whole authorisation model of the human API was one
-//! list of strings: `api_auth_enabled` plus `api_keys`. Every key could
+//! flat list of configured keys. Every key could
 //! deploy any application, rotate any secret, mint a storage credential for
 //! any tenant and delete anything, and nothing recorded which key did it. On
 //! a cluster hosting more than one team's applications that is "everyone with
@@ -23,13 +23,14 @@
 //! # The two credentials this does not touch
 //!
 //! Machines are admitted on the machine channel by the certificate each one
-//! proves, which names one machine and is not subject to `api_auth_enabled`:
+//! proves, which names one machine and is not part of this model:
 //! that channel hands out decrypted secrets and answers to machines, not to
 //! people, so it has no account and no scope. `storage_auth_secret` still
 //! signs the capability tokens that talk to deis-store. Three ways of being
 //! admitted, three channels, and this module is only about the third one -
 //! the people.
 
+pub mod bootstrap;
 pub mod scope;
 pub mod store;
 pub mod token;
@@ -134,9 +135,7 @@ impl fmt::Display for Role {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authority {
     /// No scope list at all: whatever the account's role permits, over every
-    /// application. This is what an `api_keys` entry from the configuration
-    /// file is, and what the bootstrap credential is - the old flat key,
-    /// preserved exactly, so an upgrade does not break a deploy pipeline.
+    /// application.
     ///
     /// It is also the thing an operator is meant to retire, which is why
     /// every place that lists credentials says out loud which ones are
@@ -169,24 +168,18 @@ impl Authority {
 pub enum PrincipalKind {
     /// A token minted by this control plane, belonging to an account.
     Account,
-    /// An `api_keys` entry from the configuration file. It has a placeholder
-    /// account so the audit log has something to name, and no scopes.
-    ConfigKey,
-    /// Nobody: `api_auth_enabled` is off, so no credential is required, and
-    /// this is what a caller who presents none is - directly connected from
-    /// the machine the control plane runs on, which is as far as that goes (see
-    /// [`crate::api::authz::authorize`]). Recorded in the audit log all the
-    /// same: a deploy nobody can be blamed for is still a deploy that
-    /// happened.
-    Anonymous,
+    /// The one-time bootstrap credential: it may only create the first owner
+    /// account and a first token for it, and it is revoked and its file
+    /// deleted after the first successful use (see
+    /// [`crate::identity::store::IdentityStore::ensure_bootstrap_token`]).
+    Bootstrap,
 }
 
 impl PrincipalKind {
     pub fn as_str(self) -> &'static str {
         match self {
             PrincipalKind::Account => "account",
-            PrincipalKind::ConfigKey => "config_key",
-            PrincipalKind::Anonymous => "anonymous",
+            PrincipalKind::Bootstrap => "bootstrap",
         }
     }
 }
@@ -196,36 +189,25 @@ impl PrincipalKind {
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub kind: PrincipalKind,
-    /// The account this credential belongs to. `None` only for
-    /// [`PrincipalKind::Anonymous`].
+    /// The account this credential belongs to. Never `None`: every caller
+    /// the gate admits presents a token, and every token belongs to an
+    /// account - including the bootstrap one.
     pub account: Option<String>,
     pub role: Option<Role>,
-    /// The public half of the token, or the fingerprint of a configured key.
-    /// Never the credential itself.
+    /// The public half of the token. Never the credential itself.
     pub credential_id: Option<String>,
     pub authority: Authority,
 }
 
 impl Principal {
-    /// The caller nobody authenticated, because nothing was required.
-    pub fn anonymous() -> Self {
-        Self {
-            kind: PrincipalKind::Anonymous,
-            account: None,
-            role: None,
-            credential_id: None,
-            authority: Authority::Unscoped,
-        }
-    }
-
     /// How a log line and an audit row name this caller. Short, stable, and
     /// carrying no part of any credential.
     pub fn label(&self) -> String {
         match (&self.account, &self.credential_id) {
             (Some(account), Some(credential)) => format!("{account} (token {credential})"),
             (Some(account), None) => account.clone(),
-            (None, Some(credential)) => format!("key {credential}"),
-            (None, None) => "anonymous".to_string(),
+            (None, Some(credential)) => format!("token {credential}"),
+            (None, None) => "an unnamed caller".to_string(),
         }
     }
 
@@ -235,7 +217,7 @@ impl Principal {
     /// ceiling and is applied even to an unscoped credential, so demoting an
     /// account narrows what its existing tokens can do at the very next
     /// request. The scope list is the token's own narrowing, and an unscoped
-    /// credential simply has none - which is the old flat key, unchanged.
+    /// credential simply has none.
     pub fn permits(&self, demand: &Demand<'_>) -> Result<(), Denial> {
         if let Some(role) = self.role
             && !role.permits(demand.verb)
@@ -310,13 +292,13 @@ mod tests {
         }
     }
 
-    /// The old flat key, preserved: no scopes means everything, exactly as
-    /// `api_keys` always behaved.
+    /// An unscoped credential is the widest thing an account can hold: no
+    /// scope list, so its account's role is the only limit.
     #[test]
-    fn an_unscoped_credential_is_the_old_flat_key() {
+    fn an_unscoped_credential_is_limited_only_by_its_role() {
         let key = Principal {
-            kind: PrincipalKind::ConfigKey,
-            account: Some("config-key".to_string()),
+            kind: PrincipalKind::Account,
+            account: Some("root".to_string()),
             role: Some(Role::Owner),
             credential_id: Some("a1b2c3d4".to_string()),
             authority: Authority::Unscoped,
@@ -329,11 +311,11 @@ mod tests {
                     environment: Selector::One("anywhere"),
                 })
                 .is_ok(),
-                "an api_keys entry must still be able to {verb}"
+                "an unscoped owner token must be able to {verb}"
             );
         }
         assert!(key.authority.is_unscoped());
-        assert_eq!(key.label(), "config-key (token a1b2c3d4)");
+        assert_eq!(key.label(), "root (token a1b2c3d4)");
     }
 
     /// The role is a ceiling over the token, not a default under it: a

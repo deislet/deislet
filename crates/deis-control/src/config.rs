@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Every configuration structure in this file refuses a file that names a
+/// field it does not know. An outdated key therefore stops this control plane
+/// at startup with a message naming the key, instead of being dropped by the
+/// deserializer without a word while the operator believes it took effect -
+/// which is the worst answer available here, and the reason no field on these
+/// structures carries special-cased refusal code any more.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     pub bind_addr: String,
     pub port: u16,
@@ -21,12 +28,18 @@ pub struct ControlConfig {
     /// interval after it goes quiet: the timeout is when the claim expires,
     /// the interval is how long it can take to be noticed.
     pub heartbeat_timeout: u64,
-    /// API Keys for HTTP API authentication (optional)
-    #[serde(default)]
-    pub api_keys: Vec<String>,
-    /// Enable API authentication (default: false for backward compatibility)
-    #[serde(default)]
-    pub api_auth_enabled: bool,
+    /// Directory holding this installation's own state, notably the
+    /// one-time [`bootstrap`] credential file written into it on a first
+    /// start.
+    ///
+    /// Should be absolute, for the same reason `bundle_dir` should be: a
+    /// relative value is anchored to this process's working directory, which
+    /// is right for the run that wrote it and wrong for the next one started
+    /// from somewhere else.
+    ///
+    /// [`bootstrap`]: crate::identity::bootstrap
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
     /// Origins a web page may read this control plane's answers from, each
     /// written in full - "https://console.example.com", scheme and port
     /// included, no trailing slash.
@@ -37,16 +50,15 @@ pub struct ControlConfig {
     /// through the vite server, so that is same-origin too. An entry is
     /// needed only for a console hosted somewhere else.
     ///
-    /// It used to be `*` - every origin, all methods, all headers - and
-    /// combined with `api_auth_enabled` defaulting to off that let any page
-    /// the operator happened to visit create an owner account on their
-    /// control plane, mint a root token, deploy, and read every answer.
+    /// It used to be `*` - every origin, all methods, all headers - and that
+    /// let any page the operator happened to visit create an owner account on
+    /// their control plane, mint a root token, deploy, and read every answer.
     /// `*` is therefore rejected if it appears here: an origin that may
     /// read the audit log has to be named.
     ///
     /// Naming an origin does not hand it authority. A page on another origin
-    /// never gets the unauthenticated admission that a caller on this
-    /// machine gets - it presents a token like any other remote caller. See
+    /// presents a token like any other remote caller - there is no
+    /// unauthenticated admission anywhere on the human API. See
     /// [`crate::api::authz::authorize`].
     #[serde(default)]
     pub api_cors_allowed_origins: Vec<String>,
@@ -326,11 +338,16 @@ fn default_bundle_dir() -> PathBuf {
     PathBuf::from("data/bundles")
 }
 
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("data")
+}
+
 fn default_backend_restore_driver_timeout_secs() -> u64 {
     900
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeNodeConfig {
     /// Stable identifier used in API paths and logs
     pub id: String,
@@ -359,6 +376,7 @@ pub struct RuntimeNodeConfig {
 /// or renews them, and the identity is re-read on a timer so a rotation needs
 /// no restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineChannelConfig {
     /// Interface to listen on. Deliberately not defaulted to `0.0.0.0`: the
     /// point of this listener is that an operator says where it is reachable
@@ -393,6 +411,7 @@ fn default_identity_reload_seconds() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Enable TLS on the port this control plane serves, which carries the
     /// REST API and the node gRPC channel together.
@@ -411,8 +430,7 @@ impl Default for ControlConfig {
             port: 8080,
             heartbeat_interval: 30,
             heartbeat_timeout: 90,
-            api_keys: Vec::new(),
-            api_auth_enabled: false,
+            data_dir: default_data_dir(),
             api_cors_allowed_origins: Vec::new(),
             tls: None,
             machine: None,
@@ -453,11 +471,7 @@ impl std::fmt::Debug for ControlConfig {
             .field("port", &self.port)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("heartbeat_timeout", &self.heartbeat_timeout)
-            .field(
-                "api_keys",
-                &format_args!("<redacted:{} configured>", self.api_keys.len()),
-            )
-            .field("api_auth_enabled", &self.api_auth_enabled)
+            .field("data_dir", &self.data_dir)
             .field("api_cors_allowed_origins", &self.api_cors_allowed_origins)
             .field("tls", &self.tls)
             .field("deis_runtime_nodes", &self.deis_runtime_nodes)
@@ -548,36 +562,7 @@ impl std::fmt::Debug for ControlConfig {
 impl ControlConfig {
     pub fn load(path: std::path::PathBuf) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)?;
-        Self::refuse_a_retired_fleet_key(&content)?;
         Ok(toml::from_str(&content)?)
-    }
-
-    /// Refuses a configuration that still carries the fleet-wide node key.
-    ///
-    /// Serde would drop the field without a word, and silence is the worst
-    /// answer available here. An operator whose file still reads
-    /// `node_preshared_keys = [...]` believes the fleet authenticates on that
-    /// value; it no longer does, and if they never wrote a
-    /// `[machine]` section then this control plane will admit no node at
-    /// all. They would see every node fail to attach with nothing in the
-    /// configuration to explain it. Refusing at startup puts the reason where
-    /// they are already looking.
-    fn refuse_a_retired_fleet_key(content: &str) -> Result<(), anyhow::Error> {
-        let carries_the_key = content.lines().any(|line| {
-            line.trim_start()
-                .trim_start_matches(['"', '\''])
-                .starts_with("node_preshared_keys")
-        });
-        if carries_the_key {
-            anyhow::bail!(
-                "this configuration sets `node_preshared_keys`, which no longer \
-                 exists: nodes and proxies now prove who they are with a \
-                 certificate rather than a shared secret. Delete the setting and \
-                 configure a `[machine]` section (bind_addr, port, certificate, \
-                 private_key, trust_root) instead - see deis-control.example.toml"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -590,44 +575,6 @@ mod tests {
     /// turns "copy and edit" into a control plane that refuses to start
     /// with a message about a missing field - and the example is exactly
     /// where nobody thinks to look.
-    /// The file people copy has to survive the refusal this same module
-    /// makes. An example that still carried the retired setting would refuse
-    /// to start the moment it was copied, and the message would send the
-    /// operator looking at their own edits for something the example brought.
-    #[test]
-    fn the_example_configuration_is_not_refused() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/deis-control.example.toml");
-        let text = std::fs::read_to_string(path).expect("the example configuration must exist");
-        ControlConfig::refuse_a_retired_fleet_key(&text)
-            .expect("the example must not carry the retired fleet key");
-    }
-
-    #[test]
-    fn a_configuration_carrying_the_retired_fleet_key_is_refused() {
-        let refusal = ControlConfig::refuse_a_retired_fleet_key(
-            "port = 8080\nnode_preshared_keys = [\"whatever\"]\n",
-        )
-        .expect_err("a configuration still setting the fleet key must be refused");
-        let said = refusal.to_string();
-        // The message has to name both halves: what is dead, and what to
-        // write instead. Naming only the dead setting leaves an operator
-        // deleting a line and starting a control plane no node can reach.
-        assert!(said.contains("node_preshared_keys"), "got: {said}");
-        assert!(said.contains("[machine]"), "got: {said}");
-    }
-
-    /// Prose about the retired setting is not the setting. Every document and
-    /// every comment explaining why the fleet key went away would otherwise
-    /// be a configuration file that refuses to load, which would teach the
-    /// opposite of what it says.
-    #[test]
-    fn a_comment_mentioning_the_retired_fleet_key_is_not_a_refusal() {
-        ControlConfig::refuse_a_retired_fleet_key(
-            "# node_preshared_keys used to be here; it is gone\nport = 8080\n",
-        )
-        .expect("a comment must not be read as the setting");
-    }
-
     #[test]
     fn the_example_configuration_parses() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/deis-control.example.toml");
@@ -635,7 +582,6 @@ mod tests {
         let config: ControlConfig = toml::from_str(&text)
             .unwrap_or_else(|e| panic!("deis-control.example.toml does not parse: {e}"));
 
-        assert!(config.api_auth_enabled);
         // The file people copy has to show the shape that survives being
         // started from another directory; a relative example is the reason
         // every uploaded version went missing on the first restart from
@@ -645,6 +591,52 @@ mod tests {
             "the example must show an absolute bundle_dir, got {}",
             config.bundle_dir.display()
         );
+        assert!(
+            config.data_dir.is_absolute(),
+            "the example must show an absolute data_dir, got {}",
+            config.data_dir.display()
+        );
     }
 
+    /// A field this build does not know is refused with a message naming it,
+    /// never dropped silently: an operator whose file still carries a setting
+    /// that has been removed has to be told at startup, not left believing it
+    /// took effect. This covers retired settings generally - there is no
+    /// per-field code for any of them.
+    #[test]
+    fn an_unknown_field_is_refused_and_named() {
+        for removed in [
+            "api_keys = [\"whatever\"]",
+            "api_auth_enabled = true",
+            "node_preshared_keys = [\"whatever\"]",
+            "no_such_setting = 1",
+        ] {
+            let refusal: Result<ControlConfig, _> =
+                toml::from_str(&format!("port = 8080\n{removed}\n"));
+            let err = refusal.expect_err("an unknown field must be refused");
+            let said = err.to_string();
+            assert!(
+                said.contains("unknown field"),
+                "the refusal has to say the field is unknown: {said}"
+            );
+            assert!(
+                said.contains(removed.split('=').next().unwrap().trim()),
+                "the refusal has to name the field: {said}"
+            );
+        }
+    }
+
+    /// A nested section is held to the same rule as the top level: an
+    /// unknown key inside `[machine]` or `[tls]` is refused too, not just an
+    /// unknown top-level key.
+    #[test]
+    fn an_unknown_field_in_a_nested_section_is_refused() {
+        let refusal: Result<ControlConfig, _> = toml::from_str(
+            "[tls]\napi_enabled = true\ncert_path = '/x'\nkey_path = '/y'\nno_such_key = 1\n",
+        );
+        assert!(
+            refusal.is_err(),
+            "an unknown field in [tls] must be refused"
+        );
+    }
 }

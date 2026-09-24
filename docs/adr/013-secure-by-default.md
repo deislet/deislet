@@ -3,7 +3,7 @@
 - 状态：Accepted
 - 日期：2026-09-03
 - 决策者：产品负责人
-- 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-012
+- 关联：`../archive/phase-analysis-2026-09-03.zh.md` DEC-012
 - 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 背景
@@ -241,16 +241,6 @@ Production `/ready` 或 control status 至少检查：
 
 Audit event 带 actor、subject、action、resource、result、request/operation ID、time 和来源。Production audit sink 写失败时，高风险管理操作 fail closed。
 
-## 旧安装迁移
-
-1. 启动时检测 `api_auth_enabled=false`、共享 node token 和未分离 listener。
-2. 输出结构化迁移报告，不继续静默兼容。
-3. 提供命令生成管理员、内部 CA、每节点 enrollment 和新 credentials。
-4. 支持短期双凭证窗口完成滚动迁移。
-5. 记录 legacy credential 最后使用者和时间。
-6. 完成后撤销 shared token、启用 readiness enforcement。
-7. 明确版本后删除 legacy bypass；延期必须有显式危险确认和醒目标记。
-
 ## 测试
 
 - Production defaults 无配置时不能以 insecure-ready 启动。
@@ -264,13 +254,10 @@ Audit event 带 actor、subject、action、resource、result、request/operation
 - Secret/credential 不进入 logs、audit、argv、artifact、crash dump。
 - Envelope key rotate/backup/restore。
 - Audit fail-closed for sensitive operations。
-- Legacy migration and final removal。
 - Proxy auth、SSRF、DNS rebinding、redirect、WebSocket egress regressions。
 
 ## 后果
 
-- `api_auth_enabled=false` 不再是 production 默认值。
-- 现有 fleet shared credential、proxy 权限和 assignment secret 传递需要重构。
+- Credential 不再出现在配置文件里；首次初始化走一次性 bootstrap credential（见「首次初始化与 Bootstrap」）。
 - Control identity/RBAC、internal CA/cert rotation、secret envelope 和 readiness 成为产品级子系统。
 - Dev flow 需要显式、易用的一键启动，避免安全默认损害本地体验。
-- 旧部署需要受控迁移期，但不无限维持不安全行为。

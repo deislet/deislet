@@ -277,16 +277,10 @@ impl IdentityMigrationCoordinator {
                     .to_string(),
             ));
         }
-        if config
-            .api_keys
-            .iter()
-            .any(|secret| distinct_tokens.contains(secret.as_str()))
-        {
-            return Err(MigrationCoordinatorError::Configuration(
-                "migration administrator credentials must not reuse a human API credential"
-                    .to_string(),
-            ));
-        }
+        // Human API credentials live in the database now, hashed, so this
+        // check has nothing left to compare against: no configuration field
+        // can name a live token, and a token an operator fears reusing is
+        // revoked rather than listed anywhere here.
 
         Ok(Self {
             catalog,

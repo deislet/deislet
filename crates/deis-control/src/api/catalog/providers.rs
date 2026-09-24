@@ -2831,8 +2831,8 @@ pub(crate) mod tests {
         .unwrap();
         let mut state = harness.state.clone();
         state.provider_driver_dispatcher = Some(Arc::new(dispatcher));
-        let router =
-            crate::api::catalog::router("/api", state).layer(Extension(Principal::anonymous()));
+        let router = crate::api::catalog::router("/api", state)
+            .layer(Extension(crate::api::catalog::tests::admitted_principal()));
         (harness, router)
     }
 
@@ -3731,12 +3731,12 @@ pub(crate) mod tests {
     }
 
     /// The versioned mount as the router builds it: the product routes
-    /// nested under `/api/v1`, an anonymous principal where the gate would
+    /// nested under `/api/v1`, an admitted principal where the gate would
     /// have left one, and the request context that names the surface.
     fn v1_router(state: &CatalogState) -> axum::Router {
         axum::Router::new()
             .nest("/api/v1", crate::api::catalog::router("", state.clone()))
-            .layer(Extension(Principal::anonymous()))
+            .layer(Extension(crate::api::catalog::tests::admitted_principal()))
             .layer(axum::middleware::from_fn_with_state(
                 crate::api::versioning::ApiSurface::V1,
                 crate::api::versioning::attach_request_context,
@@ -3796,7 +3796,8 @@ pub(crate) mod tests {
     async fn a_mutation_without_a_key_says_idempotency_key_required_on_v1() {
         use axum::extract::ConnectInfo;
 
-        let (router, _dir) = crate::api::tests::full_router().await;
+        let (router, _dir, secret) = crate::api::tests::full_router().await;
+        let secret = &secret;
         let body = json!({
             "backendId": "cloudflare-workers-pages",
             "name": "production",
@@ -3807,6 +3808,10 @@ pub(crate) mod tests {
             let body = body.clone();
             async move {
                 let mut request = json_request_without_key(Method::POST, uri, body);
+                request.headers_mut().insert(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {secret}").parse().unwrap(),
+                );
                 request.extensions_mut().insert(ConnectInfo(
                     "127.0.0.1:40000".parse::<std::net::SocketAddr>().unwrap(),
                 ));

@@ -21,10 +21,9 @@
 //! exact environment: `storage:myapp/production` reaches it and
 //! `storage:myapp/*` cannot be written down at all. A credential carrying
 //! `deploy:*/*` is refused here. The one credential that still gets through
-//! without naming the tenant is an unscoped one - a configuration-file
-//! `api_keys` entry, or the bootstrap token - because those are root by
-//! definition and are exactly what the scope model asks an operator to
-//! retire.
+//! without naming the tenant is an unscoped one - what a first login mints -
+//! because it is root by definition and is exactly what the scope model asks
+//! an operator to retire.
 //!
 //! Every mint is recorded in the audit log whatever its outcome, because what
 //! it hands back is a credential; see [`crate::api::authz`].
