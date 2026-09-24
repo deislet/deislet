@@ -93,6 +93,20 @@ jobs:
       - name: Node-facing paths are referenced, not restated
         run: ./scripts/check-doc-path-literals.sh
 
+  document-links:
+    name: documents link at files that exist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Fails when a relative Markdown link points at a file that does not
+      # exist, across every maintained document. docs/archive/ is exempt (its
+      # internal links are frozen history), but links from maintained
+      # documents into it are checked, so archived files cannot be renamed or
+      # deleted again without breaking the build.
+      - name: Relative Markdown link targets exist
+        run: ./scripts/check-doc-links.sh
+
   demo-witnesses:
     name: the demo's own witnesses hold
     runs-on: ubuntu-latest

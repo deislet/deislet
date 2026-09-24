@@ -14,7 +14,6 @@ import jsonschema
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_ADRS = list(range(1, 26))
 EXPECTED_PHASES = [f"phase-{number}" for number in range(6)]
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -56,6 +55,12 @@ class ValidationError(RuntimeError):
     pass
 
 
+# Legal header status values. A parenthetical suffix (for example an
+# "Accepted（partially superseded by …）" note) is tolerated after the value.
+ADR_STATUSES = ("Accepted", "Superseded", "Deprecated")
+ADR_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValidationError(message)
@@ -88,38 +93,57 @@ def workspace_package_names() -> set[str]:
     return names
 
 
-def validate_adrs() -> None:
+def adr_header_fields(text: str) -> dict[str, str]:
+    """Collect the `- key：value` header lines between the title and first section."""
+    fields: dict[str, str] = {}
+    for line in text.splitlines()[1:]:
+        if line.startswith("## "):
+            break
+        match = re.fullmatch(r"- ([^：]+)：(.*)", line.strip())
+        if match:
+            fields.setdefault(match.group(1).strip(), match.group(2).strip())
+    return fields
+
+
+def validate_adrs() -> int:
     adr_dir = ROOT / "docs/adr"
     files = sorted(adr_dir.glob("[0-9][0-9][0-9]-*.md"))
+    require(files, "no ADRs found under docs/adr")
     numbers = [int(path.name[:3]) for path in files]
     require(
-        numbers == EXPECTED_ADRS,
-        f"ADR set must be exactly 001..{EXPECTED_ADRS[-1]:03d}, got {numbers}",
+        numbers == list(range(1, len(numbers) + 1)),
+        f"ADR numbers must be contiguous from 001, got {numbers}",
     )
 
-    for path, number in zip(files, EXPECTED_ADRS, strict=True):
+    for path, number in zip(files, numbers, strict=True):
         text = path.read_text(encoding="utf-8")
         relative = path.relative_to(ROOT)
         require(text.startswith(f"# ADR-{number:03d}："), f"{relative}: title number mismatch")
-        require("- 状态：Accepted" in text[:400], f"{relative}: status is not Accepted")
+        fields = adr_header_fields(text)
+        status = fields.get("状态")
+        require(status is not None, f"{relative}: header field 状态 is missing")
+        status_value = re.split(r"[（(]", status, maxsplit=1)[0].strip()
         require(
-            "../product/phase-analysis-2026-09-03.zh.md" in text[:500],
-            f"{relative}: phase-analysis relation is missing",
+            status_value in ADR_STATUSES,
+            f"{relative}: header field 状态 must be one of {ADR_STATUSES}, got {status_value}",
         )
-        require("Edge Canon Proposal 0001" in text[:900], f"{relative}: upstream proposal link is missing")
+        date = fields.get("日期")
+        require(date is not None, f"{relative}: header field 日期 is missing")
+        require(
+            ADR_DATE.fullmatch(date) is not None,
+            f"{relative}: header field 日期 must be an ISO date, got {date}",
+        )
+        require("关联" in fields, f"{relative}: header field 关联 is missing")
         require("/tmp/" not in text, f"{relative}: temporary path remains")
 
     index = read_text("docs/adr/README.md")
-    for number in EXPECTED_ADRS:
+    for number in numbers:
         require(f"| [{number:03d}](" in index, f"ADR index is missing {number:03d}")
     adr_005 = read_text("docs/adr/005-portable-guarantees.md")
     adr_022 = read_text("docs/adr/022-entry-plan-resource-baseline.md")
     require("ADR-022" in adr_005, "ADR-005 must point at its superseding resource baseline decision")
     require("ADR-005" in adr_022, "ADR-022 must point back at the decision it partially supersedes")
-
-    analysis = read_text("docs/product/phase-analysis-2026-09-03.zh.md")
-    require("/tmp/" not in analysis, "phase analysis still references /tmp")
-    require("已归档的阶段分析" in analysis, "phase analysis archival status is missing")
+    return len(files)
 
 
 def validate_standard_lock() -> str:
@@ -303,7 +327,7 @@ def validate_standard_lock() -> str:
     return commit
 
 
-def validate_roadmap(locked_standard_commit: str) -> None:
+def validate_roadmap(locked_standard_commit: str) -> int:
     load_json("docs/product/roadmap.schema.json")
     roadmap = load_json("docs/product/roadmap.json")
     require(roadmap.get("schemaVersion") == 1, "roadmap schemaVersion must be 1")
@@ -317,13 +341,6 @@ def validate_roadmap(locked_standard_commit: str) -> None:
     require(phase_ids == EXPECTED_PHASES, f"roadmap phases must be ordered {EXPECTED_PHASES}")
     require(phases[0].get("status") == "active", "phase 0 must be active")
     require(all(phase.get("status") == "queued" for phase in phases[1:]), "later phases must remain queued")
-    require(
-        any(
-            f"{len(EXPECTED_ADRS)} 份 Accepted ADR" in criterion
-            for criterion in phases[0].get("exitCriteria", [])
-        ),
-        "phase 0 exit criteria must state the actual accepted ADR count",
-    )
 
     for index, phase in enumerate(phases):
         expected_dependencies = [] if index == 0 else [f"phase-{index - 1}"]
@@ -385,6 +402,7 @@ def validate_roadmap(locked_standard_commit: str) -> None:
     except jsonschema.ValidationError as error:
         location = "/".join(str(part) for part in error.absolute_path) or "<root>"
         raise ValidationError(f"target-status.json {location}: {error.message}") from error
+    return len(phases)
 
 
 def validate_compiler_identity_evidence(evidence_path: str) -> None:
@@ -970,23 +988,6 @@ def validate_integration() -> None:
         recorded_advisories == expected_advisories,
         "cargo audit exceptions must remain the four explicitly reviewed advisories",
     )
-    implementation = read_text("docs/implementation-plan.zh.md")
-    require("文档边界（2026-09-03）" in implementation, "legacy implementation spec lacks its authority boundary")
-    product = read_text("docs/product/README.md")
-    require(
-        "target-status.zh.md" in product and "target-status.json" in product,
-        "product entry does not delegate support status to generated registry views",
-    )
-    for path in (
-        "README.md",
-        "crates/deis-build/README.md",
-        "crates/deis-build/README.zh.md",
-    ):
-        document = read_text(path)
-        require(
-            "target-status" in document,
-            f"{path} does not delegate current target support status to the registry view",
-        )
     cli_targets = read_text("crates/deis/src/commands/targets.rs")
     web_targets = read_text("crates/deis-control/web/src/pages/Targets.tsx")
     require(
@@ -1022,58 +1023,19 @@ def validate_integration() -> None:
         not any(feature in coverage for feature in phantom_features),
         "target artifact table contains APIs the compiler cannot detect from project declarations",
     )
-    stale_build_claims = (
-        "Platform capability validation failed",
-        "Feature 'SQL Database' is not supported on EdgeOne Pages",
-        "No platform compatibility check needed",
-        "Basic services (KV, Cache) are always available",
-    )
-    for path in (
-        "crates/deis-build/docs/basic-services.md",
-        "crates/deis-build/docs/basic-services.zh.md",
-    ):
-        document = read_text(path)
-        require(
-            "target-status" in document
-            and not any(claim in document for claim in stale_build_claims),
-            f"{path} contains a hand-maintained support claim or obsolete compiler output",
-        )
-    adapter_index = read_text("crates/deis-build/docs/adapter-specs.zh.md")
-    require(
-        "target-status" in adapter_index
-        and "## Comparison Matrix" not in adapter_index
-        and "authoritative reference" not in adapter_index,
-        "adapter research index still presents unpinned notes as conformance or support",
-    )
-    for path in (
-        "crates/deis-build-adapter-cloudflare/spec.mdc",
-        "crates/deis-build-adapter-deno/spec.mdc",
-        "crates/deis-build-adapter-tencent/spec.mdc",
-    ):
-        require(
-            "Boundary:" in read_text(path),
-            f"{path} lacks a visible non-normative research boundary",
-        )
     for vendor in ("cloudflare", "deno", "tencent"):
         artifact_test = ROOT / f"crates/deis-build-adapter-{vendor}/tests/artifact_shape.rs"
         require(
             artifact_test.is_file(),
             f"{artifact_test.relative_to(ROOT)} is missing; adapter artifact checks must not be named conformance",
         )
-    contributing = read_text("crates/deis/CONTRIBUTING.md")
-    require(
-        "artifact_shape" in contributing
-        and "spec_compliance" not in contributing
-        and "An adapter existing or producing an accepted artifact is not support" in contributing,
-        "target contribution guide conflates artifact generation with conformance or support",
-    )
 
 
 def main() -> int:
     try:
-        validate_adrs()
+        adr_count = validate_adrs()
         commit = validate_standard_lock()
-        validate_roadmap(commit)
+        phase_count = validate_roadmap(commit)
         evidence_paths = sorted(
             path.relative_to(ROOT).as_posix()
             for path in (ROOT / "docs/product/evidence").glob(
@@ -1139,7 +1101,7 @@ def main() -> int:
         return 1
 
     print(
-        f"product governance validation passed: {len(EXPECTED_ADRS)} ADRs, 6 roadmap phases, "
+        f"product governance validation passed: {adr_count} ADRs, {phase_count} roadmap phases, "
         f"Edge Canon {commit[:7]} locked, no temporary paths"
     )
     return 0

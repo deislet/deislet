@@ -1,5 +1,7 @@
 # Deislet 阶段性全系统分析与产品化问题台账
 
+> 状态：历史记录，不再维护。本文是 2026-09-03 审查批次的事实基线与决策审计记录；当前进展以 `docs/product/roadmap.json` 和各 ADR 为准。
+
 - 日期：2026-09-03
 - 仓库：`/ext/deislet/deislet`
 - 基线分支：`main`

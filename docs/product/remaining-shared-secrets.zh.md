@@ -1,7 +1,7 @@
 # 机器通道迁移之后仍然存在的共享密钥
 
 > 状态：待办清单，不是决策记录。决策见 [ADR-025](../adr/025-machine-identity-and-capabilities.md)，
-> 本轮的实施过程见[阶段分析](phase-analysis-2026-09-03.zh.md)。
+> 本轮的实施过程见[阶段分析](../archive/phase-analysis-2026-09-03.zh.md)。
 
 ## 这份文档为什么存在
 

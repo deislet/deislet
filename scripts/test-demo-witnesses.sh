@@ -281,7 +281,7 @@ dead_port_probe() {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
     echo 'APP_ID=demo'
-    echo 'API_KEY=irrelevant'
+    echo 'OPERATOR_TOKEN=irrelevant'
     echo 'DEIS_RUNTIME_PORT=9'
     echo 'DEIS_PROXY_PORT=9'
     echo 'DEIS_CONTROL_PORT=9'
@@ -1571,18 +1571,20 @@ else
 fi
 
 # ----------------------------------------------------------------------
-# 17. The other two three-probe checks say no for each probe on its own
+# 17. A three-probe check says no for each probe on its own
 # ----------------------------------------------------------------------
 #
 # Section 12's lesson generalises: `check_queue_capability_token` asks
-# deis-queue three things (no token, a wrong token, the real one) and
-# `check_the_node_management_plane_needs_the_node_key` asks a node three (no
-# credential, a wrong one, and the trigger service with none) plus the real
-# key. Neither had a witness at all, so a comparison dropped from either
-# would go unnoticed for the same reason. Each is run here against a stand-in
-# that admits exactly one of the callers it must refuse, and once against one
-# that refuses even the real credential, which is not a gate but an outage
-# and must not pass either.
+# deis-queue three things (no token, a wrong token, the real one). It had no
+# witness at all, so a comparison dropped from it would go unnoticed for the
+# same reason. It is run here against a stand-in that admits exactly one of
+# the callers it must refuse, and once against one that refuses even the real
+# credential, which is not a gate but an outage and must not pass either.
+#
+# The node-management counterpart this section used to witness was deleted
+# along with the fleet-shared node key it policed; the machine channel that
+# replaced it is driven over mTLS and has no key-string comparisons left to
+# stand in for.
 
 # The queue. `grpcurl` and `storage_token` are the two doors; `command -v`
 # is answered too, because the machine running this file need not have
@@ -1670,120 +1672,7 @@ else
     "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
 fi
 
-# The node. There are now two doors to hold the check to, and they fail in
-# opposite directions, so each stand-in below opens exactly one of them and the
-# check has to notice.
-#
-# `node_grpc_status` is the plaintext management plane on the node's data port.
-# With no node key configured anywhere in this fleet, every call there is
-# refused with grpc-status 14 (UNAVAILABLE) - the node cannot tell its control
-# plane from anyone else, so it serves neither. The interesting stand-ins are
-# the ones where it serves somebody: a node left unauthenticated, or one that
-# still honours the fleet secret this demo retired.
-#
-# `curl` is stubbed for the one call the check makes directly: a plaintext gRPC
-# request at `[machine_identity] management_listen`. A caller that cannot prove
-# the control plane's name never completes a handshake there, so curl comes
-# back non-zero with no HTTP response at all; the stand-in that answers it is a
-# node whose authenticated plane is not authenticating.
-#
-# `app_request` and `control_api` are the two that confirm nothing was unloaded
-# and the platform still works, and both answer as a healthy node's would, so
-# the verdict rests on the probes alone.
-#
-# $1 says what the stand-in node opens: shut (nothing - the state this fleet is
-# in), everyone, none (no credential on GetStatus), wrong (a wrong credential),
-# key (the retired fleet secret), trigger (OnScheduled with no credential), or
-# plaintext (the mutually authenticated plane answering a plaintext call).
-node_plane_probe() {
-  local serves=$1
-  local probe="${WORK_DIR}/node-plane-${serves}.sh"
-  {
-    echo '#!/usr/bin/env bash'
-    echo 'set -euo pipefail'
-    echo 'CHECKS_PASSED=0'
-    echo 'CHECKS_FAILED=0'
-    echo 'VERIFY_CLAIMS=""'
-    printf 'LOG_DIR=%q\n' "$WORK_DIR"
-    echo 'APP_ID=demo'
-    echo 'NODE_ID=deis-runtime-demo-01'
-    echo 'SECRET=the-retired-fleet-key'
-    echo 'DEIS_RUNTIME_PORT=8086'
-    echo 'DEIS_RUNTIME_MACHINE_PORT=8097'
-    printf 'SERVES=%q\n' "$serves"
-    definition_of pass_check
-    definition_of fail_check
-    definition_of http_status
-    cat <<'STUB'
-# Prints the grpc-status header the node answered with, or nothing when the
-# call was served (a served call carries its status in the trailers).
-node_grpc_status() {
-  local path=$1 credential=$2
-  local caller
-  case "${path}|${credential}" in
-    *OnScheduled*"|") caller=trigger ;;
-    *"|") caller=none ;;
-    *"|the-retired-fleet-key") caller=key ;;
-    *) caller=wrong ;;
-  esac
-  local served=no
-  case "$SERVES" in
-    everyone) served=yes ;;
-    none|wrong|key|trigger) [ "$caller" = "$SERVES" ] && served=yes ;;
-    *) served=no ;;
-  esac
-  if [ "$served" = "yes" ]; then printf ''; else printf '14'; fi
-}
-# The only curl the check makes itself: a plaintext call at the mutually
-# authenticated plane. Non-zero means no connection, which is the answer a
-# listener that demands a certificate gives.
-curl() {
-  if [ "$SERVES" = "plaintext" ]; then return 0; fi
-  return 52
-}
-app_request() { printf 'HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n' > "$1"; }
-control_api() { printf '{"nodes":[{"id":"%s","healthy":true}]}' "$NODE_ID"; }
-STUB
-    definition_of check_the_node_management_plane_needs_the_node_key
-    echo 'check_the_node_management_plane_needs_the_node_key'
-    echo 'echo "verdicts: ${CHECKS_PASSED} passed ${CHECKS_FAILED} failed"'
-  } > "$probe"
-  bash "$probe" 2>&1
-}
 
-# $1 what the node opens; $2 what the check's report must say about it.
-# A served call has no header status, which the check prints as "none".
-node_plane_case() {
-  local serves=$1 phrase=$2
-  local name="the node-management check fails when the node serves the ${serves} caller"
-  [ "$serves" = "plaintext" ] \
-    && name="the node-management check fails when the mutually authenticated plane answers a plaintext call"
-  local out
-  out=$(node_plane_probe "$serves")
-  if [ "${out#*verdicts: 0 passed 1 failed}" != "$out" ] && [ "${out#*"$phrase"}" != "$out" ]; then
-    pass "$name"
-  else
-    fail "$name" \
-      "wanted a failure saying \"${phrase}\"; it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 400)"
-  fi
-}
-
-node_plane_case everyone 'expected grpc-status 14 with no credential (got "none")'
-node_plane_case none 'expected grpc-status 14 with no credential (got "none"), with a wrong one (got "14")'
-node_plane_case wrong 'with a wrong one (got "none"), on OnScheduled (got "14")'
-node_plane_case trigger 'on OnScheduled (got "none") and with the retired fleet secret (got "14")'
-# The one that matters most: a node that still honours the value this demo
-# stopped configuring. Nothing else in the run would notice it.
-node_plane_case key 'and with the retired fleet secret (got "none")'
-node_plane_case plaintext 'to be refused at the handshake (curl exited 0, expected non-zero)'
-
-out=$(node_plane_probe shut)
-if [ "${out#*verdicts: 1 passed 0 failed}" != "$out" ]; then
-  pass "the node-management check passes when the plaintext plane serves nobody and the authenticated one refuses a plaintext caller"
-else
-  fail "the node-management check passes when the plaintext plane serves nobody and the authenticated one refuses a plaintext caller" \
-    "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 400)"
-fi
 
 # ----------------------------------------------------------------------
 # 18. A streaming CLI that dies on startup costs one check, not the run
