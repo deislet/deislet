@@ -11,6 +11,7 @@ pub mod canonical_tenant;
 pub mod client;
 pub mod config;
 pub mod conventions;
+pub mod durability;
 pub mod deislet_storage_key;
 pub mod environment;
 pub mod error;

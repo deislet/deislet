@@ -8,6 +8,23 @@ use crate::config::ExecutionLimits;
 use crate::runtime::{FetchPolicy, IsolateSpec, OpMetricsSummary, RuntimePool};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+
+/// Compare two credentials in time that does not depend on how many leading
+/// bytes matched. The length is allowed to leak - it is a property of the
+/// format, not of the secret - but nothing else is. An empty expected value
+/// is never a match: the caller checks that first, so an unconfigured token
+/// closes the door rather than opening it.
+fn constant_time_eq(expected: &str, presented: &str) -> bool {
+    let (expected, presented) = (expected.as_bytes(), presented.as_bytes());
+    if expected.len() != presented.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(presented)
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -1243,17 +1260,19 @@ impl ApplicationManager {
     /// right hands an attacker the token one byte at a time. It is the same
     /// rule and the same function the storage token is checked with; a second
     /// spelling of it here would be a second place to get it wrong. An empty
-    /// stored token never matches, which is what the helper's own emptiness
-    /// check is for.
+    /// stored token never matches, which is the same rule the storage token
+    /// is checked with.
     ///
-    /// [`deis_wire::conventions::secret_matches`] is the last constant-time
-    /// comparison left in the platform's own plumbing, and it stayed when the
-    /// fleet-wide node key went, because this token is a different thing: it
-    /// is minted by this node for one attach, held in memory, and expires.
+    /// The comparison is constant-time because this token is presented over
+    /// the node's public port, and a comparison whose duration reports how
+    /// many leading bytes were right hands an attacker the token one byte at
+    /// a time. It is written inline rather than pulled from a helper: the
+    /// token is minted by this node for one attach, held in memory, and
+    /// expires, so it shares no code with any fleet-wide credential.
     pub fn validate_inspect_token(&self, key: &AppKey, token: &str) -> bool {
         if let Some(entry) = self.inspect_sessions.get(key) {
             let (stored_token, expires_at) = entry.value();
-            if deis_wire::conventions::secret_matches(stored_token, token)
+            if !stored_token.is_empty() && constant_time_eq(stored_token, token)
                 && SystemTime::now() < *expires_at
             {
                 return true;
