@@ -207,14 +207,19 @@ export async function onRequest(context) {{
 }
 
 fn node_function_route_config(routes: &[(String, String)]) -> anyhow::Result<serde_json::Value> {
-    let routes = routes
+    let mut route_entries = routes
         .iter()
         .map(|(route, _)| {
             let (src, dest) = route_to_build_output(route)?;
             Ok(serde_json::json!({"src": src, "dest": dest}))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(serde_json::json!({"version": 3, "routes": routes}))
+    // The filesystem boundary tells EdgeOne: function routes above
+    // this consume matching requests; everything else falls through
+    // to static file serving.  Without it, a catch-all like ^/(.*)$
+    // claims every path and no static file is ever reachable.
+    route_entries.push(serde_json::json!({"handle": "filesystem"}));
+    Ok(serde_json::json!({"version": 3, "routes": route_entries}))
 }
 
 fn route_to_build_output(route: &str) -> anyhow::Result<(String, String)> {
