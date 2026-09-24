@@ -24,6 +24,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -176,6 +177,10 @@ pub struct RuntimeConfig {
     /// Where an application's `fetch()` is allowed to go.
     #[serde(default)]
     pub fetch: FetchConfig,
+
+    /// What this node says about its own reachability.
+    #[serde(default)]
+    pub node: NodeConfig,
 }
 
 fn default_http_port() -> u16 {
@@ -228,8 +233,32 @@ impl Default for RuntimeConfig {
             bundles: BundleConfig::default(),
             assets: AssetsConfig::default(),
             fetch: FetchConfig::default(),
+            node: NodeConfig::default(),
         }
     }
+}
+
+/// What this node says about its own reachability, as a member of the fleet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NodeConfig {
+    /// Addresses that route to this node but are not on its interfaces.
+    ///
+    /// The node's own data port is refused to applications under every
+    /// address the machine can be reached at: loopback by construction, and
+    /// every interface address by enumeration at startup. An address that
+    /// only exists outside the machine -- a public IP a cloud provider 1:1
+    /// NATs onto this node, with hairpin routing -- cannot be enumerated and
+    /// has to be stated here. Without it, a worker that can name that address
+    /// can reach the data port on it and invoke another tenant's application
+    /// by writing its own `x-deis-app-id` header.
+    ///
+    /// The enumeration is a startup snapshot: interfaces that appear or
+    /// change while the node runs (DHCP renewals, hot-plugged NICs) are not
+    /// picked up, which is why an operator who knows their addresses route
+    /// oddly lists them here. The real fix is authentication on the data
+    /// port itself; this section is the stopgap until then.
+    #[serde(default)]
+    pub advertised_addresses: Vec<IpAddr>,
 }
 
 /// Reaching the control plane.
@@ -1108,6 +1137,24 @@ impl RuntimeConfig {
                 "DEIS_RUNTIME_LOGGING_MAX_PENDING_ENTRIES",
                 "a count",
             )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_NODE_ADVERTISED_ADDRESSES") {
+            // Comma-separated, because that is what an environment variable
+            // can carry; the TOML form is a list.
+            self.node.advertised_addresses = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| {
+                    entry.parse::<IpAddr>().map_err(|e| {
+                        anyhow!(
+                            "DEIS_RUNTIME_NODE_ADVERTISED_ADDRESSES contains {entry:?}, which \
+                             is not an IP address: {e}"
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
         }
 
         if let Some(value) = env_var("DEIS_RUNTIME_CONTROL_ENDPOINT") {
@@ -2010,6 +2057,75 @@ mod tests {
         config
             .validate()
             .expect("both of those are shapes the policy accepts");
+    }
+
+    #[test]
+    fn advertised_addresses_are_read_from_the_node_table_and_default_to_empty() {
+        // The node's own data port is refused under every interface address
+        // by enumeration; this section is for the addresses only the
+        // operator knows -- the public IP a cloud 1:1 NAT maps onto this
+        // node. Absent section, no addresses.
+        let config: RuntimeConfig = toml::from_str("http_port = 9000").unwrap();
+        assert!(config.node.advertised_addresses.is_empty());
+
+        let toml_str = r#"
+            [node]
+            advertised_addresses = ["203.0.113.7", "2001:db8::10"]
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.node.advertised_addresses,
+            ["203.0.113.7", "2001:db8::10"]
+                .map(|a| a.parse::<IpAddr>().unwrap())
+        );
+        config
+            .validate()
+            .expect("a list of IP addresses is a valid configuration");
+    }
+
+    #[test]
+    fn an_advertised_address_that_is_not_an_ip_address_fails_the_parse() {
+        // serde refuses it here rather than the policy discovering it per
+        // request, which is the same rule every other setting in this file
+        // follows: a typo is an operator's startup error.
+        assert!(toml::from_str::<RuntimeConfig>(
+            "[node]\nadvertised_addresses = [\"example.com\"]\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn advertised_addresses_can_be_set_from_the_environment() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+
+        env::set_var(
+            "DEIS_RUNTIME_NODE_ADVERTISED_ADDRESSES",
+            "203.0.113.7, 2001:db8::10",
+        );
+        let mut config = RuntimeConfig::default();
+        let result = config.apply_env_overrides();
+        env::remove_var("DEIS_RUNTIME_NODE_ADVERTISED_ADDRESSES");
+
+        result.expect("a comma-separated list of IP addresses applies");
+        assert_eq!(
+            config.node.advertised_addresses,
+            ["203.0.113.7", "2001:db8::10"]
+                .map(|a| a.parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_advertised_address_in_the_environment_that_is_not_an_ip_fails() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+
+        env::set_var("DEIS_RUNTIME_NODE_ADVERTISED_ADDRESSES", "not-an-ip");
+        let mut config = RuntimeConfig::default();
+        let result = config.apply_env_overrides();
+        env::remove_var("DEIS_RUNTIME_NODE_ADVERTISED_ADDRESSES");
+
+        let err =
+            result.expect_err("a name is not an address the fetch policy can match");
+        assert!(err.to_string().contains("not-an-ip"), "{err}");
     }
 
     #[test]

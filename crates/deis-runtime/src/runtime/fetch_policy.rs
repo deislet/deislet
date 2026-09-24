@@ -25,7 +25,10 @@
 //! unspecified address, and the ranges reserved for documentation,
 //! benchmarking, carrier NAT and future use. An IPv4 address written as IPv6
 //! (`::ffff:127.0.0.1`) is classified as the IPv4 address it is, because it
-//! reaches the same machine.
+//! reaches the same machine, and so are the transition forms that carry an
+//! IPv4 address: NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`) and 6to4
+//! (`2002::/16`). Teredo (`2001::/32`) hides its inner address behind an
+//! obfuscation and is refused outright, as is the discard-only `100::/64`.
 //!
 //! # The address, not the name
 //!
@@ -292,6 +295,16 @@ pub enum Refusal {
     PortNotAllowed { host: String, port: u16 },
     /// The destination resolves to an address applications may not reach.
     BlockedAddress { addr: IpAddr, kind: &'static str },
+    /// The destination is an IPv6 address that carries an IPv4 address inside
+    /// it -- IPv4-mapped, NAT64, 6to4 -- and the inner address is what the
+    /// policy judged. The refusal names both spellings, because a message
+    /// that only said "64:ff9b::7f00:1 is a loopback address" would read as
+    /// a mistake rather than as the sentence it is.
+    BlockedTransitionAddress {
+        addr: IpAddr,
+        embedded: Ipv4Addr,
+        kind: &'static str,
+    },
     /// The name does not resolve, so there is nothing to judge and nothing to
     /// connect to either.
     Unresolvable { host: String, error: String },
@@ -323,6 +336,17 @@ impl std::fmt::Display for Refusal {
                 "it resolves to {addr}, which is {kind}. Applications may only reach public \
                  internet destinations; ask the operator to add the host to [fetch] allow if \
                  this is an internal service the application is meant to reach"
+            ),
+            Self::BlockedTransitionAddress {
+                addr,
+                embedded,
+                kind,
+            } => write!(
+                f,
+                "it resolves to {addr}, which carries the IPv4 address {embedded}, and that \
+                 is {kind}. Applications may only reach public internet destinations; ask the \
+                 operator to add the host to [fetch] allow if this is an internal service the \
+                 application is meant to reach"
             ),
             Self::Unresolvable { host, error } => {
                 write!(f, "the host {host} could not be resolved: {error}")
@@ -501,8 +525,8 @@ impl FetchPolicy {
         // public address and one loopback address is exactly the shape an
         // attack takes, and the client is free to try any of them.
         for addr in addresses {
-            if let Some(kind) = blocked_reason(addr) {
-                return Err(Refusal::BlockedAddress { addr, kind });
+            if let Some(refusal) = blocked_reason(addr) {
+                return Err(refusal);
             }
         }
 
@@ -563,8 +587,8 @@ impl FetchPolicy {
         if self.is_allowlisted(host, Some(port)) {
             return Ok(());
         }
-        if let Some(kind) = blocked_reason(addr) {
-            return Err(Refusal::BlockedAddress { addr, kind });
+        if let Some(refusal) = blocked_reason(addr) {
+            return Err(refusal);
         }
         Ok(())
     }
@@ -831,14 +855,23 @@ const BLOCKED_V4: &[([u8; 4], u8)] = &[
     ([240, 0, 0, 0], 4),     // reserved, incl. 255.255.255.255
 ];
 
-/// The IPv6 ranges. Exactly the set [`blocked_v6`] refuses.
+/// The IPv6 ranges, as (network, prefix length). Together with
+/// [`embedded_ipv4`], exactly the set [`blocked_reason`] refuses. The NAT64
+/// and 6to4 networks are listed whole, but their addresses are judged by the
+/// IPv4 address each carries, so one carrying a public address is allowed;
+/// the classifier is finer-grained than the table there, never coarser.
 const BLOCKED_V6: &[(u128, u8)] = &[
-    (0, 128),                // ::
-    (1, 128),                // ::1
-    (0xfc00 << 112, 7),      // unique local
-    (0xfe80 << 112, 10),     // link-local
-    (0xff00 << 112, 8),      // multicast
-    (0x2001_0db8 << 96, 32), // documentation
+    (0, 128),                     // ::
+    (1, 128),                     // ::1
+    (0x0064_ff9b << 96, 96),      // NAT64, well-known prefix
+    (0x0064_ff9b_0001 << 80, 48), // NAT64, local-use (RFC 8215)
+    (0x2002 << 112, 16),          // 6to4
+    (0x2001 << 112, 32),          // Teredo, refused outright
+    (0x0100 << 112, 64),          // discard-only
+    (0xfc00 << 112, 7),           // unique local
+    (0xfe80 << 112, 10),          // link-local
+    (0xff00 << 112, 8),           // multicast
+    (0x2001_0db8 << 96, 32),      // documentation
 ];
 
 /// Every blocked range, as this module classifies addresses.
@@ -1017,7 +1050,7 @@ impl deno_runtime::deno_fetch::dns::Resolve for PolicyResolver {
             for addr in addresses {
                 match blocked_reason(addr.ip()) {
                     None => kept.push(addr),
-                    Some(kind) => {
+                    Some(refusal) => {
                         // Warn rather than debug: reaching this line means the
                         // name resolved differently than it did a moment ago
                         // in `FetchPolicy::check`, which is what a rebinding
@@ -1027,13 +1060,13 @@ impl deno_runtime::deno_fetch::dns::Resolve for PolicyResolver {
                             app_id = %app_id,
                             host = %host,
                             address = %addr.ip(),
-                            "Dropped {} from the addresses of {} for {}: it is {}. The name \
-                             passed the outbound fetch policy and then resolved to a blocked \
-                             address, so the connection is not opened",
+                            "Dropped {} from the addresses of {} for {}: {}. The name passed \
+                             the outbound fetch policy and then resolved to a blocked address, \
+                             so the connection is not opened",
                             addr.ip(),
                             host,
                             app_id,
-                            kind
+                            refusal
                         );
                     }
                 }
@@ -1082,46 +1115,97 @@ fn reaches_the_same_socket(mine: IpAddr, theirs: IpAddr) -> bool {
     mine.is_loopback() && theirs.is_loopback()
 }
 
-/// `::ffff:a.b.c.d` and the deprecated `::a.b.c.d` as `a.b.c.d`; `::1` and
-/// `::` stay themselves, because `to_ipv4` would read them as `0.0.0.1` and
+/// An IPv6 address that carries an IPv4 address inside it as that IPv4
+/// address, so a comparison between spellings compares machines rather than
+/// spellings: `::ffff:a.b.c.d`, the deprecated `::a.b.c.d`, the NAT64 forms
+/// `64:ff9b::a.b.c.d` and `64:ff9b:1::a.b.c.d`, and 6to4 `2002:a.b.c.d::` all
+/// read as `a.b.c.d`. Teredo carries no address that can be read out of it
+/// and is refused outright instead. `::1` and `::` stay themselves, because
+/// reading an inner address out of them would produce `0.0.0.1` and
 /// `0.0.0.0`.
 fn as_ipv4_when_it_is_one(addr: IpAddr) -> IpAddr {
     match addr {
-        IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unspecified() => v6
-            .to_ipv4_mapped()
-            .or_else(|| v6.to_ipv4())
-            .map(IpAddr::V4)
-            .unwrap_or(addr),
+        IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unspecified() => {
+            embedded_ipv4(v6).map(IpAddr::V4).unwrap_or(addr)
+        }
         _ => addr,
     }
 }
 
-/// What is wrong with one address, or `None` when an application may reach it.
+/// The IPv4 address an IPv6 transition form carries, if it carries one.
 ///
-/// The wording is what the application is told, so each arm reads as the tail
-/// of "it resolves to 10.0.0.1, which is ...".
-fn blocked_reason(addr: IpAddr) -> Option<&'static str> {
+/// Recognised: IPv4-mapped `::ffff:a.b.c.d`, the deprecated `::a.b.c.d`,
+/// NAT64 in both the well-known (`64:ff9b::/96`) and the local-use
+/// (`64:ff9b:1::/48`, RFC 8215) spelling, and 6to4 (`2002::/16`, inner
+/// address in bits 16-48). Every one of them puts the packet on an IPv4
+/// network, so the inner address is the one that has to be judged: without
+/// this, every private-range rule is one URL rewrite away from being
+/// bypassed through a NAT64 or 6to4 gateway.
+///
+/// Teredo (`2001::/32`) is deliberately absent. Its client and port halves
+/// are XOR-obfuscated, so no reliable inner address can be read out of it,
+/// and legitimate outbound traffic does not originate Teredo; the range is
+/// refused outright in [`blocked_v6`] instead.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = v6.segments();
+    let inner = |hi: u16, lo: u16| {
+        Ipv4Addr::new(
+            (hi >> 8) as u8,
+            hi as u8,
+            (lo >> 8) as u8,
+            lo as u8,
+        )
+    };
+    // IPv4-mapped, and the deprecated plain spelling beside it.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    // NAT64. The two prefixes differ in how much zero padding sits above the
+    // inner address; in both it is the last 32 bits. Not refused outright:
+    // DNS64/NAT64 is how an IPv6-only node reaches the public IPv4 internet,
+    // so the inner address is judged like any other address.
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && (segments[2] == 0 || segments[2] == 1)
+        && segments[3..6].iter().all(|&s| s == 0)
+    {
+        return Some(inner(segments[6], segments[7]));
+    }
+    // 6to4.
+    if segments[0] == 0x2002 {
+        return Some(inner(segments[1], segments[2]));
+    }
+    v6.to_ipv4()
+}
+
+/// The refusal for one address, or `None` when an application may reach it.
+///
+/// The wording is what the application is told, so each kind reads as the
+/// tail of "it resolves to 10.0.0.1, which is ...". An IPv6 address carrying
+/// an IPv4 address inside it ([`embedded_ipv4`]) is refused as the inner
+/// address, and its refusal names both spellings.
+fn blocked_reason(addr: IpAddr) -> Option<Refusal> {
     match addr {
-        IpAddr::V4(v4) => blocked_v4(v4),
+        IpAddr::V4(v4) => blocked_v4(v4).map(|kind| Refusal::BlockedAddress { addr, kind }),
         IpAddr::V6(v6) => {
             // `::1` and `::` are IPv6 addresses in their own right, and
-            // `to_ipv4` would read them as `0.0.0.1` and `0.0.0.0`: still
-            // refused, but for a reason that would puzzle whoever read the
-            // message. Judged as themselves first.
+            // reading an inner IPv4 out of them would produce `0.0.0.1` and
+            // `0.0.0.0`: still refused, but for a reason that would puzzle
+            // whoever read the message. Judged as themselves first.
             if v6.is_loopback() || v6.is_unspecified() {
-                return blocked_v6(v6);
+                return blocked_v6(v6).map(|kind| Refusal::BlockedAddress { addr, kind });
             }
-            // `::ffff:127.0.0.1` and the deprecated `::127.0.0.1` reach the
-            // same machine as `127.0.0.1` does, so they are judged as the IPv4
-            // address they carry. Without this, every rule below is one URL
-            // rewrite away from being bypassed.
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return blocked_v4(v4);
+            // An address that carries an IPv4 address inside it reaches the
+            // machine that inner address names, so it is judged as that
+            // address -- whatever the outer spelling suggests.
+            if let Some(v4) = embedded_ipv4(v6) {
+                return blocked_v4(v4).map(|kind| Refusal::BlockedTransitionAddress {
+                    addr,
+                    embedded: v4,
+                    kind,
+                });
             }
-            if let Some(v4) = v6.to_ipv4() {
-                return blocked_v4(v4);
-            }
-            blocked_v6(v6)
+            blocked_v6(v6).map(|kind| Refusal::BlockedAddress { addr, kind })
         }
     }
 }
@@ -1171,6 +1255,18 @@ fn blocked_v6(addr: Ipv6Addr) -> Option<&'static str> {
         Some("a unique-local address, which is this node's own network")
     } else if (segments[0] & 0xffc0) == 0xfe80 {
         Some("link-local")
+    } else if segments[0] == 0x2001 && segments[1] == 0 {
+        // Teredo. The client and port halves are XOR-obfuscated, so no inner
+        // address can be judged; legitimate outbound traffic does not
+        // originate Teredo, and the range is refused whole.
+        Some(
+            "in the Teredo range, which is refused outright: the address hides an IPv4 \
+             address and a port behind an obfuscation, and no inner address can be judged",
+        )
+    } else if segments[0] == 0x0100 && segments[1..4].iter().all(|&s| s == 0) {
+        // The discard-only range. Packets to it are dropped by definition,
+        // which makes it a destination for nothing.
+        Some("in the discard-only range, which is not a destination")
     } else if segments[0] == 0x2001 && segments[1] == 0x0db8 {
         Some("in a range reserved for documentation")
     } else {
@@ -1192,7 +1288,7 @@ pub fn any_blocked_range_covers_for_test(addr: IpAddr) -> bool {
 }
 
 #[cfg(test)]
-pub fn blocked_reason_for_test(addr: IpAddr) -> Option<&'static str> {
+pub fn blocked_reason_for_test(addr: IpAddr) -> Option<Refusal> {
     blocked_reason(addr)
 }
 

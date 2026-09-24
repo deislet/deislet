@@ -369,19 +369,60 @@ async fn run(
     // `x-deis-app-id` header it is handed, so a handler that could open a
     // connection to it -- headers of its own choosing included -- would be
     // invoking another tenant's code on this node.
-    let own_listener = |host: &str| format!("http://{host}:{}", config.http_port);
-    let platform_endpoints: Vec<String> = config
+    // This node's own listener is in the list as well, on every spelling of
+    // the local machine: loopback, every address on every interface, and the
+    // addresses the operator says route to this node from outside it
+    // (`node.advertised_addresses`, for the public IP a cloud 1:1 NAT maps
+    // onto this node). They are all service endpoints like the others: the
+    // dispatcher decides which application a request belongs to from the
+    // `x-deis-app-id` header it is handed, so a handler that could open a
+    // connection to the data port -- headers of its own choosing included --
+    // would be invoking another tenant's code on this node. Loopback alone
+    // would not cover the rest: on a machine whose public address sits on the
+    // NIC (or is hairpinned by the provider's NAT), `http://<public-ip>:<port>`
+    // reaches the same socket `127.0.0.1` does.
+    //
+    // The interface enumeration is a startup snapshot; an address that
+    // appears later (DHCP renewal, hot-plugged NIC) is not picked up, which
+    // is what `node.advertised_addresses` is the escape hatch for. Both this
+    // enumeration and the stopgap itself go away once the data port
+    // authenticates its callers.
+    let own_listener = |host: String| format!("http://{host}:{}", config.http_port);
+    let interface_addresses = local_addresses().map_err(|e| {
+        anyhow::anyhow!(
+            "listing this machine's interface addresses, which the outbound fetch policy \
+             needs so the node's own data port is refused under every address it answers \
+             at: {e}"
+        )
+    })?;
+    let mut platform_endpoints: Vec<String> = config
         .control
         .endpoint
         .iter()
         .chain(config.logging.endpoint.iter())
         .cloned()
         .chain([
-            own_listener("127.0.0.1"),
-            own_listener("[::1]"),
-            own_listener("localhost"),
+            own_listener("127.0.0.1".to_string()),
+            own_listener("[::1]".to_string()),
+            own_listener("localhost".to_string()),
         ])
+        .chain(
+            interface_addresses
+                .iter()
+                .map(|addr| own_listener(addr.to_string())),
+        )
+        .chain(
+            config
+                .node
+                .advertised_addresses
+                .iter()
+                .map(|addr| own_listener(addr.to_string())),
+        )
         .collect();
+    // The enumeration finds loopback again beside the spellings above; one
+    // entry per endpoint keeps the startup line and deno's deny list tidy.
+    let mut seen_endpoints = std::collections::HashSet::new();
+    platform_endpoints.retain(|endpoint| seen_endpoints.insert(endpoint.clone()));
     let fetch_policy = FetchPolicy::new(&config.fetch.allow, &platform_endpoints)
         .map_err(|e| anyhow::anyhow!("building the outbound fetch policy: {e}"))?;
 
@@ -558,6 +599,19 @@ async fn run(
     info!("👋 Runtime Platform stopped");
 
     Ok(())
+}
+
+/// Every unicast address on this machine's interfaces, loopback included.
+///
+/// A startup snapshot: an interface that appears or changes while the node
+/// runs is not picked up. This is the stopgap half of refusing the node's
+/// own data port to applications; authentication on the port itself is the
+/// fix that retires both.
+fn local_addresses() -> std::io::Result<Vec<std::net::IpAddr>> {
+    Ok(if_addrs::get_if_addrs()?
+        .into_iter()
+        .map(|interface| interface.ip())
+        .collect())
 }
 
 #[cfg(test)]
