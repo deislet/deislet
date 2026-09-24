@@ -233,7 +233,10 @@ A: The current version only allows choosing one. Recommendation:
 
 **Q: Is client certificate authentication supported?**
 
-A: Not supported in the current version. Plans to add mTLS support in future releases.
+A: Yes, since 2026-09. The control plane's machine listener (`[machine] listen`)
+uses mutual TLS to authenticate nodes and proxies by their individual SPIFFE
+certificates — see `docs/adr/025-machine-identity-and-capabilities.md`.
+The human API listener still supports only server-side TLS.
 
 ## Related Resources
 

@@ -278,34 +278,23 @@ impl std::error::Error for AssignmentError {}
 
 /// Asks the control plane what this node should run.
 ///
-/// # Two transports, one question
+/// The question and the answer are the same regardless of transport:
+/// which versions this node should be running, and whether that list is
+/// the whole truth.  Since the machine channel landed (ADR-025), the only
+/// transport is mutual TLS over the machine listener — the connection
+/// itself proves which machine is asking, and the control plane refuses a
+/// call whose `node_id` is not the name the certificate proved.
 ///
-/// The question and the answer are the same either way: which versions this
-/// node should be running, and whether that list is the whole truth. What
-/// differs is the door it is asked at and what the control plane knows about
-/// the caller when it answers.
-///
-/// * [`AssignmentClient::new`] asks over HTTP on the control plane's human
-///   listener, presenting `[control] secret` - the key every node in the fleet
-///   holds. Any holder of that one value can ask for any node's list, secrets
-///   and all.
-/// * [`AssignmentClient::over_machine_channel`] asks over the machine
-///   channel, where the connection itself proves which machine is asking. The
-///   control plane refuses a call whose `node_id` is not the name the
-///   certificate proved, so this node can only ever be handed its own
-///   assignments.
-///
-/// Which one exists is decided once, at startup, by
-/// [`AssignmentClient::from_config`]. A node with no `[machine_identity]`
-/// configured gets the first and behaves in every respect as it did before
-/// this channel existed.
+/// The transport is decided once at startup by
+/// [`AssignmentClient::from_config`].  A node without a configured
+/// `[machine_identity]` refuses to start rather than silently failing to
+/// fetch assignments on a path that is no longer served.
 pub struct AssignmentClient {
     transport: Transport,
-    /// What every log line and every error names. For HTTP that is the URL
-    /// being fetched; for the machine channel it is the endpoint followed by
-    /// the RPC's own path, which is literally what goes on the wire over
-    /// HTTP/2 - so either way an operator can match this against the control
-    /// plane's own log.
+    /// What every log line and every error names — the machine channel
+    /// endpoint followed by the RPC's path, which is literally what goes
+    /// on the wire over HTTP/2, so an operator can match this against the
+    /// control plane's own log.
     url: String,
 }
 

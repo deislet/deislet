@@ -3,15 +3,16 @@
 //! work out what it should be running (`assignments` and the bundle
 //! download for a runtime node, `routing_table` for deis-proxy).
 //!
-//! It is built as two routers, because the two halves answer to different
+//! It is built as two surfaces, because the two halves answer to different
 //! credentials:
 //!
-//! * [`router`] is the human surface - dashboard and CLI. It is merged into
+//! * [`router`] is the human surface — dashboard and CLI. It is merged into
 //!   the part of the API guarded by the API key, which `api_auth_enabled`
 //!   turns on and off.
-//! * [`node_router`] is what the platform's own processes call - a runtime
-//!   node, and deis-proxy for the routing table. It carries its own
-//!   authentication ([`crate::api::middleware::node_auth`]) and ignores
+//! * The machine channel (`[machine] listen`) is what the platform's own
+//!   processes call — a gRPC surface (`deis.machine.MachineChannel`) that
+//!   serves assignments, bundles, routing tables, and registration over
+//!   mutual TLS with per-instance SPIFFE certificates. It ignores
 //!   `api_auth_enabled` entirely: the assignment list hands out every
 //!   environment's decrypted secrets, so that channel cannot be left open by
 //!   a flag whose purpose is to make a dashboard convenient.

@@ -7,9 +7,8 @@
 //! other side, a node that moved kept its old entry, and the dashboard's idea
 //! of the fleet was whatever the file said rather than what was running.
 //!
-//! So the node says so itself, on the same channel it already uses to fetch
-//! its assignments ([`super::assignments`]) - and, like that fetch, on one of
-//! two doors.
+//! So the node says so itself, on the same machine channel it already uses to
+//! fetch its assignments ([`super::assignments`]).
 //!
 //! # One door, and why it is one
 //!
@@ -34,11 +33,12 @@
 //! comparison against a shared string could have answered the question that
 //! mattered.
 //!
-//! Which door this node uses is decided once, at startup, by
-//! [`NodeRegistrar::from_config`]. A node with no `[machine_identity]`
-//! configured gets the first and behaves in every respect as it did before the
-//! channel existed. What is said is the same either way: the same body, with
-//! the same fields, read by the same code on the other side.
+//! The transport is decided once at startup by
+//! [`NodeRegistrar::from_config`]. A node without a configured
+//! `[machine_identity]` refuses to start rather than silently failing to
+//! register on a path that is no longer served. What is said is the same
+//! either way: the same body, with the same fields, read by the same code
+//! on the other side.
 //!
 //! Registration is *not* a precondition for serving. A node that cannot
 //! register still fetches its assignments and still serves them; what is lost
@@ -273,14 +273,15 @@ const DEREGISTER_PATH: &str = "/deis.machine.MachineChannel/Deregister";
 
 /// Registers this node with the control plane.
 ///
-/// One statement, two doors; see the module documentation for which door
-/// proves what. Everything below the door is shared: the body, the answer, and
-/// the error taxonomy an operator diagnoses a fleet that will not form from.
+/// One statement, one door: registration proves the node's SPIFFE name
+/// via mutual TLS on the machine channel. See the module documentation
+/// for what the door proves and why there is no second.
 pub struct NodeRegistrar {
     transport: Transport,
-    /// What every log line and every error names for a registration. For HTTP
-    /// that is the URL being called; for the machine channel it is the
-    /// endpoint followed by the RPC's own path.
+    /// What every log line and every error names for a registration — the
+    /// machine channel endpoint followed by the RPC's path, which is
+    /// literally what goes on the wire over HTTP/2, so an operator can
+    /// match this against the control plane's access log.
     url: String,
     /// See [`NodeRegistrar::new`].
     machine_address: Option<String>,
@@ -307,8 +308,7 @@ enum Transport {
         /// presented after a renewal.
         identity: Arc<MachineIdentity>,
         /// The other RPC's path, for the lines and errors a deregistration
-        /// produces. The HTTP door needs no such second address: registering
-        /// and leaving are two methods on one path.
+        /// produces.
         deregister_url: String,
     },
 }

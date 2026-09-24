@@ -25,12 +25,12 @@
 //!
 //! **This response carries decrypted secret values.** It is one of exactly
 //! two places where they appear in the clear (the other is the
-//! `ApplyDeployment` push), which is why the route is mounted with its own
-//! node authentication in [`super::node_router`] instead of behind the
-//! dashboard's API key. There is no anonymous case to handle here: a control
-//! plane with no node credential answers 503 on this route before the handler
-//! is reached (`api::middleware::node_auth`), so everything below is talking
-//! to a caller that proved it holds a node key.
+//! `ApplyDeployment` push), which is why it is served on the machine
+//! channel (`deis.machine.MachineChannel`) with mutual TLS instead of
+//! behind the dashboard's API key. There is no anonymous case to handle
+//! here: a control plane with no machine identity answers 503 on a call
+//! into this handler (`machine::service` checks the peer certificate),
+//! so everything below is talking to a caller that proved its SPIFFE name.
 
 use std::collections::BTreeMap;
 
@@ -145,10 +145,11 @@ pub struct AssignmentView {
     pub secret_values_by_revision: BTreeMap<String, String>,
 }
 
-/// GET /api/nodes/:id/assignments
+/// GET /api/nodes/:id/assignments (machine channel)
 ///
-/// Authenticated as a node by [`super::node_router`], whatever
-/// `api_auth_enabled` says.
+/// Served on the machine listener with mutual TLS — the handler receives
+/// the caller's SPIFFE identity from the peer certificate, and
+/// `api_auth_enabled` does not apply.
 pub async fn for_node(
     State(state): State<CatalogState>,
     Path(node_id): Path<String>,

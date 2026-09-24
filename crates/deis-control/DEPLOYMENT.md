@@ -105,23 +105,18 @@ certificate = "/etc/deis-control/certs/control.pem"
 private_key = "/etc/deis-control/certs/control-key.pem"
 trust_root = "/etc/deis-control/certs/trust-root.pem"
 
-# node_preshared_keys is OPTIONAL now, and does less than it used to: it no
-# longer reaches the assignment list, the bundle download or registration -
-# those answer only to the certificate above, on the [machine] listener.
-# With [machine] configured, leaving this empty (or leaving it out
-# entirely) is the finished state: no fleet-wide value is minted in its
-# place, because every peer proves a certificate instead and there is
-# nothing left for a shared value to decide. What the list still does,
-# only while a fleet is mid-migration: it is the credential deis-proxy's
-# own gRPC control channel falls back to when that proxy has no
-# certificate of its own yet, and the bearer this control plane presents
-# on a node's plaintext management plane when that node has none either.
-# Where it is still set, make it `openssl rand -hex 32` - deis-proxy warns
-# about a value under 32 characters. The control plane shows the first 12
-# hex characters of each value's SHA-256 (as `key_fingerprint` on
-# /api/runtime and in a retired-key error) to tell values apart during a
-# rotation. See docs/trust-boundaries.md.
-node_preshared_keys = []
+# node_preshared_keys is RETIRED.  The control plane will refuse to start
+# if this key appears anywhere in the configuration file.  Every door it
+# once guarded (assignments, bundles, registration, routing table) is now
+# served exclusively on the [machine] listener with mutual TLS — see
+# docs/adr/025-machine-identity-and-capabilities.md.
+#
+# To migrate a fleet: configure [machine] on every node and proxy, verify
+# that the fleet works with node_preshared_keys set to an empty list, then
+# delete this section and remove it from every node's [control] secret.
+# The refuse_a_retired_fleet_key check in config.rs names the exact lines
+# to remove.
+# node_preshared_keys = []
 
 # Require an API key on the dashboard and the human API (recommended).
 # This setting does not reach the machine channel above.

@@ -164,27 +164,25 @@ id 不会。运维手上唯一的杠杆 `DELETE .../registration` 反而把失�
   的进程**启动即失败**。否则它会正常起来、正常监听，然后在整个生命周期里每一次注册和每一次
   路由表拉取都被拒 —— 而没有任何一行日志会说这是为什么。
 
-### 还没做的清理
+### 还没做的清理（2026-09-24 更新）
 
-1. **`node_preshared_keys` 这个字段本身**，连同 `NodeKeyStatus` / `key_fingerprint` 概念，
-   还在 control 的配置、舰队 API、已提交的 OpenAPI 文档和生成的 TypeScript 控制台客户端里。
-   删它是清理，不是加固。
-2. **HTTP 回落路径已经没有对端了 —— 陷阱已封，代码还在。**
-   `deis-proxy` 在没有 `[machine_identity]` 时会去 `GET /api/routing-table`，
-   `deis-runtime` 同理会去走 assignments / registration / bundle 的 HTTP 形式；
-   而这一轮已经把这几条整组从人用监听上摘掉了，所以它们现在拿到的都是 404。
-   **进程不会失败，这才是问题**：它照常启动、照常监听，然后在整个生命周期里
-   重试一条 404 的路由 —— 什么都不装、什么都不上报、也没有任何一行日志说出原因。
-
-   2026-09-11 两侧都加了**启动即拒**：`[control]` 在而 `[machine_identity]` 不在，
-   进程拒绝启动，报错里写清「这些东西现在只在机器通道上供应，舰队口令在那儿开不了任何门」。
-   一个永久且安静地不工作的舰队成员，因此变成一条运维只需读一次的启动错误。
-
-   **仍未做**：把这几条 HTTP 传输代码本身删掉。现在它们是不可达的（服务端路由是
-   `#[cfg(test)]`，客户端被启动校验挡住），留着只会让读代码的人以为还有两条路。
-3. **运维脚本与文档尾巴**：`backup.sh` / `restore.sh` 只复制四样东西、一样身份文件都不带；
-   `scripts/canary-release.sh`、`scripts/canary/remote-install.sh`、
-   `crates/deis-control/TLS_SETUP.md`，以及六份提到节点路由或舰队口令的文档。
+> **已完成（2026-09-24）**：
+> - 1. `node_preshared_keys` 字段已删除（a7ba508），配置写下此字段即启动失败
+>    `NodeKeyStatus`/`key_fingerprint` 已从源码删除，docs/ 中历史引用保留
+> - 2. HTTP 回落路径已移除：`node_registration_path()`/`node_assignments_path()` 死代码已删；
+>    `NODE_REGISTRATION_ROUTE`/`NODE_ASSIGNMENTS_ROUTE`/`ROUTING_TABLE_ROUTE` 常量保留为文档锚点；
+>    deis-control / deis-runtime / deis-proxy 的 doc comments 已更新为仅机器通道的描述
+> - 3. `TLS_SETUP.md` mTLS 问答已更新；DEPLOYMENT.md `node_preshared_keys` 段已重写为退役声明；
+>    canary 脚本已在 2026-09-11 迁移至 PKI 方式
+>
+> **仍未做**：
+> - `docs/architecture.zh.md`、`docs/implementation-plan.zh.md`、`docs/cloudflare-comparison.zh.md`
+>   中仍有描述旧共享口令架构的段落——需冬季文档整修
+> - `refuse_a_retired_fleet_key` 函数本身可在足够远的未来删除（当前仍需保护迁移中的机队）
+> - `routing_table()` HTTP handler（`routing_table.rs:96`）未挂载但代码仍在——
+>   确认未使用时删除
+> - `remaining-shared-secrets.zh.md` 附二所述 `scripts/test-demo-witnesses.sh` 中的口令扫描
+>   见证是安全测试基础设施，非残留
 
 ---
 

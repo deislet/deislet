@@ -284,52 +284,32 @@ pub const STORE_ENDPOINT_ENV: &str = "DEIS_STORE_ENDPOINT";
 /// `http://127.0.0.1:8091`. Same contract as [`STORE_ENDPOINT_ENV`].
 pub const QUEUE_ENDPOINT_ENV: &str = "DEIS_QUEUE_ENDPOINT";
 
-// ---- the node-facing control plane ------------------------------------
+// ---- the node-facing control plane (legacy HTTP routes) ---------------
 //
-// These four names are the contract between deis-control (which serves them)
-// and deis-runtime (which calls them). They live here, and not in either
-// crate, because nothing checks that two crates spell an HTTP path the same
-// way: a node that asked for `/register` while the control plane served
-// `/registration` compiled perfectly, and the only symptom was a fleet that
-// never learned about its own nodes.
+// These path constants were once the contract between deis-control
+// (which served them on its human HTTP listener) and deis-runtime
+// (which called them with bearer credentials).  Since the machine
+// channel landed (ADR-025), node registration, assignment fetch,
+// and routing-table delivery moved to the machine listener's gRPC
+// surface (`deis.machine.MachineChannel`).  The constants remain as
+// documentation anchors — they are no longer mounted as HTTP routes
+// anywhere in the production code path.
+//
+// The function counterparts `node_registration_path` and
+// `node_assignments_path` were deleted because nothing called them
+// after the HTTP fallback paths were gated behind a startup check.
 
-/// Route template for a node's registration, in the `:id` form an axum
-/// `Router` takes.
-///
-/// The client half is [`node_registration_path`]. They are separate because a
-/// server registers one route for every node while a client addresses one.
+/// Route template for a node's registration (no longer mounted).
 pub const NODE_REGISTRATION_ROUTE: &str = "/api/nodes/:id/registration";
 
-/// Route template for a node's assignment list. See
-/// [`NODE_REGISTRATION_ROUTE`].
+/// Route template for a node's assignment list (no longer mounted).
 pub const NODE_ASSIGNMENTS_ROUTE: &str = "/api/nodes/:id/assignments";
 
-/// Path the control plane serves its routing table on, and deis-proxy polls.
-///
-/// It carries no path parameter, so server and client spell the same string.
-/// Here for the same reason as [`NODE_ASSIGNMENTS_ROUTE`]: the two crates do
-/// not depend on each other, and a disagreement would show up as an edge that
-/// keeps an empty routing table and sends every request to whatever the local
-/// application list happens to match.
+/// Path the control plane once served its routing table on, and deis-proxy
+/// once polled.  The routing table is now delivered via
+/// `deis.machine.MachineChannel/FetchRoutingTable`; deis-proxy's wire
+/// module keeps this constant for contract tests.
 pub const ROUTING_TABLE_ROUTE: &str = "/api/routing-table";
-
-/// Path a node registers itself at, and refreshes that registration at.
-///
-/// `PUT` is the method: a registration states what a node is rather than
-/// asking to create something, so a node that lost contact and came back
-/// says it again. `DELETE` on the same path is a node leaving on purpose.
-///
-/// `node_id` must already be percent-encoded - an id containing `/` would
-/// otherwise address a different path than the one it registered under.
-pub fn node_registration_path(encoded_node_id: &str) -> String {
-    format!("/api/nodes/{encoded_node_id}/registration")
-}
-
-/// Path a node fetches its assignment list from. Same encoding rule as
-/// [`node_registration_path`].
-pub fn node_assignments_path(encoded_node_id: &str) -> String {
-    format!("/api/nodes/{encoded_node_id}/assignments")
-}
 
 /// Response header on an assignment list saying whether the list is the whole
 /// truth for that node.

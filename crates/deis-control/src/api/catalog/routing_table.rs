@@ -16,14 +16,13 @@
 //!   "nothing changed" from "changed" without diffing, and so the log line
 //!   an operator reads names the table it is talking about.
 //!
-//! The table is served on [`super::node_router`] rather than the human API.
-//! deis-proxy is not a runtime node, but it holds the same credential - the
-//! `[control] secret` in its own file is a `node_preshared_keys` value,
-//! because that is what its gRPC control channel authenticates with - and
-//! this is the channel whose authentication `api_auth_enabled` cannot switch
-//! off. An unauthenticated routing table would let anyone who can reach the
-//! port enumerate every application id and every hostname the platform
-//! serves, which is a map of the whole installation.
+//! The table is served on the machine channel
+//! (`deis.machine.MachineChannel/FetchRoutingTable`) rather than the human
+//! API. deis-proxy authenticates with its own SPIFFE certificate (mutual
+//! TLS), and this is the channel whose authentication `api_auth_enabled`
+//! cannot switch off. An unauthenticated routing table would let anyone who
+//! can reach the port enumerate every application id and every hostname the
+//! platform serves, which is a map of the whole installation.
 //!
 //! Nothing secret is in the answer: hostnames, path prefixes, app ids and
 //! environment names, all of which are already visible to anyone who can
