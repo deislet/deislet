@@ -17,39 +17,41 @@ socket handling or process model.
 ## Request flow
 
 1. **Resolve the application**, from two sources with a fixed precedence.
-   The **catalog's routing table**, polled from the control plane, is the
-   one an operator can change without touching a machine, so where both
-   can answer "which application", the catalog wins. The **local
-   application list** is still here and still matters, for a different
-   question: certificates, the cache policy, the enabled flag — what to do
-   with a request once the application is known.
+   The request's `Host` is the only routing input a client gets: every
+   header it sent under the platform's `x-deis-` prefix is deleted before
+   routing is even attempted, so a request cannot name its application with
+   `x-deis-app-id` or anything else in that namespace. The **catalog's
+   routing table**, polled from the control plane, is the one an operator
+   can change without touching a machine, so it is matched first. The
+   **local application list** is still here and still matters, for a
+   different question: certificates, the cache policy, the enabled flag —
+   what to do with a request once the application is known.
 
-   A non-empty `x-deis-app-id` header names the application and nothing
-   else, so it is answered first: the local list, then the catalog's
-   default environment for that id. Without the header, the catalog is
-   matched on host **and path prefix** — exact host, then `*.wildcard`
-   (longest suffix first, so `*.eu.example.com` beats `*.example.com`),
-   then an automatic per-environment address, then a route naming no host
-   at all, which the catalog means as "any domain". Within one host,
-   candidates are ordered by `priority` and then by prefix length, so
-   `/api/v2` beats `/api` beats `/` and an operator can still override
-   that. If the catalog claims nothing, the local list is matched on host.
+   The catalog is matched on host **and path prefix** — exact host, then
+   `*.wildcard` (longest suffix first, so `*.eu.example.com` beats
+   `*.example.com`), then an automatic per-environment address, then a
+   route naming no host at all, which the catalog means as "any domain".
+   Within one host, candidates are ordered by `priority` and then by prefix
+   length, so `/api/v2` beats `/api` beats `/` and an operator can still
+   override that. If the catalog claims nothing, the local list is matched
+   on host.
 
    What a request that matches nothing means depends on where this
    instance's routing comes from, which is a different question in each of
    three states:
 
    * **No `[control]` section and no applications of its own** — a plain
-     reverse proxy. The request is forwarded unchanged, with both routing
-     headers **stripped** from it first: deis-proxy decided neither, so
-     neither may reach a node as though it had.
+     reverse proxy. The request is forwarded unchanged, with the platform
+     namespace the client sent already deleted: deis-proxy made no routing
+     decision, so nothing of the client's may reach a node as though it
+     had.
    * **A control plane configured and a table fetched from it** — `404`,
      including when that table turned out to be empty. The control plane is
      the authority on what is routed here, and "nothing" is an answer.
    * **A control plane configured and no table ever fetched** — `503`. This
      instance has been told where its routing comes from and has not got
-     it, so it cannot place the request; forwarding it would route it by
-     the client's own `x-deis-app-id`. A poll that fails *after* one
+     it, so it cannot place the request, and a request it cannot place is
+     refused rather than forwarded. A poll that fails *after* one
      succeeded is a different thing entirely — the last table stays in
      force and traffic is unaffected. Only a proxy that has never once
      heard from its control plane refuses.
@@ -58,19 +60,19 @@ socket handling or process model.
    certificate configured and `tls.default_certificate` to fall back on)
    are redirected to HTTPS when `https.auto_redirect_to_https` is set —
    and only to a name this instance actually holds a certificate for,
-   because the `Location` is built from the request's own `Host` and a
-   request that named its application by header never had that `Host`
-   checked against anything. An application whose certificate failed to
-   load stays reachable over plain HTTP instead of being redirected to a
-   handshake that cannot succeed.
+   because the `Location` is built from the request's own `Host`, a name
+   the client chose. An application whose certificate failed to load stays
+   reachable over plain HTTP instead of being redirected to a handshake
+   that cannot succeed.
 3. **Pick a backend** from the upstream pool using the configured strategy
-   and forward the request, after taking the whole `x-deis-` namespace away
-   from the client. Every header under that prefix is dropped — not only the
-   two below, but `x-deis-caller`, `x-deis-tenant`, `x-deis-storage-token`
-   and anything a later component adds. Then `x-deis-app-id` is set to the id
-   deis-proxy decided on and `x-deis-environment` to that application's
-   environment, so deis-runtime only sees values that passed the checks above.
-   With `https.auto_offload_https = false` the upstream leg keeps TLS.
+   and forward the request carrying only this edge's own account of it. The
+   whole `x-deis-` namespace was already taken away from the client before
+   routing (step 1) — not only the two below, but `x-deis-caller`,
+   `x-deis-tenant`, `x-deis-storage-token` and anything a later component
+   adds. `x-deis-app-id` is set to the id deis-proxy decided on and
+   `x-deis-environment` to that application's environment, so deis-runtime
+   only sees values that passed the checks above. With
+   `https.auto_offload_https = false` the upstream leg keeps TLS.
 
    The prefix is the platform's own, in both directions: deis-bundle refuses
    a bundle that sets an `x-deis-` header on a *response* for the same reason
@@ -78,14 +80,15 @@ socket handling or process model.
    evidence one component produced for another, and evidence a client can
    write is not evidence. The cost is that an application cannot invent a
    header of its own under `x-deis-` and expect it to arrive; any other
-   prefix works. A client sending one is logged at `warn` with the count and
-   the names, because nothing legitimate on this path does it.
+   prefix works. A client sending one is logged at `debug` with the count
+   and the names, because nothing legitimate on this path does it.
 
-Because the header is validated — and the namespace cleared outright when
-nothing was resolved — deis-runtime's own targets such as `_inspect:<app>`
-and `_system` cannot be reached through deis-proxy in any of its modes; the
-inspector is meant to be used on deis-runtime's own port, where its
-`x-deis-inspect-token` never crosses this hop.
+Because routing answers only a `Host` this edge has a decision for, and
+the client's `x-deis-` headers are deleted before routing reads anything,
+deis-runtime's own targets such as `_inspect:<app>` and `_system` cannot
+be reached through deis-proxy in any of its modes; the inspector is meant
+to be used on deis-runtime's own port, where its `x-deis-inspect-token`
+never crosses this hop.
 
 A request body larger than `max_request_body_bytes` is refused rather than
 carried. A connection that has **completed** an upgrade is exempt, because

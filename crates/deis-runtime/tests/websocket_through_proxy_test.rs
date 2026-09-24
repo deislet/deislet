@@ -33,7 +33,6 @@ use axum::routing::any;
 use axum::Router;
 use deis_runtime::app::{AppKey, ApplicationManager};
 use deis_runtime::dispatcher::{handlers, AppState};
-use deis_runtime::APP_ID_HEADER;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -156,7 +155,15 @@ impl Handshake {
 /// pull whatever follows them out of the socket and into a buffer this
 /// function then throws away, which would silently eat the first frames of
 /// any server that starts talking immediately.
-async fn handshake(addr: SocketAddr, path: &str) -> Handshake {
+///
+/// `app_id_header` names the application in `x-deis-app-id`. A handshake
+/// against the node itself has to carry it - the node trusts that header and
+/// answers 400 without one. A handshake through the proxy must not rely on
+/// it: the proxy deletes the whole `x-deis-` namespace before it reads
+/// anything and routes by `Host`, so the direct handshake passes `Some` and
+/// the proxied ones `None`, which is itself the assertion that the header is
+/// not needed.
+async fn handshake(addr: SocketAddr, path: &str, app_id_header: Option<&str>) -> Handshake {
     let mut stream = TcpStream::connect(addr)
         .await
         .unwrap_or_else(|e| panic!("connecting to {addr}: {e}"));
@@ -168,8 +175,10 @@ async fn handshake(addr: SocketAddr, path: &str) -> Handshake {
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {HANDSHAKE_KEY}\r\n\
          Sec-WebSocket-Version: 13\r\n\
-         {APP_ID_HEADER}: {APP}\r\n\
-         \r\n"
+         {}\r\n",
+        app_id_header
+            .map(|app| format!("x-deis-app-id: {app}\r\n"))
+            .unwrap_or_default()
     );
     stream
         .write_all(request.as_bytes())
@@ -300,7 +309,7 @@ async fn a_handshake_against_the_node_switches_protocols_and_echoes_both_frame_k
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let node = Node::start().await;
-    let handshake = handshake(node.addr, "/ws").await;
+    let handshake = handshake(node.addr, "/ws", Some(APP)).await;
     assert_switched_protocols(&handshake);
 
     let mut socket = handshake.into_socket().await;
@@ -339,9 +348,11 @@ impl Drop for Proxy {
 /// creates (`app_configs(app_id, config, version_timestamp)`), because
 /// deis-runtime does not depend on deis-proxy and should not start to for a
 /// single row. The proxy's own `CREATE TABLE IF NOT EXISTS` runs over this
-/// happily. The domain is there because the proxy refuses an application
-/// that claims none; nothing in this file is addressed by host, so which
-/// name it is does not matter.
+/// happily. The proxy routes by `Host` alone - a client's `x-deis-*` headers
+/// are deleted before it reads anything - and the handshake and the readiness
+/// probe below are addressed to the address they dial, so the application's
+/// domain is the bare loopback literal that `Host` carries (the port is
+/// stripped before the match).
 fn seed_app(database: &std::path::Path, app_id: &str) {
     let connection = rusqlite::Connection::open(database).expect("the proxy database opens");
     connection
@@ -355,7 +366,7 @@ fn seed_app(database: &std::path::Path, app_id: &str) {
         )
         .expect("the app table exists");
     let config = format!(
-        r#"{{"id":"{app_id}","description":"","domains":["ws-proxy-app.test"],"certificates":[],"enabled":true,"cache":[]}}"#
+        r#"{{"id":"{app_id}","description":"","domains":["127.0.0.1"],"certificates":[],"enabled":true,"cache":[]}}"#
     );
     connection
         .execute(
@@ -514,7 +525,6 @@ impl Proxy {
     async fn probe(&self) -> Result<String, String> {
         let response = reqwest::Client::new()
             .get(format!("http://{}/", self.addr))
-            .header(APP_ID_HEADER, APP)
             .timeout(Duration::from_secs(2))
             .send()
             .await
@@ -548,7 +558,7 @@ async fn a_handshake_through_the_proxy_switches_protocols_and_echoes_both_frame_
     let node = Node::start().await;
     let proxy = Proxy::start(node.addr, 30).await;
 
-    let handshake = handshake(proxy.addr, "/ws").await;
+    let handshake = handshake(proxy.addr, "/ws", None).await;
     assert_switched_protocols(&handshake);
 
     let mut socket = handshake.into_socket().await;
@@ -578,7 +588,7 @@ async fn a_websocket_through_the_proxy_survives_an_idle_period() {
     let node = Node::start().await;
     let proxy = Proxy::start(node.addr, 2).await;
 
-    let handshake = handshake(proxy.addr, "/ws").await;
+    let handshake = handshake(proxy.addr, "/ws", None).await;
     assert_switched_protocols(&handshake);
     let mut socket = handshake.into_socket().await;
 

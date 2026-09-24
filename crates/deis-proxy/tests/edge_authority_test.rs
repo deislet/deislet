@@ -90,7 +90,9 @@ async fn a_control_plane_that_never_answered_refuses_instead_of_forwarding() {
 
     // Exactly the request that reached a different storage tenant through the
     // public edge before this was closed: a `Host` nothing here claims and a
-    // routing pair the client chose for itself.
+    // routing pair the client chose for itself. The routing pair is deleted
+    // before routing is even attempted now, and the unmatched `Host` alone
+    // decides the refusal.
     let answer = proxy
         .request_with_headers(
             "/whatever",
@@ -106,7 +108,8 @@ async fn a_control_plane_that_never_answered_refuses_instead_of_forwarding() {
     );
 
     // And the same for the node's internal application, which is the one
-    // whose name is worth guessing.
+    // whose name is worth guessing. The header is gone either way; a host of
+    // that name would not route in any state of this instance.
     let answer = proxy
         .request_with_headers("/", "victim.example", &[("x-deis-app-id", "_system")])
         .await;
@@ -176,8 +179,10 @@ async fn a_client_chosen_host_is_not_a_redirect_target() {
     // the request's own `Host`, and a default certificate is served for every
     // name that matches nothing - so "is HTTPS available for this host" used
     // to be true for every host on earth once one certificate existed. A
-    // client naming a known application and any `Host` it liked was answered
-    // 301 to that host, off the edge's domain and signed by it.
+    // client pairing a known application with any `Host` it liked was routed
+    // by that header and answered 301 to the host it chose, off the edge's
+    // domain and signed by it. The header is deleted before routing now, so
+    // the pairing routes nothing at all.
     let backend = Backend::start().await;
     let dir = tempfile::tempdir().expect("a directory for the certificate");
     let (cert_file, key_file) = certificate(dir.path(), "edge.example");
@@ -208,12 +213,15 @@ async fn a_client_chosen_host_is_not_a_redirect_target() {
     })
     .await;
 
+    // The same Host the client chose, still paired with the header: the
+    // header no longer routes, so the request is answered 404 on a Host
+    // nothing here claims - and in particular not a 301 built from it.
     let answer = proxy
         .request_with_headers("/login", "evil.example", &[("x-deis-app-id", "shop")])
         .await;
     assert!(
-        !status_line(&answer).starts_with("HTTP/1.1 301"),
-        "the edge sent a client to a host it holds no certificate for and never routed: {}",
+        status_line(&answer).starts_with("HTTP/1.1 404"),
+        "a Host nothing here claims does not route, whatever its header names; it answered {}",
         answer.lines().take(3).collect::<Vec<_>>().join(" | ")
     );
 
@@ -223,6 +231,73 @@ async fn a_client_chosen_host_is_not_a_redirect_target() {
     assert!(
         status_line(&answer).starts_with("HTTP/1.1 301") && answer.contains("https://edge.example"),
         "a name this edge serves over HTTPS still redirects to it: {}",
+        answer.lines().take(3).collect::<Vec<_>>().join(" | ")
+    );
+    backend.stop();
+}
+
+#[tokio::test]
+async fn a_client_chosen_app_id_header_does_not_route() {
+    // Before the header was deleted before routing, `x-deis-app-id` named any
+    // application the edge knew, whether or not anything routed to it
+    // publicly: an application with no route at all, and the node's own
+    // `_system`, were both reachable by asking. The header is deleted before
+    // the `Host` is even read now, so a request addressed to one application
+    // while naming another in the header is answered by the one its Host
+    // names.
+    let backend = Backend::start().await;
+    let proxy = Proxy::launch(ProxyOptions {
+        upstream: backend.addr,
+        apps: vec![
+            serde_json::json!({
+                "id": "shop",
+                "description": "",
+                "domains": ["shop.example"],
+                "certificates": [],
+                "enabled": true,
+                "cache": [],
+            }),
+            serde_json::json!({
+                "id": "blog",
+                "description": "",
+                "domains": ["blog.example"],
+                "certificates": [],
+                "enabled": true,
+                "cache": [],
+            }),
+        ],
+        // With applications configured an unknown host is a 404, so a
+        // forwarded request cannot be the readiness probe.
+        wait_for_forwarding: false,
+        ..Default::default()
+    })
+    .await;
+
+    // Addressed to shop, naming blog in the deleted namespace: blog is not
+    // reachable this way, and the request goes where its Host says.
+    let answer = proxy
+        .request_with_headers("/", "shop.example", &[("x-deis-app-id", "blog")])
+        .await;
+    assert!(
+        answer.ends_with(BACKEND_BODY),
+        "the request routes by its Host; it answered {answer:?}"
+    );
+    assert_eq!(
+        backend.last_header("x-deis-app-id").as_deref(),
+        Some("shop"),
+        "the node was handed the id this edge resolved, not the one the client typed; the head \
+         was:\n{:?}",
+        backend.heads().last()
+    );
+
+    // The node's own system application is not reachable by name either: a
+    // Host no route claims is a 404 whatever the header used to say.
+    let answer = proxy
+        .request_with_headers("/", "victim.example", &[("x-deis-app-id", "_system")])
+        .await;
+    assert!(
+        status_line(&answer).starts_with("HTTP/1.1 404"),
+        "a Host nothing here claims does not route; it answered {}",
         answer.lines().take(3).collect::<Vec<_>>().join(" | ")
     );
     backend.stop();

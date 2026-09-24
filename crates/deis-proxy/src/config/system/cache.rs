@@ -10,16 +10,16 @@
 //!
 //! Whoever wires it up inherits RUSTSEC-2026-0035. Pingora up to 0.7 shipped
 //! a default cache key built from the request path alone. On an edge that
-//! routes several tenants by `Host`, by path prefix, and by an explicit app
-//! id header, that key makes one tenant's response answerable to another
+//! routes several tenants by `Host` and by path prefix, that key makes one
+//! tenant's response answerable to another
 //! tenant's request - the same URI path under two different hosts is one
 //! entry. Pingora 0.8 deleted the default instead of repairing it, so
 //! `cache_key_callback` now has nothing to fall back on and every factor has
 //! to be named on purpose. For this proxy the key has to carry, at minimum,
 //! the scheme, the host and the whole request URI - which is what
 //! [`CacheConfig::default`] below already spells - *and* the app id and
-//! environment the router settled on, because `x-deis-app-id` can send two
-//! applications to the same host and path.
+//! environment the router settled on, so that a routing-table rewrite cannot
+//! serve one application's cached response to another.
 
 use std::str::FromStr;
 
