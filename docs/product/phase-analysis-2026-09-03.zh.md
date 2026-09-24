@@ -3277,3 +3277,126 @@ assignment 列表（那份答案里是明文 secret），被 `PermissionDenied` 
 
 另外，这一切做完之后这套安装**仍然在用别的全场通用密钥**，清单见
 [remaining-shared-secrets.zh.md](remaining-shared-secrets.zh.md)。
+
+## 106. 机器通道收尾：节点可触达的旧路由全部离场，并查实一条卡死的部署计划
+
+### 这一波做完了什么
+
+第 105 节的三个尾巴（proxy 到控制面的控制通道还在明文拨号、四个节点路由还挂在人用监听上、旧路由的 fallback 只挂了 `GET`）在这一波逐一收掉，并在门禁运行中撞见继而查实一条 wedged 部署计划。
+
+- **锁住机器通道新增的依赖边**（81bc4b7）：机器通道工作没有引入任何新的第三方 crate——`hyper`、`hyper-util`、`tokio-rustls`、`tonic` 此前都已通过别的路径进入依赖树，变的是哪些 crate 直接依赖它们。所以只落一次 `Cargo.lock`（`deis-control` 的 dependencies 里加一行 `axum-server`），源码、README、测试均无改动。
+- **proxy 控制通道转入 mTLS**（64f35a7）：`EstablishChannel`（注册、心跳、命令、配置推送）在配置了 `[machine_identity]` 时改走机器通道的 mTLS，未配置时保持原样明文拨 `[control] addr`。这是 proxy 上最后一个仍在「服务 dashboard 的监听」上拨号的连接。
+- **节点通道撤出人用监听**（45dcafd）：注册、assignment 列表、bundle 下载、routing table 四个路由从「服务 dashboard 的人类监听」上摘掉，只留在机器通道；人类监听对旧路径回 404。这是前面一系列改动为之服务的那一步：那四个路由此前由「舰队里每台机器都持有的 secret」守护，意味着承载「所有环境解密后 secret」的答案从 dashboard 可达的任何地方都能取。
+- **404 语义补齐**（2a4ca06）：静态 fallback 之前只挂了 `GET`，对本监听不存在的路径发 `PUT` 会得到 405「方法不对」——而方法从来不是问题所在。fallback 改为 `any(...)`，`PUT` 同样回 404。demo 里两个 node-fleet 检查随它们所测的路由一起搬进机器通道。
+
+门禁数字：`demo.sh verify` 维持 97/97，在「所有节点调用的路由均不在服务 dashboard 的监听上可达」的舰队上通过。（97→98 在本组之后。）
+
+- **被卡死的部署计划：从观测到查实**（a49df6e、285c53f）：门禁运行中撞见的事故，先用纯文档写明「结论尚未确定，正在核查；这一节记的是观测事实，不是结论」，再把同一节升级为带小标题的查实机制，并留三条待定产品决策。修复在下一节（见 107）。
+
+### 设计上值得记住的几条
+
+- **依赖方向跟着身份走，而不是跟着「谁能提供连接器」走**。deis-wire 被 15 个 crate 依赖，为给一个 client 提供 connector 而把 TLS 栈与 X.509 解析器拉进全部 15 个是错误交易；所以连接器放进「已有身份的 crate（deis-proxy）」这一侧——依赖从有身份的 crate 指向没有身份的 crate。
+- **通道第一次连接时才建**。tonic channel 会在构建它的 runtime 上 spawn buffer worker；proxy 在初始化用的临时 runtime 之外构建 client，构造时建通道会在启动时 panic「there is no reactor running」。改为持有 runtime-free、启动时已校验的 endpoint 与 dialler。
+- **对不存在的路径回 404 而非 401**。这个监听确实不提供它们，说 401 会暗示「某个凭据能改变这一点」——而没有任何凭据能。同理 405 也错：405 在读的人眼里是「换个方式再试」，而方法从来不是问题所在。
+- **没有 `[machine]` 段的控制面启动即拒**。否则它的病会被诊断为「一次一个 timeout、只看节点自己的日志」。
+- **事故先记观测、再记结论**。第一次落盘明确标注是观测事实不是结论，核查时要回答的是「正确行为是什么」而不是「怎么让 409 消失」；随后才在同处把观测升级为查实的机制并点名 `catalog/store.rs`、`delivery/mod.rs` 的确切位置。
+
+### 踩过的坑
+
+- **wedged 计划的事故现场**：一个额外注册的节点在部署投递期间因注册过期被移出舰队，此后该应用 production 环境**每一次部署都返回 409**「deployment plan ... is already in progress」，跨三次独立的 verify 运行、超过 30 分钟未自行解开；同一份代码在节点全程在位的干净运行里 97 项全过。
+- **查实的机制**：409 来自 `catalog/store.rs` 的 `create_deployment_plan`（写事务里拒绝该环境已有非终态计划）；target 集合在建计划时冻结、且故意把失联节点算进去（`delivery/mod.rs` 的 `serving_target_ids`），deliverer 在拨号之前就把 departed/contested 的目标翻译成 `Transport` 错误，而成功谓词是全称的。协调者租约每轮正常跑完并主动释放、两秒后又被重新认领——没有尝试上限、没有退避、没有截止时间。
+- **附带发现**：`deployments.rs` 里 `let _ = abort_prepared_plan(...)` 丢返回值，补偿没做完时 API 仍回 503「production 指针未改变」，卡死要到下一次部署才暴露。
+
+### 这一波没有做的
+
+- **fleet secret 未撤**：控制通道握手仍携带 `[control]` secret。代码注释与 commit message 都写明原因是控制面今天靠比较该 secret 决定握手——「It goes on the day the control plane takes the proved name in its place」。撤 secret 要等控制面改成接受被证明的名字，那是下一波。
+- **旧凭据路径仍以测试夹具存在**（45dcafd）：`node_router()` 改为 `#[cfg(test)] pub(crate)`，生产路径已无 producer；文件头注释承认 `NodeProof::PresharedKey`「survives only as the state a fleet in the middle of the move could still be in, with no production producer left to put a node into it」。
+- **反向调用的临时臂**：证明过证书但未上报 machine address 的节点仍被以明文 + 第一把配置 key 拨号，测试注释写明这是 `credential_for` 里被标为 temporary 的一支——「When a node refuses the key and the key leaves the configuration, this test is the one that has to be rewritten」。
+- **同名附带缺陷未修**（285c53f）：`let _ = abort_prepared_plan(...)` 丢返回值，文档只记录、未改。
+- **demo 门禁脆弱性未修**（a49df6e/285c53f）：注册与注销之间被中断会留下幽灵节点，使此后所有部署报「部分失败」；中断恢复能力未做。
+
+机制与三条待定产品决策的正文见 [remaining-shared-secrets.zh.md](remaining-shared-secrets.zh.md)。
+
+## 107. 舰队口令退场：从按证明的名字接纳，到全场零口令，再到字段删掉
+
+### 这一波做完了什么
+
+上一节留下的「fleet secret 未撤」和「wedged 计划未修」，都在这一波解决。叙事分三步，外加一条部署修复与两轮文档收口。
+
+- **第一步：证明过的名字接管握手**（435e59a）。`EstablishChannel` 在取走 stream 之前先读 `request.extensions()` 里的 `PeerIdentity`（机器通道监听口由 acceptor 写入的「这条连接证明过的名字」），`Authenticate` 分支改为 `match proved { Some(_) => true, None => 逐条比较 node_preshared_keys 与 req.secret }`——证明过名字的连接不再读 secret 字段。拒绝文案分两种：无 key 列表且没证明名字时点名「请到机器通道出示本舰队签发的证书」，其余仍是 Invalid secret——原先只会说 Invalid secret，在机器通道上那是谎报原因。三个关于流自身的事实（握手是否被接受、接受后给的名字、挂上的 session）合成一个 `ChannelState`：**「Two tests: a connection that proved a name is admitted while carrying a deliberately wrong secret, and the same wrong secret without a name is refused」**。
+- **第二步：全场零舰队口令安装**（7cc96ea）。`node_preshared_keys` 加 `#[serde(default)]`；空列表且配了 `[machine]` 时不再铸 key。`deis-wire` 的 `[control] secret` 改为 `Option<String>`，无 secret 的进程发送空握手字段——空串是「我什么都没出示」的诚实编码；写了但留空仍被拒（那是运维忘了填，不是一种选择）。`deis-proxy` 新增跨段校验：`[control]` 在、而 secret 与 `[machine_identity]` 都没有时拒绝启动。demo.sh 生成的三种配置全部删掉 `node_preshared_keys` 与 `[control] secret` 行。**「demo.sh configures no fleet key anywhere and 97 of 97 checks pass」**（`VERIFY_EXPECTED_CHECKS` 未变）。
+- **文档第一次收口**（76c105d）：十六份文档把「node_preshared_keys 仍是凭证」「节点路由在人用监听上」这两类已经变成假的句子在原处重写；写成历史的句子保留为历史。demo witness 的凭证写入者计数从至少 8 降为至少 5。验证原文：**「the credential-writer count falls to five」**。
+- **部署修复 + 启动即拒**（46d2874）。(A) fix(deploy)：新增 `deployment_target_abandon_after_secs`（默认 600 秒），离队且超过截止时间的目标被写下 `abandoned` 观测行并计入 settled，计划 note 写明有几个目标是被放弃的、不是被确认的；`aborting` 侧与 proxy 侧两个同形洞一并补掉。三个回归测试分别覆盖离队的 committed target、aborting target、committed proxy。(B) 启动即拒：`deis-proxy` 校验改为 `machine_identity.is_none()` 即拒；`deis-runtime` 新增「有 control endpoint 却没有 `[machine_identity]`」即拒，并删掉旧检查「有 machine_identity 但无 control endpoint 就拒绝」——那条用「注册仍是 HTTP 路由」给自己辩护，注册搬走后就不成立了。`VERIFY_EXPECTED_CHECKS` 从 97 升到 98，新增 `check_a_process_with_no_certificate_refuses_to_start`。**「demo.sh configures no fleet key anywhere and 98 of 98 checks pass」**、**「Its control plane sets a two-minute abandon deadline」**（demo 里 `deployment_target_abandon_after_secs = 120`）。
+- **第三步：把字段删掉，而不是改成可选**（a7ba508）。`ControlConfig` 删除 `node_preshared_keys` 字段；`ControlConfig::load` 在 `toml::from_str` 之前调用 `refuse_a_retired_fleet_key`，逐行认出仍写着 `node_preshared_keys` 的配置并启动即拒，报错同时点名 `[machine]` 的五个必配项——因为 serde 会静默丢弃该字段，把一个没有任何节点能接入的控制面留在原地。随之删掉 `ensure_node_credential`/`generate_node_key`/`NodeCredentialSource`、`middleware.rs`、`node_key.rs`、`NodeKeyStatus`、`NodeProof::PresharedKey` 与整个集成测试 crate，三个 enum 各自塌缩为一个变体，使「第二条更弱的路」不再可表示。数据端口上的明文节点管理面不再服务；`deis dev` 新增 `pki.rs`（rcgen 每次运行生成一次性自签 CA 与两张叶子，私钥 0600，trust domain 固定 `deis.dev`）；OpenAPI 删 `key_fingerprint`/`key_status`。验证原文：**「demo.sh verify: 98 of 98, with no shared value configured anywhere.」**（stat: 73 files changed, 3008 insertions(+), 6484 deletions(-)）。
+- **文档第二次收口**（ca7d683、8083bca）：`trust-boundaries.md` 标题去掉「and the fleet credential」并删掉「One credential, whole fleet」「What one value opens」两张表与整段口令轮换步骤，换成「仍被共享的值」编号清单；再进一步把「An assignment list is not scoped per node」改写为「Every node runs every application, so every node holds every application's secrets」，说明 `assignments_for` 的 `node_id` 仅作日志、答案来自 `list_assignments()`（整个目录），没有 placement model 就没有可供过滤的东西。`roadmap.json` 的 `P3-SEC-001` 由 queued 改 active。
+
+### 设计上值得记住的几条
+
+- **握手已经确定的事，握手里的字符串加不上任何东西**。一个已通过 mutual-TLS 握手、证明持有本舰队证书私钥的 proxy，仍必须把舰队密钥放进握手消息否则被拒——于是密钥无论如何都无法从配置里移除。所以证明了名字的连接里名字就是答案，secret 字段不读。
+- **拒绝理由要说明是两种情况里的哪一种**。原先只会说 Invalid secret，在机器通道上那是谎报原因；现在拆成「这台控制面没有配 key 列表、请到机器通道出示本舰队签发的证书」与「secret 不对」两种。
+- **「不写」与「写而留空」是两个状态**。`Option<String>` 让「不写」成为一种配置（该进程用证书证明自己），「留空」仍在 validate 处被拒。
+- **有身份无 secret 是完成态，不是降级态**。
+- **放弃一个节点不等于放弃一次部署**：节点每次启动都问自己该跑什么，真回来的机器会自己装上当前版本；丢的是确认，不是投递。
+- **写下的行是 `abandoned`，绝不是 `active`**：没有任何观察看到那台机器跑这个版本。
+- **两个路径有同样的洞、需要各自的答案**：等待已离队 proxy 的计划会从 `reconcile_plan` 的 proxy 门提前 return 而永远到不了终结器，所以放弃必须发生在那道门**之前**；`aborting` 是 pre-commit，但它和别的状态同样拒绝下一次部署。
+- **只对「已离队」生效，且以舰队自己的记录为基准**：还在名单上但推送失败的目标照旧无限等；截止时间以「舰队自己记录何时丢掉该机器」为基准。
+- **删掉而不是改成可选**：可选意味着「第二条更弱的路」仍然可表示；现在读到退役 key 的配置直接拒绝启动——因为 serde 会静默丢弃字段。
+
+### 踩过的坑
+
+- **格式残留进了日志**：`abandon_departed_participants` 的 error! 日志里 `Raise` 后含异常空白（疑为未清理的格式残留）。
+- **两半的时钟不同源**：proxy 侧的放弃只能用计划年龄计时（注释：「The proxy half has only the plan's own clock to measure with」），runtime 侧用 `departed_at`——时限依据不同，读代码的人得知道这一点。
+- **文档与提交自相矛盾**：`crates/deis-control/DEPLOYMENT.md` 里 backup.sh/restore.sh 示例加了 `CERTS`，而 `remaining-shared-secrets.zh.md` 第 3 条仍写「backup.sh / restore.sh 只复制四样东西、一样身份文件都不带」——仓库里没有真实的 `scripts/backup.sh`，只有文档内嵌脚本。
+
+### 这一波没有做的
+
+- **HTTP 传输代码仍未删**：服务端路由已是 `#[cfg(test)]`，客户端被启动校验挡住，但代码还在——留着只会让读代码的人以为还有两条路。
+- **proto 上的 `secret` 字段仍在 wire 上**：删除 proto 字段是破坏性变更，所以只做到「不再被读取」，注释写明「The `secret` field is still on the wire because removing a proto field is a ...」。
+- **证书签发、续期与撤销不在产品范围**：示例配置与 `pki.rs` 注释都写明「Nothing here issues, renews or revokes certificates; that is your PKI's job」。
+- **assignment 列表仍未按节点裁剪**：一台节点的证书仍读到全部租户的明文 secret；`assignments_for` 的 `node_id` 仅作日志。这不是加一个 filter 能解决的——部署计划的 `target_ids` 来自 `Deliverer::serving_target_ids`（控制面知道的所有节点），本版本没有 placement model，所以没有可供过滤的东西。
+- **控制面拨进节点这一方向尚未被证书覆盖**：证书至今只守住了「节点问、控制面答」这个方向——commit message 写道「the certificate has so far only secured the direction where the node asks and the control plane answers, not the direction where the control plane calls in」。
+- **其余全场通用值仍在**：`storage_auth_secret`、deis-telemetry 的 `auth_secret`、`api_keys`、三个 migration admin token、`secret_key_file` 各有各的改法与爆炸半径；完整清单见 [remaining-shared-secrets.zh.md](remaining-shared-secrets.zh.md)。
+- **demo 中断恢复仍未做**：注册与注销之间被中断会留下一个永不回答的机器，污染本次以及之后两次运行。
+
+## 108. 证书到期预警、配置预检与 demo 韧性三连
+
+### 这一波做完了什么
+
+门禁数字从 98 升到 101。每一步都只加了一项检查、一项能力——用最少的增量把最可能无声失效的几条路盖住。
+
+- **证书到期预警**（31d6076）：签发、续期与撤销证书不是 deislet 的职责，这使任何 PKI 都可替换——但代价是到期变成了别人的事，而且没人会注意到它被忘了。一张即将到期的证书直到到期那一刻都毫无征兆，然后机器通道上的每条连接同时失败、没有任何进程能说出原因。现在每个进程在启动时和每次重载 tick 上读自己的 `notAfter`，按证书自身有效期的比例——五分之四警告、二十分之十九报错——而不是天数。两天的证书和多年的证书挂在同一个平台上，天数阈值对前者不说话、对后者每次启动都告警。启动行是关键：运维读那些，很少在出事前读别的。`VERIFY_EXPECTED_CHECKS` 从 98 升到 99，新增 `check_every_process_says_when_its_certificate_runs_out`。验证原文：**「demo.sh verify: 99 of 99, the new check asking that all three processes really do say it and that none of them warns about a certificate minted minutes ago.」**
+- **启动前配置检查**（e3459b3）：Canary installer 因机器通道重写后从未跑过——在沙箱里生成发现了两处会在真实机器上炸的错。第一个是未引用 heredoc 里的反引号，写入节点配置时执行了一条注释里的词——与 demo.sh 早期发现的是同一问题、同一根因。第二个更值得一个 feature：`deis-control` 收到不存在的 --config 路径时不是报错，而是以内置默认值启动——port 8080、无 API 认证、无机器通道——一个没人配过的控制面，长着一副配好了的样子。现在是「以此路径命名的文件不存在」的硬错误。两个二进制同时获得 `--check-config`：加载文件、走完启动时的每一条校验规则、说出结论后退出。是门禁而不是 parse，没有 `[machine]` 段的控制面算不过而不是算过。Installer 在六个 systemctl 前后加上 `--check-config`——一份会在部署后失效的安装现在死在文件阶段，而不是六项服务各自以不可命名的方式拒绝接入。验证原文：**「Verified against what the installer really writes: both configurations load, the three certificates carry the right SPIFFE names and all chain to the authority it minted」**。
+- **节点重启回来**（9748fc1）：架构原则第 8 条说节点只被告诉该跑什么而不被信任能记住——启动时问控制面、自己下载 bundle、全部加载后才报 healthy。pull 是使重启节点带着原有的东西回来的机制，但在此之前没有代码之外的东西问过它是否真的能——其余每项检查都是对一个全程在线的节点做的，那是那项主张毫无代价的情况。在局域网中机器会重启。所以这步用 SIGTERM 停掉节点——是重启不是 crash——在相同配置、相同 data 目录上重新启动，问应用是否以相同版本重新提供服务，没有任何部署。节点 data 目录被保留，因此仅重新加载本地 bundle store 的节点从外部看完全一样。区分这两者的是一行日志「手里有控制面的 assignment 列表」——只在拨通机器通道、证明证书之后才抵达。检查等那行日志而不在第一个 200 时读取计数：端口在日志写入之前就应答，提前读计数会把 pull 当成 local reload 上报。放在最后，因为拿走节点之后任何后续检查都是在质问一个还没回来的节点。检查把自己写入替换 pid 的状态文件——因为 `stop` 读那个文件，如果被此检查拉起来的节点比 `stop` 活得更久，会占住端口并拒绝下一次 `start`，那是比正在抓的错更严重的失败，属于此检查自己的责任。`VERIFY_EXPECTED_CHECKS` 从 99 升到 100。
+- **控制面宕机流量不断**（1522a8c）：节点问控制面该跑什么。如果服务也需要控制面，那么持有 catalog 的机器就在平台的每一次请求的路上了——它的重启会是每个租户的停机。设计说不是这样：节点服务自己已经加载的东西，控制面的缺失仅使节点失去获知变化的能力。但代码之外没有东西问过这件事是否真的成立。所以这步在流量流动时停掉控制面，持续几秒反复问应用——不是一次 probe：只在下次 reconcile 才失败的节点会通过立刻取样的单次 probe。然后以相同的数据库重新启动控制面，等待舰队就节点健康达成一致——那是节点自己的重注册和控制面的轮询，两者都不是即时、两者都不是人工操作。`VERIFY_EXPECTED_CHECKS` 从 100 升到 101。**「The application answered 200 to every one of the twelve requests made while the control plane was gone.」**
+- **双跳都问**（550161c）：上一版只问节点，留下了更容易搞错的那一半未被测试。deis-proxy 每几秒轮询路由表；一次未能到达控制面的轮询如果清空了表，会在控制面离开几秒后使 edge 陷入黑暗——而节点在后端完美响应，控制面绕了一圈毕竟还是单点。于是现在真实请求经过的两跳都被问了，而且对比它们之前的回答而不是硬编码的 200。这条路由回答 202，断言 200 会在路由正确时把 edge 报成黑暗——一项因合法回答而失败的检查比没有检查更糟，因为下一个人让它通过的方式是把它变松。验证原文：**「demo.sh verify: 101 of 101 on a clean run. Both hops answered as they did before, twelve times each, while the control plane's own health answered nothing.」**
+
+### 设计上值得记住的几条
+
+- **证书是不可见的——到它到期那一刻才是**。所以检查是给运维看的，主路径是启动行；数据点在每次重载 tick 上刷新。
+- **阈值是比例、不是天数**。平台手上同时有两天的证书与多年的证书；固定天数阈值对前者的临近到期一言不发、对后者每次启动都告警——每次启动都告警的东西运维会学会跳过那个真正关键的。
+- **`--check-config` 是门禁、不是 parse**：没有 `[machine]` 段就是**过不了**的那个，因为一个没有机器通道的控制面无法运行——不在检查时拒绝它、就要在六项服务各自以不可命名的方式失败后去找。
+- **Installer 在写文件之后、启动服务之前加一刀**：一份写出来就不能用的配置死在文件阶段，而不是在六项 systemctl 启动失败、各有各的理由难缠。
+- **SIGTERM 不是 crash**：模拟的是重启——正常关闭、同一份数据、同一份配置——而不是进程被 kill -9 或断电。
+- **pull vs local reload 的区分靠日志行而不是端口响应时间**：端口在日志之前就应答了，靠时间区分不可靠。拨通机器通道、证明证书之后的日志行才是 pull 的可靠证据。
+- **一次 probe 不够**：只在下一次 reconcile 才失败的节点会通过立刻取样的单次 probe——需要在几秒窗口内多次请求才能可靠检测。
+- **双跳都问，而且对比「之前」而不是「200」**：edge hop 是最容易搞错的——proxy 的空路由表会同时让所有应用不可达——而且硬编码 200 会在路由正确回答 202 时报假失败。
+
+### 踩过的坑
+
+- **canary installer 未被跑过的无声退化**（e3459b3）：重写后从未执行——两个 faults 会在真实机器上炸。`--check-config` 和 installer 在沙箱中重新验证被加进去，使这种「变形后未经生产」不会无声通过。
+- **edge hop 默认 200 假设**（550161c）：这个路由回答 202，最初版本在两跳都问之后断言 200，edge 被报黑暗——实际上它路由正确。修复是「对比之前的回答」而不是换一个硬编码值——因为下一个路由可能回答 204，下一次又会遇到同一个问题。
+
+### 这一波没有做的
+
+- **证书续期自动化**：签发、续期、撤销仍在 deislet 之外；预警只是让运维在到期前看到那条行。
+- **控制面宕机时 proxy 路由表 refresh 的语义未全覆盖**：demo 检查了「空路由表不会发生」这一路径，但没有模拟 proxy 与控制面之间的部分网络分区、延迟波动等边缘情况。
+- **证书生命周期操作（reload / rotate）仍靠重启**：目前没有不带停机地换证书的路径；「重启回来」检查（9748fc1）恰好证明了重启之后事能接上，但并未提供在线换证能力。
+- **`remaining-shared-secrets.zh.md` 附一的幽灵节点污染**：仍靠控制面宕机→节点重启→两分钟放弃期限这一绕行链路，而不是消除污染本身。
+- **目前其余的未完成项与前面的章节共享**——全场通用值清单见 [remaining-shared-secrets.zh.md](remaining-shared-secrets.zh.md)，路线图见 [roadmap.json](roadmap.json)。
+
+---
+
+写到这里，demo.sh verify 的 101 项检查全部在「舰队量级上没有任何一处配置了共享口令、所有机器用各自证书证明身份、节点按 pull 语义还原、控制面不在时边缘与应用照常服务」的状态下通过。这是机器通道安全硬化这一波的终点。
+
+但从产品路线图来看，这只是 P3-SEC-001 的 M1 收尾——剩余清理（删旧 HTTP 传输代码、脚本与文档中口令引用尾巴）、Stage 5 能力（三服务 auth_secret、storage token 按租户、assignment 列表按节点裁剪）仍在途。接下去的工作见 [roadmap.json](roadmap.json) 的 `nextActions` 与第 107 节「这一波没有做的」。
+
