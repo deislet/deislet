@@ -24,6 +24,12 @@ MATURITY = {
     "deployed": 2,
     "conformance-passed": 3,
 }
+# Deislet-side target freeze policy (remediation D-5 / T5-1): frozen targets
+# ship stateless function artifacts only. They accept no bindings and carry no
+# certification promises; the registry snapshot stays upstream-owned, so the
+# freeze is applied here as an overlay rather than by editing the snapshot.
+FROZEN_BACKENDS = frozenset({"deno", "tencent-edgeone-makers"})
+LIFECYCLE_STATES = ("active", "frozen")
 
 
 class StatusError(RuntimeError):
@@ -113,8 +119,29 @@ def source_state() -> tuple[dict[str, Any], dict[str, Any], str]:
     return lock, registry, actual_digest
 
 
+def check_lifecycle(registry: dict[str, Any]) -> None:
+    """The freeze overlay must name real backends and promise nothing extra."""
+    registered = {backend["id"] for backend in registry["backends"]}
+    unknown = FROZEN_BACKENDS - registered
+    require(
+        not unknown,
+        f"frozen backends missing from the registry: {sorted(unknown)}",
+    )
+    for backend in registry["backends"]:
+        if backend["id"] in FROZEN_BACKENDS:
+            require(
+                not backend["certification"]["supported"],
+                f"{backend['id']}: a frozen target cannot be supported",
+            )
+            require(
+                not backend["certification"]["compliant"],
+                f"{backend['id']}: a frozen target cannot be compliant",
+            )
+
+
 def target_status() -> dict[str, Any]:
     lock, registry, digest = source_state()
+    check_lifecycle(registry)
     source = lock["source"]
     standard = lock["standard"]
     policy = registry["certificationPolicy"]
@@ -142,6 +169,9 @@ def target_status() -> dict[str, Any]:
                 "id": backend["id"],
                 "displayName": backend["displayName"],
                 "role": backend["role"],
+                "lifecycle": (
+                    "frozen" if backend["id"] in FROZEN_BACKENDS else "active"
+                ),
                 "implementation": backend["implementation"],
                 "evidence": backend["evidence"],
                 "certification": backend["certification"],
@@ -177,20 +207,22 @@ def render_markdown(status: dict[str, Any]) -> str:
         f"标准 `{standard['id']}` 当前为 `{standard['releaseStatus']}`，",
         f"normative release：{yes_no(standard['normativeRelease'])}。",
         "只有完整标准版本达到 `conformance-passed` 且仍在维护窗口内，才可显示为支持。",
+        "生命周期为 `frozen` 的目标仅生成无状态函数产物：不接受绑定，不承诺认证。",
         "",
-        "| 后端 | 角色 | 证据成熟度 | 证据结果 | 认证 | 合规 | 支持 | 有效期 |",
-        "|---|---|---|---|---|---:|---:|---|",
+        "| 后端 | 角色 | 生命周期 | 证据成熟度 | 证据结果 | 认证 | 合规 | 支持 | 有效期 |",
+        "|---|---|---|---|---|---:|---:|---:|---|",
     ]
     for backend in status["backends"]:
         evidence = backend["evidence"]
         certification = backend["certification"]
         valid_until = certification["validUntil"] or "—"
         lines.append(
-            "| {display} (`{id}`) | `{role}` | `{maturity}` | `{outcome}` | "
+            "| {display} (`{id}`) | `{role}` | `{lifecycle}` | `{maturity}` | `{outcome}` | "
             "`{certification}` | {compliant} | {supported} | {valid_until} |".format(
                 display=backend["displayName"],
                 id=backend["id"],
                 role=backend["role"],
+                lifecycle=backend["lifecycle"],
                 maturity=evidence["maturity"],
                 outcome=evidence["outcome"],
                 certification=certification["status"],

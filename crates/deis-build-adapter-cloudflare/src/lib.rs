@@ -44,39 +44,22 @@ pub fn generate_with_node_compat(
     node_compat: bool,
 ) -> anyhow::Result<AdapterArtifacts> {
     refuse_unplanned_resources(config)?;
+    // Everything below runs only for a stateless Worker: KV, D1, Blob, Queue
+    // and explicit bindings were all rejected above, so there is no branch on
+    // `has_kv`/`has_database` any more and no template that would emit a
+    // provider resource identifier the build could not know.
     let environment_declarations =
         deis_build_core::resolve_environment_declaration_entries(config)?;
     let environment_declarations_json = serde_json::to_string(&environment_declarations)?;
-    let has_kv = config
-        .services
-        .as_ref()
-        .and_then(|s| s.kv.as_ref())
-        .map(|kv| kv.enabled)
-        .unwrap_or(false);
-
-    let has_database = config
-        .services
-        .as_ref()
-        .and_then(|s| s.database.as_ref())
-        .map(|db| db.enabled)
-        .unwrap_or(false);
 
     // 1. Generate Context Builder Code
-    let context_builder_code =
-        generate_context_builder_code(has_kv, &environment_declarations_json);
+    let context_builder_code = generate_context_builder_code(&environment_declarations_json);
 
-    // 2. Generate KV Adapter Code
-    let kv_adapter_code = if has_kv {
-        Some(generate_kv_adapter_code())
-    } else {
-        None
-    };
-
-    // 3. Generate Router Code
+    // 2. Generate Router Code
     let router_code =
-        generate_router_code(routes, has_kv, node_compat, &environment_declarations_json);
+        generate_router_code(routes, node_compat, &environment_declarations_json);
 
-    // 4. Generate Config Files
+    // 3. Generate Config Files
     let mut config_files = Vec::new();
 
     // wrangler.toml
@@ -123,7 +106,7 @@ pub fn generate_with_node_compat(
         r#"name = "{}"
 main = "index.js"
 compatibility_date = "{compatibility_date}"
-{}{}{}{}"#,
+{}{}"#,
         config.name,
         if node_compat {
             "compatibility_flags = [\"nodejs_compat\"]\n"
@@ -144,25 +127,6 @@ directory = "./{ASSETS_DIR}"
 "#
             )
         },
-        if has_kv {
-            r#"
-[[kv_namespaces]]
-binding = "KV"
-id = ""  # Add your KV namespace ID
-"#
-        } else {
-            ""
-        },
-        if has_database {
-            r#"
-[[d1_databases]]
-binding = "DB"
-database_name = ""  # Add your D1 database name
-database_id = ""    # Add your D1 database ID
-"#
-        } else {
-            ""
-        }
     );
     config_files.push(("wrangler.toml".to_string(), wrangler_toml));
 
@@ -180,7 +144,7 @@ database_id = ""    # Add your D1 database ID
     Ok(AdapterArtifacts {
         router_code,
         context_builder_code,
-        kv_adapter_code,
+        kv_adapter_code: None,
         config_files,
         support_files: vec![(
             "edge-canon-runtime.js".to_string(),
@@ -211,7 +175,6 @@ fn refuse_unplanned_resources(config: &ProjectConfig) -> anyhow::Result<()> {
 
 fn generate_router_code(
     routes: &[(String, String)],
-    has_kv: bool,
     node_compat: bool,
     environment_declarations_json: &str,
 ) -> String {
@@ -245,11 +208,6 @@ fn generate_router_code(
         ));
     }
 
-    let _kv_import = if has_kv {
-        "import { createKVAdapter } from './adapters/kv-adapter';\n"
-    } else {
-        ""
-    };
     let node_runtime_import = if node_compat {
         "import { runWithEdgeCanonNodeEnv } from 'edge-canon:node-runtime';\nimport { edgeCanonProcessEnvironment } from './edge-canon-runtime.js';\n"
     } else {
@@ -292,17 +250,7 @@ export default {{
     )
 }
 
-fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &str) -> String {
-    let kv_import = if has_kv {
-        "import { createKVAdapter } from './kv-adapter';\n"
-    } else {
-        ""
-    };
-    let kv_binding = if has_kv {
-        "if (env && env.KV) standardEnv.KV = createKVAdapter(env.KV);"
-    } else {
-        ""
-    };
+fn generate_context_builder_code(environment_declarations_json: &str) -> String {
     format!(
         r#"/**
  * Edge Canon context bridge for Cloudflare Workers.
@@ -311,7 +259,7 @@ fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &s
  * request, env, params and waitUntil, as required by EC-WEB v1.
  */
 
-{kv_import}import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
+import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
 
 const EDGE_CANON_ENVIRONMENT_DECLARATIONS = {environment_declarations_json};
 
@@ -322,7 +270,6 @@ export function createContextBuilder(env: any, ctx: any) {{
       env,
       EDGE_CANON_ENVIRONMENT_DECLARATIONS
     );
-    {kv_binding}
     return createEdgeCanonContext(
       request,
       standardEnv,
@@ -333,57 +280,6 @@ export function createContextBuilder(env: any, ctx: any) {{
 }}
 "#
     )
-}
-
-fn generate_kv_adapter_code() -> String {
-    r#"/**
- * Cloudflare KV Adapter
- */
-
-export function createKVAdapter(namespace: any) {
-  return {
-    async get(key: string): Promise<string | null> {
-      return namespace.get(key);
-    },
-
-    async getJSON<T = any>(key: string): Promise<T | null> {
-      return namespace.get(key, 'json');
-    },
-
-    async put(key: string, value: string, options?: any): Promise<void> {
-      await namespace.put(key, value, {
-        expirationTtl: options?.expirationTtl,
-        metadata: options?.metadata
-      });
-    },
-
-    async putJSON<T = any>(key: string, value: T, options?: any): Promise<void> {
-      await namespace.put(key, JSON.stringify(value), {
-        expirationTtl: options?.expirationTtl,
-        metadata: options?.metadata
-      });
-    },
-
-    async delete(key: string): Promise<void> {
-      await namespace.delete(key);
-    },
-
-    async list(options?: any) {
-      const result = await namespace.list(options);
-      return {
-        keys: result.keys,
-        list_complete: result.list_complete,
-        cursor: result.cursor
-      };
-    },
-
-    async exists(key: string): Promise<boolean> {
-      return (await namespace.get(key)) !== null;
-    }
-  };
-}
-"#
-    .to_string()
 }
 
 #[cfg(test)]

@@ -46,6 +46,7 @@ struct Backend {
     id: String,
     display_name: String,
     role: String,
+    lifecycle: String,
     implementation: Implementation,
     evidence: Evidence,
     certification: Certification,
@@ -126,6 +127,7 @@ pub fn list(output: Output) -> Result<()> {
     let mut table = Table::new(&[
         "TARGET",
         "ROLE",
+        "LIFECYCLE",
         "EVIDENCE",
         "RESULT",
         "CERTIFICATION",
@@ -140,6 +142,7 @@ pub fn list(output: Output) -> Result<()> {
                 escaped(&backend.id)
             ),
             escaped(&backend.role),
+            escaped(&backend.lifecycle),
             escaped(&backend.evidence.maturity),
             escaped(&backend.evidence.outcome),
             escaped(&backend.certification.status),
@@ -197,6 +200,15 @@ pub fn inspect(id: &str, output: Output) -> Result<()> {
         escaped(&backend.id)
     );
     println!("Role: {}", escaped(&backend.role));
+    println!(
+        "Lifecycle: {}{}",
+        escaped(&backend.lifecycle),
+        if backend.lifecycle == "frozen" {
+            " (stateless function artifacts only; no bindings, no certification)"
+        } else {
+            ""
+        }
+    );
     println!(
         "Implementation evidence: {} @ {}",
         escaped(&backend.implementation.repository),
@@ -268,6 +280,22 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), before);
+    }
+
+    #[test]
+    fn frozen_targets_promise_nothing() {
+        let (_, status) = document().unwrap();
+        let frozen: Vec<&str> = status
+            .backends
+            .iter()
+            .filter(|backend| backend.lifecycle == "frozen")
+            .map(|backend| backend.id.as_str())
+            .collect();
+        assert_eq!(frozen, vec!["tencent-edgeone-makers", "deno"]);
+        assert!(status.backends.iter().all(
+            |backend| backend.lifecycle != "frozen"
+                || (!backend.certification.compliant && !backend.certification.supported)
+        ));
     }
 
     #[test]

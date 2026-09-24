@@ -22,6 +22,7 @@
       "id": "deislet",
       "displayName": "Deislet",
       "role": "first-class",
+      "lifecycle": "active",
       "implementation": {
         "repository": "https://github.com/deislet/deislet",
         "sourceCommit": "5edec52048061dfad1c1af91aa59592e8b817fbb",
@@ -55,6 +56,7 @@
       "id": "cloudflare-workers-pages",
       "displayName": "Cloudflare Workers/Pages",
       "role": "first-class",
+      "lifecycle": "active",
       "implementation": {
         "repository": "https://github.com/deislet/deislet",
         "sourceCommit": "5edec52048061dfad1c1af91aa59592e8b817fbb",
@@ -88,6 +90,7 @@
       "id": "tencent-edgeone-makers",
       "displayName": "Tencent EdgeOne Makers",
       "role": "first-class",
+      "lifecycle": "frozen",
       "implementation": {
         "repository": "https://github.com/deislet/deislet",
         "sourceCommit": "5edec52048061dfad1c1af91aa59592e8b817fbb",
@@ -121,6 +124,7 @@
       "id": "deno",
       "displayName": "Deno",
       "role": "experimental",
+      "lifecycle": "frozen",
       "implementation": {
         "repository": "https://github.com/deislet/deislet",
         "sourceCommit": "5edec52048061dfad1c1af91aa59592e8b817fbb",

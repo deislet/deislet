@@ -8,13 +8,14 @@
 标准 `edge-canon.next` 当前为 `proposal`，
 normative release：否。
 只有完整标准版本达到 `conformance-passed` 且仍在维护窗口内，才可显示为支持。
+生命周期为 `frozen` 的目标仅生成无状态函数产物：不接受绑定，不承诺认证。
 
-| 后端 | 角色 | 证据成熟度 | 证据结果 | 认证 | 合规 | 支持 | 有效期 |
-|---|---|---|---|---|---:|---:|---|
-| Deislet (`deislet`) | `first-class` | `deployed` | `pass` | `not-certified` | 否 | 否 | — |
-| Cloudflare Workers/Pages (`cloudflare-workers-pages`) | `first-class` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
-| Tencent EdgeOne Makers (`tencent-edgeone-makers`) | `first-class` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
-| Deno (`deno`) | `experimental` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
+| 后端 | 角色 | 生命周期 | 证据成熟度 | 证据结果 | 认证 | 合规 | 支持 | 有效期 |
+|---|---|---|---|---|---:|---:|---:|---|
+| Deislet (`deislet`) | `first-class` | `active` | `deployed` | `pass` | `not-certified` | 否 | 否 | — |
+| Cloudflare Workers/Pages (`cloudflare-workers-pages`) | `first-class` | `active` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
+| Tencent EdgeOne Makers (`tencent-edgeone-makers`) | `first-class` | `frozen` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
+| Deno (`deno`) | `experimental` | `frozen` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
 
 ## 当前阻断项
 

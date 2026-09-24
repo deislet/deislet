@@ -432,4 +432,3 @@ Error: SPEC_PLATFORM_DETECTION
 
 - [deislet/spec](https://github.com/deislet/spec) - 规范文档
 - [Target Artifact Coverage](./src/target_artifact_coverage.rs) - 目标产物实现清单，不是支持状态
-- [Error Codes Reference](./ERROR_CODES.md) - 完整错误代码列表

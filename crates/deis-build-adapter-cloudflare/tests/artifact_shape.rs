@@ -121,6 +121,22 @@ fn unresolved_kv_binding_is_rejected() {
 }
 
 #[test]
+fn the_wrangler_toml_never_carries_a_provider_resource_identifier() {
+    // Resource identifiers are resolved by the provider driver from the
+    // deployment state, never invented by the build. The old templates emitted
+    // `id = ""` for the author to fill in by hand, which would deploy a Worker
+    // that references nothing; bindings are refused outright instead.
+    let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
+    let result = generate(&routes, &test_config("plain", false), &[]).unwrap();
+    let content = wrangler_toml(&result);
+
+    assert!(!content.contains("[[kv_namespaces]]"), "{content}");
+    assert!(!content.contains("[[d1_databases]]"), "{content}");
+    assert!(!content.contains("id ="), "{content}");
+    assert!(!content.contains("database_id"), "{content}");
+}
+
+#[test]
 fn test_wrangler_toml_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-worker", false);
