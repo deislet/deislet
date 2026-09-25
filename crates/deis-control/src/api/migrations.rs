@@ -869,7 +869,8 @@ mod tests {
             running: Arc::new(Mutex::new(BTreeSet::new())),
             cancelling: Arc::new(Mutex::new(BTreeSet::new())),
         };
-        // Legacy prefix on purpose: the flat tree's regression coverage.
+        // Flat prefix on purpose: the same handlers under a plain mount,
+        // with no gate and no request context in the way.
         let api = router("/api", state);
 
         let response = api
@@ -1022,7 +1023,7 @@ mod tests {
             telemetry_migration_admin_token: Some("t".repeat(32)),
             ..Default::default()
         };
-        let api = router("/api", MigrationApiState::new(store, &config));
+        let api = router("/api/v1", MigrationApiState::new(store, &config));
         let request_id = CanonicalId::new_v7();
         let correlation_id = CanonicalId::new_v7();
         let idempotency_key = "migration-shop-2026-09-04";
@@ -1030,7 +1031,7 @@ mod tests {
         let make_request = move || {
             Request::builder()
                 .method("POST")
-                .uri("/api/apps/shop/identity-migration")
+                .uri("/api/v1/apps/shop/identity-migration")
                 .header(IDEMPOTENCY_KEY, idempotency_key)
                 .header(REQUEST_ID, request_id.to_string())
                 .header(CORRELATION_ID, correlation_id.to_string())
@@ -1064,7 +1065,7 @@ mod tests {
         assert_eq!(operation.state, deis_wire::OperationState::Queued);
         assert_eq!(
             location,
-            format!("/api/operations/{}", operation.operation_id)
+            format!("/api/v1/operations/{}", operation.operation_id)
         );
         assert!(
             !String::from_utf8(body.to_vec())
@@ -1088,7 +1089,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/apps/shop/identity-migration")
+                    .uri("/api/v1/apps/shop/identity-migration")
                     .header(IDEMPOTENCY_KEY, "different-migration-request")
                     .header(header::IF_MATCH, format!("\"{revision}\""))
                     .body(Body::empty())
@@ -1336,6 +1337,11 @@ mod tests {
         let etag = |revision: u64| format!("\"{revision}\"");
         let deployment_uri =
             format!("/api/apps/demo/environments/production/provider-deployments/{operation_id}");
+        // The header is spelled for the surface the request context names;
+        // this mount carries none, so it is spelled for v1.
+        let deployment_location = format!(
+            "/api/v1/apps/demo/environments/production/provider-deployments/{operation_id}"
+        );
         let cancel_uri = format!("/api/operations/{operation_id}/cancel");
 
         // The deploy scope of the operation's own application/environment is
@@ -1381,7 +1387,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         // The answer is the scoped route's answer: the deployment the same
         // credential can read, its new revision, and no caching.
-        assert_eq!(response.headers()[header::LOCATION], deployment_uri);
+        assert_eq!(response.headers()[header::LOCATION], deployment_location);
         assert_eq!(response.headers()[header::ETAG], etag(revision + 1));
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert!(response.headers().contains_key(REQUEST_ID));
@@ -1680,7 +1686,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
             response.headers()[header::LOCATION],
-            format!("/api/apps/demo/environments/production/provider-deployments/{operation_id}")
+            format!(
+                "/api/v1/apps/demo/environments/production/provider-deployments/{operation_id}"
+            )
         );
         assert_eq!(response.headers()[header::ETAG], etag(revision + 1));
         let cancelling = json(response).await;
@@ -1721,20 +1729,16 @@ mod gated_tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
-    use axum::response::IntoResponse;
     use axum::{Router, middleware::from_fn_with_state};
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use super::{
-        CORRELATION_ID, CoordinatorAvailability, MigrationApiState, OperationAccess, REQUEST_ID,
-        router,
-    };
+    use super::{CORRELATION_ID, CoordinatorAvailability, MigrationApiState, REQUEST_ID, router};
     use crate::api::authz::{AuthzState, authorize};
     use crate::api::catalog::providers::tests::{
         attach_artifact, begin_deployment, provider_fixture,
     };
-    use crate::api::error::{ApiError, codes};
+    use crate::api::error::codes;
     use crate::api::versioning::{ApiSurface, attach_request_context, render_errors};
     use crate::audit::{AuditQuery, AuditStore, Outcome};
     use crate::catalog::CatalogStore;
@@ -1787,7 +1791,9 @@ mod gated_tests {
                 .layer(from_fn_with_state(surface, render_errors))
                 .layer(from_fn_with_state(surface, attach_request_context))
         };
-        let router = surfaced(ApiSurface::Legacy, router("/api", state.clone()))
+        // The flat mount is the spelling the gate's table is written in;
+        // the nested one proves a versioned path reads as the route it is.
+        let router = surfaced(ApiSurface::V1, router("/api", state.clone()))
             .merge(surfaced(
                 ApiSurface::V1,
                 Router::new().nest("/api/v1", router("", state)),
@@ -1841,7 +1847,7 @@ mod gated_tests {
         }
     }
 
-    /// The gate is layered outside all three mounts, so a call it refuses
+    /// The gate is layered outside both mounts, so a call it refuses
     /// never reaches the request-context middleware and the answer is built
     /// by the gate itself. Both ids still come back: a client that sent a
     /// correlation id has to be able to tie the refusal to the calls it
@@ -2028,37 +2034,35 @@ mod gated_tests {
             (&elsewhere.to_string(), "deploy"),
             (&migration, "migrate"),
         ] {
-            let (status, answer) = get(&gated, &format!("/api/v1/operations/{id}"), &gated.root_secret).await;
+            let (status, answer) = get(
+                &gated,
+                &format!("/api/v1/operations/{id}"),
+                &gated.root_secret,
+            )
+            .await;
             assert_eq!(status, StatusCode::OK, "{id}: {}", answer.text());
             assert_eq!(answer.json()["kind"], kind, "{id}");
             assert!(answer.headers.contains_key(header::ETAG), "{id}");
         }
-        let (status, answer) =
-            get(&gated, &format!("/api/v1/operations/{unknown}"), &gated.root_secret).await;
+        let (status, answer) = get(
+            &gated,
+            &format!("/api/v1/operations/{unknown}"),
+            &gated.root_secret,
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{}", answer.text());
         assert_eq!(answer.json()["error"]["code"], codes::NOT_FOUND);
 
-        // (e) The legacy spelling refuses with the legacy body, byte for
-        // byte what `insufficient_scope` has always rendered there: two
-        // strings and nothing structured.
+        // (e) The unversioned spelling the gate's table is written in
+        // refuses the same way: the gate reads the record the path names
+        // and answers the envelope with the denial, whatever prefix the
+        // route was spelled under.
         let (status, answer) = get(&gated, &format!("/api/operations/{migration}"), &deploy).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{}", answer.text());
-        let expected = ApiError::insufficient_scope(
-            OperationAccess::Read.refusal_scope(),
-            OperationAccess::Read.refusal_detail(),
-        )
-        .into_response();
-        let expected = to_bytes(expected.into_body(), 1024 * 1024).await.unwrap();
-        assert_eq!(answer.bytes, expected.to_vec());
-        let text = answer.text();
-        assert!(
-            text.starts_with(r#"{"error":"This credential may not do that: "#),
-            "{text}"
-        );
-        assert!(
-            !text.contains("requestId") && !text.contains("\"code\""),
-            "{text}"
-        );
+        let denied = answer.json();
+        assert_eq!(denied["error"]["code"], codes::INSUFFICIENT_SCOPE);
+        assert_eq!(denied["error"]["requestId"], REQUEST);
+        assert_eq!(denied["error"]["retryable"], false);
         let (status, answer) = get(&gated, &format!("/api/operations/{own}"), &deploy).await;
         assert_eq!(status, StatusCode::OK, "{}", answer.text());
 

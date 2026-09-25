@@ -452,7 +452,7 @@ mod tests {
 
     /// Creating an application twice, and creating one under a name that is
     /// not one: a v1 client reads the class off `code` and the member off
-    /// `violations`, and the flat tree still answers its one string.
+    /// `violations`, and the old flat spelling is not a route any more.
     #[tokio::test]
     async fn a_v1_create_says_already_exists_and_names_the_field_it_refused() {
         let (router, _dir, secret) = crate::api::tests::full_router().await;
@@ -475,10 +475,11 @@ mod tests {
         assert_eq!(violation["code"], "invalid");
         assert_eq!(violation["message"], refused["error"]["message"]);
 
-        // The legacy tree is one string, as it has always been.
+        // The old flat spelling is not a route of this listener any more:
+        // the refusal is the route fallback's.
         let (status, refused) = post(&router, &secret, "/api/apps", body!({ "id": "Not A Name" })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(refused["error"].is_string(), "{refused}");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["error"]["code"], "route-not-found", "{refused}");
         assert_eq!(refused.as_object().unwrap().len(), 1, "{refused}");
     }
 
@@ -539,7 +540,7 @@ mod tests {
             StatusCode::CONFLICT,
             "a name whose data is still out there is not free: {refused}"
         );
-        let message = refused["error"].as_str().unwrap();
+        let message = refused["error"]["message"].as_str().unwrap();
         assert!(message.contains("victim.production"), "{message}");
         assert!(message.contains("/api/retired-apps/victim"), "{message}");
     }

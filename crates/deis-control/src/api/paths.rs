@@ -10,8 +10,8 @@
 //! [`attach_request_context`] leaves in the request extensions.
 //!
 //! Node-facing paths (`delivery::bundle_url`, the assignment and routing
-//! table routes) are not built here: they are not on any of the three
-//! surfaces and never move.
+//! table routes) are not built here: they are not on either surface and
+//! never move.
 //!
 //! [`attach_request_context`]: crate::api::versioning::attach_request_context
 
@@ -30,9 +30,9 @@ use crate::api::versioning::ApiSurface;
 ///
 /// Extracted by a handler as an argument (`paths: ApiPaths`); the extractor
 /// cannot fail. A request that carries no surface - a router built without
-/// the request-context layer, which is what the legacy tree's unit tests
-/// are - is spelled as the legacy tree, which is also what the flat `/api`
-/// mount was before there were surfaces at all.
+/// the request-context layer, which is what the unit tests are - is spelled
+/// for `/api/v1`, so a test that does not care about the prefix still gets
+/// one that a real client would be handed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApiPaths {
     surface: ApiSurface,
@@ -44,14 +44,14 @@ impl ApiPaths {
         Self { surface }
     }
 
-    /// Paths spelled for the surface a request came in through, legacy
-    /// when the request carries none.
+    /// Paths spelled for the surface a request came in through, v1 when the
+    /// request carries none.
     pub fn of(extensions: &Extensions) -> Self {
         Self::on(
             extensions
                 .get::<ApiSurface>()
                 .copied()
-                .unwrap_or(ApiSurface::Legacy),
+                .unwrap_or(ApiSurface::V1),
         )
     }
 
@@ -60,8 +60,8 @@ impl ApiPaths {
     }
 
     /// The absolute path of `route`, which is the part below the mount and
-    /// starts with `/`: `absolute("/operations/x")` is `/api/operations/x`
-    /// on the legacy surface and `/api/v1/operations/x` on v1.
+    /// starts with `/`: `absolute("/operations/x")` is `/api/v1/operations/x`
+    /// on v1 and `/api/platform/operations/x` on platform.
     pub fn absolute(self, route: &str) -> String {
         debug_assert!(
             route.starts_with('/'),
@@ -98,10 +98,6 @@ mod tests {
     #[test]
     fn a_route_is_spelled_under_the_prefix_of_its_surface() {
         assert_eq!(
-            ApiPaths::on(ApiSurface::Legacy).absolute("/operations/x"),
-            "/api/operations/x"
-        );
-        assert_eq!(
             ApiPaths::on(ApiSurface::V1).absolute("/operations/x"),
             "/api/v1/operations/x"
         );
@@ -120,10 +116,10 @@ mod tests {
     }
 
     #[test]
-    fn a_request_without_a_surface_is_spelled_as_the_legacy_tree() {
+    fn a_request_without_a_surface_is_spelled_for_v1() {
         assert_eq!(
             ApiPaths::of(&Extensions::new()).surface(),
-            ApiSurface::Legacy
+            ApiSurface::V1
         );
         let mut extensions = Extensions::new();
         extensions.insert(ApiSurface::Platform);
@@ -143,7 +139,6 @@ mod tests {
                 .layer(from_fn_with_state(surface, attach_request_context))
         };
         for (surface, expected) in [
-            (ApiSurface::Legacy, "/api/operations/1"),
             (ApiSurface::V1, "/api/v1/operations/1"),
             (ApiSurface::Platform, "/api/platform/operations/1"),
         ] {
@@ -156,7 +151,7 @@ mod tests {
                 .unwrap();
             assert_eq!(body.as_ref(), expected.as_bytes(), "{surface}");
         }
-        // And with no layer at all, the legacy spelling.
+        // And with no layer at all, the v1 spelling.
         let response = Router::new()
             .route("/probe", get(where_am_i))
             .oneshot(Request::get("/probe").body(Body::empty()).unwrap())
@@ -165,6 +160,6 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
-        assert_eq!(body.as_ref(), b"/api/operations/1");
+        assert_eq!(body.as_ref(), b"/api/v1/operations/1");
     }
 }

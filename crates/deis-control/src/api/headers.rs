@@ -4,8 +4,8 @@
 //! rather than silently taking the first value, because the two copies may
 //! disagree and the client would never learn which one was honoured. A
 //! required header that is absent answers with [`ApiError::missing_header`],
-//! which gives `Idempotency-Key` its own code and every other header the
-//! plain sentence the legacy tree has always used.
+//! which gives `Idempotency-Key` its own code and every other header a plain
+//! message.
 
 use axum::http::{HeaderMap, HeaderValue};
 
@@ -69,13 +69,12 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_required_header_is_a_bad_request_with_the_legacy_sentence() {
+    fn a_missing_required_header_is_a_bad_request() {
         let error = required_header(&headers(&[]), "if-match").unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error.into_detail().legacy_body(),
-            br#"{"error":"if-match header is required"}"#
-        );
+        let detail = error.into_detail();
+        assert_eq!(detail.code, "invalid-argument");
+        assert_eq!(detail.message, "if-match header is required");
         assert!(
             optional_header(&headers(&[]), "if-match")
                 .unwrap()
@@ -92,8 +91,8 @@ mod tests {
         ] {
             assert_eq!(error.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
-                error.into_detail().legacy_body(),
-                br#"{"error":"idempotency-key header must appear exactly once"}"#
+                error.into_detail().message,
+                "idempotency-key header must appear exactly once"
             );
         }
     }

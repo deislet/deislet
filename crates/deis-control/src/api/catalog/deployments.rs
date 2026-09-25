@@ -2161,12 +2161,6 @@ mod tests {
     fn mutation_location_identifies_the_durable_plan_status_resource() {
         let plan = "018f2518-7e38-7f80-8000-000000000001";
         let headers =
-            deployment_plan_location(ApiPaths::on(ApiSurface::Legacy), "demo", "production", plan);
-        assert_eq!(
-            headers.get(LOCATION).unwrap(),
-            "/api/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001"
-        );
-        let headers =
             deployment_plan_location(ApiPaths::on(ApiSurface::V1), "demo", "production", plan);
         assert_eq!(
             headers.get(LOCATION).unwrap(),
@@ -2174,9 +2168,10 @@ mod tests {
         );
     }
 
-    /// The same deployment route, reached through the legacy tree and
-    /// through `/api/v1`, points the caller at the plan under the prefix it
-    /// used: a v1 client is never sent back to a deprecated path.
+    /// The same deployment route, reached under the prefix the request
+    /// context names, points the caller at the plan under that prefix: a
+    /// v1 client is never handed a path this router does not serve. The
+    /// harness carries no surface, so its answer is spelled for v1.
     #[tokio::test]
     async fn a_plan_location_is_spelled_for_the_surface_the_caller_used() {
         let h = harness(true).await;
@@ -2218,7 +2213,7 @@ mod tests {
             (
                 &h.router,
                 "/api/apps/demo/environments/production/deployments",
-                "/api/apps/demo/environments/production/deployment-plans/",
+                "/api/v1/apps/demo/environments/production/deployment-plans/",
             ),
             (
                 &v1,

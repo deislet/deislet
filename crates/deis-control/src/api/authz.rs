@@ -486,9 +486,9 @@ fn narrowing_query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a st
 /// [`axum::http::Uri::query`] hands it over. One route reads it; see the
 /// module header.
 ///
-/// The table is written once, in the legacy spelling. A path under
+/// The table is written once, in the unversioned spelling. A path under
 /// `/api/v1` or `/api/platform` is the same route with its surface named, and
-/// is folded onto the legacy spelling by [`canonical_segments`] before the
+/// is folded onto that spelling by [`canonical_segments`] before the
 /// match; a route folded from the *wrong* surface - `/api/v1/runtime`,
 /// `/api/platform/apps` - is nothing this control plane mounts, and is
 /// answered with the closing arm rather than with the requirement of a route
@@ -500,26 +500,28 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
 
     let requirement = classify_canonical(method, &segments, query, writing);
     match (surface, requirement.scope) {
-        (ApiSurface::V1, RequirementScope::Operator)
-        | (ApiSurface::Platform, RequirementScope::Product) => unclassified(),
+        (Some(ApiSurface::V1), RequirementScope::Operator)
+        | (Some(ApiSurface::Platform), RequirementScope::Product) => unclassified(),
         _ => requirement,
     }
 }
 
-/// The legacy spelling of a path's segments, and the surface the path named.
+/// The unversioned spelling of a path's segments, and the surface the path
+/// named, when it named one.
 ///
 /// `["api", "v1", rest..]` and `["api", "platform", rest..]` become
 /// `["api", rest..]`. Exactly one marker is folded, and only in second
 /// position, so `/api/v1/v1/apps` and `/api/platform/v1/apps` keep their extra
 /// segment and fall to the closing arm; the comparison is byte-exact, so
-/// `/api/V1/apps` does too. Nothing else is touched: `/api/nodes/..` and
-/// `/api/routing-table` are the node channel, which is never versioned and
-/// never reaches this gate.
-fn canonical_segments<'a>(segments: &[&'a str]) -> (ApiSurface, Vec<&'a str>) {
+/// `/api/V1/apps` does too. A path under neither prefix is the table's own
+/// spelling with no surface - `/api/nodes/..` and `/api/routing-table` are
+/// the node channel, which is never versioned and never reaches this gate -
+/// and answers from the table row as written.
+fn canonical_segments<'a>(segments: &[&'a str]) -> (Option<ApiSurface>, Vec<&'a str>) {
     match segments {
-        ["api", "v1", rest @ ..] => (ApiSurface::V1, fold(rest)),
-        ["api", "platform", rest @ ..] => (ApiSurface::Platform, fold(rest)),
-        _ => (ApiSurface::Legacy, segments.to_vec()),
+        ["api", "v1", rest @ ..] => (Some(ApiSurface::V1), fold(rest)),
+        ["api", "platform", rest @ ..] => (Some(ApiSurface::Platform), fold(rest)),
+        _ => (None, segments.to_vec()),
     }
 }
 
@@ -1875,7 +1877,7 @@ fn describe_route_address(body: Option<&serde_json::Value>) -> String {
 /// what the caller quotes is what the log holds; anything a client sent
 /// that is not an id is never either.
 ///
-/// The gate is layered outside all three mounts, so this is the only place
+/// The gate is layered outside both mounts, so this is the only place
 /// a refused call's ids come from: a 401 or a 403 that did not echo the
 /// correlation id would leave the caller unable to tie the refusal to the
 /// calls it sent around it.
@@ -3526,9 +3528,9 @@ mod gate_tests {
     /// and on what the audit log then holds, which is the only pair that
     /// matters.
     ///
-    /// The routes are mounted in the legacy `/api/*` spelling on purpose, and
-    /// stay so: that tree keeps answering for the whole deprecation window,
-    /// and these are its regression tests. The two routes spelled under
+    /// The routes are mounted in the unversioned `/api/*` spelling on
+    /// purpose, and stay so: that is the spelling the gate's table is written
+    /// in, and these are its regression tests. The two routes spelled under
     /// `/api/v1` and `/api/platform` are there for the one test that proves
     /// the gate reads a versioned path as the route it is.
     struct Gate {
@@ -3602,7 +3604,7 @@ mod gate_tests {
             // the mount, inside the gate. A refusal is answered before it
             // runs; an accepted call comes back with the id it settled.
             .layer(axum::middleware::from_fn_with_state(
-                ApiSurface::Legacy,
+                ApiSurface::V1,
                 crate::api::versioning::attach_request_context,
             ))
             .layer(axum::middleware::from_fn_with_state(
@@ -3921,20 +3923,29 @@ mod gate_tests {
         );
         gate.state.identity.revoke_token(&token.id).await.unwrap();
 
-        let revoked = call_with_body(
+        // Both refusals carry the same request id, so the only thing that
+        // may differ is the id - and the id is the same, so the bodies are
+        // the same.
+        const SAME_ID: &str = "01a0d763-1234-7abc-8def-000000000001";
+        let marks = [(REQUEST_ID_HEADER, SAME_ID)];
+        let revoked = call_marked(
             &gate,
+            ON_THE_BOX,
             "POST",
             "/api/apps/demo/versions",
             Some(&secret),
             "{}",
+            &marks,
         )
         .await;
-        let never_existed = call_with_body(
+        let never_existed = call_marked(
             &gate,
+            ON_THE_BOX,
             "POST",
             "/api/apps/demo/versions",
             Some("deis_pat_00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff0011"),
             "{}",
+            &marks,
         )
         .await;
         assert_eq!(revoked.0, StatusCode::UNAUTHORIZED);
@@ -4873,12 +4884,10 @@ mod gate_tests {
         );
     }
 
-    /// The gate answers in the shape of the prefix it was called through:
-    /// the two-key legacy body under `/api`, byte for byte as before, and
-    /// the structured envelope with the request id under `/api/v1` and
-    /// `/api/platform`.
+        /// The gate's refusals answer in the envelope shape whatever prefix the
+    /// path was spelled under, and echo the id the caller sent.
     #[tokio::test]
-    async fn a_refusal_takes_the_shape_of_the_prefix_it_was_called_through() {
+    async fn a_gate_refusal_answers_the_envelope_under_any_prefix() {
         let gate = gate().await;
         gate.state
             .identity
@@ -4896,13 +4905,16 @@ mod gate_tests {
             .await
             .unwrap();
 
+        // The unversioned spelling the gate's table is written in answers
+        // the same envelope: the body no longer follows the prefix.
         let (status, body) =
             call_with_body(&gate, "POST", "/api/apps/other/versions", None, "{}").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(
-            body.starts_with(r#"{"error":"Unauthorized","details":"#),
-            "{body}"
-        );
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "unauthenticated");
+        assert!(body["error"]["requestId"].is_string(), "{body}");
+        assert_eq!(body["error"]["retryable"], false);
+
         let (status, body) = call_with_body(
             &gate,
             "POST",
@@ -4912,10 +4924,8 @@ mod gate_tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(
-            body.starts_with(r#"{"error":"This credential may not do that: "#),
-            "{body}"
-        );
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "insufficient-scope");
 
         let (status, body) =
             call_with_body(&gate, "POST", "/api/v1/apps/other/versions", None, "{}").await;

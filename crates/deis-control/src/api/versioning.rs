@@ -1,22 +1,24 @@
 //! Which face of the HTTP API a request came in through, and the request
-//! context that every face shares.
+//! context that both faces share.
 //!
-//! The API has three surfaces: the legacy flat tree under `/api/*`, the
-//! versioned tree under `/api/v1/*` and the platform diagnostics under
-//! `/api/platform/*`. They serve the same handlers; what differs is the
-//! contract around the answer - the shape of an error body, the deprecation
-//! headers a legacy answer carries. This module holds that per-surface
-//! contract so no handler has to know which door it was called through.
+//! The API has two surfaces: the versioned product tree under `/api/v1/*`
+//! and the platform diagnostics under `/api/platform/*`. They serve the
+//! same handlers; what differs is the prefix a path is spelled under, which
+//! the handlers read back through [`crate::api::paths::ApiPaths`] when they
+//! have to name an absolute path. The error contract is one for every
+//! answer, whatever the surface; see [`render_errors`]. The Prometheus
+//! exposition at `/api/metrics` belongs to neither surface and is never
+//! mounted under either; it rides the v1 contract because it has no error
+//! body of its own to carry.
 //!
-//! Three middlewares live here and are mounted per surface by the router:
+//! Two middlewares live here and are mounted per surface by the router:
 //!
 //! * [`attach_request_context`] - the outermost. Settles the request and
 //!   correlation ids, records them on the tracing span, and echoes both on
 //!   every response.
 //! * [`render_errors`] - inside it. Turns the error an [`ApiError`] left in
-//!   the response extensions into the body the surface promises.
-//! * [`deprecate_legacy`] - legacy tree only. Adds the RFC 9745 / RFC 8594
-//!   deprecation headers and points at the successor route.
+//!   the response extensions into the structured envelope carrying the ids
+//!   the context settled.
 //!
 //! The node channel (`/api/nodes/:id/assignments`, `/api/routing-table`,
 //! ...) is none of these surfaces and is never mounted under any of them.
@@ -24,18 +26,15 @@
 //! [`ApiError`]: crate::api::error::ApiError
 
 use std::fmt;
-use std::sync::{Arc, LazyLock};
 
 use axum::{
-    extract::{MatchedPath, Request, State},
-    http::{Extensions, HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    extract::{Request, State},
+    http::{Extensions, HeaderMap, HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use deis_wire::CanonicalId;
-use tracing::{Instrument, error, info_span, warn};
+use tracing::{Instrument, error, info_span};
 
 use crate::api::error::{ApiError, ErrorDetail, codes};
 
@@ -50,63 +49,38 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 /// request id.
 pub const CORRELATION_ID_HEADER: &str = "x-correlation-id";
 
-/// When the legacy `/api/*` surface was declared deprecated (RFC 9745
-/// `Deprecation` header, rendered as `@<unix seconds>`).
-pub const LEGACY_DEPRECATED_AT: &str = "2026-09-06T00:00:00Z";
-/// When the legacy `/api/*` surface stops answering (RFC 8594 `Sunset`
-/// header, rendered as an HTTP-date).
-pub const LEGACY_SUNSET_AT: &str = "2027-06-30T00:00:00Z";
-
 /// The mount a request came in through.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ApiSurface {
-    /// The flat `/api/*` tree that predates versioning. Kept for a
-    /// deprecation window; answers `{"error": "<message>"}` byte for byte as
-    /// it always has.
-    Legacy,
-    /// `/api/v1/*`: the versioned product API with the structured error
-    /// envelope.
+    /// `/api/v1/*`: the versioned product API.
     V1,
-    /// `/api/platform/*`: diagnostics about this control plane and its fleet,
-    /// same error envelope as v1.
+    /// `/api/platform/*`: diagnostics about this control plane and its fleet.
     Platform,
 }
 
 impl ApiSurface {
-    /// Classify a request path by its prefix. Anything that is not under
-    /// `/api/v1/` or `/api/platform/` is the legacy tree, which includes
-    /// paths that match no route at all: the 404 for those is a legacy
-    /// answer unless the request said otherwise.
+    /// Classify a request path by its prefix. A path that is not under
+    /// `/api/v1/` or `/api/platform/` names no surface of its own - it is
+    /// the gate's or the route fallback's to answer, and both answers are
+    /// the same envelope whatever the label - so it is answered as v1.
     pub fn of_path(path: &str) -> Self {
-        if path.starts_with("/api/v1/") || path == "/api/v1" {
-            ApiSurface::V1
-        } else if path.starts_with("/api/platform/") || path == "/api/platform" {
+        if path.starts_with("/api/platform/") || path == "/api/platform" {
             ApiSurface::Platform
         } else {
-            ApiSurface::Legacy
+            ApiSurface::V1
         }
     }
 
     /// The path prefix routes of this surface are mounted under.
     pub const fn prefix(self) -> &'static str {
         match self {
-            ApiSurface::Legacy => "/api",
             ApiSurface::V1 => "/api/v1",
             ApiSurface::Platform => "/api/platform",
         }
     }
 
-    /// Whether errors on this surface use the structured envelope.
-    pub const fn structured_errors(self) -> bool {
-        match self {
-            ApiSurface::Legacy => false,
-            ApiSurface::V1 | ApiSurface::Platform => true,
-        }
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
-            ApiSurface::Legacy => "legacy",
             ApiSurface::V1 => "v1",
             ApiSurface::Platform => "platform",
         }
@@ -260,16 +234,15 @@ pub async fn attach_request_context(
     response
 }
 
-/// Render the error an `ApiError` left behind in the shape this surface
-/// promises.
+/// Render the error an `ApiError` left behind as the structured envelope.
 ///
-/// `ApiError::into_response` always writes the legacy body and stashes the
-/// full [`ErrorDetail`] in the response extensions. On the legacy surface
-/// the body is therefore already right and only the request id header is
-/// added; on v1 and platform the body is replaced with the structured
-/// envelope, with `requestId` filled from the request context. A response
-/// without an [`ErrorDetail`] - a success, a body a handler wrote by hand, an
-/// error from `middleware::node_auth` - passes through untouched.
+/// `ApiError::into_response` writes the envelope with a freshly minted
+/// request id and stashes the full [`ErrorDetail`] in the response
+/// extensions. This reads that extension and re-renders the body with the
+/// id the request context settled, so the id inside the body is the one the
+/// response echoes. A response without an [`ErrorDetail`] - a success, a
+/// body a handler wrote by hand, an error from `middleware::node_auth` -
+/// passes through untouched.
 ///
 /// Mount inside [`attach_request_context`]; when it is mounted without one,
 /// a request id is minted here so the body never carries an empty one.
@@ -280,7 +253,7 @@ pub async fn render_errors(
 ) -> Response {
     let context = RequestContext::resolve(request.extensions(), request.headers());
     let response = next.run(request).await;
-    let response = envelope_rejection(surface, response).await;
+    let response = envelope_rejection(response).await;
     finish_error_response(surface, context, response)
 }
 
@@ -302,11 +275,9 @@ const MAX_REJECTION_BYTES: usize = 4 * 1024;
 /// JSON, including the few that are not the error envelope, so a `text/plain`
 /// 4xx that carries no `ErrorDetail` came from an extractor and nowhere else.
 /// The sentence is kept as the message - it is about what the caller sent,
-/// never about this control plane's insides - and the legacy tree is left
-/// exactly as it was, plain text and all.
-async fn envelope_rejection(surface: ApiSurface, response: Response) -> Response {
-    if !surface.structured_errors()
-        || !response.status().is_client_error()
+/// never about this control plane's insides.
+async fn envelope_rejection(response: Response) -> Response {
+    if !response.status().is_client_error()
         || response.extensions().get::<ErrorDetail>().is_some()
     {
         return response;
@@ -382,9 +353,6 @@ pub fn finish_error_response(
     let headers = response.headers_mut();
     headers.insert(REQUEST_ID_HEADER, header_value(request_id.0));
     headers.insert(CORRELATION_ID_HEADER, header_value(correlation_id.0));
-    if !surface.structured_errors() {
-        return response;
-    }
     let body = detail.structured_body(&request_id.to_string());
     let (mut parts, _) = response.into_parts();
     parts.headers.insert(
@@ -394,154 +362,6 @@ pub fn finish_error_response(
     // Recomputed from the new body by the server.
     parts.headers.remove(header::CONTENT_LENGTH);
     Response::from_parts(parts, axum::body::Body::from(body))
-}
-
-// ---------------------------------------------------------------------------
-// Legacy deprecation
-// ---------------------------------------------------------------------------
-
-static LEGACY_DEPRECATED: LazyLock<DateTime<Utc>> =
-    LazyLock::new(|| parse_instant(LEGACY_DEPRECATED_AT));
-static LEGACY_SUNSET: LazyLock<DateTime<Utc>> = LazyLock::new(|| parse_instant(LEGACY_SUNSET_AT));
-
-fn parse_instant(value: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(value)
-        .expect("deprecation instants are RFC 3339 constants")
-        .with_timezone(&Utc)
-}
-
-/// RFC 9745 `Deprecation` value: `@` followed by Unix seconds.
-pub fn deprecation_header_value() -> String {
-    format!("@{}", LEGACY_DEPRECATED.timestamp())
-}
-
-/// RFC 8594 `Sunset` value: an IMF-fixdate HTTP-date.
-pub fn sunset_header_value() -> String {
-    LEGACY_SUNSET
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string()
-}
-
-static DEPRECATION_VALUE: LazyLock<HeaderValue> = LazyLock::new(|| {
-    HeaderValue::from_str(&deprecation_header_value()).expect("digits are visible ASCII")
-});
-static SUNSET_VALUE: LazyLock<HeaderValue> = LazyLock::new(|| {
-    HeaderValue::from_str(&sunset_header_value()).expect("an HTTP-date is visible ASCII")
-});
-
-const DEPRECATION: HeaderName = HeaderName::from_static("deprecation");
-const SUNSET: HeaderName = HeaderName::from_static("sunset");
-
-/// Which surface a legacy route template moved to.
-///
-/// Built by the router from the table of routes that moved to
-/// `/api/platform`; everything else that is still deprecated moved to
-/// `/api/v1`. A template with no successor - `GET /api/metrics`, which stays
-/// where it is - gets no headers and no warning.
-#[derive(Clone)]
-pub struct LegacyDeprecation {
-    successor: Arc<SuccessorFn>,
-}
-
-/// Maps a matched legacy route template to the surface that replaced it.
-type SuccessorFn = dyn Fn(&str) -> Option<ApiSurface> + Send + Sync;
-
-impl fmt::Debug for LegacyDeprecation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("LegacyDeprecation")
-    }
-}
-
-impl LegacyDeprecation {
-    /// `successor` maps a matched legacy route template (`/api/apps/:app_id`)
-    /// to the surface that replaced it. `None`, or `Some(ApiSurface::Legacy)`,
-    /// means the route is not deprecated.
-    pub fn new(successor: impl Fn(&str) -> Option<ApiSurface> + Send + Sync + 'static) -> Self {
-        Self {
-            successor: Arc::new(successor),
-        }
-    }
-
-    /// Where a legacy template moved, if it did.
-    pub fn successor_of(&self, template: &str) -> Option<ApiSurface> {
-        match (self.successor)(template) {
-            None | Some(ApiSurface::Legacy) => None,
-            Some(surface) => Some(surface),
-        }
-    }
-}
-
-/// The successor URL for a legacy request: the same path and query, with
-/// the legacy prefix swapped for the successor surface's.
-pub fn successor_path(surface: ApiSurface, legacy_path_and_query: &str) -> Option<String> {
-    let rest = legacy_path_and_query.strip_prefix(ApiSurface::Legacy.prefix())?;
-    if !(rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')) {
-        return None;
-    }
-    Some(format!("{}{rest}", surface.prefix()))
-}
-
-/// Route templates whose deprecation has already been logged by this
-/// process. Process-wide rather than per router so that the log says each
-/// thing once, however many routers a test or an embedding builds.
-static WARNED_TEMPLATES: LazyLock<DashMap<String, ()>> = LazyLock::new(DashMap::new);
-
-/// Record that a deprecated template was used; true the first time this
-/// process sees it, which is the one time it is worth a log line.
-pub fn note_legacy_use(template: &str) -> bool {
-    WARNED_TEMPLATES.insert(template.to_string(), ()).is_none()
-}
-
-/// Mark a legacy answer as deprecated.
-///
-/// Adds `Deprecation` (RFC 9745), `Sunset` (RFC 8594) and a
-/// `Link: <successor>; rel="successor-version"` computed from the request
-/// path, and logs one warning per route template per process the first
-/// time the template is called. A request that matched no route, or whose
-/// template the policy does not deprecate, passes through untouched.
-///
-/// Mount on the legacy tree only, with
-/// `axum::middleware::from_fn_with_state(policy, deprecate_legacy)`.
-pub async fn deprecate_legacy(
-    State(policy): State<LegacyDeprecation>,
-    matched: Option<MatchedPath>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let Some(matched) = matched else {
-        return next.run(request).await;
-    };
-    let template = matched.as_str().to_string();
-    let Some(successor_surface) = policy.successor_of(&template) else {
-        return next.run(request).await;
-    };
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
-    let successor = successor_path(successor_surface, &path_and_query);
-
-    if note_legacy_use(&template) {
-        warn!(
-            route = %template,
-            successor_surface = %successor_surface,
-            sunset = %sunset_header_value(),
-            "A client called a deprecated legacy route; it keeps answering until the sunset date, after which only the successor surface does"
-        );
-    }
-
-    let mut response = next.run(request).await;
-    let headers = response.headers_mut();
-    headers.insert(DEPRECATION, DEPRECATION_VALUE.clone());
-    headers.insert(SUNSET, SUNSET_VALUE.clone());
-    if let Some(successor) = successor
-        && let Ok(link) =
-            HeaderValue::from_str(&format!("<{successor}>; rel=\"successor-version\""))
-    {
-        headers.append(header::LINK, link);
-    }
-    response
 }
 
 #[cfg(test)]
@@ -589,13 +409,17 @@ mod tests {
             ApiSurface::of_path("/api/platform/runtime"),
             ApiSurface::Platform
         );
-        assert_eq!(ApiSurface::of_path("/api/apps"), ApiSurface::Legacy);
-        assert_eq!(ApiSurface::of_path("/api/v10/apps"), ApiSurface::Legacy);
-        assert_eq!(ApiSurface::of_path("/api/v1apps"), ApiSurface::Legacy);
-        assert_eq!(ApiSurface::of_path("/health"), ApiSurface::Legacy);
+        assert_eq!(ApiSurface::of_path("/api/platform"), ApiSurface::Platform);
+        // A path that is under neither prefix names no surface of its own
+        // and is answered as v1; the byte-exact prefix keeps the lookalikes
+        // out, whatever they fall to.
+        assert_eq!(ApiSurface::of_path("/api/apps"), ApiSurface::V1);
+        assert_eq!(ApiSurface::of_path("/api/v10/apps"), ApiSurface::V1);
+        assert_eq!(ApiSurface::of_path("/api/v1apps"), ApiSurface::V1);
+        assert_eq!(ApiSurface::of_path("/health"), ApiSurface::V1);
         assert_eq!(
             ApiSurface::of_path("/api/nodes/a/assignments"),
-            ApiSurface::Legacy
+            ApiSurface::V1
         );
     }
 
@@ -700,10 +524,7 @@ mod tests {
     }
 
     /// Handlers that read the id themselves must see the one the response
-    /// echoes, whether the client sent one or not - on every surface. The
-    /// legacy tree is included on purpose: its handlers used to parse the
-    /// inbound header themselves and answer 400 to garbage, and now see the
-    /// minted id like everyone else (recorded in API_DOCUMENTATION.md).
+    /// echoes, whether the client sent one or not - on every surface.
     #[tokio::test]
     async fn the_settled_ids_are_written_back_into_the_request() {
         async fn echo(headers: HeaderMap) -> String {
@@ -714,7 +535,7 @@ mod tests {
                 headers.get_all(REQUEST_ID_HEADER).iter().count()
             )
         }
-        for surface in [ApiSurface::Legacy, ApiSurface::V1, ApiSurface::Platform] {
+        for surface in [ApiSurface::V1, ApiSurface::Platform] {
             let app = surfaced(surface, Router::new().route("/echo", get(echo)));
             let response = app
                 .oneshot(
@@ -743,56 +564,49 @@ mod tests {
         }
     }
 
-    /// The backend's text is logged under the request id and never sent
-    /// on a structured surface; the legacy body keeps it.
+    /// The backend's text is logged under the request id and never sent on
+    /// any surface: the envelope says only that the control plane failed.
     #[tokio::test]
-    async fn a_backend_failure_is_opaque_on_v1_and_verbatim_on_legacy() {
+    async fn a_backend_failure_is_opaque_on_every_surface() {
         async fn failing() -> Result<(), ApiError> {
             Err(ApiError::DatabaseError(
                 "SQLite error: database is locked".to_string(),
             ))
         }
-        let app = surfaced(ApiSurface::V1, Router::new().route("/db", get(failing)));
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/db")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = body_json(response).await;
-        assert_eq!(body["error"]["code"], "database-unavailable");
-        assert_eq!(body["error"]["message"], crate::api::error::OPAQUE_MESSAGE);
-        assert_eq!(body["error"]["retryable"], true);
-
-        let app = surfaced(ApiSurface::Legacy, Router::new().route("/db", get(failing)));
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/db")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            &bytes[..],
-            br#"{"error":"Database error: SQLite error: database is locked"}"#
-        );
+        for surface in [ApiSurface::V1, ApiSurface::Platform] {
+            let app = surfaced(surface, Router::new().route("/db", get(failing)));
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/db")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{surface}"
+            );
+            let body = body_json(response).await;
+            assert_eq!(body["error"]["code"], "database-unavailable", "{surface}");
+            assert_eq!(
+                body["error"]["message"],
+                crate::api::error::OPAQUE_MESSAGE,
+                "{surface}"
+            );
+            assert_eq!(body["error"]["retryable"], true, "{surface}");
+        }
     }
 
     /// A query, path or body that does not deserialise is refused by axum
-    /// before any handler runs, in `text/plain` and with no code. On the
-    /// structured surfaces that answer is the envelope like every other
-    /// 4xx - it is the failure a client most needs a code for, because the
-    /// request as written can never succeed - and the legacy tree keeps the
-    /// bare sentence it has always sent.
+    /// before any handler runs, in `text/plain` and with no code. On every
+    /// surface that answer is the envelope like every other 4xx - it is
+    /// the failure a client most needs a code for, because the request as
+    /// written can never succeed.
     #[tokio::test]
-    async fn an_extractor_refusal_is_the_envelope_on_the_structured_surfaces() {
+    async fn an_extractor_refusal_is_the_envelope_on_every_surface() {
         use axum::extract::Query;
         use serde::Deserialize;
 
@@ -835,28 +649,6 @@ mod tests {
                 "the caller still has to be told what it sent: {body}"
             );
         }
-
-        // The legacy tree answers exactly what it always has.
-        let app = surfaced(
-            ApiSurface::Legacy,
-            Router::new().route("/list", get(listing)),
-        );
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/list?before=3")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            response.headers()[header::CONTENT_TYPE]
-                .to_str()
-                .unwrap()
-                .starts_with("text/plain")
-        );
 
         // A body a handler wrote by hand is not a rejection and is not
         // touched, whatever its status.
@@ -909,28 +701,6 @@ mod tests {
         assert_eq!(body["error"]["retryable"], false);
     }
 
-    #[tokio::test]
-    async fn the_legacy_surface_keeps_the_flat_body_and_still_echoes_the_id() {
-        let app = surfaced(
-            ApiSurface::Legacy,
-            Router::new().route("/missing", get(not_found)),
-        );
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/missing")
-                    .header(REQUEST_ID_HEADER, VALID)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()[REQUEST_ID_HEADER], VALID);
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&bytes[..], br#"{"error":"no such thing"}"#);
-    }
-
     /// `render_errors` without a context layer above it still fills the id.
     #[tokio::test]
     async fn an_error_rendered_without_a_context_layer_mints_an_id() {
@@ -967,7 +737,7 @@ mod tests {
             )
                 .into_response()
         }
-        for surface in [ApiSurface::Legacy, ApiSurface::V1, ApiSurface::Platform] {
+        for surface in [ApiSurface::V1, ApiSurface::Platform] {
             let app = surfaced(surface, Router::new().route("/node", get(node_style)));
             let response = app
                 .oneshot(
@@ -982,138 +752,5 @@ mod tests {
             let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             assert_eq!(&bytes[..], br#"{"error":"Unauthorized"}"#, "{surface}");
         }
-    }
-
-    #[test]
-    fn deprecation_precedes_sunset_and_both_render_to_their_wire_forms() {
-        assert!(*LEGACY_DEPRECATED < *LEGACY_SUNSET);
-        assert_eq!(deprecation_header_value(), "@1788652800");
-        assert_eq!(sunset_header_value(), "Wed, 30 Jun 2027 00:00:00 GMT");
-    }
-
-    #[test]
-    fn successor_paths_swap_the_prefix_and_keep_the_query() {
-        assert_eq!(
-            successor_path(ApiSurface::V1, "/api/apps/x?limit=5").as_deref(),
-            Some("/api/v1/apps/x?limit=5")
-        );
-        assert_eq!(
-            successor_path(ApiSurface::Platform, "/api/runtime").as_deref(),
-            Some("/api/platform/runtime")
-        );
-        assert_eq!(successor_path(ApiSurface::V1, "/apix/apps"), None);
-        assert_eq!(successor_path(ApiSurface::V1, "/health"), None);
-    }
-
-    /// The policy the router builds decides per template; `Legacy` and
-    /// `None` both mean "not deprecated".
-    fn test_policy() -> LegacyDeprecation {
-        LegacyDeprecation::new(|template| {
-            if template == "/api/metrics" {
-                None
-            } else if template.starts_with("/api/runtime/") {
-                Some(ApiSurface::Platform)
-            } else {
-                Some(ApiSurface::V1)
-            }
-        })
-    }
-
-    #[test]
-    fn a_policy_names_the_successor_surface_or_nothing() {
-        let policy = test_policy();
-        assert_eq!(
-            policy.successor_of("/api/runtime/:node/apps/:app_id"),
-            Some(ApiSurface::Platform)
-        );
-        assert_eq!(
-            policy.successor_of("/api/apps/:app_id"),
-            Some(ApiSurface::V1)
-        );
-        assert_eq!(policy.successor_of("/api/metrics"), None);
-        let explicit = LegacyDeprecation::new(|_| Some(ApiSurface::Legacy));
-        assert_eq!(explicit.successor_of("/api/apps"), None);
-    }
-
-    #[tokio::test]
-    async fn legacy_answers_carry_the_deprecation_headers_and_warn_once() {
-        let policy = test_policy();
-        let app = Router::new()
-            .route("/api/apps/:app_id", get(ok))
-            .route("/api/runtime/:node", get(ok))
-            .route("/api/metrics", get(ok))
-            .layer(from_fn_with_state(policy, deprecate_legacy));
-
-        let response = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/apps/demo?limit=2")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[DEPRECATION], "@1788652800");
-        assert_eq!(response.headers()[SUNSET], "Wed, 30 Jun 2027 00:00:00 GMT");
-        assert_eq!(
-            response.headers()[header::LINK],
-            "</api/v1/apps/demo?limit=2>; rel=\"successor-version\""
-        );
-
-        let response = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/runtime/n1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            response.headers()[header::LINK],
-            "</api/platform/runtime/n1>; rel=\"successor-version\""
-        );
-
-        // The route that never moves gets nothing.
-        let response = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(response.headers().get(DEPRECATION).is_none());
-        assert!(response.headers().get(SUNSET).is_none());
-        assert!(response.headers().get(header::LINK).is_none());
-
-        // Nor does a request that matched no route.
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/nothing")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(response.headers().get(DEPRECATION).is_none());
-
-        // The templates above are shared with no other test, so the first
-        // use of each was logged by the requests above and a second use of
-        // the same template is not.
-        assert!(!note_legacy_use("/api/apps/:app_id"));
-        assert!(!note_legacy_use("/api/runtime/:node"));
-        assert!(
-            note_legacy_use("/api/tests/versioning/never-called/:id"),
-            "an unseen template is logged exactly once"
-        );
-        assert!(!note_legacy_use("/api/tests/versioning/never-called/:id"));
     }
 }

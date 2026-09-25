@@ -386,7 +386,8 @@ mod tests {
         if let RestoreCoordinatorAvailability::Unavailable(reason) = &restore_state.coordinator {
             panic!("test restore coordinator is unavailable: {reason}");
         }
-        // Legacy prefix on purpose: the flat tree's regression coverage.
+        // Flat prefix on purpose: the same handlers under a plain mount,
+        // with no gate and no request context in the way.
         let api = router("/api", restore_state);
 
         let installation_response = api
@@ -450,7 +451,7 @@ mod tests {
         assert_eq!(operation.state, deis_wire::OperationState::Queued);
         assert_eq!(
             location,
-            format!("/api/operations/{}", operation.operation_id)
+            format!("/api/v1/operations/{}", operation.operation_id)
         );
 
         let duplicate = api.clone().oneshot(make_request(body)).await.unwrap();

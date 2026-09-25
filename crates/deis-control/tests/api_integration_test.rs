@@ -134,10 +134,10 @@ async fn test_api_sessions_and_fleet_are_two_different_lists() {
     wait_for_server_ready(18082).await;
 
     // The control channels open to this process - not the runtime fleet,
-    // which is a different list at /api/runtime.
+    // which is a different list at /api/platform/runtime.
     let client = reqwest::Client::new();
     let response = client
-        .get("http://localhost:18082/api/sessions")
+        .get("http://localhost:18082/api/platform/sessions")
         .header("Authorization", bearer(&credential))
         .send()
         .await
@@ -150,7 +150,7 @@ async fn test_api_sessions_and_fleet_are_two_different_lists() {
     assert!(json.get("total").is_some());
 
     let fleet = client
-        .get("http://localhost:18082/api/runtime")
+        .get("http://localhost:18082/api/platform/runtime")
         .header("Authorization", bearer(&credential))
         .send()
         .await
@@ -197,7 +197,7 @@ async fn test_api_metrics_endpoint() {
     // Test the metrics endpoint
     let client = reqwest::Client::new();
     let response = client
-        .get("http://localhost:18083/api/metrics/summary")
+        .get("http://localhost:18083/api/platform/metrics/summary")
         .header("Authorization", bearer(&credential))
         .send()
         .await
@@ -245,7 +245,7 @@ async fn test_api_events_endpoint() {
     // Test the events endpoint
     let client = reqwest::Client::new();
     let response = client
-        .get("http://localhost:18084/api/events")
+        .get("http://localhost:18084/api/platform/events")
         .header("Authorization", bearer(&credential))
         .send()
         .await
@@ -368,11 +368,11 @@ async fn the_human_listener_serves_the_api_key_and_nothing_a_node_used_to_call()
     // And the other way round: the human API is the API key's, not the
     // node's.
     assert_eq!(
-        status_of("/api/apps", Some(&credential)).await,
+        status_of("/api/v1/apps", Some(&credential)).await,
         StatusCode::OK
     );
     assert_eq!(
-        status_of("/api/apps", Some(RETIRED_FLEET_KEY)).await,
+        status_of("/api/v1/apps", Some(RETIRED_FLEET_KEY)).await,
         StatusCode::UNAUTHORIZED
     );
 
@@ -489,7 +489,7 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
     // revokes the bootstrap credential and deletes its file.
     let (status, minted_owner) = call(
         "POST",
-        "/api/accounts/bootstrap/tokens",
+        "/api/v1/accounts/bootstrap/tokens",
         Some(&bootstrap_secret),
         r#"{"name":"owner","unscoped":true}"#,
     )
@@ -503,20 +503,20 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
         !bootstrap_file.exists(),
         "the bootstrap file must be deleted after the first successful use"
     );
-    let (status, refused) = call("GET", "/api/tokens", Some(&bootstrap_secret), "").await;
+    let (status, refused) = call("GET", "/api/v1/tokens", Some(&bootstrap_secret), "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
 
     // The operator's credential is listed, and listed as unscoped: that count
     // is what an operator drives to zero, and it is the total of the
     // `scope=unscoped` listing in the unified envelope.
-    let (status, listed) = call("GET", "/api/tokens", Some(&owner_secret), "").await;
+    let (status, listed) = call("GET", "/api/v1/tokens", Some(&owner_secret), "").await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["schemaVersion"], 1);
     assert_eq!(listed["page"]["total"], 1, "{listed}");
     assert_eq!(listed["items"][0]["origin"], "minted");
     let (status, unscoped) = call(
         "GET",
-        "/api/tokens?scope=unscoped&limit=1",
+        "/api/v1/tokens?scope=unscoped&limit=1",
         Some(&owner_secret),
         "",
     )
@@ -527,7 +527,7 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
     // An account and a token for one environment of one application.
     let (status, account) = call(
         "POST",
-        "/api/accounts",
+        "/api/v1/accounts",
         Some(&owner_secret),
         r#"{"name":"ci","role":"deployer"}"#,
     )
@@ -537,7 +537,7 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
 
     let (status, minted) = call(
         "POST",
-        "/api/accounts/ci/tokens",
+        "/api/v1/accounts/ci/tokens",
         Some(&owner_secret),
         r#"{"name":"preview-pipeline","scopes":["deploy:demo/preview"]}"#,
     )
@@ -549,14 +549,14 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
 
     // The secret exists in that one response and nowhere else: a listing
     // afterwards must not carry it.
-    let (_, listed) = call("GET", "/api/tokens", Some(&owner_secret), "").await;
+    let (_, listed) = call("GET", "/api/v1/tokens", Some(&owner_secret), "").await;
     assert!(
         !listed.to_string().contains(&secret),
         "a token listing must never carry a credential"
     );
 
     // What the scoped token may do, and what it may not, on the real router.
-    let (status, _) = call("POST", "/api/apps", Some(&secret), r#"{"id":"demo"}"#).await;
+    let (status, _) = call("POST", "/api/v1/apps", Some(&secret), r#"{"id":"demo"}"#).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -565,21 +565,22 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
 
     let (status, refused) = call(
         "POST",
-        "/api/apps",
+        "/api/v1/apps",
         Some(&secret),
         r#"{"id":"someone-elses"}"#,
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(refused["error"]["code"], "insufficient-scope");
     assert!(
-        refused["details"]
+        refused["error"]["message"]
             .as_str()
             .unwrap()
             .contains("deploy:someone-elses"),
         "{refused}"
     );
 
-    for uri in ["/api/audit", "/api/tokens", "/api/accounts"] {
+    for uri in ["/api/v1/audit", "/api/v1/tokens", "/api/v1/accounts"] {
         let (status, _) = call("GET", uri, Some(&secret), "").await;
         assert_eq!(
             status,
@@ -592,18 +593,18 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
     // expire and nothing to restart.
     let (status, _) = call(
         "DELETE",
-        &format!("/api/tokens/{token_id}"),
+        &format!("/api/v1/tokens/{token_id}"),
         Some(&owner_secret),
         "",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = call("GET", "/api/apps/demo", Some(&secret), "").await;
+    let (status, _) = call("GET", "/api/v1/apps/demo", Some(&secret), "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // And all of it is on the record, readable through the route the CLI
     // reads: the application that was created, the refusal, and the mint.
-    let (status, log) = call("GET", "/api/audit?limit=100", Some(&owner_secret), "").await;
+    let (status, log) = call("GET", "/api/v1/audit?limit=100", Some(&owner_secret), "").await;
     assert_eq!(status, StatusCode::OK, "{log}");
     let actions: Vec<&str> = log["items"]
         .as_array()
@@ -631,9 +632,9 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
     // There is no way to take a line back out. Not for the unscoped key
     // either, which is the most powerful credential this control plane has.
     let before = log["items"].as_array().unwrap().len();
-    let (status, _) = call("DELETE", "/api/audit", Some(&owner_secret), "").await;
+    let (status, _) = call("DELETE", "/api/v1/audit", Some(&owner_secret), "").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    let (_, after) = call("GET", "/api/audit?limit=100", Some(&owner_secret), "").await;
+    let (_, after) = call("GET", "/api/v1/audit?limit=100", Some(&owner_secret), "").await;
     assert!(after["items"].as_array().unwrap().len() >= before);
 }
 
@@ -678,7 +679,7 @@ async fn the_dashboards_restart_body_is_the_one_the_control_plane_accepts() {
         let router = api.router.clone();
         let mut request = Request::builder()
             .method("POST")
-            .uri("/api/commands/execute/deis-proxy-1")
+            .uri("/api/platform/commands/execute/deis-proxy-1")
             .header("content-type", "application/json")
             .header("authorization", bearer(&credential))
             .body(Body::from(body))
@@ -1067,14 +1068,14 @@ async fn pushing_config_to_an_unconnected_node_is_a_404_not_a_500() {
         }
     };
 
-    let (status, body) = post("/api/configs/push/deis-runtime-1").await;
+    let (status, body) = post("/api/platform/configs/push/deis-runtime-1").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(
         body.contains("control channel"),
         "the refusal must say why nothing could be pushed: {body}"
     );
 
-    let (status, body) = post("/api/configs/push/deis-runtime-1/app.max_instances").await;
+    let (status, body) = post("/api/platform/configs/push/deis-runtime-1/app.max_instances").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(body.contains("control channel"), "{body}");
 }
@@ -1131,9 +1132,9 @@ async fn a_web_page_on_another_origin_cannot_drive_the_control_plane() {
     //    page's origin, the browser never sends the call at all, so a JSON
     //    body or any method past POST does not leave it.
     for (method, path) in [
-        ("POST", "/api/accounts"),
-        ("POST", "/api/accounts/attacker/tokens"),
-        ("DELETE", "/api/runtime/node-1/apps/demo"),
+        ("POST", "/api/v1/accounts"),
+        ("POST", "/api/v1/accounts/attacker/tokens"),
+        ("DELETE", "/api/platform/runtime/node-1/apps/demo"),
     ] {
         let preflight = client
             .request(reqwest::Method::OPTIONS, format!("{base}{path}"))
@@ -1156,7 +1157,7 @@ async fn a_web_page_on_another_origin_cannot_drive_the_control_plane() {
     //    about the answer may depend on that. It is refused, and the refusal
     //    says what a console hosted elsewhere does instead.
     let created = client
-        .post(format!("{base}/api/accounts"))
+        .post(format!("{base}/api/v1/accounts"))
         .header("Origin", "https://evil.example")
         .header("Sec-Fetch-Site", "cross-site")
         .json(&serde_json::json!({"name": "attacker", "role": "owner"}))
@@ -1184,7 +1185,7 @@ async fn a_web_page_on_another_origin_cannot_drive_the_control_plane() {
     //    operator, presenting the credential, sees the same accounts as
     //    before; without one, even this machine's own tools are refused.
     let accounts = client
-        .get(format!("{base}/api/accounts"))
+        .get(format!("{base}/api/v1/accounts"))
         .send()
         .await
         .unwrap();
@@ -1194,7 +1195,7 @@ async fn a_web_page_on_another_origin_cannot_drive_the_control_plane() {
         "a caller with no credential is refused, from this machine or anywhere"
     );
     let accounts = client
-        .get(format!("{base}/api/accounts"))
+        .get(format!("{base}/api/v1/accounts"))
         .header("Authorization", bearer(&credential))
         .send()
         .await
@@ -1209,7 +1210,7 @@ async fn a_web_page_on_another_origin_cannot_drive_the_control_plane() {
     //    operator's credential, and a page that forges the browser's own
     //    marking without one gets the same refusal as the attacker's page.
     let same_origin = client
-        .post(format!("{base}/api/accounts"))
+        .post(format!("{base}/api/v1/accounts"))
         .header("Origin", base)
         .header("Sec-Fetch-Site", "same-origin")
         .json(&serde_json::json!({"name": "operator", "role": "owner"}))
@@ -1259,7 +1260,7 @@ async fn a_metrics_scrape_needs_the_credential_the_rest_of_the_api_needs() {
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:18392";
 
-    for path in ["/api/metrics", "/api/metrics/summary"] {
+    for path in ["/api/metrics", "/api/platform/metrics/summary"] {
         let anonymous = client.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(
             anonymous.status(),
@@ -1331,7 +1332,7 @@ async fn a_named_origin_is_answered_and_every_other_origin_is_not() {
 
     // The named origin is preflighted for itself, by name and not by `*`.
     let preflight = client
-        .request(reqwest::Method::OPTIONS, format!("{base}/api/apps"))
+        .request(reqwest::Method::OPTIONS, format!("{base}/api/v1/apps"))
         .header("Origin", "https://console.example.com")
         .header("Access-Control-Request-Method", "GET")
         .header("Access-Control-Request-Headers", "authorization")
@@ -1358,7 +1359,7 @@ async fn a_named_origin_is_answered_and_every_other_origin_is_not() {
 
     // And its calls are readable, with the credential the API requires.
     let listed = client
-        .get(format!("{base}/api/apps"))
+        .get(format!("{base}/api/v1/apps"))
         .header("Origin", "https://console.example.com")
         .header("Sec-Fetch-Site", "cross-site")
         .header("Authorization", bearer(&credential))
@@ -1381,7 +1382,7 @@ async fn a_named_origin_is_answered_and_every_other_origin_is_not() {
         "http://console.example.com",
     ] {
         let preflight = client
-            .request(reqwest::Method::OPTIONS, format!("{base}/api/apps"))
+            .request(reqwest::Method::OPTIONS, format!("{base}/api/v1/apps"))
             .header("Origin", other)
             .header("Access-Control-Request-Method", "GET")
             .send()

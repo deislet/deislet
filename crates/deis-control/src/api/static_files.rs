@@ -35,11 +35,10 @@ pub async fn serve_assets(Path(path): Path<String>) -> impl IntoResponse {
 /// which is exactly what a caller written against a renamed endpoint would
 /// hit.
 ///
-/// The refusal is `route-not-found` in the shape of the surface the path
-/// names: the structured envelope under `/api/v1` and `/api/platform`, the
-/// two-key legacy body everywhere else under `/api`. The fallback runs
-/// outside every mount, so the request and correlation ids the answer
-/// echoes are settled here, from what the caller sent.
+/// The refusal is `route-not-found` in the structured envelope, on every
+/// `/api/` path whatever surface it names. The fallback runs outside every
+/// mount, so the request and correlation ids the answer echoes are settled
+/// here, from what the caller sent.
 pub async fn serve_fallback<B>(req: Request<B>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
     if let Some(response) = try_serve_file(path) {
@@ -213,29 +212,18 @@ mod tests {
         }
     }
 
-    /// The refusal takes the shape of the surface the path names: the
-    /// legacy two-key body, byte for byte as before, under `/api`, and the
-    /// structured envelope with a minted request id under `/api/v1` and
-    /// `/api/platform`.
+    /// The refusal is the structured envelope on every API path, whatever
+    /// surface the path names, with a minted request id the response echoes.
     #[tokio::test]
-    async fn the_refusal_takes_the_shape_of_the_surface_the_path_names() {
+    async fn the_refusal_is_the_envelope_on_every_api_path() {
         use axum::body::to_bytes;
 
-        let response = serve_fallback(
-            HttpRequest::builder()
-                .uri("/api/nodes")
-                .body(AxumBody::empty())
-                .unwrap(),
-        )
-        .await
-        .into_response();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            &bytes[..],
-            br#"{"error":"Not Found","details":"No such endpoint. The API surface is listed in the component's API_DOCUMENTATION.md."}"#
-        );
-
-        for uri in ["/api/v1/nope", "/api/platform/nope"] {
+        for uri in [
+            "/api/nodes",
+            "/api/apps",
+            "/api/v1/nope",
+            "/api/platform/nope",
+        ] {
             let response = serve_fallback(
                 HttpRequest::builder()
                     .uri(uri)

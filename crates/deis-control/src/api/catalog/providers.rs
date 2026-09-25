@@ -2949,7 +2949,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(
-            response_json(response).await["error"]
+            response_json(response).await["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("release declares")
@@ -2964,7 +2964,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(
-            response_json(response).await["error"]
+            response_json(response).await["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("exceeds its declared")
@@ -2982,7 +2982,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert!(
-            response_json(response).await["error"]
+            response_json(response).await["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("release management is disabled")
@@ -3029,7 +3029,12 @@ pub(crate) mod tests {
             detail.message
         );
         let body = response_json(response).await;
-        assert!(body["error"].as_str().unwrap().contains("secret_key_file"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("secret_key_file")
+        );
         assert_eq!(idempotency_record_count(&harness.state).await, 0);
     }
 
@@ -3301,7 +3306,7 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let failure = response_json(response).await;
         assert!(
-            failure["error"]
+            failure["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("does not declare")
@@ -3333,7 +3338,7 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let failure = response_json(response).await;
         assert!(
-            failure["error"]
+            failure["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("matching verified driver release")
@@ -3459,6 +3464,10 @@ pub(crate) mod tests {
         let created = response_json(response).await;
         let grant_id = created["grantId"].as_str().unwrap();
         assert!(location.ends_with(grant_id));
+        // The header is spelled for the surface the answer names
+        // (`/api/v1/...`); this router is mounted at `/api`, so follow-up
+        // requests spell the same resource under the test mount.
+        let mounted = location.replacen("/api/v1", "/api", 1);
         assert_eq!(created["status"], "active");
         assert_eq!(created["targetName"], "grant-target");
 
@@ -3490,8 +3499,11 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let failure = response_json(response).await;
-        let message = failure["error"].as_str().unwrap();
-        assert!(message.starts_with("idempotency-key-reused"), "{message}");
+        assert_eq!(
+            failure["error"]["code"],
+            crate::api::error::codes::IDEMPOTENCY_KEY_REUSED
+        );
+        let message = failure["error"]["message"].as_str().unwrap();
         assert!(message.contains(grant_id), "{message}");
 
         let response = router
@@ -3540,11 +3552,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(nowhere.status(), StatusCode::NOT_FOUND);
-        let elsewhere = response_json(elsewhere).await["error"]
+        let elsewhere = response_json(elsewhere).await["error"]["message"]
             .as_str()
             .unwrap()
             .replace(grant_id, "<id>");
-        let nowhere = response_json(nowhere).await["error"]
+        let nowhere = response_json(nowhere).await["error"]["message"]
             .as_str()
             .unwrap()
             .replace(&unknown_id, "<id>");
@@ -3558,7 +3570,7 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(&location)
+                    .uri(&mounted)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3570,7 +3582,7 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(&location)
+                    .uri(&mounted)
                     .header(header::IF_MATCH, "\"2\"")
                     .body(Body::empty())
                     .unwrap(),
@@ -3582,7 +3594,7 @@ pub(crate) mod tests {
             .clone()
             .oneshot(keyed_request(
                 Method::DELETE,
-                &location,
+                &mounted,
                 "grant-revoke-001",
                 "\"1\"",
             ))
@@ -3600,7 +3612,7 @@ pub(crate) mod tests {
             .clone()
             .oneshot(keyed_request(
                 Method::DELETE,
-                &location,
+                &mounted,
                 "grant-revoke-001",
                 "\"1\"",
             ))
@@ -3613,7 +3625,7 @@ pub(crate) mod tests {
             .clone()
             .oneshot(keyed_request(
                 Method::DELETE,
-                &location,
+                &mounted,
                 "grant-revoke-002",
                 "\"1\"",
             ))
@@ -3625,7 +3637,7 @@ pub(crate) mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("{location}/audit"))
+                    .uri(format!("{mounted}/audit"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3744,8 +3756,8 @@ pub(crate) mod tests {
     }
 
     /// A provider resource created through `/api/v1` is located under
-    /// `/api/v1`; through the legacy tree, under `/api`. A v1 client is never
-    /// handed a deprecated path to follow.
+    /// `/api/v1`, whatever prefix the route was spelled under: a client is
+    /// never handed a path this router does not serve.
     #[tokio::test]
     async fn a_provider_resource_location_is_spelled_for_the_surface_the_caller_used() {
         let harness = harness(true).await;
@@ -3754,8 +3766,8 @@ pub(crate) mod tests {
             (
                 &harness.router,
                 "/api/providers/credentials",
-                "legacy",
-                "/api/providers/credentials/",
+                "unversioned",
+                "/api/v1/providers/credentials/",
             ),
             (
                 &v1,
@@ -3788,10 +3800,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// The missing key as a v1 client reads it: its own code and the header
-    /// it has to send, while the flat tree keeps the sentence it always
-    /// answered. Asserted through the whole router, because the envelope is
-    /// rendered by the surface mount rather than by the handler.
+    /// The missing key as a client reads it: its own code and the header
+    /// it has to send. Asserted through the whole router, because the
+    /// envelope is rendered by the surface mount rather than by the
+    /// handler.
     #[tokio::test]
     async fn a_mutation_without_a_key_says_idempotency_key_required_on_v1() {
         use axum::extract::ConnectInfo;
@@ -3832,9 +3844,11 @@ pub(crate) mod tests {
         assert_eq!(refused["error"]["target"]["field"], "Idempotency-Key");
         assert_eq!(refused["error"]["retryable"], false);
 
+        // The old flat spelling is not a route of this listener any more:
+        // the refusal is the route fallback's, in the envelope shape.
         let (status, refused) = refuse("/api/providers/credentials").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
-        assert_eq!(refused["error"], "idempotency-key header is required");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+        assert_eq!(refused["error"]["code"], "route-not-found");
         assert_eq!(refused.as_object().unwrap().len(), 1, "{refused}");
     }
 
@@ -3858,7 +3872,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            response_json(response).await["error"],
+            response_json(response).await["error"]["message"],
             "idempotency-key header is required"
         );
         let response = harness
@@ -3985,8 +3999,11 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CONFLICT);
             let failure = response_json(response).await;
-            let message = failure["error"].as_str().unwrap();
-            assert!(message.starts_with("idempotency-key-reused"), "{message}");
+            assert_eq!(
+                failure["error"]["code"],
+                crate::api::error::codes::IDEMPOTENCY_KEY_REUSED
+            );
+            let message = failure["error"]["message"].as_str().unwrap();
             assert!(
                 message.contains(&format!("provider-credential-binding {binding_id}")),
                 "{message}"
@@ -4010,7 +4027,7 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let failure = response_json(response).await;
         assert!(
-            failure["error"]
+            failure["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("already exists")
@@ -4197,11 +4214,12 @@ pub(crate) mod tests {
             .insert(header::IF_MATCH, HeaderValue::from_static("\"2\""));
         let response = harness.router.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        let message = response_json(response).await["error"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(message.starts_with("idempotency-key-reused"), "{message}");
+        let failure = response_json(response).await;
+        assert_eq!(
+            failure["error"]["code"],
+            crate::api::error::codes::IDEMPOTENCY_KEY_REUSED
+        );
+        let message = failure["error"]["message"].as_str().unwrap().to_owned();
         assert!(!message.contains("token"), "{message}");
 
         // A genuinely stale If-Match under a new key is a 412 and leaves no
@@ -4357,7 +4375,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        let message = response_json(response).await["error"]
+        let message = response_json(response).await["error"]["message"]
             .as_str()
             .unwrap()
             .to_owned();
@@ -4396,7 +4414,10 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let failure = response_json(response).await;
-        assert_eq!(failure["error"], "idempotency-key header is required");
+        assert_eq!(
+            failure["error"]["message"],
+            "idempotency-key header is required"
+        );
 
         let missing_target = CanonicalId::new_v7();
         let mut request = json_request_without_key(
@@ -4420,7 +4441,7 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let failure = response_json(response).await;
         assert_eq!(
-            failure["error"],
+            failure["error"]["message"],
             "provider target is not granted to this application/environment"
         );
         assert!(!failure.to_string().contains(&missing_target.to_string()));
@@ -4831,7 +4852,7 @@ pub(crate) mod tests {
         // conflict, not the target's status, is what answers now.
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(
-            deployed["error"]
+            deployed["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("already has active deployment operation"),
@@ -4866,11 +4887,11 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
-        let message = refused["error"].as_str().unwrap();
-        assert!(
-            message.starts_with("provider-installation-has-dependents"),
-            "{message}"
+        assert_eq!(
+            refused["error"]["code"],
+            crate::api::error::codes::PROVIDER_INSTALLATION_HAS_DEPENDENTS
         );
+        let message = refused["error"]["message"].as_str().unwrap();
         assert!(message.contains(&seeded.target_id), "{message}");
         assert!(message.contains(&seeded.grant_id), "{message}");
         // The refused delete left no replay record behind.
@@ -4971,7 +4992,7 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(again, deleted);
-        let (status, _, failure) = mutate(
+        let (_status, _, failure) = mutate(
             router,
             Method::POST,
             &format!("{installation_uri}/enable"),
@@ -4979,12 +5000,9 @@ pub(crate) mod tests {
             "\"2\"",
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert!(
-            failure["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("provider-resource-deleted"),
+        assert_eq!(
+            failure["error"]["code"],
+            crate::api::error::codes::PROVIDER_RESOURCE_DELETED,
             "{failure}"
         );
         let (status, _, failure) = mutate(
@@ -4996,11 +5014,9 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert!(
-            failure["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("provider-resource-deleted"),
+        assert_eq!(
+            failure["error"]["code"],
+            crate::api::error::codes::PROVIDER_RESOURCE_DELETED,
             "{failure}"
         );
 
@@ -5038,12 +5054,13 @@ pub(crate) mod tests {
         ] {
             let (status, _, refused) = mutate(router, Method::DELETE, &uri, key, "\"1\"").await;
             assert_eq!(status, StatusCode::CONFLICT, "{uri}");
-            let message = refused["error"].as_str().unwrap();
             assert!(
-                message.starts_with("provider-target-in-use")
-                    || message.starts_with("provider-installation-in-use"),
-                "{message}"
+                refused["error"]["code"] == crate::api::error::codes::PROVIDER_TARGET_IN_USE
+                    || refused["error"]["code"]
+                        == crate::api::error::codes::PROVIDER_INSTALLATION_IN_USE,
+                "{refused}"
             );
+            let message = refused["error"]["message"].as_str().unwrap();
             assert!(message.contains(&operation_id), "{message}");
         }
         // Nothing was cancelled or revoked by the refusals.
@@ -5478,11 +5495,11 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{nowhere}");
         assert_eq!(
-            elsewhere["error"]
+            elsewhere["error"]["message"]
                 .as_str()
                 .unwrap()
                 .replace(&operation_id, "<id>"),
-            nowhere["error"]
+            nowhere["error"]["message"]
                 .as_str()
                 .unwrap()
                 .replace(&unknown_id, "<id>"),
@@ -5508,6 +5525,11 @@ pub(crate) mod tests {
         let etag = |revision: u64| format!("\"{revision}\"");
         let deployment_uri =
             format!("/api/apps/demo/environments/production/provider-deployments/{operation_id}");
+        // The answer is spelled for the surface the request context names;
+        // this mount carries none, so it is spelled for v1.
+        let deployment_location = format!(
+            "/api/v1/apps/demo/environments/production/provider-deployments/{operation_id}"
+        );
         let cancel_uri = format!("{deployment_uri}/cancel");
 
         // If-Match is mandatory, exactly as for the generic operation cancel.
@@ -5554,7 +5576,7 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{cancelling}");
-        assert_eq!(headers[header::LOCATION], deployment_uri);
+        assert_eq!(headers[header::LOCATION], deployment_location);
         assert_eq!(headers[header::ETAG], etag(revision + 1));
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
         assert_eq!(cancelling["operationId"], operation_id);
@@ -5716,9 +5738,10 @@ pub(crate) mod tests {
         assert_eq!(rollback["kind"], "rollback");
         assert_eq!(rollback["state"], "queued");
         assert_eq!(rollback["phase"], "rollback");
-        let rollback_resource =
-            format!("/api/apps/demo/environments/production/provider-deployments/{rollback_id}");
-        assert_eq!(headers[header::LOCATION], rollback_resource);
+        let rollback_path =
+            format!("/apps/demo/environments/production/provider-deployments/{rollback_id}");
+        assert_eq!(headers[header::LOCATION], format!("/api/v1{rollback_path}"));
+        let rollback_resource = format!("/api{rollback_path}");
         assert_eq!(
             headers[header::ETAG],
             format!("\"{}\"", rollback["revision"].as_u64().unwrap())

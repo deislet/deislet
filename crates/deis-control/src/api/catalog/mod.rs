@@ -753,12 +753,12 @@ pub(crate) mod tests {
             // The human half, which since the node routes left this listener
             // is the whole of it. It is normally mounted behind
             // `crate::api::authz::authorize`, which resolves the caller and
-            // leaves a `Principal` in the request.
+            // leaves a `Principal` in the request, and normally nested
+            // under `/api/v1` and `/api/platform`.
             //
-            // Mounted in the legacy `/api/*` spelling on purpose, and kept
-            // so: that tree answers for the whole deprecation window, and
-            // these are its regression tests. The versioned mounts are the
-            // same routers under another prefix, covered in `api::tests`.
+            // Mounted in the unversioned `/api/*` spelling on purpose, and
+            // kept so: the handlers are the same under any prefix, and
+            // these tests are about the catalog rather than the surface.
             router: router("/api", state.clone())
                 .merge(platform_router("/api", state.clone()))
                 .layer(axum::middleware::from_fn(supply_test_principal)),
@@ -2128,7 +2128,9 @@ pub(crate) mod tests {
     }
 
     /// Without a master key the secret endpoints must refuse loudly rather
-    /// than fall back to storing plaintext.
+    /// than fall back to storing plaintext: a 503 whose body says the
+    /// control plane could not complete the request, with what the key file
+    /// was left for the log.
     #[tokio::test]
     async fn secrets_fail_loudly_without_a_master_key() {
         let h = harness(false).await;
@@ -2157,7 +2159,12 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body["error"].as_str().unwrap().contains("no key file"));
+        assert_eq!(body["error"]["code"], "service-unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            crate::api::error::OPAQUE_MESSAGE,
+            "the missing key file is for the log, not the answer: {body}"
+        );
 
         // And nothing was stored.
         let (_, body) = json(

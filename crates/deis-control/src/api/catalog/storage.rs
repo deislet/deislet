@@ -253,7 +253,7 @@ mod tests {
         let (status, body) = json(&h.router, "GET", ROUTE, serde_json::Value::Null).await;
 
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        let message = body["error"].as_str().unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
         assert!(message.contains("storage_auth_secret"), "{message}");
         assert!(message.contains("demo.production"), "{message}");
     }
@@ -265,7 +265,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(
-            body["error"].as_str().unwrap().contains("store_endpoint"),
+            body["error"]["message"].as_str().unwrap().contains("store_endpoint"),
             "{body}"
         );
     }
