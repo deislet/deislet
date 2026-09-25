@@ -20,7 +20,7 @@ Deislet 定位为可信代码平台：平台假设同一安装内部署的应用
 
 - 进程内上限：每类可耗尽的资源都有调用级或应用级上限（调用超时、CPU 时间、子请求数、内存上限等，见 ADR-010 与 ADR-012 的相关章节）。
 - cgroup 兕底：进程级失控交给 cgroup v2。所有服务归入一个 `deislet.slice`；`deis-runtime` 设置 `MemoryHigh`、`MemoryMax`、`TasksMax`、`OOMPolicy=stop` 与 `CPUWeight`，其余服务各设 `MemoryMax`；容器部署给出对应的 `--memory`/`--pids-limit` 建议。上限估算公式与 ADR-010 的内存预算一致。
-- readiness 检测：启动时检测 cgroup v2 与自身的 `memory.max`；检测不到资源兑底时，readiness 报告「资源兑底缺失」（该检测由后续批次实现，本 ADR 先行约定行为）。
+- readiness 检测：启动时检测 cgroup v2 与自身的 `memory.max`；检测不到资源兑底时，readiness 报告「资源兑底缺失」（`resource::backstop` 模块，节点以 degraded 及对应 reason 对外报告；检测本身不阻启动）。实施见 `scripts/canary/systemd/` 与 `docs/deploy-canary.md`。
 
 若将来要运行不可信代码，必须重新评审所有 native op 的输入校验，并引入按应用的 worker 进程隔离（该抽象已在运行时设计中预留），不能把现有 isolate 当作充分防线。
 

@@ -17,17 +17,46 @@ TimeoutStopSec=45
 KillSignal=SIGTERM
 LimitNOFILE=65536
 Environment=RUST_LOG=info
+# The startup snapshot must be prewarmed by the installer
+# (deis-runtime --warm-snapshot, run as root by remote-install.sh after every
+# upgrade) before the service starts: with ProtectHome=true below the service
+# cannot read the install tree to build one itself. A snapshot that does not
+# match the binary fails the start, loudly, rather than serving from
+# something unhardened.
+Environment=DEIS_RUNTIME_SNAPSHOT_PATH=/var/lib/deis/runtime/startup-snapshot.bin
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=deis-runtime
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-# JS sources for the isolate are loaded from the compile-time cargo/crate
-# paths (deno_core LoadedFromFsDuringSnapshot). Those currently live under
-# /home/l/.cargo and /ext/deislet on this host.
-ProtectHome=false
+# The snapshot prewarm above is what makes this possible: startup reads only
+# /usr/local/bin/deis-runtime and the snapshot under ReadWritePaths.
+ProtectHome=true
 ReadWritePaths=/var/lib/deis/runtime
+# The application's own limits (JS heap, subrequests, execution deadlines)
+# are applied by code inside this process; these are the ceilings that hold
+# when those cannot. Sizing is in docs/deploy-canary.md.
+Slice=deislet.slice
+MemoryHigh=1500M
+MemoryMax=2G
+# A memory trip ends this service, and systemd restarts it: an isolate that
+# beat every in-process limit has already forfeited the benefit of the doubt,
+# and the alternative - OOMKill choosing a victim on its own - can take a
+# neighbour instead.
+OOMPolicy=stop
+# One runtime thread per application plus pool reserves, on top of the
+# platform's own threads; the slice's TasksMax bounds the sum.
+TasksMax=256
+CPUWeight=100
+# The runtime listens on TCP only (HTTP, machine channel, management plane).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The default service set, minus what this process cannot do without. V8
+# writes generated code, so memory mappings cannot be made
+# non-executable-writable: MemoryDenyWriteExecute is left off deliberately.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=deislet.target

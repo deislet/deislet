@@ -450,9 +450,32 @@ install_bins() {
 
 install_units() {
   install -o root -g root -m 644 "${INSTALL_ROOT}/systemd/"*.service /etc/systemd/system/
+  install -o root -g root -m 644 "${INSTALL_ROOT}/systemd/deislet.slice" /etc/systemd/system/
   install -o root -g root -m 644 "${INSTALL_ROOT}/systemd/deislet.target" /etc/systemd/system/
   systemctl daemon-reload
   systemctl enable deis-telemetry deis-store deis-queue deis-control deis-runtime deis-proxy deislet.target
+}
+
+# Build the runtime's startup snapshot, before the (hardened) service needs
+# one.
+#
+# deis-runtime.service runs with ProtectHome=true, so the service itself
+# cannot read the isolate JS it loads from the install tree -- building a
+# startup snapshot means exactly that read. This runs the same binary the
+# service will run, as root, with the snapshot path the unit's environment
+# names: the resulting file is everything the hardened service starts from,
+# and a snapshot that does not match the binary fails the start loudly
+# instead of serving from something unhardened. Must run after install_bins
+# and install_runtime_fs, and before start_stack.
+warm_runtime_snapshot() {
+  local snapshot=/var/lib/deis/runtime/startup-snapshot.bin
+  install -o deis -g deis -m 755 -d /var/lib/deis/runtime
+  DEIS_RUNTIME_SNAPSHOT_PATH="${snapshot}" /usr/local/bin/deis-runtime \
+    --config /etc/deis/runtime.toml --warm-snapshot \
+    || die "the runtime startup snapshot could not be built; the hardened service would fail to start"
+  chmod 640 "${snapshot}"
+  chown deis:deis "${snapshot}"
+  log "runtime startup snapshot is warm at ${snapshot}"
 }
 
 install_runtime_fs() {
@@ -719,6 +742,7 @@ install_runtime_fs
 write_release_stamp
 ensure_hosts
 check_configs
+warm_runtime_snapshot
 start_stack
 wait_http "http://127.0.0.1:${CONTROL_PORT}/health" deis-control
 wait_http "http://127.0.0.1:${RUNTIME_PORT}/health" deis-runtime -H "x-deis-app-id: _system"

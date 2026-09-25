@@ -120,6 +120,45 @@ jobs:
       - name: Relative Markdown link targets exist
         run: ./scripts/check-doc-links.sh
 
+  unit-files:
+    name: the shipped systemd units verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # verify(8) parses the unit files and checks the directives, without
+      # starting anything. The ExecStart binaries are not built here - the
+      # workspace job does that - so each unit is verified against a
+      # placeholder at the same path, which is enough for the directive
+      # checks and for the slice's existence. Runner noise from the image's
+      # own units is filtered rather than failing on it.
+      - name: systemd-analyze verify
+        run: |
+          set -eu
+          mkdir -p /tmp/verify-bin
+          for unit in scripts/canary/systemd/*.service; do
+            name=$(basename "$unit")
+            bin=$(grep '^ExecStart=' "$unit" | head -1 | sed 's/^ExecStart=//' | awk '{print $1}')
+            touch "/tmp/verify-bin/$(basename "$bin")"
+            chmod +x "/tmp/verify-bin/$(basename "$bin")"
+            sed "s|^ExecStart=.*|ExecStart=/tmp/verify-bin/$(basename "$bin")|" "$unit" > "/tmp/verify-bin/$name"
+          done
+          cp scripts/canary/systemd/deislet.slice /tmp/verify-bin/
+          # verify reads the runner's own installed units too and reports the
+          # image's unrelated problems; what this job answers for is the
+          # files in scripts/canary/systemd/, so only their diagnostics count.
+          systemd-analyze verify /tmp/verify-bin/*.service /tmp/verify-bin/deislet.slice \
+            2> /tmp/verify-err || true
+          echo "---- diagnostics for the shipped units ----"
+          grep -F -f <(printf '%s\n' /tmp/verify-bin/deis-control.service /tmp/verify-bin/deis-proxy.service \
+            /tmp/verify-bin/deis-queue.service /tmp/verify-bin/deis-runtime.service \
+            /tmp/verify-bin/deis-store.service /tmp/verify-bin/deis-telemetry.service \
+            /tmp/verify-bin/deislet.slice) /tmp/verify-err > /tmp/verify-shipped || true
+          cat /tmp/verify-shipped
+          if [ -s /tmp/verify-shipped ]; then
+            exit 1
+          fi
+
   demo-witnesses:
     name: the demo's own witnesses hold
     runs-on: ubuntu-latest

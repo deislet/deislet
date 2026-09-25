@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use deis_identity::MachineIdentity;
 use deis_runtime::app::ApplicationManager;
@@ -63,6 +63,20 @@ struct Cli {
     /// one, reports a port clash instead of the answer that was wanted.
     #[arg(long)]
     check_config: bool,
+
+    /// Build the startup snapshot named by DEIS_RUNTIME_SNAPSHOT_PATH and
+    /// exit without binding anything or starting an isolate.
+    ///
+    /// What it is for: the service unit runs with `ProtectHome=true` (and
+    /// would have every other read of the install tree closed off), so the
+    /// runtime can only start from a snapshot that already exists -- building
+    /// one means reading this crate's embedded extension scripts back from
+    /// the install tree, which a hardened unit must never do. The installer
+    /// runs this flag as root, as the same binary that will serve, after
+    /// every upgrade and before the first start: see
+    /// `scripts/canary/remote-install.sh`.
+    #[arg(long)]
+    warm_snapshot: bool,
 }
 
 /// The log level filter for this node: `RUST_LOG` when it is set, `info`
@@ -239,6 +253,26 @@ fn main() -> Result<()> {
                 .and_then(|identity| identity.management_listen.clone())
                 .unwrap_or_else(|| "not configured - nothing can drive this node".to_string()),
         );
+        return Ok(());
+    }
+
+    if cli.warm_snapshot {
+        // Logging is not set up yet and does not need to be: this mode runs
+        // from an installer, and the operator reads its one line of output.
+        // Without DEIS_RUNTIME_SNAPSHOT_PATH there is nothing to warm -- the
+        // runtime would build its snapshot in memory every start, which is
+        // exactly the fs read at startup `ProtectHome=true` forbids.
+        let path = std::env::var("DEIS_RUNTIME_SNAPSHOT_PATH").map_err(|_| {
+            anyhow::anyhow!(
+                "--warm-snapshot needs DEIS_RUNTIME_SNAPSHOT_PATH set to the file the \n                 service will load its startup snapshot from"
+            )
+        })?;
+        match deis_runtime::runtime::load_or_create_startup_snapshot()? {
+            Some(_) => println!("startup snapshot is warm at {path}"),
+            None => anyhow::bail!(
+                "the startup snapshot did not load or build; the service would fail to start \n                 the same way this did"
+            ),
+        }
         return Ok(());
     }
 
@@ -476,6 +510,32 @@ async fn run(
     // does that, so the control plane can reach it and an operator gets an
     // answer that says "starting" rather than a refused connection.
     let health = NodeHealth::starting();
+
+    // The last resort against a runaway isolate is the kernel's, not this
+    // process's: a cgroup v2 memory.max, with the unit file's OOMPolicy
+    // deciding what a trip costs. Look for it once, now, and let readiness
+    // carry the answer -- a node without one still serves, but says so
+    // (docs/adr/018-resource-backstops.md).
+    match deis_runtime::resource::backstop::detect(
+        Path::new("/proc/self/cgroup"),
+        Path::new("/sys/fs/cgroup"),
+    ) {
+        Ok(backstop) => {
+            health.note_resource_backstop(backstop.limit_bytes, backstop.where_from.clone());
+            if let Some(bytes) = backstop.limit_bytes {
+                info!(
+                    limit_bytes = bytes,
+                    "This node's memory backstop is a cgroup v2 memory.max of {} bytes", bytes
+                );
+            }
+        }
+        Err(err) => {
+            health.note_resource_backstop(
+                None,
+                format!("/proc/self/cgroup could not be read: {err}"),
+            );
+        }
+    }
 
     let assignment_client =
         AssignmentClient::from_config(&config, &node_id, machine_identity.clone())

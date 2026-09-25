@@ -100,7 +100,7 @@
 //! same handle it reports its own passes through.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
@@ -317,7 +317,30 @@ impl Readiness {
 #[derive(Debug)]
 pub struct NodeHealth {
     state: ArcSwap<Readiness>,
+    /// The resource backstop the node looked for at startup and what it
+    /// found, held apart from `state` because the two change for different
+    /// reasons: the assignment list moves the readiness, the kernel
+    /// configuration does not, and a backstop that is missing has to stay
+    /// missing through every `mark_ready` that follows.
+    backstop: RwLock<ResourceBackstop>,
 }
+
+/// What the node concluded about the cgroup memory ceiling that is its last
+/// resort against a runaway isolate. See [`crate::resource::backstop`].
+#[derive(Debug, Clone)]
+struct ResourceBackstop {
+    /// Whether detection ran and found nothing usable. A node that has not
+    /// been probed yet is treated as having a backstop, so the default does
+    /// not degrade anything that never asked.
+    missing: bool,
+    /// Where the node looked and what it found, for `details()` and the
+    /// degraded reason.
+    detail: String,
+}
+
+/// The degraded reason a node reports when it runs without a cgroup memory
+/// ceiling (resource backstop missing, in an operator's words).
+pub const RESOURCE_BACKSTOP_REASON: &str = "resource backstop missing: this node runs without a cgroup v2 memory.max, so a runaway      isolate can only be stopped by taking the machine down with it";
 
 impl NodeHealth {
     /// A node that has not finished starting yet.
@@ -330,17 +353,72 @@ impl NodeHealth {
     pub fn starting() -> Arc<Self> {
         let health = Arc::new(Self {
             state: ArcSwap::from_pointee(Readiness::Starting),
+            backstop: RwLock::new(ResourceBackstop {
+                missing: false,
+                detail: "not probed yet".to_string(),
+            }),
         });
         SERVING.store(Some(Arc::clone(&health)));
         health
     }
 
     pub fn snapshot(&self) -> Readiness {
-        (**self.state.load()).clone()
+        self.with_backstop((**self.state.load()).clone())
     }
 
     pub fn is_healthy(&self) -> bool {
-        self.state.load().is_healthy()
+        self.snapshot().is_healthy()
+    }
+
+    /// A node whose memory backstop is missing does not answer `ready`,
+    /// however faithfully it runs its assignment list: it answers `degraded`
+    /// naming the backstop. The readiness that is *stored* stays whatever the
+    /// assignment machinery last made it -- the fold happens on every read,
+    /// so a backstop that appears (a unit file fixed, a node restarted into a
+    /// slice) lifts the degradation without anyone having to re-mark the node
+    /// ready, and a `Degraded` from a failed assignment is never overwritten
+    /// by a backstop that is fine.
+    fn with_backstop(&self, state: Readiness) -> Readiness {
+        let backstop = self.backstop.read().expect("the backstop lock");
+        if !backstop.missing {
+            return state;
+        }
+        match state {
+            Readiness::Ready { apps } => Readiness::Degraded {
+                reason: RESOURCE_BACKSTOP_REASON.to_string(),
+                apps,
+            },
+            other => other,
+        }
+    }
+
+    /// What the node found when it looked for its cgroup memory ceiling at
+    /// startup. `None` degrades the node from ready, on read; `Some` records
+    /// where the ceiling was seen, for `details()`.
+    pub fn note_resource_backstop(&self, limit_bytes: Option<u64>, detail: String) {
+        let missing = limit_bytes.is_none();
+        let previous = {
+            let mut backstop = self.backstop.write().expect("the backstop lock");
+            std::mem::replace(&mut *backstop, ResourceBackstop { missing, detail })
+        };
+        match (limit_bytes, previous.missing) {
+            (None, false) if matches!(self.state.load().as_ref(), Readiness::Ready { .. }) => {
+                tracing::error!(
+                    detail = %self.backstop.read().expect("the backstop lock").detail,
+                    "This node runs WITHOUT a cgroup v2 memory ceiling and answers degraded                      from now on: an isolate the runtime's own limits fail to stop could take                      the whole machine down. Put the service in a slice with MemoryMax set --                      see scripts/canary/systemd/deis-runtime.service"
+                );
+            }
+            (None, _) => tracing::warn!(
+                detail = %self.backstop.read().expect("the backstop lock").detail,
+                "This node runs without a cgroup v2 memory ceiling: {}",
+                RESOURCE_BACKSTOP_REASON
+            ),
+            (Some(bytes), _) => tracing::debug!(
+                limit_bytes = bytes,
+                "This node runs under a cgroup v2 memory ceiling of {} bytes",
+                bytes
+            ),
+        }
     }
 
     /// The node is running what it was told to run.
@@ -488,6 +566,17 @@ impl NodeHealth {
         let mut details = HashMap::new();
         let state = self.snapshot();
         details.insert("state".to_string(), state.state_name().to_string());
+        {
+            let backstop = self.backstop.read().expect("the backstop lock");
+            details.insert(
+                "resource_backstop".to_string(),
+                if backstop.missing {
+                    format!("missing ({})", backstop.detail)
+                } else {
+                    format!("present ({})", backstop.detail)
+                },
+            );
+        }
         match state {
             Readiness::Starting => {
                 details.insert(
@@ -510,6 +599,88 @@ impl NodeHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node that probed its cgroup memory ceiling and found one answers
+    /// `ready` as before; the probe itself changes nothing about readiness.
+    #[test]
+    fn a_present_backstop_leaves_readiness_alone() {
+        let health = NodeHealth::starting();
+        health.note_resource_backstop(
+            Some(2_147_483_648),
+            "/sys/fs/cgroup/system.slice/deis-runtime.service/memory.max".to_string(),
+        );
+        health.mark_ready(3);
+        assert_eq!(health.snapshot(), Readiness::Ready { apps: 3 });
+        assert!(health.is_healthy());
+        assert_eq!(
+            health
+                .details()
+                .get("resource_backstop")
+                .map(String::as_str),
+            Some("present (/sys/fs/cgroup/system.slice/deis-runtime.service/memory.max)")
+        );
+    }
+
+    /// The whole point of the backstop report: a node without a usable
+    /// memory ceiling does not answer `ready`, whatever its assignment
+    /// machinery says, and the reason names what is missing. The fold is on
+    /// read, so a later ceiling -- the unit file fixed, the node moved into
+    /// a slice -- lifts the degradation without a re-mark.
+    #[test]
+    fn a_missing_backstop_degrades_a_ready_node_until_a_ceiling_is_found() {
+        let health = NodeHealth::starting();
+        health.note_resource_backstop(
+            None,
+            "/sys/fs/cgroup/memory.max: memory.max is `max`, which is unlimited and bounds              nothing"
+                .to_string(),
+        );
+
+        // Even before it is ready, it reports the backstop in its details,
+        // but `starting` is not promoted to `degraded` by this -- the same
+        // rule a refused assignment follows.
+        assert_eq!(health.snapshot(), Readiness::Starting);
+
+        health.mark_ready(5);
+        match health.snapshot() {
+            Readiness::Degraded { reason, apps } => {
+                assert_eq!(apps, 5);
+                assert_eq!(reason, RESOURCE_BACKSTOP_REASON);
+                assert!(!health.is_healthy());
+            }
+            other => panic!("a node without a backstop must not read ready: {other:?}"),
+        }
+        let details = health.details();
+        assert_eq!(details.get("state").map(String::as_str), Some("degraded"));
+        assert!(
+            details
+                .get("resource_backstop")
+                .is_some_and(|d| d.starts_with("missing (")),
+            "{details:?}"
+        );
+
+        // The ceiling arrives: the node is ready again, without anybody
+        // re-marking it.
+        health.note_resource_backstop(Some(1 << 31), "/sys/fs/cgroup/memory.max".to_string());
+        assert_eq!(health.snapshot(), Readiness::Ready { apps: 5 });
+        assert!(health.is_healthy());
+    }
+
+    /// A backstop that is missing must not mask a degradation that is about
+    /// something else, and must not be masked by one: the readiness is the
+    /// stored one either way, with the backstop reported in the details.
+    #[test]
+    fn a_missing_backstop_and_another_degradation_report_the_real_reason() {
+        let health = NodeHealth::starting();
+        health.mark_ready(2);
+        health.note_resource_backstop(None, "no memory.max in the cgroup".to_string());
+        health.mark_degraded("a pushed deployment was refused", 2);
+        match health.snapshot() {
+            Readiness::Degraded { reason, .. } => {
+                assert_eq!(reason, "a pushed deployment was refused");
+            }
+            other => panic!("the assignment's degradation must survive: {other:?}"),
+        }
+    }
 
     /// Ask `system_app.js` the edge's probe with exactly the headers a node in
     /// `readiness` would have stamped.
@@ -624,7 +795,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn the_system_application_answers_the_probe_from_the_header() {
-        use crate::app::{test_host, AppConfig, AppKey};
+        use crate::app::{AppConfig, AppKey, test_host};
 
         let _turn = test_host::take();
         let apps = test_host::host();
@@ -724,7 +895,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn the_probe_states_the_reason_the_node_recorded_rather_than_guessing_it() {
-        use crate::app::{test_host, AppConfig, AppKey};
+        use crate::app::{AppConfig, AppKey, test_host};
 
         let _turn = test_host::take();
         let apps = test_host::host();
@@ -843,7 +1014,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_node_that_states_no_reason_has_none_made_up_for_it() {
-        use crate::app::{test_host, AppConfig, AppKey};
+        use crate::app::{AppConfig, AppKey, test_host};
 
         let _turn = test_host::take();
         let apps = test_host::host();

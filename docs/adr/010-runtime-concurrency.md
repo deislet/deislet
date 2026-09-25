@@ -48,7 +48,12 @@ Pool policy 至少包含：
 - idle eviction timeout。
 - startup/readiness timeout。
 - WebSocket/stream connection budget。
-- total app/node CPU and memory budget。内存预算按三部分计列：JS 堆、ArrayBuffer、外部缓冲区（native 分配）。目前只有 JS 堆可以完全计量，ArrayBuffer 与外部缓冲区尚不能完全计量；计量能力补齐前，节点级总量由 cgroup 兜底（T3，决策 D-3）。
+- total app/node CPU and memory budget。内存预算按三部分计列，各自的计量能力不同：
+  - **JS 堆**：完全可计量（V8 `near-heap-limit` 回调按 isolate 设限，超限回收 isolate，见 D-3）；预算为 `线程数 × default_memory_limit_mb`。
+  - **ArrayBuffer / typed array 后备存储**：计入 V8 堆外账目，可观测但不在 `near-heap-limit` 的直接路径上；按「堆上限的同量级」预留。
+  - **外部缓冲区（native 分配）**：响应体暂存、bundle 缓存等由各分配点自设上限，不在统一的按 isolate 计量内；不可计量部分写明为估算。
+  - 计量能力补齐前，节点级总量由 cgroup 兜底（T3，决策 D-3）；部署估算公式（线程数 × 堆上限 × 2 + 进程与缓存开销 + 余量）见 `docs/deploy-canary.md`。
+- outbound 并发上限（`max_outbound_connections`）：每应用同时持有的出站连接数（fetch 与出站 WebSocket 同计），narrowing-only，与子请求配额分别计列——前者限「同时打开多少」，后者限「一共调用多少」。
 
 标准保证这些配置的语义和范围；具体默认数值进入 ADR-005 的 guarantee table 提案。
 
