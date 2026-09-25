@@ -27,6 +27,10 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# The durability benchmark measures the open path's pragma settings with a
+# direct connection rather than the pool; `rusqlite` is already a dependency,
+# but integration tests only link `dev-dependencies`.
+rusqlite = { workspace = true }
 # `test-util` gives the tests a controllable clock, so the dead letter sweep
 # can be checked without any real waiting.
 tokio = { workspace = true, features = ["test-util"] }

@@ -3,12 +3,15 @@ use rusqlite::{Connection, OptionalExtension, Result};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-/// Initialize database schema
+/// Initialize database schema.
+///
+/// The connection is expected to be already configured - journal mode,
+/// `synchronous`, busy timeout and `foreign_keys` are set where the file is
+/// opened (`Database::init`), not here. The rebuild below relies on
+/// `foreign_keys` being on: it turns the setting off for its copy and back on
+/// afterwards, which only means anything on a connection that had it on.
 pub fn create_tables(conn: &Connection) -> Result<()> {
     info!("Creating database tables...");
-
-    // Enable foreign key constraints
-    conn.execute("PRAGMA foreign_keys = ON", [])?;
 
     // Nodes table
     conn.execute(

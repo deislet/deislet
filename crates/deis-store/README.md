@@ -29,3 +29,24 @@ decision not yet taken, not a missing check: a quota needs an owner for the
 number (the control plane knows the tenants, this service does not) and a
 story for what happens at the limit. Until then the operator's protection is
 disk monitoring and the per-request ceilings above.
+
+## Durability
+
+Every SQLite file here runs in WAL mode with `synchronous = NORMAL` by
+default; the `durability` setting chooses between `"normal"` and `"full"`.
+
+Under `normal`, a commit's WAL frame is not fsynced until a checkpoint, so
+a host that loses power may lose the last seconds of writes it had already
+acknowledged: KV entries, blob metadata, and a tenant's own SQL. The
+database cannot be corrupted by it - at recovery an incomplete WAL frame is
+discarded whole, never half-applied. `full` closes the window at the cost of
+an fsync per commit.
+
+One asymmetry worth knowing before choosing: a blob's content file is put in
+place before its metadata row commits, so a power failure under `normal` can
+leave content with no row - an orphan, removable with the one-start `remove_orphaned_blob_content`
+switch - but never a row whose content is missing.
+
+The component-by-component tradeoff, with the queue and the control plane's
+opposite choices, is ADR-012's 「各组件 SQLite 耐久性取舍」 table; the
+queue's measured cost of `full` is in `crates/deis-queue/README.md`.

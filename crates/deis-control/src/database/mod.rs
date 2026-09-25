@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use serde_json::Value as JsonValue;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
 // `states()` on both machines, which is how the two sweeps below spell their
@@ -207,7 +208,8 @@ pub struct Database {
 impl Database {
     /// Initialize database with schema
     pub async fn init<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
-        let connection = Connection::open(path)?;
+        let connection = Connection::open(&path)?;
+        configure_connection(&connection, path.as_ref())?;
 
         let db = Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -1197,6 +1199,60 @@ impl Database {
     }
 }
 
+/// The pragmas the process's one connection runs under, set before anything
+/// is created on it.
+///
+/// A control file is not opened by one process: a hand-started instance runs
+/// beside the service unit, and a blue-green switch has both halves up at
+/// once (`scheduler::lease`). They share one file, so the connection has to
+/// queue for its write lock instead of failing on it, and it has to leave the
+/// file in the journal mode that makes concurrent readers and one writer
+/// workable.
+///
+/// `path` is only used to say which file a refusal happened to.
+fn configure_connection(conn: &Connection, path: &Path) -> Result<(), DatabaseError> {
+    // WAL, which is also the precondition of the backup that replicates this
+    // file (ADR-012): a rollback journal would have the writer block every
+    // reader, and there are two processes that may both be writing. It is
+    // what leaves `-wal` and `-shm` beside the database; a network
+    // filesystem does not support it.
+    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    // An in-memory database cannot be in WAL mode and reports `memory`, which
+    // is every `Database::init(":memory:")` in the tests rather than a
+    // refusal to warn about.
+    if !mode.eq_ignore_ascii_case("wal") && !mode.eq_ignore_ascii_case("memory") {
+        tracing::warn!(
+            path = %path.display(),
+            mode = %mode,
+            "sqlite refused WAL and stayed in this journal mode; concurrent processes sharing this \
+             file will block each other, and the file's backup needs WAL"
+        );
+    }
+    // FULL, not NORMAL: this file holds the authoritative catalogue, key
+    // revisions and deployment plans, and its write rate is low. A commit
+    // that was acknowledged and then lost to a host power failure would leave
+    // the control plane disagreeing with the nodes it has already told about
+    // it.
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    // A write that finds the lock held waits instead of returning SQLITE_BUSY
+    // at once, which is what SQLite's default timeout of zero does - and the
+    // second process would then fail a request the first one would have
+    // served a moment later.
+    conn.busy_timeout(Duration::from_secs(5))?;
+    // Set here and not in `schema::create_tables`, which is handed a
+    // connection that is already configured: every later statement on this
+    // connection depends on it, and a schema function is not the place the
+    // process's one connection is configured.
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+
+    tracing::debug!(
+        path = %path.display(),
+        journal_mode = %mode,
+        "opened the control database connection"
+    );
+    Ok(())
+}
+
 /// The columns one diagnostic history page is read through, with the
 /// equality filters the request narrowed it by.
 ///
@@ -2177,6 +2233,141 @@ mod tests {
                 .len(),
             5,
             "the busy node is trimmed to the cap"
+        );
+    }
+
+    /// The pragmas the process's one connection runs under, read back through
+    /// that same connection: a second connection would only say what SQLite's
+    /// defaults are.
+    #[tokio::test]
+    async fn the_connection_carries_the_configured_pragmas() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("control.sqlite");
+        let db = Database::init(&path).await.unwrap();
+
+        let (journal_mode, synchronous, busy_timeout, foreign_keys): (String, i64, i64, i64) = db
+            .with_connection(|conn| {
+                Ok::<_, DatabaseError>((
+                    conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?,
+                    conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?,
+                    conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?,
+                    conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        assert_eq!(
+            synchronous, 2,
+            "FULL is 2; an acknowledged commit of the catalogue must survive a host power failure"
+        );
+        assert_eq!(busy_timeout, 5000);
+        assert_eq!(foreign_keys, 1);
+    }
+
+    /// Two processes share one control file - a hand-started instance beside
+    /// the service unit, and both halves of a blue-green switch
+    /// (`scheduler::lease`) - so a writer that finds the lock held has to wait
+    /// for it. SQLite's default busy timeout of zero turns that wait into an
+    /// immediate `SQLITE_BUSY` and a failed request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_writer_waits_for_the_lock_instead_of_failing() {
+        use rusqlite::TransactionBehavior;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("control.sqlite");
+        let first = Database::init(&path).await.unwrap();
+        let second = Database::init(&path).await.unwrap();
+
+        let holder_started = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&holder_started);
+        let holder = tokio::spawn(async move {
+            first
+                .with_connection(move |conn| {
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        conn,
+                        TransactionBehavior::Immediate,
+                    )?;
+                    tx.execute(
+                        "INSERT INTO events (event_type, node_id, severity, message, timestamp) \
+                         VALUES ('test', NULL, 'Info', 'holding the write lock', ?1)",
+                        ["1970-01-01T00:00:00+00:00"],
+                    )?;
+                    // The lock is held from here. Whoever is waiting for it
+                    // has to wait for the whole 300 ms, not for the instant
+                    // this closure started.
+                    signal.notify_one();
+                    std::thread::sleep(Duration::from_millis(300));
+                    tx.commit()?;
+                    Ok::<(), DatabaseError>(())
+                })
+                .await
+        });
+
+        holder_started.notified().await;
+        let started = std::time::Instant::now();
+        second
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO events (event_type, node_id, severity, message, timestamp) \
+                     VALUES ('test', NULL, 'Info', 'waited for the write lock', ?1)",
+                    ["1970-01-01T00:00:00+00:00"],
+                )?;
+                Ok::<(), DatabaseError>(())
+            })
+            .await
+            .expect("a competing writer must wait for the lock, not be refused with SQLITE_BUSY");
+        let waited = started.elapsed();
+        holder.await.unwrap().unwrap();
+
+        assert!(
+            waited >= Duration::from_millis(200),
+            "the second write returned after {waited:?}, so it did not wait for the first \
+             transaction"
+        );
+    }
+
+    /// Control's backups are Litestream's job and it decides when the WAL is
+    /// checkpointed (ADR-012, T4). A checkpoint statement anywhere in this
+    /// crate would take that decision away from it, so the absence is asserted
+    /// rather than left to review.
+    ///
+    /// The needle is assembled from two pieces so that this test's own source
+    /// is not one of the matches.
+    #[test]
+    fn the_crate_never_checkpoints_the_wal_itself() {
+        let needle = concat!("wal_", "checkpoint");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        let mut scanned = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        let mut directories = vec![root];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    scanned += 1;
+                    if std::fs::read_to_string(&path)
+                        .unwrap()
+                        .contains(needle)
+                    {
+                        offenders.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+
+        assert!(
+            scanned > 0,
+            "no source file was scanned, so this test is broken rather than the crate clean"
+        );
+        assert!(
+            offenders.is_empty(),
+            "control must leave checkpointing to the backup that replicates the file, but these \
+             sources call it: {offenders:?}"
         );
     }
 }

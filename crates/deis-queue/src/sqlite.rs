@@ -202,11 +202,16 @@ fn open(path: &Path, label: &str) -> QueueResult<Connection> {
              block each other and pull latency will spike under load"
         );
     }
-    // NORMAL trades an fsync per commit for an fsync per checkpoint. With WAL
-    // that risks losing the last commits on a machine crash, not corruption.
-    // For a queue that means the last few sends may be lost on a host crash,
-    // which is the same exposure every other Deislet store accepts.
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // FULL, not NORMAL. A queue at-least-once promise rests on `Send`: a
+    // Send that returns an id and is then lost to a host power failure is a
+    // message that was accepted and never delivered, which is the one thing
+    // the promise forbids. An ordinary commit under WAL is what makes that
+    // promise durable, and FULL is one fsync per commit. `Ack` is different:
+    // losing an acknowledgement only returns the message to its queue, and a
+    // redelivery is inside the same at-least-once contract, so the cost is
+    // paid on Send and accepted on Ack. The README records the measured
+    // cost.
+    conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
 
@@ -261,6 +266,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    /// The durability a queue owes a `Send` that returned an id: SQLite's
+    /// `FULL` is 2, and `NORMAL` is 1.
+    #[tokio::test]
+    async fn synchronous_is_full() {
+        let dir = TempDir::new().unwrap();
+        let pool = pool(&dir);
+        let synchronous: i64 = pool
+            .with_conn(|c| Ok(c.query_row("PRAGMA synchronous", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 2);
     }
 
     #[tokio::test]

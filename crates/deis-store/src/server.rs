@@ -63,6 +63,7 @@ impl Stores {
         let kv = KvService::open_with_fences(
             &config.data_dir,
             config.shared_connections,
+            config.durability,
             fences.clone(),
         )
         .await
@@ -70,12 +71,14 @@ impl Stores {
         let database = DatabaseService::open_with_fences(
             &config.data_dir,
             config.tenant_connections,
+            config.durability,
             fences.clone(),
         )
         .context("cannot open the database service")?;
         let blob = BlobService::open_with_fences(
             &config.data_dir,
             config.shared_connections,
+            config.durability,
             config.blob_limits(),
             fences.clone(),
         )

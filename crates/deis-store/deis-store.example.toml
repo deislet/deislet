@@ -56,6 +56,35 @@ listen = "127.0.0.1:8090"
 # over the top of it.
 data_dir = "./data"
 
+# How much a commit is allowed to cost in durability: "normal" or "full".
+# The default is "normal", shown here because an empty file is the
+# documented starting point.
+#
+# Every SQLite file here runs in WAL mode, so "normal" means a commit's WAL
+# frame is not fsynced until a checkpoint: a host that loses power may lose
+# the last seconds of writes it had already acknowledged (KV entries, blob
+# metadata, a tenant's own SQL). The database cannot be corrupted by it - at
+# recovery an incomplete WAL frame is discarded whole, never half-applied.
+# "full" fsyncs on every commit and closes that window.
+#
+# The store defaults to "normal" because its writes are cheaper to re-derive
+# than the queue's or the control plane's; the component-by-component
+# reasoning is ADR-012's 各组件 SQLite 耐久性取舍 table. If a power loss
+# leaves blob content whose metadata row was lost, the content file survives
+# as an orphan; see the one-start remove_orphaned_blob_content switch below
+# to clean those up.
+durability = "normal"
+
+# Whether the blob store's start-up sweep may delete content files no
+# metadata row references. Off by default: such a file is usually the
+# leftover of a crash between placing content and committing its row, but it
+# is also exactly what every object written after a metadata snapshot looks
+# like once that older snapshot is restored, and the sweep cannot tell the
+# two apart. Off, the sweep counts them and logs the count at warn with
+# this switch's name; turn it on for one start after confirming the
+# metadata is the newest copy, and turn it off again.
+# remove_orphaned_blob_content = false
+
 # Connections in the pool of each shared SQLite file (KV and blob metadata),
 # and with it the ceiling on blocking threads those two stores occupy.
 # Raising it buys concurrency for readers; SQLite serialises writers whatever

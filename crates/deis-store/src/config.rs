@@ -24,9 +24,20 @@
 //! `snapshot_dir` starts the scheduled snapshots in [`crate::backup`]; leaving
 //! it unset means nothing ever takes one, which the service also says at
 //! startup, at `warn`.
+//!
+//! # `durability` is the size of the window a host power failure can take
+//!
+//! Every SQLite file here is in WAL mode, where `normal` (the default) pays
+//! one fsync per checkpoint and `full` one per commit. A host that loses power
+//! under `normal` may lose the last seconds of writes it had already
+//! acknowledged - KV entries, blob metadata, and a tenant's own SQL - and
+//! under either setting it cannot corrupt the database. `full` closes that
+//! window at the cost of an fsync per commit; see [`crate::sqlite::Durability`]
+//! and ADR-012 for the component-by-component table.
 
 use crate::backup::SnapshotSchedule;
 use crate::blob::BlobLimits;
+use crate::sqlite::Durability;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -69,6 +80,18 @@ pub struct Config {
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// How much a commit costs in durability: `"normal"` or `"full"`.
+    ///
+    /// `normal` is one fsync per checkpoint, so a host that loses power may
+    /// lose the last seconds of writes it had already acknowledged; the
+    /// database itself stays consistent either way. `full` is one fsync per
+    /// commit, and an acknowledged write survives the power failure. Blob
+    /// content files are placed before their metadata row is committed, so
+    /// `normal` can also leave content with no row - the orphan case
+    /// [`Self::remove_orphaned_blob_content`] describes - and never a row
+    /// whose content is missing.
+    #[serde(default)]
+    pub durability: Durability,
     /// Connections in the pool of each shared SQLite file (KV, blob
     /// metadata). Also the ceiling on blocking threads those stores occupy.
     #[serde(default = "default_shared_connections")]
@@ -207,6 +230,7 @@ impl Default for Config {
         Self {
             listen: default_listen(),
             data_dir: default_data_dir(),
+            durability: Durability::default(),
             shared_connections: default_shared_connections(),
             tenant_connections: default_tenant_connections(),
             kv_sweep_interval_secs: default_sweep_interval_secs(),
@@ -278,6 +302,7 @@ mod tests {
         let defaults = Config::default();
         assert_eq!(parsed.auth_secret, defaults.auth_secret);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
+        assert_eq!(parsed.durability, defaults.durability);
         assert_eq!(parsed.snapshot_dir, defaults.snapshot_dir);
         assert_eq!(
             parsed.snapshot_interval_secs,
@@ -364,6 +389,25 @@ mod tests {
         assert_eq!(parsed.max_object_bytes, 1024);
         // Untouched fields keep their defaults.
         assert_eq!(parsed.shared_connections, default_shared_connections());
+    }
+
+    /// The default is the trade this store makes on purpose: a cheap commit,
+    /// and a host power failure can take the last seconds of acknowledged
+    /// writes. An operator who cannot accept that asks for `full`.
+    #[test]
+    fn durability_defaults_to_normal_and_full_is_opt_in() {
+        assert_eq!(Config::default().durability, Durability::Normal);
+        let parsed: Config = toml::from_str(r#"durability = "normal""#).unwrap();
+        assert_eq!(parsed.durability, Durability::Normal);
+        let parsed: Config = toml::from_str(r#"durability = "full""#).unwrap();
+        assert_eq!(parsed.durability, Durability::Full);
+    }
+
+    /// A typo in the most consequential key in the file must not quietly leave
+    /// the store on the cheaper setting.
+    #[test]
+    fn an_unknown_durability_is_a_hard_error() {
+        assert!(toml::from_str::<Config>(r#"durability = "fast""#).is_err());
     }
 
     #[test]

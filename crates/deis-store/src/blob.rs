@@ -46,7 +46,7 @@ use crate::proto::blob::{
     ListRequest, ListResponse, PreconditionFailure, PutRequest, PutResponse, RangeInfo,
     blob_store_server::BlobStore, byte_range, get_response, precondition, put_request,
 };
-use crate::sqlite::{PoolSize, SqlitePool};
+use crate::sqlite::{Durability, PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
 use crate::unix_seconds;
 // Body slice size for `Get`, and the size clients are expected to use for
@@ -167,12 +167,13 @@ impl BlobService {
         limits: BlobLimits,
     ) -> StoreResult<Self> {
         let fences = TenantWriteFences::open(data_dir.join("migration-fences.sqlite")).await?;
-        Self::open_with_fences(data_dir, connections, limits, fences).await
+        Self::open_with_fences(data_dir, connections, Durability::default(), limits, fences).await
     }
 
     pub(crate) async fn open_with_fences(
         data_dir: &Path,
         connections: usize,
+        durability: Durability,
         limits: BlobLimits,
         fences: TenantWriteFences,
     ) -> StoreResult<Self> {
@@ -186,6 +187,7 @@ impl BlobService {
             data_dir.join("blob.sqlite"),
             "blob",
             PoolSize::new(connections),
+            durability,
         );
         pool.migrate(|conn| {
             crate::legacy::reject_pre_tenant_table(conn, "blob")?;

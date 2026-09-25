@@ -249,7 +249,7 @@ use crate::proto::storage::{
     QueryInTransactionRequest, QueryPreparedRequest, QueryRequest, QueryResponse,
     RollbackTransactionRequest, RollbackTransactionResponse, database_server::Database,
 };
-use crate::sqlite::{self, PoolSize, PooledConnection, SqlitePool};
+use crate::sqlite::{self, Durability, PoolSize, PooledConnection, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
 use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences, WritePermit};
 use rusqlite::ffi;
@@ -1281,6 +1281,8 @@ pub struct DatabaseService {
     root: PathBuf,
     pools: Arc<Mutex<HashMap<TenantId, SqlitePool>>>,
     connections_per_tenant: usize,
+    /// The `synchronous` setting every tenant's file is opened with.
+    durability: Durability,
     statements: Arc<StatementRegistry>,
     transactions: Arc<TransactionRegistry>,
     limits: TransactionLimits,
@@ -1292,12 +1294,18 @@ impl DatabaseService {
     /// Prepare `<data_dir>/db/`. Nothing is opened until a tenant asks.
     pub fn open(data_dir: &std::path::Path, connections_per_tenant: usize) -> StoreResult<Self> {
         let fences = TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?;
-        Self::open_with_fences(data_dir, connections_per_tenant, fences)
+        Self::open_with_fences(
+            data_dir,
+            connections_per_tenant,
+            Durability::default(),
+            fences,
+        )
     }
 
     pub(crate) fn open_with_fences(
         data_dir: &std::path::Path,
         connections_per_tenant: usize,
+        durability: Durability,
         fences: TenantWriteFences,
     ) -> StoreResult<Self> {
         let root = data_dir.join("db");
@@ -1328,6 +1336,7 @@ impl DatabaseService {
             root,
             pools: Arc::new(Mutex::new(HashMap::new())),
             connections_per_tenant,
+            durability,
             statements: Arc::new(StatementRegistry::default()),
             transactions: Arc::new(TransactionRegistry::default()),
             limits: clamp_to_pool(TransactionLimits::default(), connections_per_tenant),
@@ -1447,6 +1456,7 @@ impl DatabaseService {
             format!("db:{tenant}"),
             PoolSize::new(self.connections_per_tenant),
             tenant_sql_authorizer,
+            self.durability,
         );
         pools.insert(tenant.clone(), pool.clone());
         pool

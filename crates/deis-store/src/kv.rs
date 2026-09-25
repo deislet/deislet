@@ -16,7 +16,7 @@ use crate::proto::storage::{
     DeleteRequest, DeleteResponse, GetRequest, GetResponse, HasRequest, HasResponse, KvEntry,
     ListRequest, ListResponse, SetRequest, SetResponse, kv_store_server::KvStore,
 };
-use crate::sqlite::{PoolSize, SqlitePool};
+use crate::sqlite::{Durability, PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
 use crate::{prefix_upper_bound, unix_seconds};
 use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences};
@@ -104,15 +104,21 @@ impl KvService {
     /// Open `<data_dir>/kv.sqlite` and make sure the schema is there.
     pub async fn open(data_dir: &std::path::Path, connections: usize) -> StoreResult<Self> {
         let fences = TenantWriteFences::open(data_dir.join("migration-fences.sqlite")).await?;
-        Self::open_with_fences(data_dir, connections, fences).await
+        Self::open_with_fences(data_dir, connections, Durability::default(), fences).await
     }
 
     pub(crate) async fn open_with_fences(
         data_dir: &std::path::Path,
         connections: usize,
+        durability: Durability,
         fences: TenantWriteFences,
     ) -> StoreResult<Self> {
-        let pool = SqlitePool::new(data_dir.join("kv.sqlite"), "kv", PoolSize::new(connections));
+        let pool = SqlitePool::new(
+            data_dir.join("kv.sqlite"),
+            "kv",
+            PoolSize::new(connections),
+            durability,
+        );
         pool.migrate(|conn| {
             // Before anything is created: a kv.sqlite from before the tenant
             // change would otherwise gain a second, empty table beside the
