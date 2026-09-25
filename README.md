@@ -49,9 +49,9 @@ node.
 the platform: an upstream for the example app's `fetch` to reach, and a
 loopback certificate authority for the ACME checks. It deploys an application
 with `deis deploy` — the same command a person would run, not a `curl` against
-the REST API — and then runs ninety-four checks in twenty groups,
-printing the evidence for each. What they prove, by group — a few rows stand for two
-consecutive checks:
+the REST API — and then runs the checks its registry lists, group by group,
+printing the evidence for each. What they prove, by group — a few rows stand
+for two consecutive checks:
 
 | Check | Evidence |
 |---|---|
@@ -137,7 +137,7 @@ consecutive checks:
 | a certificate is obtained over ACME for the names the routing table carries | against a real ACME authority on loopback, and then served over TLS by deis-proxy |
 | the challenge path answers only what was published | a token nobody issued gets nothing |
 | a current certificate is not reissued, and a restart reuses the account | which is what keeps a restart loop from spending an issuance quota |
-| the node's log was not cut off while these checks read it | fifteen of them get their evidence by grepping it, and it is a file any unauthenticated request can add to; the demo gives it a ceiling, and a run that reached the ceiling says so instead of quoting a file that stops early |
+| the node's log was not cut off while these checks read it | the checks that grep it get their evidence from it, and it is a file any unauthenticated request can add to; the demo gives it a ceiling, and a run that reached the ceiling says so instead of quoting a file that stops early |
 
 ## The nine components
 
@@ -200,10 +200,11 @@ deployment reaches it as a push. The machine channel is mutually authenticated
 by certificate, on its own listener (`[machine] listen`) rather than the port
 a browser or the console reaches — each machine's certificate carries one URI
 SAN, a SPIFFE name naming exactly it, so a holder of one machine's certificate
-cannot present itself as another. `node_preshared_keys` still exists for a
-fleet part-way through the migration off the old fleet-wide value; where it is
-still configured, [docs/trust-boundaries.md](docs/trust-boundaries.md) states
-what it opens and how to rotate it.
+cannot present itself as another. The fleet-wide `node_preshared_keys` value
+is gone: it is not a field of any configuration struct, and a control plane
+whose file still sets it refuses to start rather than admit a holder the whole
+fleet shares. [docs/trust-boundaries.md](docs/trust-boundaries.md) states what
+that value opened and why it went.
 
 The gRPC methods and the bundle download path are not spelled out here on
 purpose. They are `deis.machine.MachineChannel`'s `Register`, `Deregister`,
@@ -258,9 +259,11 @@ Three local-build pitfalls worth knowing:
   job can run on a worker with no such path, and the build fails with
   `folder … web/dist does not exist`. Keep the crate off distributed
   compilation (`SCCACHE_NO_DIST_COMPILE=1`) or build it locally.
-- **A deleted `web/dist` stays deleted.** Once the build script has run, cargo
-  does not rerun it just because the directory vanished — rebuild the console
-  (or `touch` the crate's `build.rs`) to recreate it.
+- **A deleted `web/dist` comes back — empty.** The build script emits
+  `cargo:rerun-if-changed=web/dist`, so cargo reruns it when the directory
+  appears or disappears. Deleting the directory therefore does not keep it
+  gone: the next build recreates it, with nothing in it, and the dashboard
+  pages answer 404 until `npm run build` has filled it again.
 - **A corrupt v8 cache fails with `Decompression error`.** The prebuilt v8
   static library is cached after download; clear the cache (`~/.cache/rusty_v8`
   or the file named by `RUSTY_V8_ARCHIVE`) and rebuild, or point
@@ -277,13 +280,15 @@ unused bootstrap token expires after 24 hours, and the next control-plane
 start issues a fresh one. The console asks for account credentials before it
 shows anything.
 
-The last line of a `verify` run is a tally and a roll call: `94 passed, 0
-failed, 94 of the 94 checks this file lists`. The second half is there because
-the first half cannot report a check that did not run - a call deleted from
-the list turns a green run into a slightly shorter green run, and nothing in
-the output says so. The number the run is held to is `VERIFY_EXPECTED_CHECKS`
-in `scripts/demo.sh` - that constant, not this paragraph, is where the count
-lives, and adding a check means changing it (and then this sentence).
+The last line of a `verify` run is a tally and a roll call: how many verdicts
+passed, how many failed, and how many were printed out of the number the
+script lists. The second half is there because the first half cannot report a
+check that did not run - a call deleted from the list turns a green run into a
+slightly shorter green run, and nothing in the output says so. The number a
+run is held to is `VERIFY_EXPECTED_CHECKS` in `scripts/demo.sh`, summed from
+the `group_<name>_checks` arrays under `scripts/demo/checks/`; that
+derivation, not this paragraph, is where the count lives, and adding a check
+means adding it to a group's array.
 
 ### What a green `verify` is evidence of, and what it is not
 
@@ -294,12 +299,12 @@ construction, answer several other questions:
 * **What one caller is handed that belonged to another.** A single caller
   cannot see a disclosure: the wrong answer and the right one look the same
   when there is nobody else's answer to be given. This is not hypothetical -
-  `verify` reported ninety passed and none failed on a build whose response
+  `verify` reported a complete run with no failure on a build whose response
   cache was keyed by the address alone, so one user's `POST` answer went to
-  the next anonymous `GET` of it. Two checks now put a second and a third
-  caller to the same address and compare what comes back; that is the shape
-  such a check has to take, and it is the only place in the suite that has
-  it. Every other per-caller boundary in the platform is still checked one
+  the next anonymous `GET` of it. The cross-caller checks now put a second and
+  a third caller to the same address and compare what comes back; that is the
+  shape such a check has to take, and it is the only place in the suite that
+  has it. Every other per-caller boundary in the platform is still checked one
   caller at a time.
 * **Anything that needs two nodes.** There is one. Scheduling across a fleet,
   a cache or a route table that disagrees between nodes, and what a rolling
@@ -314,22 +319,23 @@ construction, answer several other questions:
   everywhere, a stub certificate authority, and a `python3` origin standing
   in for the internet.
 
-Read a green run as: these ninety-four claims were each checked, once, in
+Read a green run as: these claims were each checked, once, in
 that arrangement. It is a good deal more than a build that compiles, and it
 is not a statement about anything above.
 
 ### What runs without anyone remembering to
 
 `.github/workflows/checks.yml` is written to run, on every push to `main` and
-every pull request: the document-path check, the witness tests below, `cargo
-fmt --check`, `cargo clippy -D warnings`, `cargo build --workspace`, `cargo
-test --workspace`, and a full `start` → `verify` → `stop`. Until it grew those
-jobs it held the document-path check alone, and nothing automatic had ever
-compiled this workspace, run its tests, or run the verification the project's
-claims are quoted from. Status: the last green run is `33848760058`,
-2026-09-04. Every run since then has failed within seconds — a GitHub billing
-problem, not a build failure — so changes landed after that date carry local
-evidence only. This paragraph is to be updated once CI is running again.
+every pull request: the three document checks (path constants, link targets
+and written-down counts), the witness tests below, `cargo fmt --check`,
+`cargo clippy -D warnings`, `cargo build --workspace`, the three test shards,
+and a full `start` → `verify` → `stop`. Until it grew those jobs it held the
+document-path check alone, and nothing automatic had ever compiled this
+workspace, run its tests, or run the verification the project's claims are
+quoted from. Status: the last green run is `33848760058`, 2026-09-04. Every
+run since then has failed within seconds — a GitHub billing problem, not a
+build failure — so changes landed after that date carry local evidence only.
+This paragraph is to be updated once CI is running again.
 
 ```bash
 bash scripts/test-demo-witnesses.sh    # unit tests for verify itself; no demo needed
@@ -377,9 +383,11 @@ Everything in the table above runs end to end. What is not there yet, in the
 order it is likely to matter:
 
 - **A preview address still needs a wildcard DNS record placed by hand.** The
-  routing link itself is closed: deis-proxy polls the routing table from the
-  control plane — over the machine channel when it has an identity, over
-  `/api/routing-table` when it does not — so host routes, path prefixes and an automatic
+  routing link itself is closed: deis-proxy polls the routing table over the
+  control plane's machine channel, proving a certificate that names that one
+  proxy — a `[control]` table with no `[machine_identity]` beside it is
+  refused at startup rather than left polling a route nothing serves — so host
+  routes, path prefixes and an automatic
   per-environment address (`<env>--<app>.<zone>`, plus the shorter
   `<app>.<zone>` for the default environment) all work. Certificates are
   closed too: `[tls.acme]` turns on an RFC 8555 client that takes its names

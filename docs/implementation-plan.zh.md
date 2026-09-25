@@ -59,8 +59,10 @@ date、账号与作用域 token 与审计日志、ACME 签发与续期、回滚�
 日志可查、`deis tail` 跟到开流之后才产生的那一行、节点自注册、`deis status` 报出真正
 在服务的节点。
 
-**组数与条数写在 `README.md` 与 `DEMO.md`，这里不再抄一份**：这个数字每加一条检查就变
-一次，抄在第三个地方就是第三处会过期的记述。逐条见 `DEMO.md`。
+**组数与条数不写在任何文档里**：那个数每加一条检查就变
+一次，抄在任何地方就是又一处会过期的记述。它由 `scripts/demo.sh` 里的
+`VERIFY_EXPECTED_CHECKS` 由各组数组求和得出，`scripts/check-doc-counts.sh` 盯着
+文档里不许再抄一份。逐条见 `DEMO.md`。
 
 ---
 
@@ -758,7 +760,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 | C1 | `deis` CLI 闭环：`deploy` / `rollback` / `versions` / `status` / `secret` / `logs` / `tail`，`dev` 接真运行时 | 完成 |
 | C2 | ~~端到端演示扩展~~：`scripts/demo.sh` 已在波次 B 收尾时完成 | 完成 |
 | C3 | 旧实现清单回填 | 完成：README、`architecture.zh.md` 与本文曾按代码逐项核对；该清单现已降为历史记录，不能作为支持状态 |
-| C4 | `scripts/demo.sh` 的部署动作改走 CLI，并补上 CLI 自身的验收 | 完成：deploy / secret set / rollback 不再打 REST，新增 6 条检查（部署、版本、密钥列名、tail、status、节点注册） |
+| C4 | `scripts/demo.sh` 的部署动作改走 CLI，并补上 CLI 自身的验收 | 完成：deploy / secret set / rollback 不再打 REST，并为 CLI 自身补了检查（部署、版本、密钥列名、tail、status、节点注册） |
 
 ### 波次 D（2026-08-30 起，对着 Cloudflare 评审的结论做的）
 

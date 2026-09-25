@@ -20,6 +20,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -92,6 +93,18 @@ jobs:
       # and names the constant to reference instead.
       - name: Node-facing paths are referenced, not restated
         run: ./scripts/check-doc-path-literals.sh
+
+      # Fails when a maintained document writes down how many checks or tests
+      # there are, and when `VERIFY_EXPECTED_CHECKS` disagrees with the sum of
+      # the group arrays it is derived from. A count in prose is a second
+      # definition of a number the registry already owns, and the two drift.
+      - name: No hand-written counts of checks or tests
+        run: ./scripts/check-doc-counts.sh
+
+      # The counter-examples first: a planted count and a planted registry
+      # mismatch must each be seen to fail before the check is trusted.
+      - name: Count check's own counter-examples
+        run: ./scripts/check-doc-counts.sh --self-test
 
   document-links:
     name: documents link at files that exist
