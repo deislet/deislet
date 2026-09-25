@@ -33,8 +33,8 @@
 #
 # What they test
 # --------------
-# The real definitions, read out of `scripts/demo.sh` at run time rather than
-# copied here: a test that carried its own copy of `node_log` would go on
+# The real definitions, read out of the demo's sources at run time rather
+# than copied here: a test that carried its own copy of `node_log` would go on
 # passing after somebody changed the one that ships.
 #
 # Usage: test-demo-witnesses.sh [path/to/demo.sh]
@@ -49,6 +49,22 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DEMO_SH="${1:-${ROOT_DIR}/scripts/demo.sh}"
 
+# The demo is one entry point plus everything it sources beside it, under
+# `scripts/demo/`. Every test below reads the definitions as they ship, which
+# means reading whatever file holds them; a candidate copy passed as $1 is
+# searched the same way, so its tree has to sit beside it.
+DEMO_FILES=("$DEMO_SH")
+if [ -d "$(dirname "$DEMO_SH")/demo" ]; then
+  while IFS= read -r demo_file; do
+    DEMO_FILES+=("$demo_file")
+  done < <(find "$(dirname "$DEMO_SH")/demo" -name '*.sh' | sort)
+fi
+
+# A path fit for a test's name: relative to the repository when it is under it.
+demo_path() {
+  printf '%s' "${1#"$ROOT_DIR"/}"
+}
+
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -57,13 +73,20 @@ failures=0
 pass() { echo "   ✓ $1"; }
 fail() { echo "   ✗ $1"; [ -n "${2:-}" ] && echo "     $2"; failures=$((failures + 1)); return 0; }
 
-# One function's body, lifted out of demo.sh exactly as it ships.
+# One function's body, lifted out of the demo's sources exactly as it ships.
+#
+# The demo is an entry point plus one file per library and per group of
+# checks, so the body is taken from whichever of them defines the function -
+# the first file that has it, with the entry point searched first.
 definition_of() {
   local name=$1
-  local text
-  text=$(sed -n "/^${name}() {/,/^}/p" "$DEMO_SH")
+  local text="" file
+  for file in "${DEMO_FILES[@]}"; do
+    text=$(sed -n "/^${name}() {/,/^}/p" "$file")
+    [ -n "$text" ] && break
+  done
   if [ -z "$text" ]; then
-    echo "❌ ${DEMO_SH} defines no ${name}(); this test is out of date" >&2
+    echo "❌ neither ${DEMO_SH} nor anything under scripts/demo/ defines ${name}(); this test is out of date" >&2
     exit 1
   fi
   printf '%s\n' "$text"
@@ -144,9 +167,9 @@ mkdir -p "$empty_log"
 printf '2026-09-02T00:00:00.000000Z  INFO ThreadId(01) nothing to see\n' \
   > "${empty_log}/deis-runtime.log"
 
-quotations=$(grep -n '^  said=\$(node_log | grep " WARN "' "$DEMO_SH" || true)
+quotations=$(grep -nH '^  said=\$(node_log | grep " WARN "' "${DEMO_FILES[@]}" || true)
 if [ -z "$quotations" ]; then
-  echo "❌ ${DEMO_SH} has no 'said=\$(node_log | grep \" WARN \" ...' line; this test is out of date" >&2
+  echo "❌ no file under scripts/demo/ has a 'said=\$(node_log | grep \" WARN \" ...' line; this test is out of date" >&2
   exit 1
 fi
 
@@ -157,11 +180,13 @@ fi
 # with errexit really in force, which is the state `verify` runs in.
 probe="${WORK_DIR}/probe.sh"
 while IFS= read -r entry; do
-  line_no=${entry%%:*}
+  source_file=${entry%%:*}
+  line_no=${entry#*:}
+  line_no=${line_no%%:*}
   # The whole assignment, continuation lines included: these quotations now
   # name the invocation they belong to and are wrapped over two lines, and a
   # probe fed half a statement measures its own truncation.
-  statement=$(awk -v start="$line_no" 'NR >= start { print; if ($0 !~ /\\$/) exit }' "$DEMO_SH")
+  statement=$(awk -v start="$line_no" 'NR >= start { print; if ($0 !~ /\\$/) exit }' "$source_file")
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
@@ -176,10 +201,11 @@ while IFS= read -r entry; do
   } > "$probe"
   status=0
   LOG_DIR="$empty_log" bash "$probe" >/dev/null 2>&1 || status=$?
+  where=$(demo_path "$source_file")
   if [ "$status" -eq 0 ]; then
-    pass "demo.sh:${line_no} survives a log that does not carry the line it quotes"
+    pass "${where}:${line_no} survives a log that does not carry the line it quotes"
   else
-    fail "demo.sh:${line_no} survives a log that does not carry the line it quotes" \
+    fail "${where}:${line_no} survives a log that does not carry the line it quotes" \
       "the assignment exited ${status}, so under set -euo pipefail the whole verify run ends here - no failure line for the check, no summary, and nothing but the exit status to say the run did not finish"
   fi
 done <<< "$quotations"
@@ -218,9 +244,9 @@ python3 "${fixture_demo}/origin/origin.py" &
 planted=$!
 trap 'kill "$planted" 2>/dev/null; rm -rf "$WORK_DIR"' EXIT
 
-scan=$(sed -n '/^  orphans=\$(pgrep -f/,/|| true)$/p' "$DEMO_SH")
+scan=$(sed -n '/^  orphans=\$(pgrep -f/,/|| true)$/p' "${DEMO_FILES[@]}")
 if [ -z "$scan" ]; then
-  echo "❌ ${DEMO_SH} has no 'orphans=\$(pgrep -f ...' scan; this test is out of date" >&2
+  echo "❌ scripts/demo/ has no 'orphans=\$(pgrep -f ...' scan; this test is out of date" >&2
   exit 1
 fi
 
@@ -356,22 +382,25 @@ done
 # property of how they are written. A check whose curl exits 7 and takes the
 # run with it prints nothing, so the reader learns neither what failed nor
 # that anything did.
-unguarded=$(python3 - "$DEMO_SH" <<'SCAN'
+unguarded=$(python3 - "${DEMO_FILES[@]}" <<'SCAN'
 import re, sys
 
-lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
-i = 0
-while i < len(lines):
-    line = lines[i]
-    assignment = re.match(r"^\s*([A-Za-z_][A-Za-z_0-9]*)=\$\(\s*(curl\b.*)$", line)
-    if assignment and not re.match(r"^\s*(local|export|declare|readonly)\b", line):
-        j = i
-        while lines[j].rstrip().endswith("\\"):
-            j += 1
-        if "||" not in "\n".join(lines[i:j + 1]):
-            print(f"{i + 1}: {lines[i].strip()}")
-        i = j
-    i += 1
+bad = []
+for path in sys.argv[1:]:
+    lines = open(path, encoding="utf-8").read().split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        assignment = re.match(r"^\s*([A-Za-z_][A-Za-z_0-9]*)=\$\(\s*(curl\b.*)$", line)
+        if assignment and not re.match(r"^\s*(local|export|declare|readonly)\b", line):
+            j = i
+            while lines[j].rstrip().endswith("\\"):
+                j += 1
+            if "||" not in "\n".join(lines[i:j + 1]):
+                bad.append(f"{path}:{i + 1}: {lines[i].strip()}")
+            i = j
+        i += 1
+print("\n".join(bad))
 SCAN
 )
 if [ -z "$unguarded" ]; then
@@ -395,15 +424,18 @@ fi
 # Every one of those lines is taken out of demo.sh as it ships and run inside
 # a function, against a body that is not JSON.
 
-givers_up=$(grep -n 'answered_json .* || return' "$DEMO_SH" || true)
+givers_up=$(grep -nH 'answered_json .* || return' "${DEMO_FILES[@]}" || true)
 if [ -z "$givers_up" ]; then
-  echo "❌ ${DEMO_SH} has no 'answered_json ... || return' line; this test is out of date" >&2
+  echo "❌ no file under scripts/demo/ has an 'answered_json ... || return' line; this test is out of date" >&2
   exit 1
 fi
 
 while IFS= read -r entry; do
-  line_no=${entry%%:*}
+  source_file=${entry%%:*}
+  line_no=${entry#*:}
+  line_no=${line_no%%:*}
   statement=${entry#*:}
+  statement=${statement#*:}
   probe="${WORK_DIR}/giveup.sh"
   {
     echo '#!/usr/bin/env bash'
@@ -425,10 +457,11 @@ while IFS= read -r entry; do
   } > "$probe"
   status=0
   bash "$probe" >/dev/null 2>&1 || status=$?
+  where=$(demo_path "$source_file")
   if [ "$status" -eq 0 ]; then
-    pass "demo.sh:${line_no} gives up on the check without ending the run"
+    pass "${where}:${line_no} gives up on the check without ending the run"
   else
-    fail "demo.sh:${line_no} gives up on the check without ending the run" \
+    fail "${where}:${line_no} gives up on the check without ending the run" \
       "the check function returned ${status}, and a check that returns non-zero under set -e ends the verify run right after it has recorded its own failure"
   fi
 done <<< "$givers_up"
@@ -452,8 +485,8 @@ probe="${WORK_DIR}/stopped.sh"
   echo 'CHECKS_FAILED=0'
   definition_of pass_check
   definition_of fail_check
-  # The two traps and their flag, lifted out of demo.sh as they ship.
-  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "$DEMO_SH"
+  # The two traps and their flag, lifted out of the demo's sources as they ship.
+  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "${DEMO_FILES[@]}"
   definition_of on_verify_exit
   echo 'set -E'
   echo 'trap '"'"'on_verify_error "$LINENO" "$BASH_COMMAND" "$?"'"'"' ERR'
@@ -491,7 +524,7 @@ probe="${WORK_DIR}/stopped-clean.sh"
   echo 'CHECKS_FAILED=0'
   definition_of pass_check
   definition_of fail_check
-  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "$DEMO_SH"
+  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "${DEMO_FILES[@]}"
   definition_of on_verify_exit
   echo 'trap on_verify_exit EXIT'
   echo 'pass_check "one that passed"'
@@ -519,7 +552,7 @@ probe="${WORK_DIR}/finished.sh"
   echo 'CHECKS_FAILED=0'
   definition_of pass_check
   definition_of fail_check
-  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "$DEMO_SH"
+  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "${DEMO_FILES[@]}"
   definition_of on_verify_exit
   echo 'set -E'
   echo 'trap '"'"'on_verify_error "$LINENO" "$BASH_COMMAND" "$?"'"'"' ERR'
@@ -696,9 +729,9 @@ theirs=2222222222222222bbbbbbbbbbbbbbbb
 # that touch the disk or the process table stubbed out. What is asserted is
 # that four settings given before it runs are still the same four afterwards.
 
-preamble=$(sed -n '/^start_demo() {/,/^  claim_port DEIS_RUNTIME_PORT/p' "$DEMO_SH" | sed '$d')
+preamble=$(sed -n '/^start_demo() {/,/^  claim_port DEIS_RUNTIME_PORT/p' "${DEMO_FILES[@]}" | sed '$d')
 if [ -z "$preamble" ]; then
-  echo "❌ ${DEMO_SH} has no start_demo() preamble ending at claim_port; this test is out of date" >&2
+  echo "❌ scripts/demo/ has no start_demo() preamble ending at claim_port; this test is out of date" >&2
   exit 1
 fi
 
@@ -815,9 +848,9 @@ esac
 # asserted, and two verdicts printed under one claim - which keeps the tally
 # right while the list is wrong - is its own failure.
 
-roll_call=$(sed -n '/^  # The roll call\./,/^}/p' "$DEMO_SH")
+roll_call=$(sed -n '/^  # The roll call\./,/^}/p' "${DEMO_FILES[@]}")
 if [ -z "$roll_call" ]; then
-  echo "❌ ${DEMO_SH} has no roll call in verify_demo; this test is out of date" >&2
+  echo "❌ scripts/demo.sh has no roll call in verify_demo; this test is out of date" >&2
   exit 1
 fi
 
@@ -888,9 +921,9 @@ fi
 # against a stand-in that answers the way a leaking platform answers, and it
 # has to say ✗. A witness nobody has ever seen fail is not yet a witness.
 
-route=$(grep '^PRIVATE_PAGE_ROUTE=' "$DEMO_SH" || true)
+route=$(grep -h '^PRIVATE_PAGE_ROUTE=' "${DEMO_FILES[@]}" || true)
 if [ -z "$route" ]; then
-  echo "❌ ${DEMO_SH} defines no PRIVATE_PAGE_ROUTE; this test is out of date" >&2
+  echo "❌ scripts/demo/ defines no PRIVATE_PAGE_ROUTE; this test is out of date" >&2
   exit 1
 fi
 
@@ -1432,8 +1465,13 @@ END {
 }
 AWK
 
-writers=$(awk -v want='(^|[^_a-z])secret = "|auth_secret = "|node_preshared_keys = |api_keys = |^SECRET=|^API_KEY=|^STORAGE_AUTH_SECRET=' \
-  -f "${WORK_DIR}/credential-writers.awk" "$DEMO_SH")
+# Read file by file: the awk below counts lines from the start of what it is
+# given, and a chmod twelve lines away in another file is not twelve lines
+# away.
+writers=$(for demo_file in "${DEMO_FILES[@]}"; do
+  awk -v want='(^|[^_a-z])secret = "|auth_secret = "|node_preshared_keys = |api_keys = |^SECRET=|^API_KEY=|^STORAGE_AUTH_SECRET=' \
+    -f "${WORK_DIR}/credential-writers.awk" "$demo_file"
+done)
 found=$(printf '%s\n' "$writers" | grep -c . || true)
 unset_writers=$(printf '%s\n' "$writers" | grep ' UNSET$' || true)
 if [ "$found" -ge 5 ] && [ -z "$unset_writers" ]; then
@@ -1459,7 +1497,8 @@ fi
 # umask, so whether it is 0600 depends on the environment the demo happened to
 # run in unless the script says so itself. Every `-keyout "..."` in demo.sh
 # therefore has to have a `chmod 600` on the same path within twelve lines.
-key_writers=$(awk '
+key_writers=$(for demo_file in "${DEMO_FILES[@]}"; do
+  awk '
   { lines[NR] = $0 }
   END {
     for (i = 1; i <= NR; i++) {
@@ -1473,7 +1512,8 @@ key_writers=$(awk '
       }
       printf "%d %s %s\n", i, v, (ok ? "0600" : "UNSET")
     }
-  }' "$DEMO_SH")
+  }' "$demo_file"
+done)
 keys_found=$(printf '%s\n' "$key_writers" | grep -c . || true)
 keys_unset=$(printf '%s\n' "$key_writers" | grep ' UNSET$' || true)
 if [ "$keys_found" -ge 2 ] && [ -z "$keys_unset" ]; then
@@ -1711,8 +1751,9 @@ trace_stream_probe() {
   # variable ends that shell and this one goes on to report it.
   BASH_ENV=/dev/null bash --noprofile --norc -c '
     set -euo pipefail
-    DEMO_SH=$1
-    work=$2
+    work=$1
+    shift
+    DEMO_FILES=("$@")
 
     BIN_DIR="${work}/bin"
     LOG_DIR="${work}/logs"
@@ -1724,7 +1765,11 @@ trace_stream_probe() {
     fail_check() { echo "FAIL ${1}"; }
 
     for name in open_trace_stream await_trace_row close_trace_stream check_cli_tail; do
-      eval "$(sed -n "/^${name}() {/,/^}/p" "$DEMO_SH")"
+      for demo_file in "${DEMO_FILES[@]}"; do
+        body=$(sed -n "/^${name}() {/,/^}/p" "$demo_file")
+        [ -n "$body" ] && break
+      done
+      eval "$body"
     done
 
     transcript="${LOG_DIR}/transcript.log"
@@ -1748,7 +1793,7 @@ trace_stream_probe() {
     check_cli_tail
 
     echo "reached the end"
-  ' witness "$DEMO_SH" "$work" 2>&1
+  ' witness "$work" "${DEMO_FILES[@]}" 2>&1
 }
 
 probe_out=$(trace_stream_probe) || true
