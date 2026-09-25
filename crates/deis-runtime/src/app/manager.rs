@@ -6,7 +6,7 @@ use crate::app_repo::AppRepo;
 use crate::assets::AssetBundle;
 use crate::config::ExecutionLimits;
 use crate::runtime::{FetchPolicy, IsolateSpec, OpMetricsSummary, RuntimePool};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 
 /// Compare two credentials in time that does not depend on how many leading
@@ -25,8 +25,8 @@ fn constant_time_eq(expected: &str, presented: &str) -> bool {
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
@@ -343,6 +343,7 @@ impl ApplicationManager {
         let rate_limit_ops_per_sec = self.effective_rate_limit(key, limits);
         let cpu_time_limit_ms = self.effective_cpu_time_limit_ms(key, limits);
         let max_subrequests = self.effective_max_subrequests(key, limits);
+        let max_outbound_connections = self.effective_max_outbound_connections(key, limits);
 
         // A thread cannot burn more CPU time than wall-clock time, so a CPU
         // ceiling at or above the duration ceiling can never be the one that
@@ -382,6 +383,7 @@ impl ApplicationManager {
             rate_limit_ops_per_sec,
             cpu_time_limit_ms,
             max_subrequests,
+            max_outbound_connections,
         }
     }
 
@@ -635,6 +637,77 @@ impl ApplicationManager {
             "App {} asks for a {}ms CPU ceiling, above this node's {}ms ceiling; it is held to \
              the node's value. Raise default_execution_limits.cpu_time_limit_ms if this node is \
              meant to carry applications that compute that long",
+            key,
+            requested,
+            node_default
+        );
+        node_default
+    }
+
+    /// Resolve the concurrent-outbound-connections ceiling for one app: the
+    /// node's default, narrowed by the app's own
+    /// `ResourceLimits.max_outbound_connections` when it asked for less.
+    ///
+    /// Narrowing only, like every other limit here, and this is the same kind
+    /// of shared thing the subrequest ceiling protects: every open outbound
+    /// connection is a file descriptor and a live socket on a runtime thread
+    /// the application shares with its neighbours. An application asking for
+    /// fewer is buying itself a tripwire -- a handler that legitimately holds
+    /// two connections and starts holding twenty fails on the change that did
+    /// it -- while an application asking for more is asking to take the
+    /// node's descriptors away from everyone else, and is held to the node's
+    /// number with a log line saying so.
+    fn effective_max_outbound_connections(
+        &self,
+        key: &AppKey,
+        limits: Option<&ResourceLimits>,
+    ) -> u32 {
+        let node_default = self.default_limits.max_outbound_connections;
+        let Some(requested) = limits.and_then(|l| l.max_outbound_connections) else {
+            return node_default;
+        };
+
+        if requested == 0 {
+            // Zero is the wire's spelling for "unset", so it should never
+            // survive as a value here; applying it would refuse the app's
+            // first outbound connection.
+            tracing::warn!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                applied = node_default,
+                "App {} asks for a ceiling of 0 open outbound connections, which would refuse \
+                 its first one; it is held to this node's {} instead",
+                key,
+                node_default
+            );
+            return node_default;
+        }
+
+        if requested <= node_default {
+            tracing::info!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                "App {} narrows the default outbound-connection ceiling: {} open at once \
+                 (platform default {})",
+                key,
+                requested,
+                node_default
+            );
+            return requested;
+        }
+
+        tracing::warn!(
+            target: "app",
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            requested,
+            applied = node_default,
+            "App {} asks to hold {} outbound connections open at once, above this node's \
+             ceiling of {}; it is held to the node's value. Raise \
+             default_execution_limits.max_outbound_connections if this node is meant to carry \
+             applications that hold that many",
             key,
             requested,
             node_default
@@ -1669,6 +1742,8 @@ mod manager_test;
 mod memory_ceiling {
     use super::*;
     use crate::app::types::{AppConfig, ResourceLimits};
+    use crate::assets::AssetBundle;
+    use std::sync::Arc;
 
     /// Allocates until something stops it. `new Array(n).fill(0)` is used
     /// rather than a bare `new Array(n)`, which V8 is free to leave as a
@@ -1683,6 +1758,21 @@ mod memory_ceiling {
         }
     "#;
 
+    /// Allocates until something stops it, but only when it has been asked
+    /// to on this isolate before. See the recycle test below for why.
+    const ARMED_RUNAWAY: &str = r#"
+        export default function handler() {
+            if (globalThis.__armed) {
+                const held = [];
+                for (;;) {
+                    held.push(new Array(100000).fill(0));
+                }
+            }
+            globalThis.__armed = true;
+            return new Response("armed");
+        }
+    "#;
+
     const HEALTHY: &str = r#"
         export default function handler() {
             return new Response("still serving");
@@ -1693,12 +1783,12 @@ mod memory_ceiling {
         AppConfig {
             limits: Some(ResourceLimits {
                 memory_mb,
-                cpu_milli: 0,
                 resource_table_max: None,
                 timeout_ms: None,
                 rate_limit_ops_per_sec: None,
                 cpu_time_limit_ms: None,
                 max_subrequests: None,
+                max_outbound_connections: None,
             }),
             ..AppConfig::default()
         }
@@ -1715,6 +1805,25 @@ mod memory_ceiling {
             )
             .await
             .map(|(status, _, body)| (status, body.into_bytes()))
+    }
+
+    /// Read a per-app counter until it reaches `expected`, with a deadline.
+    ///
+    /// The value is produced on the runtime thread a few instructions after
+    /// the reply the caller of [`call`] is waiting on, so the read has to
+    /// tolerate arriving first. The deadline is a failure, not a wait: a
+    /// counter that never gets there is exactly what this test exists to
+    /// catch.
+    async fn wait_for_counter(name: &str, app_id: &str, expected: f64) -> f64 {
+        use crate::runtime::metrics::recorder;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let value = recorder().value(name, app_id);
+            if value >= expected || std::time::Instant::now() > deadline {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// The bug this ceiling exists for: nothing ever set `memory_limit_mb`, so
@@ -1787,6 +1896,119 @@ mod memory_ceiling {
         let _ = manager.unload_app(&neighbour).await;
     }
 
+    /// The recycle half of the heap ceiling. The cut-off raises the isolate's
+    /// V8 heap limit -- the room the terminated execution needs to unwind --
+    /// and V8 offers no way to lower a limit back, so an isolate that has
+    /// tripped once is permanently more generous than the configuration says.
+    /// Before the recycle path existed, every trip left the application on an
+    /// isolate whose ceiling had grown by another 10MB, forever.
+    ///
+    /// This holds the same application through three trips and asserts the
+    /// other side of the trade: each trip recycles the isolate (the
+    /// `deis_runtime_isolate_recycled_total{reason="memory"}` counter is the
+    /// generation count an observer would watch), the application is
+    /// installed again after each trip -- the same `load_app` the reconcile
+    /// pass makes when it finds a version installed with no isolate behind
+    /// it -- and the request that reinstall serves succeeds *because* the
+    /// isolate is fresh, which is the generation claim made observable: the
+    /// handler only answers a request made of an isolate that has never run
+    /// it.
+    ///
+    /// The handler arms itself: on a fresh isolate `__armed` is unset, so the
+    /// request succeeds and arms the trip; the next request allocates without
+    /// bound and is cut off. And the last line of the acceptance: after three
+    /// trips the ceiling still bites -- an isolate that had carried a raised
+    /// limit across recycles would let the fourth armed request through.
+    #[tokio::test]
+    async fn three_heap_cutoffs_in_a_row_recycle_the_isolate_and_leave_the_ceiling_where_it_was() {
+        use crate::runtime::metrics::ISOLATE_RECYCLES_TOTAL;
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let manager = ApplicationManager::with_threads(Some(1)).with_memory_limit_mb(64);
+        let app = AppKey::production("serial_heap_trippers");
+
+        manager
+            .install_version(VersionInstall {
+                key: app.clone(),
+                version_id: "v0".to_string(),
+                deployment_id: None,
+                routing_generation: None,
+                environment_snapshot_id: None,
+                entry_point: "app.ts".to_string(),
+                code: ARMED_RUNAWAY.to_string(),
+                config: limits(64),
+                env_confirmed: true,
+                assets: Arc::new(AssetBundle::empty(Arc::from("max-age=60"))),
+            })
+            .await
+            .expect("the app loads");
+
+        for trip in 1..=3 {
+            // The fresh isolate answers, and arms its own trip. Success here
+            // is the generation evidence: `__armed` only reads as unset on an
+            // isolate this request has never reached before.
+            let (status, _) = call(&manager, &app).await.unwrap_or_else(|e| {
+                panic!(
+                    "trip {trip}: the reinstall (or first load) answers on a fresh isolate, not {e:?}"
+                )
+            });
+            assert_eq!(status, 200);
+
+            // The armed request allocates until the ceiling cuts it off.
+            let cut_off = call(&manager, &app).await;
+            assert!(
+                cut_off.is_err(),
+                "trip {trip}: the armed request must be cut off, not answered: {cut_off:?}"
+            );
+
+            // One recycle per cut-off, and no more: this is the isolate
+            // generation count, and it is what says each cut-off ran on an
+            // isolate the previous one did not poison.
+            //
+            // Polled rather than read once: the reply channel the caller sees
+            // is answered a few instructions before the hosting thread gets
+            // to record the recycle, and the test runs on another task, so a
+            // single read would race the counter it is asserting on.
+            let recycled =
+                wait_for_counter(ISOLATE_RECYCLES_TOTAL, &app.tenant_id(), trip as f64).await;
+            assert_eq!(
+                recycled, trip as f64,
+                "trip {trip}: every heap cut-off recycles exactly one isolate"
+            );
+
+            // What the deployment machinery's next pass does: install the
+            // version again through `install_version`, the same door a
+            // reconcile pass and a pushed deployment both use. The cut-off
+            // cleared the isolate; this is what puts the application back.
+            manager
+                .install_version(VersionInstall {
+                    key: app.clone(),
+                    version_id: format!("v{trip}"),
+                    deployment_id: None,
+                    routing_generation: None,
+                    environment_snapshot_id: None,
+                    entry_point: "app.ts".to_string(),
+                    code: ARMED_RUNAWAY.to_string(),
+                    config: limits(64),
+                    env_confirmed: true,
+                    assets: Arc::new(AssetBundle::empty(Arc::from("max-age=60"))),
+                })
+                .await
+                .unwrap_or_else(|e| panic!("trip {trip}: the app is installable again: {e:?}"));
+        }
+
+        // The last line of the acceptance: after three trips the application
+        // still answers, on an isolate whose ceiling is the configured 64MB
+        // (its next armed request would trip again, and a raised ceiling
+        // carried across recycles would have let it through).
+        let (status, _) = call(&manager, &app)
+            .await
+            .expect("the application is served again after three cut-offs");
+        assert_eq!(status, 200);
+
+        let _ = manager.unload_app(&app).await;
+    }
+
     #[test]
     fn an_app_that_asks_for_nothing_is_held_to_the_node_ceiling() {
         let manager = ApplicationManager::with_threads(Some(1)).with_memory_limit_mb(128);
@@ -1850,12 +2072,12 @@ mod cpu_ceiling {
         AppConfig {
             limits: Some(ResourceLimits {
                 memory_mb: 0,
-                cpu_milli: 0,
                 resource_table_max: None,
                 timeout_ms: None,
                 rate_limit_ops_per_sec: None,
                 cpu_time_limit_ms,
                 max_subrequests: None,
+                max_outbound_connections: None,
             }),
             ..AppConfig::default()
         }

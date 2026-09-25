@@ -284,12 +284,11 @@ message ResourceLimits {
     // Memory limit (MB)
     int32 memory_mb = 1;
 
-    // CPU *share* in millicores. Carried since the first version of this
-    // message and enforced by nothing: a share only means something to a
-    // scheduler that hands out fractions of a core, and a node here pins one
-    // isolate to one thread. What is actually enforced is cpu_time_limit_ms
-    // below. Kept so older control planes keep parsing.
-    int32 cpu_milli = 2;
+    // Field 2 was cpu_milli, a Kubernetes-style CPU *share* that nothing on a
+    // node here could enforce: an isolate is pinned to one thread, and the
+    // enforced ceiling is cpu_time_limit_ms. Removed rather than left dead;
+    // the number is reserved so a future field cannot silently reuse it.
+    reserved 2;
 
     // Maximum concurrent requests
     int32 max_concurrency = 3;
@@ -312,6 +311,16 @@ message ResourceLimits {
     // node's is applied. CPU time is the node's resource, not the
     // application's, so an app may give itself less of it but never more.
     int64 cpu_time_limit_ms = 7;
+
+    // Per-app override of the platform default ceiling on this app's
+    // concurrently open outbound connections. 0 means "use the platform
+    // default".
+    //
+    // Narrowing only, like every field here. Every open outbound connection
+    // is a file descriptor and a live socket on a runtime thread the
+    // application shares with its neighbours, so the node's number is the
+    // ceiling and an app may hold itself below it but never above.
+    int64 max_outbound_connections = 8;
 }
 
 // Routing rule.

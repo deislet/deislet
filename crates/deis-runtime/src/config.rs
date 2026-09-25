@@ -21,7 +21,7 @@
 //! and make startup fail with a pointer to the current name, so an override
 //! that silently stopped applying cannot be mistaken for one that worked.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::net::IpAddr;
@@ -800,6 +800,24 @@ pub struct ExecutionLimits {
     /// and may not widen it, like every other limit here.
     #[serde(default = "default_max_subrequests")]
     pub max_subrequests: u32,
+
+    /// How many outbound connections one application may hold open at the
+    /// same time.
+    ///
+    /// The ceiling on *concurrency*, which no other budget here bounds:
+    /// `max_subrequests` counts the calls one invocation makes and is spent
+    /// by a handler that opens one connection at a time in a loop, while an
+    /// application with many requests in flight -- or one long-lived outbound
+    /// WebSocket per visitor -- holds many open at once. Every open
+    /// connection is a file descriptor and a live socket on a runtime thread
+    /// the application shares with its neighbours, so an unbounded count is
+    /// a shared resource one tenant can drain.
+    ///
+    /// An application may narrow it in its manifest
+    /// (`limits.max_outbound_connections`) and may not widen it, like every
+    /// other limit here.
+    #[serde(default = "default_max_outbound_connections")]
+    pub max_outbound_connections: u32,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -866,6 +884,21 @@ fn default_max_subrequests() -> u32 {
     50
 }
 
+/// Sixty-four outbound connections open at once, per application.
+///
+/// Sized against the shapes that hold connections rather than make them: a
+/// request-shaped handler holds its fetches only as long as a call takes, so
+/// even a busy node of those never meets this; an application that keeps one
+/// outbound WebSocket per visitor is the shape this exists for, and 64 is
+/// enough for an honest one while small enough that one tenant cannot drain
+/// the process's file descriptors (the unit itself allows 65536) or pin the
+/// sockets of the runtime threads its neighbours share. An operator running a
+/// deliberate fan-in proxy raises it knowing that every open connection is a
+/// descriptor and a socket slot for the life of the connection.
+fn default_max_outbound_connections() -> u32 {
+    64
+}
+
 impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
@@ -875,6 +908,7 @@ impl Default for ExecutionLimits {
             rate_limit_ops_per_sec: default_rate_limit_ops_per_sec(),
             cpu_time_limit_ms: default_cpu_time_limit_ms(),
             max_subrequests: default_max_subrequests(),
+            max_outbound_connections: default_max_outbound_connections(),
         }
     }
 }
@@ -1157,6 +1191,16 @@ impl RuntimeConfig {
                 &value,
                 "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_MAX_SUBREQUESTS",
                 "a whole number of outbound calls per invocation",
+            )?;
+        }
+
+        if let Some(value) =
+            env_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_MAX_OUTBOUND_CONNECTIONS")
+        {
+            self.default_execution_limits.max_outbound_connections = parse_env(
+                &value,
+                "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_MAX_OUTBOUND_CONNECTIONS",
+                "a whole number of open outbound connections per application",
             )?;
         }
 
@@ -1510,6 +1554,15 @@ impl RuntimeConfig {
                  could make a single outbound call, so every fetch() would be refused. Leave it \
                  out for the default of {}",
                 default_max_subrequests()
+            ));
+        }
+
+        if limits.max_outbound_connections == 0 {
+            return Err(anyhow!(
+                "default_execution_limits.max_outbound_connections is 0; no application on \
+                 this node could hold a single outbound connection open, so every fetch() and \
+                 outbound WebSocket would be refused. Leave it out for the default of {}",
+                default_max_outbound_connections()
             ));
         }
 
@@ -2215,10 +2268,10 @@ mod tests {
         // serde refuses it here rather than the policy discovering it per
         // request, which is the same rule every other setting in this file
         // follows: a typo is an operator's startup error.
-        assert!(toml::from_str::<RuntimeConfig>(
-            "[node]\nadvertised_addresses = [\"example.com\"]\n"
-        )
-        .is_err());
+        assert!(
+            toml::from_str::<RuntimeConfig>("[node]\nadvertised_addresses = [\"example.com\"]\n")
+                .is_err()
+        );
     }
 
     #[test]

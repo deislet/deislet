@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tonic::Request;
 
 use super::RuntimeManagementService;
-use crate::app::{test_host, AppConfig, AppKey, ApplicationManager};
+use crate::app::{AppConfig, AppKey, ApplicationManager, test_host};
 use crate::config::RuntimeConfig;
 use crate::deployment::DeploymentManager;
 use crate::health::NodeHealth;
@@ -25,7 +25,7 @@ use crate::management::proto::{
     ExecuteCommandRequest, GetStatusRequest, PushConfigRequest, StartInspectRequest,
     UnloadAppRequest, UpdateAppRequest,
 };
-use crate::runtime::metrics::{recorder, RequestOutcome};
+use crate::runtime::metrics::{RequestOutcome, recorder};
 
 const HANDLER: &str = r#"
     export default function handler() { return new Response("ok"); }
@@ -615,19 +615,18 @@ mod decoding_the_limits_a_deployment_carries {
     fn every_field_an_application_can_narrow_survives_the_wire() {
         let decoded = decode_limits(Wire {
             memory_mb: 48,
-            cpu_milli: 500,
             max_concurrency: 0,
             resource_table_max: 16,
             timeout_ms: 2_000,
             rate_limit_ops_per_sec: 40.0,
             cpu_time_limit_ms: 250,
+            max_outbound_connections: 0,
         });
         assert_eq!(decoded.memory_mb, 48);
         assert_eq!(decoded.timeout_ms, Some(2_000));
         assert_eq!(decoded.rate_limit_ops_per_sec, Some(40.0));
         assert_eq!(decoded.cpu_time_limit_ms, Some(250));
         assert_eq!(decoded.resource_table_max, Some(16));
-        assert_eq!(decoded.cpu_milli, 500, "carried, though nothing applies it");
     }
 
     /// proto3 signs its integers, so a negative value is representable even

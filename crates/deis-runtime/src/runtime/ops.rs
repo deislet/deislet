@@ -3,7 +3,7 @@
 
 use super::bindings::Bound;
 use super::kv_client::KvClient;
-use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
+use deno_core::{JsBuffer, OpState, ToJsBuffer, extension, op2};
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -781,6 +781,75 @@ pub fn subrequest_allowance(state: &OpState, scope: u32) -> Option<Rc<Subrequest
     Some(of_stream.unwrap_or_else(|| budget.invocation()))
 }
 
+/// How many outbound connections one application may hold open at once.
+///
+/// The ceiling on *concurrency*, which no other budget here bounds: the
+/// subrequest allowance counts the calls one invocation makes and is spent
+/// even by a handler that opens one connection at a time, while an
+/// application with many requests in flight -- or one long-lived outbound
+/// WebSocket per visitor -- holds many connections open simultaneously. Each
+/// is a file descriptor and a live socket on a runtime thread the
+/// application shares with its neighbours, so an unbounded count is a shared
+/// resource one tenant can drain.
+///
+/// One of these belongs to one isolate, and on this node an isolate is one
+/// application's only one, which makes it per-application. Charged by the
+/// outbound fetch guard the moment a call is through the policy and about to
+/// be dialled -- the same decision point the subrequest allowance is spent
+/// at -- and by the outbound WebSocket dial; released by the platform's own
+/// wrapper when the call settles, and by the socket's bookkeeping when a
+/// WebSocket closes. The release being reachable from JS is a trade the
+/// trust model pays for: the ceiling itself is enforced where no application
+/// code runs, and a misbehaving application can only waste its own
+/// allowance, not exceed it.
+///
+/// `Cell` rather than an atomic: an isolate is one thread, every charge and
+/// release happens on that thread, and nothing holds the value across an
+/// await.
+#[derive(Debug)]
+pub struct OutboundConnections {
+    ceiling: u32,
+    open: Cell<u32>,
+}
+
+impl OutboundConnections {
+    pub fn new(ceiling: u32) -> Self {
+        Self {
+            ceiling,
+            open: Cell::new(0),
+        }
+    }
+
+    /// Take one connection out of the ceiling.
+    ///
+    /// `Err(ceiling)` means the ceiling is already held and the caller must
+    /// refuse rather than dial. Charged before anything is dialled, with no
+    /// await in between -- the same ordering that makes the subrequest
+    /// allowance mean anything.
+    pub fn charge(&self) -> Result<(), u32> {
+        let open = self.open.get();
+        if open >= self.ceiling {
+            return Err(self.ceiling);
+        }
+        self.open.set(open + 1);
+        Ok(())
+    }
+
+    /// Give a connection back. Saturating, so a release that is somehow not
+    /// matched by a charge cannot wrap the counter into an unbounded
+    /// allowance.
+    pub fn release(&self) {
+        self.open.set(self.open.get().saturating_sub(1));
+    }
+
+    /// How many connections are held right now. Tests only.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn open(&self) -> u32 {
+        self.open.get()
+    }
+}
+
 // Environment variables store
 pub type EnvStore = Rc<RefCell<HashMap<String, String>>>;
 pub type StandardEnvStore =
@@ -874,7 +943,7 @@ pub(crate) const ESCAPING_CASES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod log_escaping_test {
-    use super::{escape_control, ESCAPING_CASES};
+    use super::{ESCAPING_CASES, escape_control};
 
     #[test]
     fn the_shared_table_is_what_this_crate_escapes_to() {

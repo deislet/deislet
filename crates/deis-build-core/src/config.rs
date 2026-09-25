@@ -475,6 +475,14 @@ pub struct LimitsConfig {
     /// a `fetch()` that follows two redirects costs three.
     #[serde(rename = "maxSubrequests", alias = "max_subrequests", default)]
     pub max_subrequests: Option<u32>,
+    /// How many outbound connections this application may hold open at the
+    /// same time. Counted concurrently, not per invocation.
+    #[serde(
+        rename = "maxOutboundConnections",
+        alias = "max_outbound_connections",
+        default
+    )]
+    pub max_outbound_connections: Option<u32>,
 }
 
 #[cfg(test)]

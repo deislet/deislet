@@ -40,6 +40,7 @@ import { core, primordials } from "ext:core/mod.js";
 import {
   op_deis_fetch_budget_ms,
   op_deis_fetch_guard,
+  op_deis_outbound_release,
 } from "ext:core/ops";
 
 // deno_web, deno_fetch, deno_crypto and deno_net stopped being ES modules.
@@ -390,6 +391,15 @@ async function fetch(input, init = undefined) {
   // dialled when this rejects.
   await op_deis_fetch_guard(currentUrl, chargedScope());
 
+  // The guard passed, so an outbound connection of this application is now
+  // in flight. Released in the `finally` below, whichever way the call
+  // settles -- an answer, a throw, or the handler's own abort -- because the
+  // ceiling counts connections held, and a wrapper that lost one would leak
+  // it out of the application's allowance forever. The charge itself was
+  // taken in Rust, inside the guard, where no application code runs; see
+  // `runtime/fetch_ops.rs`.
+  try {
+
   const signal = boundedByExecutionBudget(current.signal);
 
   for (let hops = 0; ; hops++) {
@@ -481,6 +491,9 @@ async function fetch(input, init = undefined) {
     current = following;
     currentUrl = followingUrl;
     ArrayPrototypePush(urlList, currentUrl);
+  }
+  } finally {
+    op_deis_outbound_release();
   }
 }
 

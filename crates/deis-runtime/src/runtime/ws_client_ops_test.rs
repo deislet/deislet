@@ -15,9 +15,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::runtime::FetchPolicy;
 use crate::runtime::bindings::ServiceWiring;
 use crate::runtime::isolate::{AppRuntime, IsolateSpec};
-use crate::runtime::FetchPolicy;
 
 /// A WebSocket server on loopback that sends every frame straight back.
 ///

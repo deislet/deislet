@@ -1,6 +1,6 @@
 // Runtime thread pool - multi-core support
 
-use super::bindings::{consumer_queue_client, ServiceWiring};
+use super::bindings::{ServiceWiring, consumer_queue_client};
 use super::header_list::HeaderPairs;
 use super::isolate::{AppRuntime, IsolateSpec};
 use super::queue_client::LeasedMessage;
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 /// Ensure V8 platform is initialized only once
 static V8_INIT: Once = Once::new();
@@ -418,19 +418,47 @@ enum PumpTurn {
 
 /// A runtime thread reporting that the isolate it was hosting is gone.
 ///
-/// Sent when handling a message panicked. The thread itself survives -- see
-/// [`RuntimeThread::run_event_loop`] -- but the application it was hosting no
-/// longer has an isolate anywhere on this node, and the pool has to stop
-/// saying that it does. Until it does, the control plane is told the
+/// Sent when handling a message panicked, or when an invocation ended on an
+/// isolate its heap-limit cut-off had poisoned. The thread itself survives --
+/// see [`RuntimeThread::run_event_loop`] -- but the application it was
+/// hosting no longer has an isolate anywhere on this node, and the pool has
+/// to stop saying that it does. Until it does, the control plane is told the
 /// assignment is satisfied and never reinstalls it.
 struct ThreadFault {
     thread_id: usize,
     /// The tenant whose isolate was dropped. A thread that panicked while
     /// hosting nothing has nothing to report: no placement is wrong.
     app_id: String,
-    /// What the panic said, for the log line the pool writes when it acts on
-    /// this.
-    panic: String,
+    /// Why the isolate is gone, for the log line the pool writes when it
+    /// acts on this.
+    cause: ThreadFaultCause,
+}
+
+/// Why a runtime thread gave up the isolate it was hosting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThreadFaultCause {
+    /// Handling a message unwound; the panic's own text travelled with the
+    /// fault before this cause existed and is folded into the detail here.
+    Panic(String),
+    /// The isolate's V8 heap ceiling was tripped. Its heap limit was raised
+    /// by the cut-off and V8 offers no way back down, so the isolate is not
+    /// fit to be reused; the thread drops it and the application's next
+    /// request is served on a freshly built one. Counted as
+    /// `deis_runtime_isolate_recycled_total{{reason="memory"}}` before the
+    /// fault is sent.
+    Memory,
+}
+
+impl ThreadFaultCause {
+    /// The one-line reason a log reader gets. The `Panic` detail is the
+    /// panic's own message, which can be long; it is named separately where
+    /// it matters.
+    fn describe(&self) -> String {
+        match self {
+            Self::Panic(panic) => format!("panic: {panic}"),
+            Self::Memory => "V8 heap limit tripped".to_string(),
+        }
+    }
 }
 
 /// The one application a runtime thread hosts.
@@ -610,6 +638,7 @@ impl RuntimeThread {
                 msg,
                 admission_budget,
                 retry_after,
+                &faults,
             ))
             .catch_unwind()
             .await;
@@ -672,23 +701,83 @@ impl RuntimeThread {
         panic: Box<dyn std::any::Any + Send>,
         faults: &mpsc::UnboundedSender<ThreadFault>,
     ) {
-        let panic = panic_message(panic.as_ref());
+        let detail = panic_message(panic.as_ref());
+        Self::lose_hosted_isolate(thread_id, hosted, ThreadFaultCause::Panic(detail), faults);
+    }
+
+    /// Drop the isolate this thread hosts because a finished invocation left
+    /// it poisoned by a heap-limit cut-off, and keep the thread.
+    ///
+    /// The same recovery a panic gets, and deliberately the same code -- see
+    /// [`Self::lose_hosted_isolate`] for what is thrown away and what is
+    /// kept. The difference is only the register the event is written in: a
+    /// panic is a fault in or around the application, while a heap cut-off is
+    /// the platform's own ceiling doing what it was configured to do, so the
+    /// recycle is counted (reason `memory`) and logged at warn, not error.
+    /// The caller passes the tenant the finished invocation belonged to; a
+    /// thread that was hosting nobody when it was asked has nothing to
+    /// recycle, and the placement that moved the application elsewhere in the
+    /// meantime is handled by the pool, not by this thread.
+    fn recycle_poisoned_isolate(
+        thread_id: usize,
+        hosted: &mut Option<HostedApp>,
+        app_id: &str,
+        faults: &mpsc::UnboundedSender<ThreadFault>,
+    ) {
+        let poisoned = hosted
+            .as_ref()
+            .is_some_and(|h| h.app_id == app_id && h.runtime.heap_poisoned());
+        if !poisoned {
+            return;
+        }
+        super::metrics::recorder()
+            .record_isolate_recycled(app_id, super::metrics::RECYCLE_REASON_MEMORY);
+        Self::lose_hosted_isolate(thread_id, hosted, ThreadFaultCause::Memory, faults);
+    }
+
+    /// The one way a thread gives up an isolate and keeps itself, whichever
+    /// of the two events asked for it.
+    ///
+    /// One function and not a copy per caller, because the three things below
+    /// all have to happen, in this order, for either cause: the isolate is
+    /// dropped here, on the thread that built it; the log line says what was
+    /// lost; and the pool is told to stop claiming the application is placed
+    /// here, without which the control plane never reinstalls it.
+    fn lose_hosted_isolate(
+        thread_id: usize,
+        hosted: &mut Option<HostedApp>,
+        cause: ThreadFaultCause,
+        faults: &mpsc::UnboundedSender<ThreadFault>,
+    ) {
         // Taken before the log line so the isolate is dropped whether or not
         // anything was hosted, and so the fault names the application that
         // lost it.
         match hosted.take() {
             Some(lost) => {
-                tracing::error!(
-                    thread_id,
-                    app_id = %lost.app_id,
-                    panic = %panic,
-                    "Runtime thread {} panicked while serving {}: {}. Its isolate is being \
-                     dropped and the application has nothing running on this node until it is \
-                     loaded again; the thread itself stays and is free for the next application",
-                    thread_id,
-                    lost.app_id,
-                    panic
-                );
+                match &cause {
+                    ThreadFaultCause::Panic(panic) => tracing::error!(
+                        thread_id,
+                        app_id = %lost.app_id,
+                        panic = %panic,
+                        "Runtime thread {} panicked while serving {}: {}. Its isolate is being \
+                         dropped and the application has nothing running on this node until it is \
+                         loaded again; the thread itself stays and is free for the next application",
+                        thread_id,
+                        lost.app_id,
+                        panic
+                    ),
+                    ThreadFaultCause::Memory => tracing::warn!(
+                        thread_id,
+                        app_id = %lost.app_id,
+                        "Runtime thread {} is recycling the isolate of {}: its V8 heap limit was \
+                         tripped. The isolate is being dropped and rebuilt fresh on this thread's \
+                         next load of the application, which is what keeps its heap ceiling equal \
+                         to the configured one; the thread itself stays and the application is \
+                         reinstalled without operator action",
+                        thread_id,
+                        lost.app_id
+                    ),
+                }
                 let app_id = lost.app_id.clone();
                 // Here, explicitly, and before the fault is sent: the isolate
                 // may only be dropped on the thread that built it, and the
@@ -701,16 +790,16 @@ impl RuntimeThread {
                 let _ = faults.send(ThreadFault {
                     thread_id,
                     app_id,
-                    panic,
+                    cause,
                 });
             }
             None => tracing::error!(
                 thread_id,
-                panic = %panic,
-                "Runtime thread {} panicked with no application loaded on it: {}. The thread \
+                detail = %cause.describe(),
+                "Runtime thread {} lost its isolate ({}), but it was hosting nothing; the thread \
                  stays and is free for the next application",
                 thread_id,
-                panic
+                cause.describe()
             ),
         }
     }
@@ -728,6 +817,7 @@ impl RuntimeThread {
         msg: RuntimeMessage,
         admission_budget: Duration,
         retry_after: Duration,
+        faults: &mpsc::UnboundedSender<ThreadFault>,
     ) -> ControlFlow<()> {
         match msg {
             RuntimeMessage::LoadApp {
@@ -828,6 +918,12 @@ impl RuntimeThread {
                                 let _ = response.send(Err(DispatchError::NotFound.into()));
                             }
                         };
+                        // A heap-limit cut-off during the invocation leaves the
+                        // isolate poisoned: its raised ceiling will not come
+                        // back down, so it is dropped and the application's
+                        // next request is served on a freshly built one. See
+                        // `recycle_poisoned_isolate`.
+                        Self::recycle_poisoned_isolate(thread_id, hosted, &app_id, faults);
                     }
                 }
             }
@@ -879,6 +975,7 @@ impl RuntimeThread {
                                 )));
                             }
                         }
+                        Self::recycle_poisoned_isolate(thread_id, hosted, &app_id, faults);
                     }
                 }
             }
@@ -913,6 +1010,7 @@ impl RuntimeThread {
                             )),
                         };
                         let _ = response.send(result);
+                        Self::recycle_poisoned_isolate(thread_id, hosted, &app_id, faults);
                     }
                 }
             }
@@ -948,6 +1046,7 @@ impl RuntimeThread {
                             )),
                         };
                         let _ = response.send(result);
+                        Self::recycle_poisoned_isolate(thread_id, hosted, &app_id, faults);
                     }
                 }
             }
@@ -1751,7 +1850,7 @@ impl RuntimePool {
         for ThreadFault {
             thread_id,
             app_id,
-            panic,
+            cause,
         } in faults
         {
             // Only if it is still placed *there*. A version change that moved
@@ -1783,11 +1882,12 @@ impl RuntimePool {
                 tracing::info!(
                     thread_id,
                     app_id = %app_id,
-                    panic = %panic,
-                    "Runtime thread {} panicked while hosting {}, which has since moved to \
+                    cause = %cause.describe(),
+                    "Runtime thread {} lost the isolate of {} ({}), which has since moved to \
                      another thread; nothing to forget",
                     thread_id,
-                    app_id
+                    app_id,
+                    cause.describe()
                 );
                 continue;
             }
@@ -1797,7 +1897,7 @@ impl RuntimePool {
                     thread_id,
                     app_id = %app_id,
                     generations = ?lost_generations.iter().map(|(_, generation)| generation).collect::<Vec<_>>(),
-                    panic = %panic,
+                    cause = %cause.describe(),
                     "A prepared or retained deployment generation lost its isolate before activation/drain; it is no longer addressable and the control plane must prepare it again"
                 );
                 continue;
@@ -1806,14 +1906,14 @@ impl RuntimePool {
             tracing::error!(
                 thread_id,
                 app_id = %app_id,
-                panic = %panic,
+                cause = %cause.describe(),
                 "Forgetting the placement of {}: the isolate it was serving from on thread {} \
-                 was lost to a panic ({}). This node now answers requests for it with \
+                 was lost ({}). This node now answers requests for it with \
                  \"App not found\" instead of a stopped thread, and reports it as not running, \
                  so the control plane reinstalls it on the next reconcile",
                 app_id,
                 thread_id,
-                panic
+                cause.describe()
             );
 
             // Before the placement goes, so no batch is leased for an
@@ -2199,7 +2299,7 @@ impl RuntimePool {
                         "the staged isolate of {tenant} on thread {thread_id} is no longer this \
                          application's; it was unloaded while the new version was being built, \
                          and the new version was discarded with it"
-                    ))
+                    ));
                 }
             }
             let previous = placement.of_app.insert(tenant.clone(), thread_id);
@@ -2995,7 +3095,7 @@ impl RuntimePool {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::runtime::metrics::{recorder, ABANDONED_BEFORE_START_TOTAL, REQUESTS_TOTAL};
+    use crate::runtime::metrics::{ABANDONED_BEFORE_START_TOTAL, REQUESTS_TOTAL, recorder};
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};

@@ -9,11 +9,11 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use deis_build_core::ProjectConfig;
 use deis_bundle::{
-    Asset, Binding, BindingKind, DeclaredBindings, DeclaredCompatibility, DeclaredLimits, Manifest,
-    QueueConsumer, Route, MIN_SUPPORTED_SCHEMA, SUPPORTED_SCHEMA,
+    Asset, Binding, BindingKind, DeclaredBindings, DeclaredCompatibility, DeclaredLimits,
+    MIN_SUPPORTED_SCHEMA, Manifest, QueueConsumer, Route, SUPPORTED_SCHEMA,
 };
 
 use crate::assets::StagedAsset;
@@ -62,7 +62,9 @@ pub fn build_manifest(
 ) -> Result<Manifest> {
     let app = config.name.trim();
     if app.is_empty() {
-        bail!("the project's \"name\" is the application id the bundle is filed under; it cannot be empty");
+        bail!(
+            "the project's \"name\" is the application id the bundle is filed under; it cannot be empty"
+        );
     }
 
     // Read and checked before anything else uses `assets`, because the two
@@ -167,6 +169,7 @@ fn limits(config: &ProjectConfig) -> Result<Option<DeclaredLimits>> {
         cpu_time_limit_ms: declared.cpu_time_limit_ms,
         resource_table_max: declared.resource_table_max,
         max_subrequests: declared.max_subrequests,
+        max_outbound_connections: declared.max_outbound_connections,
     };
     if limits.is_empty() {
         return Ok(None);
@@ -454,9 +457,11 @@ mod tests {
         assert_eq!(manifest.environment, Some(declarations));
         assert!(manifest.env.is_empty());
         assert!(manifest.secrets.is_empty());
-        assert!(!serde_json::to_string(&manifest)
-            .unwrap()
-            .contains("must-not-enter"));
+        assert!(
+            !serde_json::to_string(&manifest)
+                .unwrap()
+                .contains("must-not-enter")
+        );
     }
 
     #[test]

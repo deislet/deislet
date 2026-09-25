@@ -1,31 +1,31 @@
 // V8 Runtime Isolate wrapper
 
 use super::bindings::{AppServices, ServiceWiring};
-use super::cache_ops::{create_cache_store, CacheStore, InvocationCounter};
+use super::cache_ops::{CacheStore, InvocationCounter, create_cache_store};
 use super::fetch_policy::FetchPolicy;
-use super::header_list::{combine_cookie_fields, count_of, fold_duplicate_names, HeaderPairs};
+use super::header_list::{HeaderPairs, combine_cookie_fields, count_of, fold_duplicate_names};
 use super::loader::DbModuleLoader;
 use super::metrics::{
-    now_us, recorder, InvocationKind, InvocationOutcome, InvocationTrace, MetricsRegistry,
-    RequestFacts, RequestOutcome, RATE_LIMIT_CUTOFFS_TOTAL,
+    InvocationKind, InvocationOutcome, InvocationTrace, MetricsRegistry, RATE_LIMIT_CUTOFFS_TOTAL,
+    RequestFacts, RequestOutcome, now_us, recorder,
 };
-use super::node_compat::{rewrite_node_artifact, NodeProcessEnvStore};
+use super::node_compat::{NodeProcessEnvStore, rewrite_node_artifact};
 use super::ops::{
-    new_trace_id, AppId, CurrentTrace, EnvStore, ExecutionDeadline, PendingRequestBody,
-    PendingResponseBody, ResponseStore, SubrequestBudget,
+    AppId, CurrentTrace, EnvStore, ExecutionDeadline, PendingRequestBody, PendingResponseBody,
+    ResponseStore, SubrequestBudget, new_trace_id,
 };
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
 use super::rate_limit::RateLimiter;
 use super::response_stream::{
-    record_broken_body, response_streams, ResponseBody, ResponseStreams, StreamOwner,
+    ResponseBody, ResponseStreams, StreamOwner, record_broken_body, response_streams,
 };
 use super::route_match::{match_routes, path_from_url};
 use super::runtime_init::{build_runtime_extensions, init_lazy_extensions};
 use super::service_call::{CallPath, ServiceBindings};
 use super::service_ops::ServiceRouter;
 use super::snapshot::load_or_create_startup_snapshot;
-use super::ws_server_ops::{create_ws_server_manager, WsServerManager};
+use super::ws_server_ops::{WsServerManager, create_ws_server_manager};
 use crate::app::types::AppPermissions;
 use crate::config::ExecutionLimits;
 use anyhow::Result;
@@ -1152,6 +1152,19 @@ pub struct AppRuntime {
     /// the code that next explains a failure. Whichever stretch the cut-off
     /// fired in, the producers it killed are explained by it.
     op_ceiling_fired: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the near-heap-limit callback the moment this isolate's V8 heap
+    /// ceiling is tripped, and never cleared for the life of the isolate.
+    ///
+    /// The callback must return a raised limit to give V8 room to unwind the
+    /// terminated execution, and V8 offers no way to lower a heap limit back,
+    /// so an isolate that has been here is permanently more generous than its
+    /// configuration says -- and, worse, is an isolate whose next ceiling is
+    /// whatever the last escape left. It is therefore not reused: the runtime
+    /// thread that hosts it reads this flag when the invocation ends, drops
+    /// the isolate, and serves the application's next request on a freshly
+    /// built one. See [`RuntimePool`]'s recycle path and
+    /// [`super::metrics::ISOLATE_RECYCLES_TOTAL`] for how that is counted.
+    heap_poisoned: Arc<std::sync::atomic::AtomicBool>,
     /// Where this isolate's request, error, execution-time and cut-off
     /// counters go. See `super::metrics`.
     metrics: Arc<MetricsRegistry>,
@@ -1277,6 +1290,8 @@ impl AppRuntime {
             rate_limit_ops_per_sec,
             cpu_time_limit_ms,
             max_subrequests,
+            max_outbound_connections,
+            ..
         } = limits;
 
         // The node's own configuration knows where deis-control and
@@ -1337,6 +1352,7 @@ impl AppRuntime {
         // baseline was taken and was invisible to it.
         let op_ceiling_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let op_ceiling_fired_for_limiter = op_ceiling_fired.clone();
+        let heap_poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let isolate_handle_cell = Arc::new(OnceCell::<deno_core::v8::IsolateHandle>::new());
         let isolate_handle_cell_clone = isolate_handle_cell.clone();
         let app_id_clone = app_id.clone();
@@ -1595,6 +1611,16 @@ impl AppRuntime {
             // here.
             state.put(subrequest_budget.clone());
 
+            // The application's ceiling on concurrently open outbound
+            // connections, charged by `op_deis_fetch_guard` and by the
+            // outbound WebSocket dial, released when each settles or closes.
+            // An app on this node has one isolate, so an isolate-scoped
+            // counter is a per-application one. See
+            // [`super::ops::OutboundConnections`].
+            state.put(Rc::new(super::ops::OutboundConnections::new(
+                max_outbound_connections,
+            )));
+
             // What this isolate may call, the way back into the pool that
             // would dispatch it, and the chain it is currently part of. All
             // three are needed to answer one service call, and an isolate
@@ -1708,8 +1734,15 @@ impl AppRuntime {
             // zero however often this fired, which reads to an operator as
             // "this never happens" - worse than having no metric at all.
             let metrics_for_cutoff = metrics.clone();
+            let heap_poisoned_for_callback = heap_poisoned.clone();
 
             runtime.add_near_heap_limit_callback(move |current, initial| {
+                // Latched once and never cleared: the limit this return
+                // raises stays raised for the life of the isolate, so the
+                // isolate is not fit to be reused even if the terminated
+                // invocation is the only one that ever trips it. The pool
+                // reads the flag when the invocation ends and rebuilds.
+                heap_poisoned_for_callback.store(true, std::sync::atomic::Ordering::Release);
                 tracing::error!(
                     target: "app",
                     app_id = %app_id_clone,
@@ -1750,6 +1783,7 @@ impl AppRuntime {
             cpu_time_limit_ms,
             rate_limit_ops_per_sec,
             op_ceiling_fired,
+            heap_poisoned,
             metrics,
             execution_deadline,
             subrequest_budget,
@@ -1842,6 +1876,16 @@ impl AppRuntime {
         self.trace.borrow().clone()
     }
 
+    /// Whether this isolate's V8 heap ceiling has been tripped.
+    ///
+    /// Once true, the isolate is finished: its heap limit was raised by the
+    /// cut-off and cannot be brought back, so the hosting thread drops it
+    /// rather than reuses it. See [`Self::heap_poisoned`], the field.
+    pub fn heap_poisoned(&self) -> bool {
+        self.heap_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Start one invocation: a request, a queue batch, a cron tick, one
     /// inbound WebSocket message, or the evaluation of the module itself.
     ///
@@ -1900,6 +1944,44 @@ impl AppRuntime {
         // invocation's lines would join the previous one's trace.
         self.trace.borrow_mut().clear();
         self.disarm_execution_budget();
+
+        // A heap-limit cut-off is the one path out that does not get the
+        // cleanup below. The termination flag is left set -- cancelling it is
+        // what an isolate's continued reuse used to be built on, and this one
+        // will not be reused: its heap limit was raised by the cut-off and
+        // never comes back down, so the hosting thread reads the flag and
+        // rebuilds instead -- and the sweep is script, which a set termination
+        // flag kills, so running it would only produce a warn about a failure
+        // the next invocation was never going to reach. Everything else an
+        // invocation holds still has to be given back, and the outbound
+        // sockets in particular: the isolate is dropped by the thread that
+        // built it, but a socket is a connection to somebody else's server and
+        // it goes now, not whenever the drop lands.
+        if self.heap_poisoned() {
+            tracing::debug!(
+                target: "app",
+                app_id = %self.app_id,
+                "Invocation of app {} ended with its isolate poisoned by a heap-limit \
+                 cut-off; the isolate will be discarded and rebuilt, not reused",
+                self.app_id
+            );
+            if let Some(sockets) = self.outbound_sockets() {
+                let closed = sockets.close_all();
+                if closed > 0 {
+                    tracing::debug!(
+                        target: "app",
+                        app_id = %self.app_id,
+                        closed,
+                        "Closed {} outbound WebSocket(s) of the poisoned isolate of app {}",
+                        closed,
+                        self.app_id
+                    );
+                }
+            }
+            self.timers_swept = true;
+            return;
+        }
+
         // The sweep below is script, so a termination flag left by a cut-off
         // has to go first or the sweep is what it kills.
         self.clear_termination();

@@ -809,20 +809,19 @@ fn decrypt_secret(
 /// would quietly get the node's default instead of being told its manifest is
 /// wrong.
 ///
-/// `cpu_milli` and `max_concurrency` are left at zero on purpose. They are
-/// fields 2 and 3 of the message and nothing on a node enforces either of them
-/// (see `deis.management.ResourceLimits`); sending a number for something that
-/// is not applied is how a platform ends up documenting a limit it does not
-/// have.
+/// `max_concurrency` is left at zero on purpose. It is field 3 of the message
+/// and nothing on a node enforces it (see `deis.management.ResourceLimits`);
+/// sending a number for something that is not applied is how a platform ends
+/// up documenting a limit it does not have.
 fn limits_to_wire(limits: &DeclaredLimits) -> proto::ResourceLimits {
     proto::ResourceLimits {
         memory_mb: limits.memory_mb.unwrap_or(0) as i32,
-        cpu_milli: 0,
         max_concurrency: 0,
         resource_table_max: limits.resource_table_max.unwrap_or(0) as i32,
         timeout_ms: limits.timeout_ms.unwrap_or(0) as i64,
         rate_limit_ops_per_sec: limits.rate_limit_ops_per_sec.unwrap_or(0.0),
         cpu_time_limit_ms: limits.cpu_time_limit_ms.unwrap_or(0) as i64,
+        max_outbound_connections: limits.max_outbound_connections.unwrap_or(0) as i64,
     }
 }
 
@@ -2599,7 +2598,6 @@ mod tests {
         assert_eq!(wire.resource_table_max, 16);
         // Fields nothing on a node enforces stay at the absent sentinel
         // rather than carrying a number the platform would not apply.
-        assert_eq!(wire.cpu_milli, 0);
         assert_eq!(wire.max_concurrency, 0);
     }
 

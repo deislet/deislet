@@ -138,4 +138,90 @@ mod tests {
             answers[1]
         );
     }
+
+    /// The concurrent-connection ceiling fires while calls are still in
+    /// flight, which is the one shape the subrequest allowance above cannot
+    /// catch: an application whose every call is its invocation's first can
+    /// still hold them all open at once.
+    ///
+    /// Two fetches are started together against a ceiling of one. The first
+    /// takes the isolate's only unit and is dialled (to a port nothing
+    /// listens on, so it fails on the wire, which is not this test's
+    /// subject); the second is refused by the ceiling before anything is
+    /// dialled, as a catchable `TypeError` naming the ceiling. Sequential
+    /// calls must not trip it -- the wrapper releases on settle -- which the
+    /// test above already covers from the subrequest side and this one does
+    /// not repeat.
+    #[tokio::test]
+    async fn a_second_concurrent_outbound_call_is_refused_when_the_connection_ceiling_is_one() {
+        use crate::config::ExecutionLimits;
+        use crate::runtime::fetch_policy::FetchPolicy;
+        use crate::runtime::isolate::{AppRuntime, IsolateSpec};
+        use crate::runtime::{ServiceRouter, ServiceWiring};
+
+        let code = r#"
+            export default async function handler() {
+                const settled = await Promise.allSettled([
+                    fetch("http://127.0.0.1:9/"),
+                    fetch("http://127.0.0.1:9/"),
+                ]);
+                return new Response(JSON.stringify(settled.map((s) =>
+                    s.status === "fulfilled" ? "reached" : String(s.reason)
+                )));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "outbound_app.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec {
+                limits: ExecutionLimits {
+                    max_outbound_connections: 1,
+                    ..ExecutionLimits::default()
+                },
+                fetch_policy: FetchPolicy::new(["127.0.0.1:9"], Vec::<String>::new())
+                    .expect("a host:port entry"),
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .expect("the isolate builds");
+        runtime.init_module().await.expect("the module loads");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (status, _headers, body) = rx.await.expect("a response").expect("a response");
+        let body = String::from_utf8(body.into_bytes().unwrap_or_default()).expect("text");
+        assert_eq!(status, 200, "{body}");
+
+        let answers: Vec<String> = serde_json::from_str(&body).expect("a JSON array");
+        assert_eq!(answers.len(), 2, "{body}");
+        let dialled = answers
+            .iter()
+            .find(|a| !a.contains("outbound connection"))
+            .expect("one of the two calls gets past the ceiling");
+        assert!(
+            !dialled.contains("reached"),
+            "nothing listens on the discard port, so the dialled call fails on the wire: {dialled}"
+        );
+        let refused = answers
+            .iter()
+            .find(|a| a.contains("outbound connection"))
+            .expect("the other call is refused by the ceiling");
+        assert!(
+            refused.contains("already holds 1 outbound connection(s) open"),
+            "the refusal has to name the ceiling and the number held: {refused}"
+        );
+    }
 }

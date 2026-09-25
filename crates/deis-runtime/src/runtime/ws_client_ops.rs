@@ -124,26 +124,26 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use deno_core::url::{Host, Url};
-use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
+use deno_core::{JsBuffer, OpState, ToJsBuffer, extension, op2};
 use deno_error::JsErrorBox;
 use deno_runtime::deno_tls::rustls::pki_types::ServerName;
 use deno_runtime::deno_tls::rustls::{ClientConfig, ClientConnection};
-use deno_runtime::deno_tls::{create_client_config, SocketUse, TlsClientConfigOptions, TlsStream};
+use deno_runtime::deno_tls::{SocketUse, TlsClientConfigOptions, TlsStream, create_client_config};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{Mutex, mpsc, watch};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 
-use crate::runtime::fetch_policy::{loggable, FetchPolicy};
+use crate::runtime::fetch_policy::{FetchPolicy, loggable};
 use crate::runtime::isolate::OutboundSockets;
-use crate::runtime::ops::{subrequest_allowance, AppId, ExecutionDeadline};
+use crate::runtime::ops::{AppId, ExecutionDeadline, subrequest_allowance};
 
 /// How many outbound sockets one isolate may hold open at once.
 ///
@@ -297,6 +297,12 @@ struct OpenSocket {
 #[derive(Default)]
 struct WsClients {
     next_rid: u32,
+    /// The application's ceiling on concurrently open outbound connections,
+    /// shared with the outbound fetch guard. Every socket in `open` holds one
+    /// unit of it; every removal below gives its unit back. `None` only in
+    /// the stand-in state built before the first op ran (see [`ws_state`]),
+    /// which fills it in from the isolate's `OpState`.
+    connections: Option<Rc<crate::runtime::ops::OutboundConnections>>,
     open: HashMap<u32, OpenSocket>,
     /// The handles the last invocation left open when it ended, and where each
     /// went. Kept only so that a handler reaching for one is told what became
@@ -322,7 +328,22 @@ impl WsClients {
     /// [`MAX_OPEN_SOCKETS`] forever. The pump task dropping its end of the
     /// command channel is what says it has finished.
     fn forget_closed(&mut self) {
+        let before = self.open.len();
         self.open.retain(|_, socket| !socket.outgoing.is_closed());
+        self.release(before - self.open.len());
+    }
+
+    /// Give `count` units of the connection ceiling back. Saturating on the
+    /// counter's own side, so a bookkeeping slip cannot widen the allowance.
+    fn release(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(connections) = &self.connections {
+            for _ in 0..count {
+                connections.release();
+            }
+        }
     }
 
     /// Close every socket, and answer how many there were.
@@ -337,6 +358,7 @@ impl WsClients {
         for (rid, socket) in self.open.drain() {
             self.revoked.insert(rid, socket.destination);
         }
+        self.release(self.revoked.len());
         self.revoked.len()
     }
 }
@@ -406,6 +428,12 @@ fn ws_state(state: &mut OpState) -> Rc<WsState> {
         return existing.clone();
     }
     let created = Rc::new(WsState::new());
+    // The connection ceiling travels with the isolate's own state, so the
+    // sockets this module registers are counted against the same number the
+    // outbound fetch guard charges.
+    created.clients.borrow_mut().connections = state
+        .try_borrow::<Rc<crate::runtime::ops::OutboundConnections>>()
+        .cloned();
     state.put::<Rc<dyn OutboundSockets>>(created.clone());
     state.put(created.clone());
     created
@@ -450,7 +478,7 @@ fn policy_url(parsed: &Url) -> Result<Url, String> {
         other => {
             return Err(format!(
                 "the {other}: scheme is not a WebSocket URL; a WebSocket is opened with ws: or wss:"
-            ))
+            ));
         }
     };
     let mut probe = parsed.clone();
@@ -1012,6 +1040,41 @@ async fn op_deis_ws_connect(
         }
     }
 
+    // One of the application's concurrent outbound connections, charged at
+    // the same point and for the same reason as the allowance above: before
+    // anything is dialled and with no await in between. Held for as long as
+    // the socket is in the registry -- a live WebSocket is exactly the shape
+    // this ceiling exists to bound -- and given back by whichever of the
+    // removal paths below or the invocation sweep closes it. Charged here
+    // rather than at insert time because the failed dials below must not
+    // count against the ceiling, and because a charge committed after the
+    // handshake would bound nothing.
+    let connections = sockets.clients.borrow().connections.clone();
+    if let Some(connections) = connections.as_ref() {
+        if let Err(ceiling) = connections.charge() {
+            crate::runtime::metrics::recorder()
+                .record_overloaded(&app_id, crate::runtime::metrics::OVERLOAD_CLASS_OUTBOUND);
+            tracing::warn!(
+                target: "app",
+                app_id = %app_id,
+                destination = %destination,
+                ceiling,
+                "Refused an outbound WebSocket from {} to {}: this application already holds {} \
+                 outbound connection(s) open, which is its ceiling. Nothing was dialled. Raise \
+                 limits.max_outbound_connections in the manifest, or the node's \
+                 default_execution_limits.max_outbound_connections",
+                app_id,
+                destination,
+                ceiling
+            );
+            return Err(JsErrorBox::type_error(format!(
+                "WebSocket to {destination} was refused: this application already holds \
+                 {ceiling} outbound connection(s) open, which is its ceiling. Close one before \
+                 opening another"
+            )));
+        }
+    }
+
     let opened = match tokio::time::timeout(allowance, dial(&policy, &app_id, &url, &protocols))
         .await
     {
@@ -1021,6 +1084,13 @@ async fn op_deis_ws_connect(
                 // Refused before a socket was opened, so it gives its charge
                 // back; an `Unreachable` was dialled and keeps it.
                 budget_left.refund();
+            }
+            if let Some(connections) = connections.as_ref() {
+                // A connection that never came up holds nothing open, so
+                // whatever shape the failure took, the ceiling is given its
+                // unit back. (The subrequest allowance above keeps the
+                // `Unreachable` charge on purpose: the call left the isolate.)
+                connections.release();
             }
             match &failure {
                 DialFailure::Refused(reason) => tracing::warn!(
@@ -1048,6 +1118,9 @@ async fn op_deis_ws_connect(
             return Err(JsErrorBox::type_error(failure.message().to_string()));
         }
         Err(_) => {
+            if let Some(connections) = connections.as_ref() {
+                connections.release();
+            }
             tracing::warn!(
                 target: "app",
                 app_id = %app_id,
@@ -1084,6 +1157,12 @@ async fn op_deis_ws_connect(
             app_id,
             destination
         );
+        if let Some(connections) = connections.as_ref() {
+            // Dropping `opened` closes the connection, so the ceiling gets
+            // its unit back here and not at some sweep that will never see
+            // this socket.
+            connections.release();
+        }
         return Err(JsErrorBox::type_error(format!(
             "the WebSocket to {destination} came up after the invocation that opened it had \
              ended, and was closed: a socket does not outlive the request that opened it"
@@ -1207,7 +1286,9 @@ fn borrow_socket<T>(
     // invocation that did not sweep. Close it and say so rather than trusting
     // that the sweep covered every path.
     if !still_the_same_invocation(state, opened_in) {
-        sockets.clients.borrow_mut().open.remove(&rid);
+        let mut registry = sockets.clients.borrow_mut();
+        registry.release(1);
+        registry.open.remove(&rid);
         return Err(not_this_invocation(&app_id, &destination));
     }
     Ok(taken)
@@ -1365,6 +1446,7 @@ async fn op_deis_ws_next_event(
                 .unwrap_or_default();
             let sockets = ws_state(&mut state);
             let mut registry = sockets.clients.borrow_mut();
+            registry.release(1);
             registry.open.remove(&rid);
             registry.revoked.remove(&rid);
             drop(registry);
@@ -1383,7 +1465,9 @@ async fn op_deis_ws_next_event(
     if event.is_terminal() {
         let mut state = state.borrow_mut();
         let sockets = ws_state(&mut state);
-        sockets.clients.borrow_mut().open.remove(&rid);
+        let mut registry = sockets.clients.borrow_mut();
+        registry.release(1);
+        registry.open.remove(&rid);
     }
 
     Ok(event.into())

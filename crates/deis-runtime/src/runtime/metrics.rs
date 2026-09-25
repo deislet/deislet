@@ -61,13 +61,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::time::interval;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
 use crate::config::LoggingConfig;
-use crate::telemetry::{report_posture, TelemetryCredential};
+use crate::telemetry::{TelemetryCredential, report_posture};
 
 /// Generated clients for deis-telemetry's `MetricService` and `TraceService`
 /// (package `deis.telemetry`).
@@ -174,6 +174,24 @@ pub const QUEUE_MESSAGE_FAILURES_TOTAL: &str = "deis_runtime_queue_message_failu
 pub const QUEUE_POLL_ERRORS_TOTAL: &str = "deis_runtime_queue_poll_errors_total";
 /// Executions cut off because the isolate reached its V8 heap ceiling.
 pub const MEMORY_CUTOFFS_TOTAL: &str = "deis_runtime_memory_cutoffs_total";
+/// Isolates discarded and rebuilt because they were no longer fit to serve
+/// from, counted by why.
+///
+/// The `reason` label says what disqualified the isolate. Today there is one:
+/// `memory`, an isolate whose V8 heap ceiling was tripped. Its heap limit was
+/// raised by the cut-off itself (the room the termination needs), and V8
+/// offers no way to lower a limit back, so the isolate is dropped and the
+/// next request for the application is served on a freshly built one. Without
+/// this counter a node either kept raising the ceiling forever or recycled
+/// invisibly; an operator watching `deis_runtime_memory_cutoffs_total` climb
+/// without any recycle in reply would be reading a node that reuses poisoned
+/// isolates.
+pub const ISOLATE_RECYCLES_TOTAL: &str = "deis_runtime_isolate_recycled_total";
+/// `reason` on [`ISOLATE_RECYCLES_TOTAL`]: the isolate's V8 heap ceiling was
+/// tripped, so it was discarded and rebuilt on its thread.
+pub const RECYCLE_REASON_MEMORY: &str = "memory";
+/// Label carrying why an isolate was recycled on [`ISOLATE_RECYCLES_TOTAL`].
+const RECYCLE_REASON_LABEL: &str = "reason";
 /// Requests dropped when the runtime thread reached them and their caller had
 /// already gone away.
 ///
@@ -209,6 +227,11 @@ pub const OVERLOADED_TOTAL: &str = "deis_runtime_overloaded_total";
 /// moment work is posted to an application's runtime thread, and nothing was
 /// run.
 pub const OVERLOAD_CLASS_ADMISSION: &str = "admission";
+/// `class` on [`OVERLOADED_TOTAL`]: the application's own ceiling on
+/// concurrently open outbound connections refused the call, in the outbound
+/// fetch guard, before anything was dialled. Admission would have passed it;
+/// what it ran into was its own configured concurrency.
+pub const OVERLOAD_CLASS_OUTBOUND: &str = "outbound";
 /// Invocations this node built a trace record for.
 pub const TRACES_RECORDED_TOTAL: &str = "deis_runtime_traces_recorded_total";
 /// Invocations sampling deliberately did not record. Policy, not loss.
@@ -530,6 +553,14 @@ impl MetricsRegistry {
     pub fn record_memory_cutoff(&self, app_id: &str) {
         self.add(SampleKey::new(MEMORY_CUTOFFS_TOTAL, app_id), 1.0);
         self.note_cut_off(app_id, InvocationOutcome::MemoryLimit);
+    }
+
+    /// One isolate was discarded and rebuilt, and why.
+    pub fn record_isolate_recycled(&self, app_id: &str, reason: &str) {
+        self.add(
+            SampleKey::new(ISOLATE_RECYCLES_TOTAL, app_id).with_label(RECYCLE_REASON_LABEL, reason),
+            1.0,
+        );
     }
 
     /// CPU time one stretch of an app's code spent on a runtime thread.

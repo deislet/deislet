@@ -53,11 +53,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use deno_core::{extension, op2, OpState};
+use deno_core::{OpState, extension, op2};
 use deno_error::JsErrorBox;
 
-use super::fetch_policy::{loggable, FetchPolicy};
-use super::ops::{subrequest_allowance, AppId, ExecutionDeadline};
+use super::fetch_policy::{FetchPolicy, loggable};
+use super::ops::{AppId, ExecutionDeadline, subrequest_allowance};
 
 /// How much of the invocation's budget an outbound call is allowed to keep for
 /// itself, so that what is left is enough for the handler to notice the
@@ -128,7 +128,7 @@ async fn op_deis_fetch_guard(
     #[string] url: String,
     scope: u32,
 ) -> Result<(), JsErrorBox> {
-    let (policy, app_id, budget, subrequests) = {
+    let (policy, app_id, budget, subrequests, connections) = {
         let state = state.borrow();
         (
             state.try_borrow::<FetchPolicy>().cloned(),
@@ -144,6 +144,13 @@ async fn op_deis_fetch_guard(
             // may have stepped in between -- and a refund that landed
             // elsewhere would credit an invocation that never made the call.
             subrequest_allowance(&state, scope),
+            // The application's concurrent-connection ceiling, for the same
+            // reason the allowance is resolved once: the charge below and
+            // the refunds on the refusals further down must act on the same
+            // counter.
+            state
+                .try_borrow::<Rc<super::ops::OutboundConnections>>()
+                .cloned(),
         )
     };
 
@@ -237,7 +244,39 @@ async fn op_deis_fetch_guard(
     };
 
     match verdict {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Past every ceiling and the policy: this call is about to leave
+            // the isolate, so it takes one of the application's concurrent
+            // outbound connections. The platform's fetch wrapper releases it
+            // when the call settles; a refused call never gets here, so
+            // nothing of this one leaks into the application's allowance.
+            // The refusal names the ceiling the way the subrequest refusal
+            // above names its own, and is counted as overloaded: the
+            // application's concurrency, not its correctness, is what the
+            // caller ran into.
+            if let Some(connections) = connections.as_ref() {
+                if let Err(ceiling) = connections.charge() {
+                    crate::runtime::metrics::recorder().record_overloaded(
+                        &app_id,
+                        crate::runtime::metrics::OVERLOAD_CLASS_OUTBOUND,
+                    );
+                    tracing::warn!(
+                        target: "app",
+                        app_id = %app_id,
+                        destination = %loggable(&url),
+                        ceiling,
+                        "Refused an outbound fetch from {} to {}: this application already holds {} outbound connection(s) open, which is its ceiling. Nothing was dialled. Raise limits.max_outbound_connections in the manifest, or the node's default_execution_limits.max_outbound_connections",
+                        app_id,
+                        loggable(&url),
+                        ceiling
+                    );
+                    return Err(JsErrorBox::type_error(format!(
+                        "fetch to {url} was refused: this application already holds {ceiling} outbound connection(s) open, which is its ceiling. Release one before dialling another"
+                    )));
+                }
+            }
+            Ok(())
+        }
         Err(refusal) => {
             // Refused before a socket was opened, so the charge taken above
             // goes back: the ceiling counts what leaves the isolate.
@@ -262,9 +301,32 @@ async fn op_deis_fetch_guard(
     }
 }
 
+/// Give one outbound connection back to the application's ceiling.
+///
+/// The counterpart of the charge [`op_deis_fetch_guard`] takes on the far
+/// side of the policy: the platform's fetch wrapper calls this when the call
+/// settles, whichever way it settles, so a handler that fires a hundred
+/// calls and lets half of them fail does not leak the failures out of its
+/// own allowance. Saturating on the Rust side, so a wrapper that somehow
+/// released twice cannot inflate the allowance past the ceiling.
+#[op2(fast)]
+fn op_deis_outbound_release(state: Rc<RefCell<OpState>>) {
+    if let Some(connections) = state
+        .borrow()
+        .try_borrow::<Rc<super::ops::OutboundConnections>>()
+        .cloned()
+    {
+        connections.release();
+    }
+}
+
 extension!(
     deis_runtime_fetch_ops,
-    ops = [op_deis_fetch_guard, op_deis_fetch_budget_ms],
+    ops = [
+        op_deis_fetch_guard,
+        op_deis_fetch_budget_ms,
+        op_deis_outbound_release
+    ],
 );
 
 pub fn init_fetch_guard_extension() -> deno_core::Extension {

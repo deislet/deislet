@@ -5,8 +5,8 @@ mod tests {
     use crate::runtime::bindings::{ServiceDeclaration, ServiceEndpoints, ServiceWiring};
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::metrics::{
-        recorder, CPU_CUTOFFS_TOTAL, CPU_MS_SUM, EXECUTION_MS_COUNT, REQUESTS_TOTAL,
-        REQUEST_ERRORS_TOTAL, TIMEOUT_CUTOFFS_TOTAL,
+        CPU_CUTOFFS_TOTAL, CPU_MS_SUM, EXECUTION_MS_COUNT, REQUEST_ERRORS_TOTAL, REQUESTS_TOTAL,
+        TIMEOUT_CUTOFFS_TOTAL, recorder,
     };
     use crate::runtime::queue_client::LeasedMessage;
     use crate::runtime::{ResponseBody, ServiceRouter};
@@ -2567,6 +2567,7 @@ export default function handler(context: any): Response {
                     rate_limit_ops_per_sec: 42.5,
                     cpu_time_limit_ms: 1_250,
                     max_subrequests: 50,
+                    max_outbound_connections: 64,
                 },
                 ..Default::default()
             },
@@ -6535,8 +6536,8 @@ export default function handler(context: any): Response {
         // tail is armed with a budget of its own instead, which this call fits
         // inside comfortably; see the tail tests at the end of this file.
         use axum::routing::get;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hits = Arc::new(AtomicUsize::new(0));
         let counted = hits.clone();

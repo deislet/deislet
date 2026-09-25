@@ -8,7 +8,7 @@ use crate::app::types::ResourceLimits;
 use crate::app::{AppKey, ApplicationManager};
 use crate::deployment::{Applied, DeploymentManager, DeploymentOrder, StandardEnvironmentOrder};
 use crate::health::NodeHealth;
-use crate::runtime::metrics::{recorder, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL};
+use crate::runtime::metrics::{REQUEST_ERRORS_TOTAL, REQUESTS_TOTAL, recorder};
 
 use super::proto::runtime_management_server::RuntimeManagement;
 use super::proto::*;
@@ -811,17 +811,13 @@ fn decode_standard_environment(
 /// node's own configuration is in scope.
 fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
     ResourceLimits {
-        // `max_subrequests` has no field in this message and is left absent
-        // here. It is not lost: `crate::deployment` fills in every limit the
-        // deployment did not carry from the version's own manifest, which is
-        // where the declaration was written in the first place. A control
-        // plane that grows a field for it will simply agree with what the
-        // bundle already says.
+        // `max_subrequests` has no field in this message version's carrier and
+        // is left absent here. It is not lost: `crate::deployment` fills in
+        // every limit the deployment did not carry from the version's own
+        // manifest, which is where the declaration was written in the first
+        // place. A control plane that grows a field for it will simply agree
+        // with what the bundle already says.
         memory_mb: limits.memory_mb.max(0) as usize,
-        // Field 2 of the message, enforced by nothing on this node; carried
-        // into the struct only so that what the control plane sent and what
-        // the node holds are the same value.
-        cpu_milli: limits.cpu_milli.max(0) as u32,
         resource_table_max: (limits.resource_table_max > 0)
             .then_some(limits.resource_table_max as usize),
         timeout_ms: (limits.timeout_ms > 0).then_some(limits.timeout_ms as u64),
@@ -829,7 +825,12 @@ fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
             .then_some(limits.rate_limit_ops_per_sec),
         cpu_time_limit_ms: (limits.cpu_time_limit_ms > 0)
             .then_some(limits.cpu_time_limit_ms as u64),
+        // The wire does carry this one; `max_subrequests` above is the
+        // same story. A zero means the control plane said nothing, which
+        // is "use the platform default" here too.
         max_subrequests: None,
+        max_outbound_connections: (limits.max_outbound_connections > 0)
+            .then_some(limits.max_outbound_connections as u32),
     }
 }
 
