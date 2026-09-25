@@ -79,6 +79,15 @@ same way: a node once asked for `/register` while the control plane served
 `/registration`, both compiled, and the symptom was a fleet with no nodes in
 it.
 
+**The control-plane schema changes only by appending a numbered migration.**
+`crates/deis-control/src/database/migrations/` owns the metadata database
+schema. Never edit an existing migration file — especially
+`0001_baseline.sql`, which is a frozen snapshot. A schema change is a new
+`NNNN_name.sql` appended at the end, with a test (see the golden and
+per-version-fixture tests in `src/database/schema.rs`). `PRAGMA user_version`
+is the version record; hand-rolled databases without it are refused, not
+repaired.
+
 **Names mean one thing each.**
 
 | Word | Means | Never means |

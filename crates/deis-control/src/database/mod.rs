@@ -219,7 +219,7 @@ impl Database {
         // runs SQLite is the one place that runs SQLite - schema creation on
         // a cold, large database is not instant either.
         db.with_connection(|conn| {
-            schema::create_tables(conn)?;
+            schema::run_migrations(conn)?;
             Ok::<(), DatabaseError>(())
         })
         .await?;
@@ -1239,7 +1239,7 @@ fn configure_connection(conn: &Connection, path: &Path) -> Result<(), DatabaseEr
     // second process would then fail a request the first one would have
     // served a moment later.
     conn.busy_timeout(Duration::from_secs(5))?;
-    // Set here and not in `schema::create_tables`, which is handed a
+    // Set here and not in `schema::run_migrations`, which is handed a
     // connection that is already configured: every later statement on this
     // connection depends on it, and a schema function is not the place the
     // process's one connection is configured.

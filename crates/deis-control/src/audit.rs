@@ -630,39 +630,23 @@ mod tests {
         assert_eq!(dump["requestId"], "018f2518-7e38-7f80-8000-000000000001");
     }
 
-    /// A log written before request ids were recorded is read through the
-    /// same store: the column arrives on the next start, the old lines read
-    /// back with no id, and new lines carry theirs.
+    /// A log line written before request ids were recorded (request_id left
+    /// NULL) is read through the same store as the new lines that carry one.
     #[tokio::test]
     async fn an_older_log_reads_back_with_no_request_id_and_keeps_taking_lines() {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("control.sqlite");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE audit_log (
-                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    at               INTEGER NOT NULL,
-                    actor_kind       TEXT NOT NULL,
-                    actor_account    TEXT,
-                    actor_credential TEXT,
-                    action           TEXT NOT NULL,
-                    app_id           TEXT,
-                    environment      TEXT,
-                    target           TEXT,
-                    method           TEXT NOT NULL,
-                    path             TEXT NOT NULL,
-                    peer             TEXT,
-                    outcome          TEXT NOT NULL,
-                    status           INTEGER NOT NULL,
-                    detail           TEXT
-                );
-                INSERT INTO audit_log
+            crate::database::schema::run_migrations(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO audit_log
                     (at, actor_kind, actor_account, action, app_id, environment, method,
                      path, outcome, status)
                     VALUES (1700000000, 'account', 'alice', 'deploy', 'demo', 'production',
                             'POST', '/api/apps/demo/environments/production/deployments',
                             'accepted', 201);",
+                [],
             )
             .unwrap();
         }

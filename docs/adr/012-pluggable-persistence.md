@@ -353,6 +353,25 @@ control 不在线时数据面继续服务。这张表是承诺，与生产节点
 - 破坏性 contract 只在确认旧版本完全退出后执行。
 - Provider driver/companion service 同样记录 schema compatibility。
 
+### deis-control 元数据库迁移策略
+
+deis-control 的 SQLite 元数据库由 `src/database/migrations/` 下的编号迁移文件序列定义，
+通过 `PRAGMA user_version` 记录当前版本、`PRAGMA application_id` 记录归属魔数。规则：
+
+- **只能新增编号迁移，永不编辑已有迁移**。`0001_baseline.sql` 是冻结的收敛 schema
+  （从空库导出的 `sqlite_master` 快照），后续每个 schema 变更追加一个新编号文件。
+- 打开数据库时判定四种状态：空库直接跑基线并盖章；`0 < user_version ≤ LATEST_VERSION`
+  顺序补齐缺失迁移；`user_version` 超出本构建认知、非空库带外来 `application_id`、
+  或非空库 `user_version = 0` 的一律拒绝打开，绝不猜测性改写。
+- 每个迁移独占一个 `BEGIN IMMEDIATE` 事务，写锁下重读 `user_version` 防并发双写；
+  失败即回滚，库停留在上一个版本，不会半迁移。
+- 重建表的迁移按 SQLite 官方 altertable 文档第 12 步执行：`foreign_keys` 关闭、
+  事务内重建、提交前 `pragma_foreign_key_check` 清零、guard 保证出错也恢复 pragma。
+- 需要 Rust 侧计算（如 UUIDv7 主键）的种子行不进迁移 SQL，由执行器在迁移完成后
+  以幂等 `INSERT OR IGNORE` 补齐。
+- golden 测试内嵌执行迁移序列并与 `sqlite_master` 快照逐对象比对，防止 schema 漂移；
+  每个历史版本都有空库 fixture 测试，保证旧版本库能一路迁到最新。
+
 ## 安全
 
 - 服务间使用独立身份和最小数据库/object permissions。
