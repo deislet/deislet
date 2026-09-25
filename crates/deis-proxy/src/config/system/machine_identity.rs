@@ -268,7 +268,9 @@ impl Validatable for MachineIdentityConfig {
         .collect();
         if !missing.is_empty() {
             return refuse(format!(
-                "{} {} required. A [machine_identity] table names all three files or none of                  them: this proxy's certificate chain, the private key that goes with it, and                  the trust root every peer must chain to",
+                "{} {} required. A [machine_identity] table names all three files or none of \
+                 them: this proxy's certificate chain, the private key that goes with it, and \
+                 the trust root every peer must chain to",
                 missing.join(", "),
                 if missing.len() == 1 { "is" } else { "are" }
             ));

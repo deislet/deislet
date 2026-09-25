@@ -11,7 +11,7 @@ pub mod tls;
 pub mod upstream;
 
 use std::ops::Add;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use deis_wire::ControlConfig;
@@ -29,7 +29,7 @@ pub use health::{
 pub use https::HttpsConfig;
 pub use log::*;
 pub use machine_identity::MachineIdentityConfig;
-pub use routing::RoutingConfig;
+pub use routing::{DEFAULT_CACHE_FILE, RoutingConfig};
 pub use tls::TlsConfig;
 pub use upstream::UpstreamServer;
 
@@ -355,6 +355,31 @@ impl SystemConfig {
         self.routing.clone().unwrap_or_default()
     }
 
+    /// Where the routing table this instance last published is kept.
+    ///
+    /// `routing.cache_path` when the operator named one - resolved against
+    /// the start directory by [`Self::resolve_paths`], like every other path
+    /// here - and otherwise [`DEFAULT_CACHE_FILE`] beside the application
+    /// database, which is the directory this instance already owns and
+    /// writes at runtime. A `database` with no directory of its own leaves
+    /// the file in the working directory, which is the same file an operator
+    /// who named neither would expect.
+    pub fn routing_cache_path(&self) -> PathBuf {
+        if let Some(path) = self
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.cache_path.as_deref())
+        {
+            return PathBuf::from(path);
+        }
+        match Path::new(self.database()).parent() {
+            Some(directory) if !directory.as_os_str().is_empty() => {
+                directory.join(DEFAULT_CACHE_FILE)
+            }
+            _ => PathBuf::from(DEFAULT_CACHE_FILE),
+        }
+    }
+
     /// Largest request body this instance carries to an upstream.
     pub fn max_request_body_bytes(&self) -> usize {
         self.max_request_body_bytes
@@ -428,6 +453,16 @@ impl SystemConfig {
             resolve(&mut identity.certificate);
             resolve(&mut identity.private_key);
             resolve(&mut identity.trust_root);
+        }
+        // The poll loop writes this file after every table it publishes, and
+        // a starting process reads it before it polls - both long after
+        // pingora's daemon mode has moved the working directory to `/`. Left
+        // relative, the file would be a different one on the next start, or
+        // an unwritable one.
+        if let Some(routing) = self.routing.as_mut()
+            && let Some(path) = routing.cache_path.as_mut()
+        {
+            resolve(path);
         }
     }
 }
@@ -799,6 +834,44 @@ ports = [443]
         assert!(
             said.contains(&MAX_UPGRADE_SOCK_PATH_LEN.to_string()),
             "the message has to name the limit so an operator knows how much to cut: {said}"
+        );
+    }
+
+    #[test]
+    fn the_persisted_routing_table_sits_beside_the_database() {
+        // Not in the working directory: a proxy started by an init system
+        // has `/` for one, and the file would then be unwritable or gone.
+        let mut merged = SystemConfig::baseline();
+        merged.resolve_paths(Path::new("/srv/deis-proxy"));
+        assert_eq!(
+            merged.routing_cache_path(),
+            PathBuf::from("/srv/deis-proxy/routing-table.json")
+        );
+
+        let local: SystemConfig =
+            toml::from_str("database = \"/var/lib/deis-proxy/sites.db\"\n").unwrap();
+        let merged = SystemConfig::baseline() + local;
+        assert_eq!(
+            merged.routing_cache_path(),
+            PathBuf::from("/var/lib/deis-proxy/routing-table.json"),
+            "the directory that already holds this instance's state is the one it can write"
+        );
+    }
+
+    #[test]
+    fn a_configured_routing_cache_path_resolves_against_the_base() {
+        let local: SystemConfig = toml::from_str(
+            r#"
+[routing]
+cache_path = "var/routing-table.json"
+"#,
+        )
+        .unwrap();
+        let mut merged = SystemConfig::baseline() + local;
+        merged.resolve_paths(Path::new("/srv/deis-proxy"));
+        assert_eq!(
+            merged.routing_cache_path(),
+            PathBuf::from("/srv/deis-proxy/var/routing-table.json")
         );
     }
 

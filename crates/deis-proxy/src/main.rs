@@ -709,6 +709,7 @@ fn main() -> Result<()> {
                     info!(
                         poll_interval_secs = routing.control_poll_interval_secs(),
                         max_table_bytes = routing.max_table_bytes(),
+                        routing_cache = %system.routing_cache_path().display(),
                         "a route created in the control plane takes effect within one poll \
                          interval, and a poll that fails leaves the last table in force"
                     );
@@ -716,6 +717,7 @@ fn main() -> Result<()> {
                         client,
                         Arc::clone(&config),
                         Duration::from_secs(routing.control_poll_interval_secs()),
+                        Some(system.routing_cache_path()),
                     );
                     server.add_service(background_service("routing table", poller));
                 }

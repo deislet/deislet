@@ -64,6 +64,13 @@
 //! and falls back to the locally configured applications, which is exactly
 //! what it did before this module existed.
 //!
+//! A restart used to be that case. Every table this instance publishes is
+//! now written to the file described in [`persist`], and a starting process
+//! reads it back before its first poll, so an edge restarted while the
+//! control plane is unreachable routes exactly as it did before it stopped.
+//! The file never outranks a live answer: a successful poll replaces the
+//! table in memory and the copy on disk together.
+//!
 //! # All or nothing
 //!
 //! A table that arrives half-written must never be applied - half a routing
@@ -86,11 +93,13 @@
 pub mod client;
 #[cfg(test)]
 mod mock;
+pub mod persist;
 pub mod service;
 pub mod table;
 pub mod wire;
 
 pub use client::{CatalogClient, FetchError, routing_table_client};
+pub use persist::{CacheError, RoutingTableCache, StoredRoutingTable};
 pub use service::CatalogPoller;
 pub use table::{CatalogRoutes, Match, MatchSource, PreviewZone, Target};
 pub use wire::{ROUTING_TABLE_PATH, RoutingTableDocument};

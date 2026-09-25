@@ -287,8 +287,8 @@ the control pushes. Notable behaviour:
   implements `request_cache_filter` and pingora is built without its `cache`
   feature, so no response is stored and no `X-Cache-Status` is emitted.
 - `[routing]` is where the catalog's routing table is configured:
-  `control_poll_interval_secs` (5 by default), `max_table_bytes`, and
-  `preview_zone`. The poll runs on the mutually authenticated machine
+  `control_poll_interval_secs` (5 by default), `max_table_bytes`,
+  `cache_path` and `preview_zone`. The poll runs on the mutually authenticated machine
   channel, proving a certificate that names this proxy and nothing else and
   answered only once the control plane has proved its own name back. A
   `[machine_identity]` table is required wherever `[control]` is set; a file
@@ -317,7 +317,9 @@ the control pushes. Notable behaviour:
   customer-visible one. Each failure logs at `ERROR` saying which table is
   still routing and how old it is. An instance that has never once fetched the
   table has nothing to keep and falls back to the locally configured
-  applications.
+  applications; a restart is not that case, because every table published is
+  also kept in `routing.cache_path` (default: `routing-table.json` beside
+  `database`) and read back before the first poll.
 
 Applications (`id`, `description`, `domains`, `certificates`, `enabled`,
 `cache`) are not part of the file. They are pushed by the control and persisted in `database`

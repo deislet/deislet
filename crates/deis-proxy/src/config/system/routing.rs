@@ -28,6 +28,15 @@ pub const DEFAULT_MAX_TABLE_BYTES: usize = 8 * 1024 * 1024;
 /// a mistake rather than a tight limit.
 const MIN_MAX_TABLE_BYTES: usize = 1024;
 
+/// Name of the file the last published routing table is kept in when
+/// `cache_path` names none.
+///
+/// It sits beside `database` rather than in the working directory because
+/// that is the directory this instance already owns and writes to at
+/// runtime, and because a process started by an init system has `/` as its
+/// working directory.
+pub const DEFAULT_CACHE_FILE: &str = "routing-table.json";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
@@ -36,6 +45,13 @@ pub struct RoutingConfig {
     pub control_poll_interval_secs: Option<u64>,
     /// Ceiling on the fetched table, in bytes.
     pub max_table_bytes: Option<usize>,
+    /// File the routing table this instance last published is kept in, so
+    /// that a restart while the control plane is unreachable still routes.
+    ///
+    /// Unset - the default - is `routing-table.json` beside `database`. A
+    /// relative path is resolved against the directory deis-proxy was
+    /// started from, like every other path here.
+    pub cache_path: Option<String>,
     /// Domain the automatic per-environment addresses live under, for
     /// instance `preview.example.com`; an environment is then reachable at
     /// `<env>--<app>.<zone>` and, for the default environment, also at
@@ -95,6 +111,19 @@ impl Validatable for RoutingConfig {
                 message: format!(
                     "routing.preview_zone {zone:?} is not a domain; remove it to turn automatic \
                      per-environment addresses off"
+                ),
+            });
+        }
+        if let Some(path) = &self.cache_path
+            && path.trim().is_empty()
+        {
+            // Unset is the default path; empty is neither that nor a path,
+            // and would be resolved into the working directory, which is a
+            // directory this instance may not be able to write.
+            return Err(ConfigError::ValidationError {
+                message: format!(
+                    "routing.cache_path is empty; remove the line to keep the routing table in \
+                     {DEFAULT_CACHE_FILE} beside database"
                 ),
             });
         }
@@ -161,5 +190,20 @@ mod tests {
             routing.preview_zone().unwrap().as_str(),
             "preview.example.com"
         );
+    }
+
+    #[test]
+    fn an_empty_cache_path_is_refused_rather_than_resolved() {
+        let routed = RoutingConfig {
+            cache_path: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let message = routed.validate().unwrap_err().to_string();
+        assert!(message.contains("cache_path"), "{message}");
+        assert!(
+            message.contains(DEFAULT_CACHE_FILE),
+            "the refusal has to say what removing the line gets instead: {message}"
+        );
+        assert!(RoutingConfig::default().validate().is_ok());
     }
 }
