@@ -163,7 +163,8 @@ async fn op_kv_set(
         // saves a round trip.
         if ttl <= 0 {
             return Err(JsErrorBox::type_error(format!(
-                "kv.put({key:?}): expirationTtl must be greater than 0 seconds, got {ttl}; the                  value was not written"
+                "kv.put({key:?}): expirationTtl must be greater than 0 seconds, got {ttl}; the \
+                 value was not written"
             )));
         }
     }

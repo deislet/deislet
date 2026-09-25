@@ -3,6 +3,7 @@
 use super::AppState;
 use crate::app::AppKey;
 use crate::runtime::header_list;
+use crate::runtime::DispatchError;
 use crate::{
     is_platform_header, APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER,
     PLATFORM_HEADER_PREFIX,
@@ -18,7 +19,24 @@ use axum::{
 };
 use deno_core::url::Url;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Whether this overload refusal gets a warn line of its own.
+///
+/// An overload burst is exactly when a warn per refusal stops being useful:
+/// the node is doing the right thing, and a stream of requests piling up
+/// behind a wedged thread would write one line per request for as long as
+/// the burst lasts. Every one of the first few refusals of the process is
+/// logged, because the first is the moment an operator learns something new;
+/// after that one in a hundred gets the line, and the rest are in the
+/// metric `deis_runtime_overloaded_total`.
+static OVERLOAD_REFUSALS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+fn overload_refusal_is_logged() -> bool {
+    let seen = OVERLOAD_REFUSALS_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    seen <= 5 || seen.is_multiple_of(100)
+}
 
 /// How the kind of an inbound WebSocket frame reaches the isolate.
 ///
@@ -908,6 +926,115 @@ pub async fn handle_request(
             }
         }
         Err(e) => {
+            // The node's own refusal travels down this channel as itself.
+            //
+            // This is the one place the pool's two kinds of failure meet the
+            // client. An application error and a node error are different
+            // things for the caller: the first is answered with an incident
+            // so the operator can find it, the second is a scheduling answer
+            // the caller may act on -- retry after a moment, or not at all.
+            // The pool is the only sender of a [`DispatchError`], so a
+            // downcast is the whole of the check.
+            if let Some(refusal) = e.downcast_ref::<DispatchError>() {
+                return match refusal {
+                    DispatchError::Overloaded { retry_after } => {
+                        // Whole seconds, floored at one: a fractional or zero
+                        // Retry-After is not a hint a client can schedule on,
+                        // and the budget this refusal came from is already
+                        // back in the neighbourhood of zero by the time the
+                        // retry lands.
+                        let retry_after = retry_after.as_secs().max(1);
+                        crate::runtime::metrics::recorder().record_overloaded(
+                            &key.tenant_id(),
+                            crate::runtime::metrics::OVERLOAD_CLASS_ADMISSION,
+                        );
+                        if overload_refusal_is_logged() {
+                            tracing::warn!(
+                                app_id = %key.app_id(),
+                                environment = %key.environment(),
+                                method = %method,
+                                path = uri.path(),
+                                "Refusing a request as overloaded: the runtime thread for {} was at \
+                                 capacity, so the application never saw it. The caller is told to \
+                                 retry in {retry_after}s",
+                                key
+                            );
+                        } else {
+                            tracing::debug!(
+                                app_id = %key.app_id(),
+                                environment = %key.environment(),
+                                "Refusing another request as overloaded; the warn line for these \
+                                 is sampled, and the count is in the overloaded metric"
+                            );
+                        }
+                        // Built rather than unwrapped: every value here is a
+                        // fixed literal or a positive integer, so the builder
+                        // cannot fail -- and the refusal the caller is owed
+                        // must not itself be able to become a 500.
+                        let response = Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header("retry-after", retry_after.to_string())
+                            .header("x-deis-outcome", "overloaded")
+                            .header("x-deis-outcome-detail", "admission")
+                            .body(Body::from("Runtime overloaded, retry shortly"));
+                        match response {
+                            Ok(response) => response.into_response(),
+                            Err(_) => (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Runtime overloaded, retry shortly",
+                            )
+                                .into_response(),
+                        }
+                    }
+                    DispatchError::Stopped | DispatchError::GenerationNotPrepared => {
+                        // A placement answer, not an overload: the application
+                        // (or the exact generation the edge selected for it)
+                        // is not on this node at this moment. The same shape
+                        // as the other 503s this file gives out -- a fixed
+                        // sentence and no incident, because nothing failed
+                        // here; reinstalling or converging the placement is
+                        // the control plane's job, not this request's.
+                        tracing::warn!(
+                            app_id = %key.app_id(),
+                            environment = %key.environment(),
+                            method = %method,
+                            path = uri.path(),
+                            "Refusing a request for {}: the node was told to run it but its \
+                             placement is not here ({refusal})",
+                            key
+                        );
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "The application is not currently available on this node.",
+                        )
+                            .into_response()
+                    }
+                    DispatchError::NotFound => {
+                        // The check at the top of this handler said the
+                        // application was placed here; the post says it is not.
+                        // It was unloaded or moved in the between. The
+                        // established answer for a placement that is not here
+                        // yet is the 503 with no incident: nothing failed,
+                        // and the caller may retry while the placement
+                        // converges.
+                        tracing::warn!(
+                            app_id = %key.app_id(),
+                            environment = %key.environment(),
+                            method = %method,
+                            path = uri.path(),
+                            "Refusing a request for {}: it was checked as placed a moment ago \
+                             and is not on this node any more",
+                            key
+                        );
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "The application is not currently available on this node.",
+                        )
+                            .into_response()
+                    }
+                };
+            }
+
             // The other half of the same disclosure the invoke wrapper had.
             //
             // This arm is not only "the runtime thread went away". A bundle

@@ -681,4 +681,17 @@ mod tests {
         assert_eq!(cutoffs.app_id, "legacy-app");
         assert!(cutoffs.labels.iter().all(|(k, _)| *k != "environment"));
     }
+
+    #[test]
+    fn a_request_dropped_before_it_started_is_counted_apart_from_every_other_outcome() {
+        let registry = MetricsRegistry::new();
+        registry.record_abandoned_before_start("demo");
+
+        assert_eq!(registry.value(ABANDONED_BEFORE_START_TOTAL, "demo"), 1.0);
+        // No isolate was entered, so a dropped request must not move the
+        // request count or the latency histogram: a node losing requests this
+        // way is saying they waited, not that the application is slow.
+        assert_eq!(registry.value(REQUESTS_TOTAL, "demo"), 0.0);
+        assert_eq!(registry.value(EXECUTION_MS_COUNT, "demo"), 0.0);
+    }
 }

@@ -54,7 +54,7 @@ pub use metrics::{
     MetricShipperConfig, MetricsRegistry,
 };
 pub use op_metrics::{OpMetricsSummary, OpMetricsSummaryTracker};
-pub use pool::{RuntimePool, StagedVersion};
+pub use pool::{DispatchError, RuntimePool, StagedVersion};
 pub use queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};
 pub use queue_consumer::{BatchOutcome, ConsumerSettings};
 pub use queue_ops::init_queue_extension;

@@ -281,6 +281,34 @@ impl ApplicationManager {
         self
     }
 
+    /// Override how long work may wait for an application's runtime thread
+    /// before the node refuses it. Intended to be called once at startup with
+    /// `RuntimeConfig::admission_wait_ms`.
+    pub fn with_admission_wait_ms(self, admission_wait_ms: u64) -> Self {
+        tracing::info!(
+            admission_wait_ms,
+            "Work that has waited in an application's runtime thread queue for more than {}ms is \
+             refused as overloaded instead of started",
+            admission_wait_ms
+        );
+        self.runtime_pool.set_admission_wait_ms(admission_wait_ms);
+        self
+    }
+
+    /// Override what an overloaded refusal tells its caller to wait before
+    /// retrying, in whole seconds. Intended to be called once at startup with
+    /// `RuntimeConfig::overload_retry_after_seconds`, which validation has
+    /// already held above zero.
+    pub fn with_overload_retry_after_secs(self, overload_retry_after_secs: u64) -> Self {
+        tracing::info!(
+            overload_retry_after_secs,
+            "A request refused as overloaded is told to retry after {}s",
+            overload_retry_after_secs
+        );
+        self.runtime_pool.set_overload_retry_after_secs(overload_retry_after_secs);
+        self
+    }
+
     /// Set the node's outbound-fetch policy. Intended to be called once at
     /// startup with the operator's `[fetch] allow` list and the addresses of
     /// this node's own platform services.
@@ -1198,6 +1226,14 @@ impl ApplicationManager {
     #[cfg(test)]
     pub async fn drop_isolate_for_test(&self, key: &AppKey) {
         let _ = self.runtime_pool.unload_app(&key.tenant_id()).await;
+    }
+
+    /// Test hook: the runtime pool this manager dispatches into, for a test
+    /// that needs to put the pool itself in a state -- a full thread queue --
+    /// that only the pool's own code can reach.
+    #[cfg(test)]
+    pub fn runtime_pool_for_test(&self) -> &Arc<RuntimePool> {
+        &self.runtime_pool
     }
 
     /// Whether this environment has a live isolate on this node right now.

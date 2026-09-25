@@ -86,6 +86,16 @@ const MIN_CPU_TIME_LIMIT_MS: u64 = 100;
 /// it was assigned and the reason would look like an application fault.
 const MIN_MEMORY_LIMIT_MB: usize = 32;
 
+/// deis-proxy's default `upstream_read_timeout_secs`, in milliseconds.
+///
+/// The edge stops waiting for a node's answer after this long. A node's
+/// admission budget has to be below it, or a request it starts may outlive the
+/// connection the answer is written to; see [`RuntimeConfig::admission_wait_warning`].
+/// The two crates do not depend on each other, so this is a copy of
+/// `deis_proxy::config::system::DEFAULT_UPSTREAM_READ_TIMEOUT_SECS` and the two
+/// numbers have to be changed together.
+const PROXY_DEFAULT_UPSTREAM_READ_TIMEOUT_MS: u64 = 30_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     /// How this node names itself to the control plane. Unset means "use the
@@ -135,6 +145,41 @@ pub struct RuntimeConfig {
     /// requests, which it is not.
     #[serde(default = "default_memory_limit_mb")]
     pub default_memory_limit_mb: usize,
+
+    /// How long work posted to an application's runtime thread may wait for it
+    /// before the node refuses that work, in milliseconds.
+    ///
+    /// One application runs on one runtime thread, and a thread runs what it
+    /// has been given one piece at a time, so a slow invocation makes
+    /// everything posted behind it wait. This is the ceiling on that wait:
+    /// work still queued when the budget runs out is answered `503` with a
+    /// `Retry-After` header instead of being started, because by then the
+    /// caller has probably gone and running it would only take the thread away
+    /// from the next request that is still waiting.
+    ///
+    /// It has to be below the edge's `upstream_read_timeout`, or a request can
+    /// be admitted after deis-proxy has already abandoned it; the node warns
+    /// at startup when this value is not below that setting's default.
+    ///
+    /// Must be greater than 0; 0 refuses every request that had to wait at
+    /// all, which is every request that finds the thread busy.
+    #[serde(default = "default_admission_wait_ms")]
+    pub admission_wait_ms: u64,
+
+    /// What a refusal at admission tells its caller to wait before retrying,
+    /// in whole seconds: the value of the `Retry-After` header on the `503`
+    /// the node answers with.
+    ///
+    /// The refusal is about a thread that is busy, not an application that
+    /// is down, and a busy thread is usually free again within one
+    /// invocation, so the default is the shortest whole second. A longer hint
+    /// keeps the caller backing off past the moment the node could have
+    /// served it; it is a hint, not a promise.
+    ///
+    /// Must be at least 1: 0 would tell a client to retry at once, which is
+    /// the one thing a refusal at capacity is not.
+    #[serde(default = "default_overload_retry_after_seconds")]
+    pub overload_retry_after_seconds: u64,
 
     /// Platform-wide defaults for per-app execution limits. An app may override
     /// `timeout_ms` and `rate_limit_ops_per_sec` via its `ResourceLimits`
@@ -217,6 +262,23 @@ pub fn default_memory_limit_mb() -> usize {
     256
 }
 
+/// 10 s: long enough that a request only meets it when the thread it is
+/// waiting for is genuinely wedged behind something, and short enough to be
+/// well inside the edge's 30 s upstream read timeout by default, so the answer
+/// reaches a client that is still there. An application whose handlers
+/// routinely run longer than this is telling its operator to raise the value
+/// or move the slow work off the request path.
+pub fn default_admission_wait_ms() -> u64 {
+    10_000
+}
+
+/// 1 s: a busy thread is usually free again within one invocation, so a
+/// short hint keeps the client from backing off past the moment the node
+/// could have served it. See [`RuntimeConfig::overload_retry_after_seconds`].
+pub fn default_overload_retry_after_seconds() -> u64 {
+    1
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -226,6 +288,8 @@ impl Default for RuntimeConfig {
             shutdown_grace_period_secs: default_shutdown_grace_period_secs(),
             max_request_body_bytes: default_max_request_body_bytes(),
             default_memory_limit_mb: default_memory_limit_mb(),
+            admission_wait_ms: default_admission_wait_ms(),
+            overload_retry_after_seconds: default_overload_retry_after_seconds(),
             default_execution_limits: ExecutionLimits::default(),
             logging: LoggingConfig::default(),
             control: ControlPlaneConfig::default(),
@@ -1030,6 +1094,22 @@ impl RuntimeConfig {
             )?;
         }
 
+        if let Some(value) = env_var("DEIS_RUNTIME_ADMISSION_WAIT_MS") {
+            self.admission_wait_ms = parse_env(
+                &value,
+                "DEIS_RUNTIME_ADMISSION_WAIT_MS",
+                "a whole number of milliseconds",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_OVERLOAD_RETRY_AFTER_SECONDS") {
+            self.overload_retry_after_seconds = parse_env(
+                &value,
+                "DEIS_RUNTIME_OVERLOAD_RETRY_AFTER_SECONDS",
+                "a whole number of seconds",
+            )?;
+        }
+
         if let Some(value) = env_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS") {
             self.default_execution_limits.timeout_ms = parse_env(
                 &value,
@@ -1292,6 +1372,33 @@ impl RuntimeConfig {
         }
     }
 
+    /// The line to log when the admission budget can outlast the edge's
+    /// patience, if it can.
+    ///
+    /// A request is admitted only while somebody is waiting to read the
+    /// answer, and the caller on the edge is deis-proxy, which gives up on the
+    /// upstream read after its own `upstream_read_timeout`. This crate does not
+    /// depend on deis-proxy and cannot read what that instance was configured
+    /// with, so what it compares against is the setting's default; an operator
+    /// who raised the edge's timeout may raise this past it and be right to,
+    /// and is told so rather than being stopped.
+    ///
+    /// `None` when the budget is inside the default.
+    pub fn admission_wait_warning(&self) -> Option<String> {
+        if self.admission_wait_ms < PROXY_DEFAULT_UPSTREAM_READ_TIMEOUT_MS {
+            return None;
+        }
+        Some(format!(
+            "admission_wait_ms is {}ms, which is not below deis-proxy's default \
+             upstream_read_timeout ({}s): a request admitted this late may already have been \
+             abandoned by the edge, so the thread would spend itself on an answer nobody is \
+             reading. Lower admission_wait_ms under the edge's configured value, or raise the \
+             edge's upstream_read_timeout_secs above this one",
+            self.admission_wait_ms,
+            PROXY_DEFAULT_UPSTREAM_READ_TIMEOUT_MS / 1000
+        ))
+    }
+
     /// Reject configurations the node cannot serve traffic on.
     ///
     /// Every rule here guards a value that would otherwise fail every request
@@ -1331,6 +1438,29 @@ impl RuntimeConfig {
                 self.default_memory_limit_mb,
                 MIN_MEMORY_LIMIT_MB
             ));
+        }
+
+        if self.admission_wait_ms == 0 {
+            return Err(anyhow!(
+                "admission_wait_ms must be greater than 0; 0 refuses every request that had to \
+                 wait at all, and a request that finds the application's runtime thread busy has \
+                 always waited, so the node would answer 503 to everything but the first request \
+                 in each quiet moment"
+            ));
+        }
+
+        if self.overload_retry_after_seconds < 1 {
+            return Err(anyhow!(
+                "overload_retry_after_seconds must be at least 1; 0 would tell a client to \
+                 retry at once, which is the one thing a refusal at capacity is not"
+            ));
+        }
+
+        // Said and not enforced: the value being compared against is the edge's
+        // default, and an operator whose edge waits longer than that has a
+        // legitimate reason to go past it.
+        if let Some(warning) = self.admission_wait_warning() {
+            tracing::warn!("{warning}");
         }
 
         let limits = &self.default_execution_limits;
@@ -2200,6 +2330,51 @@ mod tests {
     #[test]
     fn test_validate_accepts_defaults() {
         RuntimeConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_admission_wait() {
+        let config = RuntimeConfig {
+            admission_wait_ms: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("admission_wait_ms"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_overload_retry_after() {
+        let config = RuntimeConfig {
+            overload_retry_after_seconds: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("overload_retry_after_seconds"), "{err}");
+    }
+
+    #[test]
+    fn test_admission_wait_beyond_the_edge_read_timeout_is_warned_about() {
+        // A warning rather than a refusal, and for a reason the check has to
+        // carry: what it compares against is the edge's *default* read timeout,
+        // because these two crates do not depend on each other, and an operator
+        // whose edge waits longer than the default is entitled to raise the
+        // budget past it.
+        let default = RuntimeConfig::default();
+        assert_eq!(default.admission_wait_ms, 10_000);
+        assert!(default.admission_wait_warning().is_none());
+
+        let config = RuntimeConfig {
+            admission_wait_ms: PROXY_DEFAULT_UPSTREAM_READ_TIMEOUT_MS,
+            ..Default::default()
+        };
+        let warning = config
+            .admission_wait_warning()
+            .expect("a budget at the edge's default read timeout must be reported");
+        assert!(warning.contains("admission_wait_ms"), "{warning}");
+        assert!(
+            config.validate().is_ok(),
+            "an over-long admission budget is reported at startup, not refused"
+        );
     }
 
     #[test]

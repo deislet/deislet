@@ -526,6 +526,7 @@ mod tests {
                     NackRequest {
                         queue_name: "jobs".to_string(),
                         delay_seconds: 0,
+                        refund_attempt: false,
                         messages: leased
                             .iter()
                             .map(|message| MessageHandle {

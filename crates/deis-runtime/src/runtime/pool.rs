@@ -17,9 +17,10 @@ use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 /// Ensure V8 platform is initialized only once
@@ -86,6 +87,168 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     "a panic payload that is neither a string nor a &str".to_string()
 }
 
+/// Why the runtime did not start work a caller asked for.
+///
+/// It travels back down the same reply channel an invocation's result does,
+/// which is what lets a caller tell this node's own refusal apart from the
+/// application failing: no isolate was entered. A caller reads it with
+/// `downcast_ref::<DispatchError>()` to answer its client differently -- an
+/// overload is a `503` with a `Retry-After`, not the `500` an application's
+/// own error gets.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    /// The application's runtime thread is at capacity: either its queue was
+    /// full when the work was posted, or the work waited past the node's
+    /// admission budget before the thread reached it.
+    ///
+    /// The application never saw the work, so retrying is the right answer and
+    /// is not a duplicate side effect.
+    #[error("the runtime thread for this application is at capacity; retry after {retry_after:?}")]
+    Overloaded { retry_after: Duration },
+    /// The thread the application is placed on has stopped: it lost its
+    /// isolate to a panic and is no longer answering for this application.
+    ///
+    /// Nothing is lost by retrying, because no work ran, and the pool already
+    /// reports the application as not hosted so the control plane reinstalls
+    /// it. Until it is reinstalled, the right answer for a caller is to try
+    /// again shortly, not to fail as if the application itself had broken.
+    #[error("the runtime thread for this application has stopped and it is not serving on this node")]
+    Stopped,
+    /// The application is not on this node at all: it was never placed here,
+    /// or it was and its placement has since been forgotten.
+    ///
+    /// A scheduling answer about this node, not a statement that the
+    /// application does not exist -- the control plane's placement table is
+    /// the one that says that, and it may disagree with this node for a while
+    /// after an uninstall or a move.
+    #[error("the application is not hosted on this node")]
+    NotFound,
+    /// The exact deployment generation the caller selected has not been
+    /// prepared on this node.
+    ///
+    /// The distinction from [`DispatchError::NotFound`] is the one an exact-
+    /// generation caller depends on: the application's other versions may be
+    /// serving here just fine, and substituting one of them would serve a
+    /// different version than the routing layer selected. The answer is that
+    /// this particular generation is not here yet, which is a placement or
+    /// convergence fault the caller may retry while the node converges.
+    #[error("the requested deployment generation has not been prepared on this node")]
+    GenerationNotPrepared,
+}
+
+/// What a caller refused at admission is told to wait before retrying.
+///
+/// The refusal is about a thread that is busy, not an application that is
+/// down, and a busy thread is usually free again within one invocation. A
+/// short hint keeps the client from backing off past the moment the node could
+/// have served it.
+///
+/// Read from the pool's shared value rather than a constant: the number is
+/// the configured `overload_retry_after_seconds`, and the hint the caller
+/// gets has to be the same no matter which of the refusals below produced
+/// it. Floored at one second: a zero Retry-After is not a hint a client can
+/// schedule on, and a value applied at 0 is refused by validation anyway.
+fn overload_retry_after(secs: &AtomicU64) -> Duration {
+    Duration::from_secs(secs.load(Ordering::Relaxed).max(1))
+}
+
+/// What a runtime thread does with one message it has just taken off its
+/// queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Run it.
+    Run,
+    /// Drop it without a word: the caller closed the reply channel.
+    Abandoned,
+    /// Refuse it as overloaded: it waited longer than its budget.
+    Expired,
+}
+
+/// Decide what to do with work that has been waiting in the thread's queue.
+///
+/// The caller being gone is asked first, and the order matters: a caller that
+/// has gone away is owed no answer at all, and refusing it as overloaded would
+/// have this node write a reply onto a channel nobody is holding.
+///
+/// `wait` is passed in rather than read from the clock here, so the boundary
+/// can be tested without waiting for it.
+fn admission(wait: Duration, budget: Duration, caller_gone: bool) -> Admission {
+    if caller_gone {
+        Admission::Abandoned
+    } else if wait > budget {
+        Admission::Expired
+    } else {
+        Admission::Run
+    }
+}
+
+/// Throw away work whose caller has already gone, and count it.
+fn drop_abandoned(thread_id: usize, app_id: &str, what: &str) {
+    tracing::debug!(
+        thread_id,
+        app_id = %app_id,
+        kind = what,
+        "Thread {}: dropping a {} whose caller has gone away before the thread reached it; the \
+         application is not entered",
+        thread_id,
+        what
+    );
+    super::metrics::recorder().record_abandoned_before_start(app_id);
+}
+
+/// Answer a caller whose work outlasted its admission budget, and run nothing.
+fn reply_overloaded<T>(response: oneshot::Sender<Result<T>>, retry_after: Duration) {
+    let _ = response.send(Err(DispatchError::Overloaded { retry_after }.into()));
+}
+
+/// Unix seconds: the clock deis-queue stamps lease expiry with.
+///
+/// The same clock `queue_consumer` reads leases off. This copy exists because
+/// it is the runtime thread, not the poller, that decides whether a batch is
+/// still worth starting.
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long the shortest-lived message in a batch is still leased to this
+/// node.
+///
+/// The earliest expiry is the one that counts: from that instant on, that
+/// message belongs to whoever pulls next. `None` when no message carries an
+/// expiry, which is the shape of a test double rather than of a server.
+fn remaining_lease(messages: &[LeasedMessage], now: i64) -> Option<Duration> {
+    let earliest = messages
+        .iter()
+        .map(|message| message.lease_expires_at)
+        .filter(|expiry| *expiry > 0)
+        .min()?;
+    Some(Duration::from_secs(
+        earliest.saturating_sub(now).max(0) as u64
+    ))
+}
+
+/// How long one queue batch may wait for the application's runtime thread.
+///
+/// The smaller of the node's admission budget and what is left of the lease,
+/// because both are deadlines that have already started ticking: the admission
+/// budget bounds how long a caller may wait for an answer, and the lease bounds
+/// how long this node may still answer for the messages at all. Past the lease
+/// the messages have been handed to another consumer, and running the handler
+/// would do that work a second time.
+fn batch_admission_budget(
+    admission_budget: Duration,
+    messages: &[LeasedMessage],
+    now: i64,
+) -> Duration {
+    match remaining_lease(messages, now) {
+        Some(lease) => admission_budget.min(lease),
+        None => admission_budget,
+    }
+}
+
 /// Runtime message type
 pub enum RuntimeMessage {
     /// Load application
@@ -120,6 +283,10 @@ pub enum RuntimeMessage {
         method: String,
         headers: HeaderPairs,
         body: Option<Vec<u8>>,
+        /// When this message was posted to the thread's queue. Read when the
+        /// thread takes it off: a message whose caller has gone, or that has
+        /// waited past the admission budget, is not run.
+        enqueued_at: Instant,
         response: oneshot::Sender<Result<FetchResult>>,
     },
     /// Hand a batch of queue messages to an app's queue handler
@@ -127,6 +294,9 @@ pub enum RuntimeMessage {
         app_id: String,
         queue: String,
         messages: Vec<LeasedMessage>,
+        /// When this message was posted to the thread's queue; see
+        /// [`RuntimeMessage::ExecuteRequest`].
+        enqueued_at: Instant,
         response: oneshot::Sender<Result<BatchOutcome>>,
     },
     /// Hand one application-to-application call to the callee's isolate.
@@ -139,6 +309,9 @@ pub enum RuntimeMessage {
     ExecuteServiceCall {
         app_id: String,
         call: Box<super::service_call::ServiceCall>,
+        /// When this message was posted to the thread's queue; see
+        /// [`RuntimeMessage::ExecuteRequest`].
+        enqueued_at: Instant,
         response: oneshot::Sender<Result<FetchResult>>,
     },
     /// Run an app's scheduled handler for one due cron expression
@@ -147,6 +320,9 @@ pub enum RuntimeMessage {
         cron: String,
         /// Unix milliseconds the tick was due.
         scheduled_time_ms: i64,
+        /// When this message was posted to the thread's queue; see
+        /// [`RuntimeMessage::ExecuteRequest`].
+        enqueued_at: Instant,
         response: oneshot::Sender<Result<()>>,
     },
     /// Get application list
@@ -289,14 +465,26 @@ struct RuntimeThread {
     thread_id: usize,
     sender: mpsc::Sender<RuntimeMessage>,
     handle: Option<thread::JoinHandle<()>>,
+    /// What a refusal this thread's queue gives the caller should tell it to
+    /// wait; see the `overload_retry_after_secs` field of `RuntimePool`.
+    overload_retry_after_secs: Arc<AtomicU64>,
 }
 
 impl RuntimeThread {
     /// Create new runtime thread
-    fn new(thread_id: usize, faults: mpsc::UnboundedSender<ThreadFault>) -> Self {
+    fn new(
+        thread_id: usize,
+        faults: mpsc::UnboundedSender<ThreadFault>,
+        admission_wait_ms: Arc<AtomicU64>,
+        overload_retry_after_secs: Arc<AtomicU64>,
+    ) -> Self {
         // Set channel capacity to 100, exceeding will trigger backpressure (reject requests)
         let (tx, rx) = mpsc::channel(100);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        // Cloned for the struct: the field is how `send` prices a full-queue
+        // refusal from the pool's side of the queue, and the thread keeps its
+        // own copy for the refusals it answers from the other side.
+        let thread_retry_after = overload_retry_after_secs.clone();
 
         let handle = thread::spawn(move || {
             // Create current_thread tokio runtime
@@ -306,7 +494,15 @@ impl RuntimeThread {
                 .expect("Failed to create tokio runtime");
 
             rt.block_on(async move {
-                Self::run_event_loop(thread_id, rx, ready_tx, faults).await;
+                Self::run_event_loop(
+                    thread_id,
+                    rx,
+                    ready_tx,
+                    faults,
+                    admission_wait_ms.clone(),
+                    overload_retry_after_secs,
+                )
+                .await;
             });
         });
 
@@ -317,6 +513,7 @@ impl RuntimeThread {
             thread_id,
             sender: tx,
             handle: Some(handle),
+            overload_retry_after_secs: thread_retry_after,
         }
     }
 
@@ -326,6 +523,8 @@ impl RuntimeThread {
         mut rx: mpsc::Receiver<RuntimeMessage>,
         ready_tx: std::sync::mpsc::Sender<()>,
         faults: mpsc::UnboundedSender<ThreadFault>,
+        admission_wait_ms: Arc<AtomicU64>,
+        overload_retry_after_secs: Arc<AtomicU64>,
     ) {
         tracing::info!("Runtime thread {} started", thread_id);
 
@@ -390,6 +589,12 @@ impl RuntimeThread {
             let Some(msg) = msg else {
                 break;
             };
+            // Read per message rather than once, so a budget applied after this
+            // thread started is the one in force.
+            let admission_budget = Duration::from_millis(admission_wait_ms.load(Ordering::Relaxed));
+            // The hint a refusal of this message would carry, read beside the
+            // budget for the same reason.
+            let retry_after = overload_retry_after(&overload_retry_after_secs);
             // One panic on a runtime thread used to end it. The thread is
             // this application's only isolate on this node, so every later
             // request, queue batch and cron tick for it answered "Runtime
@@ -397,9 +602,15 @@ impl RuntimeThread {
             // the node went on reporting the application as running. So the
             // panic is caught at the boundary of one message; see
             // [`Self::lose_isolate`] for what is thrown away and what is kept.
-            let handled = AssertUnwindSafe(Self::handle_message(thread_id, &mut hosted, msg))
-                .catch_unwind()
-                .await;
+            let handled = AssertUnwindSafe(Self::handle_message(
+                thread_id,
+                &mut hosted,
+                msg,
+                admission_budget,
+                retry_after,
+            ))
+            .catch_unwind()
+            .await;
             match handled {
                 Ok(ControlFlow::Continue(())) => {}
                 Ok(ControlFlow::Break(())) => break,
@@ -513,6 +724,8 @@ impl RuntimeThread {
         thread_id: usize,
         hosted: &mut Option<HostedApp>,
         msg: RuntimeMessage,
+        admission_budget: Duration,
+        retry_after: Duration,
     ) -> ControlFlow<()> {
         match msg {
             RuntimeMessage::LoadApp {
@@ -580,58 +793,90 @@ impl RuntimeThread {
                 headers,
                 body,
                 response,
+                enqueued_at,
             } => {
-                tracing::debug!("Thread {}: Executing request for app {}", thread_id, app_id);
-                match hosted_mut(hosted, &app_id) {
-                    Some(runtime) => {
-                        if let Err(e) = runtime
-                            .execute_fetch(url, method, headers, body, response)
-                            .await
-                        {
-                            tracing::error!("Error executing fetch: {}", e);
-                        }
+                match admission(
+                    enqueued_at.elapsed(),
+                    admission_budget,
+                    response.is_closed(),
+                ) {
+                    Admission::Abandoned => drop_abandoned(thread_id, &app_id, "request"),
+                    Admission::Expired => reply_overloaded(response, retry_after),
+                    Admission::Run => {
+                        tracing::debug!(
+                            "Thread {}: Executing request for app {}",
+                            thread_id,
+                            app_id
+                        );
+                        match hosted_mut(hosted, &app_id) {
+                            Some(runtime) => {
+                                if let Err(e) = runtime
+                                    .execute_fetch(url, method, headers, body, response)
+                                    .await
+                                {
+                                    tracing::error!("Error executing fetch: {}", e);
+                                }
+                            }
+                            None => {
+                                // The thread was reassigned or the app's
+                                // placement was forgotten between the dispatch
+                                // reading it and this message being taken: the
+                                // caller gets the same named answer as if the
+                                // lookup itself had failed.
+                                let _ = response.send(Err(DispatchError::NotFound.into()));
+                            }
+                        };
                     }
-                    None => {
-                        let _ = response.send(Err(anyhow::anyhow!("App not found")));
-                    }
-                };
+                }
             }
 
             RuntimeMessage::ExecuteServiceCall {
                 app_id,
                 call,
                 response,
+                enqueued_at,
             } => {
-                tracing::debug!(
-                    thread_id,
-                    app_id = %app_id,
-                    binding = %call.binding,
-                    caller = %call.caller_tenant(),
-                    "Thread {}: {} is calling {} through binding {}",
-                    thread_id,
-                    call.caller_tenant(),
-                    app_id,
-                    call.binding
-                );
-                match hosted_mut(hosted, &app_id) {
-                    Some(runtime) => {
-                        if let Err(e) = runtime.execute_service_call(*call, response).await {
-                            tracing::error!(
-                                app_id = %app_id,
-                                error = %e,
-                                "A service call into {} could not be run",
-                                app_id
-                            );
+                match admission(
+                    enqueued_at.elapsed(),
+                    admission_budget,
+                    response.is_closed(),
+                ) {
+                    Admission::Abandoned => drop_abandoned(thread_id, &app_id, "service call"),
+                    Admission::Expired => reply_overloaded(response, retry_after),
+                    Admission::Run => {
+                        tracing::debug!(
+                            thread_id,
+                            app_id = %app_id,
+                            binding = %call.binding,
+                            caller = %call.caller_tenant(),
+                            "Thread {}: {} is calling {} through binding {}",
+                            thread_id,
+                            call.caller_tenant(),
+                            app_id,
+                            call.binding
+                        );
+                        match hosted_mut(hosted, &app_id) {
+                            Some(runtime) => {
+                                if let Err(e) = runtime.execute_service_call(*call, response).await
+                                {
+                                    tracing::error!(
+                                        app_id = %app_id,
+                                        error = %e,
+                                        "A service call into {} could not be run",
+                                        app_id
+                                    );
+                                }
+                            }
+                            None => {
+                                // The thread was reassigned between the placement
+                                // read and this message being taken. The caller
+                                // gets the same answer as if the callee had never
+                                // been here, which is what it now is.
+                                let _ = response.send(Err(anyhow::anyhow!(
+                                    "{app_id} is no longer loaded on this node"
+                                )));
+                            }
                         }
-                    }
-                    None => {
-                        // The thread was reassigned between the placement
-                        // read and this message being taken. The caller
-                        // gets the same answer as if the callee had never
-                        // been here, which is what it now is.
-                        let _ = response.send(Err(anyhow::anyhow!(
-                            "{app_id} is no longer loaded on this node"
-                        )));
                     }
                 }
             }
@@ -641,22 +886,33 @@ impl RuntimeThread {
                 queue,
                 messages,
                 response,
+                enqueued_at,
             } => {
-                tracing::debug!(
-                    "Thread {}: Handling {} queue message(s) for app {} from queue {}",
-                    thread_id,
-                    messages.len(),
-                    app_id,
-                    queue
-                );
-                let result = match hosted_mut(hosted, &app_id) {
-                    Some(runtime) => runtime.execute_queue_batch(queue, messages).await,
-                    None => Err(anyhow::anyhow!(
-                        "App {app_id} is not loaded on this node; its queue batch was not \
-                         handled and goes back to deis-queue"
-                    )),
-                };
-                let _ = response.send(result);
+                // A batch is held to the shorter of the node's admission budget
+                // and what is left of its lease; past the lease the messages
+                // already belong to another consumer.
+                let budget = batch_admission_budget(admission_budget, &messages, now_unix_secs());
+                match admission(enqueued_at.elapsed(), budget, response.is_closed()) {
+                    Admission::Abandoned => drop_abandoned(thread_id, &app_id, "queue batch"),
+                    Admission::Expired => reply_overloaded(response, retry_after),
+                    Admission::Run => {
+                        tracing::debug!(
+                            "Thread {}: Handling {} queue message(s) for app {} from queue {}",
+                            thread_id,
+                            messages.len(),
+                            app_id,
+                            queue
+                        );
+                        let result = match hosted_mut(hosted, &app_id) {
+                            Some(runtime) => runtime.execute_queue_batch(queue, messages).await,
+                            None => Err(anyhow::anyhow!(
+                                "App {app_id} is not loaded on this node; its queue batch was not \
+                                 handled and goes back to deis-queue"
+                            )),
+                        };
+                        let _ = response.send(result);
+                    }
+                }
             }
 
             RuntimeMessage::ExecuteScheduled {
@@ -664,20 +920,34 @@ impl RuntimeThread {
                 cron,
                 scheduled_time_ms,
                 response,
+                enqueued_at,
             } => {
-                tracing::debug!(
-                    "Thread {}: Running the scheduled handler of app {} for {}",
-                    thread_id,
-                    app_id,
-                    cron
-                );
-                let result = match hosted_mut(hosted, &app_id) {
-                    Some(runtime) => runtime.execute_scheduled(cron, scheduled_time_ms).await,
-                    None => Err(anyhow::anyhow!(
-                        "App {app_id} is not loaded on this node, so its scheduled run did                              not happen here; the control plane should try another node"
-                    )),
-                };
-                let _ = response.send(result);
+                match admission(
+                    enqueued_at.elapsed(),
+                    admission_budget,
+                    response.is_closed(),
+                ) {
+                    Admission::Abandoned => drop_abandoned(thread_id, &app_id, "scheduled run"),
+                    Admission::Expired => reply_overloaded(response, retry_after),
+                    Admission::Run => {
+                        tracing::debug!(
+                            "Thread {}: Running the scheduled handler of app {} for {}",
+                            thread_id,
+                            app_id,
+                            cron
+                        );
+                        let result = match hosted_mut(hosted, &app_id) {
+                            Some(runtime) => {
+                                runtime.execute_scheduled(cron, scheduled_time_ms).await
+                            }
+                            None => Err(anyhow::anyhow!(
+                                "App {app_id} is not loaded on this node, so its scheduled run did \
+                                 not happen here; the control plane should try another node"
+                            )),
+                        };
+                        let _ = response.send(result);
+                    }
+                }
             }
 
             RuntimeMessage::ListApps { response } => {
@@ -820,12 +1090,18 @@ impl RuntimeThread {
 
     /// Send message
     fn send(&self, msg: RuntimeMessage) -> Result<()> {
-        self.sender.try_send(msg).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => {
-                anyhow::anyhow!("Runtime thread overloaded (queue full)")
+        match self.sender.try_send(msg) {
+            Ok(()) => Ok(()),
+            // The same two refusals the admission check makes, from the other
+            // side of the queue: a full queue is a thread at capacity and a
+            // closed one is a thread that is gone. A caller reads both back
+            // as a [`DispatchError`], not as a sentence it has to parse.
+            Err(mpsc::error::TrySendError::Full(_)) => Err(DispatchError::Overloaded {
+                retry_after: overload_retry_after(&self.overload_retry_after_secs),
             }
-            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("Runtime thread has stopped"),
-        })
+            .into()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(DispatchError::Stopped.into()),
+        }
     }
 }
 
@@ -900,6 +1176,25 @@ pub struct RuntimePool {
     /// and not `Arc`: the isolates are owned by the threads the pool owns, so
     /// an `Arc` here would be a cycle that never drops and would keep every
     /// runtime thread alive after the node had finished with them.
+    /// How long work may wait in a runtime thread's queue before that thread
+    /// refuses it, in milliseconds.
+    ///
+    /// Shared with every thread rather than copied into each as it starts: the
+    /// value is applied once at startup, and a thread started before that (or
+    /// after it, for a newly loaded application) has to read the one in force.
+    /// Read on the runtime thread every time it takes a message off its queue.
+    admission_wait_ms: Arc<AtomicU64>,
+    /// What an overloaded refusal tells its caller to wait before retrying,
+    /// in whole seconds.
+    ///
+    /// Shared with every thread the way the admission budget is, for the
+    /// same reason: the value is applied once at startup from
+    /// `RuntimeConfig::overload_retry_after_seconds`, and a thread started
+    /// before that has to give the caller the hint in force, not the default
+    /// it was born with. This is the single source of the `Retry-After` a
+    /// client sees on an overloaded refusal, and of the number the node logs
+    /// beside it -- nothing else may invent one.
+    overload_retry_after_secs: Arc<AtomicU64>,
     self_ref: std::sync::Weak<RuntimePool>,
 }
 
@@ -1042,9 +1337,23 @@ impl RuntimePool {
         // many unread faults as there are threads.
         let (faults_tx, faults_rx) = mpsc::unbounded_channel();
 
+        // Built before the threads, so each one shares it, and replaced once at
+        // startup with the configured value.
+        let admission_wait_ms =
+            Arc::new(AtomicU64::new(crate::config::default_admission_wait_ms()));
+        let overload_retry_after_secs =
+            Arc::new(AtomicU64::new(crate::config::default_overload_retry_after_seconds()));
+
         Arc::new_cyclic(|self_ref| {
             let threads = (0..num_threads)
-                .map(|id| RuntimeThread::new(id, faults_tx.clone()))
+                .map(|id| {
+                    RuntimeThread::new(
+                        id,
+                        faults_tx.clone(),
+                        admission_wait_ms.clone(),
+                        overload_retry_after_secs.clone(),
+                    )
+                })
                 .collect();
             Self {
                 placement: RwLock::new(Placement {
@@ -1060,6 +1369,8 @@ impl RuntimePool {
                 serving: RwLock::new(HashMap::new()),
                 faults_tx,
                 faults: std::sync::Mutex::new(faults_rx),
+                admission_wait_ms,
+                overload_retry_after_secs,
                 self_ref: self_ref.clone(),
             }
         })
@@ -1068,6 +1379,30 @@ impl RuntimePool {
     /// A handle an isolate can use to reach this pool, for service calls.
     pub fn router(&self) -> super::service_ops::ServiceRouter {
         super::service_ops::ServiceRouter::new(self.self_ref.clone())
+    }
+
+    /// Hold queued work to this admission budget before a runtime thread
+    /// refuses it.
+    ///
+    /// Called once at startup with the configured `admission_wait_ms`. The
+    /// threads read it live, so a value applied after they started is the one
+    /// they use; nothing else about a running pool changes.
+    pub fn set_admission_wait_ms(&self, admission_wait_ms: u64) {
+        self.admission_wait_ms
+            .store(admission_wait_ms, Ordering::Relaxed);
+    }
+
+    /// What an overloaded refusal tells its caller to retry in, in whole
+    /// seconds.
+    ///
+    /// Called once at startup with the configured
+    /// `overload_retry_after_seconds`, which validation has already held
+    /// above zero. The threads read it live, so a value applied after they
+    /// started is the one their next refusal carries; nothing else about a
+    /// running pool changes.
+    pub fn set_overload_retry_after_secs(&self, overload_retry_after_secs: u64) {
+        self.overload_retry_after_secs
+            .store(overload_retry_after_secs, Ordering::Relaxed);
     }
 
     /// Record what the version now serving one tenant declared, and say out
@@ -1169,9 +1504,12 @@ impl RuntimePool {
                 // a thread outside the lock - is what lets two loads pick the
                 // same one.
                 let id = placement.threads.len();
-                placement
-                    .threads
-                    .push(RuntimeThread::new(id, self.faults_tx.clone()));
+                placement.threads.push(RuntimeThread::new(
+                    id,
+                    self.faults_tx.clone(),
+                    self.admission_wait_ms.clone(),
+                    self.overload_retry_after_secs.clone(),
+                ));
                 tracing::info!(
                     thread_id = id,
                     app_id = tenant,
@@ -1314,6 +1652,7 @@ impl RuntimePool {
                 Some(id) => placement.threads[*id].send(RuntimeMessage::ExecuteServiceCall {
                     app_id: callee_tenant.to_string(),
                     call: Box::new(call),
+                    enqueued_at: Instant::now(),
                     response: tx,
                 }),
             }
@@ -1498,7 +1837,7 @@ impl RuntimePool {
         let id = *placement
             .of_app
             .get(app_id)
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+            .ok_or(DispatchError::NotFound)?;
         placement.threads[id].send(message)
     }
 
@@ -1513,14 +1852,18 @@ impl RuntimePool {
         let slot = placement
             .generations
             .get(&(app_id.to_string(), generation.to_string()))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "deployment generation {generation} of {app_id} is not prepared on this node"
-                )
-            })?;
-        slot.sender
-            .try_send(message)
-            .map_err(|error| anyhow::anyhow!("runtime thread could not take request: {error}"))
+            .ok_or(DispatchError::GenerationNotPrepared)?;
+        // The generation's thread is a raw sender rather than a
+        // [`RuntimeThread`], so the two refusals get the same answers here
+        // that [`RuntimeThread::send`] gives them on the current path.
+        match slot.sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(DispatchError::Overloaded {
+                retry_after: overload_retry_after(&self.overload_retry_after_secs),
+            }
+            .into()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(DispatchError::Stopped.into()),
+        }
     }
 
     /// Load one environment of one application.
@@ -1615,13 +1958,15 @@ impl RuntimePool {
                 .await
                 .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))
                 .and_then(|inner| inner),
+            // The same mapping `RuntimeThread::send` applies: the claim on
+            // the thread is released below when this returns an error, so a
+            // caller retrying the stage finds it free again.
             Err(e) => Err(match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    anyhow::anyhow!("Runtime thread overloaded (queue full)")
+                mpsc::error::TrySendError::Full(_) => DispatchError::Overloaded {
+                    retry_after: overload_retry_after(&self.overload_retry_after_secs),
                 }
-                mpsc::error::TrySendError::Closed(_) => {
-                    anyhow::anyhow!("Runtime thread has stopped")
-                }
+                .into(),
+                mpsc::error::TrySendError::Closed(_) => DispatchError::Stopped.into(),
             }),
         };
 
@@ -2018,7 +2363,11 @@ impl RuntimePool {
 
         let mut handles = Vec::with_capacity(specs.len());
         for spec in specs {
-            let invoker = Self::batch_invoker(tenant, sender.clone());
+            let invoker = Self::batch_invoker(
+                tenant,
+                sender.clone(),
+                self.overload_retry_after_secs.clone(),
+            );
             handles.push(queue_consumer::spawn(
                 tenant.to_string(),
                 spec.name,
@@ -2036,27 +2385,42 @@ impl RuntimePool {
 
     /// How a poller reaches the isolate: by posting the batch to the runtime
     /// thread the app lives on, exactly like a request.
-    fn batch_invoker(app_id: &str, sender: mpsc::Sender<RuntimeMessage>) -> BatchInvoker {
+    ///
+    /// The post is a `try_send` and not the blocking `send`: the batch is
+    /// already out on its lease from the moment it was pulled, and a post
+    /// that waits on a busy thread holds that lease while it waits -- past
+    /// the lease the same messages go to another node and the work runs
+    /// twice. A full queue is answered as overloaded instead, and the
+    /// consumer refunds the attempt the refusal burned; a closed one is a
+    /// thread that is gone, and the batch goes back without a refund.
+    fn batch_invoker(
+        app_id: &str,
+        sender: mpsc::Sender<RuntimeMessage>,
+        overload_retry_after_secs: Arc<AtomicU64>,
+    ) -> BatchInvoker {
         let app_id = app_id.to_string();
         Arc::new(move |queue: String, messages: Vec<LeasedMessage>| {
             let sender = sender.clone();
             let app_id = app_id.clone();
+            let overload_retry_after_secs = overload_retry_after_secs.clone();
             Box::pin(async move {
                 let (tx, rx) = oneshot::channel();
-                sender
-                    .send(RuntimeMessage::ExecuteQueueBatch {
-                        app_id: app_id.clone(),
-                        queue,
-                        messages,
-                        response: tx,
-                    })
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "the runtime thread running app {app_id} has stopped; the batch was \
-                             not handled"
-                        )
-                    })?;
+                let posted = sender.try_send(RuntimeMessage::ExecuteQueueBatch {
+                    app_id: app_id.clone(),
+                    queue,
+                    messages,
+                    enqueued_at: Instant::now(),
+                    response: tx,
+                });
+                if let Err(error) = posted {
+                    return Err(match error {
+                        mpsc::error::TrySendError::Full(_) => DispatchError::Overloaded {
+                            retry_after: overload_retry_after(&overload_retry_after_secs),
+                        }
+                        .into(),
+                        mpsc::error::TrySendError::Closed(_) => DispatchError::Stopped.into(),
+                    });
+                }
                 rx.await.map_err(|_| {
                     anyhow::anyhow!(
                         "the runtime thread running app {app_id} dropped the batch without \
@@ -2160,6 +2524,7 @@ impl RuntimePool {
                 method,
                 headers,
                 body,
+                enqueued_at: Instant::now(),
                 response: tx,
             },
         )
@@ -2174,7 +2539,8 @@ impl RuntimePool {
             // so a handler that threw was reported to the client as this
             // sentence rather than as its own error.
             anyhow::anyhow!(
-                "the runtime thread serving app {app_id} ended this request without answering it;                  the node's log has what happened to it"
+                "the runtime thread serving app {app_id} ended this request without answering it; \
+                 the node's log has what happened to it"
             )
         })?
     }
@@ -2200,6 +2566,7 @@ impl RuntimePool {
                 method,
                 headers,
                 body,
+                enqueued_at: Instant::now(),
                 response: tx,
             },
         )
@@ -2419,6 +2786,7 @@ impl RuntimePool {
                 app_id: app_id.to_string(),
                 queue,
                 messages,
+                enqueued_at: Instant::now(),
                 response: tx,
             },
         )
@@ -2446,6 +2814,7 @@ impl RuntimePool {
                 app_id: app_id.to_string(),
                 cron,
                 scheduled_time_ms,
+                enqueued_at: Instant::now(),
                 response: tx,
             },
         )
@@ -2555,6 +2924,68 @@ impl RuntimePool {
 }
 
 #[cfg(test)]
+impl RuntimePool {
+    /// Test hook: post requests at the thread that serves `tenant` -- or, when
+    /// `generation` is given, at that generation's slot -- until one is
+    /// refused, which is the moment the queue is full.
+    ///
+    /// The caller is left to hold the thread on something else first: an idle
+    /// thread drains a queue of 100 faster than a test can fill it, and what
+    /// a test after this one wants is the refusal that only a full queue
+    /// gives. The posts carry reply channels nobody holds, so whatever the
+    /// thread takes off the queue afterwards it finds its caller gone and
+    /// throws away rather than runs: this fills the queue, not the
+    /// application.
+    pub async fn post_requests_until_refused(
+        &self,
+        tenant: &str,
+        generation: Option<&str>,
+    ) -> Result<()> {
+        self.apply_thread_faults().await;
+        let placement = self.placement.read().await;
+        let sender = match generation {
+            Some(generation) => placement
+                .generations
+                .get(&(tenant.to_string(), generation.to_string()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("generation {generation} of {tenant} is not prepared")
+                })?
+                .sender
+                .clone(),
+            None => placement
+                .threads
+                [*placement
+                    .of_app
+                    .get(tenant)
+                    .ok_or_else(|| anyhow::anyhow!("tenant {tenant} is not placed"))?]
+                .sender
+                .clone(),
+        };
+        for _ in 0..1000 {
+            let (tx, _rx) = oneshot::channel();
+            if sender
+                .try_send(RuntimeMessage::ExecuteRequest {
+                    app_id: tenant.to_string(),
+                    url: "http://localhost/".to_string(),
+                    method: "GET".to_string(),
+                    headers: Vec::new(),
+                    body: None,
+                    enqueued_at: Instant::now(),
+                    response: tx,
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "a queue of 100 never filled with 1000 posts: the thread is draining it \
+             faster than the test can fill it"
+        )
+    }
+}
+
+#[cfg(test)]
 // Holding the std MutexGuard across await points is intentional here: the global
 // TEST_POOL mutex exists precisely to serialize these tests against a shared
 // singleton RuntimePool (V8 cannot be created/destroyed repeatedly). Each test is
@@ -2563,8 +2994,10 @@ impl RuntimePool {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
+    use crate::runtime::metrics::{recorder, ABANDONED_BEFORE_START_TOTAL, REQUESTS_TOTAL};
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     // Use global RuntimePool to avoid V8 issues from multiple creation/destruction
     static TEST_POOL: Lazy<Mutex<Arc<RuntimePool>>> =
@@ -2896,7 +3329,8 @@ mod tests {
         assert!(body.contains("cy-a.production"), "{body}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
-            "a cycle must be refused structurally, not by waiting for a budget to run out;              this one took {:?}",
+            "a cycle must be refused structurally, not by waiting for a budget to run out; \
+             this one took {:?}",
             started.elapsed()
         );
 
@@ -3721,7 +4155,10 @@ mod tests {
             .await
             .expect_err("the isolate that panicked is gone");
         assert!(
-            error.to_string().contains("App not found"),
+            matches!(
+                error.downcast_ref::<DispatchError>(),
+                Some(DispatchError::NotFound)
+            ),
             "a lost isolate must read as an application that is not here, not as a stopped \
              thread: {error}"
         );
@@ -3909,7 +4346,10 @@ mod tests {
             .await
             .expect_err("the isolate that panicked is gone");
         assert!(
-            error.to_string().contains("App not found"),
+            matches!(
+                error.downcast_ref::<DispatchError>(),
+                Some(DispatchError::NotFound)
+            ),
             "a lost isolate must read as an application that is not here, not as a stopped \
              thread: {error}"
         );
@@ -4080,5 +4520,493 @@ mod tests {
 
         let _ = pool.unload_app("repeat-caller.production").await;
         let _ = pool.unload_app("repeat-callee.production").await;
+    }
+
+    /// Post a request straight to the thread hosting `app`, the way
+    /// [`RuntimePool::execute_request`] does, and answer the caller's half of
+    /// the reply channel.
+    ///
+    /// Going around the public entry point is what lets a test say when the
+    /// message was posted: [`RuntimeMessage::ExecuteRequest`] carries that
+    /// instant, and a test that needs a message to have waited a long time
+    /// cannot spend it.
+    async fn post_request(
+        pool: &RuntimePool,
+        app: &str,
+        enqueued_at: Instant,
+    ) -> oneshot::Receiver<Result<FetchResult>> {
+        let (tx, rx) = oneshot::channel();
+        let placement = pool.placement.read().await;
+        let id = *placement
+            .of_app
+            .get(app)
+            .expect("the application is loaded on some thread");
+        placement.threads[id]
+            .send(RuntimeMessage::ExecuteRequest {
+                app_id: app.to_string(),
+                url: "http://localhost/".to_string(),
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                body: None,
+                enqueued_at,
+                response: tx,
+            })
+            .expect("the thread takes the message");
+        rx
+    }
+
+    /// A request whose caller has gone must not be run.
+    ///
+    /// This is what a client hanging up, or the edge's own read timeout
+    /// firing, leaves behind: the reply channel is dropped while the request
+    /// waits behind whatever the application's runtime thread is already
+    /// running, and the thread has to find that out before it enters the
+    /// isolate.
+    #[tokio::test]
+    async fn a_request_whose_caller_has_gone_is_not_run() {
+        let pool = pool();
+        let app = "r4-abandoned.production";
+        let code = r#"
+            export default function handler() {
+                return new Response("ran");
+            }
+        "#;
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("the application loads");
+
+        let requests_before = recorder().value(REQUESTS_TOTAL, app);
+        let abandoned_before = recorder().value(ABANDONED_BEFORE_START_TOTAL, app);
+
+        // Posted, then abandoned before the thread reaches it.
+        drop(post_request(&pool, app, Instant::now()).await);
+
+        // The same thread handles this one after it, so once this answers, the
+        // first has already been decided.
+        let answer = post_request(&pool, app, Instant::now()).await;
+        let (status, _, _) = answer
+            .await
+            .expect("the thread answers the second request")
+            .expect("the second request runs");
+        assert_eq!(status, 200);
+
+        assert_eq!(
+            recorder().value(REQUESTS_TOTAL, app),
+            requests_before + 1.0,
+            "only the second request may have entered the isolate"
+        );
+        assert_eq!(
+            recorder().value(ABANDONED_BEFORE_START_TOTAL, app),
+            abandoned_before + 1.0,
+            "the abandoned request must be counted as dropped before it started"
+        );
+
+        let _ = pool.unload_app(app).await;
+    }
+
+    /// A request that waited past the admission budget is refused as
+    /// overloaded rather than started.
+    #[tokio::test]
+    async fn a_request_that_waited_past_the_admission_budget_is_refused_as_overloaded() {
+        let pool = pool();
+        let app = "r4-expired.production";
+        let code = r#"
+            export default function handler() {
+                return new Response("ran");
+            }
+        "#;
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("the application loads");
+
+        let requests_before = recorder().value(REQUESTS_TOTAL, app);
+
+        pool.set_admission_wait_ms(50);
+        // Posted as though it had been waiting half a second, which is the
+        // whole subject of the check and the one thing a test cannot spend.
+        let answer = post_request(&pool, app, Instant::now() - Duration::from_millis(500)).await;
+        let answered = answer
+            .await
+            .expect("the thread answers rather than dropping the message");
+        // Put the budget back before asserting, so a failure here cannot leak
+        // into the next test of this module.
+        pool.set_admission_wait_ms(crate::config::default_admission_wait_ms());
+
+        let error = answered.expect_err("a request past the budget must be refused");
+        assert!(
+            matches!(
+                error.downcast_ref::<DispatchError>(),
+                Some(DispatchError::Overloaded { .. })
+            ),
+            "expected an overloaded refusal, got: {error}"
+        );
+        assert_eq!(
+            recorder().value(REQUESTS_TOTAL, app),
+            requests_before,
+            "a refused request must not have entered the isolate"
+        );
+
+        let _ = pool.unload_app(app).await;
+    }
+
+    /// A full queue is the same refusal as a spent admission budget, from
+    /// the other side of the queue: the work is turned away at the moment it
+    /// is posted rather than when the thread reaches it, and the caller gets
+    /// the same named answer either way.
+    #[tokio::test]
+    async fn a_request_posted_to_a_full_queue_is_refused_as_overloaded() {
+        let pool = pool();
+        let app = "r4-fullqueue.production";
+        // Holds the thread for as long as the flood below takes, so the
+        // queue it fills cannot drain in the middle of the test.
+        let code = r#"
+            export default function handler() {
+                return new Promise((resolve) =>
+                    setTimeout(() => resolve(new Response("ran")), 200));
+            }
+        "#;
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("the application loads");
+
+        // Put the thread to work; from here on it cannot take another
+        // message off its queue until this request finishes.
+        let first = post_request(&pool, app, Instant::now()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fill the queue. The reply channel of every message posted is
+        // dropped, so what the thread reaches afterwards is work whose
+        // caller has gone and it throws it away rather than running it.
+        let placement = pool.placement.read().await;
+        let id = *placement.of_app.get(app).expect("the application is placed");
+        let mut refused = None;
+        for _ in 0..200 {
+            let (tx, _rx) = oneshot::channel();
+            match placement.threads[id].send(RuntimeMessage::ExecuteRequest {
+                app_id: app.to_string(),
+                url: "http://localhost/".to_string(),
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                body: None,
+                enqueued_at: Instant::now(),
+                response: tx,
+            }) {
+                Ok(()) => {}
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+        drop(placement);
+
+        let error = refused.expect("a queue of 100 cannot hold 200 more requests");
+        assert!(
+            matches!(
+                error.downcast_ref::<DispatchError>(),
+                Some(DispatchError::Overloaded { .. })
+            ),
+            "expected an overloaded refusal, got: {error}"
+        );
+
+        // The work the thread actually took still ran to the end.
+        let (status, _, _) = first
+            .await
+            .expect("the thread answers the request it took")
+            .expect("the first request runs");
+        assert_eq!(status, 200);
+
+        // The queue is still full, so the UnloadApp message cannot get in
+        // yet: in front of it sit the dropped posts. The probe below holds
+        // its reply channel, so it is run rather than dropped, and it is
+        // answered only once everything ahead of it is gone -- after which
+        // the unload message fits.
+        let probe = 'probe: loop {
+            let (tx, rx) = oneshot::channel();
+            let placement = pool.placement.read().await;
+            let id = *placement
+                .of_app
+                .get(app)
+                .expect("the application is still placed");
+            let accepted = placement
+                .threads[id]
+                .send(RuntimeMessage::ExecuteRequest {
+                    app_id: app.to_string(),
+                    url: "http://localhost/".to_string(),
+                    method: "GET".to_string(),
+                    headers: Vec::new(),
+                    body: None,
+                    enqueued_at: Instant::now(),
+                    response: tx,
+                })
+                .is_ok();
+            drop(placement);
+            if accepted {
+                break 'probe rx;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let (status, _, _) = probe
+            .await
+            .expect("the thread answers the probe")
+            .expect("the probe runs");
+        assert_eq!(status, 200);
+
+        pool.unload_app(app).await.expect("the application unloads");
+    }
+
+    /// A generation's slot holds a bare sender rather than a runtime thread,
+    /// so the same full-queue refusal is given by the dispatch rather than by
+    /// the thread, and must give the same answer.
+    #[tokio::test]
+    async fn a_generation_whose_queue_is_full_is_refused_as_overloaded() {
+        let pool = pool();
+        let app = "r4-gen-full.production";
+        let code = r#"
+            export default function handler() {
+                return new Promise((resolve) =>
+                    setTimeout(() => resolve(new Response("ran")), 200));
+            }
+        "#;
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("the application loads");
+        let staged = pool
+            .stage_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("the replacement stages");
+        pool.prepare_generation(staged, "gen-1".to_string())
+            .await
+            .expect("the generation is prepared");
+
+        // Put the generation's thread to work, through the slot's own
+        // sender: that is the channel the dispatch below will fill.
+        let (tx, first) = oneshot::channel();
+        {
+            let placement = pool.placement.read().await;
+            let slot = placement
+                .generations
+                .get(&(app.to_string(), "gen-1".to_string()))
+                .expect("the generation is prepared")
+                .clone();
+            slot.sender
+                .try_send(RuntimeMessage::ExecuteRequest {
+                    app_id: app.to_string(),
+                    url: "http://localhost/".to_string(),
+                    method: "GET".to_string(),
+                    headers: Vec::new(),
+                    body: None,
+                    enqueued_at: Instant::now(),
+                    response: tx,
+                })
+                .expect("the generation's thread takes the request");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut refused = None;
+        for _ in 0..200 {
+            let (tx, _rx) = oneshot::channel();
+            match pool
+                .dispatch_generation(
+                    app,
+                    "gen-1",
+                    RuntimeMessage::ExecuteRequest {
+                        app_id: app.to_string(),
+                        url: "http://localhost/".to_string(),
+                        method: "GET".to_string(),
+                        headers: Vec::new(),
+                        body: None,
+                        enqueued_at: Instant::now(),
+                        response: tx,
+                    },
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+
+        let error = refused.expect("a queue of 100 cannot hold 200 more requests");
+        assert!(
+            matches!(
+                error.downcast_ref::<DispatchError>(),
+                Some(DispatchError::Overloaded { .. })
+            ),
+            "expected an overloaded refusal, got: {error}"
+        );
+
+        let (status, _, _) = first
+            .await
+            .expect("the thread answers the request it took")
+            .expect("the first request runs");
+        assert_eq!(status, 200);
+
+        pool.discard_generation(app, "gen-1")
+            .await
+            .expect("the generation is discarded");
+        let _ = pool.unload_app(app).await;
+    }
+
+    /// The two placement refusals that never reach a queue: the application
+    /// is not on this node, and the generation asked for is not prepared
+    /// here. Each is a named error rather than a sentence to parse, and
+    /// downcasts to it from the `Result` the dispatch hands back.
+    #[tokio::test]
+    async fn placement_refusals_are_named_errors() {
+        let pool = pool();
+
+        let error = pool
+            .execute_request(
+                "r4-ghost.production",
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect_err("the application is not here");
+        assert!(
+            matches!(
+                error.downcast_ref::<DispatchError>(),
+                Some(DispatchError::NotFound)
+            ),
+            "expected an application that is not hosted here, got: {error}"
+        );
+
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+        let app = "r4-gen-missing.production";
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("the application loads");
+        let error = pool
+            .execute_request_generation(
+                app,
+                "a-generation-never-prepared",
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect_err("the generation is not prepared");
+        assert!(
+            matches!(
+                error.downcast_ref::<DispatchError>(),
+                Some(DispatchError::GenerationNotPrepared)
+            ),
+            "expected a generation that is not prepared here, got: {error}"
+        );
+
+        let _ = pool.unload_app(app).await;
+    }
+
+    /// The refusal sentences are read by callers and operators alike, so a
+    /// line wrapped without its continuation once broke one: the error
+    /// carried a run of spaces inside the sentence, and nothing said so. A
+    /// refusal that cannot be quoted verbatim cannot be matched against,
+    /// so the refusal the code produces is checked for it, not the one a
+    /// test happens to type.
+    #[test]
+    fn dispatch_refusal_messages_carry_no_accidental_spaces_in_their_middle() {
+        for message in [
+            DispatchError::Overloaded { retry_after: Duration::from_secs(1) }.to_string(),
+            DispatchError::Stopped.to_string(),
+            DispatchError::NotFound.to_string(),
+            DispatchError::GenerationNotPrepared.to_string(),
+        ] {
+            assert!(
+                !message.contains("  "),
+                "a refusal message carries a run of spaces in its middle: {message:?}"
+            );
+        }
+    }
+
+    /// Where the admission boundary is, and which question is asked first.
+    #[test]
+    fn the_admission_budget_refuses_only_what_waited_longer_than_it() {
+        let budget = Duration::from_millis(100);
+        assert_eq!(
+            admission(Duration::from_millis(99), budget, false),
+            Admission::Run
+        );
+        assert_eq!(
+            admission(budget, budget, false),
+            Admission::Run,
+            "exactly the budget is still inside it"
+        );
+        assert_eq!(
+            admission(Duration::from_millis(101), budget, false),
+            Admission::Expired
+        );
+        // A caller that has gone is owed no answer, however long it waited:
+        // asking the budget question first would write a reply onto a channel
+        // nobody is holding.
+        assert_eq!(
+            admission(Duration::from_secs(60), Duration::from_millis(1), true),
+            Admission::Abandoned
+        );
+    }
+
+    /// One message leased until `lease_expires_at`.
+    fn message_leased_until(id: &str, lease_expires_at: i64) -> LeasedMessage {
+        LeasedMessage {
+            id: id.to_string(),
+            body: Vec::new(),
+            attempts: 1,
+            lease_expires_at,
+            created_at: 0,
+            lease_token: format!("lease-of-{id}"),
+        }
+    }
+
+    /// A queue batch is held to the shorter of the admission budget and what
+    /// is left of its lease.
+    #[test]
+    fn a_queue_batch_waits_no_longer_than_its_lease_or_the_admission_budget() {
+        let now = 1_000;
+        let admission_budget = Duration::from_secs(10);
+
+        // Plenty of lease left: the admission budget is the binding one.
+        let long_lease = [message_leased_until("m1", now + 60)];
+        assert_eq!(
+            batch_admission_budget(admission_budget, &long_lease, now),
+            admission_budget
+        );
+
+        // The lease now runs out sooner than the admission budget would allow.
+        let short_lease = [message_leased_until("m2", now + 3)];
+        assert_eq!(
+            batch_admission_budget(admission_budget, &short_lease, now),
+            Duration::from_secs(3)
+        );
+
+        // The earliest expiry in the batch is the one that counts.
+        let mixed = [
+            message_leased_until("m3", now + 60),
+            message_leased_until("m4", now + 2),
+        ];
+        assert_eq!(
+            batch_admission_budget(admission_budget, &mixed, now),
+            Duration::from_secs(2)
+        );
+
+        // Already lapsed: no budget of its own, so nothing may start.
+        let lapsed = [message_leased_until("m5", now - 5)];
+        assert_eq!(
+            batch_admission_budget(admission_budget, &lapsed, now),
+            Duration::ZERO
+        );
+
+        // No expiry at all is a test double's shape, not a server's; the
+        // admission budget is then all there is to go on.
+        let no_expiry = [message_leased_until("m6", 0)];
+        assert_eq!(
+            batch_admission_budget(admission_budget, &no_expiry, now),
+            admission_budget
+        );
     }
 }

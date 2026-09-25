@@ -214,7 +214,7 @@ Invocation-local 值不得放在可被另一 invocation 覆写的 runtime single
 
 截至 2026-09-24 修订时：
 
-- Admission 过载的 `overloaded` outcome 与排队超时的最小形态（R3/R4）已排期（批次 2）：`DispatchError::Overloaded`、HTTP `503` + `Retry-After` + `x-deis-outcome-detail: admission`、queue 过载 `refund_attempt` 不计次。
+- Admission 过载的 `overloaded` outcome 与排队超时的最小形态（R3/R4）已实现：`DispatchError`（`Overloaded`/`Stopped`/`NotFound`/`GenerationNotPrepared`）、HTTP `503` + `Retry-After`（`runtime.overload_retry_after_seconds`，默认 1）+ `x-deis-outcome: overloaded` + `x-deis-outcome-detail: admission`、独立指标 `deis_runtime_overloaded_total` 与 `deis_runtime_abandoned_before_start_total`、queue 过载 nack 带 `refund_attempt` 不计投递尝试次数。
 - 超限即回收 isolate 的 poisoned 语义随 RA-1 落地（批次 3），按本文修订后的取消语义实现。
 - 本文描述的弹性 isolate pool 尚未实现，按 RD 的分阶段计划落地（批次 4）：
   - D1 有界线程 + 空闲驱逐 + 按 app 的 admission（含 `WorkerHost` 抽象）：待实施。

@@ -58,6 +58,30 @@ max_request_body_bytes = 33554432
 # and no application would ever run.
 default_memory_limit_mb = 256
 
+# How long work posted to an application's runtime thread may wait for it
+# before the node refuses that work, in milliseconds. One application runs on
+# one runtime thread, and a thread runs what it has been given one piece at a
+# time, so a slow invocation makes everything behind it wait. Work still queued
+# when this runs out is answered 503 with a Retry-After header instead of being
+# started: by then the caller has probably gone, and starting it would take the
+# thread away from the next request that is still waiting.
+#
+# It must be below deis-proxy's upstream_read_timeout, or the answer may be
+# written to a connection the edge has already abandoned. The edge's default is
+# 30 seconds; this node warns at startup when the budget is not below that
+# default, since it cannot read what the edge was configured with.
+#
+# Must be greater than 0; 0 refuses every request that had to wait at all,
+# which is every request that finds the thread busy.
+admission_wait_ms = 10000
+
+# How long, in whole seconds, a caller refused as overloaded is told to wait
+# before retrying: the value of the Retry-After header the node sends with
+# the refusal. A busy thread is usually free again within one invocation, so
+# the hint stays short; a longer value only makes a caller that honours it
+# come back later. Must be greater than 0.
+overload_retry_after_seconds = 1
+
 # Default execution limits applied to each app's isolate. An individual app may
 # override timeout_ms, rate_limit_ops_per_sec and cpu_time_limit_ms through its
 # own ResourceLimits; these are the fallback used when it does not. The CPU

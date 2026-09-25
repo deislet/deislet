@@ -325,6 +325,7 @@ mod tests {
                     lease_token: leased.lease_token,
                 }],
                 None,
+                false,
             )
             .await
             .unwrap();

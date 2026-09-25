@@ -416,6 +416,7 @@ async fn nack(
                 queue_name: queue.to_string(),
                 messages,
                 delay_seconds,
+                refund_attempt: false,
             },
         ))
         .await

@@ -63,6 +63,7 @@ use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinSet;
 
 use super::metrics::{recorder, MetricsRegistry};
+use super::pool::DispatchError;
 use super::queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};
 
 /// What the app's queue handler did with a batch.
@@ -116,11 +117,15 @@ pub trait QueuePort: Send + Sync + 'static {
         handles: Vec<MessageHandle>,
     ) -> BoxFuture<'a, anyhow::Result<AckOutcome>>;
 
+    /// `refund_attempt` gives the delivery attempts the server counted at the
+    /// pull back again; see [`QueueClient::nack`] for why only a refusal that
+    /// never reached the application may do that.
     fn nack_messages<'a>(
         &'a self,
         queue: &'a str,
         handles: Vec<MessageHandle>,
         delay_seconds: u32,
+        refund_attempt: bool,
     ) -> BoxFuture<'a, anyhow::Result<NackOutcome>>;
 }
 
@@ -147,8 +152,14 @@ impl QueuePort for QueueClient {
         queue: &'a str,
         handles: Vec<MessageHandle>,
         delay_seconds: u32,
+        refund_attempt: bool,
     ) -> BoxFuture<'a, anyhow::Result<NackOutcome>> {
-        Box::pin(self.nack(queue, handles, delay_seconds))
+        Box::pin(self.nack(
+            queue,
+            handles,
+            delay_seconds,
+            refund_attempt,
+        ))
     }
 }
 
@@ -570,18 +581,44 @@ async fn handle_batch(
     let delivered = messages.len();
     let budget = handling_budget(&messages, settings, now_unix());
 
-    let outcome = match tokio::time::timeout(budget, invoke(queue.to_string(), messages.clone()))
-        .await
-        .unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "the batch was not finished within the {} second(s) its lease still had to run; \
-                 it is handed back now rather than acknowledged after deis-queue has already \
-                 given it to somebody else. The handler may still be running, so these messages \
-                 can be processed twice -- queue handlers must be idempotent",
-                budget.as_secs()
-            ))
-        }) {
-        Ok(outcome) => outcome,
+    // Whether the attempts the queue counted for these deliveries may be
+    // given back when they are handed back below. Attempts are charged at
+    // the pull, so a batch the runtime refused at capacity -- the thread's
+    // queue full, or the admission budget spent before the thread reached it
+    // -- burned one attempt per message without the application ever seeing
+    // the work. Refunding it is what keeps an overloaded node from dead
+    // lettering messages nothing ever ran. Every other failure -- the
+    // handler threw, the lease ran out -- is an attempt spent, and a refund
+    // there would let a poison message outlive the ceiling that exists to
+    // retire it.
+    let (outcome, refund_attempt) =
+        match tokio::time::timeout(budget, invoke(queue.to_string(), messages.clone())).await
+        {
+            Err(_) => (
+                Err(anyhow::anyhow!(
+                    "the batch was not finished within the {} second(s) its lease still had to \
+                     run; it is handed back now rather than acknowledged after deis-queue has \
+                     already given it to somebody else. The handler may still be running, so \
+                     these messages can be processed twice -- queue handlers must be idempotent",
+                    budget.as_secs()
+                )),
+                false,
+            ),
+            Ok(Err(e)) => {
+                // Asked before the error is handed back into the tuple: the
+                // downcast borrows it, and the tuple needs to own it.
+                let refund_attempt = e
+                    .downcast_ref::<DispatchError>()
+                    .is_some_and(|error| matches!(error, DispatchError::Overloaded { .. }));
+                (Err(e), refund_attempt)
+            }
+            Ok(Ok(completed)) => (Ok(completed), false),
+        };
+
+    // Settled by handle, not by id: the lease token in each handle is what
+    // proves this consumer still holds the delivery it is answering for.
+    let outcome = match outcome {
+        Ok(completed) => completed,
         Err(e) => {
             // The handler never ran, threw, or is still running with the
             // lease about to lapse. Every message in the batch is unfinished;
@@ -590,6 +627,7 @@ async fn handle_batch(
                 app_id,
                 queue,
                 messages = delivered,
+                refund_attempt,
                 error = %e,
                 "App {} failed to handle a batch of {} message(s) from queue {}; they are \
                  returned to deis-queue and will be delivered again, or dead lettered once \
@@ -602,8 +640,6 @@ async fn handle_batch(
         }
     };
 
-    // Settled by handle, not by id: the lease token in each handle is what
-    // proves this consumer still holds the delivery it is answering for.
     let failed: Vec<MessageHandle> = messages
         .iter()
         .filter(|message| outcome.failed.contains(&message.id))
@@ -638,7 +674,7 @@ async fn handle_batch(
     if !failed.is_empty() {
         let count = failed.len();
         match client
-            .nack_messages(queue, failed, settings.retry_delay_seconds)
+            .nack_messages(queue, failed, settings.retry_delay_seconds, refund_attempt)
             .await
         {
             Ok(outcome) => {

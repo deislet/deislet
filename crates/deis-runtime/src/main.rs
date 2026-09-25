@@ -431,6 +431,8 @@ async fn run(
         ApplicationManager::new_with_repo(app_repo.clone())
             .with_limits(config.default_execution_limits.clone())
             .with_memory_limit_mb(config.default_memory_limit_mb)
+            .with_admission_wait_ms(config.admission_wait_ms)
+            .with_overload_retry_after_secs(config.overload_retry_after_seconds)
             .with_fetch_policy(fetch_policy.clone()),
     );
     info!(

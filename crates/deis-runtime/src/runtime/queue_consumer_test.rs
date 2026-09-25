@@ -2,6 +2,7 @@
 mod tests {
     use super::super::*;
     use crate::runtime::metrics::{MetricsRegistry, QUEUE_MESSAGES_TOTAL, QUEUE_POLL_ERRORS_TOTAL};
+    use crate::runtime::pool::DispatchError;
     use crate::runtime::queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome};
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
@@ -42,6 +43,9 @@ mod tests {
         ack_tokens: Vec<String>,
         nack_tokens: Vec<String>,
         nack_delay: u32,
+        /// Whether each recorded nack asked deis-queue to give the delivery
+        /// attempts back, in the order the messages were nacked.
+        nack_refunds: Vec<bool>,
     }
 
     /// A queue that hands out one scripted batch per pull and records how the
@@ -131,6 +135,7 @@ mod tests {
             _queue: &'a str,
             handles: Vec<MessageHandle>,
             delay_seconds: u32,
+            refund_attempt: bool,
         ) -> futures_util::future::BoxFuture<'a, anyhow::Result<NackOutcome>> {
             let count = handles.len() as i32;
             {
@@ -142,6 +147,7 @@ mod tests {
                     .nacked
                     .extend(handles.into_iter().map(|handle| handle.id));
                 journal.nack_delay = delay_seconds;
+                journal.nack_refunds.push(refund_attempt);
             }
             Box::pin(async move {
                 Ok(NackOutcome {
@@ -257,6 +263,87 @@ mod tests {
         let journal = journal.lock().unwrap();
         assert!(journal.acked.is_empty(), "nothing was handled");
         assert_eq!(journal.nacked, vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(
+            journal.nack_refunds, vec![false],
+            "a handler that threw did spend its attempts: refunding would let a poison \
+             message outlive the ceiling that exists to retire it"
+        );
+    }
+
+    /// The runtime refused the batch at capacity, before the application saw
+    /// it. The delivery still had an attempt counted at the pull, so the
+    /// nack must give it back -- or an overloaded node would dead letter
+    /// messages nothing ever ran.
+    #[tokio::test]
+    async fn a_batch_refused_as_overloaded_is_nacked_with_a_refunded_attempt() {
+        let (queue, journal) = FakeQueue::with_batches(vec![vec![message("m1"), message("m2")]]);
+        let mut pulls = queue.watch_pulls();
+        let invoke: BatchInvoker = Arc::new(|_queue, _messages| {
+            Box::pin(async move {
+                Err(anyhow::Error::new(DispatchError::Overloaded {
+                    retry_after: std::time::Duration::from_secs(1),
+                }))
+            })
+        });
+
+        let handle = spawn_with_registry(
+            "demo".to_string(),
+            "jobs".to_string(),
+            queue.clone(),
+            settings(),
+            invoke,
+            Arc::new(MetricsRegistry::new()),
+        );
+        wait_for_pulls(&mut pulls, 2).await;
+        handle.stop().await;
+
+        let journal = journal.lock().unwrap();
+        assert!(journal.acked.is_empty(), "the application never saw the work");
+        assert_eq!(
+            journal.nacked,
+            vec!["m1".to_string(), "m2".to_string()],
+            "the refused batch still has to be handed back, not dropped"
+        );
+        assert_eq!(
+            journal.nack_refunds, vec![true],
+            "the attempt an overload refusal burned must be given back"
+        );
+    }
+
+    /// The same refusal shape, but any *other* error the invoker reports --
+    /// the thread stopped, the reply lost -- did not burn a delivery in the
+    /// same way, and a refund for it would teach the queue to trust errors
+    /// it was never told about.
+    #[tokio::test]
+    async fn a_batch_that_fails_for_another_reason_is_nacked_without_a_refund() {
+        let (queue, journal) =
+            FakeQueue::with_batches(vec![vec![message("m1")]]);
+        let mut pulls = queue.watch_pulls();
+        let invoke: BatchInvoker = Arc::new(|_queue, _messages| {
+            Box::pin(async move {
+                Err(anyhow::anyhow!(
+                    "the runtime thread running app demo dropped the batch without answering"
+                ))
+            })
+        });
+
+        let handle = spawn_with_registry(
+            "demo".to_string(),
+            "jobs".to_string(),
+            queue.clone(),
+            settings(),
+            invoke,
+            Arc::new(MetricsRegistry::new()),
+        );
+        wait_for_pulls(&mut pulls, 2).await;
+        handle.stop().await;
+
+        let journal = journal.lock().unwrap();
+        assert_eq!(journal.nacked, vec!["m1".to_string()]);
+        assert_eq!(
+            journal.nack_refunds, vec![false],
+            "only a DispatchError::Overloaded refusal may refund an attempt"
+        );
     }
 
     #[tokio::test]
@@ -368,6 +455,11 @@ mod tests {
             journal.nacked,
             vec!["stuck".to_string()],
             "the batch has to go back to deis-queue before the lease lapses"
+        );
+        assert_eq!(
+            journal.nack_refunds, vec![false],
+            "the handler may still be running, so its attempt was spent and must not be \
+             refunded"
         );
     }
 
