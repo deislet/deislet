@@ -949,8 +949,8 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
   （默认 7 天）记 `ERROR`，两种都写清第几次失败、还剩几天、下次什么时候试。
   **仍然要人手放的只剩通配证书**：RFC 8555 只允许 `dns-01` 签通配，这个实现不说那套
   协议。`crates/deis-proxy/tests/support/acme_ca.rs` 是一个只跑在环回口上的假 CA，
-  八个集成测试跑的都是真的 `deis-proxy` 进程；`scripts/demo.sh verify` 的「automatic
-  certificates」一组另有五条检查。
+  集成测试跑的都是真的 `deis-proxy` 进程；`scripts/demo.sh verify` 的「automatic
+  certificates」一组把同一件事在整套演示里再走一遍。
 - （已定）`deis dev` 怎么执行用户代码：起一个本地 `deis-runtime`，用控制面同一个
   `ApplyDeployment` 把包交给它。另外两条路——调 deno CLI、把 deno_core 嵌进 deis
   ——都不再考虑，因为它们跑的都不是线上那个引擎。

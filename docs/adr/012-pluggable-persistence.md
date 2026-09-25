@@ -239,6 +239,84 @@ Production readiness 至少验证：
 - 记录恢复演练报告和缺失对象。
 - Key material 与数据备份分离保护但共同纳入恢复清单。
 
+### 各组件 SQLite 耐久性取舍
+
+每个 embedded SQLite 文件打开时就定好耐久性取舍，运行中不改变；取舍的理由集中写在这里（R5）。control 的完整前提见下节。
+
+| 组件 | 文件 | Journal mode | `synchronous` | 取舍 |
+|---|---|---|---|---|
+| control | `control.db` | WAL | `FULL`（2） | 写入量低，存的是目录、密钥修订、部署计划等权威状态；丢失一个已确认的提交会让控制面与已通知它的节点不一致。`busy_timeout = 5s`，为两个进程共用一个文件和 Litestream 读时短暂持锁而留；外键约束开启（`foreign_keys = ON`）。见下节 |
+| queue | `queue.sqlite` | WAL | `FULL`（2） | at-least-once 的承诺主要落在 Send 上：Send 已确认却因掉电丢失就是丢消息，违反承诺；Ack 丢失只导致重投，在语义之内。Send 在 `IMMEDIATE` 事务里逐条提交，改 `FULL` 后的吞吐开销有实测数字，见 `crates/deis-queue/README.md` |
+| store | KV、SQL 与 Blob 元数据 | WAL | `NORMAL`（1），默认 | 默认接受「主机掉电可能丢失最近已确认的元数据写入」换取每个提交少一次 fsync；需要与 queue 同等保证时设 `durability = "full"` |
+| 迁移 fence journal | `migration-fences.sqlite`（queue 与 store 各一份） | WAL | `FULL`（2） | 迁移围栏状态必须比数据更耐久，回滚一个已确认的 fence 比丢数据更糟（ADR-023） |
+
+掉电窗口：WAL + `NORMAL` 下，提交的 WAL 帧要到 checkpoint 才 fsync，所以主机掉电可能丢失最近若干秒「已确认」的写入（对 store 就是最近的 KV/Blob 元数据）；数据库不会损坏，恢复时不完整的 WAL 帧整体丢弃而不是半应用。WAL + `FULL` 则每个提交 fsync 一次，掉电丢失窗口归零，代价就是上表中 queue 实测的吞吐折损。
+
+另外两条与部署相关的边界：WAL 依赖共享内存文件（`-shm`）与共享写锁，**不支持网络文件系统**（NFS/SMB），四个文件都必须在本地盘上；`-wal`、`-shm` 与主库是同一份状态，备份与恢复必须把它们当作一个整体（见下节与 `docs/control-backup-and-restore.md`）。
+
+### embedded 模式的 control：单实例 + Litestream 持续备份
+
+control 是一个 SQLite 文件、一个进程、一个连接，没有 leader election（`scheduler::lease` 只支持同机两个进程共用一个文件）。embedded 模式不为 control 做在线 HA：主机整体丢失由持续备份兜住，Litestream 以 WAL 为单位把 control 库持续复制到第二块盘或 S3 兼容存储。样例配置与 systemd 单元在 `scripts/canary/litestream.yml` 与 `scripts/canary/systemd/litestream.service`，pin 在 0.5 系列（0.5.17）。
+
+**目标**
+
+- **RPO**：control 库 ≤ 1 秒量级（`sync-interval`，样例取 1s；一次提交在本地 WAL 里已经是持久的，这一秒是它「本机之外还不存在」的上限）。`bundles/` ≤ 1 分钟（`rclone sync` 或 restic 定时任务）。密钥材料只在变更时备份，RPO 为 0——变更很少，所以每次变更都要求有备份。
+- **RTO**：从「确认 control 主机不可用」到「新主机上的 control 通过 readiness」≤ 15 分钟，由人工按 runbook 执行。单实例意味着故障期间不能部署、不能回滚、不能轮换 secret、不能新建 app，这是 D-4 接受的代价。
+- 每季度至少一次恢复演练，演练结果作为证据进仓库。
+
+**一套备份要覆盖的材料**（缺任何一样，恢复出来的 control 都会照常启动、`/health` 照答 `OK`、控制台照列出应用，却一个也跑不起来）
+
+| 材料 | 默认位置 | 备份方式 |
+|---|---|---|
+| 控制面库 | `<data_dir>/control.db` | Litestream 持续复制 |
+| 版本包 | `<data_dir>/bundles/` | 内容寻址；`rclone sync` 或 restic，每分钟一次，恢复时按 sha256 校验 |
+| master key | `<data_dir>/keys/`（`secret_key_file`） | 与数据分开的存储桶或加密存储；轮换时同步 |
+| issuer 私钥 | `<data_dir>/keys/` | 同上 |
+| machine 通道证书、私钥、trust root | `<data_dir>/machine/` | 变更时同步；与 master key 分开保护 |
+
+`bootstrap.token` 不在清单里：它是一次性入口而不是状态，未使用 24 小时后过期，恢复后的安装自己会重新签发一个。control 启动时会把这份清单打一条日志（并点出 `data_dir` 之外的部分），`--check-config` 会把每一项都列出来。
+
+**WAL 与 Litestream 的分工**
+
+- control 代码中**不得出现任何 `wal_checkpoint` 调用**，`TRUNCATE` 与 `RESTART` 都在禁列；`crates/deis-control` 里有一个 grep 测试守着这一条。checkpoint 交给 Litestream 管理：它按 `checkpoint-interval` 做 PASSIVE checkpoint，并在复制之前持有读事务，所以 WAL 不会被提前截断。SQLite 自身的自动 checkpoint（PASSIVE）保留。
+- 该库是 WAL、`synchronous = FULL`、`busy_timeout = 5s`，这是本方案的前提；Litestream 读取时会短暂持锁，5 秒的等待正是为此留的。写入量低，不需要为了 Litestream 改用 NORMAL。
+- 库必须在本地文件系统上（WAL 的前提）。
+
+**Litestream 的已知约束**
+
+- 同一时刻只能有一个 Litestream 进程复制同一个库，也不能有别的工具截断 WAL。蓝绿切换时两个 control 进程共用一个文件没有问题，但 Litestream 只能有一个。
+- 运行期间不得用文件复制替换该库，也不得执行 `VACUUM`（`VACUUM INTO` 除外）。恢复必须先停 Litestream 和 control。
+- 恢复后 Litestream 开始新的 generation，旧 generation 按保留策略清理（样例 `snapshot.retention = 168h`，也就是最远可以回到一周前）。
+- 0.5 与 0.3 的配置格式和副本格式都不兼容，升级 Litestream 是一次变更而不是一次工具升级，纳入升级清单。
+
+**与版本化迁移（RC）的配合**
+
+- 迁移全部在 `BEGIN IMMEDIATE` 事务中执行，与 Litestream 兼容。
+- 关闭外键的 12 步重建会产生较大的 WAL：迁移后要确认 Litestream 追平再做下一步运维。
+- 迁移前自动取一次 `VACUUM INTO <data_dir>/pre-migration-<version>.db`，作为 Litestream 之外的第二道保险。
+- 恢复出的库 `user_version` 高于二进制已知版本时 RC 拒绝启动，所以恢复时使用与备份时相同或更新的二进制。
+
+**控制面故障期间数据面的承诺**
+
+control 不在线时数据面继续服务。这张表是承诺，与生产节点、proxy 和校验方的实现（见 ADR-025）配套：
+
+| 控制面故障期间 | 0–24 小时 | 超过 24 小时 |
+|---|---|---|
+| 已部署 app 的请求 | 可用 | 可用（不依赖存储的部分） |
+| store/queue/telemetry 访问 | 可用（宽限期） | 中断 |
+| proxy 重启 | 可用（落盘路由表） | 可用 |
+| 节点重启 | 可用（离线缓存） | app 能启动，存储访问中断 |
+| 部署、回滚、secret 轮换、新 app | 不可用 | 不可用 |
+| 吊销生效 | 只有失联前已下发的吊销生效 | 同左 |
+
+**恢复演练**
+
+`scripts/control-restore-drill.sh` 在隔离目录中执行：`litestream restore` → `PRAGMA integrity_check` → 读 `user_version` → `deis-control --check-config` → 读关键表行数 → 启动 control（loopback，配置里没有生产节点、没有存储端点、没有 provider driver 根）并调用 `/health` 与只读目录接口。给了 `--source-database` 时还会只读地读一次原库，比较关键表行数并断言副本落后不超过允许值。
+
+报告是一份 JSON，写在 `docs/product/evidence/control-restore-drill-<UTC 时间>.json`，schema 是同目录下的 `control-restore-drill.schema.json`，脚本落盘前自己先校验一遍。恢复耗时与数据时间点都在报告里，RTO 的实测值取自最近一份证据文件。
+
+部署侧的展开（安装、runbook、约束清单）在 `docs/control-backup-and-restore.md`。
+
 “备份成功”不等于可恢复；只有最近一次恢复演练是强证据。
 
 ## Embedded → Production 迁移

@@ -150,6 +150,8 @@ Dev 只用于明确本地进程：
 - UI/CLI 明显显示 DEV / NOT PRODUCTION READY。
 - 尝试 bind non-loopback、连接远程 node 或启用公网域名时拒绝，除非切换 production mode。
 - Dev 可以简化首次登录，但内部 service calls 仍尽量走同一 auth code path，避免生产路径未测试。
+- 任何模式都不存在匿名/无 credential 路径：loopback 或本地 peer 不构成身份，dev 也不例外，每次调用都要携带 credential。
+- Dev 简化的只是首次登录：bootstrap credential 存放在 0600 的本地文件中，之后的每一次调用仍走同一 credential 认证。
 
 不能根据 bind address 自动推断 dev；mode 必须显式。
 

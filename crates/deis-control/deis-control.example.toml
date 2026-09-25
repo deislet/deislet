@@ -198,21 +198,42 @@ api_cors_allowed_origins = []
 
 # Directory holding uploaded application bundles: one sub-directory per
 # app, one content-addressed zip per version. This is the only copy of a
-# version's code the platform keeps, so put it on persistent storage.
+# version's code the platform keeps, so put it on persistent storage -
+# and on the same storage as the database, because a restore needs both.
 #
-# Make it absolute. A relative path is anchored to the directory the control
-# plane process was started in, which is fine until it is started from
-# somewhere else - a systemd unit, another shell, a container with a different
-# WORKDIR - and every uploaded version is suddenly somewhere the process is not
-# looking. Existing installations are repaired at startup: a version row whose
-# path was stored relative is re-anchored under whatever bundle_dir now
+# Left out, it is <data_dir>/bundles below. Give it a path elsewhere only
+# when there is a reason, and then back that path up too: the documented
+# policy covers data_dir, and a restore of it alone would find the
+# database's version rows and none of the zips they name.
+#
+# It has to be absolute. A relative path is refused at startup, because it
+# names a different directory to every process started from a different
+# working directory - and every uploaded version is then somewhere the
+# process is not looking.
+#
+# One thing is repaired at startup: a version row whose path was stored
+# relative by an earlier run is re-anchored under whatever bundle_dir now
 # resolves to, and the startup log says how many were moved and how many of
 # them have no file there.
 bundle_dir = "/var/lib/deis-control/bundles"
 
-# Directory holding this installation's own state. The one-time bootstrap
-# credential file is written here on a first start. Make it absolute, for the
-# same reason as bundle_dir.
+# Directory holding this installation's own state, and the one directory a
+# backup policy has to cover (ADR-012):
+#
+#   control.db        the catalogue                            (--database)
+#   bundles/          every version's code                    (bundle_dir)
+#   keys/             the master key that decrypts what the database holds
+#   machine/          the machine channel's certificate, its key and the
+#                     trust root every node and proxy chains to
+#
+# The one-time bootstrap credential is written here on a first start too,
+# and is deliberately not part of a restore: it is a way in rather than
+# state, and a restored installation mints a fresh one by itself.
+#
+# Absolute, and for the same reason as bundle_dir. A control plane started
+# with a relative one writes its database, its bundles and its keys into
+# whatever directory it was started in, and looks perfectly healthy doing
+# it.
 data_dir = "/var/lib/deis-control"
 
 # Absolute base URL nodes use to reach this control plane. It ends up in

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use structopt::StructOpt;
 use tonic::service::Routes;
@@ -11,8 +11,16 @@ struct Opts {
     config: Option<PathBuf>,
     #[structopt(short, long)]
     port: Option<u16>,
-    #[structopt(long, default_value = "deis-control.db")]
-    database: String,
+    /// The SQLite file this installation keeps its catalogue in.
+    ///
+    /// Leave it out and it is `<data_dir>/control.db`, which is inside the
+    /// one directory a backup policy covers (ADR-012). A relative path is
+    /// refused rather than resolved: it names a different file to every
+    /// process started from a different working directory, and the failure
+    /// that produces is quiet - this control plane coming up healthy on a
+    /// database it has just created empty.
+    #[structopt(long, parse(from_os_str))]
+    database: Option<PathBuf>,
     /// Load the configuration, say whether it is usable, and exit without
     /// binding anything.
     ///
@@ -94,35 +102,53 @@ fn init_logging() {
     }
 }
 
+/// Say what one backup has to cover, and which parts of it are outside the
+/// directory the documented policy captures.
+///
+/// ADR-012's policy is one directory - `data_dir`, with the database in it.
+/// An installation that keeps the master key or the machine channel's
+/// certificates somewhere else is not wrong; permissions on a key file are a
+/// good reason for it. It does have a restore set that spans two places, and
+/// the failure this prevents is the quiet one: a restore of `data_dir`
+/// alone, coming up healthy, listing every application and unable to decrypt
+/// one secret or reach one node.
+fn announce_restore_set(config: &deis_control::ControlConfig, database: &Path) {
+    let outside: Vec<(&str, PathBuf)> = config
+        .backup_material(database)
+        .into_iter()
+        .filter(|(_, path)| !path.starts_with(&config.data_dir))
+        .collect();
+
+    if outside.is_empty() {
+        info!(
+            data_dir = %config.data_dir.display(),
+            "Everything a restore needs is under data_dir: capturing that one directory is the whole \
+             backup (ADR-012)"
+        );
+        return;
+    }
+
+    warn!(
+        data_dir = %config.data_dir.display(),
+        "A restore needs more than data_dir: {}. Capture each of these as well, or a restore will \
+         come up healthy with the database and be unable to decrypt a secret or reach a node \
+         (ADR-012)",
+        outside
+            .iter()
+            .map(|(what, path)| format!("{what} at {}", path.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     init_logging();
 
     let opts = Opts::from_args();
-    init_logging();
-
-    if let Some(Command::Bootstrap { token_file }) = &opts.command {
-        let secret = std::fs::read_to_string(token_file)
-            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", token_file.display()))?
-            .trim()
-            .to_string();
-        let database = Arc::new(deis_control::Database::init(&opts.database).await?);
-        let identity = deis_control::IdentityStore::new(database);
-        let id = identity
-            .install_preset_bootstrap_token(&secret)
-            .await
-            .map_err(|e| anyhow::anyhow!("the bootstrap token was not installed: {e}"))?;
-        info!(
-            token = %id,
-            "Installed the preset bootstrap credential; it expires 24 hours from now if never used, and any previous bootstrap credential has stopped working"
-        );
-        return Ok(());
-    }
-
-    info!("Starting Control v{}", deis_control::VERSION);
 
     let mut config = deis_control::ControlConfig::default();
-    if let Some(path) = opts.config {
+    if let Some(path) = opts.config.clone() {
         // A path that was given and is not there is an error, not a shrug.
         // Ignoring it silently started this process on the built-in defaults
         // - port 8080, no API authentication, no machine channel - which is a
@@ -141,6 +167,39 @@ async fn main() -> Result<(), anyhow::Error> {
     if let Some(port) = opts.port {
         config.port = port;
     }
+
+    // The database is the second thing inside `data_dir`; the bundle
+    // directory and the key material are resolved by the configuration (see
+    // `ControlConfig::bundle_dir`). Everything a restore needs is therefore
+    // under one directory by default, which is what makes one backup policy
+    // enough for an installation (ADR-012) - and what is not under it is
+    // named below rather than left to be found by a restore.
+    let database_path = opts
+        .database
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("control.db"));
+    config.refuse_relative_paths(&database_path)?;
+    announce_restore_set(&config, &database_path);
+
+    if let Some(Command::Bootstrap { token_file }) = &opts.command {
+        let secret = std::fs::read_to_string(token_file)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", token_file.display()))?
+            .trim()
+            .to_string();
+        let database = Arc::new(deis_control::Database::init(&database_path).await?);
+        let identity = deis_control::IdentityStore::new(database);
+        let id = identity
+            .install_preset_bootstrap_token(&secret)
+            .await
+            .map_err(|e| anyhow::anyhow!("the bootstrap token was not installed: {e}"))?;
+        info!(
+            token = %id,
+            "Installed the preset bootstrap credential; it expires 24 hours from now if never used, and any previous bootstrap credential has stopped working"
+        );
+        return Ok(());
+    }
+
+    info!("Starting Control v{}", deis_control::VERSION);
 
     if opts.check_config {
         // Every rule startup would apply, applied here. A check that only
@@ -162,6 +221,10 @@ async fn main() -> Result<(), anyhow::Error> {
             machine.port,
             config.data_dir.join("bootstrap.token").display()
         );
+        println!("one backup has to cover all of this, together:");
+        for (what, path) in config.backup_material(&database_path) {
+            println!("  {what}: {}", path.display());
+        }
         return Ok(());
     }
 
@@ -170,8 +233,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!("Listening on {}:{}", bind_addr, port);
 
-    let database = Arc::new(deis_control::Database::init(&opts.database).await?);
-    info!("Database initialized: {}", opts.database);
+    let database = Arc::new(deis_control::Database::init(&database_path).await?);
+    info!("Database initialized: {}", database_path.display());
 
     // Before anything can connect: take back what the previous process was
     // still claiming. Nothing is connected yet and nothing is waiting on a

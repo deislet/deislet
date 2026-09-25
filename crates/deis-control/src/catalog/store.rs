@@ -863,10 +863,10 @@ impl CatalogStore {
     /// The one place a version row is ever rewritten, and it does not touch
     /// what a version *is*: not its number, not its digest, not its manifest.
     /// It repairs where this installation says the file is, which was recorded
-    /// as it was written - and `bundle_dir` defaults to the relative
-    /// `data/bundles`, so on most installations it was recorded relative to
-    /// whatever directory the control plane happened to be started in. The
-    /// first restart from another directory made every version ever uploaded
+    /// as it was written - and a `bundle_dir` that was relative (the default
+    /// once was `data/bundles`) meant it was recorded relative to whatever
+    /// directory the control plane happened to be started in. The first
+    /// restart from another directory made every version ever uploaded
     /// unreachable at once, with the zips still sitting on the disk.
     ///
     /// The new value is computed from the version's own identity -
@@ -2615,8 +2615,13 @@ impl CatalogStore {
     }
 
     /// Point an environment at a version by inserting a new pointer row.
-    /// Used by both deploy and rollback; only the note differs.
-    pub async fn deploy(
+    /// Test-only: production traffic goes through
+    /// [`CatalogStore::activate_deployment_inner`], which moves the pointer
+    /// under the plan's CAS. This helper exists so tests can stand up an
+    /// active deployment in one step; only the note differs between the
+    /// deploy and rollback cases.
+    #[cfg(test)]
+    pub(crate) async fn deploy(
         &self,
         env: &Environment,
         version_id: &str,
@@ -5017,7 +5022,8 @@ mod tests {
     async fn bundle_paths_stored_relative_are_anchored_to_the_bundle_root() {
         let store = store().await;
         store.create_app("demo").await.unwrap();
-        // Exactly what the default `bundle_dir` used to write.
+        // Exactly what a relative bundle root used to write: a path that
+        // only resolves from the directory that run was started in.
         store
             .create_version("demo", "sha-1", "data/bundles/demo/sha-1.zip", "{}")
             .await

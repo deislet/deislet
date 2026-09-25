@@ -1,0 +1,66 @@
+# Litestream configuration: continuous backup of the control plane's SQLite
+# database, and of nothing else.
+#
+# Install this as /etc/litestream.yml - the path `litestream` reads by default -
+# and run it as litestream.service, which sits in the same slice as
+# deis-control. The RPO/RTO this buys, the full list of what a restore needs,
+# and the constraints everyone else has to respect are in
+# docs/adr/012-pluggable-persistence.md and
+# docs/control-backup-and-restore.md.
+#
+# Pinned version: 0.5.17. The 0.5 series is not interchangeable with 0.3: the
+# configuration changed (`replica`, one object, replaced the `replicas` array),
+# the replica format changed, and 0.5 cannot read a replica written by 0.3.
+# Read https://litestream.io/docs/migration/ before moving between series, and
+# treat a Litestream upgrade as a release of its own.
+#
+# What this does not cover: the bundle store (`bundles/`) is content-addressed
+# files that belong to an rclone/restic job of their own, and the key material
+# (`keys/`, `machine/`) changes only when it is rotated, so it is backed up
+# when it changes rather than on a schedule. A restore that has this replica
+# and neither of those comes up healthy, lists every application and cannot run
+# one of them or reach a node.
+
+# How far back a restore can reach: a snapshot is a full copy of the database
+# at compaction level 9, and `retention` is how long Litestream keeps it and
+# the LTX files that belong to it. This is the oldest point in time that
+# `litestream restore -timestamp` can name, so it has to be longer than the
+# longest outage anyone is willing to accept as data loss.
+snapshot:
+  interval: 24h
+  retention: 168h
+
+dbs:
+  - path: /var/lib/deis-control/control.db
+
+    # The control plane's own busy timeout is 5 seconds (ADR-012): another
+    # process may hold the write lock that long, and a reader that gives up
+    # sooner would fail a sync that would have succeeded a moment later.
+    busy-timeout: 5s
+
+    # WAL checkpoints are Litestream's to make, never the control plane's:
+    # control contains no `wal_checkpoint` call at all, and a grep test in
+    # `crates/deis-control` keeps it that way. Litestream checkpoints in
+    # PASSIVE mode (non-blocking for both readers and writers) and holds a
+    # read transaction, so the WAL is not truncated before it has copied it.
+    # The only TRUNCATE anywhere is Litestream's own emergency one, above
+    # `truncate-page-n` (default ~500MB of WAL, a size this database does not
+    # reach in normal operation).
+    checkpoint-interval: 1m
+
+    replica:
+      # One second: the whole RPO of this database (ADR-012). Every commit is
+      # already durable in the local WAL; this is how long it may exist
+      # nowhere else.
+      sync-interval: 1s
+
+      # An S3-compatible bucket, or a path that is not the disk holding the
+      # database:
+      #   url: file:///mnt/backup/deis-control
+      #
+      # Credentials come from the environment of litestream.service, never
+      # from this file, which is readable by anyone who can read /etc:
+      # LITESTREAM_ACCESS_KEY_ID and LITESTREAM_SECRET_ACCESS_KEY, or the
+      # usual AWS_* pair.
+      url: s3://deis-control-backup/control
+      region: us-east-1
