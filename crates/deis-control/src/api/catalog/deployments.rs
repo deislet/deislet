@@ -1060,11 +1060,9 @@ async fn only_departed_targets_are_left(
         Some(at) => now.saturating_sub(at.timestamp()),
         None => age,
     };
-    if report
-        .failed
-        .iter()
-        .any(|failure| state.nodes.node(&failure.node).is_some() || gone_for(&failure.node) < deadline)
-    {
+    if report.failed.iter().any(|failure| {
+        state.nodes.node(&failure.node).is_some() || gone_for(&failure.node) < deadline
+    }) {
         return Ok(false);
     }
 
@@ -1166,15 +1164,14 @@ async fn abandon_departed_proxies(
 
         state
             .store
-            .record_deployment_proxy_observation(
-                DeploymentProxyObservation {
-                    plan_id: plan.id.clone(),
-                    proxy_id: proxy.clone(),
-                    observed_state: ABANDONED.to_string(),
-                    routing_table_version: String::new(),
-                    routing_generation: generation.to_string(),
-                    observed_at: now_secs(),
-                })
+            .record_deployment_proxy_observation(DeploymentProxyObservation {
+                plan_id: plan.id.clone(),
+                proxy_id: proxy.clone(),
+                observed_state: ABANDONED.to_string(),
+                routing_table_version: String::new(),
+                routing_generation: generation.to_string(),
+                observed_at: now_secs(),
+            })
             .await?;
     }
     Ok(())
@@ -1990,7 +1987,9 @@ async fn abort_prepared_plan(
         .push_to(payload, reason, &plan.target_ids)
         .await;
     record_target_report(state, plan, &report, "aborted", lease).await?;
-    if !report.fully_delivered() && !only_departed_targets_are_left(state, plan, &report, lease).await? {
+    if !report.fully_delivered()
+        && !only_departed_targets_are_left(state, plan, &report, lease).await?
+    {
         return Ok(false);
     }
     let terminal = state
@@ -2518,7 +2517,12 @@ mod tests {
             .get_environment("demo", "production")
             .await
             .unwrap();
-        let version = h.state.store.get_version("demo", &version_id).await.unwrap();
+        let version = h
+            .state
+            .store
+            .get_version("demo", &version_id)
+            .await
+            .unwrap();
 
         // A machine that was on the fleet when the plan was made and is not on
         // it now. Never registered here, which is the same thing this control
@@ -2691,7 +2695,12 @@ mod tests {
             .get_environment("demo", "production")
             .await
             .unwrap();
-        let version = h.state.store.get_version("demo", &version_id).await.unwrap();
+        let version = h
+            .state
+            .store
+            .get_version("demo", &version_id)
+            .await
+            .unwrap();
         let owner = CanonicalId::new_v7();
         let plan = h
             .state

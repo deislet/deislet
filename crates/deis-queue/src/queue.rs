@@ -2511,14 +2511,10 @@ mod tests {
         // One connection, so the mode a round pins is the mode every
         // statement of that round runs under: `with_conn` hands out the same
         // connection every time when the pool holds exactly one.
-        let service = QueueService::open_with_clock(
-            dir.path(),
-            1,
-            QueueLimits::default(),
-            Clock::fixed(T0),
-        )
-        .await
-        .unwrap();
+        let service =
+            QueueService::open_with_clock(dir.path(), 1, QueueLimits::default(), Clock::fixed(T0))
+                .await
+                .unwrap();
         let tenant = tenant("bench.sandbox");
 
         let mut send_rates: Vec<(&str, f64)> = Vec::new();
@@ -3724,11 +3720,7 @@ mod tests {
         })
         .await;
         let a = tenant("app-one.production");
-        let id = f
-            .service
-            .send(&a, "jobs", b"work".to_vec())
-            .await
-            .unwrap();
+        let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
 
         // The first failure is real, so it keeps its attempt.
         let first = f.service.pull(&a, "jobs", None, None).await.unwrap();
@@ -3994,7 +3986,9 @@ mod tests {
             Err(QueueError::InvalidArgument(_))
         ));
         assert!(matches!(
-            f.service.nack(&a, "jobs", vec![tokenless], None, false).await,
+            f.service
+                .nack(&a, "jobs", vec![tokenless], None, false)
+                .await,
             Err(QueueError::InvalidArgument(_))
         ));
         // Nothing was acted on, so the message is still leased to whoever

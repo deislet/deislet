@@ -494,9 +494,8 @@ mod tests {
             deis_identity::MachineIdentity::load(files.as_identity_files(), &[])
                 .expect("the control plane's own identity"),
         );
-        let nodes = Arc::new(
-            RuntimeNodeManager::new(Vec::new(), 15).with_machine_identity(Some(identity)),
-        );
+        let nodes =
+            Arc::new(RuntimeNodeManager::new(Vec::new(), 15).with_machine_identity(Some(identity)));
         nodes
             .register(
                 "node-a",

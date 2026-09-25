@@ -351,11 +351,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &driver_executable,
-                std::fs::Permissions::from_mode(0o500),
-            )
-            .unwrap();
+            std::fs::set_permissions(&driver_executable, std::fs::Permissions::from_mode(0o500))
+                .unwrap();
         }
         let database = Arc::new(
             Database::init(directory.path().join("control.sqlite"))

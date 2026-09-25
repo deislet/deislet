@@ -312,10 +312,7 @@ mod tests {
         );
 
         assert_eq!(poller.poll_once(0).await, 0);
-        assert_eq!(
-            control.last_request().observed_routing_table_version,
-            "v1"
-        );
+        assert_eq!(control.last_request().observed_routing_table_version, "v1");
     }
 
     #[tokio::test]

@@ -434,8 +434,7 @@ fn unreachable_client(machine_endpoint: &str, node_id: &str) -> AssignmentClient
 async fn a_node_loads_everything_the_control_plane_assigned_it() {
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
@@ -456,8 +455,7 @@ async fn an_inflight_assignment_prepares_without_starting_the_current_version() 
     const GENERATION: &str = "018f2518-7e38-7f80-8000-000000000022";
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
     plane.now_assigns(serde_json::json!([{
         "app_id": "demo",
         "version_id": "v1",
@@ -852,8 +850,7 @@ async fn an_environment_the_control_plane_no_longer_assigns_stops_serving() {
     // process.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
@@ -900,8 +897,7 @@ async fn one_short_answer_alone_never_stops_an_application() {
     // two apart, and a fault that has passed disagrees with the first.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
@@ -978,8 +974,7 @@ async fn reconciling_a_node_that_already_matches_changes_nothing() {
     // reload, no re-download, no restarted isolate.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
@@ -1006,8 +1001,7 @@ async fn a_new_version_in_the_list_replaces_the_running_one() {
     // reaches it through a later reconciliation.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
@@ -1049,8 +1043,7 @@ async fn an_incomplete_answer_loads_but_never_removes() {
     // problem on the other side.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
@@ -1087,8 +1080,7 @@ async fn an_incomplete_answer_neither_counts_towards_a_removal_nor_undoes_one() 
     // and it must not reset a count that a complete answer already started.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
@@ -1290,8 +1282,7 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_rolled_back() {
     // itself since.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
@@ -1351,8 +1342,7 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
     // so it has nothing to say about the environment any more.
     let dir = tempfile::tempdir().unwrap();
     let (bytes, sha) = bundle("demo");
-    let plane =
-        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
+    let plane = ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha).await;
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;

@@ -685,7 +685,12 @@ impl PooledConnection {
         };
         let conn = match idle {
             Some(conn) => conn,
-            None => open(&inner.path, &inner.label, inner.authorizer, inner.durability)?,
+            None => open(
+                &inner.path,
+                &inner.label,
+                inner.authorizer,
+                inner.durability,
+            )?,
         };
         Ok(Self {
             inner,

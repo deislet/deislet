@@ -305,7 +305,8 @@ impl ApplicationManager {
             "A request refused as overloaded is told to retry after {}s",
             overload_retry_after_secs
         );
-        self.runtime_pool.set_overload_retry_after_secs(overload_retry_after_secs);
+        self.runtime_pool
+            .set_overload_retry_after_secs(overload_retry_after_secs);
         self
     }
 
@@ -1308,7 +1309,8 @@ impl ApplicationManager {
     pub fn validate_inspect_token(&self, key: &AppKey, token: &str) -> bool {
         if let Some(entry) = self.inspect_sessions.get(key) {
             let (stored_token, expires_at) = entry.value();
-            if !stored_token.is_empty() && constant_time_eq(stored_token, token)
+            if !stored_token.is_empty()
+                && constant_time_eq(stored_token, token)
                 && SystemTime::now() < *expires_at
             {
                 return true;

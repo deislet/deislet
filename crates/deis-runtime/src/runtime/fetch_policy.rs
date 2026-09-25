@@ -1148,14 +1148,8 @@ fn as_ipv4_when_it_is_one(addr: IpAddr) -> IpAddr {
 /// refused outright in [`blocked_v6`] instead.
 fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let segments = v6.segments();
-    let inner = |hi: u16, lo: u16| {
-        Ipv4Addr::new(
-            (hi >> 8) as u8,
-            hi as u8,
-            (lo >> 8) as u8,
-            lo as u8,
-        )
-    };
+    let inner =
+        |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
     // IPv4-mapped, and the deprecated plain spelling beside it.
     if let Some(v4) = v6.to_ipv4_mapped() {
         return Some(v4);

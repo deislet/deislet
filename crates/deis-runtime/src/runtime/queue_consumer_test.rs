@@ -264,7 +264,8 @@ mod tests {
         assert!(journal.acked.is_empty(), "nothing was handled");
         assert_eq!(journal.nacked, vec!["m1".to_string(), "m2".to_string()]);
         assert_eq!(
-            journal.nack_refunds, vec![false],
+            journal.nack_refunds,
+            vec![false],
             "a handler that threw did spend its attempts: refunding would let a poison \
              message outlive the ceiling that exists to retire it"
         );
@@ -298,14 +299,18 @@ mod tests {
         handle.stop().await;
 
         let journal = journal.lock().unwrap();
-        assert!(journal.acked.is_empty(), "the application never saw the work");
+        assert!(
+            journal.acked.is_empty(),
+            "the application never saw the work"
+        );
         assert_eq!(
             journal.nacked,
             vec!["m1".to_string(), "m2".to_string()],
             "the refused batch still has to be handed back, not dropped"
         );
         assert_eq!(
-            journal.nack_refunds, vec![true],
+            journal.nack_refunds,
+            vec![true],
             "the attempt an overload refusal burned must be given back"
         );
     }
@@ -316,8 +321,7 @@ mod tests {
     /// it was never told about.
     #[tokio::test]
     async fn a_batch_that_fails_for_another_reason_is_nacked_without_a_refund() {
-        let (queue, journal) =
-            FakeQueue::with_batches(vec![vec![message("m1")]]);
+        let (queue, journal) = FakeQueue::with_batches(vec![vec![message("m1")]]);
         let mut pulls = queue.watch_pulls();
         let invoke: BatchInvoker = Arc::new(|_queue, _messages| {
             Box::pin(async move {
@@ -341,7 +345,8 @@ mod tests {
         let journal = journal.lock().unwrap();
         assert_eq!(journal.nacked, vec!["m1".to_string()]);
         assert_eq!(
-            journal.nack_refunds, vec![false],
+            journal.nack_refunds,
+            vec![false],
             "only a DispatchError::Overloaded refusal may refund an attempt"
         );
     }
@@ -457,7 +462,8 @@ mod tests {
             "the batch has to go back to deis-queue before the lease lapses"
         );
         assert_eq!(
-            journal.nack_refunds, vec![false],
+            journal.nack_refunds,
+            vec![false],
             "the handler may still be running, so its attempt was spent and must not be \
              refunded"
         );

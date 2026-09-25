@@ -371,11 +371,8 @@ async fn a_machine_channel_without_the_rpc_is_a_permanent_answer() {
 /// to be a wrong credential and is now a connection that never authenticated.
 #[tokio::test]
 async fn a_control_plane_that_cannot_authenticate_this_node_is_a_refusal_too() {
-    let (registrar, _plane) = machine_registrar(
-        Err(Status::unauthenticated("no name was proved")),
-        Ok(true),
-    )
-    .await;
+    let (registrar, _plane) =
+        machine_registrar(Err(Status::unauthenticated("no name was proved")), Ok(true)).await;
 
     let error = registrar
         .register()

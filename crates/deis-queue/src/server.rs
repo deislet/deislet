@@ -420,7 +420,10 @@ mod tests {
                 lease_token: message.lease_token.clone(),
             })
             .collect();
-        queue.nack(&tenant, "jobs", handles, None, false).await.unwrap();
+        queue
+            .nack(&tenant, "jobs", handles, None, false)
+            .await
+            .unwrap();
         assert_eq!(queue.dead_letters(&tenant, "jobs").await.unwrap().len(), 1);
 
         let sweeper = spawn_dead_letter_sweeper(queue.clone(), 1).expect("retention is on");

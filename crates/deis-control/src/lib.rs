@@ -157,7 +157,6 @@ mod tests {
         assert_eq!(manager.count(), 0);
     }
 
-
     #[tokio::test]
     async fn test_message_handler_register() {
         let config = ControlConfig::default();

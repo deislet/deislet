@@ -1105,18 +1105,20 @@ mod tests {
         for (error, status, code) in every_variant() {
             // The ones whose text belongs to a backend say only
             // [`OPAQUE_MESSAGE`]; the rest carry their own.
-            let is_opaque = matches!(error, ApiError::InternalError(_) | ApiError::DatabaseError(_))
-                || matches!(error, ApiError::Detailed(ref d) if d.diagnostic.is_some());
+            let is_opaque = matches!(
+                error,
+                ApiError::InternalError(_) | ApiError::DatabaseError(_)
+            ) || matches!(error, ApiError::Detailed(ref d) if d.diagnostic.is_some());
             let (got_status, bytes) = into_response_bytes(error).await;
             assert_eq!(got_status, status);
             let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body.as_object().unwrap().len(), 1, "only `error` at the top");
+            assert_eq!(
+                body.as_object().unwrap().len(),
+                1,
+                "only `error` at the top"
+            );
             assert_eq!(body["error"]["code"], code);
-            let expected_message = if is_opaque {
-                OPAQUE_MESSAGE
-            } else {
-                "x"
-            };
+            let expected_message = if is_opaque { OPAQUE_MESSAGE } else { "x" };
             assert_eq!(body["error"]["message"], expected_message, "{code}");
             assert!(
                 body["error"]["requestId"]
@@ -1456,8 +1458,7 @@ mod tests {
         use crate::api::versioning::RequestId;
         let context = RequestContext::of(RequestId(REQUEST.parse().unwrap()));
         let body_of = |error: ApiError| {
-            let response =
-                error.into_response_for(ApiSurface::of_path("/api/v1/apps"), context);
+            let response = error.into_response_for(ApiSurface::of_path("/api/v1/apps"), context);
             let status = response.status();
             // A producer outside every mount echoes both ids, so a refusal
             // can be tied to the calls the caller sent around it.
@@ -1481,8 +1482,7 @@ mod tests {
         assert_eq!(body["error"]["message"], "no credential");
         assert_eq!(body["error"]["requestId"], REQUEST);
 
-        let (status, response) =
-            body_of(ApiError::insufficient_scope("apps:write", "create app"));
+        let (status, response) = body_of(ApiError::insufficient_scope("apps:write", "create app"));
         assert_eq!(status, StatusCode::FORBIDDEN);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())

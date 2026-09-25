@@ -4884,7 +4884,7 @@ mod gate_tests {
         );
     }
 
-        /// The gate's refusals answer in the envelope shape whatever prefix the
+    /// The gate's refusals answer in the envelope shape whatever prefix the
     /// path was spelled under, and echo the id the caller sent.
     #[tokio::test]
     async fn a_gate_refusal_answers_the_envelope_under_any_prefix() {

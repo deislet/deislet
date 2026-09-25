@@ -152,7 +152,6 @@ pub async fn build_api_router(
     let restore_state = restores::RestoreApiState::new(Arc::clone(&catalog_state.store), &config);
     restore_state.resume_on_start();
 
-
     // One gate for the whole human surface. It resolves the credential into
     // an account, checks the scope the route needs, and writes the audit
     // line - so a route cannot be mounted here without all three. There is
@@ -412,10 +411,7 @@ fn human_router(states: &HumanStates) -> Router {
     use versioning::ApiSurface;
 
     let v1 = Router::new().nest(ApiSurface::V1.prefix(), product_router("", states));
-    let platform = Router::new().nest(
-        ApiSurface::Platform.prefix(),
-        platform_router("", states),
-    );
+    let platform = Router::new().nest(ApiSurface::Platform.prefix(), platform_router("", states));
     let metrics = Router::new()
         .route(PROMETHEUS_ROUTE, get(metrics::export_prometheus))
         .with_state(states.metrics.clone());
@@ -943,13 +939,11 @@ pub async fn start_api_server(
     let machine_channel = config.machine.is_some();
     let config = Arc::new(config);
     let tls_config = config.tls.clone();
-    let deis_runtime_manager = Arc::new(
-        crate::runtime_client::RuntimeNodeManager::new_with_ttl(
-            config.deis_runtime_nodes.clone(),
-            config.deis_runtime_poll_interval,
-            config.node_registration_ttl_secs,
-        )
-    );
+    let deis_runtime_manager = Arc::new(crate::runtime_client::RuntimeNodeManager::new_with_ttl(
+        config.deis_runtime_nodes.clone(),
+        config.deis_runtime_poll_interval,
+        config.node_registration_ttl_secs,
+    ));
     // One stop signal for the server and the health poller, so the poller
     // stops probing at the same moment the listener stops accepting rather
     // than being cut off mid-probe by an abort.
@@ -1090,11 +1084,7 @@ pub(crate) mod tests {
         let (_, secret) = api
             .authz
             .identity
-            .create_token(
-                "root",
-                "operator",
-                crate::identity::Authority::Unscoped,
-            )
+            .create_token("root", "operator", crate::identity::Authority::Unscoped)
             .await
             .unwrap();
         // As the binary mounts it: the route fallback goes on last, over
@@ -1114,12 +1104,7 @@ pub(crate) mod tests {
     /// token [`full_router`] minted. The peer address no longer decides
     /// anything - the gate refuses every caller without a credential - but
     /// the real server always puts one on the request, so the test does too.
-    async fn call_with_token(
-        router: &Router,
-        secret: &str,
-        method: &str,
-        uri: &str,
-    ) -> Response {
+    async fn call_with_token(router: &Router, secret: &str, method: &str, uri: &str) -> Response {
         let mut request = Request::builder()
             .method(method)
             .uri(uri)
@@ -1312,8 +1297,7 @@ pub(crate) mod tests {
             );
             let body = body_json(response).await;
             assert_eq!(
-                body["error"]["code"],
-                "route-not-found",
+                body["error"]["code"], "route-not-found",
                 "{method} {uri}: {body}"
             );
             assert!(

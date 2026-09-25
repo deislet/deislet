@@ -277,8 +277,7 @@ const MAX_REJECTION_BYTES: usize = 4 * 1024;
 /// The sentence is kept as the message - it is about what the caller sent,
 /// never about this control plane's insides.
 async fn envelope_rejection(response: Response) -> Response {
-    if !response.status().is_client_error()
-        || response.extensions().get::<ErrorDetail>().is_some()
+    if !response.status().is_client_error() || response.extensions().get::<ErrorDetail>().is_some()
     {
         return response;
     }

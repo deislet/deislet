@@ -328,8 +328,6 @@ enum Transport {
 const FETCH_ASSIGNMENTS_PATH: &str = "/deis.machine.MachineChannel/FetchAssignments";
 
 impl AssignmentClient {
-
-
     /// Ask over the machine channel, proving `identity` and refusing to talk
     /// to anything that cannot prove it is `control_identity`.
     ///
@@ -492,7 +490,6 @@ impl AssignmentClient {
             .await
     }
 
-
     async fn fetch_over_machine_channel(
         &self,
         client: &MachineChannelClient<Channel>,
@@ -635,7 +632,6 @@ fn machine_failure(
     }
 }
 
-
 /// One answer from the control plane.
 ///
 /// The array on its own cannot be acted on for removal: an application that is
@@ -653,7 +649,6 @@ pub struct AssignmentList {
     /// Assignments the control plane left out, when `complete` is false.
     pub withheld: u32,
 }
-
 
 /// Result of one pass over the assignment list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

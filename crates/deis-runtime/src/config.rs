@@ -1591,8 +1591,6 @@ impl RuntimeConfig {
 }
 
 impl ControlPlaneConfig {
-
-
     fn validate(&self) -> Result<()> {
         if let Some(endpoint) = self.endpoint.as_deref() {
             if endpoint.trim().is_empty() {
@@ -2205,8 +2203,7 @@ mod tests {
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(
             config.node.advertised_addresses,
-            ["203.0.113.7", "2001:db8::10"]
-                .map(|a| a.parse::<IpAddr>().unwrap())
+            ["203.0.113.7", "2001:db8::10"].map(|a| a.parse::<IpAddr>().unwrap())
         );
         config
             .validate()
@@ -2239,8 +2236,7 @@ mod tests {
         result.expect("a comma-separated list of IP addresses applies");
         assert_eq!(
             config.node.advertised_addresses,
-            ["203.0.113.7", "2001:db8::10"]
-                .map(|a| a.parse::<IpAddr>().unwrap())
+            ["203.0.113.7", "2001:db8::10"].map(|a| a.parse::<IpAddr>().unwrap())
         );
     }
 
@@ -2253,8 +2249,7 @@ mod tests {
         let result = config.apply_env_overrides();
         env::remove_var("DEIS_RUNTIME_NODE_ADVERTISED_ADDRESSES");
 
-        let err =
-            result.expect_err("a name is not an address the fetch policy can match");
+        let err = result.expect_err("a name is not an address the fetch policy can match");
         assert!(err.to_string().contains("not-an-ip"), "{err}");
     }
 

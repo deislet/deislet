@@ -56,8 +56,7 @@ pub fn generate_with_node_compat(
     let context_builder_code = generate_context_builder_code(&environment_declarations_json);
 
     // 2. Generate Router Code
-    let router_code =
-        generate_router_code(routes, node_compat, &environment_declarations_json);
+    let router_code = generate_router_code(routes, node_compat, &environment_declarations_json);
 
     // 3. Generate Config Files
     let mut config_files = Vec::new();

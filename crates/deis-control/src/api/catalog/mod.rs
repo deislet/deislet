@@ -353,7 +353,6 @@ pub(super) fn actor_subject(principal: &crate::identity::Principal) -> String {
     }
 }
 
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -538,8 +537,7 @@ pub(crate) mod tests {
             queue_endpoint: Some(endpoint.clone()),
             ..Default::default()
         });
-        let mut harness =
-            harness_with_storage(secrets_ready, storage).await;
+        let mut harness = harness_with_storage(secrets_ready, storage).await;
         harness.queue_endpoint = Some(endpoint);
         harness._queue_dir = Some(queue_dir);
         harness._queue_shutdown = Some(shutdown);
@@ -573,12 +571,7 @@ pub(crate) mod tests {
     /// that cannot acknowledge PREPARE. Used to prove a partial prepare never
     /// moves the production pointer.
     pub(crate) async fn harness_with_failed_runtime(secrets_ready: bool) -> Harness {
-        harness_with_storage_and_failed_runtime(
-            secrets_ready,
-            storage_wiring(None),
-            true,
-        )
-        .await
+        harness_with_storage_and_failed_runtime(secrets_ready, storage_wiring(None), true).await
     }
 
     async fn harness_with_storage_and_failed_runtime(
@@ -794,9 +787,7 @@ pub(crate) mod tests {
         mut request: axum::extract::Request,
         next: axum::middleware::Next,
     ) -> axum::response::Response {
-        request
-            .extensions_mut()
-            .insert(admitted_principal());
+        request.extensions_mut().insert(admitted_principal());
         next.run(request).await
     }
 

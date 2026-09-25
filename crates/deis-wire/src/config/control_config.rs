@@ -86,13 +86,9 @@ fn default_retry_count() -> u32 {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_control_config_new() {
-        let config = ControlConfig::new(
-            "test-id".to_string(),
-            "http://localhost:8080".to_string(),
-        );
+        let config = ControlConfig::new("test-id".to_string(), "http://localhost:8080".to_string());
 
         assert_eq!(config.associated_id, "test-id");
         assert_eq!(config.addr, "http://localhost:8080");
@@ -103,10 +99,7 @@ mod tests {
 
     #[test]
     fn test_duration_methods() {
-        let config = ControlConfig::new(
-            "test-id".to_string(),
-            "http://localhost:8080".to_string(),
-        );
+        let config = ControlConfig::new("test-id".to_string(), "http://localhost:8080".to_string());
 
         assert_eq!(config.heartbeat_duration(), Duration::from_secs(30));
         assert_eq!(config.request_timeout_duration(), Duration::from_secs(10));
@@ -114,10 +107,8 @@ mod tests {
 
     #[test]
     fn test_grpc_endpoint_building() {
-        let ws_config = ControlConfig::new(
-            "test-id".to_string(),
-            "http://localhost:8080".to_string(),
-        );
+        let ws_config =
+            ControlConfig::new("test-id".to_string(), "http://localhost:8080".to_string());
         assert_eq!(ws_config.grpc_endpoint(), "http://localhost:8080");
 
         let wss_config = ControlConfig::new(
@@ -129,20 +120,14 @@ mod tests {
 
     #[test]
     fn test_validation_success() {
-        let config = ControlConfig::new(
-            "test-id".to_string(),
-            "http://localhost:8080".to_string(),
-        );
+        let config = ControlConfig::new("test-id".to_string(), "http://localhost:8080".to_string());
 
         assert!(config.validate().is_ok());
     }
     // ...
     #[test]
     fn test_validation_invalid_addr_scheme() {
-        let config = ControlConfig::new(
-            "test-id".to_string(),
-            "ws://example.com".to_string(),
-        );
+        let config = ControlConfig::new("test-id".to_string(), "ws://example.com".to_string());
 
         let result = config.validate();
         assert!(result.is_err());
@@ -154,10 +139,7 @@ mod tests {
 
     #[test]
     fn test_validation_empty_associated_id() {
-        let config = ControlConfig::new(
-            "".to_string(),
-            "http://localhost:8080".to_string(),
-        );
+        let config = ControlConfig::new("".to_string(), "http://localhost:8080".to_string());
 
         let result = config.validate();
         assert!(result.is_err());
@@ -165,10 +147,7 @@ mod tests {
     }
     #[test]
     fn test_validation_empty_addr() {
-        let config = ControlConfig::new(
-            "test-id".to_string(),
-            "".to_string(),
-        );
+        let config = ControlConfig::new("test-id".to_string(), "".to_string());
 
         let result = config.validate();
         assert!(result.is_err());
@@ -177,10 +156,7 @@ mod tests {
 
     #[test]
     fn test_serde_serialization() {
-        let config = ControlConfig::new(
-            "test-id".to_string(),
-            "http://localhost:8080".to_string(),
-        );
+        let config = ControlConfig::new("test-id".to_string(), "http://localhost:8080".to_string());
 
         let serialized = serde_json::to_string(&config).unwrap();
         let deserialized: ControlConfig = serde_json::from_str(&serialized).unwrap();

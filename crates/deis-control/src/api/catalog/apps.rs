@@ -456,10 +456,12 @@ mod tests {
     #[tokio::test]
     async fn a_v1_create_says_already_exists_and_names_the_field_it_refused() {
         let (router, _dir, secret) = crate::api::tests::full_router().await;
-        let (status, created) = post(&router, &secret, "/api/v1/apps", body!({ "id": "shop" })).await;
+        let (status, created) =
+            post(&router, &secret, "/api/v1/apps", body!({ "id": "shop" })).await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
 
-        let (status, refused) = post(&router, &secret, "/api/v1/apps", body!({ "id": "shop" })).await;
+        let (status, refused) =
+            post(&router, &secret, "/api/v1/apps", body!({ "id": "shop" })).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
         assert_eq!(refused["error"]["code"], "already-exists");
         assert_eq!(refused["error"]["target"]["resource"], "application");
@@ -467,7 +469,13 @@ mod tests {
         assert_eq!(refused["error"]["message"], "app shop already exists");
         assert_eq!(refused["error"]["retryable"], false);
 
-        let (status, refused) = post(&router, &secret, "/api/v1/apps", body!({ "id": "Not A Name" })).await;
+        let (status, refused) = post(
+            &router,
+            &secret,
+            "/api/v1/apps",
+            body!({ "id": "Not A Name" }),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
         assert_eq!(refused["error"]["code"], "invalid-argument");
         let violation = &refused["error"]["violations"][0];
@@ -477,16 +485,15 @@ mod tests {
 
         // The old flat spelling is not a route of this listener any more:
         // the refusal is the route fallback's.
-        let (status, refused) = post(&router, &secret, "/api/apps", body!({ "id": "Not A Name" })).await;
+        let (status, refused) =
+            post(&router, &secret, "/api/apps", body!({ "id": "Not A Name" })).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(refused["error"]["code"], "route-not-found", "{refused}");
         assert_eq!(refused.as_object().unwrap().len(), 1, "{refused}");
     }
 
     async fn platform() -> Harness {
-        harness_with_storage(true, storage_wiring(Some(TEST_STORAGE_SECRET)),
-        )
-        .await
+        harness_with_storage(true, storage_wiring(Some(TEST_STORAGE_SECRET))).await
     }
 
     async fn app_with_production(h: &Harness, app: &str) {

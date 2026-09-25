@@ -120,9 +120,9 @@ mod tests {
                         "the refusal must name both the literal and the inner address: {text}"
                     );
                 }
-                other => panic!(
-                    "{url} was refused as {other:?}, expected a transition-form refusal"
-                ),
+                other => {
+                    panic!("{url} was refused as {other:?}, expected a transition-form refusal")
+                }
             }
         }
     }
@@ -181,9 +181,7 @@ mod tests {
                 assert_eq!(embedded, "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap());
                 assert!(kind.contains("loopback"), "{kind}");
             }
-            other => panic!(
-                "the hop was refused as {other:?}, expected a transition-form refusal"
-            ),
+            other => panic!("the hop was refused as {other:?}, expected a transition-form refusal"),
         }
     }
 

@@ -1,9 +1,7 @@
 use crate::command::{CommandExecutor, CommandResponse};
 use crate::config::ControlConfig;
 use crate::database::{Database, Event, EventSeverity, HeartbeatEntry};
-use crate::message::{
-    HeartbeatAck, HeartbeatRequest, RegisterRequest, RegisterResponse,
-};
+use crate::message::{HeartbeatAck, HeartbeatRequest, RegisterRequest, RegisterResponse};
 use crate::session::{NodeEvent, NodeSession, NodeState, SessionManager};
 use chrono::Utc;
 use std::sync::Arc;

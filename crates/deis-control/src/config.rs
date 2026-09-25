@@ -755,10 +755,8 @@ mod tests {
     /// the key material in one place.
     #[test]
     fn a_data_directory_carries_the_bundle_directory_with_it() {
-        let config: ControlConfig = toml::from_str(&format!(
-            "{REQUIRED}data_dir = '/srv/deis'\n"
-        ))
-        .expect("data_dir alone is a valid file");
+        let config: ControlConfig = toml::from_str(&format!("{REQUIRED}data_dir = '/srv/deis'\n"))
+            .expect("data_dir alone is a valid file");
 
         assert_eq!(config.bundle_dir(), PathBuf::from("/srv/deis/bundles"));
     }
@@ -786,7 +784,10 @@ mod tests {
             .refuse_relative_paths(Path::new("/srv/deis/control.db"))
             .expect_err("a relative data directory must be refused");
         let said = refusal.to_string();
-        assert!(said.contains("data_dir data"), "the refusal names it: {said}");
+        assert!(
+            said.contains("data_dir data"),
+            "the refusal names it: {said}"
+        );
 
         let config = ControlConfig::default();
         let refusal = config
@@ -855,10 +856,7 @@ mod tests {
             ControlConfig::default().backup_material(Path::new("/var/lib/deis-control/control.db"));
 
         assert_eq!(
-            material
-                .iter()
-                .map(|(name, _)| *name)
-                .collect::<Vec<_>>(),
+            material.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
             vec!["control database", "uploaded bundles"]
         );
     }

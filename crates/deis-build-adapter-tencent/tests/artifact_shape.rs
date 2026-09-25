@@ -229,5 +229,8 @@ fn validated_node_graph_uses_build_output_v3_node_api_shape() {
     // pattern like ^/(.*)$ claims every path.
     assert_eq!(config["routes"][2]["handle"], "filesystem");
     assert!(!config["routes"][2].as_object().unwrap().contains_key("src"));
-    assert!(!config["routes"][2].as_object().unwrap().contains_key("dest"));
+    assert!(!config["routes"][2]
+        .as_object()
+        .unwrap()
+        .contains_key("dest"));
 }

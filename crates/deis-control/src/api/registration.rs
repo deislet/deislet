@@ -19,12 +19,9 @@
 //! catalog, and a node that never registers still serves every application it
 //! pulls; it is only invisible to pushes and to cron.
 
-
 use serde::{Deserialize, Serialize};
 
-use crate::runtime_client::{
-    NodeSource, Registered, RegistrationError,
-};
+use crate::runtime_client::{NodeSource, Registered, RegistrationError};
 
 /// What a node sends about itself.
 #[derive(Debug, Deserialize)]

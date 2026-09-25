@@ -115,8 +115,6 @@ pub enum FetchError {
     Invalid(#[from] DocumentError),
 }
 
-
-
 /// How a connection to the machine channel is opened.
 ///
 /// A trait rather than the [`Dialler`] outright, because a mutual TLS
@@ -191,7 +189,6 @@ pub struct CatalogClient {
 }
 
 impl CatalogClient {
-
     /// Fetch over the machine channel, proving `identity` and requiring
     /// `control` to be proved back.
     ///
@@ -374,7 +371,6 @@ impl CatalogClient {
 
         self.accept(answer.into_inner().routing_table_json.as_bytes())
     }
-
 }
 
 /// Build the client this configuration asks for: the machine channel, proving

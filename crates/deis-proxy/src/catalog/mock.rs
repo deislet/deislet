@@ -164,7 +164,12 @@ impl MockControl {
         let directory = tempfile::tempdir().expect("a directory");
         let ca = TestCa::new();
         let control_id = names::control(TRUST_DOMAIN).expect("a control name");
-        let files = write_files(directory.path(), "control", &ca.issue(&control_id), &ca.root_pem);
+        let files = write_files(
+            directory.path(),
+            "control",
+            &ca.issue(&control_id),
+            &ca.root_pem,
+        );
         let control_identity = MachineIdentity::load(files.as_identity_files(), &[Protocol::Http2])
             .expect("a control identity");
 

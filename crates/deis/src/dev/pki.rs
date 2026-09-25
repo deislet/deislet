@@ -78,8 +78,12 @@ pub struct DevPki {
 /// node only serves loopback, a key that is readable for no reason is a key
 /// that will eventually be copied somewhere it matters.
 pub fn issue(directory: &Path) -> Result<DevPki> {
-    fs::create_dir_all(directory)
-        .with_context(|| format!("creating {} for this run's certificates", directory.display()))?;
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "creating {} for this run's certificates",
+            directory.display()
+        )
+    })?;
 
     let authority = Authority::new()?;
     let control_name = format!("spiffe://{DEV_TRUST_DOMAIN}/deislet/control");
@@ -209,7 +213,13 @@ mod tests {
         let pki = issue(dir.path()).expect("certificates");
         for key in [&pki.node.private_key, &pki.control.private_key] {
             let mode = fs::metadata(key).expect("the key").permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "{} is {:o}", key.display(), mode & 0o777);
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "{} is {:o}",
+                key.display(),
+                mode & 0o777
+            );
         }
     }
 }

@@ -22,8 +22,7 @@ use deis_wire::{
     BACKEND_RESTORE_REPORT_SCHEMA_V1, BACKEND_RESTORE_SET_SCHEMA_V1, BackendRestoreExecutionReport,
     BackendRestoreExecutionState, BackendRestoreSet, BackendRestoredComponent, CanonicalId,
     RestoreBackend, RestoreBarrierKind, RestoreComponent, RestoreConsistencyBarrier, RestoreDigest,
-    RestoreScope, RestoreScopeKind, RestoreTopologyDriver,
-    durability::sync_parent_directory,
+    RestoreScope, RestoreScopeKind, RestoreTopologyDriver, durability::sync_parent_directory,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};

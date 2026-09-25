@@ -117,10 +117,7 @@ mod tests {
 
     #[test]
     fn a_request_without_a_surface_is_spelled_for_v1() {
-        assert_eq!(
-            ApiPaths::of(&Extensions::new()).surface(),
-            ApiSurface::V1
-        );
+        assert_eq!(ApiPaths::of(&Extensions::new()).surface(), ApiSurface::V1);
         let mut extensions = Extensions::new();
         extensions.insert(ApiSurface::Platform);
         assert_eq!(ApiPaths::of(&extensions).surface(), ApiSurface::Platform);

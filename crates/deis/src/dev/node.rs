@@ -542,11 +542,7 @@ async fn connect(
         // Built fresh each attempt: a dialler holds the certificate material
         // in force when it was made, and the node may not have finished
         // binding its listener on the first try.
-        let dialler = Dialler::new(
-            Arc::clone(&identity),
-            node_name.clone(),
-            &[Protocol::Http2],
-        );
+        let dialler = Dialler::new(Arc::clone(&identity), node_name.clone(), &[Protocol::Http2]);
         match endpoint.clone().connect_with_connector(dialler).await {
             Ok(channel) => {
                 let mut client = RuntimeManagementClient::new(channel)

@@ -1230,7 +1230,12 @@ mod tests {
     /// [`resolve_app`] on an instance nobody drives: no `[control]` section,
     /// so this machine's own application list is the whole truth about
     /// routing and an empty one is a plain reverse proxy.
-    fn standalone(routes: &RouteTable, catalog: &CatalogRoutes, host: &str, path: &str) -> Resolution {
+    fn standalone(
+        routes: &RouteTable,
+        catalog: &CatalogRoutes,
+        host: &str,
+        path: &str,
+    ) -> Resolution {
         resolve_app(routes, catalog, RoutingSource::ThisMachine, host, path)
     }
 
@@ -1412,7 +1417,10 @@ mod tests {
         let routes = table(&[]);
         let found = resolved(driven(&routes, &catalog, "shop.example.com", "/")).unwrap();
         assert_eq!(found.app_id, "shop");
-        assert_eq!(found.environment, deis_wire::conventions::DEFAULT_ENVIRONMENT);
+        assert_eq!(
+            found.environment,
+            deis_wire::conventions::DEFAULT_ENVIRONMENT
+        );
         assert!(matches!(
             driven(&routes, &catalog, "anything.test", "/"),
             Resolution::NotFound

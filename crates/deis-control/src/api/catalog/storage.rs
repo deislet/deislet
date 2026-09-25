@@ -265,7 +265,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(
-            body["error"]["message"].as_str().unwrap().contains("store_endpoint"),
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("store_endpoint"),
             "{body}"
         );
     }

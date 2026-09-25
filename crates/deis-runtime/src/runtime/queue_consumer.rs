@@ -154,12 +154,7 @@ impl QueuePort for QueueClient {
         delay_seconds: u32,
         refund_attempt: bool,
     ) -> BoxFuture<'a, anyhow::Result<NackOutcome>> {
-        Box::pin(self.nack(
-            queue,
-            handles,
-            delay_seconds,
-            refund_attempt,
-        ))
+        Box::pin(self.nack(queue, handles, delay_seconds, refund_attempt))
     }
 }
 
@@ -592,8 +587,7 @@ async fn handle_batch(
     // there would let a poison message outlive the ceiling that exists to
     // retire it.
     let (outcome, refund_attempt) =
-        match tokio::time::timeout(budget, invoke(queue.to_string(), messages.clone())).await
-        {
+        match tokio::time::timeout(budget, invoke(queue.to_string(), messages.clone())).await {
             Err(_) => (
                 Err(anyhow::anyhow!(
                     "the batch was not finished within the {} second(s) its lease still had to \

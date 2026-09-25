@@ -511,9 +511,6 @@ mod tests {
         // only that the caller be entitled to read what it binds to, and an
         // unscoped owner is.
         let manifest = manifest_with(r#"{"AUTH":{"kind":"service","app":"auth-api"}}"#);
-        assert_eq!(
-            check_service_bindings(&unscoped_owner(), &manifest),
-            Ok(())
-        );
+        assert_eq!(check_service_bindings(&unscoped_owner(), &manifest), Ok(()));
     }
 }

@@ -751,10 +751,8 @@ impl IdentityStore {
         }
         let now = self.now();
         let expires_at = now + BOOTSTRAP_TTL_SECS;
-        self.with_conn(move |conn| {
-            ensure_account_row(conn, BOOTSTRAP_ACCOUNT, Role::Owner, now)
-        })
-        .await?;
+        self.with_conn(move |conn| ensure_account_row(conn, BOOTSTRAP_ACCOUNT, Role::Owner, now))
+            .await?;
         let minted = token::mint();
         let row_id = minted.id.clone();
         let secret = minted.secret.clone();
@@ -1369,16 +1367,9 @@ mod tests {
     #[tokio::test]
     async fn a_preset_bootstrap_token_replaces_the_previous_one_and_refuses_malformed_input() {
         let store = new_store().await;
-        let (first_id, first_secret) = store
-            .ensure_bootstrap_token()
-            .await
-            .unwrap()
-            .expect("mint");
+        let (first_id, first_secret) = store.ensure_bootstrap_token().await.unwrap().expect("mint");
 
-        let replacement = format!(
-            "deis_pat_ffffffffffffffff_{}",
-            "a".repeat(64)
-        );
+        let replacement = format!("deis_pat_ffffffffffffffff_{}", "a".repeat(64));
         let second_id = store
             .install_preset_bootstrap_token(&replacement)
             .await
@@ -1397,10 +1388,7 @@ mod tests {
             .install_preset_bootstrap_token("not-a-token")
             .await
             .unwrap_err();
-        assert!(
-            refused.to_string().contains("well-formed"),
-            "{refused}"
-        );
+        assert!(refused.to_string().contains("well-formed"), "{refused}");
     }
 
     /// Revoking the bootstrap credential after its first use is the gate's
@@ -1409,11 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn a_bootstrap_token_revoked_after_use_is_refused_on_its_next_presentation() {
         let store = new_store().await;
-        let (id, secret) = store
-            .ensure_bootstrap_token()
-            .await
-            .unwrap()
-            .expect("mint");
+        let (id, secret) = store.ensure_bootstrap_token().await.unwrap().expect("mint");
         store.revoke_bootstrap_token(&id).await.unwrap();
         assert!(matches!(
             store.resolve_token(&secret).await.unwrap(),

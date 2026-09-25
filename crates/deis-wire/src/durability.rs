@@ -43,10 +43,8 @@ mod tests {
 
     #[test]
     fn a_created_file_has_a_fsyncable_parent() {
-        let dir = std::env::temp_dir().join(format!(
-            "deis-wire-durability-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("deis-wire-durability-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("entry");
         fs::write(&file, b"bytes").unwrap();

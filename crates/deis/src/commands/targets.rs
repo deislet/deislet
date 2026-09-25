@@ -292,10 +292,13 @@ mod tests {
             .map(|backend| backend.id.as_str())
             .collect();
         assert_eq!(frozen, vec!["tencent-edgeone-makers", "deno"]);
-        assert!(status.backends.iter().all(
-            |backend| backend.lifecycle != "frozen"
-                || (!backend.certification.compliant && !backend.certification.supported)
-        ));
+        assert!(
+            status
+                .backends
+                .iter()
+                .all(|backend| backend.lifecycle != "frozen"
+                    || (!backend.certification.compliant && !backend.certification.supported))
+        );
     }
 
     #[test]

@@ -2446,7 +2446,14 @@ mod tests {
             "ControlListPage_Environment",
             "listEnvironments",
             200,
-            send_json(r, &secret, "GET", "/api/apps/demo/environments", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/apps/demo/environments",
+                Value::Null,
+            )
+            .await,
         );
         let uploaded = send(
             r,
@@ -2731,7 +2738,14 @@ mod tests {
             "ControlListPage_ApiToken",
             "listTokens",
             200,
-            send_json(r, &secret, "GET", "/api/v1/tokens?account=root", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/v1/tokens?account=root",
+                Value::Null,
+            )
+            .await,
         );
         keep(
             "ApiToken",
@@ -2781,13 +2795,27 @@ mod tests {
             "NodeConfigs",
             "getNodeConfigs",
             200,
-            send_json(r, &secret, "GET", "/api/platform/configs/node-a", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/platform/configs/node-a",
+                Value::Null,
+            )
+            .await,
         );
         keep(
             "ConfigValue",
             "getNodeConfigValue",
             200,
-            send_json(r, &secret, "GET", "/api/platform/configs/node-a/port", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/platform/configs/node-a/port",
+                Value::Null,
+            )
+            .await,
         );
         keep(
             "ControlListPage_ConfigHistoryItem",
@@ -2806,7 +2834,14 @@ mod tests {
             "ConfigStatsResponse",
             "getNodeConfigStats",
             200,
-            send_json(r, &secret, "GET", "/api/platform/configs/stats", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/platform/configs/stats",
+                Value::Null,
+            )
+            .await,
         );
         keep(
             "ConfigKeyOutcome",
@@ -2825,7 +2860,14 @@ mod tests {
             "NodeConfigOutcome",
             "deleteNodeConfigs",
             200,
-            send_json(r, &secret, "DELETE", "/api/platform/configs/node-a", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "DELETE",
+                "/api/platform/configs/node-a",
+                Value::Null,
+            )
+            .await,
         );
         for (schema, operation_id, uri) in [
             ("SessionsResponse", "listSessions", "/api/platform/sessions"),

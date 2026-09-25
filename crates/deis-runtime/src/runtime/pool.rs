@@ -112,7 +112,9 @@ pub enum DispatchError {
     /// reports the application as not hosted so the control plane reinstalls
     /// it. Until it is reinstalled, the right answer for a caller is to try
     /// again shortly, not to fail as if the application itself had broken.
-    #[error("the runtime thread for this application has stopped and it is not serving on this node")]
+    #[error(
+        "the runtime thread for this application has stopped and it is not serving on this node"
+    )]
     Stopped,
     /// The application is not on this node at all: it was never placed here,
     /// or it was and its placement has since been forgotten.
@@ -1341,8 +1343,9 @@ impl RuntimePool {
         // startup with the configured value.
         let admission_wait_ms =
             Arc::new(AtomicU64::new(crate::config::default_admission_wait_ms()));
-        let overload_retry_after_secs =
-            Arc::new(AtomicU64::new(crate::config::default_overload_retry_after_seconds()));
+        let overload_retry_after_secs = Arc::new(AtomicU64::new(
+            crate::config::default_overload_retry_after_seconds(),
+        ));
 
         Arc::new_cyclic(|self_ref| {
             let threads = (0..num_threads)
@@ -2952,14 +2955,12 @@ impl RuntimePool {
                 })?
                 .sender
                 .clone(),
-            None => placement
-                .threads
-                [*placement
-                    .of_app
-                    .get(tenant)
-                    .ok_or_else(|| anyhow::anyhow!("tenant {tenant} is not placed"))?]
-                .sender
-                .clone(),
+            None => placement.threads[*placement
+                .of_app
+                .get(tenant)
+                .ok_or_else(|| anyhow::anyhow!("tenant {tenant} is not placed"))?]
+            .sender
+            .clone(),
         };
         for _ in 0..1000 {
             let (tx, _rx) = oneshot::channel();
@@ -4678,7 +4679,10 @@ mod tests {
         // dropped, so what the thread reaches afterwards is work whose
         // caller has gone and it throws it away rather than running it.
         let placement = pool.placement.read().await;
-        let id = *placement.of_app.get(app).expect("the application is placed");
+        let id = *placement
+            .of_app
+            .get(app)
+            .expect("the application is placed");
         let mut refused = None;
         for _ in 0..200 {
             let (tx, _rx) = oneshot::channel();
@@ -4728,8 +4732,7 @@ mod tests {
                 .of_app
                 .get(app)
                 .expect("the application is still placed");
-            let accepted = placement
-                .threads[id]
+            let accepted = placement.threads[id]
                 .send(RuntimeMessage::ExecuteRequest {
                     app_id: app.to_string(),
                     url: "http://localhost/".to_string(),
@@ -4913,7 +4916,10 @@ mod tests {
     #[test]
     fn dispatch_refusal_messages_carry_no_accidental_spaces_in_their_middle() {
         for message in [
-            DispatchError::Overloaded { retry_after: Duration::from_secs(1) }.to_string(),
+            DispatchError::Overloaded {
+                retry_after: Duration::from_secs(1),
+            }
+            .to_string(),
             DispatchError::Stopped.to_string(),
             DispatchError::NotFound.to_string(),
             DispatchError::GenerationNotPrepared.to_string(),

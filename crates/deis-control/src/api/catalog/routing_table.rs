@@ -354,7 +354,6 @@ mod tests {
             .expect("the routing table is built")
     }
 
-
     async fn create_app(router: &axum::Router, id: &str) {
         let response = router
             .clone()
@@ -550,5 +549,4 @@ mod tests {
             ["app_id", "environment", "host", "path_prefix", "priority"]
         );
     }
-
 }

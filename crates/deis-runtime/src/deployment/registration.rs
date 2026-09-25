@@ -57,7 +57,6 @@ use serde::{Deserialize, Serialize};
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, warn};
 
-
 /// What a node says about itself.
 ///
 /// Only things the node actually knows. `host` and `port` are where this
@@ -139,7 +138,6 @@ struct RegisterAnswer {
     #[serde(default)]
     refresh_after_seconds: u64,
 }
-
 
 impl NodeRegistration {
     /// The role string a deis-runtime node registers under.
@@ -314,7 +312,6 @@ enum Transport {
 }
 
 impl NodeRegistrar {
-
     /// Register over the machine channel, proving `identity` and refusing to
     /// talk to anything that cannot prove it is `control_identity`.
     ///
@@ -528,7 +525,6 @@ impl NodeRegistrar {
             .await
     }
 
-
     async fn register_over_machine_channel(
         &self,
         client: &MachineChannelClient<Channel>,
@@ -602,7 +598,6 @@ impl NodeRegistrar {
             } => self.deregister_over_machine_channel(client, identity).await,
         }
     }
-
 
     async fn deregister_over_machine_channel(
         &self,

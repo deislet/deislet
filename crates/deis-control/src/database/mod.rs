@@ -2285,10 +2285,8 @@ mod tests {
         let holder = tokio::spawn(async move {
             first
                 .with_connection(move |conn| {
-                    let tx = rusqlite::Transaction::new_unchecked(
-                        conn,
-                        TransactionBehavior::Immediate,
-                    )?;
+                    let tx =
+                        rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
                     tx.execute(
                         "INSERT INTO events (event_type, node_id, severity, message, timestamp) \
                          VALUES ('test', NULL, 'Info', 'holding the write lock', ?1)",
@@ -2350,10 +2348,7 @@ mod tests {
                     directories.push(path);
                 } else if path.extension().is_some_and(|extension| extension == "rs") {
                     scanned += 1;
-                    if std::fs::read_to_string(&path)
-                        .unwrap()
-                        .contains(needle)
-                    {
+                    if std::fs::read_to_string(&path).unwrap().contains(needle) {
                         offenders.push(path.display().to_string());
                     }
                 }
