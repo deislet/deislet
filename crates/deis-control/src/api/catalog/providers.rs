@@ -115,6 +115,10 @@ pub struct ProvisionCredentialRequest {
     pub backend_id: String,
     pub name: String,
     pub credential: String,
+    /// Provider-specific account identifier (e.g., Cloudflare account ID).
+    /// Passed as `account_id` to the credential binding spec.
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -565,6 +569,7 @@ pub async fn provision_credential(
             "backendId": request.backend_id,
             "name": request.name,
             "credential": request.credential,
+            "accountId": request.account_id,
         }),
     )?;
     let material = credential_material(request.credential)?;
@@ -581,6 +586,7 @@ pub async fn provision_credential(
                 ProviderCredentialBindingSpec {
                     backend_id: request.backend_id,
                     name: request.name,
+                    account_id: request.account_id.clone(),
                 },
                 material,
                 credential_mutation_context(&principal, record),

@@ -16,7 +16,7 @@ use deis_provider_driver::{
 use deis_wire::CanonicalId;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::idempotency::{PendingIdempotencyRecord, complete_idempotency_record};
@@ -33,10 +33,16 @@ const MAX_CREDENTIAL_LEASE: Duration = Duration::from_secs(5 * 60);
 const SYSTEM_VAULT_ACTOR: &str = "system:provider-credential-vault";
 const SYSTEM_DRIVER_ACTOR: &str = "system:provider-driver";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderCredentialBindingSpec {
     pub backend_id: String,
     pub name: String,
+    /// Provider-specific account identifier (e.g., Cloudflare account ID).
+    /// When provisioning a Cloudflare credential, this maps to the
+    /// `account_id` field in the `EDGE_CANON_PROVIDER_CREDENTIAL` environment
+    /// variable (`{"api_token":"...","account_id":"..."}`).
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 /// Identity attached to a provider-credential lifecycle audit event.
@@ -1225,6 +1231,7 @@ mod tests {
                 ProviderCredentialBindingSpec {
                     backend_id: "cloudflare-workers-pages".to_owned(),
                     name: "credential-test".to_owned(),
+                    account_id: None,
                 },
                 CredentialMaterial::new(secret.to_vec()).unwrap(),
                 context("credential-provision"),

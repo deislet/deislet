@@ -229,6 +229,14 @@ enum Commands {
         /// Keep the bundle unminified.
         #[arg(long)]
         no_minify: bool,
+
+        /// Deploy to an external platform through its provider driver.
+        #[arg(
+            long,
+            value_name = "VENDOR",
+            help = "Provider driver vendor (e.g., cloudflare)"
+        )]
+        vendor: Option<String>,
     },
 
     /// List an application's versions and which environments run them.
@@ -1286,6 +1294,7 @@ async fn run(cli: Cli) -> Result<()> {
             bundle,
             no_build,
             no_minify,
+            vendor,
         } => {
             commands::deploy::execute(
                 commands::deploy::Args {
@@ -1295,6 +1304,7 @@ async fn run(cli: Cli) -> Result<()> {
                     bundle,
                     no_build,
                     no_minify,
+                    vendor,
                 },
                 format.into(),
             )
@@ -2031,12 +2041,12 @@ mod tests {
         );
     }
 
-    /// Deploying targets this platform only. A `--vendor` flag here would
-    /// have suggested it could push to Cloudflare or Deno, which it cannot.
+    /// Deploying a vendor routes through the provider driver on the
+    /// control plane (preflight/plan/prepare/upload/verify/activate).
     #[test]
-    fn deploy_takes_no_vendor() {
+    fn deploy_accepts_vendor_flag() {
         assert!(
-            Cli::try_parse_from(["deis", "deploy", "--vendor", "cloudflare"]).is_err(),
+            Cli::try_parse_from(["deis", "deploy", "--vendor", "cloudflare"]).is_ok(),
             "deploy must not accept --vendor"
         );
         assert!(
