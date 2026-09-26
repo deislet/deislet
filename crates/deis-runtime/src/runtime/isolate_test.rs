@@ -1681,6 +1681,100 @@ export default function handler(context: any): Response {
         );
     }
 
+    /// A lifetime below the shared standard's floor (60 seconds) is refused at
+    /// the call site: it is a lifetime the other target (Cloudflare Workers
+    /// KV) cannot express, so an application must not learn to depend on one.
+    #[tokio::test]
+    async fn a_lifetime_below_the_shared_minimum_is_refused_before_the_store_sees_it() {
+        let code = r#"
+            export default async function handler(ctx) {
+                try {
+                    await ctx.services.kv.put("k", "v", { expirationTtl: 59 });
+                    return new Response("accepted");
+                } catch (e) {
+                    return new Response(String(e.message || e));
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "kv_short_ttl_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (_, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body).unwrap_or_default();
+        assert!(
+            body.contains("expirationTtl") && body.contains("at least 60"),
+            "the app must be told the shared floor: {body}"
+        );
+    }
+
+    /// Metadata over the shared standard's 1 KiB ceiling is refused at the
+    /// call site, with the encoded size named: that is the size the store
+    /// would hold, which is the size the other target bounds.
+    #[tokio::test]
+    async fn metadata_over_the_shared_ceiling_is_refused_before_the_store_sees_it() {
+        let code = r#"
+            export default async function handler(ctx) {
+                try {
+                    await ctx.services.kv.put("k", "v", { metadata: "m".repeat(1024) });
+                    return new Response("accepted");
+                } catch (e) {
+                    return new Response(String(e.message || e));
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "kv_big_metadata_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (_, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body).unwrap_or_default();
+        // A string of 1024 `m`s encodes to a 1026-byte JSON string (two
+        // quotes), one past the ceiling; 1024 encoded bytes is inside it.
+        assert!(
+            body.contains("metadata is 1026 bytes encoded, limit is 1024"),
+            "the app must be told the encoded size and the ceiling: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_fetch() {
         let code = r#"

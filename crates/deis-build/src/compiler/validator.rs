@@ -1,7 +1,7 @@
 use deis_build_core::*;
-use swc_common::{sync::Lrc, FileName, SourceMap};
+use swc_common::{FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
-use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
+use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
 use swc_ecma_visit::{Visit, VisitWith};
 
 pub struct Validator {

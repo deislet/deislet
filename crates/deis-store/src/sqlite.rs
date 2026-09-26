@@ -135,39 +135,42 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The largest single string, blob or table row a tenant's SQL may produce
 /// or store, in bytes. SQLite's own default is a gigabyte.
 ///
-/// Eight megabytes, derived from the wire rather than from taste. A value a
-/// caller wrote arrived in one gRPC message, and a value it reads leaves in
-/// one, and that message is capped at
-/// [`crate::MAX_GRPC_MESSAGE_BYTES`] - sixteen megabytes. Half of it is the
-/// largest single value that still leaves room in the message for the row it
-/// sits in and the columns beside it. Anything larger is either unreachable
-/// from outside or was built inside SQLite by a function like `randomblob`,
-/// where the only thing it can do is cost memory: `SELECT
-/// randomblob(20000000)` took the store from 18 MB resident to 1476 MB,
-/// because a blob comes back as a JSON array of byte values, and SQLite's
-/// default would have allowed fifty times that in one call.
+/// Two megabytes - two million bytes, the shared standard's single-value
+/// ceiling.
+///
+/// Cloudflare D1 refuses a single string, blob or row over about 2,000,000
+/// bytes (developers.cloudflare.com/d1/platform/limits, checked 2026-09-25),
+/// so a value the self-hosted store accepted past that would be one an
+/// application could write here and never store there. It is also well under
+/// the wire bound it used to be derived from: a value a caller wrote arrived
+/// in one gRPC message capped at [`crate::MAX_GRPC_MESSAGE_BYTES`], and half
+/// of that is ample room for the row it sits in and the columns beside it.
+/// Anything larger is either unreachable from outside or was built inside
+/// SQLite by a function like `randomblob`, where the only thing it can do is
+/// cost memory: `SELECT randomblob(20000000)` took the store from 18 MB
+/// resident to 1476 MB, because a blob comes back as a JSON array of byte
+/// values, and SQLite's default would have allowed fifty times that in one
+/// call.
 ///
 /// This also caps the total width of a row, which is what it should do: a
-/// row wider than one message can never be read back whole either.
-const TENANT_MAX_VALUE_BYTES: i32 = 8 * 1024 * 1024;
+/// row wider than the ceiling can never be read back whole on every host.
+const TENANT_MAX_VALUE_BYTES: i32 = 2_000_000;
 
 /// The longest single statement a tenant may send, in bytes. SQLite's own
 /// default is again a gigabyte.
 ///
-/// Sixty-four kilobytes is around fifteen hundred lines of SQL, and it is
-/// also roughly where SQLite's own `SQLITE_LIMIT_VARIABLE_NUMBER` of 32766
-/// already stops an `INSERT ... VALUES (?),(?),...`: two characters a
-/// placeholder puts that statement at 64 KB give or take. So the two
-/// ceilings meet, and nothing that fits under the existing one is refused by
-/// this one.
+/// One hundred thousand bytes, the shared standard's statement ceiling:
+/// Cloudflare D1 documents about 100 KB of SQL per statement
+/// (developers.cloudflare.com/d1/platform/limits, checked 2026-09-25), so the
+/// self-hosted store holds the same line and an application cannot grow a
+/// statement the other target would refuse.
 ///
 /// It is here rather than in [`crate::database`] because the memory it
 /// bounds is not the statement's own. `Prepare` remembers statement text
 /// under a handle, up to `MAX_PREPARED_STATEMENTS` of them at once, and
 /// until this limit existed the size of each was bounded only by the gRPC
-/// message that carried it - 4096 handles of 16 MB is 64 GB of remembered
-/// SQL. With it the same table cannot exceed 256 MB.
-const TENANT_MAX_SQL_BYTES: i32 = 64 * 1024;
+/// message that carried it. With it the same table cannot exceed 256 MB.
+const TENANT_MAX_SQL_BYTES: i32 = 100_000;
 
 /// How many SQLite virtual-machine instructions run between two consultations
 /// of the cost budget.

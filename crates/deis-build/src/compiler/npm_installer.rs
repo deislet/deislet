@@ -6,9 +6,9 @@
 //! bundler consume it. No provider receives registry credentials or a runtime
 //! package manager.
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use deis_build_core::{NodeNpmUsage, NODE_SEMANTIC_BASELINE};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use deis_build_core::{NODE_SEMANTIC_BASELINE, NodeNpmUsage};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha512};
@@ -21,7 +21,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::{Child, Command};
-use tokio::time::{sleep, sleep_until, timeout, Instant};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 use unicode_normalization::UnicodeNormalization;
 
 const NPM_TOOLCHAIN_VERSION: &str = "11.19.0";
@@ -200,7 +200,9 @@ pub(super) async fn stage_locked_dependencies(
     if !status.success() {
         anyhow::bail!(
             "EC_NPM_PACKAGE_UNRESOLVED: pinned npm install failed with status {}; stdout/stderr are withheld because registry diagnostics may contain credentials",
-            status.code().map_or_else(|| "signal".to_string(), |code| code.to_string())
+            status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string())
         );
     }
 

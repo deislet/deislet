@@ -6,9 +6,8 @@
 
 use crate::ModuleReference;
 pub use deis_node_contract::{
-    builtin_exports, canonical_builtin, is_known_node_builtin, NODE_BUILTIN_MODULES,
-    NODE_CUSTOM_CONDITIONS, NODE_IMPORT_CONDITIONS, NODE_REQUIRE_CONDITIONS,
-    NODE_SEMANTIC_BASELINE,
+    NODE_BUILTIN_MODULES, NODE_CUSTOM_CONDITIONS, NODE_IMPORT_CONDITIONS, NODE_REQUIRE_CONDITIONS,
+    NODE_SEMANTIC_BASELINE, builtin_exports, canonical_builtin, is_known_node_builtin,
 };
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};

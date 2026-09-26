@@ -96,6 +96,13 @@ pub struct Config {
     /// on a timer would quietly destroy the evidence of why a queue failed.
     /// The cost of the default is that the table grows until an operator
     /// prunes it.
+    ///
+    /// Note what the standard guarantees and what it does not: a message
+    /// that exhausts its deliveries enters the dead-letter table, and that is
+    /// all the standard says. How long it is kept afterwards is this
+    /// deployment's choice - the other target keeps dead letters on a
+    /// retention clock, so nothing an application does may depend on a
+    /// dead letter outliving this host's own retention policy.
     #[serde(default = "default_dead_letter_retention_secs")]
     pub dead_letter_retention_secs: i64,
     /// How often expired dead letters are deleted. Only consulted when
@@ -125,8 +132,13 @@ fn default_connections() -> usize {
 
 /// A queue message is a job description, not a payload: anything large
 /// belongs in blob storage with its key sent through the queue.
+///
+/// 128 KB, the shared standard's message ceiling: Cloudflare Queues refuses
+/// a message over 128 KB (developers.cloudflare.com/queues/platform/limits,
+/// checked 2026-09-25), so a larger one would be a message an application
+/// could send on this host and never on the other.
 fn default_max_body_bytes() -> usize {
-    1024 * 1024
+    128 * 1024
 }
 
 fn default_max_batch_messages() -> usize {
@@ -151,9 +163,13 @@ fn default_max_pull_messages() -> i32 {
     100
 }
 
-/// The ceiling the implementation plan names.
+/// The shared standard's delivery count, and also the number a queue
+/// consumer's declaration carries by default: Cloudflare Queues retries a
+/// message 3 times before dead-lettering it (developers.cloudflare.com/queues,
+/// checked 2026-09-25), so a message fails onto the dead-letter table the
+/// same number of deliveries in on both hosts.
 fn default_max_attempts() -> i32 {
-    5
+    3
 }
 
 fn default_dead_letter_retention_secs() -> i64 {
@@ -277,8 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn the_attempt_ceiling_defaults_to_five() {
-        assert_eq!(Config::default().max_attempts, 5);
+    fn the_attempt_ceiling_matches_the_shared_standard() {
+        // 3, Cloudflare Queues' retry count too (checked 2026-09-25): a
+        // message fails onto the dead-letter table the same number of
+        // deliveries in on both hosts, and a queue consumer's declaration
+        // states the same default.
+        assert_eq!(Config::default().max_attempts, 3);
+    }
+
+    #[test]
+    fn the_message_ceiling_matches_the_shared_standard() {
+        // 128 KB, the largest message every host accepts.
+        assert_eq!(Config::default().max_body_bytes, 128 * 1024);
     }
 
     #[test]

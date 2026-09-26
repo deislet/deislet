@@ -1,10 +1,11 @@
-//! Provider targets must not turn non-HTTP event files into public routes.
+//! Provider targets must not turn non-HTTP event files into public routes,
+//! and the cloudflare target encodes them as Workers event exports.
 
 use std::path::Path;
 
 use deis_build::{Compiler, CompilerOptions};
 
-const PROVIDERS: &[&str] = &["cloudflare", "deno", "tencent"];
+const PROVIDERS: &[&str] = &["deno", "tencent"];
 
 fn stage(root: &Path, handler: &str) {
     std::fs::create_dir_all(root.join("functions")).expect("function root");
@@ -86,5 +87,33 @@ async fn a_nested_event_like_name_remains_an_http_handler() {
         build(project.path(), vendor).await.unwrap_or_else(|error| {
             panic!("{vendor} should treat the nested file as HTTP: {error}")
         });
+    }
+}
+
+/// The cloudflare packager encodes event handlers: a root `_queue`/`_scheduled`
+/// file becomes the Workers `queue`/`scheduled` export, and the file is never
+/// published as a route.
+#[tokio::test]
+async fn cloudflare_encodes_event_handlers_as_workers_exports() {
+    for handler in ["_queue.ts", "_scheduled.ts"] {
+        let event_kind = handler.trim_start_matches('_').trim_end_matches(".ts");
+        let project = tempfile::tempdir().expect("temporary project");
+        stage(project.path(), handler);
+
+        let result = build(project.path(), "cloudflare")
+            .await
+            .unwrap_or_else(|error| panic!("cloudflare encodes {handler}: {error}"));
+        let output_dir = Path::new(&result.builds.get("cloudflare").expect("build").output_path);
+        // The bundled entry is the deployable artifact; the export survives
+        // bundling, so it is what gets asserted on.
+        let entry = std::fs::read_to_string(output_dir.join("index.js")).expect("entry module");
+
+        // The bundler minifies, so the export is asserted on in the form the
+        // bundle actually spells it: the export clause names the exported
+        // binding whatever the local function was renamed to.
+        assert!(
+            entry.contains(format!("as {event_kind}").as_str()),
+            "{handler} was not exported from the bundle: {entry}"
+        );
     }
 }

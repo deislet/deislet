@@ -4417,9 +4417,26 @@ mod tests {
         assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
         let message = err.to_string();
         assert!(
-            message.contains("8388608") && message.contains("blob service"),
+            message.contains("2000000") && message.contains("blob service"),
             "the refusal has to name the ceiling and where such a payload belongs: {message}"
         );
+    }
+
+    /// The boundary of the shared single-value ceiling: exactly 2,000,000
+    /// bytes fits, one byte more does not. The other target draws the same
+    /// line, so an application at the boundary runs identically on both.
+    #[tokio::test]
+    async fn a_value_at_the_shared_ceiling_is_kept_and_one_byte_more_is_refused() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        svc.fetch_rows(&app, "SELECT length(randomblob(2000000)) AS n", &[])
+            .await
+            .expect("a value at the ceiling is a legal value");
+        let err = svc
+            .fetch_rows(&app, "SELECT randomblob(2000001) AS b", &[])
+            .await
+            .expect_err("one byte over the ceiling is over the ceiling");
+        assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
     }
 
     /// The same shape one layer over: `Prepare` remembers statement text
@@ -4431,16 +4448,16 @@ mod tests {
         let (_dir, svc) = service();
         let app = tenant("app-one.production");
         // The padding is a comment, so this is one ordinary `SELECT 1` that
-        // happens to weigh 70 KB - the ceiling is on the bytes, not on what
-        // they say.
-        let padded = format!("/*{}*/ SELECT 1 AS n", "x".repeat(70_000));
+        // happens to weigh just over the shared 100 KB statement ceiling - the
+        // ceiling is on the bytes, not on what they say.
+        let padded = format!("/*{}*/ SELECT 1 AS n", "x".repeat(100_500));
 
         let err = svc
             .register_statement(&app, &padded)
             .await
             .expect_err("Prepare must not remember a statement this size");
         assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
-        assert!(err.to_string().contains("65536"), "{err}");
+        assert!(err.to_string().contains("100000"), "{err}");
         assert_eq!(
             svc.statements.len(),
             0,

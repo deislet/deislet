@@ -120,13 +120,13 @@ impl Default for QueueLimits {
         // binary actually runs on; these are for tests and for callers
         // building the service directly.
         Self {
-            max_body_bytes: 1024 * 1024,
+            max_body_bytes: 128 * 1024,
             max_batch_messages: 100,
             default_lease_secs: 30,
             max_lease_secs: 3600,
             default_pull_messages: 10,
             max_pull_messages: 100,
-            max_attempts: 5,
+            max_attempts: 3,
             dead_letter_retention_secs: 0,
             max_pull_response_bytes: MAX_PULL_RESPONSE_BYTES,
         }
@@ -4509,6 +4509,33 @@ mod tests {
         assert_eq!(
             bodies(&f.service.pull(&a, "jobs", None, None).await.unwrap()),
             vec!["one".to_string(), "two".to_string()]
+        );
+    }
+
+    /// The boundary of the shared standard's message ceiling: a message of
+    /// exactly 128 KB - the most Cloudflare Queues accepts - is stored, and
+    /// one byte more is refused with the size named. The default limits are
+    /// the ones under test, so a drift in the default and the standard shows
+    /// here.
+    #[tokio::test]
+    async fn a_message_at_the_shared_ceiling_is_kept_and_one_byte_more_is_refused() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+
+        f.service
+            .send(&a, "jobs", vec![b'x'; 128 * 1024])
+            .await
+            .expect("a message at the shared ceiling is a legal message");
+
+        let err = f
+            .service
+            .send(&a, "jobs", vec![b'x'; 129 * 1024])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QueueError::TooLarge(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("132096") && err.to_string().contains("131072"),
+            "the refusal names the size and the shared ceiling: {err}"
         );
     }
 

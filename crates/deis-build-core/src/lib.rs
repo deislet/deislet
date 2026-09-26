@@ -1,3 +1,4 @@
+pub mod binding_plan;
 pub mod bundler;
 pub mod config;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod routes;
 pub mod target_artifact_coverage;
 pub mod types;
 
+pub use binding_plan::*;
 pub use bundler::*;
 pub use config::*;
 pub use error::*;

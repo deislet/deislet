@@ -337,6 +337,18 @@ pub struct QueueConsumer {
     /// `deis-runtime`'s consumer clamps the value and says what it applied.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
+    /// How many times a failing delivery is retried before the message is
+    /// dead-lettered.
+    ///
+    /// The standard requires the number to be declared, so the build always
+    /// states one here (the standard's default of 3 fills an absent project
+    /// value). The deislet queue service counts attempts server-side and
+    /// applies the same default, so a manifest that says nothing and one that
+    /// says 3 behave identically; the declared value is what a provider
+    /// driver writes into its own consumer configuration, so both targets
+    /// retry the same number of times.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
 }
 
 /// One static file carried in the bundle.

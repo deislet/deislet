@@ -103,6 +103,7 @@ pub fn build_manifest(
                 name: queue.name.clone(),
                 batch_size: queue.batch_size,
                 max_concurrency: queue.max_concurrency,
+                max_retries: queue.max_retries,
             })
             .collect(),
         assets: assets
