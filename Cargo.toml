@@ -24,3 +24,5 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # could not be compared and two builds of the same crate.
 yasm = { version = "0.6.0", features = ["serde"] }
 deis-wire = { path = "crates/deis-wire" }
+deis-build-core = { path = "crates/deis-build-core" }
+deis-provider-driver = { path = "crates/deis-provider-driver" }

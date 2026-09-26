@@ -5013,6 +5013,7 @@ mod tests {
                 ProviderCredentialBindingSpec {
                     backend_id: "cloudflare-workers-pages".to_owned(),
                     name: "provider-test".to_owned(),
+                    account_id: None,
                 },
                 CredentialMaterial::new(b"provider-test-credential".to_vec()).unwrap(),
                 context("provider-credential-provision"),
