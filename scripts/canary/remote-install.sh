@@ -285,7 +285,11 @@ EOF
 
   cat >/etc/deis/runtime.toml <<EOF
 node_id = "${NODE_ID}"
-http_port = ${RUNTIME_PORT}
+# The data port answers only mutual TLS: every caller is verified against the
+# fleet root and must present a certificate naming a proxy of this
+# installation, which is what deis-proxy forwards with and what the health
+# wait below presents.
+data_listen = "0.0.0.0:${RUNTIME_PORT}"
 data_dir = "/var/lib/deis/runtime"
 shutdown_grace_period_secs = 30
 max_request_body_bytes = 33554432
@@ -577,8 +581,9 @@ bootstrap_login() {
   [[ -n ${owner} ]] || die "could not read back the owner account the bootstrap login created"
 
   operator_token=$(DEIS_CONTROL_ENDPOINT="http://${LAN_IP}:${CONTROL_PORT}" DEIS_CONFIG_HOME=/root/.config/deis \
-    /usr/local/bin/deis token create --account "${owner}" --name canary-operator \
-      --scope 'admin:*/*' --scope 'deploy:*/*' --scope 'secrets:*/*' --scope 'storage:*/*' \
+    /usr/local/bin/deis token create --account "${owner}" canary-operator \
+      --scope 'admin:*/*' --scope 'deploy:*/*' --scope 'secrets:*/*' \
+      --scope "storage:demo/production" --scope "storage:demo/preview" \
       --json 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("secret",""))') \
     || operator_token=""
@@ -699,7 +704,7 @@ print_status() {
   log "  console     http://${LAN_IP}:${CONTROL_PORT}/"
   log "  control API http://${LAN_IP}:${CONTROL_PORT}/api"
   log "  health      http://${LAN_IP}:${CONTROL_PORT}/health"
-  log "  runtime     http://${LAN_IP}:${RUNTIME_PORT}/"
+  log "  runtime     https://${LAN_IP}:${RUNTIME_PORT}/  (mutual TLS; a fleet proxy certificate is required)"
   log "  proxy       http://${LAN_IP}:${PROXY_PORT}/"
   log "  preview     http://<env>--<app>.${ZONE}/  (production: http://<app>.${ZONE}/)"
   log "  store gRPC  ${LAN_IP}:${STORE_PORT}"
@@ -745,7 +750,19 @@ check_configs
 warm_runtime_snapshot
 start_stack
 wait_http "http://127.0.0.1:${CONTROL_PORT}/health" deis-control
-wait_http "http://127.0.0.1:${RUNTIME_PORT}/health" deis-runtime -H "x-deis-app-id: _system"
+# The data port admits only a proxy's certificate, so its readiness probe
+# carries this installation's proxy leaf and verifies the node against the
+# fleet root - the same handshake a forwarded request gets.
+if curl -fsS --max-time 2 --retry 45 --retry-delay 2 --retry-all-errors \
+  --cacert "${PKI_DIR}/ca.crt" \
+  --cert "${PKI_DIR}/proxy.crt" --key "${PKI_DIR}/proxy.key" \
+  -H "x-deis-app-id: _system" \
+  "https://127.0.0.1:${RUNTIME_PORT}/health" >/dev/null; then
+  log "ready: deis-runtime (https://127.0.0.1:${RUNTIME_PORT}/health, mutual TLS)"
+else
+  dump_unit deis-runtime
+  die "deis-runtime did not become ready at https://127.0.0.1:${RUNTIME_PORT}/health"
+fi
 wait_tcp 127.0.0.1 "${STORE_PORT}" deis-store
 wait_tcp 127.0.0.1 "${QUEUE_PORT}" deis-queue
 wait_tcp 127.0.0.1 "${TELEMETRY_PORT}" deis-telemetry

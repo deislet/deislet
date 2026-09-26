@@ -311,8 +311,16 @@ dead_port_probe() {
     echo 'DEIS_RUNTIME_PORT=9'
     echo 'DEIS_PROXY_PORT=9'
     echo 'DEIS_CONTROL_PORT=9'
+    # The runtime helpers now carry the demo proxy's certificate, so the
+    # environment they are lifted into has to name a PKI the way the demo's
+    # does. It points at nothing here - which is the point: a curl that
+    # cannot even load a key has to die the same guarded death as one that
+    # cannot connect.
+    printf 'PKI_DIR=%q\n' "${WORK_DIR}/pki"
     printf 'LOG_DIR=%q\n' "$WORK_DIR"
     echo 'control_url() { printf "http://127.0.0.1:%s" "$DEIS_CONTROL_PORT"; }'
+    definition_of runtime_curl
+    definition_of runtime_data_url
     definition_of "$helper"
     # A plain assignment, not `local x=...`: `local` returns its own status
     # and would hide exactly the failure being tested for.
@@ -381,7 +389,9 @@ done
 # and the property wanted is that none of them can end the run - which is a
 # property of how they are written. A check whose curl exits 7 and takes the
 # run with it prints nothing, so the reader learns neither what failed nor
-# that anything did.
+# that anything did. `runtime_curl` is the demo's TLS-carrying curl, so it is
+# counted with the rest: a check that reads its answer has the same duty to
+# guard the assignment.
 unguarded=$(python3 - "${DEMO_FILES[@]}" <<'SCAN'
 import re, sys
 
@@ -391,7 +401,7 @@ for path in sys.argv[1:]:
     i = 0
     while i < len(lines):
         line = lines[i]
-        assignment = re.match(r"^\s*([A-Za-z_][A-Za-z_0-9]*)=\$\(\s*(curl\b.*)$", line)
+        assignment = re.match(r"^\s*([A-Za-z_][A-Za-z_0-9]*)=\$\(\s*((?:runtime_)?curl\b.*)$", line)
         if assignment and not re.match(r"^\s*(local|export|declare|readonly)\b", line):
             j = i
             while lines[j].rstrip().endswith("\\"):

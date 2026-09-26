@@ -10,7 +10,7 @@
 //! DEIS_RUNTIME_ + <table>_<key>, upper-cased
 //! ```
 //!
-//! so `http_port` is `DEIS_RUNTIME_HTTP_PORT`, and
+//! so `data_listen` is `DEIS_RUNTIME_DATA_LISTEN`, and
 //! `[default_execution_limits] timeout_ms` is
 //! `DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS`. There are no aliases and
 //! no second spelling; guessing the variable from the TOML key (or the other
@@ -41,7 +41,8 @@ const REMOVED_ENV_VARS: &[(&str, &str)] = &[
         "DEIS_RUNTIME_DEFAULT_RATE_LIMIT_OPS_PER_SEC",
         "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_RATE_LIMIT_OPS_PER_SEC",
     ),
-    ("PORT", "DEIS_RUNTIME_HTTP_PORT"),
+    ("PORT", "DEIS_RUNTIME_DATA_LISTEN"),
+    ("DEIS_RUNTIME_HTTP_PORT", "DEIS_RUNTIME_DATA_LISTEN"),
     (
         "DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES",
         "DEIS_RUNTIME_BUNDLES_MAX_BYTES",
@@ -54,7 +55,10 @@ const REMOVED_ENV_VARS: &[(&str, &str)] = &[
 /// Same reasoning as [`REMOVED_ENV_VARS`]: a key that is quietly ignored looks
 /// exactly like one that worked, and the setting it names is a ceiling, so the
 /// node would run on a default the operator thought they had overridden.
-const REMOVED_CONFIG_KEYS: &[(&str, &str)] = &[("bundles.max_bundle_bytes", "bundles.max_bytes")];
+const REMOVED_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("bundles.max_bundle_bytes", "bundles.max_bytes"),
+    ("http_port", "data_listen"),
+];
 
 /// Smallest execution timeout that can be configured.
 ///
@@ -105,9 +109,19 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub node_id: Option<String>,
 
-    /// Port serving both HTTP traffic and the gRPC management interface.
-    #[serde(default = "default_http_port")]
-    pub http_port: u16,
+    /// Where this node serves application traffic: its data port, as an
+    /// `ip:port` literal, e.g. `0.0.0.0:8000`.
+    ///
+    /// # Why the data port is no longer a bare port number
+    ///
+    /// It used to be `http_port`, bound on `0.0.0.0`, and a caller was
+    /// admitted because it could reach the socket at all. The data port now
+    /// takes application traffic from this fleet's proxies over mutual TLS -
+    /// see `crate::dispatcher::data` - and where a fleet's proxy sits decides
+    /// which interface this binds: `127.0.0.1` when the proxy is beside this
+    /// node, `0.0.0.0` when it is in front of it on the network.
+    #[serde(default = "default_data_listen")]
+    pub data_listen: String,
 
     /// Directory holding this node's SQLite database and other local state.
     #[serde(default = "default_data_dir")]
@@ -228,8 +242,8 @@ pub struct RuntimeConfig {
     pub node: NodeConfig,
 }
 
-fn default_http_port() -> u16 {
-    8000
+fn default_data_listen() -> String {
+    "127.0.0.1:8000".to_string()
 }
 
 fn default_data_dir() -> PathBuf {
@@ -283,7 +297,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             node_id: None,
-            http_port: default_http_port(),
+            data_listen: default_data_listen(),
             data_dir: default_data_dir(),
             shutdown_grace_period_secs: default_shutdown_grace_period_secs(),
             max_request_body_bytes: default_max_request_body_bytes(),
@@ -1083,6 +1097,24 @@ impl RuntimeConfig {
         Duration::from_secs(self.shutdown_grace_period_secs)
     }
 
+    /// Where the data port binds, parsed.
+    ///
+    /// `data_listen` is an `ip:port` literal and not a hostname, for the same
+    /// reason `machine_identity.management_listen` is: which interface a node
+    /// serves its traffic on is not a question DNS should be answering at
+    /// startup.
+    pub fn data_listen_addr(&self) -> Result<std::net::SocketAddr> {
+        let listen = self.data_listen.trim();
+        listen.parse::<std::net::SocketAddr>().map_err(|e| {
+            anyhow!(
+                "data_listen {listen:?} is not an ip:port address ({e}); write it as \
+                     0.0.0.0:8000 or 127.0.0.1:8000. A hostname is refused because which \
+                     interface this node offers its data port on is not a question DNS should \
+                     be answering at startup"
+            )
+        })
+    }
+
     fn load_from(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -1096,8 +1128,8 @@ impl RuntimeConfig {
             self.node_id = Some(value);
         }
 
-        if let Some(value) = env_var("DEIS_RUNTIME_HTTP_PORT") {
-            self.http_port = parse_env(&value, "DEIS_RUNTIME_HTTP_PORT", "a TCP port")?;
+        if let Some(value) = env_var("DEIS_RUNTIME_DATA_LISTEN") {
+            self.data_listen = value;
         }
 
         if let Some(value) = env_var("DEIS_RUNTIME_DATA_DIR") {
@@ -1452,10 +1484,34 @@ impl RuntimeConfig {
     /// op dispatch kills the request. Failing at startup keeps that class of
     /// mistake in the operator's terminal instead of in the traffic.
     pub fn validate(&self) -> Result<()> {
-        if self.http_port == 0 {
+        // Parsed here rather than at first use so that a typo is an operator's
+        // startup error: a data address that will not parse is a node that
+        // binds nothing and looks healthy while serving nobody.
+        let data_addr = self.data_listen_addr()?;
+        if data_addr.port() == 0 {
             return Err(anyhow!(
-                "http_port must be a real port (1-65535); 0 asks the OS for an arbitrary port, \
-                 which the control plane cannot address"
+                "data_listen {} names port 0, which asks the OS for an arbitrary port. The \
+                 data port is in every proxy's upstream list and every demo check dials it by \
+                 number; a port nobody can predict is a fleet that cannot be configured",
+                self.data_listen
+            ));
+        }
+
+        // The data port is mutual TLS on every address it binds. There is no
+        // listener to serve without an identity: a caller - a proxy - proves a
+        // name before any request exists, and a node that cannot present a
+        // certificate of its own cannot even complete that handshake. Starting
+        // one anyway would move the failure to the first forwarded request, by
+        // which time it is an outage being diagnosed from a handshake error
+        // instead of a startup message naming the missing table.
+        if self.machine_identity.is_none() {
+            return Err(anyhow!(
+                "[machine_identity] is not configured. The data port admits a caller only \
+                 over mutual TLS - a proxy proves a certificate naming it during the TLS \
+                 handshake, before any request is read, and there is no plaintext fallback to \
+                 turn on. Give this node a [machine_identity] table naming its certificate, \
+                 private key and trust root; the same table is what its management plane \
+                 already needed"
             ));
         }
 
@@ -1613,23 +1669,20 @@ impl RuntimeConfig {
         if let Some(identity) = &self.machine_identity {
             identity.validate()?;
 
-            // Three listeners, three sockets. The data listener binds
-            // `0.0.0.0:http_port`, which covers every address on this host,
-            // so a machine listener sharing that port could not bind at all
-            // and would take the node's startup down with it. Sharing a port
-            // with the plaintext management plane is the worse failure of the
-            // two: the two doors authenticate their callers differently, and
-            // which of them a control plane met would be decided by which
-            // bound first. Refused here rather than discovered from an
-            // "address already in use" that names a port and neither setting.
+            // Two listeners, two sockets. A machine listener sharing the data
+            // port could not bind at all and would take the node's startup
+            // down with it, and the two doors authenticate their callers
+            // differently - a control plane on one, a proxy on the other - so
+            // which of them a connection met would be decided by which bound
+            // first. Refused here rather than discovered from an "address
+            // already in use" that names a port and neither setting.
             if let Some(machine) = identity.management_listen_addr()? {
-                if machine.port() == self.http_port {
+                if machine.port() == data_addr.port() {
                     return Err(anyhow!(
                         "machine_identity.management_listen {machine} names the same port as \
-                         http_port ({}), which the data listener binds on every address of this \
-                         host. Give the mutually authenticated management plane a port of its \
-                         own",
-                        self.http_port
+                         data_listen ({}). Give the mutually authenticated management plane a \
+                         port of its own",
+                        data_addr.port()
                     ));
                 }
             }
@@ -2132,7 +2185,7 @@ mod tests {
         let config: RuntimeConfig =
             toml::from_str("[default_execution_limits]\ntimeout_ms = 5000\n").unwrap();
         assert_eq!(config.default_execution_limits.cpu_time_limit_ms, 5_000);
-        config.validate().unwrap();
+        with_a_valid_identity(config).validate().unwrap();
     }
 
     #[test]
@@ -2145,12 +2198,12 @@ mod tests {
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.default_execution_limits.timeout_ms, 30_000);
         assert_eq!(config.default_execution_limits.cpu_time_limit_ms, 250);
-        config.validate().unwrap();
+        with_a_valid_identity(config).validate().unwrap();
     }
 
     #[test]
     fn test_validate_rejects_cpu_ceiling_below_floor() {
-        let mut config = RuntimeConfig::default();
+        let mut config = with_a_valid_identity(RuntimeConfig::default());
         config.default_execution_limits.cpu_time_limit_ms = MIN_CPU_TIME_LIMIT_MS - 1;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("cpu_time_limit_ms"), "{err}");
@@ -2172,7 +2225,7 @@ mod tests {
             config.default_execution_limits.wait_until_timeout_ms,
             120_000
         );
-        config.validate().unwrap();
+        with_a_valid_identity(config).validate().unwrap();
     }
 
     #[test]
@@ -2189,7 +2242,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_tail_budget_below_floor() {
-        let mut config = RuntimeConfig::default();
+        let mut config = with_a_valid_identity(RuntimeConfig::default());
         config.default_execution_limits.wait_until_timeout_ms = MIN_TIMEOUT_MS - 1;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("wait_until_timeout_ms"), "{err}");
@@ -2205,14 +2258,14 @@ mod tests {
     #[test]
     fn test_parse_toml_with_limits_override() {
         let toml_str = r#"
-            http_port = 9000
+            data_listen = "127.0.0.1:9000"
 
             [default_execution_limits]
             timeout_ms = 5000
             rate_limit_ops_per_sec = 250.0
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.http_port, 9000);
+        assert_eq!(config.data_listen, "127.0.0.1:9000");
         assert_eq!(config.default_execution_limits.timeout_ms, 5000);
         assert_eq!(
             config.default_execution_limits.rate_limit_ops_per_sec,
@@ -2222,12 +2275,14 @@ mod tests {
 
     #[test]
     fn the_fetch_allowlist_is_read_and_defaults_to_empty() {
-        let config: RuntimeConfig = toml::from_str("http_port = 9000").unwrap();
+        let config: RuntimeConfig = toml::from_str("data_listen = \"127.0.0.1:9000\"").unwrap();
         assert!(
             config.fetch.allow.is_empty(),
             "a node that says nothing about fetch must let applications reach public \
              destinations and nothing else"
         );
+        // Covered for validation by `a_fetch_allowlist_entry_that_is_not_a_host_fails_startup`;
+        // this test is about the parse alone.
 
         let toml_str = r#"
             [fetch]
@@ -2235,7 +2290,7 @@ mod tests {
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.fetch.allow, ["internal-api.svc:8443", "10.4.0.7"]);
-        config
+        with_a_valid_identity(config)
             .validate()
             .expect("both of those are shapes the policy accepts");
     }
@@ -2246,7 +2301,7 @@ mod tests {
         // by enumeration; this section is for the addresses only the
         // operator knows -- the public IP a cloud 1:1 NAT maps onto this
         // node. Absent section, no addresses.
-        let config: RuntimeConfig = toml::from_str("http_port = 9000").unwrap();
+        let config: RuntimeConfig = toml::from_str("data_listen = \"127.0.0.1:9000\"").unwrap();
         assert!(config.node.advertised_addresses.is_empty());
 
         let toml_str = r#"
@@ -2258,7 +2313,7 @@ mod tests {
             config.node.advertised_addresses,
             ["203.0.113.7", "2001:db8::10"].map(|a| a.parse::<IpAddr>().unwrap())
         );
-        config
+        with_a_valid_identity(config)
             .validate()
             .expect("a list of IP addresses is a valid configuration");
     }
@@ -2315,7 +2370,7 @@ mod tests {
             [fetch]
             allow = ["not a host at all"]
         "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let config = with_a_valid_identity(toml::from_str(toml_str).unwrap());
         let error = config.validate().expect_err("that entry is not a host");
         assert!(error.to_string().contains("fetch.allow"), "{error}");
     }
@@ -2326,7 +2381,7 @@ mod tests {
         // variables unconditionally, so a node that says nothing about them
         // would otherwise have its applications' egress decided by whatever
         // shell, unit file or container env the binary happened to start in.
-        let config: RuntimeConfig = toml::from_str("http_port = 9000").unwrap();
+        let config: RuntimeConfig = toml::from_str("data_listen = \"127.0.0.1:9000\"").unwrap();
         assert!(
             !config.fetch.proxy_from_env,
             "a node that says nothing must not hand applications the node's proxy"
@@ -2344,7 +2399,7 @@ mod tests {
 
     #[test]
     fn test_parse_toml_without_limits_uses_defaults() {
-        let toml_str = "http_port = 9000";
+        let toml_str = "data_listen = \"127.0.0.1:9000\"";
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.default_execution_limits, ExecutionLimits::default());
     }
@@ -2372,30 +2427,32 @@ mod tests {
         assert_eq!(config.logging.batch_size, 64);
         assert_eq!(config.logging.max_retries, 5);
         assert_eq!(config.logging.max_pending_entries, 2048);
-        config.validate().unwrap();
+        with_a_valid_identity(config).validate().unwrap();
     }
 
     #[test]
     fn test_validate_accepts_defaults() {
-        RuntimeConfig::default().validate().unwrap();
+        with_a_valid_identity(RuntimeConfig::default())
+            .validate()
+            .unwrap();
     }
 
     #[test]
     fn test_validate_rejects_zero_admission_wait() {
-        let config = RuntimeConfig {
+        let config = with_a_valid_identity(RuntimeConfig {
             admission_wait_ms: 0,
             ..Default::default()
-        };
+        });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("admission_wait_ms"), "{err}");
     }
 
     #[test]
     fn test_validate_rejects_zero_overload_retry_after() {
-        let config = RuntimeConfig {
+        let config = with_a_valid_identity(RuntimeConfig {
             overload_retry_after_seconds: 0,
             ..Default::default()
-        };
+        });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("overload_retry_after_seconds"), "{err}");
     }
@@ -2420,14 +2477,14 @@ mod tests {
             .expect("a budget at the edge's default read timeout must be reported");
         assert!(warning.contains("admission_wait_ms"), "{warning}");
         assert!(
-            config.validate().is_ok(),
+            with_a_valid_identity(config).validate().is_ok(),
             "an over-long admission budget is reported at startup, not refused"
         );
     }
 
     #[test]
     fn test_validate_rejects_zero_timeout() {
-        let mut config = RuntimeConfig::default();
+        let mut config = with_a_valid_identity(RuntimeConfig::default());
         config.default_execution_limits.timeout_ms = 0;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("timeout_ms"), "{err}");
@@ -2442,7 +2499,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_zero_rate_limit() {
-        let mut config = RuntimeConfig::default();
+        let mut config = with_a_valid_identity(RuntimeConfig::default());
         config.default_execution_limits.rate_limit_ops_per_sec = 0.0;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("rate_limit_ops_per_sec"), "{err}");
@@ -2470,12 +2527,23 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_zero_http_port() {
+    fn test_validate_rejects_unparseable_data_listen() {
         let config = RuntimeConfig {
-            http_port: 0,
+            data_listen: "localhost:8000".to_string(),
             ..Default::default()
         };
-        assert!(config.validate().is_err());
+        let err = config.validate().err().expect("a hostname is refused");
+        assert!(err.to_string().contains("data_listen"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_data_listen_on_port_zero() {
+        let config = RuntimeConfig {
+            data_listen: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().err().expect("port 0 is refused");
+        assert!(err.to_string().contains("port 0"), "{err}");
     }
 
     #[test]
@@ -2489,7 +2557,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_shipping_without_endpoint() {
-        let mut config = RuntimeConfig::default();
+        let mut config = with_a_valid_identity(RuntimeConfig::default());
         config.logging.enabled = true;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("logging.endpoint"), "{err}");
@@ -2511,7 +2579,7 @@ mod tests {
         config.logging.enabled = false;
         config.logging.batch_size = 0;
         config.logging.max_retries = 0;
-        config.validate().unwrap();
+        with_a_valid_identity(config).validate().unwrap();
     }
 
     #[test]
@@ -2540,16 +2608,34 @@ mod tests {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
 
         let dir = tempfile::tempdir().expect("a temporary directory");
+        // `load` validates, and validation requires an identity: these files
+        // are about which file is read, so both carry the same one.
+        let identity = r#"
+            [machine_identity]
+            control_endpoint = "https://127.0.0.1:8443"
+            certificate = "/tmp/node.crt"
+            private_key = "/tmp/node.key"
+            trust_root = "/tmp/fleet-root.pem"
+            trust_domain = "deis.internal"
+        "#;
         let named = dir.path().join("named.toml");
-        std::fs::write(&named, "http_port = 9101\n").expect("the file is written");
+        std::fs::write(
+            &named,
+            format!("data_listen = \"127.0.0.1:9101\"\n{identity}"),
+        )
+        .expect("the file is written");
         let by_variable = dir.path().join("by-variable.toml");
-        std::fs::write(&by_variable, "http_port = 9102\n").expect("the file is written");
+        std::fs::write(
+            &by_variable,
+            format!("data_listen = \"127.0.0.1:9102\"\n{identity}"),
+        )
+        .expect("the file is written");
 
         // With nothing named, the variable still decides, which is what every
         // installation that predates the flag depends on.
         env::set_var("DEIS_RUNTIME_CONFIG", &by_variable);
         let (config, source) = RuntimeConfig::load(None).expect("the variable's file is read");
-        assert_eq!(config.http_port, 9102);
+        assert_eq!(config.data_listen, "127.0.0.1:9102");
         assert_eq!(source.as_deref(), Some(by_variable.as_path()));
 
         // And a file named on the command line wins over it: the flag is the
@@ -2557,7 +2643,7 @@ mod tests {
         // host says so there.
         let (config, source) = RuntimeConfig::load(Some(&named)).expect("the named file is read");
         assert_eq!(
-            config.http_port, 9101,
+            config.data_listen, "127.0.0.1:9101",
             "the file named on the command line was not the one read"
         );
         assert_eq!(source.as_deref(), Some(named.as_path()));
@@ -2690,15 +2776,17 @@ mod tests {
                 .expect("the keys parse");
         assert_eq!(config.max_request_body_bytes, 8192);
         assert_eq!(config.default_memory_limit_mb, 512);
-        config.validate().expect("both values are usable");
+        with_a_valid_identity(config)
+            .validate()
+            .expect("both values are usable");
     }
 
     #[test]
     fn a_zero_request_body_ceiling_is_refused() {
-        let config = RuntimeConfig {
+        let config = with_a_valid_identity(RuntimeConfig {
             max_request_body_bytes: 0,
             ..Default::default()
-        };
+        });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("max_request_body_bytes"), "{err}");
     }
@@ -2708,10 +2796,10 @@ mod tests {
         // Small enough that the isolate's own bootstrap would exhaust it, so
         // the node would refuse every application it was assigned and the
         // reason would read like an application fault.
-        let config = RuntimeConfig {
+        let config = with_a_valid_identity(RuntimeConfig {
             default_memory_limit_mb: 1,
             ..Default::default()
-        };
+        });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("default_memory_limit_mb"), "{err}");
         assert!(err.contains(&MIN_MEMORY_LIMIT_MB.to_string()), "{err}");
@@ -2771,7 +2859,7 @@ mod tests {
         assert_eq!(config.bundles.max_bytes, 1_048_576);
         assert_eq!(config.assets.cache_control, "public, max-age=60");
         assert_eq!(config.assets.max_bytes, 2048);
-        config.validate().unwrap();
+        with_a_valid_identity(config).validate().unwrap();
     }
 
     #[test]
@@ -2800,8 +2888,13 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_a_control_endpoint_without_a_scheme() {
-        let mut config = RuntimeConfig::default();
-        config.control.endpoint = Some("127.0.0.1:8080".to_string());
+        let config = with_a_valid_identity(RuntimeConfig {
+            control: ControlPlaneConfig {
+                endpoint: Some("127.0.0.1:8080".to_string()),
+                ..ControlPlaneConfig::default()
+            },
+            ..Default::default()
+        });
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("http://"), "{err}");
     }
@@ -2815,7 +2908,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_a_zero_bundle_ceiling() {
-        let mut config = RuntimeConfig::default();
+        let mut config = with_a_valid_identity(RuntimeConfig::default());
         config.bundles.max_bytes = 0;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("max_bytes"), "{err}");
@@ -2871,11 +2964,16 @@ mod tests {
 
     #[test]
     fn test_machine_identity_is_absent_by_default() {
-        // Absent means today's behaviour exactly: no section to half-fill,
-        // nothing to reject.
+        // Absent from the file there is no section to half-fill - and it is
+        // the startup check's job to refuse the default, because a node
+        // without an identity has no data port it can serve.
         let config = RuntimeConfig::default();
         assert!(config.machine_identity.is_none());
-        assert!(config.validate().is_ok());
+        let err = config
+            .validate()
+            .expect_err("the default is refused until an identity is named")
+            .to_string();
+        assert!(err.contains("machine_identity"), "{err}");
     }
 
     #[test]
@@ -3085,14 +3183,26 @@ mod tests {
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("machine_identity"), "{err}");
         assert!(
-            err.contains("404"),
+            err.contains("mutual TLS"),
             "the message has to say what would have happened instead: {err}"
         );
     }
 
     #[test]
     fn test_a_configuration_with_no_machine_channel_is_still_valid() {
-        RuntimeConfig::default()
+        // No *machine channel* - no control endpoint, no management listener -
+        // is not the same as no identity. A node that dials nothing and is
+        // driven by nothing is still a node that serves its proxies, and
+        // `machine_identity.validate` accepts exactly that shape.
+        let config = with_a_valid_identity(RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                control_endpoint: None,
+                management_listen: None,
+                ..complete_identity()
+            }),
+            ..Default::default()
+        });
+        config
             .validate()
             .expect("a node with no machine channel configured is the ordinary case");
     }
@@ -3136,14 +3246,20 @@ mod tests {
             .expect("a bracketed IPv6 address with a port is an ordinary machine endpoint");
     }
 
-    /// Neither half set is the default and the only configuration that must
-    /// keep behaving in every respect as it did before the machine channel
-    /// existed.
+    /// Neither half set is a node that asks nothing of a control plane and is
+    /// driven by nothing, which the identity table accepts on its own terms -
+    /// see `test_a_configuration_with_no_machine_channel_is_still_valid`.
     #[test]
     fn test_validate_accepts_a_node_with_neither_half_of_the_machine_channel() {
-        let config = RuntimeConfig::default();
-        assert!(config.machine_identity.is_none());
-        assert!(config.machine_identity.is_none());
+        let config = with_a_valid_identity(RuntimeConfig {
+            machine_identity: Some(MachineIdentityConfig {
+                control_endpoint: None,
+                management_listen: None,
+                ..complete_identity()
+            }),
+            ..Default::default()
+        });
+        assert!(config.control.endpoint.is_none());
         config.validate().expect("the default must stay valid");
     }
 
@@ -3160,6 +3276,14 @@ mod tests {
             },
             ..RuntimeConfig::default()
         }
+    }
+
+    /// A configuration that passes the identity gate, for tests about some
+    /// other rule. The data port is mutual TLS now, so there is no
+    /// configuration without one to validate.
+    fn with_a_valid_identity(mut config: RuntimeConfig) -> RuntimeConfig {
+        config.machine_identity = Some(complete_identity());
+        config
     }
 
     fn complete_identity() -> MachineIdentityConfig {
@@ -3244,14 +3368,30 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_a_machine_management_listener_sharing_a_port() {
-        // The data port. `0.0.0.0:http_port` covers every address on this
-        // host, so any spelling of this port is the same socket.
+        // Whichever interface each of the two listeners binds, sharing a port
+        // is the same socket to the kernel, so one of them cannot bind at all.
         let config = with_machine_channel(MachineIdentityConfig {
-            management_listen: Some(format!("127.0.0.1:{}", RuntimeConfig::default().http_port)),
+            management_listen: Some(format!(
+                "127.0.0.1:{}",
+                RuntimeConfig::default()
+                    .data_listen_addr()
+                    .expect("the default parses")
+                    .port()
+            )),
             ..complete_identity()
         });
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("http_port"), "{err}");
+        assert!(err.contains("data_listen"), "{err}");
+    }
+
+    /// A node without `[machine_identity]` has no data port to serve: the
+    /// plaintext listener it used to fall back to is gone, and the mTLS one
+    /// needs a certificate to present.
+    #[test]
+    fn test_validate_rejects_a_node_without_a_machine_identity() {
+        let config = RuntimeConfig::default();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("machine_identity"), "{err}");
     }
 
     #[test]
@@ -3363,7 +3503,7 @@ mod tests {
         config
             .validate()
             .expect("deis-runtime.toml must pass validation");
-        assert_eq!(config.http_port, 8000);
+        assert_eq!(config.data_listen, "127.0.0.1:8000");
         assert_eq!(
             config.assets.cache_control,
             "public, max-age=0, must-revalidate"

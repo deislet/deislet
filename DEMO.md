@@ -31,16 +31,21 @@
 投日志、往 `deis-store` / `deis-queue` 发调用。（目前只有 `deis-runtime` 在投日志，
 其余组件还只写自己的 stdout。）
 
-启动完成后可以这样打一发请求：
+启动完成后可以这样打一发请求（经 deis-proxy，模拟一个访客）：
 
 ```bash
-curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
+curl -H 'x-deis-app-id: demo' http://127.0.0.1:8087/hello/world
 ```
 
-**8086 是节点的端口，不是 deis-proxy 的。** 演示里 deis-proxy 起着，但它自己的配置文件
-里一个应用都没写，控制面的目录里也没有人建过路由，所以它选不出应用：请求原样转发给它
-唯一的那个上游（就是节点）。走 `http://127.0.0.1:8087/hello/world` 也能通，只是它证明
-的是「pingora 在转发」，不是「deis-proxy 按域名或路径选对了应用」。
+**8086 是节点的数据端口，不是 deis-proxy 的，而且它只接受互证 TLS。** 节点在该端口上
+验证 caller 必须持有机队签发给 proxy 的证书，明文连接在握手时就被关闭——所以直连
+8086 要用演示脚本里的 `runtime_curl`（`scripts/demo/lib.sh`，带 proxy 叶子证书并校验
+节点证书）。deis-proxy 自己转发请求时就带这张证书，这也正是它的上游连接方式。
+
+8087 是 deis-proxy 的端口。演示里它自己的配置文件里一个应用都没写，控制面的目录里也
+没有人建过路由，所以它选不出应用：请求原样转发给它唯一的那个上游（就是节点）。走
+8087 通了，证明的是「pingora 在转发」；要证明「deis-proxy 按域名或路径选对了应用」，
+要的是它的域名路由（`verify` 的 routing 组检查这件事）。
 
 有一处例外要说清楚，因为它是新加的：演示的 proxy 配置里写了 `[control]` 与
 `[machine_identity]`，所以它每 5 秒经机队通道向控制面要一次整张路由表

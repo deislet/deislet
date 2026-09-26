@@ -167,18 +167,31 @@ curl_noproxy() {
   curl --noproxy '*' "$@"
 }
 
+# The node's data port answers mutual TLS and nothing else, so the probes
+# that reach it run on the host itself, where this installation's fleet PKI
+# lives (/etc/deis/pki, root-owned), presenting the proxy leaf exactly the
+# way deis-proxy does and verifying the node against the fleet root.
+runtime_mtls() {
+  ssh_host "sudo curl -fsS --max-time 5 --noproxy '*' \
+    --cacert /etc/deis/pki/ca.crt \
+    --cert /etc/deis/pki/proxy.crt --key /etc/deis/pki/proxy.key \
+    $*"
+}
+
 cmd_verify() {
   log "==> verify ${LAN_IP}"
   local health
   health="$(curl_noproxy -fsS --max-time 5 "http://${LAN_IP}:8080/health")"
   [[ ${health} == OK ]] || die "control /health returned ${health@Q}"
   log "control /health OK"
-  curl_noproxy -fsS --max-time 5 -H 'x-deis-app-id: _system' \
-    "http://${LAN_IP}:8086/health" >/dev/null
-  log "runtime /health OK"
+  runtime_mtls -H 'x-deis-app-id: _system' \
+    "https://127.0.0.1:8086/health" >/dev/null
+  log "runtime /health OK (mutual TLS, probed on the host with the fleet proxy leaf)"
   local code
-  code="$(curl_noproxy -sS --max-time 5 -o /dev/null -w '%{http_code}' \
-    -H 'x-deis-app-id: demo' "http://${LAN_IP}:8086/hello/world" || true)"
+  code="$(ssh_host "sudo curl -sS --max-time 5 --noproxy '*' -o /dev/null -w '%{http_code}' \
+    --cacert /etc/deis/pki/ca.crt \
+    --cert /etc/deis/pki/proxy.crt --key /etc/deis/pki/proxy.key \
+    -H 'x-deis-app-id: demo' 'https://127.0.0.1:8086/hello/world'" || true)"
   if [[ ${code} == 200 ]]; then
     log "demo /hello/world via runtime 200"
     curl_noproxy -fsS --max-time 5 --resolve "demo.${ZONE}:80:${LAN_IP}" \

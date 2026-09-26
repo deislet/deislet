@@ -251,7 +251,7 @@ mod tests {
         ));
 
         // An entry that names a port is port-exact, like every platform
-        // entry: the generated ones carry the node's own http_port, and other
+        // entry: the generated ones carry the node's own data port, and other
         // ports on that address are judged by the address ranges alone.
         assert!(matches!(
             refusal(&policy, "http://203.0.113.7:9000/").await,
@@ -637,8 +637,10 @@ mod tests {
 
         let bound_everywhere = FetchPolicy::new(["example.test"], ["0.0.0.0:8085"]).unwrap();
         assert!(bound_everywhere.is_a_platform_service_address("::1".parse().unwrap(), Some(8085)));
-        assert!(bound_everywhere
-            .is_a_platform_service_address("127.0.0.1".parse().unwrap(), Some(8085)));
+        assert!(
+            bound_everywhere
+                .is_a_platform_service_address("127.0.0.1".parse().unwrap(), Some(8085))
+        );
     }
 
     #[test]

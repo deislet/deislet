@@ -200,13 +200,13 @@ check_a_restarted_node_comes_back_with_what_it_had() {
   # While it is down, the application must not be served by anything else -
   # otherwise "it came back" would be a sentence about the proxy's cache.
   local down_status
-  down_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-    -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" 2>/dev/null) || down_status="000"
+  down_status=$(runtime_curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    -H "x-deis-app-id: ${APP_ID}" "$(runtime_data_url)/" 2>/dev/null) || down_status="000"
 
   # And back. The same configuration and the same data directory: this is the
   # machine coming up again, not a new one joining.
   DEIS_RUNTIME_CONFIG="$DEIS_RUNTIME_CONFIG" \
-    DEIS_RUNTIME_HTTP_PORT="$DEIS_RUNTIME_PORT" \
+    DEIS_RUNTIME_DATA_LISTEN="127.0.0.1:${DEIS_RUNTIME_PORT}" \
     "${BIN_DIR}/deis-runtime" \
     >> "${LOG_DIR}/deis-runtime.log" 2>&1 &
   DEIS_RUNTIME_PID=$!
@@ -228,8 +228,8 @@ check_a_restarted_node_comes_back_with_what_it_had() {
   # then its applications, and how long that takes is the machine's business.
   local ready=0 attempt=0 after_status="000"
   while [ "$attempt" -lt 240 ]; do
-    after_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-      -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" 2>/dev/null) || after_status="000"
+    after_status=$(runtime_curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+      -H "x-deis-app-id: ${APP_ID}" "$(runtime_data_url)/" 2>/dev/null) || after_status="000"
     if [ "$after_status" = "200" ]; then
       ready=1
       break

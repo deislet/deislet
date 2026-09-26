@@ -8,7 +8,7 @@
 
 ## 背景
 
-当前 Control 人类 API 认证为兼容旧安装默认关闭。节点和 proxy 使用整个 fleet 等价的共享凭证；持有该凭证可能访问 assignments、bundle、路由、节点管理和环境 secrets。Runtime data port 的隔离又较多依赖私网与防火墙。
+当前 Control 人类 API 认证为兼容旧安装默认关闭。节点和 proxy 使用整个 fleet 等价的共享凭证；持有该凭证可能访问 assignments、bundle、路由、节点管理和环境 secrets。Runtime data port 的隔离曾较多依赖私网与防火墙；现在该端口只接受互证 TLS（caller 须持本 installation 的 proxy 角色证书），见 ADR-025 的落地记录。
 
 Loopback、容器私网或“位于反向代理之后”都不是可靠身份边界。错误配置会把开发便利直接带入生产。
 

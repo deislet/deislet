@@ -97,7 +97,7 @@ trust_bundle = "/etc/deislet/pki/control-roots.pem"
 - human session/API token 不能访问 machine listener；machine certificate 也不能访问 human 管理 API，除非另有明确 service action capability。
 - 不信任反向代理注入的 principal header。TLS 可以在受控 sidecar 终止，但 sidecar 与服务间必须使用经过认证的 Unix socket 或再次 mTLS，并把已验证身份放入不可由普通客户端到达的协议字段。
 - bundle、assignment、routing、registration/renewal 和 Control-to-node management 均迁到 machine listener。公开应用 route 永不挂载这些路径。
-- runtime、proxy、store、queue 与 telemetry 的 management listener 与应用 data listener 分离。ADR-023/024 的迁移和恢复管理员调用使用各自 principal 与 operation capability，不再依赖长期静态管理员 bearer token。
+- runtime、proxy、store、queue 与 telemetry 的 management listener 与应用 data listener 分离。ADR-023/024 的迁移和恢复管理员调用使用各自 principal 与 operation capability，不再依赖长期静态管理员 bearer token。runtime 的应用 data listener 同样只接受互证 TLS：caller 必须持有本 installation 签发的 proxy 角色证书（URI SAN `deislet/proxy/...`），否则握手即断，无任何明文回落（2026-09 落地：`deis_runtime::dispatcher::DataPlaneAcceptor`，验收见 `crates/deis-runtime/tests/management_auth_test.rs` 与 `crates/deis-proxy/tests/upstream_mtls_test.rs`）。
 - Production 缺少独立 listener、client trust、server identity 或认证 Unix socket 时只进入 diagnostic/not-ready。Dev 可以由本地 ephemeral CA 自动配置，但仍经过相同 principal 与授权代码路径。
 
 ## Enrollment、证书续期与 Registration

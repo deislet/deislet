@@ -103,28 +103,34 @@ pub mod service;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::modules::http::HttpModules;
 use pingora::modules::http::compression::{ResponseCompression, ResponseCompressionBuilder};
 use pingora::protocols::http::compression::Algorithm;
+use pingora::protocols::tls::CaType;
 use pingora::proxy::{ProxyHttp, Session};
+use pingora::tls::pkey::PKey;
+use pingora::tls::x509::X509;
 use pingora::upstreams::peer::HttpPeer;
+use pingora::utils::tls::CertKey;
 use pingora::{Error, ErrorType};
 use tracing::{debug, info, warn};
 
 use crate::acme::{CHALLENGE_PREFIX, ChallengeResponder};
 use crate::catalog::table::{CatalogRoutes, MatchSource};
 use crate::config::routes::{RouteTable, normalize_host};
-use crate::config::system::{CompressionAlgo, DEFAULT_MAX_REQUEST_BODY_BYTES};
+use crate::config::system::{
+    CompressionAlgo, DEFAULT_MAX_REQUEST_BODY_BYTES, MachineIdentityConfig,
+};
 use crate::config::{AppConfig, ConfigManager, SystemConfig};
 
 pub use access_log::AccessLog;
 pub use balancer::Balancer;
 pub use inherited::InheritedListeners;
 pub use service::ExitOnPanic;
-
 pub struct DeisProxy {
     config: Arc<ConfigManager>,
     balancer: Balancer,
@@ -133,6 +139,70 @@ pub struct DeisProxy {
     /// switched on. `None` means the challenge path is routed like any other
     /// path, which is what an instance with its own certificate files wants.
     acme: Option<Arc<ChallengeResponder>>,
+    /// Mutual-TLS material for the upstream leg, present only when
+    /// `[machine_identity]` is configured. A node's data port admits a caller
+    /// only over mutual TLS naming a proxy of its fleet, so a proxy holding
+    /// this reaches its nodes proved and verified; one without keeps the
+    /// plaintext leg it always had and is refused by every node it dials.
+    upstream_tls: Option<UpstreamTls>,
+}
+
+/// The upstream leg's mutual-TLS material, parsed once at startup.
+///
+/// The certificate and key come from the same files `[machine_identity]`
+/// names; on a renewal the files change on disk and the machine channel
+/// reloads its own copy, while this parsed snapshot stays as it was. The gap
+/// lasts until restart, which is acceptable for material that outlives a
+/// demo's certificates by weeks - and it is why this is logged, not hidden.
+#[derive(Clone)]
+pub struct UpstreamTls {
+    /// This proxy's certificate and key, presented to a node's data port.
+    pub client_cert_key: Arc<CertKey>,
+    /// The root a node's certificate must chain to.
+    pub ca: Arc<CaType>,
+}
+
+impl UpstreamTls {
+    /// Read and parse the three files `[machine_identity]` names.
+    pub fn load(identity: &MachineIdentityConfig) -> anyhow::Result<Self> {
+        let cert_pem = std::fs::read(&identity.certificate).with_context(|| {
+            format!(
+                "reading upstream client certificate {}",
+                identity.certificate
+            )
+        })?;
+        let key_pem = std::fs::read(&identity.private_key)
+            .with_context(|| format!("reading upstream client key {}", identity.private_key))?;
+        let root_pem = std::fs::read(&identity.trust_root)
+            .with_context(|| format!("reading the upstream trust root {}", identity.trust_root))?;
+        let certificates = X509::stack_from_pem(&cert_pem).with_context(|| {
+            format!(
+                "parsing upstream client certificate {}",
+                identity.certificate
+            )
+        })?;
+        if certificates.is_empty() {
+            anyhow::bail!(
+                "{} contains no certificate, so there is nothing to present to a node's \
+                 data port",
+                identity.certificate
+            );
+        }
+        let key = PKey::private_key_from_pem(&key_pem)
+            .with_context(|| format!("parsing upstream client key {}", identity.private_key))?;
+        let roots = X509::stack_from_pem(&root_pem)
+            .with_context(|| format!("parsing the upstream trust root {}", identity.trust_root))?;
+        if roots.is_empty() {
+            anyhow::bail!(
+                "{} contains no certificate, so no node could prove itself to this proxy",
+                identity.trust_root
+            );
+        }
+        Ok(Self {
+            client_cert_key: Arc::new(CertKey::new(certificates, key)),
+            ca: Arc::new(roots.into_boxed_slice()),
+        })
+    }
 }
 
 /// Per-request state shared between proxy phases.
@@ -213,12 +283,14 @@ impl DeisProxy {
         balancer: Balancer,
         access_log: Option<AccessLog>,
         acme: Option<Arc<ChallengeResponder>>,
+        upstream_tls: Option<UpstreamTls>,
     ) -> Self {
         Self {
             config,
             balancer,
             access_log,
             acme,
+            upstream_tls,
         }
     }
 
@@ -957,17 +1029,50 @@ impl ProxyHttp for DeisProxy {
         ctx.tried_upstreams.push(addr.to_string());
 
         let system = self.config.get_system_config();
-        // Offloading means the upstream leg is plain even when the client
-        // leg is TLS; otherwise TLS is carried through to the backend.
-        let tls_upstream = ctx.tls && !system.https().auto_offload_https;
-        // SNI only matters on a TLS leg; leaving it empty on plain legs keeps
-        // one connection pool per backend instead of one per client Host.
-        let sni = if tls_upstream {
-            ctx.host.clone()
-        } else {
-            String::new()
+        // The upstream leg carries the client's TLS through unless offloading
+        // is on. But a node's data port answers mutual TLS and nothing else -
+        // a caller that proved no proxy of this fleet gets no connection at
+        // all - so a proxy holding an identity dials every node over TLS and
+        // proves itself, whatever the client leg was. Without an identity
+        // there is nothing to prove, the leg stays as it was, and the node
+        // refuses it during the handshake; that refusal is the configuration
+        // gap speaking, and it is said at startup too.
+        let sni = match self.upstream_tls.as_ref() {
+            Some(_) => {
+                // Empty SNI turns pingora's verification off completely, so
+                // the leg names the node it is dialling. `ctx.host` is the
+                // authority the client asked for, which on a fleet fronted by
+                // deis-proxy is always set; the fallback keeps an odd HTTP/1.0
+                // request from silently disabling verification.
+                if ctx.host.is_empty() {
+                    "deis-node.internal".to_string()
+                } else {
+                    ctx.host.clone()
+                }
+            }
+            None => {
+                let tls_upstream = ctx.tls && !system.https().auto_offload_https;
+                if tls_upstream {
+                    ctx.host.clone()
+                } else {
+                    String::new()
+                }
+            }
         };
+        let tls_upstream =
+            self.upstream_tls.is_some() || (ctx.tls && !system.https().auto_offload_https);
         let mut peer = HttpPeer::new(addr, tls_upstream, sni);
+        if let Some(upstream_tls) = self.upstream_tls.as_ref() {
+            peer.client_cert_key = Some(Arc::clone(&upstream_tls.client_cert_key));
+            peer.options.ca = Some(Arc::clone(&upstream_tls.ca));
+            peer.options.verify_cert = true;
+            // The node names itself with a SPIFFE URI, which no DNS hostname
+            // matcher can read. The chain to this fleet's root is the answer
+            // to "is this the node I was told about"; matching the dialled
+            // address against a name the certificate deliberately does not
+            // carry would verify nothing and refuse everything.
+            peer.options.verify_hostname = false;
+        }
         peer.options.connection_timeout = Some(system.upstream_connect_timeout());
         // Bounds an in-flight write to the upstream, which only exists while
         // there are bytes to push, so it means the same thing on a tunnel as

@@ -117,6 +117,7 @@ pub async fn run(options: Options) -> Result<()> {
         runtime_port,
         app.clone(),
         options.environment.clone(),
+        node.proxy().clone(),
     ));
 
     print_banner(&app, &options, &bundle, addr, runtime_port);

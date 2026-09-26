@@ -59,6 +59,8 @@ pub struct DevNode {
     data_dir: PathBuf,
     canonical_application_id: Option<deis_wire::CanonicalId>,
     canonical_environment_id: Option<deis_wire::CanonicalId>,
+    /// The front door's proxy identity, issued alongside the node's own.
+    proxy: pki::Machine,
 }
 
 /// One complete deployment handed to the local production runtime.
@@ -115,7 +117,7 @@ impl DevNode {
         let mut command = Command::new(binary);
         command
             .env("DEIS_RUNTIME_NODE_ID", pki::DEV_NODE_ID)
-            .env("DEIS_RUNTIME_HTTP_PORT", port.to_string())
+            .env("DEIS_RUNTIME_DATA_LISTEN", format!("0.0.0.0:{port}"))
             .env(
                 "DEIS_RUNTIME_MACHINE_IDENTITY_MANAGEMENT_LISTEN",
                 format!("127.0.0.1:{management_port}"),
@@ -186,9 +188,16 @@ impl DevNode {
                 data_dir,
                 canonical_application_id: None,
                 canonical_environment_id: None,
+                proxy: pki.proxy,
             },
             exited,
         ))
+    }
+
+    /// The identity the front door presents to this node's data port, which
+    /// admits a proxy of the run's trust domain and nothing else.
+    pub(super) fn proxy(&self) -> &pki::Machine {
+        &self.proxy
     }
 
     /// Load a bundle, the same call and the same arguments the control plane

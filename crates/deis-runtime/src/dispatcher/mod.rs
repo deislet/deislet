@@ -1,6 +1,7 @@
 // HTTP Gateway Module
 
 pub mod auth;
+pub mod data;
 pub mod handlers;
 pub mod machine;
 
@@ -13,7 +14,6 @@ use anyhow::{Context, Result};
 use auth::ManagementAuth;
 use axum::Router;
 pub use machine::MachineManagement;
-use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -55,7 +55,8 @@ pub struct ServerOptions {
     /// Readiness, which the `HealthCheck` RPC reports.
     pub health: Arc<NodeHealth>,
     pub node_id: String,
-    pub port: u16,
+    /// Where the data port binds, from `data_listen`.
+    pub data_listen: std::net::SocketAddr,
 
     /// When this node's process started. Passed in rather than taken here so
     /// that the uptime the management API reports is the process's, not the
@@ -72,6 +73,17 @@ pub struct ServerOptions {
     /// was validated against.
     pub max_request_body_bytes: usize,
 
+    /// This node's machine identity. Both TLS listeners are built from it:
+    /// the data port admits this fleet's proxies, the management plane this
+    /// node's control plane. Configuration validation refuses a node without
+    /// one, so by the time startup reaches here this is present.
+    pub identity: Arc<deis_identity::MachineIdentity>,
+
+    /// The mutually authenticated management plane, when this node serves
+    /// one: where it binds, and the one name this node takes management
+    /// instructions from. A node that dials but serves nothing - which no
+    /// node in a running installation looks like - is warned about in `main`
+    /// and reaches this listener as `None`.
     pub machine_management: Option<MachineManagement>,
 }
 
@@ -99,7 +111,7 @@ async fn shutdown_signal() -> &'static str {
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut stream) => {
                 stream.recv().await;
@@ -137,10 +149,11 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         deployer,
         health,
         node_id,
-        port,
+        data_listen,
         started_at,
         shutdown_grace,
         max_request_body_bytes,
+        identity,
         machine_management,
     } = options;
 
@@ -151,7 +164,7 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         app_manager.clone(),
         deployer,
         health,
-        node_id,
+        node_id.clone(),
         started_at,
     );
     let trigger_service = TriggerServer::create_service(app_manager.clone());
@@ -234,51 +247,70 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     // management plane is unreachable.
     //
     // Nothing administrative is mounted here. The two gRPC prefixes used to
-    // be, on this same `0.0.0.0` port that public application traffic arrives
-    // on, guarded by a value the whole fleet shared; both the value and that
-    // door are gone. Their paths now fall through to the wildcard below and
-    // are answered as any other request that names no application is - 400 for
-    // want of an `x-deis-app-id` header - which is a public port having
-    // nothing to say about a management call, not a management call being
-    // refused.
+    // be, on this same port that public application traffic arrives on,
+    // guarded by a value the whole fleet shared; both the value and that door
+    // are gone. Their paths now fall through to the wildcard below and are
+    // answered as any other request that names no application is - 400 for
+    // want of an `x-deis-app-id` header - which is a port having nothing to
+    // say about a management call, not a management call being refused. The
+    // inspector WebSocket moved the same way: it is mounted on the management
+    // listener below, whose handshake decides who gets to ask.
     let app = Router::new()
         .route("/*path", axum::routing::any(handlers::handle_request))
         .route("/", axum::routing::any(handlers::handle_request))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
 
-    // Bind address
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // The data port. `data_listen` decides which interface it binds; the
+    // acceptor decides who is admitted - a proxy of this fleet, proved during
+    // the TLS handshake, and nobody else. This is the port a proxy has in its
+    // upstream list, and since it stopped answering plaintext it is also the
+    // port a worker on this network can no longer use to reach an application
+    // by naming one in a header.
+    let data_listener = std::net::TcpListener::bind(data_listen)
+        .with_context(|| format!("cannot bind the data port on data_listen {data_listen}"))?;
 
-    // The mutually authenticated management plane's socket, when this node
-    // has one. Bound here for the same reason as the one above: before any
-    // application is loaded, so an address already in use ends startup rather
-    // than leaving a node that looks healthy while its control plane's
-    // connections are refused by whatever else holds the port.
+    // The mutually authenticated management plane's socket. Bound here for
+    // the same reason as the one above: before any application is loaded, so
+    // an address already in use ends startup rather than leaving a node that
+    // looks healthy while its control plane's connections are refused by
+    // whatever else holds the port.
     //
     // The caller on this socket proved a certificate naming exactly this
     // node's control plane before the connection existed, so nothing on the
     // request is read - see `auth::ManagementAuth::for_machine_listener`.
     let machine_serving = match machine_management {
         Some(machine) => {
-            let listener = std::net::TcpListener::bind(machine.listen).with_context(|| {
-                format!(
-                    "cannot bind the mutually authenticated management plane on \
-                     machine_identity.management_listen {}",
-                    machine.listen
-                )
-            })?;
+            let machine_listener =
+                std::net::TcpListener::bind(machine.listen).with_context(|| {
+                    format!(
+                        "cannot bind the mutually authenticated management plane on \
+                         machine_identity.management_listen {}",
+                        machine.listen
+                    )
+                })?;
             let auth = ManagementAuth::for_machine_listener(
                 machine.expected_control.clone(),
                 machine.listen,
             );
             let entrance = entrance(auth);
-            let app = Router::new()
+            // The inspector channel rides on this listener: its token is
+            // minted by `StartInspect` on the machine channel, and the
+            // WebSocket it opens gives a debugger full access to a running
+            // isolate, so it belongs behind the handshake this listener
+            // already makes. The path is fixed and documented - the data port
+            // used to answer it on any path, and there is no client in this
+            // repository to keep compatible.
+            let machine_app = Router::new()
                 .route_service("/deis.management.RuntimeManagement/*rpc", entrance.clone())
                 .route_service("/deis.trigger.Trigger/*rpc", entrance)
+                .route(
+                    "/inspector",
+                    axum::routing::get(handlers::handle_inspector_upgrade),
+                )
+                .with_state(state)
                 .layer(TraceLayer::new_for_http());
-            Some((listener, app, machine))
+            Some((machine_listener, machine_app, machine))
         }
         None => None,
     };
@@ -305,7 +337,10 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
 
     info!("====================================");
     info!("✅ Runtime Platform is ready!");
-    info!("📡 HTTP Server: http://localhost:{}", port);
+    info!(
+        "📡 Data port: {} (mutual TLS; a proxy's certificate admits, nothing else does)",
+        data_listen
+    );
 
     info!(
         "🎯 Routing: {} names the application, {} the environment (absent = {})",
@@ -314,64 +349,77 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         crate::DEFAULT_ENVIRONMENT
     );
     info!(
-        "📊 Health Check: curl -H \"x-deis-app-id: _system\" http://localhost:{}/health",
-        port
+        "📊 Health Check: a proxy, proving its certificate, dials https://{}/health with {} \"_system\" - the data port answers nothing over plaintext",
+        data_listen,
+        crate::APP_ID_HEADER,
     );
     info!(
         max_request_body_bytes,
         "📦 Request bodies larger than this are answered 413 and never reach an application"
     );
-    info!(
-        "📚 Platform Info: curl -H \"x-deis-app-id: _system\" http://localhost:{}/",
-        port
-    );
     info!("====================================");
 
     // Serve until a signal arrives, then drain.
     //
-    // `with_graceful_shutdown` stops accepting new connections and lets the
-    // ones already in flight run to completion, which is what keeps an isolate
-    // from being torn down half way through a request. The deadline exists so
-    // that one stuck handler cannot hold the whole node open forever.
+    // The data port is served by `data::serve` rather than `axum::serve` for
+    // the same reason the management listener is: what decides who is
+    // admitted happens between the accept and the first request, and a plain
+    // serving loop has no place to put that decision.
     let (drain_tx, drain_rx) = oneshot::channel::<()>();
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = drain_rx.await;
-        })
-        .into_future();
-    tokio::pin!(server);
+    let mut data_task = tokio::spawn({
+        let identity = Arc::clone(&identity);
+        let node_id = node_id.clone();
+        async move {
+            // The outcome, good or bad, is logged inside `data::serve`
+            // against the address it was serving.
+            data::serve(
+                data_listener,
+                app,
+                identity,
+                node_id,
+                shutdown_grace,
+                async move {
+                    let _ = drain_rx.await;
+                },
+            )
+            .await
+        }
+    });
 
     // The mutually authenticated plane drains on the same edge, and for the
     // same reason: a node that had stopped taking public traffic but kept
     // accepting deployment pushes would apply a version it is on its way to
-    // not serving.
-    let mut machine_drain = None;
-    let mut machine_task = None;
-    if let Some((listener, app, machine)) = machine_serving {
-        let (tx, rx) = oneshot::channel::<()>();
-        machine_drain = Some(tx);
-        machine_task = Some(tokio::spawn(async move {
+    // not serving. A node that serves no management plane runs without it -
+    // and is warned about in `main`, because no node in a running
+    // installation looks like that.
+    let (machine_drain_tx, machine_drain_rx) = oneshot::channel::<()>();
+    let mut machine_drain_tx = Some(machine_drain_tx);
+    let machine_task = machine_serving.map(|(machine_listener, machine_app, machine)| {
+        tokio::spawn(async move {
             // The outcome, good or bad, is logged inside `machine::serve`
             // against the address it was serving, which is more than could be
             // said here.
             let _ = machine::serve(
-                listener,
-                app,
+                machine_listener,
+                machine_app,
                 machine.identity,
                 machine.expected_control,
                 shutdown_grace,
                 async move {
-                    let _ = rx.await;
+                    let _ = machine_drain_rx.await;
                 },
             )
             .await;
-        }));
-    }
+        })
+    });
 
     tokio::select! {
-        result = &mut server => {
-            result?;
-            info!("HTTP server stopped on its own");
+        result = &mut data_task => {
+            match result {
+                Ok(Ok(())) => info!("The data port stopped on its own"),
+                Ok(Err(e)) => return Err(e).context("the data port stopped with an error"),
+                Err(e) => return Err(e).context("the data port's serving task panicked"),
+            }
         }
         signal = shutdown_signal() => {
             info!(
@@ -381,16 +429,21 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
                  have the grace period to finish"
             );
             let _ = drain_tx.send(());
-            if let Some(tx) = machine_drain.take() {
+            if let Some(tx) = machine_drain_tx.take() {
                 let _ = tx.send(());
             }
 
-            match tokio::time::timeout(shutdown_grace, &mut server).await {
-                Ok(Ok(())) => info!("All in-flight requests finished; the node drained cleanly"),
+            match tokio::time::timeout(shutdown_grace, &mut data_task).await {
+                Ok(Ok(Ok(()))) => info!("All in-flight requests finished; the node drained cleanly"),
+                Ok(Ok(Err(e))) => warn!(
+                    error = %e,
+                    "The data port reported an error while draining; some requests may have been \
+                     cut off"
+                ),
                 Ok(Err(e)) => warn!(
                     error = %e,
-                    "The server reported an error while draining; some requests may have been cut \
-                     off"
+                    "The data port's serving task panicked while draining; some requests may \
+                     have been cut off"
                 ),
                 Err(_) => error!(
                     grace_secs = shutdown_grace.as_secs(),
@@ -401,25 +454,40 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         }
     }
 
-    // Reached from both arms, so the management listener is closed whether the
-    // node was signalled or the data listener stopped by itself. `drain` has
-    // already been sent in the signal case; sending it here covers the other.
-    if let Some(tx) = machine_drain.take() {
+    // Reached from both arms, so the management listener is closed whether
+    // the node was signalled or the data listener stopped by itself. The
+    // drain has already been sent in the signal case; sending it here covers
+    // the other. `machine_drain_tx` was taken in the signal arm, and a
+    // taken Option sends nothing here.
+    if let Some(tx) = machine_drain_tx {
         let _ = tx.send(());
     }
 
+    // Awaited without a timeout of its own, which is where this differs
+    // from the drain deadline above. `data::serve` and `machine::serve` are
+    // handed the grace period and stop on it from the inside. A second
+    // deadline here would expire on the same edge as that one and report,
+    // roughly half the time, a listener that had in fact drained.
+    match data_task.await {
+        Ok(Ok(())) => info!("the data port drained"),
+        Ok(Err(e)) => warn!(
+            error = %e,
+            "the data port did not finish cleanly; a request that was in flight may have been \
+             cut off"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "the data port's serving task did not finish cleanly; a request that was in flight \
+             may have been cut off"
+        ),
+    }
+
     if let Some(task) = machine_task {
-        // Awaited without a timeout of its own, which is where this differs
-        // from the two listeners above. Their graceful shutdown is unbounded,
-        // so the deadline has to be imposed from out here; `machine::serve`
-        // is handed the grace period and stops on it from the inside. A
-        // second deadline here would expire on the same edge as that one and
-        // report, roughly half the time, a listener that had in fact drained.
         match task.await {
-            Ok(()) => info!("The mutually authenticated management listener drained"),
+            Ok(()) => info!("the mutually authenticated management listener drained"),
             Err(e) => warn!(
                 error = %e,
-                "The mutually authenticated management listener did not finish cleanly; a \
+                "the mutually authenticated management listener did not finish cleanly; a \
                  deployment push or cron fire that was in flight may have been cut off, and the \
                  control plane will see it as a failure and retry"
             ),

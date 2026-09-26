@@ -45,13 +45,13 @@ check_a_client_cannot_forge_the_platform_s_headers() {
   local title="a client cannot hand a handler the platform's own headers"
   local headers="${LOG_DIR}/verify-forged-platform-headers.headers"
   local body
-  body=$(curl -s -D "$headers" \
+  body=$(runtime_curl -s -D "$headers" \
     -H "x-deis-app-id: ${CALLEE_APP_ID}" \
     -H "x-deis-caller: admin-app.production" \
     -H "x-deis-tenant: victim.production" \
     -H "x-deis-storage-token: forged" \
     -H "x-demo-note: sent by a client" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/verify" || true)
+    "$(runtime_data_url)/verify" || true)
 
   local status called_by note
   status=$(http_status "$headers")

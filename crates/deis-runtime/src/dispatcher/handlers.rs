@@ -2,25 +2,25 @@
 
 use super::AppState;
 use crate::app::AppKey;
-use crate::runtime::header_list;
 use crate::runtime::DispatchError;
+use crate::runtime::header_list;
 use crate::{
-    is_platform_header, APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER,
-    PLATFORM_HEADER_PREFIX,
+    APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER, PLATFORM_HEADER_PREFIX,
+    is_platform_header,
 };
 use axum::{
     body::{Body, Bytes},
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{header, HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use deno_core::url::Url;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Whether this overload refusal gets a warn line of its own.
 ///
@@ -387,35 +387,15 @@ pub async fn handle_request(
         }
     };
 
-    // Check if it's a debug request
-    if let Some(target_app_id) = app_id.strip_prefix("_inspect:") {
-        let token = headers
-            .get("x-deis-inspect-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let target = AppKey::new(target_app_id, environment);
-        if !state.app_manager.validate_inspect_token(&target, token) {
-            return (StatusCode::FORBIDDEN, "Invalid or expired inspector token").into_response();
-        }
-
-        if let Some(ws_upgrade) = ws {
-            let app_manager = state.app_manager.clone();
-            return ws_upgrade
-                .on_upgrade(move |socket| handle_inspector_session(socket, target, app_manager))
-                .into_response();
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Inspector requires WebSocket connection",
-            )
-                .into_response();
-        }
-    }
-
-    // The pair names a directory on this node and a storage tenant, so a
-    // request that carries something else is refused here rather than being
-    // allowed to reach code that would build a path out of it.
+    // The inspector channel is not here. It moved to the management
+    // listener: the token it answers to is minted by `StartInspect` on the
+    // machine channel, and the WebSocket that token opens gives a debugger
+    // full access to a running isolate - a door like that belongs behind the
+    // same handshake the machine channel is behind, not on a port that used
+    // to admit anyone who could open a socket. See
+    // `handle_inspector_upgrade`, served by the management listener's router.
+    // The key that used to route it is refused here like any other name this
+    // port does not serve.
     let key = AppKey::new(app_id, environment);
     if let Err(e) = key.validate() {
         tracing::warn!(
@@ -1366,6 +1346,66 @@ async fn handle_websocket_bridged(
         key,
         ws_id
     );
+}
+
+/// Open the inspector WebSocket, from the management listener.
+///
+/// The protocol is unchanged from when this rode on the data port: the caller
+/// names its target as `x-deis-app-id: _inspect:<app>`, carries the token
+/// `StartInspect` minted in `x-deis-inspect-token`, and upgrades. What changed
+/// is the door: this handler is mounted on the listener only this fleet's
+/// machines can reach, so a stolen token no longer works from a connection
+/// that proves nothing, and the node's public port has nothing to say about
+/// debuggers at all.
+///
+/// The caller was admitted by the TLS handshake - it proved a certificate of
+/// this fleet. Nothing here re-checks *which* machine it was: minting a token
+/// already required the control plane, and the token is the answer to "who may
+/// attach", scoped to one application and one environment, with an expiry.
+pub async fn handle_inspector_upgrade(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: Option<WebSocketUpgrade>,
+) -> Response {
+    let target = match headers
+        .get(APP_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|id| id.strip_prefix("_inspect:"))
+    {
+        Some(target_app_id) => target_app_id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Missing or malformed {APP_ID_HEADER} header: expected _inspect:<app>"),
+            )
+                .into_response();
+        }
+    };
+
+    let token = headers
+        .get("x-deis-inspect-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let environment = requested_environment(&headers).to_string();
+    let target = AppKey::new(target, environment);
+    if !state.app_manager.validate_inspect_token(&target, token) {
+        return (StatusCode::FORBIDDEN, "Invalid or expired inspector token").into_response();
+    }
+
+    match ws {
+        Some(ws_upgrade) => {
+            let app_manager = state.app_manager.clone();
+            ws_upgrade
+                .on_upgrade(move |socket| handle_inspector_session(socket, target, app_manager))
+                .into_response()
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            "Inspector requires WebSocket connection",
+        )
+            .into_response(),
+    }
 }
 
 /// Handle debugger session

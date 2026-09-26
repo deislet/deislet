@@ -83,7 +83,7 @@ use crate::config::system::{
     ReadinessVerdict, judge_readiness,
 };
 use crate::config::{ConfigManager, SystemConfig};
-use crate::proxy::APP_ID_HEADER;
+use crate::proxy::{APP_ID_HEADER, UpstreamTls};
 
 /// Resolves the configured upstreams into backends.
 pub struct ConfigDiscovery {
@@ -253,8 +253,25 @@ impl Balancer {
     /// Build the balancer for the configured strategy. The returned service
     /// runs discovery and health checks and must be registered with the
     /// server.
-    pub fn build(config: Arc<ConfigManager>) -> (Balancer, Box<dyn ServiceWithDependents>) {
+    pub fn build(
+        config: Arc<ConfigManager>,
+        upstream_tls: Option<UpstreamTls>,
+    ) -> (Balancer, Box<dyn ServiceWithDependents>) {
         let system = config.get_system_config();
+        if system.upstreams.is_some() {
+            match upstream_tls {
+                Some(_) => info!(
+                    "the upstream leg to every node is mutual TLS: this proxy proves its own \
+                     certificate and checks each node against the fleet's trust root"
+                ),
+                None => warn!(
+                    "upstreams are configured but no [machine_identity] is, so this proxy \
+                     reaches them in plaintext. A deis-runtime node's data port admits a caller \
+                     only over mutual TLS - every request to such a node will be refused during \
+                     the handshake until [machine_identity] names this proxy's certificate"
+                ),
+            }
+        }
         // Said once, at startup, because there is no other moment an operator
         // finds it out. See "Where the pool comes from, and where it does
         // not" in the module documentation.
@@ -281,7 +298,8 @@ impl Balancer {
         });
         match system.balancing_strategy() {
             BalancingStrategy::RoundRobin => {
-                let (lb, service) = make::<RoundRobin>(discovery, &system, &admission);
+                let (lb, service) =
+                    make::<RoundRobin>(discovery, &system, &admission, upstream_tls.as_ref());
                 (
                     Balancer {
                         inner: BalancerKind::RoundRobin(lb),
@@ -291,7 +309,8 @@ impl Balancer {
                 )
             }
             BalancingStrategy::Random => {
-                let (lb, service) = make::<Random>(discovery, &system, &admission);
+                let (lb, service) =
+                    make::<Random>(discovery, &system, &admission, upstream_tls.as_ref());
                 (
                     Balancer {
                         inner: BalancerKind::Random(lb),
@@ -301,7 +320,8 @@ impl Balancer {
                 )
             }
             BalancingStrategy::HeaderHash(header) => {
-                let (lb, service) = make::<FNVHash>(discovery, &system, &admission);
+                let (lb, service) =
+                    make::<FNVHash>(discovery, &system, &admission, upstream_tls.as_ref());
                 (
                     Balancer {
                         inner: BalancerKind::HeaderHash { header, lb },
@@ -311,7 +331,8 @@ impl Balancer {
                 )
             }
             BalancingStrategy::IpHash => {
-                let (lb, service) = make::<Consistent>(discovery, &system, &admission);
+                let (lb, service) =
+                    make::<Consistent>(discovery, &system, &admission, upstream_tls.as_ref());
                 (
                     Balancer {
                         inner: BalancerKind::IpHash(lb),
@@ -573,7 +594,10 @@ impl DegradedNotice {
 /// See [`crate::config::system::health`] for why the default asks the node
 /// rather than its kernel, and for what the node has to say for the answer to
 /// mean anything.
-fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Sync + 'static> {
+fn build_health_check(
+    system: &SystemConfig,
+    upstream_tls: Option<&UpstreamTls>,
+) -> Box<dyn HealthCheck + Send + Sync + 'static> {
     let settings = system.health_check();
     let timeout = settings.timeout();
     match settings.mode() {
@@ -584,6 +608,15 @@ fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Syn
                     "health_check.readiness is set but health_check.mode is tcp, so nothing is \
                      ever asked and the setting does nothing. Leave the mode unset to have the \
                      node asked"
+                );
+            }
+            if upstream_tls.is_some() {
+                warn!(
+                    "health_check.mode is tcp, but this proxy holds a machine_identity and its \
+                     nodes' data port answers mutual TLS only. A TCP probe still passes - the \
+                     port accepts a connection - so a node that is up but refusing this proxy \
+                     keeps its full share of traffic until a request fails. Leave the mode \
+                     unset to ask the node over mutual TLS instead"
                 );
             }
             let asked = "mode=tcp (connect only; a node that is listening and not ready passes)"
@@ -613,8 +646,29 @@ fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Syn
             // goes to the backend's own address and the node routes on
             // `x-deis-app-id`, not on `Host`. `localhost` is what the node
             // itself falls back to for a request that names no authority.
-            let mut check = HttpHealthCheck::new("localhost", false);
-            let mut asked = format!("mode=http GET {}", settings.path());
+            //
+            // With a machine identity the probe rides mutual TLS, the same
+            // handshake the traffic uses: without it the node refuses the
+            // probe during the handshake and every upstream would read as
+            // unhealthy, which would be this proxy's configuration gap
+            // wearing the fleet's outage costume.
+            let mut check = HttpHealthCheck::new("localhost", upstream_tls.is_some());
+            let mut asked = format!(
+                "mode=http GET {}{}",
+                settings.path(),
+                if upstream_tls.is_some() { " mTLS" } else { "" }
+            );
+            if let Some(upstream_tls) = upstream_tls {
+                check.peer_template.sni = "localhost".into();
+                check.peer_template.client_cert_key =
+                    Some(Arc::clone(&upstream_tls.client_cert_key));
+                check.peer_template.options.ca = Some(Arc::clone(&upstream_tls.ca));
+                check.peer_template.options.verify_cert = true;
+                // Same reason as the traffic leg: the node's certificate
+                // names it with a SPIFFE URI, so there is no DNS hostname to
+                // match and the chain to the fleet's root is the check.
+                check.peer_template.options.verify_hostname = false;
+            }
             match RequestHeader::build("GET", settings.path().as_bytes(), None) {
                 Ok(mut req) => {
                     if let Err(e) = req.append_header("Host", "localhost") {
@@ -755,6 +809,7 @@ fn make<S>(
     discovery: Box<dyn ServiceDiscovery + Send + Sync + 'static>,
     system: &SystemConfig,
     admission: &Arc<Admission>,
+    upstream_tls: Option<&UpstreamTls>,
 ) -> (Arc<LoadBalancer<S>>, Box<dyn ServiceWithDependents>)
 where
     S: BackendSelection + Send + Sync + 'static,
@@ -762,7 +817,7 @@ where
 {
     let mut backends = Backends::new(discovery);
     backends.set_health_check(Box::new(AdmittingHealthCheck {
-        inner: build_health_check(system),
+        inner: build_health_check(system, upstream_tls),
         admission: Arc::clone(admission),
     }));
     let mut lb = LoadBalancer::<S>::from_backends(backends);

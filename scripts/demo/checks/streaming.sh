@@ -26,7 +26,9 @@
 stream_exchange() {
   python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYSTREAM'
 import json
+import os
 import socket
+import ssl
 import sys
 import time
 
@@ -37,6 +39,21 @@ target = sys.argv[4]
 max_ms = int(sys.argv[5])
 stop_after = int(sys.argv[6])
 accept_encoding = sys.argv[7]
+
+# Through deis-proxy the exchange is plaintext HTTP, as any visitor's is.
+# Straight to a node's data port it is mutual TLS: the node verifies the
+# caller's certificate names a proxy and closes the connection otherwise, so
+# the harness presents the demo proxy's leaf and verifies the node against
+# the fleet root. The paths come from the environment so the one helper can
+# serve both.
+tls_ca = os.environ.get("STREAM_MTLS_CA")
+if tls_ca:
+    context = ssl.create_default_context(cafile=tls_ca)
+    context.load_cert_chain(
+        os.environ["STREAM_MTLS_CERT"], os.environ["STREAM_MTLS_KEY"]
+    )
+else:
+    context = None
 
 report = {
     "status_line": "",
@@ -54,6 +71,8 @@ def ms():
 
 try:
     sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    if context is not None:
+        sock = context.wrap_socket(sock, server_hostname="127.0.0.1")
     app_header = "x-deis-app-id: %s\r\n" % app_id if app_id else ""
     request = (
         "GET %s HTTP/1.1\r\n"
@@ -145,6 +164,17 @@ except Exception as failure:
 
 print(json.dumps(report))
 PYSTREAM
+}
+
+# The same exchange, straight to the node's data port - which speaks mutual
+# TLS, so the harness carries the demo proxy's leaf and verifies the node
+# against the fleet root. The certificates travel by environment because the
+# python inside `stream_exchange` reads them from there; the wrapper is the
+# only caller that sets them.
+runtime_stream_exchange() {
+  STREAM_MTLS_CA="${PKI_DIR}/ca.crt" \
+    STREAM_MTLS_CERT="${PKI_DIR}/proxy.crt" STREAM_MTLS_KEY="${PKI_DIR}/proxy.key" \
+    stream_exchange "$@"
 }
 
 # One field out of a streaming report, empty when it is not there.
@@ -309,7 +339,7 @@ check_a_stream_stops_when_the_client_hangs_up() {
   # Two frames and then the socket is closed where it stands, which is what a
   # visitor closing a tab looks like from inside the node.
   local gap=80
-  stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
+  runtime_stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
     "${STREAM_ROUTE}?mode=endless&gapMs=${gap}&tag=${tag}" \
     6000 2 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-hangup.log" || true
 
@@ -446,7 +476,7 @@ check_a_stream_past_its_budget_is_closed_by_the_node() {
   # Read for well past the ceiling. The node is what has to end this, and the
   # client keeps asking until it does.
   local patience=$(( DEMO_STREAM_TIMEOUT_MS * 3 ))
-  stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
+  runtime_stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
     "${STREAM_ROUTE}?mode=endless&gapMs=120&tag=${tag}" \
     "$patience" 0 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-budget.log" || true
 
@@ -521,7 +551,7 @@ check_a_request_is_served_while_a_stream_is_open() {
   # underneath it. Both go to the same application, which on this node is one
   # isolate on one thread -- the arrangement that would let a slow reader block
   # everybody if a stream owned the isolate for its lifetime.
-  stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
+  runtime_stream_exchange "$DEIS_RUNTIME_PORT" "127.0.0.1" "$APP_ID" \
     "${STREAM_ROUTE}?mode=endless&gapMs=200&tag=${tag}" \
     4000 0 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-parallel.log" &
   local holder=$!

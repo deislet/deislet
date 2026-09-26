@@ -392,14 +392,15 @@ mint_fleet_identities() {
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/node" \
     "spiffe://${FLEET_TRUST_DOMAIN}/deislet/node/${NODE_ID}" "IP:127.0.0.1"
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/proxy" \
-    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/${PROXY_ID}"
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/${PROXY_ID}" "IP:127.0.0.1"
 
   # The replacement proxy the zero-downtime restart check starts. It is a
   # second machine with a name of its own, not the same one twice: the
   # handover is two processes alive at once, and each has to be able to say
-  # which it is.
+  # which it is. The IP SAN is there because it forwards to the node over
+  # mutual TLS, as its colleague does.
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/proxy-restart" \
-    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/deis-proxy-demo-restart"
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/deis-proxy-demo-restart" "IP:127.0.0.1"
 
   # A second real machine of this fleet: the node that joins by registering,
   # which it can only do by proving a name of its own.
@@ -449,6 +450,23 @@ wait_for_http_any() {
     --retry "$attempts" --retry-delay 1 --retry-max-time $((attempts * 2)) \
     --retry-connrefused \
     "$url" >/dev/null 2>&1
+}
+
+# Wait for the node's data port to answer over mutual TLS. The shape is
+# `wait_for_http_any`'s, with the demo proxy's certificate in front and the
+# port read from the environment - which is what lets it sit behind
+# `wait_for_service` beside the plaintext probes above: a node that has bound
+# the port but not yet loaded its applications answers 503 with
+# `x-deis-node-readiness: starting`, and curl's --retry retries that too, so
+# only a node serving its assignment reports ready. The handshake itself is
+# retried as well: until the node is up the connection is refused, and
+# --retry-connrefused covers that.
+wait_for_runtime() {
+  local attempts=$1
+  runtime_curl -s -o /dev/null -m 2 \
+    --retry "$attempts" --retry-delay 1 --retry-max-time $((attempts * 2)) \
+    --retry-connrefused \
+    "$(runtime_data_url)/health" >/dev/null 2>&1
 }
 
 # Wait until a gRPC listener accepts TCP connections. gRPC speaks h2c, so a
@@ -514,6 +532,8 @@ wait_for_service() {
   local rounds=$4
   local round=0
 
+  # The runtime's probe takes only the retry count, its caller's target is
+  # the pid to watch; the probe reads the port from the environment.
   while [ "$round" -lt "$rounds" ]; do
     if ! pid_running "$pid"; then
       return 2
@@ -1073,7 +1093,11 @@ deis_cli() {
 #    credential answered by no scope list is the shape this platform retired
 #    with `api_keys`. The verbs cover what the demo's own calls do - deploy
 #    and upload versions, write secrets, mint storage tokens, manage
-#    accounts, routes and the audit log;
+#    accounts, routes and the audit log. The storage verbs name their two
+#    tenants outright, because a blanket storage grant is refused where it is
+#    written: such a token works against deis-store with no control plane in
+#    the path and never expires, so there is no wildcard form of it to hand
+#    out by accident.
 # 3. the spent bootstrap secret is kept in a 0600 file beside the demo state,
 #    so `verify` can present it once more and watch it be refused.
 bootstrap_operator_session() {
@@ -1124,8 +1148,9 @@ bootstrap_operator_session() {
   minted=$(env \
     DEIS_CONTROL_ENDPOINT="$(control_url)" \
     DEIS_CONFIG_HOME="${DEMO_DIR}/deis-config" \
-    "${BIN_DIR}/deis" token create --account "$owner" --name demo-operator \
-      --scope "admin:*/*" --scope "deploy:*/*" --scope "secrets:*/*" --scope "storage:*/*" \
+    "${BIN_DIR}/deis" token create --account "$owner" demo-operator \
+      --scope "admin:*/*" --scope "deploy:*/*" --scope "secrets:*/*" \
+      --scope "storage:${APP_ID}/${ENV_NAME}" --scope "storage:${APP_ID}/${PREVIEW_ENV_NAME}" \
       --json 2>/dev/null || echo '{}')
   OPERATOR_TOKEN=$(echo "$minted" | jq -r '.secret // empty')
   if [ -z "$OPERATOR_TOKEN" ]; then
@@ -1921,7 +1946,7 @@ deploy_example_app() {
   APP_V2_NUMBER=$(report_field cli-deploy-v2-preview '.version.number')
   echo "   ✓ deis deploy -e ${PREVIEW_ENV_NAME}: version ${APP_V2_NUMBER} (${APP_V2_ID}) is serving ${PREVIEW_ENV_NAME}"
 
-  echo "   Send requests with: curl -H 'x-deis-app-id: ${APP_ID}' http://127.0.0.1:${DEIS_RUNTIME_PORT}/"
+  echo "   Send requests with: ${SCRIPT_DIR}/lib.sh's runtime_curl -H 'x-deis-app-id: ${APP_ID}' https://127.0.0.1:${DEIS_RUNTIME_PORT}/ -- the data port admits only a fleet proxy's certificate"
 }
 
 # ----------------------------------------------------------------------
@@ -2045,12 +2070,27 @@ on_verify_exit() {
 # between them. "The component did not answer" is an outcome every one of
 # these checks is written to report, so it has to reach the check as the
 # empty body it is rather than as a dead script.
+# The node's data port admits a caller only over mutual TLS naming a proxy of
+# this fleet, so every request the checks send there presents the demo
+# proxy's own leaf - the same credential deis-proxy presents when it forwards
+# a visitor's request - and verifies the node against the fleet root. The
+# node's leaf carries an IP SAN for 127.0.0.1, so verification is by name and
+# not by `--insecure`.
+runtime_curl() {
+  curl --cacert "${PKI_DIR}/ca.crt" \
+    --cert "${PKI_DIR}/proxy.crt" --key "${PKI_DIR}/proxy.key" "$@"
+}
+
+runtime_data_url() {
+  printf 'https://127.0.0.1:%s' "${DEIS_RUNTIME_PORT}"
+}
+
 app_request() {
   local header_file=$1
   local path=$2
   shift 2
-  curl -s -D "$header_file" -H "x-deis-app-id: ${APP_ID}" "$@" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}" || true
+  runtime_curl -s -D "$header_file" -H "x-deis-app-id: ${APP_ID}" "$@" \
+    "$(runtime_data_url)${path}" || true
 }
 
 # The same, addressed to a named environment of the application. No header
@@ -2061,9 +2101,9 @@ env_request() {
   local header_file=$2
   local path=$3
   shift 3
-  curl -s -D "$header_file" \
+  runtime_curl -s -D "$header_file" \
     -H "x-deis-app-id: ${APP_ID}" -H "x-deis-environment: ${environment}" "$@" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}" || true
+    "$(runtime_data_url)${path}" || true
 }
 
 # Read one header value out of a saved response, lower-casing the name.
@@ -2392,10 +2432,10 @@ deployed_version() {
 app_fetch() {
   local label=$1
   local target=$2
-  curl -s -G -D "${LOG_DIR}/verify-${label}.headers" \
+  runtime_curl -s -G -D "${LOG_DIR}/verify-${label}.headers" \
     -H "x-deis-app-id: ${APP_ID}" \
     --data-urlencode "url=${target}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/fetch" || true
+    "$(runtime_data_url)/api/fetch" || true
 }
 
 # Did the handler answer at all?

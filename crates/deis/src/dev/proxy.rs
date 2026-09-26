@@ -7,6 +7,10 @@
 //! application and no hostname to consult, so this stamps the two headers on
 //! and forwards. That is all deis-proxy does to a request on the way in, so
 //! what the handler sees here is what it will see in production.
+//!
+//! It also reaches the node the way deis-proxy does: over mutual TLS, proving
+//! a proxy of the run's own throwaway trust domain, because the node's data
+//! port admits a caller that proved nothing else no longer at all.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,6 +22,8 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+
+use super::pki;
 
 /// Largest request body the dev front door will buffer.
 ///
@@ -62,20 +68,23 @@ pub async fn bind_front_door(addr: SocketAddr) -> Result<TcpListener> {
 }
 
 /// Serve the developer's requests, forwarding each to the node.
+///
+/// The forwarding leg is mutual TLS: the node's data port admits a proxy of
+/// this run's trust domain and nothing else, and `proxy` is this run's front
+/// door wearing that name. The node's certificate carries the same kind of
+/// name - a URI, not an address - so hostname verification is waived while
+/// the chain is still checked against the run's own root.
 pub async fn serve_front_door(
     listener: TcpListener,
     node_port: u16,
     app: String,
     environment: String,
+    proxy: pki::Machine,
 ) -> Result<()> {
+    let http = forwarder(&proxy)?;
     let state = Front {
-        // No timeout: a handler being debugged with a breakpoint or a slow
-        // upstream is normal locally, and a proxy that gave up would look
-        // like the handler failing.
-        http: reqwest::Client::builder()
-            .build()
-            .context("building the dev server's HTTP client")?,
-        node: format!("http://127.0.0.1:{node_port}"),
+        http,
+        node: format!("https://127.0.0.1:{node_port}"),
         app,
         environment,
     };
@@ -85,6 +94,35 @@ pub async fn serve_front_door(
     axum::serve(listener, router)
         .await
         .context("serving the dev front door")
+}
+
+/// An HTTP client that reaches the node's data port as its fleet's proxy.
+fn forwarder(proxy: &pki::Machine) -> Result<reqwest::Client> {
+    // One PEM the client library can read as "this is who I am": the leaf
+    // followed by its key, both of which this run issued to itself.
+    let certificate = std::fs::read(&proxy.certificate)
+        .with_context(|| format!("reading {}", proxy.certificate.display()))?;
+    let key = std::fs::read(&proxy.private_key)
+        .with_context(|| format!("reading {}", proxy.private_key.display()))?;
+    let identity = reqwest::Identity::from_pkcs8_pem(&certificate, &key)
+        .context("loading the dev front door's proxy identity")?;
+
+    let root = std::fs::read(&proxy.trust_root)
+        .with_context(|| format!("reading {}", proxy.trust_root.display()))?;
+    let root = reqwest::Certificate::from_pem(&root).context("loading this run's trust root")?;
+
+    // No timeout: a handler being debugged with a breakpoint or a slow
+    // upstream is normal locally, and a proxy that gave up would look like
+    // the handler failing.
+    reqwest::Client::builder()
+        .identity(identity)
+        .add_root_certificate(root)
+        // The node proves a SPIFFE name, which is checked by nothing that
+        // speaks plain DNS hostname matching; the chain to this run's own
+        // root is the verification that matters here.
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .context("building the dev server's HTTP client")
 }
 
 async fn forward(State(state): State<Front>, request: Request) -> Response {

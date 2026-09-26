@@ -62,7 +62,7 @@ the shape of the name, not its issuer.
 | Process | Section | Refuses to start when |
 |---|---|---|
 | deis-control | `[machine]`: `bind_addr`, `port`, `certificate`, `private_key`, `trust_root`, `identity_reload_seconds` (default 60), `public_base_url` (`crates/deis-control/src/config.rs`) | the section is absent. Everything a node or a proxy calls is served there, so a control plane without it would answer a dashboard and be dead to its fleet (`crates/deis-control/src/main.rs`). |
-| deis-runtime | `[machine_identity]`: the three files, `control_endpoint` (an `https://` URL naming an explicit port), `trust_domain` or `control_identity`, `management_listen`, `identity_reload_seconds` (`crates/deis-runtime/src/config.rs`) | `control.endpoint` is set and `[machine_identity]` is not; or the table has neither `control_endpoint` nor `management_listen`; or `management_listen` names the same port as `http_port`. |
+| deis-runtime | `[machine_identity]`: the three files, `control_endpoint` (an `https://` URL naming an explicit port), `trust_domain` or `control_identity`, `management_listen`, `identity_reload_seconds` (`crates/deis-runtime/src/config.rs`) | `[machine_identity]` is absent; or the table has neither `control_endpoint` nor `management_listen`; or `management_listen` names the same port as `data_listen`. |
 | deis-proxy | `[machine_identity]`: the three files, `control_endpoint`, `trust_domain` (with `control_identity` as an override when the control plane's certificate was issued outside this naming convention) (`crates/deis-proxy/src/config/system/machine_identity.rs`) | `[control]` is present and `[machine_identity]` is not - that proxy would poll a route answering 404 for as long as it ran and route on whatever its own file said (`crates/deis-proxy/src/config/system/mod.rs`). |
 
 ## What each proof opens
@@ -88,7 +88,7 @@ connection, node and proxy certificates included.
 | the control plane's private key | Drive any node that has registered a name and a management address: `ApplyDeployment` (run a bundle of the caller's choosing under any tenant's identity, **with that environment's decrypted secrets carried in the same request**), `UnloadApp`, `GetStatus` (every tenant's applications and metrics on that node), `StartInspect`, `HealthCheck`, and the cron trigger `OnScheduled`. `PushConfig`, `UpdateApp` and `ExecuteCommand` exist on the wire and answer `unimplemented` (`crates/deis-runtime/src/management/service.rs`). This is the only way any node is dialled: `crates/deis-control/src/runtime_client/mod.rs` builds one channel, over mutual TLS, and a node that proved no name or reported no management address is not driven at all and says so. |
 | one node's private key | `Register` and `Deregister` **its own id only** - the id in the request is held against the id in the proved name and a mismatch is refused (`crates/deis-control/src/machine/service.rs`). `FetchAssignments` for its own id only, and that answer carries **every** environment's decrypted secrets, not that node's (see "What is not implemented"). `FetchRoutingTable`. The bundle download for any application and any version: the handler checks nothing about who is asking (`crates/deis-control/src/api/catalog/versions.rs`, `download_bundle`). And the control channel, for a place in the session list, heartbeats and whatever operator-issued command is addressed to the id it announced. |
 | one proxy's private key | `FetchRoutingTable`, and the control channel. Not `FetchAssignments`: a proxy name yields no node id, so the call is refused. The bundle download is not scoped either, so a proxy certificate reaches it too. |
-| an inspector session token, minted by `StartInspect` | A Chrome DevTools Protocol WebSocket **on the node's data port**, against a running isolate: full debugger access to a tenant's running code (`crates/deis-runtime/src/dispatcher/handlers.rs`). |
+| an inspector session token, minted by `StartInspect` | A Chrome DevTools Protocol WebSocket **on the node's `management_listen`**, against a running isolate: full debugger access to a tenant's running code (`crates/deis-runtime/src/dispatcher/machine.rs`). The socket it used to live on - the data port - now admits only a proxy's certificate, so the token alone no longer reaches it: the caller proves the control plane's name first. |
 
 The control plane's human listener still carries `EstablishChannel` as well,
 and it admits nobody there: that listener has no acceptor, so no connection on
@@ -196,43 +196,46 @@ tenants do not trust each other.
 
 ## The node's data port is a trust boundary
 
-The node's data port binds `0.0.0.0:http_port`
-(`crates/deis-runtime/src/dispatcher/mod.rs`). Anything that can reach it can:
+The node's data port binds `data_listen`
+(`crates/deis-runtime/src/dispatcher/mod.rs`) and admits a caller only over
+mutual TLS: the node presents the leaf from its `[machine_identity]`, the
+caller must present a certificate that chains to the same trust root and
+names a **proxy** of this installation (`deislet/proxy/...` in the URI
+subject alternative name), and a handshake that proves anything else - or
+nothing at all - is closed before a byte of any request is read. The demo's
+three witnesses for this are `check_the_data_port_admits_a_fleet_proxy_and_nothing_else`
+(`scripts/demo/checks/accounts.sh`), and the handshakes themselves are tested
+end to end in `crates/deis-runtime/tests/management_auth_test.rs`.
+
+What a caller with a proxy certificate can then reach:
 
 - Address **any application in any environment** on that node by sending
   `x-deis-app-id` and `x-deis-environment` headers. That includes preview
   environments and applications with no route in the catalog at all: the node
   routes on the headers, and having no public address is not a defence.
-- Reach the inspector WebSocket, with a token from `StartInspect`.
+- Reach the inspector WebSocket - not here any more: it moved to the
+  `[machine_identity] management_listen`, where the caller has already proved
+  the control plane's name.
 
 What it can no longer reach is the management plane. Nothing administrative is
 mounted on this port: the two gRPC prefixes fall through to the wildcard and
 are answered as any request naming no application is.
 
-Nothing on this port authenticates its caller either - the certificate demand
-of the management listener is not repeated here. That is a known gap with a
-root fix planned (data-port mutual TLS, so that only a connection holding this
-installation's proxy identity may use routing headers at all, after which the
-stopgap described next is deleted); in this release the port's containment is
-the firewall table below, plus the node's own refusal of its own addresses.
+The certificate demand is the whole of the story now, and the stopgap it
+deleted is worth naming because it shaped the fetch policy below. When this
+port answered plaintext HTTP, any process on the machine - this node's own
+applications included - could have opened it with routing headers of its own
+choosing; the port's containment was the firewall plus the node's refusal of
+its own addresses. The refusal stays. It is no longer the only thing between
+a tenant and another tenant's code - the handshake is - but an application
+that could reach the port at all should still be refused before the
+conversation starts, and the fetch policy below is what does that.
 
-One path a firewall alone does not close is this node's own tenants reaching
-the port from inside. The data port binds every interface, so on a machine
-whose public address sits on the NIC - or is hairpinned by a provider's 1:1
-NAT - an application running on this node can open
-`http://<this node's public address>:<http_port>/` with routing headers of its
-own choosing and invoke another tenant's code on the same node, under exactly
-the private-address rules that were meant to keep it on its own side. The
-outbound fetch policy therefore refuses this node's own data port under every
-address it answers at: the loopback spellings, every interface address found
-at startup, and the addresses the operator lists under
-`node.advertised_addresses` for the ones NAT maps from outside onto this node
-(`crates/deis-runtime/src/main.rs`). Two limits are worth naming: the
-interface enumeration is a startup snapshot, so an address that appears later
-- a DHCP renewal, a hot-plugged NIC - is covered only once the operator adds
-it to `advertised_addresses`; and on a host running several nodes, only this
-node's own port is refused, because the enumeration carries this node's port
-alone.
+A proxy certificate in hand is not a small thing: whoever holds one can
+address every application on the node exactly as the real proxy can. That is
+why the trust boundary does not move - the port still must not be reachable
+from the internet, and a leaked proxy key is handled the same way as a leaked
+node key, under the rule at the end of this section.
 
 None of this is reachable *through* deis-proxy. The edge routes on the `Host`
 header and the path alone: the client's whole `x-deis-` header namespace is
@@ -254,7 +257,7 @@ network - not by the absence of a published address:
 
 | Port | Who may reach it |
 |---|---|
-| Node data port (`http_port`) | deis-proxy, and whoever attaches an inspector session. Nothing else, and never the internet - and, per the fetch policy above, not this node's own applications under any address of this node either. The control plane no longer dials it: every call it makes into a node goes to the address below. |
+| Node data port (`data_listen`, mutual TLS) | deis-proxy, and whoever attaches an inspector session over a certificate naming this installation's control plane. Every caller proves a proxy's name in the handshake; a plaintext caller, a caller with no certificate, one naming another machine, and one signed by an outside authority all get a closed connection. The control plane no longer dials it: every call it makes into a node goes to the address below. |
 | Node `[machine_identity] management_listen` | The one machine this node's `[machine_identity]` names as its control plane, and nobody else this fleet has ever signed a certificate for - every other proved name is refused at the connection. |
 | Control plane's human listener (`bind_addr`, `port`) | The operators' network. Never the internet. It serves the dashboard and the API - every caller presents a token, and there is no anonymous path - plus a control channel that admits nobody. |
 | Control plane's `[machine]` listener | Machines holding a certificate this fleet signed. This is where the assignment list, the routing table and the bundle store live, so it must never be the internet either - the certificate demand is the authentication, not the containment. |

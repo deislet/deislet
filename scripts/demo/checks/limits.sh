@@ -25,9 +25,9 @@
 timed_slow_request() {
   local environment=$1
   local ms=$2
-  curl -s -o /dev/null -w '%{http_code} %{time_total}' \
+  runtime_curl -s -o /dev/null -w '%{http_code} %{time_total}' \
     -H "x-deis-app-id: ${APP_ID}" -H "x-deis-environment: ${environment}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/slow?ms=${ms}"
+    "$(runtime_data_url)/api/slow?ms=${ms}"
 }
 
 check_app_limits_narrowed() {
@@ -352,9 +352,9 @@ check_memory_cutoff() {
   # while this request fails for some other reason entirely.
   local tag="heap-$$-${RANDOM}"
   local answered status seconds
-  answered=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' \
+  answered=$(runtime_curl -s -o /dev/null -w '%{http_code} %{time_total}' \
     -H "x-deis-app-id: ${APP_ID}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/heap?tag=${tag}" || true)
+    "$(runtime_data_url)/api/heap?tag=${tag}" || true)
   status=${answered%% *}
   seconds=${answered##* }
 

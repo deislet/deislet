@@ -39,7 +39,11 @@ hex = "0.4"
 # Renders a KV value or a blob object in --json output without doubling a
 # binary payload into a much larger array of per-byte JSON numbers.
 base64 = "0.22"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# "native-tls" is what makes reqwest::Identity (a client certificate) exist:
+# the default-tls feature alone compiles the TLS connection but no client-auth
+# API, and the front door forwards to the node's data port as its fleet's
+# proxy, which mutual TLS demands.
+reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
 tonic = "0.12"
 prost = "0.13"
 tokio-stream = "0.1"

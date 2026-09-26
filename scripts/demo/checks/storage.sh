@@ -9,9 +9,9 @@ check_kv_roundtrip() {
   local headers="${LOG_DIR}/verify-kv.headers"
 
   local put
-  put=$(curl -s -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+  put=$(runtime_curl -s -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "$value" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/${key}" || true)
+    "$(runtime_data_url)/api/kv/${key}" || true)
   if [ "$(http_status "$headers")" != "201" ]; then
     fail_check "$title" "PUT answered $(http_status "$headers"): ${put}"
     return
@@ -306,7 +306,7 @@ check_data_cli_reads_the_apps_write() {
   # that is not being tested.
   curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "$value" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/${key}"
+    "$(runtime_data_url)/api/kv/${key}"
   if [ "$(http_status "$headers")" != "201" ]; then
     fail_check "$title" \
       "the handler could not store ${key}: HTTP $(http_status "$headers")"
@@ -620,9 +620,9 @@ seed_blob_objects() {
   local headers="${LOG_DIR}/verify-blob-seed.headers"
   local key
   for key in "img/logo.png" "img/hero.png" "img/icons/star.svg" "index.html"; do
-    curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+    runtime_curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
       --data-binary "0123456789abcdef" \
-      "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=${key}&contentType=text/plain"
+      "$(runtime_data_url)${BLOB_ROUTE}?key=${key}&contentType=text/plain"
     if [ "$(http_status "$headers")" != "201" ]; then
       echo "$key"
       return 1
@@ -652,9 +652,9 @@ check_blob_listing() {
   local scope="listing/"
   local seeded
   for seeded in "index.html" "img/logo.png" "img/hero.png" "img/icons/star.svg"; do
-    curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+    runtime_curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
       --data-binary "0123456789abcdef" \
-      "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=${scope}${seeded}&contentType=text/plain"
+      "$(runtime_data_url)${BLOB_ROUTE}?key=${scope}${seeded}&contentType=text/plain"
     if [ "$(http_status "$headers")" != "201" ]; then
       fail_check "$title" "the application could not store ${scope}${seeded}"
       return
@@ -707,8 +707,8 @@ check_blob_head() {
   type=$(echo "$head" | jq -r '.contentType // empty' 2>/dev/null || true)
 
   local missing_status
-  missing_status=$(curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?op=head&key=never-written" || true)
+  missing_status=$(runtime_curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
+    "$(runtime_data_url)${BLOB_ROUTE}?op=head&key=never-written" || true)
 
   # The etag has to be the object's sha256, because that is the value a
   # conditional write compares against; a made-up identity would still look
@@ -755,13 +755,13 @@ check_blob_range_read() {
   # other than "no such object", or the application cannot answer 416 where it
   # owes 416 and 404 where it owes 404.
   local unsatisfiable
-  unsatisfiable=$(curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
+  unsatisfiable=$(runtime_curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
     -H "range: bytes=99-" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=index.html" || true)
+    "$(runtime_data_url)${BLOB_ROUTE}?key=index.html" || true)
   local absent
-  absent=$(curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
+  absent=$(runtime_curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
     -H "range: bytes=0-1" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=never-written" || true)
+    "$(runtime_data_url)${BLOB_ROUTE}?key=never-written" || true)
 
   if [ "$status" = "206" ] && [ "$body" = "456789" ] \
     && [ "$range" = "bytes 4-9/16" ] && [ "$suffix" = "cdef" ] \
@@ -779,14 +779,14 @@ check_blob_conditional_write() {
   local title="two conditional writes of one key: one lands, the other is told it lost"
   local key="lock-$$"
   local headers="${LOG_DIR}/verify-blob-cas.headers"
-  local url="http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}"
+  local url="$(runtime_data_url)${BLOB_ROUTE}"
 
   # Create-once. The second attempt must not overwrite, and must not look like
   # a transport failure either: the application answers 412 for exactly this.
   local first second
-  first=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
+  first=$(runtime_curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "held by the first writer" "${url}?key=${key}&ifNoneMatch=*" || true)
-  second=$(curl -s -o "${LOG_DIR}/verify-blob-cas-second.json" -w '%{http_code}' \
+  second=$(runtime_curl -s -o "${LOG_DIR}/verify-blob-cas-second.json" -w '%{http_code}' \
     -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "held by the second writer" "${url}?key=${key}&ifNoneMatch=*" || true)
 
@@ -798,14 +798,14 @@ check_blob_conditional_write() {
   local etag
   etag=$(app_request "$headers" "${BLOB_ROUTE}?op=head&key=${key}" | jq -r '.etag // empty' 2>/dev/null || true)
   local updated stale
-  updated=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
+  updated=$(runtime_curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "second version" "${url}?key=${key}&ifMatch=${etag}" || true)
-  stale=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
+  stale=$(runtime_curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "third version" "${url}?key=${key}&ifMatch=${etag}" || true)
 
   # And a conditional delete against the etag that is no longer current.
   local stale_delete
-  stale_delete=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "x-deis-app-id: ${APP_ID}" \
+  stale_delete=$(runtime_curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "x-deis-app-id: ${APP_ID}" \
     "${url}?key=${key}&ifMatch=${etag}" || true)
 
   local final

@@ -304,7 +304,7 @@ check_a_process_with_no_certificate_refuses_to_start() {
   local node_config="${dir}/deis-runtime.toml"
   cat > "$node_config" <<EOF
 node_id = "deis-runtime-demo-no-identity"
-http_port = 1
+data_listen = "127.0.0.1:1"
 data_dir = "${dir}/runtime-data"
 
 [control]

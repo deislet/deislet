@@ -498,12 +498,12 @@ private_page_request() {
   local credential=$3
 
   if [ -n "$credential" ]; then
-    curl -s -D "$headers" -H "x-deis-app-id: ${APP_ID}" \
+    runtime_curl -s -D "$headers" -H "x-deis-app-id: ${APP_ID}" \
       -H "authorization: ${credential}" \
-      "http://127.0.0.1:${DEIS_RUNTIME_PORT}${PRIVATE_PAGE_ROUTE}?mode=${mode}" || true
+      "$(runtime_data_url)${PRIVATE_PAGE_ROUTE}?mode=${mode}" || true
   else
-    curl -s -D "$headers" -H "x-deis-app-id: ${APP_ID}" \
-      "http://127.0.0.1:${DEIS_RUNTIME_PORT}${PRIVATE_PAGE_ROUTE}?mode=${mode}" || true
+    runtime_curl -s -D "$headers" -H "x-deis-app-id: ${APP_ID}" \
+      "$(runtime_data_url)${PRIVATE_PAGE_ROUTE}?mode=${mode}" || true
   fi
 }
 

@@ -255,7 +255,10 @@ EOF
     # allowlist entry can reach. `verify` asks for one of each.
     cat > "$DEIS_RUNTIME_CONFIG" <<EOF
 node_id = "${NODE_ID}"
-http_port = ${DEIS_RUNTIME_PORT}
+# The data port answers only mutual TLS: the node verifies every caller
+# against the fleet root and checks the certificate names a proxy, so the
+# address below is unusable without the proxy's leaf from ${PKI_DIR}.
+data_listen = "127.0.0.1:${DEIS_RUNTIME_PORT}"
 data_dir = "${DEMO_DIR}/deis-runtime-data"
 
 [logging]
@@ -426,15 +429,14 @@ EOF
   # node kept its port. With `>` `>(...)` the job is the node and `$!` is the
   # node.
   DEIS_RUNTIME_CONFIG="$DEIS_RUNTIME_CONFIG" \
-    DEIS_RUNTIME_HTTP_PORT="$DEIS_RUNTIME_PORT" \
+    DEIS_RUNTIME_DATA_LISTEN="127.0.0.1:${DEIS_RUNTIME_PORT}" \
     "${BIN_DIR}/deis-runtime" \
     > >(bounded_log "${LOG_DIR}/deis-runtime.log") 2>&1 &
   DEIS_RUNTIME_PID=$!
 
   local runtime_rc
   runtime_rc=0
-  wait_for_service wait_for_http_any "http://127.0.0.1:${DEIS_RUNTIME_PORT}/health" \
-    "$DEIS_RUNTIME_PID" 60 || runtime_rc=$?
+  wait_for_service wait_for_runtime 60 "$DEIS_RUNTIME_PID" 60 || runtime_rc=$?
   report_service "Runtime" "$runtime_rc" "${LOG_DIR}/deis-runtime.log" \
     "no application can serve a request"
 
@@ -474,7 +476,7 @@ EOF
 
   echo "✅ Demo environment started"
   echo "- Control API: http://127.0.0.1:${DEIS_CONTROL_PORT}"
-  echo "- Runtime: http://127.0.0.1:${DEIS_RUNTIME_PORT}"
+  echo "- Runtime data port: https://127.0.0.1:${DEIS_RUNTIME_PORT} (mutual TLS; needs a fleet proxy certificate)"
   echo "- Proxy: http://127.0.0.1:${DEIS_PROXY_PORT}"
   echo "- Proxy TLS: https://${ACME_PRODUCTION_NAME}:${DEIS_PROXY_TLS_PORT}/ (certificate obtained over ACME; curl needs --cacert ${ACME_CA_ROOT} --resolve)"
   echo "- Store (gRPC): 127.0.0.1:${DEIS_STORE_PORT}"
@@ -588,7 +590,7 @@ status_demo() {
   echo "- Telemetry PID: ${DEIS_TELEMETRY_PID:-unknown}"
   echo "- Origin PID: ${DEIS_ORIGIN_PID:-none}"
   echo "- Control API: http://127.0.0.1:${DEIS_CONTROL_PORT}"
-  echo "- Runtime: http://127.0.0.1:${DEIS_RUNTIME_PORT}"
+  echo "- Runtime data port: https://127.0.0.1:${DEIS_RUNTIME_PORT:-unknown} (mutual TLS; needs a fleet proxy certificate)"
   echo "- Proxy: http://127.0.0.1:${DEIS_PROXY_PORT}"
   echo "- Store (gRPC): 127.0.0.1:${DEIS_STORE_PORT:-unknown}"
   echo "- Queue (gRPC): 127.0.0.1:${DEIS_QUEUE_PORT:-unknown}"

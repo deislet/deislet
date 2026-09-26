@@ -25,7 +25,9 @@ use deis_proxy::config::system::acme::{LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STA
 use deis_proxy::config::system::{LogLevel, MachineIdentityConfig};
 use deis_proxy::config::{ConfigManager, SystemConfig};
 use deis_proxy::control::{ControlService, control_client};
-use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic, InheritedListeners};
+use deis_proxy::proxy::{
+    AccessLog, Balancer, DeisProxy, ExitOnPanic, InheritedListeners, UpstreamTls,
+};
 use deis_proxy::restart::{
     ProcessControl, RelaunchArgs, announce_ready, check_upgrade_socket_path, executable_path,
     prove_listeners_bindable, prove_pid_file_writable, prove_upgrade_socket_bindable,
@@ -484,7 +486,21 @@ fn main() -> Result<()> {
          deis-runtime's own max_request_body_bytes should be set to the same value"
     );
 
-    let (balancer, balancer_service) = Balancer::build(Arc::clone(&config));
+    // The upstream leg's mutual-TLS material, read from the same files
+    // [machine_identity] names. Parsed before the balancer exists, because
+    // the health checks dial the same mutual-TLS door the traffic does, and
+    // a failure here is a startup failure for the same reason a bad listener
+    // address is: a proxy that cannot prove itself to its nodes serves no
+    // one, and saying so beats an edge full of 502s.
+    let upstream_tls = match &system.machine_identity {
+        Some(identity_config) => Some(
+            UpstreamTls::load(identity_config)
+                .context("loading the upstream mutual-TLS material from [machine_identity]")?,
+        ),
+        None => None,
+    };
+
+    let (balancer, balancer_service) = Balancer::build(Arc::clone(&config), upstream_tls.clone());
 
     let access_log = match system.log.as_ref().and_then(|log| log.access_log.as_ref()) {
         Some(access) => {
@@ -556,6 +572,7 @@ fn main() -> Result<()> {
         acme_runtime
             .as_ref()
             .map(|runtime| Arc::clone(&runtime.responder)),
+        upstream_tls,
     );
     let mut service = http_proxy_service_with_name(&server.configuration, proxy, "deis_proxy");
 

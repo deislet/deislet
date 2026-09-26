@@ -380,22 +380,25 @@ check_a_scoped_token_cannot_unload_an_application_from_a_node() {
   fi
 }
 
-# One gRPC call at the node's own management plane, answering with the
-# grpc-status the node put in its response.
+# One gRPC call at the node's data port, answering with the grpc-status the
+# node put in its response.
 #
 # A refusal is a trailers-only response - HTTP 200 with the status in the
 # headers and no message at all - so reading the headers is enough and nothing
 # here has to decode protobuf. An empty status means the call was served: a
 # served answer puts its status in the trailers instead.
+#
+# The call goes over mutual TLS with the demo proxy's leaf, because that is
+# the only shape of caller the data port talks to at all now - which is also
+# why no credential header is asked about any more: a gRPC service that never
+# sees the request has no string to answer a header with, and the door the
+# header used to open was on a listener that no longer takes plaintext.
 node_grpc_status() {
-  local path=$1 credential=$2 frame=$3
+  local path=$1 frame=$2
   local args=(-s -o /dev/null -D - -X POST
     -H "content-type: application/grpc" -H "te: trailers"
     --data-binary "@${frame}")
-  if [ -n "$credential" ]; then
-    args+=(-H "authorization: Bearer ${credential}")
-  fi
-  curl "${args[@]}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}" 2>/dev/null \
+  runtime_curl "${args[@]}" "$(runtime_data_url)${path}" 2>/dev/null \
     | tr -d '\r' | awk 'tolower($1) == "grpc-status:" {print $2}' | head -n 1
 }
 
@@ -510,37 +513,34 @@ check_the_node_management_plane_is_not_on_the_data_port() {
   # bytes come from /dev/zero because a shell variable cannot carry a NUL.
   head -c 5 /dev/zero > "$frame"
 
-  # No grpc-status on any of them, which is the assertion: a status would mean
-  # a gRPC service had seen the request and decided something about it.
-  local grpc_none grpc_wrong grpc_key grpc_trigger
-  grpc_none=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "" "$frame")
-  grpc_wrong=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "not-the-node-key" "$frame")
-  # The value this demo used to configure everywhere, sent now that nothing
-  # configures it. It buys exactly as much as the wrong one above, and as much
-  # as bringing nothing: the door it used to open is not locked, it is gone.
-  grpc_key=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "$SECRET" "$frame")
-  grpc_trigger=$(node_grpc_status "/deis.trigger.Trigger/OnScheduled" "" "$frame")
+  # No grpc-status on either, which is the assertion: a status would mean a
+  # gRPC service had seen the request and decided something about it.
+  local grpc_none grpc_trigger
+  grpc_none=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "$frame")
+  grpc_trigger=$(node_grpc_status "/deis.trigger.Trigger/OnScheduled" "$frame")
 
   # And what the port does answer, which is what says these are being read as
-  # application traffic rather than refused as management calls.
+  # application traffic rather than refused as management calls. These go
+  # over the same mutual TLS as every caller of this port now: the credential
+  # question is the certificate's, and the check below asks it directly.
   local without_app_id with_app_id trigger_with_app_id traced
-  without_app_id=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  without_app_id=$(runtime_curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H "content-type: application/grpc" -H "te: trailers" \
     --data-binary "@${frame}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/deis.management.RuntimeManagement/GetStatus" 2>/dev/null || true)
+    "$(runtime_data_url)/deis.management.RuntimeManagement/GetStatus" 2>/dev/null || true)
 
   local traced_headers="${LOG_DIR}/verify-node-management-path.headers"
-  with_app_id=$(curl -s -o /dev/null -D "$traced_headers" -w '%{http_code}' -X POST \
+  with_app_id=$(runtime_curl -s -o /dev/null -D "$traced_headers" -w '%{http_code}' -X POST \
     -H "content-type: application/grpc" -H "te: trailers" -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "@${frame}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/deis.management.RuntimeManagement/GetStatus" 2>/dev/null || true)
+    "$(runtime_data_url)/deis.management.RuntimeManagement/GetStatus" 2>/dev/null || true)
   traced=$(tr -d '\r' < "$traced_headers" 2>/dev/null \
     | awk 'tolower($1) == "x-deis-trace-id:" {print $2}' | head -n 1)
 
-  trigger_with_app_id=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  trigger_with_app_id=$(runtime_curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H "content-type: application/grpc" -H "te: trailers" -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "@${frame}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/deis.trigger.Trigger/OnScheduled" 2>/dev/null || true)
+    "$(runtime_data_url)/deis.trigger.Trigger/OnScheduled" 2>/dev/null || true)
 
   # And the socket that does drive this node, asked in plaintext. A caller
   # that cannot prove the control plane's name never completes a handshake,
@@ -564,16 +564,56 @@ check_the_node_management_plane_is_not_on_the_data_port() {
   healthy=$(jq -r --arg id "$NODE_ID" \
     '.nodes[] | select(.id == $id) | .healthy' < "$fleet" 2>/dev/null || true)
 
-  if [ -z "$grpc_none" ] && [ -z "$grpc_wrong" ] && [ -z "$grpc_key" ] && [ -z "$grpc_trigger" ] \
+  if [ -z "$grpc_none" ] && [ -z "$grpc_trigger" ] \
     && [ "$without_app_id" = "400" ] && [ "$with_app_id" = "404" ] \
     && [ "$trigger_with_app_id" = "404" ] && [ -n "$traced" ] \
     && [ "$plaintext_at_machine_plane" -ne 0 ] \
     && [ "$still_serving" = "200" ] && [ "$healthy" = "true" ]; then
     pass_check "$title" \
-      "GetStatus at the node's data port answered no grpc-status at all - with no credential, with a wrong one, and with the fleet secret this demo used to configure everywhere - and neither did the trigger service's OnScheduled. What it did answer is HTTP ${without_app_id} asking for an x-deis-app-id header, and with ${APP_ID}'s header on it, HTTP ${with_app_id} carrying trace id ${traced}: the path was handed to the application's own router, which has no such route. So there is no management call to refuse here and no string that would change that. A plaintext call at the mutually authenticated plane on port ${DEIS_RUNTIME_MACHINE_PORT} got no response at all (curl exited ${plaintext_at_machine_plane}), because a caller that has not proved this node's control plane's name does not get a connection. ${APP_ID} still answers HTTP ${still_serving}, and the control plane reports ${NODE_ID} healthy, which is its own health poll getting through the one door that is open"
+      "GetStatus at the node's data port, asked over the mutual TLS the port now requires, answered no grpc-status at all - and neither did the trigger service's OnScheduled. What the port did answer is HTTP ${without_app_id} asking for an x-deis-app-id header, and with ${APP_ID}'s header on it, HTTP ${with_app_id} carrying trace id ${traced}: the path was handed to the application's own router, which has no such route. So there is no management call to refuse here, and no string a caller could bring that would change that - the questions a shared value used to answer are the certificate's now, and the next check asks those. A plaintext call at the mutually authenticated plane on port ${DEIS_RUNTIME_MACHINE_PORT} got no response at all (curl exited ${plaintext_at_machine_plane}), because a caller that has not proved this node's control plane's name does not get a connection. ${APP_ID} still answers HTTP ${still_serving}, and the control plane reports ${NODE_ID} healthy, which is its own health poll getting through the one door that is open"
   else
     fail_check "$title" \
-      "expected no grpc-status on the data port with no credential (got \"${grpc_none:-none}\"), a wrong one (got \"${grpc_wrong:-none}\"), the retired fleet secret (got \"${grpc_key:-none}\") or on OnScheduled (got \"${grpc_trigger:-none}\"); HTTP 400 without an app id (got ${without_app_id:-none}), 404 with one (got ${with_app_id:-none}) carrying a trace id (got \"${traced:-none}\"), and 404 for OnScheduled with one (got ${trigger_with_app_id:-none}); a plaintext call at port ${DEIS_RUNTIME_MACHINE_PORT} refused at the handshake (curl exited ${plaintext_at_machine_plane}, expected non-zero). ${APP_ID} answered ${still_serving} (expected 200) and the control plane reports ${NODE_ID} healthy=${healthy:-unknown}"
+      "expected no grpc-status on the data port for GetStatus (got \"${grpc_none:-none}\") or OnScheduled (got \"${grpc_trigger:-none}\"); HTTP 400 without an app id (got ${without_app_id:-none}), 404 with one (got ${with_app_id:-none}) carrying a trace id (got \"${traced:-none}\"), and 404 for OnScheduled with one (got ${trigger_with_app_id:-none}); a plaintext call at port ${DEIS_RUNTIME_MACHINE_PORT} refused at the handshake (curl exited ${plaintext_at_machine_plane}, expected non-zero). ${APP_ID} answered ${still_serving} (expected 200) and the control plane reports ${NODE_ID} healthy=${healthy:-unknown}"
+  fi
+}
+
+# The other half of the sentence the check above starts. Its probes speak
+# mutual TLS and reach the application, which leaves open who the certificate
+# itself admits. The answer the design wants is a fixed list: a caller whose
+# certificate names a proxy of this fleet. Everything else is refused at the
+# handshake, where nothing is dispatched and nothing of the request is read -
+# so these three witnesses assert the shape of the answers, as the one above
+# does, and the first two of them are the two ways to fail the same way: to
+# bring nothing at all, and to bring a real certificate that speaks for the
+# wrong machine. The third is a certificate in the right shape from an
+# authority this fleet has never heard of, which is the attack the shared
+# value could not tell from a colleague.
+check_the_data_port_admits_a_fleet_proxy_and_nothing_else() {
+  local title="a node's data port answers a fleet proxy and nothing else"
+
+  local anonymous named rogue
+  anonymous=$(curl -s -o /dev/null -w '%{http_code}' \
+    --cacert "${PKI_DIR}/ca.crt" \
+    "$(runtime_data_url)/" 2>/dev/null || true)
+  named=$(curl -s -o /dev/null -w '%{http_code}' \
+    --cacert "${PKI_DIR}/ca.crt" \
+    --cert "${PKI_DIR}/impostor.crt" --key "${PKI_DIR}/impostor.key" \
+    "$(runtime_data_url)/" 2>/dev/null || true)
+  rogue=$(curl -s -o /dev/null -w '%{http_code}' \
+    --cacert "${PKI_DIR}/ca.crt" \
+    --cert "${PKI_DIR}/rogue.crt" --key "${PKI_DIR}/rogue.key" \
+    "$(runtime_data_url)/" 2>/dev/null || true)
+
+  # `000` is curl reporting that no HTTP status was ever received: the
+  # handshake ended and no request was served. The proxy's own leaf got a
+  # status from the same path in the checks above, which is what says the
+  # refusals here are about the credential and not about the address.
+  if [ "${anonymous}" = "000" ] && [ "${named}" = "000" ] && [ "${rogue}" = "000" ]; then
+    pass_check "$title" \
+      "three callers asked this node's data port for ${APP_ID}: one with no certificate, one with a real certificate of this fleet naming the wrong machine, and one with a certificate naming the right machine that this fleet never signed. None got an HTTP status at all - curl reported 000 for each - because the node ends every handshake where the certificate does not name a proxy of this fleet, before a byte of any request is read. What a shared value could not have said - is this caller the proxy or somebody who read the same configuration file - the handshake says about each of them"
+  else
+    fail_check "$title" \
+      "expected 000 from all three callers at the data port: no certificate got ${anonymous:-none}, a certificate naming another machine got ${named:-none}, a certificate from an outside authority got ${rogue:-none}"
   fi
 }
 
@@ -774,6 +814,9 @@ group_accounts_checks=(
   check_a_credential_cannot_wire_an_app_to_one_it_cannot_see
   check_a_scoped_token_cannot_unload_an_application_from_a_node
   check_the_node_management_plane_is_not_on_the_data_port
+  # And the certificate question that check above leaves open: which callers
+  # the data port's own handshake admits.
+  check_the_data_port_admits_a_fleet_proxy_and_nothing_else
   check_every_process_says_when_its_certificate_runs_out
   check_a_wide_credential_cannot_mint_a_storage_token
   check_a_revoked_token_stops_at_its_next_call

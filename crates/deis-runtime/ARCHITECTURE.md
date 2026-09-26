@@ -201,8 +201,8 @@ there is no `--config` flag. Every key is documented inline in the checked-in
 below is only the shape:
 
 ```toml
-http_port = 8000            # application HTTP traffic only - the management
-                             # plane is on [machine_identity] management_listen
+data_listen = "127.0.0.1:8000"  # application traffic over mutual TLS - the
+                             # management plane is on [machine_identity] management_listen
 data_dir = "./data"         # this node's SQLite database and local state
 
 [default_execution_limits]

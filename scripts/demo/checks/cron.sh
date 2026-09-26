@@ -71,7 +71,7 @@ check_cron() {
   # than the three minutes the default tick would need. curl paces its own
   # retries a second apart; nothing here sleeps.
   local title="a cron expression fires on one node and runs the app's handler"
-  local kv="http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv"
+  local kv="https://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv"
 
   # The moment this run chose. Taken before anything is read, so every
   # judgement below is about what happened after it.
@@ -87,21 +87,21 @@ check_cron() {
   local probe_key="cron:forgery-probe-$$-${RANDOM}"
   local probe_headers="${LOG_DIR}/verify-cron-forgery.headers"
   local refused forged_status probe_found
-  refused=$(curl -s -D "$probe_headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+  refused=$(runtime_curl -s -D "$probe_headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary '{"at":"2099-01-01T00:00:00.000Z","tick":999999}' \
     "${kv}/${probe_key}" 2>/dev/null || true)
   forged_status=$(http_status "$probe_headers")
   # `tostring` rather than `// empty`: jq's `//` yields its right side for
   # `false` as well as for null, so the one answer this probe wants to see -
   # "found": false - would come back indistinguishable from no answer at all.
-  probe_found=$(curl -s -m 5 -H "x-deis-app-id: ${APP_ID}" "${kv}/${probe_key}" 2>/dev/null \
+  probe_found=$(runtime_curl -s -m 5 -H "x-deis-app-id: ${APP_ID}" "${kv}/${probe_key}" 2>/dev/null \
     | jq -r '.found | tostring' 2>/dev/null || true)
 
   # What the store already held. Missing - the first minute after `start` -
   # and a value this app did not write both read as tick 0, which any real
   # tick beats.
   local seen previous_record previous_tick previous_at
-  seen=$(curl -s -m 5 -H "x-deis-app-id: ${APP_ID}" "${kv}/cron:last-run" 2>/dev/null || true)
+  seen=$(runtime_curl -s -m 5 -H "x-deis-app-id: ${APP_ID}" "${kv}/cron:last-run" 2>/dev/null || true)
   previous_record=$(echo "$seen" | jq -r '.value // empty' 2>/dev/null || true)
   previous_tick=$(echo "$previous_record" | jq -r '.tick // empty' 2>/dev/null || true)
   previous_at=$(echo "$previous_record" | jq -r '.at // empty' 2>/dev/null || true)
@@ -121,7 +121,7 @@ check_cron() {
   while [ "$round" -lt 3 ]; do
     round=$((round + 1))
     waited_for="cron:tick:${want}"
-    record=$(curl -sf --retry 100 --retry-delay 1 --retry-max-time 130 --retry-all-errors \
+    record=$(runtime_curl -sf --retry 100 --retry-delay 1 --retry-max-time 130 --retry-all-errors \
       -H "x-deis-app-id: ${APP_ID}" "${kv}/${waited_for}" 2>/dev/null \
       | jq -r '.value // empty' 2>/dev/null || true)
     if [ -z "$record" ]; then

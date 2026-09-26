@@ -227,8 +227,14 @@ scripts/demo.sh stop      # stop everything and wait until each process has real
 Then talk to the deployed application:
 
 ```bash
-curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
+curl -H 'x-deis-app-id: demo' http://127.0.0.1:8087/hello/world
 ```
+
+Through deis-proxy, as a visitor arrives. The node's own data port (8086 in
+the default layout) no longer takes plaintext: it answers only a connection
+presenting a certificate this fleet signed for a proxy, so the demo's checks
+reach it through `scripts/demo/lib.sh`'s `runtime_curl`, which carries the
+demo proxy's leaf and verifies the node against the fleet root.
 
 `start` needs `cargo`, `curl` and `jq`. Some checks need more, and they are
 named here by what they do rather than counted, because the count moves every

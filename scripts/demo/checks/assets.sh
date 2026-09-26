@@ -38,13 +38,13 @@ check_static_asset_conditional() {
   fi
 
   local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' \
+  code=$(runtime_curl -s -o /dev/null -w '%{http_code}' \
     -H "x-deis-app-id: ${APP_ID}" -H "If-None-Match: ${etag}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" || true)
+    "$(runtime_data_url)/" || true)
   local length
-  length=$(curl -s -o /dev/null -w '%{size_download}' \
+  length=$(runtime_curl -s -o /dev/null -w '%{size_download}' \
     -H "x-deis-app-id: ${APP_ID}" -H "If-None-Match: ${etag}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" || true)
+    "$(runtime_data_url)/" || true)
 
   if [ "$code" = "304" ] && [ "$length" = "0" ]; then
     pass_check "If-None-Match on that ETag answers 304 with no body" \

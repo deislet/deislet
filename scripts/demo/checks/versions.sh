@@ -4,7 +4,7 @@
 # The static label the served asset carries, which rides inside the version
 # bundle rather than being produced by a handler.
 asset_label() {
-  curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
+  runtime_curl -s -H "x-deis-app-id: ${APP_ID}" "$(runtime_data_url)/" \
     | grep -o 'data-label="[^"]*"' || true
 }
 

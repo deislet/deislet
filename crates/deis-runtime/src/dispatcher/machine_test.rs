@@ -21,10 +21,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::get;
 use axum::Router;
-use deis_identity::{names, Dialler, MachineIdentity, Protocol, SpiffeId};
-use deis_identity_test_pki::{write_files, TestCa};
+use axum::routing::get;
+use deis_identity::{Dialler, MachineIdentity, Protocol, SpiffeId, names};
+use deis_identity_test_pki::{TestCa, write_files};
 use tonic::transport::Endpoint;
 use tower::ServiceExt;
 

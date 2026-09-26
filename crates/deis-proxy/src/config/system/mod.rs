@@ -616,6 +616,23 @@ impl Validatable for SystemConfig {
                 ),
             });
         }
+        // A control plane was named but no endpoint to reach its machine
+        // channel at: the identity would load and then nothing would dial.
+        // A standalone proxy is the other way round - it has no control plane
+        // to name and uses its identity on the upstream leg instead - so the
+        // endpoint stays optional exactly there.
+        if self.control.is_some()
+            && let Some(identity) = &self.machine_identity
+            && identity.control_endpoint.is_empty()
+        {
+            return Err(ConfigError::ValidationError {
+                message: "[control] is configured but machine_identity.control_endpoint is \
+                          empty. The routing table is fetched over the control plane's machine \
+                          channel, and there is no address here to fetch it from; write the \
+                          https://host:port the control plane's [machine] listener answers on"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -809,6 +826,33 @@ ports = [443]
         config
             .validate()
             .expect("a long upgrade_sock is a warning at startup, not a refusal");
+    }
+
+    #[test]
+    fn a_control_plane_with_a_machine_identity_that_names_no_endpoint_is_refused() {
+        // Each half alone is fine - [control] with no identity is refused
+        // elsewhere, an identity with no endpoint is a standalone proxy - but
+        // together they describe a proxy that loads a certificate, announces
+        // it has a control plane, and then never dials anything. Only a
+        // validate that sees both sections can refuse it.
+        let config = SystemConfig {
+            control: Some(deis_wire::ControlConfig::new(
+                "i-1".to_string(),
+                "https://127.0.0.1:8001".to_string(),
+            )),
+            machine_identity: Some(crate::config::system::MachineIdentityConfig {
+                certificate: "machine/proxy.pem".to_string(),
+                private_key: "machine/proxy-key.pem".to_string(),
+                trust_root: "machine/root.pem".to_string(),
+                identity_reload_seconds: 60,
+                trust_domain: "deis.internal".to_string(),
+                control_endpoint: String::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("control_endpoint"), "{error}");
     }
 
     #[test]

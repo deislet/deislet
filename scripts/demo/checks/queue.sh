@@ -8,10 +8,10 @@ check_queue_roundtrip() {
   local headers="${LOG_DIR}/verify-queue.headers"
 
   local sent
-  sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+  sent=$(runtime_curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
     -H 'content-type: application/json' \
     -d "{\"key\":\"${key}\",\"value\":\"${value}\"}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue" || true)
+    "$(runtime_data_url)/api/enqueue" || true)
   if [ "$(http_status "$headers")" != "202" ]; then
     fail_check "a queue message is produced and consumed" \
       "POST /api/enqueue answered $(http_status "$headers"): ${sent}"
@@ -22,9 +22,9 @@ check_queue_roundtrip() {
   # only thing to do is wait for the effect it has. curl paces its own
   # retries a second apart and gives up after the budget below.
   local got
-  got=$(curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
+  got=$(runtime_curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
     -H "x-deis-app-id: ${APP_ID}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/job:${key}" 2>/dev/null || echo '')
+    "$(runtime_data_url)/api/kv/job:${key}" 2>/dev/null || echo '')
 
   if [ "$(echo "$got" | jq -r '.value // empty' 2>/dev/null || true)" = "$value" ]; then
     pass_check "a queue message is produced and consumed" \
@@ -67,9 +67,9 @@ check_queue_send_batch() {
   mark=$(node_log_mark)
 
   local sent
-  sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+  sent=$(runtime_curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
     -H 'content-type: application/json' -d "$jobs" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue-batch" || true)
+    "$(runtime_data_url)/api/enqueue-batch" || true)
   if [ "$(http_status "$headers")" != "202" ]; then
     fail_check "$title" \
       "POST /api/enqueue-batch answered $(http_status "$headers"): ${sent}"
@@ -85,9 +85,9 @@ check_queue_send_batch() {
   # one of them has been handled the rest are in the same batch.
   local missing="" got
   for i in $(seq 1 $size); do
-    got=$(curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
+    got=$(runtime_curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
       -H "x-deis-app-id: ${APP_ID}" \
-      "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/job:${stamp}-${i}" 2>/dev/null || echo '')
+      "$(runtime_data_url)/api/kv/job:${stamp}-${i}" 2>/dev/null || echo '')
     if [ "$(echo "$got" | jq -r '.value // empty' 2>/dev/null || true)" != "batched-${i}" ]; then
       missing="${missing} job:${stamp}-${i}"
     fi
@@ -155,10 +155,10 @@ check_queue_consumer_concurrency() {
   local value="consumed-while-this-check-watched"
   local headers="${LOG_DIR}/verify-queue-concurrency.headers"
   local sent
-  sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+  sent=$(runtime_curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
     -H 'content-type: application/json' \
     -d "{\"key\":\"${key}\",\"value\":\"${value}\"}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue" || true)
+    "$(runtime_data_url)/api/enqueue" || true)
   local accepted
   accepted=$(http_status "$headers")
 
@@ -166,9 +166,9 @@ check_queue_consumer_concurrency() {
   # curl paces its own retries a second apart; nothing here sleeps.
   local got consumed=""
   if [ "$accepted" = "202" ]; then
-    got=$(curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
+    got=$(runtime_curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
       -H "x-deis-app-id: ${APP_ID}" \
-      "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/job:${key}" 2>/dev/null || echo '')
+      "$(runtime_data_url)/api/kv/job:${key}" 2>/dev/null || echo '')
     consumed=$(echo "$got" | jq -r '.value // empty' 2>/dev/null || true)
   fi
 
@@ -205,10 +205,10 @@ check_queue_dead_letters() {
   key="poison-$$-${RANDOM}-$(printf '%1100s' '' | tr ' ' 'x')"
 
   local sent
-  sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+  sent=$(runtime_curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
     -H 'content-type: application/json' \
     -d "{\"key\":\"${key}\",\"value\":\"never-stored\"}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue" || true)
+    "$(runtime_data_url)/api/enqueue" || true)
   if [ "$(http_status "$headers")" != "202" ]; then
     fail_check "$title" "POST /api/enqueue answered $(http_status "$headers"): ${sent}"
     return
