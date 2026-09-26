@@ -235,7 +235,6 @@ impl DevNode {
             environment_declarations_json,
             environment_snapshot_json,
             environment_snapshot_id,
-            secret_values_by_revision,
         ) = if let Some(declarations) = manifest.environment.as_ref() {
             let application_id = *self
                 .canonical_application_id
@@ -305,7 +304,6 @@ impl DevNode {
                 String::from_utf8(declarations.canonical_json().map_err(anyhow::Error::new)?)?,
                 String::from_utf8(snapshot.canonical_json().map_err(anyhow::Error::new)?)?,
                 snapshot_id,
-                revision_values,
             )
         } else {
             (
@@ -314,7 +312,6 @@ impl DevNode {
                 String::new(),
                 String::new(),
                 String::new(),
-                HashMap::new(),
             )
         };
         let response = self
@@ -351,10 +348,9 @@ impl DevNode {
                 environment_declarations_json,
                 environment_snapshot_json,
                 environment_snapshot_id,
-                secret_values_by_revision,
                 deployment_id: String::new(),
                 routing_generation: String::new(),
-                action: proto::DeploymentAction::LegacyApply as i32,
+                action: proto::DeploymentAction::Unspecified as i32,
             })
             .await
             .map_err(|e| {

@@ -2368,7 +2368,7 @@ impl Queue for QueueService {
                 &req.queue_name,
                 handles_of(req.messages),
                 Some(req.delay_seconds),
-                req.refund_attempt,
+                false,
             )
             .await?;
         Ok(Response::new(NackResponse {

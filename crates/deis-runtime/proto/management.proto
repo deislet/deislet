@@ -186,16 +186,15 @@ message ApplyDeploymentRequest {
     string canonical_environment_id = 10;
 
     // Exact Edge Canon declaration and version-bound binding snapshot. JSON is
-    // RFC 8785 canonical UTF-8. Both are present together for schema-2 native
-    // bundles and absent together only on legacy schema-1 deployments.
+    // RFC 8785 canonical UTF-8. Always present.
     string environment_declarations_json = 11;
     string environment_snapshot_json = 12;
     string environment_snapshot_id = 13;
 
-    // Plaintext secret values keyed by the opaque revision ids named in the
-    // snapshot. Names and config values remain in the canonical snapshot;
-    // this map is the only secret-bearing addition and must never be logged.
-    map<string, string> secret_values_by_revision = 14;
+    // Secret values no longer travel in the deployment message; nodes fetch
+    // them on demand through FetchSecretValues on the machine channel.
+    reserved 14;
+    reserved "secret_values_by_revision";
 
     // Durable control-plane operation identity. Empty only for an older
     // producer or local development. It is echoed in every observation so a
@@ -210,19 +209,20 @@ message ApplyDeploymentRequest {
 
     // PREPARE builds and verifies a candidate without moving production;
     // ACTIVATE enables triggers/current-version bookkeeping after the route
-    // selector has committed; ABORT discards an unactivated candidate. The
-    // unspecified/legacy value preserves rolling compatibility with an older
-    // control plane and performs the historical one-call apply.
+    // selector has committed; ABORT discards an unactivated candidate.
     DeploymentAction action = 17;
 }
 
 enum DeploymentAction {
     DEPLOYMENT_ACTION_UNSPECIFIED = 0;
-    LEGACY_APPLY = 1;
+    // LEGACY_APPLY = 1 was the historical one-call apply.  Schema-1 bundles
+    // are removed; a deployment now always arrives as Prepare + Activate.
+    reserved 1;
+    reserved "LEGACY_APPLY";
     PREPARE = 2;
     ACTIVATE = 3;
-  ABORT = 4;
-  DRAIN = 5;
+    ABORT = 4;
+    DRAIN = 5;
 }
 
 // A version's compatibility declaration, exactly as its manifest spells it.

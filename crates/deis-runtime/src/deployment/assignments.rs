@@ -119,8 +119,6 @@ pub struct Assignment {
     pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
     #[serde(default)]
     pub environment_snapshot_id: Option<String>,
-    #[serde(default)]
-    pub secret_values_by_revision: std::collections::HashMap<String, String>,
 }
 
 /// Hand-written so a `{:?}` on an assignment - in a log line, in an error
@@ -144,7 +142,6 @@ impl std::fmt::Debug for Assignment {
             .field("limits", &self.limits)
             .field("compatibility", &self.compatibility)
             .field("environment_snapshot_id", &self.environment_snapshot_id)
-            .field("secret_values", &"<redacted>")
             .finish()
     }
 }
@@ -200,13 +197,12 @@ impl Assignment {
             self.environment_snapshot,
             self.environment_snapshot_id,
         ) {
-            (None, None, None) if self.secret_values_by_revision.is_empty() => None,
+            (None, None, None) => None,
             (Some(declarations), Some(snapshot), Some(snapshot_id)) => {
-                Some(super::StandardEnvironmentOrder::new(
+                Some(super::StandardEnvironmentOrder::new_without_secrets(
                     declarations,
                     snapshot,
                     snapshot_id,
-                    self.secret_values_by_revision,
                     &self.version_id,
                     standard_environment_id.as_deref().ok_or_else(|| {
                         "EC_ENV_SNAPSHOT_INVALID: canonical environment identity is missing"

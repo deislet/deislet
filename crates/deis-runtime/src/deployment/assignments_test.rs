@@ -205,6 +205,13 @@ impl MachineChannel for AssignmentsService {
             "this stand-in only serves FetchAssignments",
         ))
     }
+
+    async fn fetch_secret_values(
+        &self,
+        _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
+    ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fetch_secret_values"))
+    }
 }
 
 /// A stand-in control plane that serves an assignment list over the machine
@@ -1156,6 +1163,13 @@ async fn counting_registrar() -> (NodeRegistrar, Arc<std::sync::atomic::AtomicUs
                 "this stand-in only counts registrations",
             ))
         }
+
+        async fn fetch_secret_values(
+            &self,
+            _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
+        ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("fetch_secret_values"))
+        }
     }
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1448,6 +1462,13 @@ impl MachineChannel for MachineControlPlane {
         Err(Status::unimplemented(
             "these cases do not deregister this node",
         ))
+    }
+
+    async fn fetch_secret_values(
+        &self,
+        _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
+    ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fetch_secret_values"))
     }
 }
 

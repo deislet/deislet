@@ -903,7 +903,7 @@
           ],
           "environment": "production",
           "failed": [],
-          "phase": "legacy_apply",
+          "phase": "apply",
           "reason": "secret_change",
           "skipped": null,
           "version_id": "018f2518-7e38-7f80-8000-000000000001"
@@ -927,7 +927,7 @@
           ],
           "environment": "production",
           "failed": [],
-          "phase": "legacy_apply",
+          "phase": "apply",
           "reason": "secret_change",
           "skipped": null,
           "version_id": "018f2518-7e38-7f80-8000-000000000001"

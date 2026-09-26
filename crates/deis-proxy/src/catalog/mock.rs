@@ -98,6 +98,13 @@ impl MachineChannel for MockService {
             Answer::Denied(message) => Err(Status::permission_denied(message.clone())),
         }
     }
+
+    async fn fetch_secret_values(
+        &self,
+        _request: Request<deis_wire::machine::FetchSecretValuesRequest>,
+    ) -> Result<Response<deis_wire::machine::FetchSecretValuesResponse>, Status> {
+        Err(Status::unimplemented("fetch_secret_values"))
+    }
 }
 
 /// A TLS connection tonic will serve on.

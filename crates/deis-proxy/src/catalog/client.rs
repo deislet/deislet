@@ -495,6 +495,13 @@ mod tests {
                 Err(status) => Err(status),
             }
         }
+
+        async fn fetch_secret_values(
+            &self,
+            _request: Request<deis_wire::machine::FetchSecretValuesRequest>,
+        ) -> Result<Response<deis_wire::machine::FetchSecretValuesResponse>, Status> {
+            Err(Status::unimplemented("fetch_secret_values"))
+        }
     }
 
     /// A plain HTTP/2 connection to the mock above, in place of the mutual

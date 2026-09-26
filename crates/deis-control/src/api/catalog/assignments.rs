@@ -141,8 +141,6 @@ pub struct AssignmentView {
     pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment_snapshot_id: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub secret_values_by_revision: BTreeMap<String, String>,
 }
 
 /// GET /api/nodes/:id/assignments (machine channel)
@@ -237,11 +235,10 @@ pub(crate) async fn assignments_for(
             Ok(payload) => {
                 let deployment_action = match payload.action() {
                     crate::runtime_client::proto::DeploymentAction::Prepare => "prepare",
-                    crate::runtime_client::proto::DeploymentAction::LegacyApply
-                    | crate::runtime_client::proto::DeploymentAction::Activate => "activate",
+                    crate::runtime_client::proto::DeploymentAction::Activate
+                    | crate::runtime_client::proto::DeploymentAction::Unspecified => "activate",
                     crate::runtime_client::proto::DeploymentAction::Abort
-                    | crate::runtime_client::proto::DeploymentAction::Drain
-                    | crate::runtime_client::proto::DeploymentAction::Unspecified => {
+                    | crate::runtime_client::proto::DeploymentAction::Drain => {
                         error!(
                             node = %node_id,
                             deployment_id = %assignment.deployment_id,
@@ -296,16 +293,13 @@ pub(crate) async fn assignments_for(
             compatibility,
             environment_declarations: standard_environment
                 .as_ref()
-                .map(|(declarations, _, _, _)| declarations.clone()),
+                .map(|(declarations, _, _)| declarations.clone()),
             environment_snapshot: standard_environment
                 .as_ref()
-                .map(|(_, snapshot, _, _)| snapshot.clone()),
+                .map(|(_, snapshot, _)| snapshot.clone()),
             environment_snapshot_id: standard_environment
                 .as_ref()
-                .map(|(_, _, identity, _)| identity.clone()),
-            secret_values_by_revision: standard_environment
-                .map(|(_, _, _, secrets)| secrets)
-                .unwrap_or_default(),
+                .map(|(_, _, identity)| identity.clone()),
         });
     }
 

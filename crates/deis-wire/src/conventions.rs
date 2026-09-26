@@ -467,6 +467,16 @@ fn base64_standard(bytes: &[u8]) -> String {
 /// our own logic. Checked at compile time so it cannot drift.
 const _: () = assert!(STREAM_CHUNK_BYTES * 2 < MAX_GRPC_MESSAGE_BYTES);
 
+/// One entry in a `FetchSecretValues` request: a deployment id and the set
+/// of secret revision ids the calling node needs plaintext values for.
+///
+/// This is the wire type for the `entries_json` field of the gRPC request.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SecretFetchEntry {
+    pub deployment_id: String,
+    pub revisions: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

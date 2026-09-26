@@ -416,8 +416,7 @@ pub(crate) mod tests {
                 crate::runtime_client::proto::DeploymentAction::Activate => "active",
                 crate::runtime_client::proto::DeploymentAction::Abort => "aborted",
                 crate::runtime_client::proto::DeploymentAction::Drain => "drained",
-                crate::runtime_client::proto::DeploymentAction::LegacyApply
-                | crate::runtime_client::proto::DeploymentAction::Unspecified => "legacy_applied",
+                crate::runtime_client::proto::DeploymentAction::Unspecified => "applied",
             };
             Ok(tonic::Response::new(
                 crate::runtime_client::proto::ApplyDeploymentResponse {

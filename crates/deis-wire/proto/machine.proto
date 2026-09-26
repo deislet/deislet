@@ -29,6 +29,10 @@ service MachineChannel {
 
   // Every hostname and route on the platform. deis-proxy runs on this.
   rpc FetchRoutingTable(FetchRoutingTableRequest) returns (FetchRoutingTableResponse);
+
+  // A node asks for the plaintext values of the secrets it needs for a
+  // deployment. Secrets no longer travel in the deployment message itself.
+  rpc FetchSecretValues(FetchSecretValuesRequest) returns (FetchSecretValuesResponse);
 }
 
 // ---- what is deliberately not here --------------------------------------
@@ -127,4 +131,18 @@ message FetchRoutingTableResponse {
   string routing_table_json = 1;
 }
 
+message FetchSecretValuesRequest {
+  // Which node is asking. Verified against the peer certificate.
+  string node_id = 1;
+  // A JSON array of `deis_wire::SecretFetchEntry`: deployment id and the
+  // set of secret revision ids the node needs plaintext values for.
+  string entries_json = 2;
+}
+
+message FetchSecretValuesResponse {
+  // A JSON object mapping `{deployment_id}\x00{revision}` to the plaintext
+  // secret value. A key absent from this map means the value is not
+  // available (unknown deployment, revision not found, or unauthorized).
+  string values_json = 1;
+}
 

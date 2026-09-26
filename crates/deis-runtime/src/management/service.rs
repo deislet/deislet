@@ -156,10 +156,7 @@ impl RuntimeManagement for RuntimeManagementService {
                 }));
             }
         };
-        if !matches!(
-            action,
-            DeploymentAction::Unspecified | DeploymentAction::LegacyApply
-        ) && instruction.0.is_none()
+        if !matches!(action, DeploymentAction::Unspecified) && instruction.0.is_none()
         {
             return Ok(Response::new(ApplyDeploymentResponse {
                 success: false,
@@ -278,7 +275,6 @@ impl RuntimeManagement for RuntimeManagementService {
             &req.environment_declarations_json,
             &req.environment_snapshot_json,
             &req.environment_snapshot_id,
-            req.secret_values_by_revision.clone(),
             &req.version_id,
             &req.canonical_environment_id,
         ) {
@@ -756,20 +752,12 @@ fn decode_standard_environment(
     declarations_json: &str,
     snapshot_json: &str,
     snapshot_id: &str,
-    secrets: std::collections::HashMap<String, String>,
     version_id: &str,
     environment_id: &str,
 ) -> Result<Option<StandardEnvironmentOrder>, String> {
     let absent = declarations_json.is_empty() && snapshot_json.is_empty() && snapshot_id.is_empty();
     if absent {
-        return if secrets.is_empty() {
-            Ok(None)
-        } else {
-            Err(
-                "EC_ENV_SNAPSHOT_INVALID: secret revisions arrived without environment documents"
-                    .to_string(),
-            )
-        };
+        return Ok(None);
     }
     if declarations_json.is_empty()
         || snapshot_json.is_empty()
@@ -786,11 +774,10 @@ fn decode_standard_environment(
     })?;
     let snapshot = serde_json::from_str(snapshot_json)
         .map_err(|_| "EC_ENV_SNAPSHOT_INVALID: environment snapshot JSON is invalid".to_string())?;
-    StandardEnvironmentOrder::new(
+    StandardEnvironmentOrder::new_without_secrets(
         declarations,
         snapshot,
         snapshot_id.to_string(),
-        secrets,
         version_id,
         environment_id,
     )

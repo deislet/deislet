@@ -19,11 +19,14 @@
 //! who chooses a node's id is the same person who has its certificate issued -
 //! so the id is in the certificate already, and reading it there is free.
 
+use std::collections::BTreeMap;
+
 use deis_identity::{SpiffeId, names};
 use deis_wire::machine::machine_channel_server::MachineChannel;
 use deis_wire::machine::{
     DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
     FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
+    FetchSecretValuesRequest, FetchSecretValuesResponse,
     RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::{Request, Response, Status};
@@ -250,6 +253,91 @@ impl MachineChannel for MachineChannelService {
         Ok(Response::new(FetchRoutingTableResponse {
             routing_table_json,
         }))
+    }
+
+    async fn fetch_secret_values(
+        &self,
+        request: Request<FetchSecretValuesRequest>,
+    ) -> Result<Response<FetchSecretValuesResponse>, Status> {
+        let proved = Self::caller(&request)
+            .ok_or_else(no_proved_identity)?
+            .clone();
+        let claimed = &request.get_ref().node_id;
+        match names::node_id_of(&proved) {
+            Some(node_id) if node_id == claimed => {}
+            _ => return Err(refuse_mismatch("node", &proved, claimed)),
+        }
+
+        let entries: Vec<deis_wire::conventions::SecretFetchEntry> =
+            serde_json::from_str(&request.get_ref().entries_json).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "secret fetch entries could not be parsed: {error}"
+                ))
+            })?;
+
+        let all_assignments = self
+            .state
+            .store
+            .list_assignments()
+            .await
+            .map_err(|error| {
+                Status::internal(format!("could not list assignments: {error:?}"))
+            })?;
+
+        // Use a dummy base URL since FetchSecretValues does not need
+        // bundle download URLs — only the secret values matter here.
+        let base = "";
+        let mut values: BTreeMap<String, String> = BTreeMap::new();
+
+        for entry in &entries {
+            let Some(assignment) = all_assignments
+                .assignments
+                .iter()
+                .find(|a| a.deployment_id == entry.deployment_id)
+            else {
+                debug!(
+                    node = %proved,
+                    deployment_id = %entry.deployment_id,
+                    "FetchSecretValues: deployment not found"
+                );
+                continue;
+            };
+
+            let payload = match self
+                .state
+                .deliverer
+                .assignment_payload(assignment, base)
+                .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warn!(
+                        node = %proved,
+                        deployment_id = %entry.deployment_id,
+                        error = ?error,
+                        "FetchSecretValues: could not build payload"
+                    );
+                    continue;
+                }
+            };
+
+            for (revision, value) in &payload.secret_values_by_revision {
+                let key = format!("{}\x00{revision}", entry.deployment_id);
+                values.insert(key, value.clone());
+            }
+        }
+
+        let values_json = serde_json::to_string(&values).map_err(|error| {
+            Status::internal(format!("could not encode secret values: {error}"))
+        })?;
+
+        debug!(
+            node = %proved,
+            entries = entries.len(),
+            values = values.len(),
+            "Served secret values over the machine channel"
+        );
+        Ok(Response::new(FetchSecretValuesResponse { values_json }))
     }
 }
 

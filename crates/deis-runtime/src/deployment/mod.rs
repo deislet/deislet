@@ -32,6 +32,7 @@ mod assignments;
 mod credential;
 mod fetch;
 mod registration;
+mod secret_cache;
 mod store;
 
 use std::collections::HashMap;
@@ -122,7 +123,10 @@ pub struct DeploymentOrder {
 
 /// Typed Edge Canon environment material sent beside a schema-2 bundle.
 /// Secret values are keyed by immutable revision and deliberately omitted
-/// from Debug output.
+/// from Debug output.  Secrets arrive through [`SecretCache`] rather than
+/// the deployment wire message; the snapshot structure is validated when
+/// the order is received, while secret values are validated when
+/// [`Self::with_secrets`] is called.
 pub struct StandardEnvironmentOrder {
     pub declarations: deis_wire::EnvironmentDeclarations,
     pub snapshot: deis_wire::EnvironmentBindingSnapshot,
@@ -131,11 +135,16 @@ pub struct StandardEnvironmentOrder {
 }
 
 impl StandardEnvironmentOrder {
-    pub fn new(
+    /// Create a standard-environment order without secret values.
+    ///
+    /// The snapshot structure is validated, but no secrets are checked
+    /// because they have not been fetched yet (they arrive through the
+    /// `FetchSecretValues` machine RPC).  Call [`Self::with_secrets`]
+    /// once the secrets are populated.
+    pub fn new_without_secrets(
         declarations: deis_wire::EnvironmentDeclarations,
         snapshot: deis_wire::EnvironmentBindingSnapshot,
         snapshot_id: String,
-        secret_values_by_revision: HashMap<String, String>,
         version_id: &str,
         environment_id: &str,
     ) -> Result<Self, String> {
@@ -158,7 +167,23 @@ impl StandardEnvironmentOrder {
                     .to_string(),
             );
         }
-        let expected = snapshot
+        Ok(Self {
+            declarations,
+            snapshot,
+            snapshot_id,
+            secret_values_by_revision: HashMap::new(),
+        })
+    }
+
+    /// Populate and validate secret values fetched through
+    /// `FetchSecretValues`.  All revisions referenced by the snapshot
+    /// must be present; extras are rejected.
+    pub fn with_secrets(
+        mut self,
+        secret_values_by_revision: HashMap<String, String>,
+    ) -> Result<Self, String> {
+        let expected = self
+            .snapshot
             .bindings
             .iter()
             .filter_map(|binding| match binding {
@@ -176,9 +201,9 @@ impl StandardEnvironmentOrder {
                     .to_string(),
             );
         }
-        snapshot
+        self.snapshot
             .validate(
-                &declarations,
+                &self.declarations,
                 deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
                 |revision| secret_values_by_revision.contains_key(revision),
             )
@@ -186,12 +211,8 @@ impl StandardEnvironmentOrder {
         for value in secret_values_by_revision.values() {
             deis_wire::validate_secret_value(value).map_err(|error| error.to_string())?;
         }
-        Ok(Self {
-            declarations,
-            snapshot,
-            snapshot_id,
-            secret_values_by_revision,
-        })
+        self.secret_values_by_revision = secret_values_by_revision;
+        Ok(self)
     }
 }
 

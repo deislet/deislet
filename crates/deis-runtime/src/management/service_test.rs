@@ -405,10 +405,9 @@ async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_an
             environment_declarations_json: String::new(),
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
-            secret_values_by_revision: Default::default(),
             deployment_id: String::new(),
             routing_generation: String::new(),
-            action: DeploymentAction::LegacyApply as i32,
+            action: DeploymentAction::Unspecified as i32,
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -464,10 +463,9 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_i
             environment_declarations_json: String::new(),
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
-            secret_values_by_revision: Default::default(),
             deployment_id: String::new(),
             routing_generation: String::new(),
-            action: DeploymentAction::LegacyApply as i32,
+            action: DeploymentAction::Unspecified as i32,
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -514,10 +512,9 @@ async fn a_partial_canonical_identity_is_refused_before_the_bundle_is_fetched() 
             environment_declarations_json: String::new(),
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
-            secret_values_by_revision: Default::default(),
             deployment_id: String::new(),
             routing_generation: String::new(),
-            action: DeploymentAction::LegacyApply as i32,
+            action: DeploymentAction::Unspecified as i32,
         }))
         .await
         .unwrap()
