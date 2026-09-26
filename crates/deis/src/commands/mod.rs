@@ -10,6 +10,7 @@ pub mod dev;
 pub mod domains;
 pub mod init;
 pub mod kv;
+pub mod login;
 pub mod logs;
 pub mod provider_deployments;
 pub mod queue;

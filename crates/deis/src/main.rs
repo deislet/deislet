@@ -470,6 +470,27 @@ enum Commands {
         action: ConfigAction,
     },
 
+    /// Log the first owner in with the one-time bootstrap credential.
+    ///
+    /// A fresh control plane with no live credential writes one to
+    /// `<data_dir>/bootstrap.token` (mode 0600). This command trades it for
+    /// the operator's standing token, stored where every later command finds
+    /// it; the control plane revokes the bootstrap credential and deletes its
+    /// file on this login's first successful use.
+    Login {
+        /// The bootstrap.token file the control plane wrote.
+        #[arg(long, value_name = "PATH")]
+        bootstrap: std::path::PathBuf,
+
+        /// The control plane's address. Read from $DEIS_CONTROL_ENDPOINT
+        /// when left out.
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+
+        #[command(flatten)]
+        format: Format,
+    },
+
     /// Manage the accounts that may call this platform.
     ///
     /// An account is what an audit line blames, and its role is the ceiling
@@ -1835,6 +1856,12 @@ async fn run(cli: Cli) -> Result<()> {
             ConfigAction::Unset { key, format } => commands::config::unset(&key, format.into()),
             ConfigAction::List { format } => commands::config::list(format.into()),
         },
+
+        Commands::Login {
+            bootstrap,
+            endpoint,
+            format,
+        } => commands::login::execute(bootstrap, endpoint, format.into()).await,
     }
 }
 
