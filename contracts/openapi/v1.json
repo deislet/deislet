@@ -7036,6 +7036,13 @@
       "ProvisionCredentialRequest": {
         "additionalProperties": false,
         "properties": {
+          "accountId": {
+            "description": "Provider-specific account identifier (e.g., Cloudflare account ID).\nPassed as `account_id` to the credential binding spec.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "backendId": {
             "type": "string"
           },
