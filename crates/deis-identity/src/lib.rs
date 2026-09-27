@@ -307,6 +307,22 @@ impl MachineIdentity {
                  restart"
             );
         }
+        // T8: the control-plane disconnect grace period needs at least 72 h
+        // of certificate validity.  If the certificate drops below 48 h it
+        // cannot survive a full 24 h grace window plus the TLS handshake
+        // skew, so the operator must be warned on every report cycle.
+        if remaining > 0 && remaining < 172_800 {
+            warn!(
+                identity = %id,
+                certificate = %certificate,
+                remaining_hours = remaining / 3600,
+                "This machine's certificate has less than 48 hours remaining. During a control \
+                 plane outage the certificate cannot be renewed, and a grace period that outlasts \
+                 it causes every machine-channel connection to fail at the TLS handshake. Issue \
+                 a new certificate with at least 72 hours of validity; it is picked up without \
+                 a restart"
+            );
+        }
     }
 
     /// A listener configuration that requires the peer to prove a name in our
