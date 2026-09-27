@@ -1663,6 +1663,7 @@ queue_token_probe() {
     echo 'APP_ID=demo'
     echo 'ENV_NAME=production'
     echo 'DEIS_QUEUE_PORT=9'
+    printf 'PKI_DIR=%q\n' "${WORK_DIR}/pki"
     printf 'SERVES=%q\n' "$serves"
     definition_of pass_check
     definition_of fail_check

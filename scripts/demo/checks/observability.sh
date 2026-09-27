@@ -23,7 +23,7 @@ check_telemetry_logs() {
   # logs` gets it: deis-telemetry refuses a query without one.
   local out token
   token=$(telemetry_token "$ENV_NAME")
-  out=$(grpcurl -plaintext -max-time 10 \
+  out=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 10 \
     -H "authorization: Bearer ${token}" \
     -import-path "${ROOT_DIR}/crates/deis-telemetry/proto" \
     -proto telemetry.proto \

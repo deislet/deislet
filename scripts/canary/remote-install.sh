@@ -28,6 +28,11 @@ PROXY_PORT="${PROXY_PORT:-80}"
 STORE_PORT="${STORE_PORT:-8090}"
 QUEUE_PORT="${QUEUE_PORT:-8091}"
 TELEMETRY_PORT="${TELEMETRY_PORT:-8092}"
+# The ids the three data services' certificates carry,
+# spiffe://<trust domain>/deislet/<kind>/<id>.
+STORE_ID="${STORE_ID:-store-1}"
+QUEUE_ID="${QUEUE_ID:-queue-1}"
+TELEMETRY_ID="${TELEMETRY_ID:-telemetry-1}"
 TELEMETRY_METRICS_PORT="${TELEMETRY_METRICS_PORT:-8093}"
 
 # The two listeners Deislet's own processes talk to each other on. They are
@@ -164,8 +169,10 @@ EOF
 #     its management plane and dials the control plane.
 #
 # Like secrets.env, existing files are reused: a release must not hand a live
-# installation new names. Delete /etc/deis/pki to start over, and remember that
-# every process has to be restarted to pick the new root up.
+# installation new names. Each leaf is issued only if its file is missing, so
+# an upgrade that adds a machine - as the data services were added - issues
+# that one and leaves the rest alone. Delete /etc/deis/pki to start over, and
+# remember that every process has to be restarted to pick the new root up.
 mint_ca() {
   local prefix=$1
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
@@ -203,26 +210,42 @@ EXT
   rm -f "${leaf}.csr" "${leaf}.ext"
 }
 
-ensure_pki() {
-  if [[ -f ${PKI_DIR}/ca.crt ]]; then
-    log "reusing existing ${PKI_DIR}"
+# mint_leaf_once <leaf-prefix> <spiffe-path> [extra-san]
+mint_leaf_once() {
+  if [[ -f ${1}.crt ]]; then
     return
   fi
+  mint_leaf "$@"
+  log "issued ${1}.crt for spiffe://${FLEET_TRUST_DOMAIN}${2}"
+}
+
+ensure_pki() {
   command -v openssl >/dev/null 2>&1 || die "openssl is needed to issue this installation's certificates"
 
   mkdir -p "${PKI_DIR}"
   chmod 700 "${PKI_DIR}"
-  mint_ca "${PKI_DIR}/ca"
+  if [[ -f ${PKI_DIR}/ca.crt ]]; then
+    log "reusing the existing authority in ${PKI_DIR}"
+  else
+    mint_ca "${PKI_DIR}/ca"
+  fi
 
   # Each leaf carries the address its own listener answers on, because a peer
   # dialling it checks the name it dialled as well as the certificate: an IP
   # address reached over a name it does not carry is refused at the handshake.
-  mint_leaf "${PKI_DIR}/control" "/deislet/control" "IP:${LAN_IP},IP:127.0.0.1"
-  mint_leaf "${PKI_DIR}/node" "/deislet/node/${NODE_ID}" "IP:${LAN_IP},IP:127.0.0.1"
-  mint_leaf "${PKI_DIR}/proxy" "/deislet/proxy/${PROXY_ID}"
+  mint_leaf_once "${PKI_DIR}/control" "/deislet/control" "IP:${LAN_IP},IP:127.0.0.1"
+  mint_leaf_once "${PKI_DIR}/node" "/deislet/node/${NODE_ID}" "IP:${LAN_IP},IP:127.0.0.1"
+  mint_leaf_once "${PKI_DIR}/proxy" "/deislet/proxy/${PROXY_ID}"
+  # The data services serve their gRPC listeners over TLS with these, and
+  # prove them to the control plane when they read its capability keys.
+  mint_leaf_once "${PKI_DIR}/store" "/deislet/store/${STORE_ID}" "IP:${LAN_IP},IP:127.0.0.1"
+  mint_leaf_once "${PKI_DIR}/queue" "/deislet/queue/${QUEUE_ID}" "IP:${LAN_IP},IP:127.0.0.1"
+  mint_leaf_once "${PKI_DIR}/telemetry" "/deislet/telemetry/${TELEMETRY_ID}" "IP:${LAN_IP},IP:127.0.0.1"
 
   chown -R deis:deis "${PKI_DIR}"
-  log "issued ${PKI_DIR}: one authority and three machines under spiffe://${FLEET_TRUST_DOMAIN}"
+  # The root is public, and the operator's CLI checks every data service's
+  # certificate against it, so a readable copy sits outside the 0700 directory.
+  install -o root -g root -m 644 "${PKI_DIR}/ca.crt" /etc/deis/services-ca.crt
 }
 
 write_master_key() {
@@ -248,8 +271,8 @@ api_cors_allowed_origins = []
 bundle_dir = "/var/lib/deis/control/bundles"
 public_base_url = "http://${LAN_IP}:${CONTROL_PORT}"
 secret_key_file = "/etc/deis/secret.key"
-store_endpoint = "http://${LAN_IP}:${STORE_PORT}"
-queue_endpoint = "http://${LAN_IP}:${QUEUE_PORT}"
+store_endpoint = "https://${LAN_IP}:${STORE_PORT}"
+queue_endpoint = "https://${LAN_IP}:${QUEUE_PORT}"
 deis_runtime_poll_interval = 15
 node_registration_ttl_secs = 90
 cron_tick_seconds = 60
@@ -300,7 +323,7 @@ max_subrequests = 50
 
 [logging]
 enabled = true
-endpoint = "http://127.0.0.1:${TELEMETRY_PORT}"
+endpoint = "https://127.0.0.1:${TELEMETRY_PORT}"
 buffer_size = 10000
 flush_interval_secs = 5
 batch_size = 100
@@ -407,12 +430,12 @@ preview_zone = "${ZONE}"
 EOF
 
   # deis-store and deis-queue hold no secret: every call carries a capability
-  # the control plane signed, checked against the public keys they fetch from
-  # its JWKS (and refresh on their own when it rotates). Both default to the
-  # control plane's default port, so both addresses are spelled out.
+  # the control plane signed, checked against the public keys they read from
+  # its JWKS on the machine channel, under mutual TLS with their own
+  # certificates (and refresh on their own when it rotates). The same
+  # certificate is what each serves its gRPC listener with: TLS only.
   cat >/etc/deis/store.toml <<EOF
 listen = "0.0.0.0:${STORE_PORT}"
-capability_jwks_url = "http://127.0.0.1:${CONTROL_PORT}/.well-known/deis/capability-jwks.json"
 revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/store"
 snapshot_dir = "/var/lib/deis/store-snapshots"
@@ -420,14 +443,25 @@ snapshot_interval_secs = 86400
 snapshot_retention = 7
 shared_connections = 8
 tenant_connections = 4
+
+[machine_identity]
+certificate = "${PKI_DIR}/store.crt"
+private_key = "${PKI_DIR}/store.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "https://${LAN_IP}:${CONTROL_MACHINE_PORT}"
 EOF
 
   cat >/etc/deis/queue.toml <<EOF
 listen = "0.0.0.0:${QUEUE_PORT}"
-capability_jwks_url = "http://127.0.0.1:${CONTROL_PORT}/.well-known/deis/capability-jwks.json"
 revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/queue"
 connections = 8
+
+[machine_identity]
+certificate = "${PKI_DIR}/queue.crt"
+private_key = "${PKI_DIR}/queue.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "https://${LAN_IP}:${CONTROL_MACHINE_PORT}"
 EOF
 
   # deis-telemetry holds no secret either: every call and every scrape carries
@@ -438,12 +472,17 @@ EOF
   cat >/etc/deis/telemetry.toml <<EOF
 listen = "0.0.0.0:${TELEMETRY_PORT}"
 metrics_listen = "0.0.0.0:${TELEMETRY_METRICS_PORT}"
-capability_jwks_url = "http://127.0.0.1:${CONTROL_PORT}/.well-known/deis/capability-jwks.json"
 revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/telemetry"
 log_retention_days = 7
 metric_retention_days = 30
 trace_retention_days = 3
+
+[machine_identity]
+certificate = "${PKI_DIR}/telemetry.crt"
+private_key = "${PKI_DIR}/telemetry.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "https://${LAN_IP}:${CONTROL_MACHINE_PORT}"
 EOF
 
   chown deis:deis /etc/deis/*.toml /etc/deis/secret.key
@@ -518,8 +557,9 @@ write_operator_env() {
 # Source this file to talk to this canary from a shell.
 export DEIS_CONTROL_ENDPOINT=http://${LAN_IP}:${CONTROL_PORT}
 export DEIS_CONTROL_TOKEN=${operator_token}
-export DEIS_TELEMETRY_ENDPOINT=http://${LAN_IP}:${TELEMETRY_PORT}
-export DEIS_QUEUE_ENDPOINT=http://${LAN_IP}:${QUEUE_PORT}
+export DEIS_TELEMETRY_ENDPOINT=https://${LAN_IP}:${TELEMETRY_PORT}
+export DEIS_QUEUE_ENDPOINT=https://${LAN_IP}:${QUEUE_PORT}
+export DEIS_SERVICES_CA=/etc/deis/services-ca.crt
 EOF
   chown deis:deis /etc/deis/operator.env
   chmod 600 /etc/deis/operator.env
@@ -533,8 +573,9 @@ EOF
     cat >/home/leo/.config/deis/env <<EOF
 export DEIS_CONTROL_ENDPOINT=http://${LAN_IP}:${CONTROL_PORT}
 export DEIS_CONTROL_TOKEN=${operator_token}
-export DEIS_TELEMETRY_ENDPOINT=http://${LAN_IP}:${TELEMETRY_PORT}
-export DEIS_QUEUE_ENDPOINT=http://${LAN_IP}:${QUEUE_PORT}
+export DEIS_TELEMETRY_ENDPOINT=https://${LAN_IP}:${TELEMETRY_PORT}
+export DEIS_QUEUE_ENDPOINT=https://${LAN_IP}:${QUEUE_PORT}
+export DEIS_SERVICES_CA=/etc/deis/services-ca.crt
 EOF
     chown -R leo:leo /home/leo/.config/deis
     chmod 700 /home/leo/.config/deis

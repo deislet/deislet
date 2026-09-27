@@ -410,6 +410,18 @@ mint_fleet_identities() {
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/proxy-restart" \
     "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/deis-proxy-demo-restart" "IP:127.0.0.1"
 
+  # The three data services. Each serves its gRPC listener over TLS with its
+  # own certificate, and proves the same one to the control plane when it
+  # reads the capability keys. The IP SAN is the harness concession above:
+  # grpcurl, which the storage and queue checks ask the services with, checks
+  # the address before anything reads the SPIFFE name.
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/store" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/store/deis-store-demo" "IP:127.0.0.1"
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/queue" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/queue/deis-queue-demo" "IP:127.0.0.1"
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/telemetry" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/telemetry/deis-telemetry-demo" "IP:127.0.0.1"
+
   # A second real machine of this fleet: the node that joins by registering,
   # which it can only do by proving a name of its own.
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/unlisted" \
@@ -695,23 +707,32 @@ build_binaries() {
 # Neither has a secret of its own. Every call must carry an Ed25519
 # capability the control plane signed for the tenant, audience and binding it
 # names (crates/deis-store/src/auth.rs), and the keys it is checked against
-# are fetched from the control plane's JWKS at capability_jwks_url - at
-# startup, every few minutes, and whenever a token names a key not yet seen,
-# so a key rotation needs nothing done here. revocation_list_url is where
-# both poll for revoked tokens. Both default to the control plane's default
-# port, which this demo may not have been given, so both are spelled out.
+# are read from the control plane's JWKS on the machine channel - under
+# mutual TLS, each proving the certificate minted for it above - at startup,
+# every few minutes, and whenever a token names a key not yet seen, so a key
+# rotation needs nothing done here. The same certificate is what each serves
+# its gRPC listener with: there is no plaintext port. revocation_list_url is
+# where both poll for revoked tokens.
 start_storage_services() {
   local control_url="http://127.0.0.1:${DEIS_CONTROL_PORT}"
+  local machine_url="https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
 
   # deis-telemetry is in the same position: it holds no secret, verifies every
-  # push, query and scrape against the same published keys, and so comes up
-  # here too - before the node, which is the first thing to ship at it.
+  # push, query and scrape against the same published keys read the same way,
+  # serves TLS with its own certificate, and so comes up here too - before the
+  # node, which is the first thing to ship at it.
   cat > "$DEIS_TELEMETRY_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_TELEMETRY_PORT}"
 metrics_listen = "127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}"
 data_dir = "${DEMO_DIR}/deis-telemetry-data"
-capability_jwks_url = "${control_url}/.well-known/deis/capability-jwks.json"
 revocation_list_url = "${control_url}"
+
+# The gRPC listener speaks TLS only, presenting this certificate.
+[machine_identity]
+certificate = "${PKI_DIR}/telemetry.crt"
+private_key = "${PKI_DIR}/telemetry.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "${machine_url}"
 EOF
   chmod 600 "$DEIS_TELEMETRY_CONFIG"
 
@@ -731,16 +752,26 @@ EOF
   cat > "$DEIS_STORE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_STORE_PORT}"
 data_dir = "${DEMO_DIR}/deis-store-data"
-capability_jwks_url = "${control_url}/.well-known/deis/capability-jwks.json"
 revocation_list_url = "${control_url}"
+
+[machine_identity]
+certificate = "${PKI_DIR}/store.crt"
+private_key = "${PKI_DIR}/store.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "${machine_url}"
 EOF
   chmod 600 "$DEIS_STORE_CONFIG"
 
   cat > "$DEIS_QUEUE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_QUEUE_PORT}"
 data_dir = "${DEMO_DIR}/deis-queue-data"
-capability_jwks_url = "${control_url}/.well-known/deis/capability-jwks.json"
 revocation_list_url = "${control_url}"
+
+[machine_identity]
+certificate = "${PKI_DIR}/queue.crt"
+private_key = "${PKI_DIR}/queue.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "${machine_url}"
 EOF
   chmod 600 "$DEIS_QUEUE_CONFIG"
 
@@ -1073,14 +1104,18 @@ control_list_all() {
 deis_cli_env() {
   DEIS_CLI_ENV=(
     "DEIS_CONTROL_ENDPOINT=$(control_url)"
-    "DEIS_TELEMETRY_ENDPOINT=http://127.0.0.1:${DEIS_TELEMETRY_PORT}"
+    "DEIS_TELEMETRY_ENDPOINT=https://127.0.0.1:${DEIS_TELEMETRY_PORT}"
     # Where deis-queue listens, for `deis queue dead-letters` and `deis queue
     # replay`. It is not fetched from the control plane the way deis-store's
     # address is - the storage-token route answers with the store's address
     # and the tenant's token, and that same token is what deis-queue checks -
     # so the CLI is told it here, exactly as a person would put it in
     # deis.toml under [queue].
-    "DEIS_QUEUE_ENDPOINT=http://127.0.0.1:${DEIS_QUEUE_PORT}"
+    "DEIS_QUEUE_ENDPOINT=https://127.0.0.1:${DEIS_QUEUE_PORT}"
+    # The authority deis-store, deis-queue and deis-telemetry certificates
+    # chain to. All three serve TLS only, and the CLI refuses a server whose
+    # certificate this authority did not issue for that kind of service.
+    "DEIS_SERVICES_CA=${PKI_DIR}/ca.crt"
     "DEIS_APP=${APP_ID}"
     "DEIS_ENVIRONMENT=${ENV_NAME}"
     "DEIS_CONFIG_HOME=${DEMO_DIR}/deis-config"

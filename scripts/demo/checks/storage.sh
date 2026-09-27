@@ -57,7 +57,7 @@ check_kv_roundtrip() {
   # deis-store actually holds the right bytes.
   local tenant="${APP_ID}.${ENV_NAME}"
   local direct direct_value
-  direct=$(grpcurl -plaintext -max-time 5 \
+  direct=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" \
     -H "authorization: Bearer $(storage_token)" \
@@ -137,14 +137,14 @@ check_named_bindings_are_separate_namespaces() {
   local tenant token direct_hot direct_kv
   tenant="${APP_ID}.${ENV_NAME}"
   token=$(storage_token)
-  direct_hot=$(grpcurl -plaintext -max-time 5 \
+  direct_hot=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: HOT" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
     | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
-  direct_kv=$(grpcurl -plaintext -max-time 5 \
+  direct_kv=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: KV" \
@@ -182,7 +182,7 @@ check_a_binding_cannot_reach_another_tenant() {
   for hostile in ".." "a.b" "a@b" "../../etc" "$(printf 'x%.0s' $(seq 1 65))"; do
     total=$((total + 1))
     local answer
-    answer=$(grpcurl -plaintext -max-time 5 \
+    answer=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
       -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
       -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
       -H "x-deis-binding: ${hostile}" \
@@ -198,7 +198,7 @@ check_a_binding_cannot_reach_another_tenant() {
   # different token for a different binding. A call naming another tenant is
   # refused whatever binding it asks for.
   local cross
-  cross=$(grpcurl -plaintext -max-time 5 \
+  cross=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${CALLEE_APP_ID}.${ENV_NAME}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: HOT" \
@@ -267,7 +267,7 @@ check_storage_capability_token() {
 
   local tenant="${APP_ID}.${ENV_NAME}"
   local out rc
-  out=$(grpcurl -plaintext -max-time 5 \
+  out=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" \
     -d "{\"key\":\"whatever-this-key-is-does-not-matter\"}" \
@@ -279,6 +279,44 @@ check_storage_capability_token() {
   else
     fail_check "$title" \
       "expected the call to be refused as Code: Unauthenticated with no token; deis-store answered: $(echo "$out" | tr '\n' ' ' | head -c 300)"
+  fi
+}
+
+# The transport under that token. deis-store serves TLS only, with a
+# certificate the fleet's authority issued for a store, so the capability a
+# call carries is never readable on the wire. A plaintext call is not
+# answered at all - there is no second listener that would take one - and a
+# client that trusts some other authority refuses the store's certificate
+# before it sends anything.
+check_storage_serves_tls_only() {
+  local title="deis-store answers only over TLS, with a certificate the fleet issued for a store"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is not installed, so this check could not be run"
+    return
+  fi
+
+  local tenant="${APP_ID}.${ENV_NAME}"
+  local plain plain_rc stranger stranger_rc
+  plain=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -H "authorization: Bearer $(storage_token)" \
+    -d '{"key":"tls-only"}' \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1) && plain_rc=0 || plain_rc=$?
+  stranger=$(grpcurl -cacert "${PKI_DIR}/rogue-ca.crt" -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -d '{"key":"tls-only"}' \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1) && stranger_rc=0 || stranger_rc=$?
+
+  if [ "$plain_rc" -ne 0 ] && ! echo "$plain" | grep -q 'Code:' \
+    && [ "$stranger_rc" -ne 0 ] && echo "$stranger" | grep -qi 'certificate'; then
+    pass_check "$title" \
+      "a plaintext KvStore.Get got no gRPC answer ($(echo "$plain" | tr '\n' ' ' | head -c 120)), and a client trusting another authority refused the store's certificate ($(echo "$stranger" | tr '\n' ' ' | head -c 120))"
+  else
+    fail_check "$title" \
+      "plaintext: rc=${plain_rc} $(echo "$plain" | tr '\n' ' ' | head -c 200); foreign authority: rc=${stranger_rc} $(echo "$stranger" | tr '\n' ' ' | head -c 200)"
   fi
 }
 
@@ -946,6 +984,7 @@ group_storage_checks=(
   check_a_binding_cannot_reach_another_tenant
   check_cli_reads_a_named_binding
   check_storage_capability_token
+  check_storage_serves_tls_only
   check_storage_token_route_requires_a_credential
   check_data_cli_reads_the_apps_write
   # What a tenant's SQL may cost, as opposed to what it may touch. Both go
