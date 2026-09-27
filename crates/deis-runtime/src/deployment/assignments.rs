@@ -37,7 +37,8 @@
 //! The bundle itself is never in the list: each line is a pointer - app,
 //! version, environment, URL, digest - plus the environment map that a push
 //! would have carried, so an app that comes back this way comes back with its
-//! secrets and its storage addresses rather than with an empty environment.
+//! variables and its storage addresses rather than with an empty environment;
+//! the secrets its snapshot binds are fetched separately.
 //! An older control plane that sends no `env` still works; the app then runs
 //! on its manifest's own variables until the next push, which is what this
 //! path used to do for every app and is said out loud when it happens.
@@ -83,8 +84,8 @@ pub struct Assignment {
     pub canonical_environment_id: Option<CanonicalId>,
     pub bundle_url: String,
     pub bundle_sha: String,
-    /// Variables, decrypted secrets and platform wiring, exactly as a push
-    /// would have sent them. Absent from an older control plane.
+    /// Variables and platform wiring, exactly as a push would have sent
+    /// them; never a secret value. Absent from an older control plane.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
     /// What this version's manifest asked to be held to, exactly as a push

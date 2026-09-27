@@ -923,27 +923,21 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::CREATED);
     }
 
-    /// The assignment list is the one read API that answers with decrypted
-    /// secret values, which is the whole reason it is served nowhere a person
-    /// can reach.
-    ///
-    /// What this asserts is the positive half: the value really is in the
-    /// list, because a node that received the list without it would load the
-    /// application and run it misconfigured. The other half - who may ask for
-    /// it - is not assertable here any more and is not asserted twice: a
-    /// caller reaches this list only by completing a mutual-TLS handshake on
-    /// the machine listener and then proving the node id it asks about, which
-    /// `crate::machine::service` tests directly and `scripts/demo.sh` proves
-    /// against a running fleet with a real certificate issued for another
-    /// machine.
+    /// The assignment list carries no secret value. A node fetches the
+    /// values a deployment's snapshot binds through `FetchSecretValues`,
+    /// which checks and audits each fetch; a manifest with no `environment`
+    /// declarations binds none, so a stored secret stays in the catalog.
     #[tokio::test]
-    async fn the_assignment_list_carries_the_environments_decrypted_secret() {
+    async fn the_assignment_list_never_carries_a_secret_value() {
         let h = harness(true).await;
         let router = &h.router;
         deployed_app(router, "demo", Some(("API_KEY", "super-secret"))).await;
 
         let body = assignments_of(&h.state, "node-a").await;
-        assert_eq!(body[0]["env"]["API_KEY"], "super-secret");
+        assert!(
+            !body.to_string().contains("super-secret"),
+            "a secret value travelled in the assignment list: {body}"
+        );
     }
 
     /// The other half of deletion. Push cannot reach a node that is down, so

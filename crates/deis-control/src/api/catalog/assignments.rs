@@ -23,11 +23,11 @@
 //! reason of the control plane's own, so completeness is stated explicitly in
 //! [`ASSIGNMENTS_COMPLETE_HEADER`] rather than inferred from the array.
 //!
-//! **This response carries decrypted secret values.** It is one of exactly
-//! two places where they appear in the clear (the other is the
-//! `ApplyDeployment` push), which is why it is served on the machine
-//! channel (`deis.machine.MachineChannel`) with mutual TLS instead of
-//! behind the dashboard's API key. There is no anonymous case to handle
+//! **This response carries no secret value** - only each deployment's
+//! snapshot, which names the revisions a node then fetches through
+//! `FetchSecretValues`. It is still served on the machine channel
+//! (`deis.machine.MachineChannel`) with mutual TLS instead of behind the
+//! dashboard's API key, because it is the whole platform's topology. There is no anonymous case to handle
 //! here: a control plane with no machine identity answers 503 on a call
 //! into this handler (`machine::service` checks the peer certificate),
 //! so everything below is talking to a caller that proved its SPIFFE name.
@@ -100,17 +100,13 @@ pub struct AssignmentView {
     pub bundle_url: String,
     /// Digest the node must verify after downloading.
     pub bundle_sha: String,
-    /// Exactly what a push would have carried: the manifest's variables,
-    /// this environment's decrypted secrets, and the storage addresses.
+    /// Exactly what a push would have carried: the manifest's variables
+    /// and the storage addresses. Never a secret value or a credential.
     ///
     /// Without it a node that restarts comes back running the right code
-    /// with an empty environment - no secrets, and no address for
+    /// with an empty environment - no variables, and no address for
     /// deis-store or deis-queue - and stays that way until somebody
-    /// deploys again. Secrets are decrypted here, for this response only,
-    /// and are never stored or logged decrypted.
-    ///
-    /// This is why the endpoint authenticates the caller as a node: the
-    /// values in this map are the platform's secrets in the clear.
+    /// deploys again.
     pub env: BTreeMap<String, String>,
     /// What this version's manifest asked to be held to, exactly as the
     /// `ApplyDeployment` push carries it. Omitted when the application

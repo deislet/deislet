@@ -557,10 +557,12 @@ impl DeliveryReason {
 
 /// Everything one node needs in order to run one environment of one app.
 ///
-/// `env` holds decrypted secret values. That is the whole reason this type
-/// exists instead of a bare proto message: it does not derive `Debug`,
-/// `Serialize` or `Clone`-into-a-log, and the only way out of it is
-/// [`Self::to_request`], which is consumed immediately by the RPC.
+/// `secret_values_by_revision` holds decrypted secret values, which is why
+/// this type exists instead of a bare proto message: it does not derive
+/// `Debug`, `Serialize` or `Clone`-into-a-log. Those values never reach the
+/// wire from here - [`Self::to_request`] carries only the snapshot that names
+/// their revisions, and a node fetches the values through
+/// `FetchSecretValues`.
 pub struct DeploymentPayload {
     pub app_id: String,
     /// Permanent application identity. The legacy name above remains for
@@ -576,11 +578,11 @@ pub struct DeploymentPayload {
     pub canonical_environment_id: deis_wire::CanonicalId,
     pub bundle_url: String,
     pub bundle_sha: String,
-    /// Plain variables from the manifest merged with decrypted secrets.
-    /// The application's own environment, and nothing the platform added.
+    /// Plain variables from the manifest. The application's own
+    /// environment, and nothing the platform added; never a secret value.
     env: BTreeMap<String, String>,
-    /// Which of the `env` keys came from a secret. Names only - they are
-    /// safe to log, the values are not.
+    /// Which secrets the snapshot binds. Names only - they are safe to log,
+    /// the values are not.
     secret_names: Vec<String>,
     /// Standard declaration and snapshot are public only to the internal
     /// delivery/runtime boundary. Neither contains secret plaintext.
@@ -773,7 +775,7 @@ impl DeploymentPayload {
     }
 
     /// The complete environment a node should see: the application's own
-    /// variables and secrets, and the platform's storage addresses.
+    /// variables and the platform's storage addresses.
     ///
     /// Nodes authenticate to storage through mTLS on the machine channel;
     /// DEIS_STORAGE_TOKEN is no longer written.
@@ -790,8 +792,8 @@ impl DeploymentPayload {
         env
     }
 
-    /// Build the wire message. The result carries secret values in the
-    /// clear: hand it straight to the RPC and never log it.
+    /// Build the wire message. It carries the application's variables but
+    /// no secret value; still, hand it straight to the RPC rather than a log.
     pub fn to_request(&self) -> proto::ApplyDeploymentRequest {
         let env = self.env_for_wire();
 
@@ -1405,32 +1407,19 @@ impl DeploymentDeliverer {
             environment_declarations = Some(declarations);
             environment_snapshot = Some(snapshot);
         } else {
-            let ciphertexts = self.store.secret_ciphertexts(&env.id).await?;
-            if !ciphertexts.is_empty() {
-                for stored in ciphertexts {
-                    let value = decrypt_secret(self.secrets.as_ref(), &env.id, &stored)?;
-                    if env_map.insert(stored.name.clone(), value).is_some() {
-                        warn!(
-                            app_id = %env.app_id,
-                            environment = %env.name,
-                            name = %stored.name,
-                            "A stored secret has the same name as a manifest variable; the secret wins, so the value in the bundle's manifest never reaches the application"
-                        );
-                    }
-                    secret_names.push(stored.name);
-                }
-            }
-
-            for declared in &manifest.secrets {
-                if !secret_names.iter().any(|name| name == declared) {
-                    warn!(
-                        app_id = %env.app_id,
-                        environment = %env.name,
-                        version_id = %version_id,
-                        secret = %declared,
-                        "The legacy manifest declares this secret but no value is stored for this environment"
-                    );
-                }
+            // No `environment` declarations: nothing binds a secret, so none
+            // is delivered. A secret value reaches a node only through a
+            // snapshot and `FetchSecretValues`, never in the deployment's env.
+            let stored = self.store.secret_ciphertexts(&env.id).await?.len();
+            if stored > 0 || !manifest.secrets.is_empty() {
+                warn!(
+                    app_id = %env.app_id,
+                    environment = %env.name,
+                    version_id = %version_id,
+                    stored_secrets = stored,
+                    manifest_secrets = manifest.secrets.len(),
+                    "This version's manifest has no `environment` declarations, so it binds no secret and none is delivered; declare each secret under `environment` to have the node fetch it"
+                );
             }
         }
 
@@ -2192,7 +2181,6 @@ mod tests {
     use super::*;
     use crate::catalog::SecretCipher;
     use crate::catalog::secrets::MASTER_KEY_LEN;
-    use crate::catalog::secrets::secret_aad;
     use crate::database::Database;
     use chrono::Utc;
 
@@ -2387,7 +2375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn payload_merges_manifest_variables_with_decrypted_secrets() {
+    async fn a_manifest_without_declarations_is_delivered_no_secret() {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
         let app = store.get_app("demo").await.unwrap();
@@ -2418,13 +2406,22 @@ mod tests {
             payload.bundle_url,
             "http://control.test/api/apps/demo/versions/v-1/bundle"
         );
-        assert_eq!(payload.secret_names(), ["API_KEY"]);
-        assert_eq!(payload.variable_names(), ["LOG_LEVEL"]);
+        // A value is stored, but nothing in this manifest binds it: a secret
+        // reaches a node only through a snapshot and `FetchSecretValues`.
+        assert!(payload.secret_names().is_empty());
+        assert_eq!(payload.variable_names(), ["API_KEY", "LOG_LEVEL"]);
 
         let request = payload.to_request();
         assert_eq!(request.env.get("LOG_LEVEL").unwrap(), "info");
-        // Schema 1 manifests still merge decrypted secrets into the env map.
-        assert_eq!(request.env.get("API_KEY").unwrap(), "s3cr3t");
+        assert_eq!(
+            request.env.get("API_KEY").unwrap(),
+            "placeholder-from-manifest"
+        );
+        assert!(
+            request.env.values().all(|value| value != "s3cr3t"),
+            "a decrypted secret travelled in the deployment's env"
+        );
+        assert!(request.environment_snapshot_json.is_empty());
         assert_eq!(request.bundle_sha, "abc123");
         assert_eq!(
             request.canonical_application_id,
@@ -3141,19 +3138,35 @@ mod tests {
         assert_eq!(payload.variable_count(), 2);
     }
 
-    /// With a secret stored but no usable key, the deployment must fail
-    /// rather than reach the node with the secret silently absent.
+    /// With a declared secret stored but no usable key, the deployment must
+    /// fail rather than reach the node with the secret silently absent.
     #[tokio::test]
     async fn a_stored_secret_without_a_master_key_refuses_to_deliver() {
         let (ready, store) = deliverer(true).await;
         let env = environment(&store).await;
+        let revision = deis_wire::CanonicalId::new_v7().to_string();
         let blob = ready
             .secrets
             .cipher()
             .unwrap()
-            .encrypt(b"s3cr3t", &secret_aad(&env.id, "API_KEY"))
+            .encrypt(
+                b"s3cr3t",
+                &secret_revision_aad(&env.id, "API_KEY", &revision),
+            )
             .unwrap();
-        store.put_secret(&env, "API_KEY", blob).await.unwrap();
+        store
+            .put_secret_revision(&env, "API_KEY", &revision, blob)
+            .await
+            .unwrap();
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "API_KEY".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        );
 
         let broken = DeploymentDeliverer::new(
             Arc::clone(&store),
@@ -3165,7 +3178,11 @@ mod tests {
             StorageWiring::default(),
         );
         let err = broken
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(
+                &env,
+                &version(&standard_manifest(&declarations)),
+                "http://control.test",
+            )
             .await
             .unwrap_err();
         assert!(
