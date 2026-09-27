@@ -55,6 +55,7 @@ use serde::Deserialize;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
+use super::offline_cache::OfflineCache;
 use super::registration::{NodeRegistrar, Registered};
 use super::{Applied, DeploymentManager, DeploymentOrder};
 use crate::app::{AppKey, InstalledVersion};
@@ -557,6 +558,7 @@ fn decode_machine_answer(
         assignments,
         complete: answer.complete,
         withheld: answer.withheld,
+        raw_json: answer.assignments_json,
     })
 }
 
@@ -663,6 +665,9 @@ pub struct AssignmentList {
     pub complete: bool,
     /// Assignments the control plane left out, when `complete` is false.
     pub withheld: u32,
+    /// The list exactly as it arrived, which is what the offline cache keeps:
+    /// a node restarting without its control plane decodes it the same way.
+    pub raw_json: String,
 }
 
 /// Result of one pass over the assignment list.
@@ -805,6 +810,9 @@ pub struct Reconciler<'a> {
     /// node was running them. An incomplete answer neither adds to this nor
     /// clears it: it is not evidence about absence in either direction.
     absent_before: HashSet<AppKey>,
+    /// The last complete list, as it arrived, not yet handed to the offline
+    /// cache. See [`Self::take_complete_list`].
+    complete_list: Option<String>,
 }
 
 impl<'a> Reconciler<'a> {
@@ -813,7 +821,15 @@ impl<'a> Reconciler<'a> {
             client,
             deployer,
             absent_before: HashSet::new(),
+            complete_list: None,
         }
+    }
+
+    /// The list the last pass acted on in full, if it was complete, as it
+    /// arrived. Taken once: a later pass that answers incompletely leaves
+    /// nothing to take, so the offline cache keeps the last whole answer.
+    pub fn take_complete_list(&mut self) -> Option<String> {
+        self.complete_list.take()
     }
 
     /// Fetch the assignment list and make this node match it.
@@ -844,6 +860,7 @@ impl<'a> Reconciler<'a> {
             assignments,
             complete,
             withheld,
+            raw_json,
         } = self.client.fetch().await?;
 
         let assigned: HashMap<AppKey, String> = assignments
@@ -949,6 +966,7 @@ impl<'a> Reconciler<'a> {
         // Only a complete answer bounds the secret cache: a deployment an
         // incomplete one left out may still be running here.
         self.deployer.retain_secrets(&assigned_deployments);
+        self.complete_list = Some(raw_json);
 
         let mut absent_now: HashSet<AppKey> = HashSet::new();
         for (key, installed) in running {
@@ -1224,6 +1242,7 @@ pub async fn run_control_loop(
     health: Arc<NodeHealth>,
     retry_interval: Duration,
     reconcile_interval: Duration,
+    offline: Option<Arc<OfflineCache>>,
 ) {
     // Every event that changes what this node can serve has to move what it
     // says about itself, not only the passes below. The deployment manager is
@@ -1260,8 +1279,20 @@ pub async fn run_control_loop(
     // machine-channel identity and endpoint, and reads the global token
     // registry that AppServices::connect() populates.
     let _renewal_metrics = client.machine_channel_client().map(|channel| {
-        crate::deployment::capability_renewer::spawn(channel, client.node_id().to_string(), None)
+        let on_renewed = offline.clone().map(|cache| {
+            Arc::new(move || cache.record_capabilities())
+                as crate::deployment::capability_renewer::OnRenewed
+        });
+        crate::deployment::capability_renewer::spawn(
+            channel,
+            client.node_id().to_string(),
+            on_renewed,
+        )
     });
+    // Whether any pass has reached the control plane yet. The offline cache
+    // is read only before that: once this process has heard from the control
+    // plane, what it runs is newer than anything on disk.
+    let mut synced_once = false;
 
     loop {
         if unreachable > 0 {
@@ -1276,6 +1307,10 @@ pub async fn run_control_loop(
 
         match reconciler.once().await {
             Ok(outcome) => {
+                synced_once = true;
+                if let (Some(cache), Some(list)) = (&offline, reconciler.take_complete_list()) {
+                    cache.record_sync(&list, deployer.secret_values());
+                }
                 let serving = outcome.serving();
                 if outcome.failed > 0 || outcome.unload_failed > 0 {
                     // The control plane answered, so the node is not cut off;
@@ -1334,7 +1369,11 @@ pub async fn run_control_loop(
 
                 if !recovered_locally {
                     recovered_locally = true;
-                    let recovered = deployer.recover_from_disk().await;
+                    let restored = match (&offline, synced_once) {
+                        (Some(cache), false) => restore_offline(cache, &deployer).await,
+                        _ => 0,
+                    };
+                    let recovered = restored + deployer.recover_from_disk().await;
                     warn!(
                         url = client.url(),
                         error = %e,
@@ -1370,6 +1409,102 @@ pub async fn run_control_loop(
             }
         }
     }
+}
+
+/// Put back what the offline cache says this node was running, for a node
+/// that starts while its control plane is unreachable.
+///
+/// The capabilities and the secret values go back first, so each deployment
+/// is installed with its whole environment and its storage clients start out
+/// holding the last capability this node was given. Each deployment is then
+/// applied the way the list would apply it; its bundle has to be on this
+/// node's disk already, because nothing can be downloaded. Returns how many
+/// environments serve because of it.
+async fn restore_offline(cache: &OfflineCache, deployer: &DeploymentManager) -> usize {
+    let state = match cache.load() {
+        Ok(Some(state)) => state,
+        Ok(None) => return 0,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Not using this node's offline cache; it comes back only with what its bundle \
+                 store records"
+            );
+            return 0;
+        }
+    };
+    let capabilities = crate::deployment::capability_renewer::adopt(state.capabilities);
+    deployer.restore_secret_values(
+        state
+            .secrets
+            .into_iter()
+            .map(|(deployment, values)| (deployment, values.into_iter().collect()))
+            .collect(),
+    );
+    let assignments: Vec<Assignment> = match serde_json::from_str(&state.assignments_json) {
+        Ok(assignments) => assignments,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "The assignment list in this node's offline cache does not decode; nothing is \
+                 restored from it"
+            );
+            return 0;
+        }
+    };
+
+    let as_of = deployer.change_stamp();
+    let mut restored = 0;
+    for assignment in assignments {
+        let app_id = assignment.app_id.clone();
+        let environment = assignment.environment.clone();
+        let version_id = assignment.version_id.clone();
+        let action = assignment.deployment_action;
+        let order = match assignment.into_order() {
+            Ok(order) => order,
+            Err(error) => {
+                error!(
+                    app_id = %app_id,
+                    environment = %environment,
+                    error = %error,
+                    "Skipping an assignment in the offline cache that does not make an order"
+                );
+                continue;
+            }
+        };
+        let applied = match action {
+            AssignmentDeploymentAction::Prepare => {
+                deployer.prepare_from_assignment(order, as_of).await
+            }
+            AssignmentDeploymentAction::Activate => {
+                deployer.apply_from_assignment(order, as_of).await
+            }
+        };
+        match applied {
+            Ok(Applied::Installed { .. } | Applied::AlreadyRunning) => restored += 1,
+            Ok(Applied::Superseded { .. }) => {}
+            Err(error) => error!(
+                app_id = %app_id,
+                environment = %environment,
+                version_id = %version_id,
+                error = %error,
+                "Could not restore {} from the offline cache; it is not serving here until the \
+                 control plane answers",
+                app_id
+            ),
+        }
+    }
+    warn!(
+        restored,
+        capabilities,
+        written_at = state.written_at,
+        "The control plane is unreachable, so this node restored {} environment(s) from its \
+         offline cache, as the last sync left them, with their secrets and its last \
+         capabilities. It serves them for at most 24 hours from that sync without hearing from \
+         the control plane",
+        restored
+    );
+    restored
 }
 
 /// Announce this node, unless it is already announced or this control plane

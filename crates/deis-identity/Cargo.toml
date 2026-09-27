@@ -9,6 +9,9 @@ description = "Machine identity for the deislet control channel: SPIFFE-named ce
 
 [dependencies]
 arc-swap = "1.9"
+# Derives the key a machine seals its own files at rest with, from its
+# private key, so that key never has to be stored anywhere.
+hkdf = "0.12"
 rustls = "0.23"
 rustls-pemfile = "2.0"
 sha2 = "0.10"

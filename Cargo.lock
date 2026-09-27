@@ -2315,6 +2315,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "deis-identity-test-pki",
+ "hkdf",
  "http",
  "hyper-util",
  "rustls",
@@ -2458,6 +2459,7 @@ dependencies = [
 name = "deis-runtime"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arc-swap",
  "axum",

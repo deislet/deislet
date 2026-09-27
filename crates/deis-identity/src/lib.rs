@@ -220,6 +220,28 @@ impl MachineIdentity {
             .unwrap_or(0)
     }
 
+    /// A 32-byte key for sealing this machine's own files at rest, derived
+    /// from the private key in force with HKDF-SHA256.
+    ///
+    /// `purpose` separates one use from another, so two files sealed for
+    /// different reasons never share a key. The private key never leaves this
+    /// crate; only what is derived from it does, and HKDF makes that one-way.
+    ///
+    /// A key rotation changes the answer. Whatever was sealed under the old
+    /// key can no longer be opened - which is the right direction for a file
+    /// that only ever holds what this machine can fetch again.
+    pub fn derive_local_key(&self, purpose: &[u8]) -> [u8; 32] {
+        let material = self.current.load();
+        let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(
+            Some(b"deislet/machine-local-key/v1"),
+            material.key.secret_der(),
+        );
+        let mut key = [0u8; 32];
+        hkdf.expand(purpose, &mut key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        key
+    }
+
     /// When the certificate currently in force stops being valid.
     pub fn validity(&self) -> crate::cert::Validity {
         self.current.load().validity

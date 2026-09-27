@@ -590,6 +590,17 @@ async fn run(
         );
     }
 
+    // What this node needs to restart and keep serving while the control
+    // plane is unreachable, sealed under a key derived from its own private
+    // key. Only a node that asks a control plane has anything to keep.
+    let offline_cache = assignment_client.as_ref().map(|_| {
+        Arc::new(deis_runtime::deployment::offline_cache::OfflineCache::for_identity(
+            &config.data_dir,
+            &machine_identity,
+            node_id.clone(),
+        ))
+    });
+
     // Runs for the life of the process: it registers this node, keeps it
     // matching the control plane's assignment list, and reports readiness.
     let control_loop = tokio::spawn(deis_runtime::deployment::run_control_loop(
@@ -599,6 +610,7 @@ async fn run(
         health.clone(),
         std::time::Duration::from_secs(config.control.retry_interval_secs),
         std::time::Duration::from_secs(config.control.reconcile_interval_secs),
+        offline_cache,
     ));
 
     info!("====================================");

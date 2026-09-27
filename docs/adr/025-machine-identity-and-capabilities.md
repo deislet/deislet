@@ -175,6 +175,12 @@ Capability 默认 5 分钟、最长 15 分钟，不使用长期 refresh token。
 
 当前 store/queue 的 `HMAC(shared_secret, tenant)` token 只隔离 tenant，任何取得根 secret 的进程可以铸造全部 tenant token，也不能表达 binding、operation、version、audience、expiry 或持有者。它必须迁移到上述 capability；地址与 token 放进 assignment 不等于授权完成。
 
+### 节点侧：自行申领、离线缓存
+
+- 部署消息（`ApplyDeployment` 与 assignment 的 `env`）不携带任何 capability 或 secret 值。节点以自己的证书身份经机器通道调用 `IssueCapability`，subject 是节点自身的 SPIFFE 名字，有效期 15 分钟；某个租户的存储客户端一建好就立即申领（不等一个续签周期），剩余 5 分钟时续签（`crates/deis-runtime/src/deployment/capability_renewer.rs`）。secret 值只经 snapshot + `FetchSecretValues` 取得；没有 `environment` 声明的 manifest 不绑定任何 secret，也不会收到任何 secret。
+- 节点在 `<data_dir>/offline-cache/state.bin` 保存离线缓存：最后一次完整的 assignment 列表、这些 deployment 按 revision 取得的 secret 值、以及当前持有的 capability。用节点私钥经 HKDF-SHA256 派生的密钥做 AES-256-GCM 封装，node id 作为附加数据；每次成功同步和每次续签后原子写入（0600 临时文件 → fsync → rename → fsync 目录）。只在启动时控制面不可达才读取；写入超过 24 小时的缓存整体拒绝，过期超过 24 小时的 capability 不再保留。私钥轮换后旧缓存无法打开，这是预期方向：缓存里只有节点能重新取得的东西（`crates/deis-runtime/src/deployment/offline_cache.rs`）。
+- FetchSecretValues 的审计 fail-closed：「已交付」审计行写不进去时，不返回任何 secret 值；内部错误同样写审计行。
+
 ## 密钥、证书与撤销生命周期
 
 - Platform root CA 默认离线；online intermediate、Control server cert、machine cert、capability issuer key 分开，权限与用途扩展不混用。

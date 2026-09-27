@@ -7,8 +7,9 @@
 //!
 //! What never lives here is a secret. The record holds app, version,
 //! environment and digest - all of which the control plane already logs - and
-//! the bundle itself carries only secret *names*. Decrypted values exist in
-//! this process's memory and nowhere else.
+//! the bundle itself carries only secret *names*. Decrypted values are never
+//! written here; the one place they reach this node's disk is the sealed
+//! offline cache (`super::offline_cache`).
 //!
 //! The layout is `apps/<app>/<environment>/<version>.zip`. The environment is
 //! part of the path because it is part of the identity: production and a

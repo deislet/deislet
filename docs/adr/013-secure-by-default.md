@@ -197,7 +197,8 @@ platform root/KMS key
 - Root key 不与 control DB/bundle backup 同位置明文保存。
 - Online rotation and rewrap。
 - Secret value 不进入 logs、audit payload、artifact、CLI argv 或 provider temp output。
-- Runtime 只接收当前 version 所需 secret，生命周期有界。
+- Runtime 只接收当前 version 所需 secret，生命周期有界。secret 值只经 snapshot + `FetchSecretValues` 到达节点，从不出现在部署消息的 `env` 里；每次交付都先写审计行，写不进去就不交付（fail-closed）。
+- 节点落盘的唯一 secret 副本是离线缓存（`<data_dir>/offline-cache/`）：以节点私钥经 HKDF 派生的密钥做 AES-256-GCM 封装，0600，最长只在写入后 24 小时内被读取，且只在启动时控制面不可达才读取（见 ADR-025「节点侧：自行申领、离线缓存」）。
 - Backup/restore drill 包含 key 可用性验证。
 
 ## Readiness 门禁
