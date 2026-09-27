@@ -871,9 +871,8 @@ pub(crate) fn streaming_channel(endpoint: &str) -> Result<Channel> {
 ///
 /// The token is held behind an [`Arc`]`<`[`RwLock`]`>` so that the node's
 /// background capability renewal loop can refresh it without rebuilding the
-/// isolate. A caller that creates one with [`StorageIdentity::new`] gets a
-/// private lock populated from the initial value; one created with
-/// [`StorageIdentity::from_lock`] shares its lock with other clients.
+/// isolate. [`StorageIdentity::new`] populates the lock from the initial
+/// value, and clones share it.
 #[derive(Clone)]
 pub struct StorageIdentity {
     tenant: Tenant,
@@ -959,34 +958,6 @@ impl StorageIdentity {
         Ok(Self {
             tenant,
             token: std::sync::Arc::new(std::sync::RwLock::new(packed)),
-            binding: None,
-            binding_name: None,
-        })
-    }
-
-    /// Bind to one tenant, sharing the token lock with other clients so a
-    /// background renewal loop can refresh all of them at once.
-    ///
-    /// The lock already holds the parsed token (or `None`), having been
-    /// populated by the caller from the initial deployment env.
-    pub fn from_lock(
-        tenant: impl Into<String>,
-        token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
-    ) -> Result<Self> {
-        let tenant = Tenant::new(tenant)?;
-        // Validate whatever is in the lock now so a bad initial token fails
-        // fast.
-        if let Some(ref t) = *token.read().unwrap() {
-            let _ = t.parse::<MetadataValue<Ascii>>().map_err(|_| {
-                anyhow!(
-                    "the storage capability token handed to {} cannot be sent as gRPC metadata",
-                    tenant.as_str()
-                )
-            })?;
-        }
-        Ok(Self {
-            tenant,
-            token,
             binding: None,
             binding_name: None,
         })

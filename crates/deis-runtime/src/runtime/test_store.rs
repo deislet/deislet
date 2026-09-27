@@ -36,16 +36,11 @@ impl TestStore {
     /// A store that uses a different signing key, verifying that tokens from
     /// the wrong key are refused.
     pub(crate) async fn start_with_secret(secret: &str) -> Self {
-        use sha2::{Digest, Sha256};
+        use sha2::Digest;
         let hash = sha2::Sha256::digest(secret.as_bytes());
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&hash);
         Self::start_with_key(ed25519_dalek::SigningKey::from_bytes(&seed)).await
-    }
-
-    /// Get the verifying key for this test store.
-    pub(crate) fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
-        self.signing_key.verifying_key()
     }
 
     async fn start_with_key(signing_key: ed25519_dalek::SigningKey) -> Self {
@@ -131,37 +126,16 @@ impl TestStore {
         encode(&claims, &self.signing_key)
     }
 
-    /// The reserved env entries that carry KV wiring to an isolate.
-    ///
-    /// `ApplicationManager` has no wiring parameter: the endpoints ride in the
-    /// deployment's env map under reserved keys and `RuntimePool` lifts them
-    /// out (`ServiceWiring::take_from_env`). A test that goes through the
-    /// manager therefore has to write them the same way a real deployment
-    /// does, which is what `write_to_env` is for.
-    pub(crate) fn kv_env(&self) -> std::collections::HashMap<String, String> {
-        let mut env = std::collections::HashMap::new();
-        self.kv_wiring().write_to_env(&mut env);
-        env
-    }
-
-    /// Wiring that declares only KV and points it at this store.
-    pub(crate) fn kv_wiring(&self) -> ServiceWiring {
-        self.kv_wiring_for("default")
-    }
-
-    /// The same, minting a capability token for a specific tenant.
+    /// Wiring that declares only KV and points it at this store, minting a
+    /// capability token for `tenant`.
     pub(crate) fn kv_wiring_for(&self, tenant: &str) -> ServiceWiring {
         self.wiring_for_tenant(tenant, ["kv"])
     }
 
     /// Wiring that declares the named services and points them all at this
-    /// store. The queue endpoint stays empty: deis-queue is a separate
-    /// process and nothing here speaks to it.
-    pub(crate) fn wiring_for<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> ServiceWiring {
-        self.wiring_for_tenant("default", names)
-    }
-
-    /// The same, minting a capability token for a specific tenant.
+    /// store, minting a capability token for `tenant`. The queue endpoint
+    /// stays empty: deis-queue is a separate process and nothing here speaks
+    /// to it.
     pub(crate) fn wiring_for_tenant<'a>(
         &self,
         tenant: &str,
@@ -184,17 +158,6 @@ impl TestStore {
     ///
     /// Every name becomes a second namespace inside the same tenant, which is
     /// the property the tests below actually check.
-    pub(crate) fn wiring_with_bindings<'a>(
-        &self,
-        names: impl IntoIterator<Item = &'a str>,
-        kind: deis_bundle::BindingKind,
-        bindings: impl IntoIterator<Item = &'a str>,
-    ) -> ServiceWiring {
-        self.wiring_with_bindings_for("default", names, kind, bindings)
-    }
-
-    /// The same as `wiring_with_bindings`, minting a capability token for a
-    /// specific tenant.
     pub(crate) fn wiring_with_bindings_for<'a>(
         &self,
         tenant: &str,

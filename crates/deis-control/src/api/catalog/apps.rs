@@ -413,9 +413,7 @@ pub(super) async fn resolve_app_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{
-        Harness, TEST_STORAGE_SECRET, harness_with_storage, json, storage_wiring,
-    };
+    use super::super::tests::{Harness, harness_with_storage, json, storage_wiring};
 
     use axum::http::StatusCode;
     use serde_json::{Value, json as body};

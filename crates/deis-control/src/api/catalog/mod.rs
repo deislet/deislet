@@ -546,12 +546,6 @@ pub(crate) mod tests {
         harness
     }
 
-    /// The storage secret the harness mints tokens from when it is asked to
-    /// mint any. Not a realistic secret; what matters is that a test can
-    /// recompute the token the endpoint should have answered with, from the
-    /// same convention deis-store checks it against.
-    pub(crate) const TEST_STORAGE_SECRET: &str = "harness-storage-secret";
-
     /// Wiring built the way the server builds it, so the harness cannot
     /// drift from the real assembly of a delivery.
     pub(crate) fn storage_wiring(with_issuer: bool) -> crate::delivery::StorageWiring {

@@ -360,10 +360,6 @@ mod tests {
         shutdown: Option<oneshot::Sender<()>>,
     }
 
-    /// The shared secret an authenticated install holds in three places:
-    /// deis-control, deis-store and deis-queue.
-    const AUTH_SECRET: &str = "the-secret-both-halves-hold";
-
     impl Store {
         /// Start a store with capability-based auth using an ephemeral key.
         async fn start() -> Self {
