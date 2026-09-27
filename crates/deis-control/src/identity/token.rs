@@ -84,18 +84,6 @@ pub fn hash_secret(secret_half: &str) -> String {
     hex::encode(Sha256::digest(secret_half.as_bytes()))
 }
 
-/// A short, stable, non-reversible name for a credential this platform did
-/// not mint - an `api_keys` entry from the configuration file.
-///
-/// Four bytes of SHA-256: enough to tell two configured keys apart and to
-/// match an audit line against a key an operator still holds, useless to
-/// anyone reading the log for a way in. The same reduction the audit line
-/// used before there were accounts, kept so old lines and new ones name the
-/// same key the same way.
-pub fn fingerprint(credential: &str) -> String {
-    hex::encode(&Sha256::digest(credential.as_bytes())[..4])
-}
-
 /// The two halves of a presented token string, once it has been recognised
 /// as one.
 pub struct PresentedToken<'a> {
@@ -106,11 +94,11 @@ pub struct PresentedToken<'a> {
 /// Split a presented credential into its halves, or answer `None` because it
 /// is not one of this platform's tokens at all.
 ///
-/// `None` is not a failure: an `api_keys` entry from the configuration file
-/// is a perfectly good credential and takes the other path in
-/// [`super::store::IdentityStore::resolve`]. What this function must never do
-/// is accept a malformed string as a token with an empty secret, which is why
-/// both halves are length-checked here rather than at the comparison.
+/// `None` is not a failure: it just means the caller did not present one of
+/// ours, and the request is refused like any other unauthenticated call. What
+/// this function must never do is accept a malformed string as a token with
+/// an empty secret, which is why both halves are length-checked here rather
+/// than at the comparison.
 pub fn split(presented: &str) -> Option<PresentedToken<'_>> {
     let rest = presented.strip_prefix(TOKEN_PREFIX)?;
     let (id, secret_half) = rest.split_once('_')?;
@@ -123,29 +111,6 @@ pub fn split(presented: &str) -> Option<PresentedToken<'_>> {
     Some(PresentedToken { id, secret_half })
 }
 
-/// Compare two credential-shaped strings in time that does not depend on how
-/// many leading bytes matched.
-///
-/// It lives here because this module is what says what a credential is and
-/// how one is checked, and both callers are asking that question: a token's
-/// stored hash against the hash of what was presented ([`secret_matches`]),
-/// and a configured `api_keys` entry against a presented one
-/// (`crate::api::authz`). The second is where it earns its keep - those are
-/// raw secrets compared directly, and a byte-at-a-time comparison of one is
-/// the textbook timing oracle. The first is closer to a formality, and says
-/// so where it is written.
-///
-/// It used to live in `api::middleware`, on the grounds that the node channel
-/// compared its fleet key with it too. There is no node channel and no fleet
-/// key, so that reason went with them.
-pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 /// Whether a presented secret half is the one behind a stored hash.
 ///
 /// Compared in time that does not depend on how many leading bytes matched.
@@ -154,7 +119,12 @@ pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
 /// who has the database already has, and spelling the comparison this way
 /// costs nothing and removes the question.
 pub fn secret_matches(stored_hash: &str, presented_secret_half: &str) -> bool {
-    secret_eq(stored_hash, &hash_secret(presented_secret_half))
+    let presented_hash = hash_secret(presented_secret_half);
+    let (a, b) = (stored_hash.as_bytes(), presented_hash.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -201,7 +171,7 @@ mod tests {
     fn a_credential_that_is_not_a_token_is_not_parsed_as_one() {
         for text in [
             "",
-            "some-api-key-from-the-config-file",
+            "some-credential-from-who-knows-where",
             "deis_pat_",
             "deis_pat_0011223344556677",
             "deis_pat_0011223344556677_",
@@ -224,16 +194,5 @@ mod tests {
         assert!(secret_matches(&a.secret_hash, a_half));
         assert!(!secret_matches(&a.secret_hash, b_half));
         assert!(!secret_matches(&a.secret_hash, ""));
-    }
-
-    /// The fingerprint of a configured key is short, stable and not the key.
-    #[test]
-    fn a_configured_key_is_named_by_a_fingerprint_that_is_not_the_key() {
-        let key = "an-api-keys-entry";
-        let fp = fingerprint(key);
-        assert_eq!(fp.len(), 8);
-        assert_eq!(fp, fingerprint(key));
-        assert_ne!(fp, fingerprint("another-api-keys-entry"));
-        assert!(!key.contains(&fp));
     }
 }

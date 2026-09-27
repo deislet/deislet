@@ -413,9 +413,7 @@ pub(super) async fn resolve_app_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{
-        Harness, TEST_STORAGE_SECRET, harness_with_storage, json, storage_wiring,
-    };
+    use super::super::tests::{Harness, harness_with_storage, json, storage_wiring};
 
     use axum::http::StatusCode;
     use serde_json::{Value, json as body};
@@ -423,7 +421,12 @@ mod tests {
     /// One JSON request through the whole router, on whichever surface the
     /// path names - the mounts `api::tests` builds, which is where the
     /// structured envelope is rendered.
-    async fn post(router: &axum::Router, uri: &str, request: Value) -> (StatusCode, Value) {
+    async fn post(
+        router: &axum::Router,
+        secret: &str,
+        uri: &str,
+        request: Value,
+    ) -> (StatusCode, Value) {
         use axum::body::{Body, to_bytes};
         use axum::extract::ConnectInfo;
         use axum::http::Request;
@@ -433,6 +436,7 @@ mod tests {
             .method("POST")
             .uri(uri)
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {secret}"))
             .body(Body::from(request.to_string()))
             .unwrap();
         http.extensions_mut().insert(ConnectInfo(
@@ -446,14 +450,16 @@ mod tests {
 
     /// Creating an application twice, and creating one under a name that is
     /// not one: a v1 client reads the class off `code` and the member off
-    /// `violations`, and the flat tree still answers its one string.
+    /// `violations`, and the old flat spelling is not a route any more.
     #[tokio::test]
     async fn a_v1_create_says_already_exists_and_names_the_field_it_refused() {
-        let (router, _dir) = crate::api::tests::full_router().await;
-        let (status, created) = post(&router, "/api/v1/apps", body!({ "id": "shop" })).await;
+        let (router, _dir, secret) = crate::api::tests::full_router().await;
+        let (status, created) =
+            post(&router, &secret, "/api/v1/apps", body!({ "id": "shop" })).await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
 
-        let (status, refused) = post(&router, "/api/v1/apps", body!({ "id": "shop" })).await;
+        let (status, refused) =
+            post(&router, &secret, "/api/v1/apps", body!({ "id": "shop" })).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
         assert_eq!(refused["error"]["code"], "already-exists");
         assert_eq!(refused["error"]["target"]["resource"], "application");
@@ -461,7 +467,13 @@ mod tests {
         assert_eq!(refused["error"]["message"], "app shop already exists");
         assert_eq!(refused["error"]["retryable"], false);
 
-        let (status, refused) = post(&router, "/api/v1/apps", body!({ "id": "Not A Name" })).await;
+        let (status, refused) = post(
+            &router,
+            &secret,
+            "/api/v1/apps",
+            body!({ "id": "Not A Name" }),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
         assert_eq!(refused["error"]["code"], "invalid-argument");
         let violation = &refused["error"]["violations"][0];
@@ -469,17 +481,17 @@ mod tests {
         assert_eq!(violation["code"], "invalid");
         assert_eq!(violation["message"], refused["error"]["message"]);
 
-        // The legacy tree is one string, as it has always been.
-        let (status, refused) = post(&router, "/api/apps", body!({ "id": "Not A Name" })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(refused["error"].is_string(), "{refused}");
+        // The old flat spelling is not a route of this listener any more:
+        // the refusal is the route fallback's.
+        let (status, refused) =
+            post(&router, &secret, "/api/apps", body!({ "id": "Not A Name" })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(refused["error"]["code"], "route-not-found", "{refused}");
         assert_eq!(refused.as_object().unwrap().len(), 1, "{refused}");
     }
 
     async fn platform() -> Harness {
-        harness_with_storage(true, storage_wiring(Some(TEST_STORAGE_SECRET)),
-        )
-        .await
+        harness_with_storage(true, storage_wiring(true)).await
     }
 
     async fn app_with_production(h: &Harness, app: &str) {
@@ -533,7 +545,7 @@ mod tests {
             StatusCode::CONFLICT,
             "a name whose data is still out there is not free: {refused}"
         );
-        let message = refused["error"].as_str().unwrap();
+        let message = refused["error"]["message"].as_str().unwrap();
         assert!(message.contains("victim.production"), "{message}");
         assert!(message.contains("/api/retired-apps/victim"), "{message}");
     }
@@ -576,8 +588,28 @@ mod tests {
         .await;
         let after = storage_token(&h, "victim").await;
         assert_eq!(after["tenant"], before["tenant"]);
-        assert_eq!(
-            after["token"], before["token"],
+
+        // Both tokens must be valid Ed25519 capabilities for the same tenant.
+        // They differ byte-for-byte (random jti), but authorise the same tenant
+        // because releasing a name means someone else can now use it under the
+        // same `<app>.<environment>` string.
+        let verifying_key = h.state.issuer.verifying_key().await;
+        let before_claims = deis_capability::decode(
+            before["token"].as_str().unwrap(),
+            &verifying_key,
+        )
+        .expect("before token must be a valid Ed25519 capability");
+        let after_claims = deis_capability::decode(
+            after["token"].as_str().unwrap(),
+            &verifying_key,
+        )
+        .expect("after token must be a valid Ed25519 capability");
+        assert!(
+            before_claims.authorizes_tenant("victim.production"),
+            "before token must authorise the tenant"
+        );
+        assert!(
+            after_claims.authorizes_tenant("victim.production"),
             "the tenant key is (application, environment) by design; releasing the name is the \
              moment somebody accepted that"
         );

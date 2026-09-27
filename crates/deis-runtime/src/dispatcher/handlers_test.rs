@@ -1549,3 +1549,565 @@ mod the_status_the_node_will_write {
         }
     }
 }
+
+/// What the client is told when the node itself refuses the request.
+///
+/// Every error out of the runtime dispatch used to be answered with a 500
+/// and an incident id, because the node had no way to tell the two kinds of
+/// failure apart: an application that failed and a node that was too busy to
+/// run it. Those are different things for a client -- the first is a fault to
+/// be investigated, the second is a scheduling answer it may act on by
+/// retrying -- and the overload is the one that has a `Retry-After` and no
+/// incident.
+mod a_refused_request_is_answered_503_rather_than_500 {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::any;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use crate::app::types::AppConfig;
+    use crate::app::{AppKey, ApplicationManager};
+    use crate::config::default_max_request_body_bytes;
+    use crate::dispatcher::handlers::handle_request;
+    use crate::dispatcher::AppState;
+    use crate::runtime::metrics::{recorder, OVERLOADED_TOTAL};
+    use crate::APP_ID_HEADER;
+
+    const APP: &str = "overloaded-entry";
+    const TENANT: &str = "overloaded-entry.production";
+
+    /// The handler holds the application's one runtime thread on `/slow` and
+    /// answers everywhere else at once, so a request to the other path sits
+    /// in the queue behind it.
+    pub const CODE: &str = r#"
+        export default function handler(context) {
+            const url = new URL(context.request.url);
+            if (url.pathname === "/slow") {
+                return new Promise((resolve) =>
+                    setTimeout(() => resolve(new Response("ran")), 300));
+            }
+            return new Response("fast");
+        }
+    "#;
+
+    /// The real dispatcher in front of a loaded app, on a node whose
+    /// admission budget is 50ms.
+    ///
+    /// Small enough that a request queued behind the 300ms invocation is
+    /// clearly past it, wide enough that the one that actually takes the
+    /// thread -- picked up off an empty queue -- is clearly not.
+    async fn node() -> Router {
+        let manager =
+            Arc::new(ApplicationManager::with_threads(Some(1)).with_admission_wait_ms(50));
+        manager
+            .load_app(
+                AppKey::production(APP),
+                CODE.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the app loads");
+
+        Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(manager, default_max_request_body_bytes()))
+    }
+
+    fn request_to(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(APP_ID_HEADER, APP)
+            .body(Body::empty())
+            .expect("buildable")
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_as_overloaded_is_a_503_with_a_retry_after() {
+        let router = node().await;
+        let overloaded_before = recorder().value(OVERLOADED_TOTAL, TENANT);
+
+        // Sent together: the slow one takes the thread, the other waits in
+        // the queue behind it, and by the time the thread reaches it well
+        // more than the 50ms budget has gone.
+        let (slow, refused) = tokio::join!(
+            router.clone().oneshot(request_to("/slow")),
+            router.clone().oneshot(request_to("/fast")),
+        );
+
+        let slow = slow.expect("the node answers the slow request");
+        assert_eq!(
+            slow.status(),
+            StatusCode::OK,
+            "the request that holds the thread must still be answered"
+        );
+
+        let refused = refused.expect("the node answers the queued request");
+        assert_eq!(
+            refused.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an overloaded refusal is a 503 a client can act on, not the 500 \
+             an application failure gets"
+        );
+        let retry_after = refused
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert!(
+            retry_after.is_some_and(|s| s >= 1),
+            "the refusal has to say when to come back; it said {:?}",
+            refused.headers().get(header::RETRY_AFTER)
+        );
+        assert_eq!(
+            refused
+                .headers()
+                .get("x-deis-outcome")
+                .and_then(|v| v.to_str().ok()),
+            Some("overloaded"),
+            "the outcome header is what a client without retry logic branches on"
+        );
+        assert_eq!(
+            refused
+                .headers()
+                .get("x-deis-outcome-detail")
+                .and_then(|v| v.to_str().ok()),
+            Some("admission"),
+            "the detail says which half of admission turned it away"
+        );
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        let message = String::from_utf8(body.to_vec()).expect("the body is text");
+        assert!(
+            !message.contains("incident"),
+            "a refusal by the node is not a fault to be investigated and does not \
+             get an incident id: {message}"
+        );
+
+        assert_eq!(
+            recorder().value(OVERLOADED_TOTAL, TENANT),
+            overloaded_before + 1.0,
+            "a refusal as overloaded is counted as a refusal, not as an executed \
+             request"
+        );
+    }
+
+    /// The same 503, from the other side of admission: the queue is full at
+    /// the moment the request is posted, so it is refused before the thread
+    /// ever reaches it. The default admission budget is in force, which is
+    /// what makes the full queue -- rather than a spent budget -- the thing
+    /// that turns the request away.
+    #[tokio::test]
+    async fn a_request_posted_to_a_full_queue_is_a_503_with_a_retry_after() {
+        let manager = Arc::new(ApplicationManager::with_threads(Some(1)));
+        manager
+            .load_app(
+                AppKey::production(APP),
+                CODE.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the app loads");
+        let router = Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(
+                manager.clone(),
+                default_max_request_body_bytes(),
+            ));
+
+        let overloaded_before = recorder().value(OVERLOADED_TOTAL, TENANT);
+
+        let (slow, refused) = tokio::join!(router.clone().oneshot(request_to("/slow")), async {
+            // Give the slow request a turn so it takes the thread, then
+            // fill the queue that thread cannot drain: past 100 in the
+            // queue, the next post is refused at the moment it is made.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            manager
+                .runtime_pool_for_test()
+                .post_requests_until_refused(TENANT, None)
+                .await
+                .expect("a queue of 100 fills while the thread is held");
+            router.clone().oneshot(request_to("/fast")).await
+        });
+
+        let slow = slow.expect("the node answers the slow request");
+        assert_eq!(
+            slow.status(),
+            StatusCode::OK,
+            "the request that holds the thread must still be answered"
+        );
+
+        let refused = refused.expect("the node answers the queued request");
+        assert_eq!(
+            refused.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a full queue is a refusal a client can act on, not the 500 an \
+             application failure gets"
+        );
+        let retry_after = refused
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert!(
+            retry_after.is_some_and(|s| s >= 1),
+            "the refusal has to say when to come back; it said {:?}",
+            refused.headers().get(header::RETRY_AFTER)
+        );
+        assert_eq!(
+            refused
+                .headers()
+                .get("x-deis-outcome")
+                .and_then(|v| v.to_str().ok()),
+            Some("overloaded"),
+            "the outcome header is what a client without retry logic branches on"
+        );
+        assert_eq!(
+            refused
+                .headers()
+                .get("x-deis-outcome-detail")
+                .and_then(|v| v.to_str().ok()),
+            Some("admission"),
+            "the detail says which half of admission turned it away"
+        );
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        let message = String::from_utf8(body.to_vec()).expect("the body is text");
+        assert!(
+            !message.contains("incident"),
+            "a refusal by the node is not a fault to be investigated and does not \
+             get an incident id: {message}"
+        );
+
+        assert_eq!(
+            recorder().value(OVERLOADED_TOTAL, TENANT),
+            overloaded_before + 1.0,
+            "a refusal as overloaded is counted as a refusal, not as an executed \
+             request"
+        );
+
+        // The queue still holds the abandoned posts that filled it, and the
+        // thread only frees when it has taken its Shutdown -- which cannot
+        // jump the queue. Requests through until one gets 200: that one is
+        // answered only after every message ahead of it has been dealt with,
+        // which is what lets the test end without the node's drop waiting on
+        // a thread that is still chewing through them.
+        let mut drained = false;
+        for _ in 0..1000 {
+            let response = router
+                .clone()
+                .oneshot(request_to("/fast"))
+                .await
+                .expect("the node answers");
+            if response.status() == StatusCode::OK {
+                drained = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            drained,
+            "the thread never reached the messages it had queued up"
+        );
+    }
+}
+
+/// The exact-generation dispatch is the other door into a thread's queue: the
+/// edge selected a particular generation, that generation's thread is at
+/// capacity, and the answer must be the same 503 the legacy path gets rather
+/// than a 500 that reads as the application failing.
+mod a_refused_generation_request_is_answered_503 {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::any;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use crate::app::types::AppConfig;
+    use crate::app::{AppKey, ApplicationManager, VersionInstall};
+    use crate::assets::AssetBundle;
+    use crate::config::default_max_request_body_bytes;
+    use crate::dispatcher::handlers::handle_request;
+    use crate::dispatcher::AppState;
+    use crate::{APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER};
+
+    use super::a_refused_request_is_answered_503_rather_than_500::CODE;
+
+    const APP: &str = "overloaded-generation";
+
+    /// The app's current version and a prepared replacement generation behind
+    /// a 50ms admission budget: small enough that a request queued behind the
+    /// 300ms invocation is clearly past it.
+    async fn node() -> (Router, String) {
+        let generation = deis_wire::CanonicalId::new_v7().to_string();
+        let manager =
+            Arc::new(ApplicationManager::with_threads(Some(1)).with_admission_wait_ms(50));
+        manager
+            .load_app(
+                AppKey::production(APP),
+                CODE.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the current version loads");
+        manager
+            .prepare_version(VersionInstall {
+                key: AppKey::production(APP),
+                version_id: "overload-gen".to_string(),
+                deployment_id: Some("overload-gen-deployment".to_string()),
+                routing_generation: Some(generation.clone()),
+                environment_snapshot_id: None,
+                entry_point: "index.js".to_string(),
+                code: CODE.to_string(),
+                config: AppConfig::default(),
+                env_confirmed: true,
+                assets: Arc::new(AssetBundle::empty(Arc::from("max-age=300"))),
+            })
+            .await
+            .expect("the generation prepares");
+        let router = Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(manager, default_max_request_body_bytes()));
+        (router, generation)
+    }
+
+    fn request_to(path: &str, generation: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(APP_ID_HEADER, APP)
+            .header(DEPLOYMENT_GENERATION_HEADER, generation)
+            .body(Body::empty())
+            .expect("buildable")
+    }
+
+    #[tokio::test]
+    async fn a_generation_request_refused_as_overloaded_is_a_503_with_a_retry_after() {
+        let (router, generation) = node().await;
+
+        // Sent together at the selected generation: the slow one takes that
+        // generation's thread, the other waits in its queue behind it, and by
+        // the time the thread reaches it well more than the 50ms budget has
+        // gone.
+        let (slow, refused) = tokio::join!(
+            router.clone().oneshot(request_to("/slow", &generation)),
+            router.clone().oneshot(request_to("/fast", &generation)),
+        );
+
+        let slow = slow.expect("the node answers the slow request");
+        assert_eq!(
+            slow.status(),
+            StatusCode::OK,
+            "the request that holds the generation's thread must still be answered"
+        );
+
+        let refused = refused.expect("the node answers the queued request");
+        assert_eq!(
+            refused.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an overloaded refusal is a 503 a client can act on, not the 500 \
+             an application failure gets"
+        );
+        let retry_after = refused
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert!(
+            retry_after.is_some_and(|s| s >= 1),
+            "the refusal has to say when to come back; it said {:?}",
+            refused.headers().get(header::RETRY_AFTER)
+        );
+        assert_eq!(
+            refused
+                .headers()
+                .get("x-deis-outcome")
+                .and_then(|v| v.to_str().ok()),
+            Some("overloaded"),
+            "the outcome header is what a client without retry logic branches on"
+        );
+        assert_eq!(
+            refused
+                .headers()
+                .get("x-deis-outcome-detail")
+                .and_then(|v| v.to_str().ok()),
+            Some("admission"),
+            "the detail says which half of admission turned it away"
+        );
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        let message = String::from_utf8(body.to_vec()).expect("the body is text");
+        assert!(
+            !message.contains("incident"),
+            "a refusal by the node is not a fault to be investigated and does not \
+             get an incident id: {message}"
+        );
+    }
+}
+
+/// What becomes of a request whose client hung up before its turn came.
+///
+/// The runtime thread asks two questions about every message it takes off its
+/// queue -- has the caller gone, has the work waited past its budget -- and
+/// the caller-gone question is the one a disconnect becomes. Inside this node
+/// a disconnect is not a socket event the dispatcher sees: it is the request
+/// future being dropped, which closes the reply channel with it, and that
+/// closure is what `is_closed` reads when the message's turn comes. That is
+/// exactly what this harness can drive through the real handler -- a dropped
+/// `oneshot` future -- and what it cannot drive is a peer vanishing at the
+/// TCP level so quickly that hyper never surfaces it while the handler still
+/// holds the request; for that shape the admission budget
+/// (`admission_wait_ms`) is the backstop, and the two checks are not
+/// substitutes for each other.
+mod a_request_abandoned_by_its_client_is_not_run {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::any;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use crate::app::types::AppConfig;
+    use crate::app::{AppKey, ApplicationManager};
+    use crate::config::default_max_request_body_bytes;
+    use crate::dispatcher::handlers::handle_request;
+    use crate::dispatcher::AppState;
+    use crate::runtime::metrics::{recorder, ABANDONED_BEFORE_START_TOTAL};
+    use crate::APP_ID_HEADER;
+
+    const APP: &str = "abandoned-client";
+    const TENANT: &str = "abandoned-client.production";
+
+    /// `/slow` holds the application's one runtime thread; every other path
+    /// counts how many times the application was actually entered, in the
+    /// isolate's own globals. That count is the application-side observable:
+    /// whether the abandoned request ever reached the code is read off it,
+    /// not inferred from the counter the node keeps for itself.
+    const CODE: &str = r#"
+        export default async function handler(context) {
+            const url = new URL(context.request.url);
+            if (url.pathname === "/slow") {
+                await new Promise((resolve) => setTimeout(resolve, 500));
+                return new Response("ran");
+            }
+            globalThis.entries = (globalThis.entries || 0) + 1;
+            return new Response(String(globalThis.entries));
+        }
+    "#;
+
+    /// The real dispatcher, on the default admission budget -- so the only
+    /// thing that can turn the queued request away is the caller being gone,
+    /// not a spent budget or a full queue.
+    async fn node() -> Router {
+        let manager = Arc::new(ApplicationManager::with_threads(Some(1)));
+        manager
+            .load_app(
+                AppKey::production(APP),
+                CODE.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the app loads");
+
+        Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(manager, default_max_request_body_bytes()))
+    }
+
+    fn request_to(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(APP_ID_HEADER, APP)
+            .body(Body::empty())
+            .expect("buildable")
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_while_it_waits_is_counted_and_never_reaches_the_application() {
+        let router = node().await;
+        let abandoned_before = recorder().value(ABANDONED_BEFORE_START_TOTAL, TENANT);
+
+        // The slow request takes the thread; the counted one queues behind
+        // it. Dropping the counted request's future is what the client's
+        // disconnect becomes inside this node: the reply channel closes with
+        // the future, while the posted message still sits in the queue. The
+        // window is generous because a drop that landed before the message
+        // was posted would leave nothing behind for the thread to find --
+        // the counter assertion below would catch that as a miss, not let
+        // the test pass on a request that was never queued at all.
+        let slow = tokio::spawn(router.clone().oneshot(request_to("/slow")));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let counted = tokio::spawn(router.clone().oneshot(request_to("/count")));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        counted.abort();
+
+        let slow = slow
+            .await
+            .expect("the slow request finishes")
+            .expect("the node answers the request that stayed");
+        assert_eq!(
+            slow.status(),
+            StatusCode::OK,
+            "the request that held the thread must still be answered"
+        );
+
+        // The thread reached the dropped request after its caller was gone,
+        // and answered it with nothing: counted as abandoned before start.
+        // The answer to the request that stayed can beat the thread around
+        // to the queue, so this is waited for rather than read on arrival.
+        let mut counted_as_abandoned = false;
+        for _ in 0..400 {
+            if recorder().value(ABANDONED_BEFORE_START_TOTAL, TENANT) == abandoned_before + 1.0 {
+                counted_as_abandoned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            counted_as_abandoned,
+            "a request whose caller is gone is counted, not run (the counter stayed at \
+             {})",
+            recorder().value(ABANDONED_BEFORE_START_TOTAL, TENANT)
+        );
+
+        // And the application was never entered on its behalf: the isolate's
+        // own count carries this probe alone. A second entry here would mean
+        // the dropped request was executed after all.
+        let probe = router
+            .clone()
+            .oneshot(request_to("/count"))
+            .await
+            .expect("the node answers the probe");
+        assert_eq!(
+            probe.status(),
+            StatusCode::OK,
+            "the probe itself must be answered normally"
+        );
+        let body = axum::body::to_bytes(probe.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "1",
+            "the dropped request reached the application: the count is {:?}, not the one \
+             entry this probe makes",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}

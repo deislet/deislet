@@ -24,6 +24,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+Slice=deislet.slice
+MemoryMax=512M
 ReadWritePaths=/var/lib/deis/telemetry
 
 [Install]

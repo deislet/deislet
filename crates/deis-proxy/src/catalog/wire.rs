@@ -7,8 +7,13 @@
 //! the document was not produced by a control plane this build understands,
 //! and applying the rest of it would send live traffic somewhere on the
 //! strength of a payload we have already caught being wrong.
+//!
+//! `Serialize` is here for [`super::persist`] alone, which writes a fetched
+//! document to a local file and reads it back through the same validation.
+//! The control plane still owns the shape: this side only has to be able to
+//! put a document it accepted into a file byte for byte.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Path the control plane serves the routing table on.
 ///
@@ -19,7 +24,7 @@ use serde::Deserialize;
 pub const ROUTING_TABLE_PATH: &str = deis_wire::conventions::ROUTING_TABLE_ROUTE;
 
 /// One route: a host and path prefix bound to one environment of one app.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutingEntry {
     pub app_id: String,
     pub environment: String,
@@ -37,7 +42,7 @@ pub struct RoutingEntry {
 
 /// One environment that exists, whether or not a route points at it. This is
 /// what an automatic preview address is built from.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvironmentRef {
     pub app_id: String,
     pub environment: String,
@@ -46,7 +51,7 @@ pub struct EnvironmentRef {
 }
 
 /// The whole document.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutingTableDocument {
     /// Content digest computed by the control plane. Two polls that return
     /// the same version describe the same table, which is how "nothing

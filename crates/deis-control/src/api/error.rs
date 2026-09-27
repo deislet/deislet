@@ -1,40 +1,33 @@
-//! The one error type handlers return, and the two bodies it renders to.
+//! The one error type handlers return, and the one body it renders to.
 //!
 //! An [`ApiError`] is a status class plus a message, as it always was; the
 //! ~200 places that construct one are untouched. What is new is that every
 //! variant also has a stable machine-readable [`codes`] entry, and that a
 //! handler may enrich an error with a target, field violations, provider
-//! detail or a retry hint through the builder methods without changing its
-//! legacy rendering.
+//! detail or a retry hint through the builder methods.
 //!
-//! Rendering is split in two so that the same error answers differently
-//! per surface without any handler knowing which surface it is on:
-//!
-//! 1. [`IntoResponse`] writes the legacy `{"error": "<message>"}` body -
-//!    byte for byte what the flat `/api/*` tree has always sent - and leaves
-//!    the full [`ErrorDetail`] in the response extensions.
-//! 2. [`crate::api::versioning::render_errors`], mounted per surface, reads
-//!    that extension and, on `/api/v1` and `/api/platform`, replaces the body
-//!    with the structured envelope `{"error": {code, message, requestId,
-//!    ...}}`.
-//!
-//! Producers that build a `Response` outside any mount (the authorization
-//! gate, the route fallback) go through
-//! [`ApiError::into_response_for`] with the surface read off the path.
+//! The body is the structured envelope `{"error": {code, message, requestId,
+//! ...}}` on every answer. [`IntoResponse`] writes it with a freshly minted
+//! request id and leaves the full [`ErrorDetail`] in the response
+//! extensions; the renderers then re-render the body with the id the request
+//! context settled - [`crate::api::versioning::render_errors`] mounted per
+//! surface, or [`ApiError::into_response_for`] for the producers that build
+//! their response outside every mount (the authorization gate, the route
+//! fallback) - so the id inside the body is the one the response echoes.
 //!
 //! A failure on the control plane's own side - its database, a node it
-//! dialled, a backend it drove - is described to the caller of a structured
-//! surface by [`OPAQUE_MESSAGE`] and the request id only. The backend's own
+//! dialled, a backend it drove - is described to the caller by
+//! [`OPAQUE_MESSAGE`] and the request id only. The backend's own
 //! text (an SQLite error, an io path, a node's gRPC address) is kept in
 //! [`ErrorDetail::diagnostic`] for the server log, where the id finds it,
-//! and never enters the envelope; the legacy body keeps carrying it because
-//! that body is frozen byte for byte.
+//! and never enters the envelope.
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use deis_provider_driver::{DriverErrorCategory, SideEffect};
+use deis_wire::CanonicalId;
 use serde::Serialize;
 
 use crate::api::versioning::{ApiSurface, RequestContext, finish_error_response};
@@ -227,8 +220,8 @@ pub struct ProviderDiagnostic {
     pub request_id: Option<String>,
 }
 
-/// Everything known about an error, in the form the structured envelope and
-/// the legacy body are both rendered from.
+/// Everything known about an error, in the form the envelope is rendered
+/// from.
 ///
 /// Left in the response extensions by [`IntoResponse`] for
 /// [`crate::api::versioning::render_errors`] to pick up.
@@ -236,18 +229,12 @@ pub struct ProviderDiagnostic {
 pub struct ErrorDetail {
     pub status: StatusCode,
     pub code: &'static str,
-    /// The message the structured envelope carries: without a leading code
-    /// token and without the legacy `Database error: ` prefix.
+    /// The message the envelope carries: without a leading code token and
+    /// without the `Database error: ` prefix.
     pub message: String,
-    /// The `error` string the legacy body carries, exactly as it was sent
-    /// before the structured envelope existed.
-    pub legacy_message: String,
-    /// The legacy `details` string for the few producers whose flat body
-    /// had one (the authorization gate, the route fallback).
-    pub legacy_details: Option<String>,
-    /// The backend's own text for a failure the structured surfaces
-    /// describe with [`OPAQUE_MESSAGE`]. For the server log only, where the
-    /// request id finds it; never serialised into the envelope.
+    /// The backend's own text for a failure the envelope describes with
+    /// [`OPAQUE_MESSAGE`]. For the server log only, where the request id
+    /// finds it; never serialised into the envelope.
     pub diagnostic: Option<String>,
     /// What the audit record of this answer says, when the handler that
     /// produced it knows more than the status: a refusal whose exact demand
@@ -266,18 +253,11 @@ pub struct ErrorDetail {
 }
 
 impl ErrorDetail {
-    fn new(
-        status: StatusCode,
-        code: &'static str,
-        message: String,
-        legacy_message: String,
-    ) -> Self {
+    fn new(status: StatusCode, code: &'static str, message: String) -> Self {
         Self {
             status,
             code,
             message,
-            legacy_message,
-            legacy_details: None,
             diagnostic: None,
             audit_detail: None,
             target: None,
@@ -289,16 +269,10 @@ impl ErrorDetail {
         }
     }
 
-    /// A failure on the control plane's own side: the structured message
-    /// is [`OPAQUE_MESSAGE`], the legacy body keeps `legacy_message`, and
-    /// `diagnostic` is what the log gets.
-    fn opaque(
-        status: StatusCode,
-        code: &'static str,
-        diagnostic: String,
-        legacy_message: String,
-    ) -> Self {
-        let mut detail = Self::new(status, code, OPAQUE_MESSAGE.to_string(), legacy_message);
+    /// A failure on the control plane's own side: the message is
+    /// [`OPAQUE_MESSAGE`] and `diagnostic` is what the log gets.
+    fn opaque(status: StatusCode, code: &'static str, diagnostic: String) -> Self {
+        let mut detail = Self::new(status, code, OPAQUE_MESSAGE.to_string());
         detail.diagnostic = Some(diagnostic);
         detail
     }
@@ -324,25 +298,6 @@ impl ErrorDetail {
         };
         serde_json::to_vec(&envelope).expect("an error envelope holds only serialisable values")
     }
-
-    /// Serialise the legacy body: `{"error": "<message>"}` and, for the
-    /// producers that had one, `"details"` after it. Written by hand so the
-    /// key order does not depend on how the JSON map type was compiled.
-    pub fn legacy_body(&self) -> Vec<u8> {
-        let mut out = String::with_capacity(self.legacy_message.len() + 16);
-        out.push_str(r#"{"error":"#);
-        out.push_str(&json_string(&self.legacy_message));
-        if let Some(details) = &self.legacy_details {
-            out.push_str(r#","details":"#);
-            out.push_str(&json_string(details));
-        }
-        out.push('}');
-        out.into_bytes()
-    }
-}
-
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).expect("a string always serialises")
 }
 
 /// The structured envelope's `error` object, as a client sees it.
@@ -381,7 +336,7 @@ pub enum ApiError {
     /// control plane will not help, but the request itself was fine.
     ServiceUnavailable(String),
     /// This control plane is deliberately not set up to do what was asked -
-    /// a storage token with no `storage_auth_secret`, say.
+    /// a storage token with no `store_endpoint`, say.
     ///
     /// Deliberately 4xx and not [`Self::ServiceUnavailable`]: nothing here is
     /// unavailable or failing, and a 5xx tells every client and every proxy
@@ -408,85 +363,65 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    /// An error with an explicit status and code. `message` is what both
-    /// surfaces say.
+    /// An error with an explicit status and code.
     pub fn coded(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         let message = message.into();
-        ApiError::Detailed(Box::new(ErrorDetail::new(
-            status,
-            code,
-            message.clone(),
-            message,
-        )))
+        ApiError::Detailed(Box::new(ErrorDetail::new(status, code, message)))
     }
 
     /// A failure on the control plane's own side whose text is a backend's
-    /// (a node's transport error, a store's refusal). The legacy body
-    /// carries `diagnostic` as it always has; the structured surfaces say
+    /// (a node's transport error, a store's refusal). The envelope says
     /// [`OPAQUE_MESSAGE`] and the log gets the text under the request id.
     pub fn opaque(status: StatusCode, code: &'static str, diagnostic: impl Into<String>) -> Self {
-        let diagnostic = diagnostic.into();
         ApiError::Detailed(Box::new(ErrorDetail::opaque(
             status,
             code,
-            diagnostic.clone(),
-            diagnostic,
+            diagnostic.into(),
         )))
     }
 
-    /// The authorization gate's "no acceptable credential" answer. Legacy
-    /// body: `{"error":"Unauthorized","details":"<detail>"}`, as before.
+    /// The authorization gate's "no acceptable credential" answer.
     pub fn unauthenticated(detail: impl Into<String>) -> Self {
         let detail = detail.into();
-        let mut error = ErrorDetail::new(
+        ApiError::Detailed(Box::new(ErrorDetail::new(
             StatusCode::UNAUTHORIZED,
             codes::UNAUTHENTICATED,
-            detail.clone(),
-            "Unauthorized".to_string(),
-        );
-        error.legacy_details = Some(detail);
-        ApiError::Detailed(Box::new(error))
+            detail,
+        )))
     }
 
     /// The authorization gate's "authenticated but not for this" answer.
-    /// Legacy body keeps its two strings; the structured message joins them.
+    /// The sentence says what the call needed, and the hint says how to get
+    /// it, so a caller with the right answer can act without asking.
     pub fn insufficient_scope(required_scope: &str, detail: &str) -> Self {
-        let legacy_message = format!("This credential may not do that: {detail}");
         let hint = format!(
             "A token carrying {required_scope} would be allowed. Ask an owner for one with \
              `deis token create --account <you> --scope {required_scope}`."
         );
-        let mut error = ErrorDetail::new(
+        ApiError::Detailed(Box::new(ErrorDetail::new(
             StatusCode::FORBIDDEN,
             codes::INSUFFICIENT_SCOPE,
-            format!("{legacy_message}. {hint}"),
-            legacy_message,
-        );
-        error.legacy_details = Some(hint);
-        ApiError::Detailed(Box::new(error))
+            format!("{detail}. {hint}"),
+        )))
     }
 
     /// The answer for an `/api/` path that matched no route.
     pub fn route_not_found() -> Self {
-        const DETAILS: &str =
-            "No such endpoint. The API surface is listed in the component's API_DOCUMENTATION.md.";
-        let mut error = ErrorDetail::new(
+        ApiError::Detailed(Box::new(ErrorDetail::new(
             StatusCode::NOT_FOUND,
             codes::ROUTE_NOT_FOUND,
-            DETAILS.to_string(),
-            "Not Found".to_string(),
-        );
-        error.legacy_details = Some(DETAILS.to_string());
-        ApiError::Detailed(Box::new(error))
+            "No such endpoint. The API surface is listed in the component's \
+             API_DOCUMENTATION.md."
+                .to_string(),
+        )))
     }
 
     /// A required request header that was not sent.
     ///
-    /// The sentence is the one the legacy tree has always answered with,
-    /// whatever the header. `Idempotency-Key` takes its own code because a
-    /// client that omitted it has to change the request in a particular
-    /// way - mint a key and send it - rather than fix a value it already
-    /// chose, and that is worth branching on.
+    /// `Idempotency-Key` takes its own code because a client that omitted it
+    /// has to change the request in a particular way - mint a key and send
+    /// it - rather than fix a value it already chose, and that is worth
+    /// branching on.
     pub fn missing_header(name: &str) -> Self {
         let message = format!("{name} header is required");
         if name.eq_ignore_ascii_case(IDEMPOTENCY_KEY_HEADER) {
@@ -536,8 +471,7 @@ impl ApiError {
     /// any 409 that already carries a code of its own (`not-configured`, a
     /// reused idempotency key, a provider-lifecycle conflict).
     ///
-    /// The message is the store's, unchanged, so the legacy body is
-    /// byte-identical either way.
+    /// The message is the store's, unchanged.
     pub fn creating(self, resource: &str) -> Self {
         let (status, code) = self.classify();
         if status != StatusCode::CONFLICT || code != codes::CONFLICT {
@@ -551,8 +485,7 @@ impl ApiError {
     ///
     /// Only for a 400 the route can attribute to a single field with no
     /// guessing; the message stays what it was and becomes the violation's,
-    /// so the legacy body does not move and the structured one gains
-    /// `violations: [{field, code: "invalid", message}]`.
+    /// so the envelope gains `violations: [{field, code: "invalid", message}]`.
     pub fn invalid_field(self, field: &str) -> Self {
         let (status, code) = self.classify();
         if status != StatusCode::BAD_REQUEST || code != codes::INVALID_ARGUMENT {
@@ -677,7 +610,7 @@ impl ApiError {
         ApiError::Detailed(Box::new(error))
     }
 
-    /// Resolve into the full detail both bodies are rendered from.
+    /// Resolve into the full detail the envelope is rendered from.
     pub fn into_detail(self) -> ErrorDetail {
         let (status, code) = self.classify();
         let message = match self {
@@ -692,39 +625,40 @@ impl ApiError {
             | ApiError::Forbidden(msg) => msg,
             // Both carry whatever text the failing component produced, at
             // ~200 call sites: the log gets it, the envelope does not.
-            ApiError::InternalError(msg) => {
-                return ErrorDetail::opaque(status, code, msg.clone(), msg);
-            }
-            ApiError::DatabaseError(msg) => {
-                // The legacy body has always prefixed these; the structured
-                // one says it through the code.
-                let legacy_message = format!("Database error: {}", msg);
-                return ErrorDetail::opaque(status, code, msg, legacy_message);
+            ApiError::InternalError(msg) | ApiError::DatabaseError(msg) => {
+                return ErrorDetail::opaque(status, code, msg);
             }
         };
-        let structured = match codes::split_prefix(&message) {
+        // A leading code token is lifted into `code` and dropped from the
+        // message it would otherwise travel with.
+        let message = match codes::split_prefix(&message) {
             Some((_, rest)) => rest.to_string(),
-            None => message.clone(),
+            None => message,
         };
-        ErrorDetail::new(status, code, structured, message)
+        ErrorDetail::new(status, code, message)
     }
 
-    /// Render for a producer that runs outside any surface mount, choosing
-    /// the body by `surface` and echoing the request and correlation ids
-    /// the caller is to quote. [`RequestContext::resolve`] settles both,
-    /// whether or not the context middleware has run.
+    /// Render for a producer that runs outside any surface mount, echoing
+    /// the request and correlation ids the caller is to quote.
+    /// [`RequestContext::resolve`] settles both, whether or not the context
+    /// middleware has run. `surface` only names the answer in the log: the
+    /// body is the envelope either way.
     pub fn into_response_for(self, surface: ApiSurface, context: RequestContext) -> Response {
         finish_error_response(surface, context, self.into_response())
     }
 }
 
 impl IntoResponse for ApiError {
-    /// The legacy body, with the detail left in the extensions for the
-    /// surface's `render_errors` to re-render where the contract differs.
+    /// The structured envelope, with a request id minted here, and the
+    /// detail left in the extensions for the renderer - the surface's
+    /// `render_errors`, or [`Self::into_response_for`] for a producer
+    /// outside every mount - to re-render it with the id the request
+    /// context settled, which is the one the response echoes.
     fn into_response(self) -> Response {
         let detail = self.into_detail();
         let status = detail.status;
-        let body = detail.legacy_body();
+        let request_id = CanonicalId::new_v7();
+        let body = detail.structured_body(&request_id.to_string());
         let mut response = (
             status,
             [(
@@ -753,9 +687,7 @@ impl From<crate::database::DatabaseError> for ApiError {
 /// query as a plain [`CatalogError::Invalid`], and it is the same sentence
 /// every time - [`crate::catalog::INVALID_CURSOR_MESSAGE`], which that
 /// module owns and this reads. Recognising it here rather than adding a
-/// variant keeps the sentence in the legacy body byte for byte (a code
-/// token prefixed onto the message would change it) and keeps the ~40
-/// list routes free of a mapping each.
+/// variant keeps the ~40 list routes free of a mapping each.
 impl From<crate::catalog::CatalogError> for ApiError {
     fn from(err: crate::catalog::CatalogError) -> Self {
         use crate::catalog::CatalogError;
@@ -777,7 +709,7 @@ impl From<crate::catalog::CatalogError> for ApiError {
             // absolute path, and a caller holding one environment's secret
             // scope must not learn where an operator keeps it. Opaque like
             // every other 5xx: the path goes to the log under the request
-            // id, the legacy body keeps the sentence it always sent.
+            // id.
             CatalogError::SecretsUnavailable(_) => ApiError::opaque(
                 StatusCode::SERVICE_UNAVAILABLE,
                 codes::SERVICE_UNAVAILABLE,
@@ -894,12 +826,10 @@ impl From<crate::command::ExecuteError> for ApiError {
 
 /// Map failures of the gRPC management plane to a runtime node.
 ///
-/// The legacy body is `{"error": "<Display>"}` for every variant, as
-/// `api::apps` has always answered; the status is the node's, not this
-/// process's: an unreachable node is a bad gateway, a node whose key was
-/// retired is a conflict it clears by registering again. A transport
-/// failure spells out the node's management address, so on the structured
-/// surfaces it is opaque and the log has it.
+/// The status is the node's, not this process's: an unreachable node is a
+/// bad gateway, a node whose key was retired is a conflict it clears by
+/// registering again. A transport failure spells out the node's management
+/// address, so it is opaque and the log has it.
 impl From<crate::runtime_client::NodeError> for ApiError {
     fn from(err: crate::runtime_client::NodeError) -> Self {
         use crate::runtime_client::NodeError;
@@ -1018,7 +948,7 @@ mod tests {
         }
     }
 
-    async fn legacy_bytes(error: ApiError) -> (StatusCode, Vec<u8>) {
+    async fn into_response_bytes(error: ApiError) -> (StatusCode, Vec<u8>) {
         let response = error.into_response();
         let status = response.status();
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
@@ -1138,11 +1068,6 @@ mod tests {
                 diagnostic.contains(backend_text),
                 "the log line lost {backend_text}: {diagnostic}"
             );
-            assert!(
-                detail.legacy_message.contains(backend_text),
-                "the legacy body lost {backend_text}: {}",
-                detail.legacy_message
-            );
             let body = String::from_utf8(detail.structured_body(REQUEST)).unwrap();
             assert!(
                 !body.contains(backend_text),
@@ -1172,58 +1097,78 @@ mod tests {
         }
     }
 
-    /// The flat body is the contract of the legacy tree: one key, the
-    /// message, nothing else, and `Database error: ` still prefixed.
+    /// The body is the envelope on every variant: one top-level key, the
+    /// code the contract promises, the message the variant carries except
+    /// where the text belongs to a backend.
     #[tokio::test]
-    async fn the_legacy_body_is_exactly_one_error_string() {
-        for (error, status, _) in every_variant() {
-            let is_database = matches!(error, ApiError::DatabaseError(_));
-            let (got_status, bytes) = legacy_bytes(error).await;
+    async fn the_body_is_one_error_object_with_the_promised_code() {
+        for (error, status, code) in every_variant() {
+            // The ones whose text belongs to a backend say only
+            // [`OPAQUE_MESSAGE`]; the rest carry their own.
+            let is_opaque = matches!(
+                error,
+                ApiError::InternalError(_) | ApiError::DatabaseError(_)
+            ) || matches!(error, ApiError::Detailed(ref d) if d.diagnostic.is_some());
+            let (got_status, bytes) = into_response_bytes(error).await;
             assert_eq!(got_status, status);
-            let expected = if is_database {
-                br#"{"error":"Database error: x"}"#.to_vec()
-            } else {
-                br#"{"error":"x"}"#.to_vec()
-            };
-            assert_eq!(bytes, expected);
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body.as_object().unwrap().len(),
+                1,
+                "only `error` at the top"
+            );
+            assert_eq!(body["error"]["code"], code);
+            let expected_message = if is_opaque { OPAQUE_MESSAGE } else { "x" };
+            assert_eq!(body["error"]["message"], expected_message, "{code}");
+            assert!(
+                body["error"]["requestId"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<deis_wire::CanonicalId>()
+                    .is_ok(),
+                "the body carries an id until the renderer settles the real one"
+            );
         }
         // Escaping and the `Json` extractor's compact form agree.
         let message = "quote \" and slash / and unicode é";
-        let (_, bytes) = legacy_bytes(ApiError::BadRequest(message.to_string())).await;
-        let expected = serde_json::to_vec(&json!({ "error": message })).unwrap();
-        assert_eq!(bytes, expected);
+        let (_, bytes) = into_response_bytes(ApiError::BadRequest(message.to_string())).await;
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["message"], message);
         // The helpers that add a code, a target or a violation leave the
-        // legacy sentence exactly as the route wrote it.
-        for (error, status, expected) in [
+        // message exactly as the route wrote it.
+        for (error, status, message) in [
             (
                 ApiError::missing_header("idempotency-key"),
                 StatusCode::BAD_REQUEST,
-                br#"{"error":"idempotency-key header is required"}"#.to_vec(),
+                "idempotency-key header is required",
             ),
             (
                 ApiError::missing_header("If-Match"),
                 StatusCode::BAD_REQUEST,
-                br#"{"error":"If-Match header is required"}"#.to_vec(),
+                "If-Match header is required",
             ),
             (
                 ApiError::Conflict("x".into()).creating("application"),
                 StatusCode::CONFLICT,
-                br#"{"error":"x"}"#.to_vec(),
+                "x",
             ),
             (
                 ApiError::BadRequest("x".into()).invalid_field("id"),
                 StatusCode::BAD_REQUEST,
-                br#"{"error":"x"}"#.to_vec(),
+                "x",
             ),
         ] {
-            let (got_status, bytes) = legacy_bytes(error).await;
+            let (got_status, bytes) = into_response_bytes(error).await;
             assert_eq!(got_status, status);
-            assert_eq!(bytes, expected);
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["message"], message);
         }
     }
 
-    #[tokio::test]
-    async fn the_legacy_body_keeps_its_code_prefix_while_the_envelope_lifts_it() {
+    /// A message that starts with one of [`codes::MESSAGE_PREFIXES`] lifts
+    /// the token into `code` and drops it from the message.
+    #[test]
+    fn the_envelope_lifts_a_code_prefix_out_of_the_message() {
         let message = format!(
             "{}: the Idempotency-Key was already used on route for x",
             codes::IDEMPOTENCY_KEY_REUSED
@@ -1231,11 +1176,6 @@ mod tests {
         let error = ApiError::Conflict(message.clone());
         assert_eq!(error.code(), codes::IDEMPOTENCY_KEY_REUSED);
         assert_eq!(error.status(), StatusCode::CONFLICT);
-        let (_, bytes) = legacy_bytes(ApiError::Conflict(message.clone())).await;
-        assert_eq!(
-            bytes,
-            serde_json::to_vec(&json!({ "error": message })).unwrap()
-        );
 
         let body = structured(ApiError::Conflict(message));
         assert_eq!(body["error"]["code"], codes::IDEMPOTENCY_KEY_REUSED);
@@ -1382,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builders_enrich_the_envelope_without_changing_the_legacy_body() {
+    async fn builders_enrich_the_envelope() {
         let make = || {
             ApiError::BadRequest("limit must be between 1 and 1000".to_string())
                 .with_code(codes::LIMIT_OUT_OF_RANGE)
@@ -1395,13 +1335,20 @@ mod tests {
                 .with_docs("https://example.invalid/pagination")
                 .with_provider(provider_diagnostic())
         };
-        let (status, bytes) = legacy_bytes(make()).await;
+        let (status, bytes) = into_response_bytes(make()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            &bytes[..],
-            br#"{"error":"limit must be between 1 and 1000"}"#
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], codes::LIMIT_OUT_OF_RANGE);
+        assert_eq!(body["error"]["message"], "limit must be between 1 and 1000");
+        assert_eq!(body["error"]["retryable"], false);
+        assert!(
+            body["error"]["requestId"]
+                .as_str()
+                .unwrap()
+                .parse::<deis_wire::CanonicalId>()
+                .is_ok(),
+            "the body carries an id until the renderer settles the real one"
         );
-
         let body = structured(make());
         assert_eq!(
             body,
@@ -1463,29 +1410,33 @@ mod tests {
         let _ = ApiError::NotFound("x".to_string()).retry_after(1);
     }
 
-    /// The backend's text stays in the legacy body and in the diagnostic
-    /// for the log; the envelope says only that the control plane failed.
+    /// The backend's text stays in the diagnostic for the log; the envelope
+    /// says only that the control plane failed.
     #[tokio::test]
-    async fn backend_text_is_opaque_on_the_structured_surfaces() {
+    async fn backend_text_is_opaque_on_the_envelope() {
         let detail = ApiError::DatabaseError("locked".to_string()).into_detail();
         assert_eq!(detail.message, OPAQUE_MESSAGE);
         assert_eq!(detail.diagnostic.as_deref(), Some("locked"));
         let body = structured(ApiError::DatabaseError("locked".to_string()));
         assert_eq!(body["error"]["message"], OPAQUE_MESSAGE);
         assert_eq!(body["error"]["code"], codes::DATABASE_UNAVAILABLE);
-        let (_, bytes) = legacy_bytes(ApiError::DatabaseError("locked".to_string())).await;
-        assert_eq!(&bytes[..], br#"{"error":"Database error: locked"}"#);
 
         let path = "/var/lib/deis/bundles/x: permission denied";
         let detail = ApiError::InternalError(path.to_string()).into_detail();
         assert_eq!(detail.message, OPAQUE_MESSAGE);
-        assert_eq!(detail.legacy_message, path);
         assert_eq!(detail.diagnostic.as_deref(), Some(path));
         assert!(
             !String::from_utf8(detail.structured_body(REQUEST))
                 .unwrap()
                 .contains("/var/lib"),
             "the envelope must not carry the path"
+        );
+        let (status, bytes) = into_response_bytes(ApiError::InternalError(path.to_string())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            !text.contains("/var/lib"),
+            "the rendered body must not carry the path: {text}"
         );
 
         // A sentence a handler wrote itself is not a backend's and stays.
@@ -1499,84 +1450,90 @@ mod tests {
         assert!(detail.diagnostic.is_none());
     }
 
-    /// The producers that had a `details` key keep it. The key order is
-    /// fixed at `error` first: the `json!` literals these replace sorted
-    /// their keys or kept them in writing order depending on which crates
-    /// were built alongside (`serde_json/preserve_order` is unified in by
-    /// `rolldown`), so the only order worth promising is a deterministic
-    /// one, and it is the one the route fallback's literal always had.
+    /// The producers that build their answer outside every mount - the
+    /// authorization gate, the route fallback - render the same envelope,
+    /// and the ids the caller is to quote are settled from what it sent.
     #[tokio::test]
-    async fn out_of_mount_producers_keep_their_legacy_two_key_bodies() {
-        let (status, bytes) = legacy_bytes(ApiError::unauthenticated("no credential")).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            &bytes[..],
-            br#"{"error":"Unauthorized","details":"no credential"}"#
-        );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes).unwrap(),
-            json!({ "error": "Unauthorized", "details": "no credential" })
-        );
-
-        let (status, bytes) =
-            legacy_bytes(ApiError::insufficient_scope("apps:write", "create app")).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes).unwrap(),
-            json!({
-                "error": "This credential may not do that: create app",
-                "details": "A token carrying apps:write would be allowed. Ask an owner for one with `deis token create --account <you> --scope apps:write`.",
-            })
-        );
-        assert!(
-            bytes.starts_with(
-                br#"{"error":"This credential may not do that: create app","details":"#
-            )
-        );
-
-        let (status, bytes) = legacy_bytes(ApiError::route_not_found()).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(
-            &bytes[..],
-            br#"{"error":"Not Found","details":"No such endpoint. The API surface is listed in the component's API_DOCUMENTATION.md."}"#
-        );
-
-        let body = structured(ApiError::unauthenticated("no credential"));
-        assert_eq!(body["error"]["code"], codes::UNAUTHENTICATED);
-        assert_eq!(body["error"]["message"], "no credential");
-        let body = structured(ApiError::route_not_found());
-        assert_eq!(body["error"]["code"], codes::ROUTE_NOT_FOUND);
-        let body = structured(ApiError::insufficient_scope("apps:write", "create app"));
-        assert_eq!(body["error"]["code"], codes::INSUFFICIENT_SCOPE);
-    }
-
-    #[tokio::test]
-    async fn into_response_for_picks_the_body_by_surface() {
+    async fn out_of_mount_producers_render_the_envelope() {
         use crate::api::versioning::RequestId;
         let context = RequestContext::of(RequestId(REQUEST.parse().unwrap()));
-        let response = ApiError::unauthenticated("x")
-            .into_response_for(ApiSurface::of_path("/api/apps"), context);
-        assert_eq!(
-            response.headers()[crate::api::versioning::REQUEST_ID_HEADER],
-            REQUEST
-        );
-        // A producer outside every mount echoes both ids, so a refusal can
-        // be tied to the calls the caller sent around it.
-        assert_eq!(
-            response.headers()[crate::api::versioning::CORRELATION_ID_HEADER],
-            REQUEST
-        );
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&bytes[..], br#"{"error":"Unauthorized","details":"x"}"#);
+        let body_of = |error: ApiError| {
+            let response = error.into_response_for(ApiSurface::of_path("/api/v1/apps"), context);
+            let status = response.status();
+            // A producer outside every mount echoes both ids, so a refusal
+            // can be tied to the calls the caller sent around it.
+            assert_eq!(
+                response.headers()[crate::api::versioning::REQUEST_ID_HEADER],
+                REQUEST
+            );
+            assert_eq!(
+                response.headers()[crate::api::versioning::CORRELATION_ID_HEADER],
+                REQUEST
+            );
+            (status, response)
+        };
 
-        let response = ApiError::unauthenticated("x")
-            .into_response_for(ApiSurface::of_path("/api/v1/apps"), context);
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let (status, response) = body_of(ApiError::unauthenticated("no credential"));
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["error"]["code"], codes::UNAUTHENTICATED);
+        assert_eq!(body["error"]["message"], "no credential");
         assert_eq!(body["error"]["requestId"], REQUEST);
+
+        let (status, response) = body_of(ApiError::insufficient_scope("apps:write", "create app"));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], codes::INSUFFICIENT_SCOPE);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("create app."),
+            "the sentence says what the call needed: {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("apps:write"),
+            "the hint names the scope that would be allowed: {body}"
+        );
+
+        let (status, response) = body_of(ApiError::route_not_found());
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], codes::ROUTE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn into_response_for_renders_the_envelope_and_echoes_both_ids() {
+        use crate::api::versioning::RequestId;
+        let context = RequestContext::of(RequestId(REQUEST.parse().unwrap()));
+        // A path that names no surface of its own gets the same envelope.
+        for path in ["/api/apps", "/api/v1/apps", "/api/platform/nope"] {
+            let response = ApiError::unauthenticated("x")
+                .into_response_for(ApiSurface::of_path(path), context);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()[crate::api::versioning::REQUEST_ID_HEADER],
+                REQUEST
+            );
+            assert_eq!(
+                response.headers()[crate::api::versioning::CORRELATION_ID_HEADER],
+                REQUEST
+            );
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], codes::UNAUTHENTICATED, "{path}");
+            assert_eq!(body["error"]["requestId"], REQUEST, "{path}");
+        }
 
         let response = ApiError::route_not_found().into_response_for(
             ApiSurface::of_path("/api/platform/nope"),
@@ -1599,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn node_errors_keep_their_display_as_the_legacy_message() {
+    fn node_errors_keep_their_display_for_the_log() {
         use crate::runtime_client::NodeError;
         let unknown = ApiError::from(NodeError::UnknownNode);
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
@@ -1609,15 +1566,11 @@ mod tests {
         assert_eq!(transport.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(transport.code(), codes::BACKEND_UNAVAILABLE);
         let detail = transport.into_detail();
-        assert_eq!(
-            detail.legacy_message,
-            "transport error: connect http://10.0.0.7:50051: refused"
-        );
         // The node's management address is for the log, not the caller.
         assert_eq!(detail.message, OPAQUE_MESSAGE);
         assert_eq!(
             detail.diagnostic.as_deref(),
-            Some(detail.legacy_message.as_str())
+            Some("transport error: connect http://10.0.0.7:50051: refused")
         );
         assert!(detail.retryable);
         let rpc = ApiError::from(NodeError::Rpc {

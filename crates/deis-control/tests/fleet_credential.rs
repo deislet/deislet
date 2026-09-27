@@ -9,11 +9,13 @@
 //! key, and no node can do that any more. The human listener mounts no route
 //! a node calls; registration arrives on the machine listener, where the
 //! caller proves a SPIFFE name with a certificate, so every registration this
-//! control plane accepts in production records `NodeProof::Certificate`.
-//! `NodeProof::PresharedKey` survives only as the state a fleet in the middle
-//! of the move could still be in, with no production producer left to put a
-//! node into it. A test of the old rule would therefore be a test of a
-//! property nothing can reach.
+//! control plane accepts records the name the caller proved, carried as
+//! `NodeClaim::identity`, and nothing else. The weaker proof is not only
+//! unproduced but unreachable: `node_preshared_keys` is refused at startup
+//! because no configuration structure accepts it any more, so the state a
+//! fleet in the middle of the move could once have been in cannot be
+//! configured back into existence. A test of the old rule would therefore be
+//! a test of a property nothing can reach.
 //!
 //! # What is guarded instead
 //!
@@ -64,8 +66,21 @@ use deis_control::runtime_client::proto::{
 use deis_control::runtime_client::{NodeClaim, RuntimeNodeManager};
 use deis_identity::{MachineIdentity, Protocol, SpiffeId, names};
 use deis_identity_test_pki::{TestCa, write_files};
-use deis_wire::conventions::{NODE_AUTH_METADATA, node_auth_secret};
 use tonic::{Request, Response, Status};
+
+/// The metadata key a bearer credential would travel under on a
+/// control-plane-to-node call, spelled locally: it left
+/// `deis_wire::conventions` with the fleet key itself. Asserting against it
+/// here is what keeps the absence meaningful - if a credential ever comes
+/// back, it comes back on a name, and this is the name it would use.
+const NODE_AUTH_METADATA: &str = "authorization";
+
+/// The bare key inside a presented `authorization` value, should one ever
+/// appear: `Bearer <key>` is the shape the old wire helper produced, and a
+/// value without the prefix is taken as it stands.
+fn node_auth_secret(value: &str) -> &str {
+    value.strip_prefix("Bearer ").unwrap_or(value)
+}
 
 const TRUST_DOMAIN: &str = "deis.internal";
 
@@ -124,6 +139,10 @@ impl RecordingNode {
     }
 
     fn record<T>(&self, request: &Request<T>) {
+        // The credential is read as "what the old fleet-key convention would
+        // have carried" so the assertions below check the `authorization`
+        // metadata is absent - and equality with `Call::proving` is exactly
+        // that assertion, since `credential` is `None` there.
         let credential = request
             .metadata()
             .get(NODE_AUTH_METADATA)
@@ -208,7 +227,7 @@ impl RuntimeManagement for RecordingNode {
 }
 
 /// Start a recording node on a free loopback port, serving the plaintext
-/// management plane - the one a fleet key still guards. Returns the address
+/// management plane. Returns the address
 /// to register and the log of calls it has been shown.
 async fn plaintext_node(node_id: &str) -> (String, Calls) {
     let node = RecordingNode::new(node_id);
@@ -319,9 +338,7 @@ fn control_plane(
     configured: Vec<RuntimeNodeConfig>,
     identity: Option<Arc<MachineIdentity>>,
 ) -> Arc<RuntimeNodeManager> {
-    Arc::new(
-        RuntimeNodeManager::new_with_ttl(configured, 15, 90).with_machine_identity(identity),
-    )
+    Arc::new(RuntimeNodeManager::new_with_ttl(configured, 15, 90).with_machine_identity(identity))
 }
 
 /// A node registering as the machine channel's `Register` does it: a name
@@ -365,9 +382,7 @@ async fn a_node_reached_over_mutual_tls_is_handed_no_key_at_all() {
     let (machine_addr, over_tls) = machine_node("node-07", &identity).await;
     let (plaintext_addr, over_plaintext) = plaintext_node("node-07").await;
 
-    let nodes = control_plane(
-        Vec::new(),
-        Some(Arc::clone(&fleet.control)));
+    let nodes = control_plane(Vec::new(), Some(Arc::clone(&fleet.control)));
     register(
         &nodes,
         "node-07",

@@ -284,52 +284,32 @@ pub const STORE_ENDPOINT_ENV: &str = "DEIS_STORE_ENDPOINT";
 /// `http://127.0.0.1:8091`. Same contract as [`STORE_ENDPOINT_ENV`].
 pub const QUEUE_ENDPOINT_ENV: &str = "DEIS_QUEUE_ENDPOINT";
 
-// ---- the node-facing control plane ------------------------------------
+// ---- the node-facing control plane (legacy HTTP routes) ---------------
 //
-// These four names are the contract between deis-control (which serves them)
-// and deis-runtime (which calls them). They live here, and not in either
-// crate, because nothing checks that two crates spell an HTTP path the same
-// way: a node that asked for `/register` while the control plane served
-// `/registration` compiled perfectly, and the only symptom was a fleet that
-// never learned about its own nodes.
+// These path constants were once the contract between deis-control
+// (which served them on its human HTTP listener) and deis-runtime
+// (which called them with bearer credentials).  Since the machine
+// channel landed (ADR-025), node registration, assignment fetch,
+// and routing-table delivery moved to the machine listener's gRPC
+// surface (`deis.machine.MachineChannel`).  The constants remain as
+// documentation anchors — they are no longer mounted as HTTP routes
+// anywhere in the production code path.
+//
+// The function counterparts `node_registration_path` and
+// `node_assignments_path` were deleted because nothing called them
+// after the HTTP fallback paths were gated behind a startup check.
 
-/// Route template for a node's registration, in the `:id` form an axum
-/// `Router` takes.
-///
-/// The client half is [`node_registration_path`]. They are separate because a
-/// server registers one route for every node while a client addresses one.
+/// Route template for a node's registration (no longer mounted).
 pub const NODE_REGISTRATION_ROUTE: &str = "/api/nodes/:id/registration";
 
-/// Route template for a node's assignment list. See
-/// [`NODE_REGISTRATION_ROUTE`].
+/// Route template for a node's assignment list (no longer mounted).
 pub const NODE_ASSIGNMENTS_ROUTE: &str = "/api/nodes/:id/assignments";
 
-/// Path the control plane serves its routing table on, and deis-proxy polls.
-///
-/// It carries no path parameter, so server and client spell the same string.
-/// Here for the same reason as [`NODE_ASSIGNMENTS_ROUTE`]: the two crates do
-/// not depend on each other, and a disagreement would show up as an edge that
-/// keeps an empty routing table and sends every request to whatever the local
-/// application list happens to match.
+/// Path the control plane once served its routing table on, and deis-proxy
+/// once polled.  The routing table is now delivered via
+/// `deis.machine.MachineChannel/FetchRoutingTable`; deis-proxy's wire
+/// module keeps this constant for contract tests.
 pub const ROUTING_TABLE_ROUTE: &str = "/api/routing-table";
-
-/// Path a node registers itself at, and refreshes that registration at.
-///
-/// `PUT` is the method: a registration states what a node is rather than
-/// asking to create something, so a node that lost contact and came back
-/// says it again. `DELETE` on the same path is a node leaving on purpose.
-///
-/// `node_id` must already be percent-encoded - an id containing `/` would
-/// otherwise address a different path than the one it registered under.
-pub fn node_registration_path(encoded_node_id: &str) -> String {
-    format!("/api/nodes/{encoded_node_id}/registration")
-}
-
-/// Path a node fetches its assignment list from. Same encoding rule as
-/// [`node_registration_path`].
-pub fn node_assignments_path(encoded_node_id: &str) -> String {
-    format!("/api/nodes/{encoded_node_id}/assignments")
-}
 
 /// Response header on an assignment list saying whether the list is the whole
 /// truth for that node.
@@ -393,171 +373,28 @@ pub const STORAGE_TOKEN_HEADER: &str = "x-deis-storage-token";
 /// the storage port, bypassing every check the node makes on its behalf.
 pub const STORAGE_TOKEN_ENV: &str = "DEIS_STORAGE_TOKEN";
 
-/// The capability token for one tenant, derived from the shared secret.
-///
-/// `base64(HMAC-SHA256(secret, tenant))`, standard alphabet with padding.
-/// HMAC rather than a plain hash so the secret cannot be recovered by
-/// extending a digest, and per tenant rather than one bearer token for the
-/// fleet so that a token which leaked out of one application is useless for
-/// another: it only ever matches the one tenant it was derived for.
-///
-/// The token is not a session and does not expire. Rotating the secret
-/// invalidates every token at once, which is the intended lever: change it on
-/// the control plane and on both storage services, and every node picks up
-/// new tokens with its next deployment.
-///
-/// `secret` is used as the HMAC key, so any length works, including the empty
-/// string - which is why an unconfigured secret is a *refusal* on the
-/// verifying side rather than an empty key that happens to compute.
-pub fn storage_token(secret: &str, tenant: &str) -> String {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<sha2::Sha256>>::new_from_slice(secret.as_bytes())
-        .expect("HMAC-SHA256 accepts a key of any length");
-    mac.update(tenant.as_bytes());
-    base64_standard(&mac.finalize().into_bytes())
-}
+/// Deployment-env key carrying the queue-specific capability token.
+/// Separate from STORAGE_TOKEN_ENV because queue requires `aud = "queue"`
+/// while store/DB/blob require `aud = "store"`.
+pub const QUEUE_TOKEN_ENV: &str = "DEIS_QUEUE_TOKEN";
 
-/// Whether a presented token is the expected one, in time that does not
-/// depend on how many leading bytes matched.
-///
-/// The verifying side computes the expected token with [`storage_token`] for
-/// the tenant *the request itself claims*, then compares here. Doing it in
-/// that order is what makes a leaked token useless elsewhere: there is no
-/// lookup from token to tenant, so a token only ever authorises the tenant it
-/// was derived for.
-///
-/// The timing difference is small over a LAN and costs nothing to remove;
-/// this is the whole authorisation of the storage channel.
-pub fn storage_token_matches(expected: &str, presented: &str) -> bool {
-    constant_time_eq(expected, presented)
-}
-
-// ---- proving a caller may drive a node's management plane --------------
-//
-// The three names below are the other direction of the node credential. The
-// control plane serves its node-facing HTTP endpoints to a caller that
-// presents one of its `node_preshared_keys`; deis-runtime serves
-// `deis.management.RuntimeManagement` and `deis.trigger.Trigger` to a caller
-// that presents the same value back. They live here because the node checks
-// the string the control plane builds, and a disagreement about the metadata
-// key or the `Bearer ` prefix would show up as a fleet whose every deployment
-// push and every cron fire is refused - with the node logging "no credential"
-// and the control plane logging "unauthenticated", neither naming the typo.
-
-/// Metadata key carrying the node credential on a control-plane-to-node gRPC
-/// call.
-///
-/// The same header the node already sends the other way on the assignment
-/// fetch and the bundle download, so one credential is spelled one way in
-/// both directions. It must be lowercase: tonic refuses a capitalised
-/// metadata key at send time, which would turn a correct credential into a
-/// call that never leaves the control plane.
-pub const NODE_AUTH_METADATA: &str = "authorization";
-
-/// The metadata value that presents a node key.
-///
-/// `Bearer <key>` rather than the bare key, matching what deis-runtime
-/// already puts on `Authorization` when it fetches its assignments and what
-/// deis-proxy puts on its catalog poll.
-pub fn node_auth_value(secret: &str) -> String {
-    format!("Bearer {secret}")
-}
-
-/// The key inside a presented [`NODE_AUTH_METADATA`] value.
-///
-/// The bare key is accepted as well as `Bearer <key>`, the same latitude
-/// deis-control's HTTP node endpoints already give: an operator testing a
-/// node by hand should not be refused over a prefix, and accepting both costs
-/// nothing because the value is still compared against the configured key in
-/// full.
-pub fn node_auth_secret(value: &str) -> &str {
-    value.strip_prefix("Bearer ").unwrap_or(value)
-}
-
-/// Whether a presented credential is the one the receiver accepts, in time
-/// that does not depend on how many leading bytes matched.
-///
-/// The empty credential is never a match, in either position. An unconfigured
-/// credential must be a refusal on the checking side, not an empty string
-/// that happens to compare equal to another empty string - that is the
-/// difference between a closed door and an open one.
-///
-/// # Why this is not named after the node key
-///
-/// Three unrelated credentials are checked here, and only one of them is the
-/// fleet's node key: the storage token below, and deis-runtime's per-session
-/// inspector token, which is minted by the node, lives in memory, expires,
-/// and has nothing to do with any fleet-wide value. Naming the comparator
-/// after one of its callers made the other two look like the same credential,
-/// and it meant that retiring the node key would have taken an unrelated
-/// check down with it.
-pub fn secret_matches(expected: &str, presented: &str) -> bool {
-    !expected.is_empty() && constant_time_eq(expected, presented)
-}
-
-/// Whether a presented node key is one the receiver accepts.
-///
-/// [`secret_matches`] under the fleet key's own name, kept for the callers
-/// that really are checking that credential so the grep for it still finds
-/// them all. It carries no rule of its own.
-pub fn node_secret_matches(expected: &str, presented: &str) -> bool {
-    secret_matches(expected, presented)
-}
-
-/// Compare two credentials in time that does not depend on how many leading
-/// bytes matched.
-///
-/// Shared by the storage token and the node key because both are the whole
-/// authorisation of their channel. The length is allowed to leak - it is a
-/// property of the format, not of the secret - but nothing else is.
-fn constant_time_eq(expected: &str, presented: &str) -> bool {
-    let (expected, presented) = (expected.as_bytes(), presented.as_bytes());
-    if expected.len() != presented.len() {
-        return false;
-    }
-    expected
-        .iter()
-        .zip(presented)
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
-}
-
-/// Standard base64 with padding (RFC 4648 section 4).
-///
-/// Written out here rather than pulled in as a dependency because it encodes
-/// exactly one thing - a 32 byte digest - and because every component in the
-/// platform has to produce the identical string for the same bytes. The
-/// alphabet is chosen so the result is valid in a gRPC metadata value, which
-/// admits only printable ASCII.
-fn base64_standard(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let group = ((chunk[0] as u32) << 16)
-            | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
-            | (*chunk.get(2).unwrap_or(&0) as u32);
-        out.push(ALPHABET[(group >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(group >> 12) as usize & 63] as char);
-        // The tail is padded rather than truncated: a decoder that is handed
-        // an unpadded string is entitled to reject it, and these values are
-        // compared as strings, so one side dropping the padding would refuse
-        // every call.
-        out.push(match chunk.len() {
-            1 => '=',
-            _ => ALPHABET[(group >> 6) as usize & 63] as char,
-        });
-        out.push(match chunk.len() {
-            3 => ALPHABET[group as usize & 63] as char,
-            _ => '=',
-        });
-    }
-    out
-}
 
 /// A single chunk plus its framing must never approach the ceiling, otherwise
 /// streaming would start failing on the transport instead of being bounded by
 /// our own logic. Checked at compile time so it cannot drift.
 const _: () = assert!(STREAM_CHUNK_BYTES * 2 < MAX_GRPC_MESSAGE_BYTES);
+
+/// One entry in a `FetchSecretValues` request: a deployment id and the set
+/// of secret revision ids the calling node needs plaintext values for.
+///
+/// This is the wire type for the `entries_json` field of the gRPC request.
+/// `revisions` must be non-empty and every one of them bound by the
+/// deployment's snapshot; there is no "all secrets of this deployment" form.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SecretFetchEntry {
+    pub deployment_id: String,
+    pub revisions: Vec<String>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -577,47 +414,6 @@ mod tests {
                 "{key} is not a usable environment variable name"
             );
         }
-    }
-
-    #[test]
-    fn a_node_key_round_trips_through_the_metadata_value() {
-        // The control plane builds the value and the node reads it back. A
-        // mismatch here is a fleet where every push and every cron fire is
-        // refused, so the pair is pinned rather than left to two call sites
-        // that happen to agree today.
-        let value = node_auth_value("node-psk");
-        assert_eq!(value, "Bearer node-psk");
-        assert_eq!(node_auth_secret(&value), "node-psk");
-        assert_eq!(node_auth_secret("node-psk"), "node-psk");
-        assert_eq!(NODE_AUTH_METADATA, NODE_AUTH_METADATA.to_ascii_lowercase());
-    }
-
-    #[test]
-    fn an_empty_node_key_matches_nothing_at_all() {
-        // The case that decides whether an unconfigured node is closed or
-        // open: a receiver holding no key must refuse a caller presenting no
-        // key, rather than finding two empty strings equal and letting it in.
-        assert!(!node_secret_matches("", ""));
-        assert!(!node_secret_matches("", "anything"));
-        assert!(!node_secret_matches("node-psk", ""));
-        assert!(node_secret_matches("node-psk", "node-psk"));
-        assert!(!node_secret_matches("node-psk", "node-psl"));
-        assert!(!node_secret_matches("node-psk", "node-psk-longer"));
-    }
-
-    /// The same rule, asserted at the name the credentials that are not the
-    /// fleet key are checked under. Both spellings are pinned so that
-    /// retiring the node key's wrapper cannot quietly take the rule with it -
-    /// deis-runtime's per-session inspector token is checked here, and it
-    /// outlives the fleet key by design.
-    #[test]
-    fn an_empty_credential_matches_nothing_at_all() {
-        assert!(!secret_matches("", ""));
-        assert!(!secret_matches("", "anything"));
-        assert!(!secret_matches("session-token", ""));
-        assert!(secret_matches("session-token", "session-token"));
-        assert!(!secret_matches("session-token", "session-tokem"));
-        assert!(!secret_matches("session-token", "session-token-longer"));
     }
 
     #[test]
@@ -697,89 +493,6 @@ mod tests {
                 "{hostile} must not parse as a namespace"
             );
         }
-    }
-
-    #[test]
-    fn base64_agrees_with_rfc_4648() {
-        // The token is compared as a string across three binaries, so the
-        // encoder is pinned to the published vectors rather than to itself.
-        for (input, want) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64_standard(input.as_bytes()), want, "for {input:?}");
-        }
-    }
-
-    #[test]
-    fn a_storage_token_is_the_published_hmac_of_the_tenant() {
-        // RFC 4231 test case 2, so the digest is checked against something
-        // outside this crate: a change of algorithm here would otherwise be
-        // invisible until the control plane and the store disagreed.
-        let expected = base64_standard(
-            &hex::decode("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
-                .unwrap(),
-        );
-        assert_eq!(
-            storage_token("Jefe", "what do ya want for nothing?"),
-            expected
-        );
-    }
-
-    #[test]
-    fn a_token_only_ever_matches_the_tenant_it_was_minted_for() {
-        // The whole point of deriving per tenant: a token that leaked out of
-        // one application authorises nothing in another, and neither does a
-        // token minted under a different secret.
-        let secret = "shared-secret";
-        let mine = storage_token(secret, &tenant_id("shop", "production"));
-        for other in [
-            tenant_id("shop", "preview-7"),
-            tenant_id("other-app", "production"),
-        ] {
-            assert!(
-                !storage_token_matches(&storage_token(secret, &other), &mine),
-                "a token for shop.production must not be accepted for {other}"
-            );
-        }
-        assert!(!storage_token_matches(
-            &storage_token("another-secret", &tenant_id("shop", "production")),
-            &mine
-        ));
-        assert!(storage_token_matches(
-            &storage_token(secret, &tenant_id("shop", "production")),
-            &mine
-        ));
-    }
-
-    #[test]
-    fn a_token_is_printable_ascii_so_it_survives_grpc_metadata() {
-        // tonic refuses a metadata value that is not visible ASCII at send
-        // time, which would turn a correct token into a call that never
-        // leaves the node.
-        let token = storage_token("s", &tenant_id("app", "production"));
-        assert!(
-            token.bytes().all(|b| b.is_ascii_graphic() || b == b' '),
-            "{token} cannot be sent as metadata"
-        );
-        // 32 digest bytes, so four characters per three bytes plus padding.
-        assert_eq!(token.len(), 44);
-    }
-
-    #[test]
-    fn comparing_tokens_is_length_safe() {
-        // A truncated or extended presentation must be refused rather than
-        // indexing past the end of either side.
-        let token = storage_token("s", "app.production");
-        assert!(!storage_token_matches(&token, ""));
-        assert!(!storage_token_matches(&token, &token[..10]));
-        assert!(!storage_token_matches(&token, &format!("{token}x")));
-        assert!(storage_token_matches("", ""));
     }
 
     #[test]

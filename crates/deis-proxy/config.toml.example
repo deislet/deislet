@@ -11,9 +11,9 @@
 # `config::tests::the_shipped_example_configuration_loads` reads this file.
 
 # Relative paths anywhere in this file (database, pid_file, upgrade_sock,
-# log paths, certificate files) are resolved against the directory deis-proxy was
-# started from, including across `-s reload`, which starts the replacement
-# from that same directory.
+# log paths, certificate files, routing.cache_path) are resolved against the
+# directory deis-proxy was started from, including across `-s reload`, which
+# starts the replacement from that same directory.
 
 # Run in the background and write pid_file. Also enabled by `-d`.
 daemon = false
@@ -242,10 +242,17 @@ level = "info"  # trace | debug | info | warn | error; RUST_LOG overrides
 # and the only thing lost is the ability to change routing. Each failed poll
 # logs at ERROR saying which table is still routing and how old it is.
 #
+# That table is also kept on disk, so a restart during the same outage still
+# routes. A successful poll replaces the file, and a file that cannot be read
+# or does not validate is ignored with a warning.
+#
 # Needs [control] above. Without it there is no table to fetch and only the
 # applications configured on this machine are routed.
 # [routing]
 # control_poll_interval_secs = 5
+# Where the table this instance last published is kept. Default:
+# routing-table.json in the directory holding `database`.
+# cache_path = "/var/lib/deis-proxy/routing-table.json"
 # Ceiling on the fetched table, in bytes (default 8 MiB, roughly one line of
 # JSON per route). A table larger than this is refused whole and the previous
 # one stays in force.

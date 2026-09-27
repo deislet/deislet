@@ -78,13 +78,16 @@ use tracing::{debug, error, info, warn};
 
 /// What this listener advertises during the handshake.
 ///
-/// gRPC and nothing else: the two services are all that is mounted on it, and
-/// the bundle download that shares the control plane's machine listener has
-/// no counterpart here. Stating it matters because a peer that offers `h2` to
-/// a listener advertising nothing gets a connection with no agreed protocol,
+/// gRPC, which is `h2`, and the inspector WebSocket, which is an HTTP/1.1
+/// upgrade: the debugger channel moved here from the data port, because a
+/// listener only this fleet's machines can reach is where a CDP session into
+/// a tenant's isolate belongs. Order matters for preference, not correctness:
+/// a gRPC client picks `h2` and a WebSocket client picks `http/1.1` from the
+/// same list. Stating them matters because a peer that offers `h2` to a
+/// listener advertising nothing gets a connection with no agreed protocol,
 /// which works by accident today and stops working the moment anything
 /// stricter than hyper is in the path.
-pub const SERVES: &[Protocol] = &[Protocol::Http2];
+pub const SERVES: &[Protocol] = &[Protocol::Http2, Protocol::Http11];
 
 /// Everything the mutually authenticated management plane needs to be bound.
 ///

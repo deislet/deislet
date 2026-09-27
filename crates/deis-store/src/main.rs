@@ -6,11 +6,9 @@
 //! is also where the tenant id is built - here it is one opaque key.
 //!
 //! Who a caller is allowed to be, it does check: a call carries a capability
-//! token for the tenant it names, derived from the `auth_secret` this service
-//! and deis-control share. With no secret configured it listens on loopback
-//! and believes the header, which is the default single-box install; binding
-//! anywhere else in that state is refused at startup. See
-//! [`deis_store::auth`].
+//! token for the tenant it names, an Ed25519-signed JCS-JWT verified against
+//! the control plane's published keys, fetched from its JWKS. Every call must present a valid token;
+//! there is no anonymous or loopback bypass. See [`deis_store::auth`].
 //!
 //! Beside serving, the binary is also how a data directory is backed up and
 //! put back: `snapshot` and `restore`. Those are subcommands rather than RPCs
@@ -110,7 +108,29 @@ async fn main() -> Result<()> {
 
 async fn serve(config: Config) -> Result<()> {
     let listener = server::bind(&config).await?;
-    server::serve(config, listener, server::shutdown_signal()).await
+
+    let keys = capability_keys(&config);
+
+    server::serve(config, listener, server::shutdown_signal(), keys).await
+}
+
+/// The verifier's key ring, kept current from the control plane's JWKS.
+///
+/// Starts empty and never blocks startup: the control plane may come up
+/// after this process, and until the first fetch lands every call is refused
+/// as signed by an unknown key - which is true - and the refresher retries.
+fn capability_keys(config: &Config) -> deis_capability::KeyRing {
+    let keys = deis_capability::KeyRing::new();
+    tracing::info!(
+        url = %config.capability_jwks_url,
+        "Fetching the control plane's capability verifying keys; calls are refused until they arrive"
+    );
+    deis_capability::fetch::spawn_refresher(
+        keys.clone(),
+        config.capability_jwks_url.clone(),
+        deis_capability::fetch::RefreshPolicy::default(),
+    );
+    keys
 }
 
 fn take_snapshot(config: &Config, out: &std::path::Path) -> Result<()> {

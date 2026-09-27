@@ -58,15 +58,16 @@ impl BundleStore {
     /// Open the store at `root`, anchoring a relative path to the directory
     /// this process was started in.
     ///
-    /// `bundle_dir` defaults to the relative `data/bundles`, and every path
-    /// derived from the root is written into `versions.bundle_path` exactly as
-    /// it comes out - so an installation on the default was storing, for every
-    /// version it ever accepted, a path that only means anything from one
-    /// particular working directory. Start the control plane from anywhere
-    /// else - a systemd unit, a shell in another directory, a container with a
-    /// different WORKDIR - and every version at once became "recorded but
-    /// missing on disk": the zips are still there, and no node can load any of
-    /// them.
+    /// Every path derived from the root is written into
+    /// `versions.bundle_path` exactly as it comes out, so an installation
+    /// whose root was relative recorded, for every version it ever accepted,
+    /// a path that only means anything from one particular working
+    /// directory. Start the control plane from anywhere else - a systemd
+    /// unit, a shell in another directory, a container with a different
+    /// WORKDIR - and every version at once became "recorded but missing on
+    /// disk": the zips are still there, and no node can load any of them.
+    /// The binary refuses a relative `bundle_dir` for exactly that reason;
+    /// this is what faces a caller that is not the binary.
     ///
     /// Anchoring here rather than at each use is what makes that impossible to
     /// reintroduce: there is no other way to build one of these, so no path

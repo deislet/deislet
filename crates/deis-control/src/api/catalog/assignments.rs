@@ -25,12 +25,12 @@
 //!
 //! **This response carries decrypted secret values.** It is one of exactly
 //! two places where they appear in the clear (the other is the
-//! `ApplyDeployment` push), which is why the route is mounted with its own
-//! node authentication in [`super::node_router`] instead of behind the
-//! dashboard's API key. There is no anonymous case to handle here: a control
-//! plane with no node credential answers 503 on this route before the handler
-//! is reached (`api::middleware::node_auth`), so everything below is talking
-//! to a caller that proved it holds a node key.
+//! `ApplyDeployment` push), which is why it is served on the machine
+//! channel (`deis.machine.MachineChannel`) with mutual TLS instead of
+//! behind the dashboard's API key. There is no anonymous case to handle
+//! here: a control plane with no machine identity answers 503 on a call
+//! into this handler (`machine::service` checks the peer certificate),
+//! so everything below is talking to a caller that proved its SPIFFE name.
 
 use std::collections::BTreeMap;
 
@@ -141,14 +141,13 @@ pub struct AssignmentView {
     pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment_snapshot_id: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub secret_values_by_revision: BTreeMap<String, String>,
 }
 
-/// GET /api/nodes/:id/assignments
+/// GET /api/nodes/:id/assignments (machine channel)
 ///
-/// Authenticated as a node by [`super::node_router`], whatever
-/// `api_auth_enabled` says.
+/// Served on the machine listener with mutual TLS — the handler receives
+/// the caller's SPIFFE identity from the peer certificate. The human API's
+/// credential gate does not reach this channel.
 pub async fn for_node(
     State(state): State<CatalogState>,
     Path(node_id): Path<String>,
@@ -236,11 +235,10 @@ pub(crate) async fn assignments_for(
             Ok(payload) => {
                 let deployment_action = match payload.action() {
                     crate::runtime_client::proto::DeploymentAction::Prepare => "prepare",
-                    crate::runtime_client::proto::DeploymentAction::LegacyApply
-                    | crate::runtime_client::proto::DeploymentAction::Activate => "activate",
+                    crate::runtime_client::proto::DeploymentAction::Activate
+                    | crate::runtime_client::proto::DeploymentAction::Unspecified => "activate",
                     crate::runtime_client::proto::DeploymentAction::Abort
-                    | crate::runtime_client::proto::DeploymentAction::Drain
-                    | crate::runtime_client::proto::DeploymentAction::Unspecified => {
+                    | crate::runtime_client::proto::DeploymentAction::Drain => {
                         error!(
                             node = %node_id,
                             deployment_id = %assignment.deployment_id,
@@ -295,16 +293,13 @@ pub(crate) async fn assignments_for(
             compatibility,
             environment_declarations: standard_environment
                 .as_ref()
-                .map(|(declarations, _, _, _)| declarations.clone()),
+                .map(|(declarations, _, _)| declarations.clone()),
             environment_snapshot: standard_environment
                 .as_ref()
-                .map(|(_, snapshot, _, _)| snapshot.clone()),
+                .map(|(_, snapshot, _)| snapshot.clone()),
             environment_snapshot_id: standard_environment
                 .as_ref()
-                .map(|(_, _, identity, _)| identity.clone()),
-            secret_values_by_revision: standard_environment
-                .map(|(_, _, _, secrets)| secrets)
-                .unwrap_or_default(),
+                .map(|(_, _, identity)| identity.clone()),
         });
     }
 
@@ -341,4 +336,47 @@ pub(crate) async fn assignments_for(
         complete,
         withheld,
     })
+}
+
+/// Where one deployment's secrets live, for a node that may read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisibleDeployment {
+    /// Primary key of the environment row: the half of a secret revision's
+    /// storage key and AAD that the snapshot does not carry.
+    pub env_id: String,
+    /// `None` for a deployment that predates typed snapshots, which binds no
+    /// secret revisions and so has nothing to fetch.
+    pub snapshot_id: Option<String>,
+}
+
+/// Which deployments `node_id` may read secret values for, keyed by id.
+///
+/// The single place that decides it, so that a placement model narrows it
+/// here and nowhere else. Today every node runs every application, so this is
+/// every current assignment plus every in-flight plan that names this node as
+/// a target: a PREPARE push reaches the node before the deployment pointer is
+/// written, and the node fetches its secrets while preparing.
+pub(crate) async fn deployments_visible_to(
+    state: &CatalogState,
+    node_id: &str,
+) -> crate::catalog::CatalogResult<BTreeMap<String, VisibleDeployment>> {
+    let mut visible = BTreeMap::new();
+    for assignment in state.store.list_assignments().await?.assignments {
+        visible.insert(
+            assignment.deployment_id,
+            VisibleDeployment {
+                env_id: assignment.environment_id,
+                snapshot_id: assignment.snapshot_id,
+            },
+        );
+    }
+    for plan in state.store.nonterminal_deployment_plans().await? {
+        if plan.target_ids.iter().any(|target| target == node_id) {
+            visible.entry(plan.id).or_insert(VisibleDeployment {
+                env_id: plan.env_id,
+                snapshot_id: plan.snapshot_id,
+            });
+        }
+    }
+    Ok(visible)
 }

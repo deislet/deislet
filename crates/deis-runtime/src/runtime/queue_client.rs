@@ -395,11 +395,21 @@ impl QueueClient {
     ///
     /// A message that has used up its attempts is dead lettered by the server
     /// instead of being released; the returned counts say which happened.
+    ///
+    /// `refund_attempt` gives the delivery attempt the server counted at the
+    /// pull back again. Attempts are charged when a message is handed out, so
+    /// a nack of work that never reached the application would otherwise burn
+    /// an attempt on a delivery that did nothing and eventually dead letter
+    /// it. Set it only when the batch was refused before the application saw
+    /// it -- the runtime thread at capacity -- and never for work the
+    /// application actually failed, or a poison message would never reach the
+    /// ceiling that exists to retire it.
     pub async fn nack(
         &self,
         queue_name: &str,
         handles: Vec<MessageHandle>,
         delay_seconds: u32,
+        refund_attempt: bool,
     ) -> Result<NackOutcome> {
         if handles.is_empty() {
             return Ok(NackOutcome {
@@ -412,6 +422,7 @@ impl QueueClient {
             queue_name: queue_name.to_string(),
             messages: handles.into_iter().map(Into::into).collect(),
             delay_seconds: delay_seconds.min(i32::MAX as u32) as i32,
+            refund_attempt,
         });
 
         let mut client = self.client.clone();

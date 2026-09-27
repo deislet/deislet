@@ -84,7 +84,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use deis_wire::conventions::{BINDING_HEADER, STORAGE_TOKEN_HEADER};
+use deis_wire::conventions::BINDING_HEADER;
 use deno_core::OpState;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
@@ -122,12 +122,22 @@ pub const QUEUE_CONSUMERS_KEY: &str = "DEIS_QUEUE_CONSUMERS";
 /// Reserved deployment-env key holding this tenant's storage capability
 /// token, minted by deis-control from a secret the storage services share.
 ///
+/// The name `DEIS_STORAGE_TOKEN` arrives under on the environment map.
+///
+/// Lifted out of the map with the rest of the wiring, and for a stronger
+/// reason than the addresses: an application that could read this value could
+/// call deis-store directly *as its own tenant*, bypassing every check this
+/// node makes on its behalf.
+pub const STORAGE_TOKEN_KEY: &str = deis_wire::conventions::STORAGE_TOKEN_ENV;
+
+/// The name `DEIS_QUEUE_TOKEN` arrives under on the environment map.
+///
 /// Lifted out of the map with the rest of the wiring, and for a stronger
 /// reason than the addresses: an application that could read this value could
 /// call deis-store and deis-queue directly *as its own tenant*, bypassing
 /// every check this node makes on its behalf, and one that could declare the
 /// key would be choosing the credential the node then presents for it.
-pub const STORAGE_TOKEN_KEY: &str = deis_wire::conventions::STORAGE_TOKEN_ENV;
+pub const QUEUE_TOKEN_KEY: &str = deis_wire::conventions::QUEUE_TOKEN_ENV;
 
 /// The name `env.ASSETS` is published under.
 ///
@@ -178,12 +188,13 @@ pub const CALLABLE_BY_KEY: &str = "DEIS_CALLABLE_BY";
 
 /// Every key this module claims. Anything spelled this way in a deployment's
 /// env map is platform wiring and is removed before the app sees the map.
-pub const RESERVED_ENV_KEYS: [&str; 8] = [
+pub const RESERVED_ENV_KEYS: [&str; 9] = [
     SERVICES_KEY,
     STORE_ENDPOINT_KEY,
     QUEUE_ENDPOINT_KEY,
     QUEUE_CONSUMERS_KEY,
     STORAGE_TOKEN_KEY,
+    QUEUE_TOKEN_KEY,
     ASSETS_BINDING_KEY,
     BINDINGS_KEY,
     CALLABLE_BY_KEY,
@@ -384,9 +395,13 @@ pub struct ServiceWiring {
     pub endpoints: ServiceEndpoints,
     pub consumers: Vec<QueueConsumerSpec>,
     /// This tenant's storage capability token, or `None` on a platform whose
-    /// control plane has no shared secret configured. Carried here rather
+    /// control plane has no issuer configured. Carried here rather
     /// than left in the env map because the map becomes `ctx.env`.
     pub storage_token: Option<String>,
+    /// Queue-specific capability token (`aud = "queue"`). Separate from
+    /// `storage_token` because store (KV/SQL/blob) and queue require
+    /// different audience claims in their capability tokens.
+    pub queue_token: Option<String>,
     /// The namespaces and the applications this version reaches by name,
     /// exactly as its manifest declared them.
     ///
@@ -416,6 +431,7 @@ impl std::fmt::Debug for ServiceWiring {
             .field("bindings", &self.bindings.describe())
             .field("callable_by", &self.callable_by)
             .field("storage_token", &token_state(&self.storage_token))
+            .field("queue_token", &token_state(&self.queue_token))
             .finish()
     }
 }
@@ -439,6 +455,7 @@ impl ServiceWiring {
             // Not a manifest concept: it is minted per deployment by the
             // control plane, so a caller that has one adds it afterwards.
             storage_token: None,
+            queue_token: None,
             consumers: manifest
                 .queues
                 .iter()
@@ -462,6 +479,7 @@ impl ServiceWiring {
         let queue = env.remove(QUEUE_ENDPOINT_KEY);
         let consumers = env.remove(QUEUE_CONSUMERS_KEY).unwrap_or_default();
         let storage_token = env.remove(STORAGE_TOKEN_KEY);
+        let queue_token = env.remove(QUEUE_TOKEN_KEY);
         let bindings = env.remove(BINDINGS_KEY).unwrap_or_default();
         let callable_by = env.remove(CALLABLE_BY_KEY).unwrap_or_default();
         // Nothing is read out of it -- the binding is built from the version's
@@ -479,6 +497,7 @@ impl ServiceWiring {
             },
             consumers: parse_consumers(&consumers),
             storage_token: non_empty(storage_token),
+            queue_token: non_empty(queue_token),
             bindings: parse_bindings(&bindings),
             callable_by: callable_by
                 .split(',')
@@ -506,6 +525,9 @@ impl ServiceWiring {
         }
         if let Some(token) = &self.storage_token {
             env.insert(STORAGE_TOKEN_KEY.to_string(), token.clone());
+        }
+        if let Some(token) = &self.queue_token {
+            env.insert(QUEUE_TOKEN_KEY.to_string(), token.clone());
         }
         if !self.bindings.is_empty() {
             env.insert(BINDINGS_KEY.to_string(), encode_bindings(&self.bindings));
@@ -846,12 +868,18 @@ pub(crate) fn streaming_channel(endpoint: &str) -> Result<Channel> {
 /// deis-store or deis-queue with no `auth_secret` accepts. That is why nothing
 /// here is conditional on a feature or a mode: the same code is correct
 /// against both configurations.
+///
+/// The token is held behind an [`Arc`]`<`[`RwLock`]`>` so that the node's
+/// background capability renewal loop can refresh it without rebuilding the
+/// isolate. [`StorageIdentity::new`] populates the lock from the initial
+/// value, and clones share it.
 #[derive(Clone)]
 pub struct StorageIdentity {
     tenant: Tenant,
-    /// Parsed once, so a token that cannot be sent as metadata is refused
-    /// when the client is built rather than on every call.
-    token: Option<MetadataValue<Ascii>>,
+    /// Held behind a lock so the renewal loop can refresh it. An empty or
+    /// missing token is `None` (or `Some("")`): both mean no credential was
+    /// handed to this node, and every call stamps only the tenant.
+    token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     /// Which namespace inside the tenant this client speaks for, or `None`
     /// for the tenant's unnamed one.
     ///
@@ -879,7 +907,7 @@ impl std::fmt::Debug for StorageIdentity {
             )
             .field(
                 "token",
-                &if self.token.is_some() {
+                &if self.token.read().unwrap().as_ref().map_or(false, |t| !t.is_empty()) {
                     "<present>"
                 } else {
                     "<absent>"
@@ -898,6 +926,10 @@ impl StorageIdentity {
     /// presented as a token and refused, where sending nothing at least
     /// works against a service that requires no proof.
     ///
+    /// The token is wrapped in a private [`Arc`]`<`[`RwLock`]`>` so callers
+    /// that also hold a reference through [`Self::token_lock`] can update
+    /// it.
+    ///
     /// Fails on a tenant that is not two legal parts, and on a token that is
     /// not sendable as gRPC metadata. Both are configuration faults that no
     /// retry fixes: the control plane's token is base64, so a value that will
@@ -906,20 +938,26 @@ impl StorageIdentity {
     /// the tenant rather than about the credential.
     pub fn new(tenant: impl Into<String>, token: Option<&str>) -> Result<Self> {
         let tenant = Tenant::new(tenant)?;
-        let token = match token.map(str::trim).filter(|token| !token.is_empty()) {
-            Some(token) => Some(token.parse::<MetadataValue<Ascii>>().map_err(|_| {
-                anyhow!(
-                    "the storage capability token handed to {} cannot be sent as gRPC metadata, \
-                     so every storage call of this application would be refused; the control \
-                     plane mints it as base64, which means this value did not come from one",
-                    tenant.as_str()
-                )
-            })?),
+        let packed = match token.map(str::trim).filter(|token| !token.is_empty()) {
+            Some(token) => {
+                // Parse eagerly: a token that cannot be sent as metadata is
+                // caught before the first storage call.
+                let _ = token.parse::<MetadataValue<Ascii>>().map_err(|_| {
+                    anyhow!(
+                        "the storage capability token handed to {} cannot be sent as gRPC \
+                         metadata, so every storage call of this application would be refused; \
+                         the control plane mints it as base64, which means this value did not \
+                         come from one",
+                        tenant.as_str()
+                    )
+                })?;
+                Some(token.to_string())
+            }
             None => None,
         };
         Ok(Self {
             tenant,
-            token,
+            token: std::sync::Arc::new(std::sync::RwLock::new(packed)),
             binding: None,
             binding_name: None,
         })
@@ -938,7 +976,7 @@ impl StorageIdentity {
         let Some(name) = binding.map(str::trim).filter(|name| !name.is_empty()) else {
             return Ok(Self {
                 tenant: self.tenant.clone(),
-                token: self.token.clone(),
+                token: std::sync::Arc::clone(&self.token),
                 binding: None,
                 binding_name: None,
             });
@@ -953,7 +991,7 @@ impl StorageIdentity {
         }
         Ok(Self {
             tenant: self.tenant.clone(),
-            token: self.token.clone(),
+            token: std::sync::Arc::clone(&self.token),
             binding: Some(name.parse::<MetadataValue<Ascii>>().map_err(|_| {
                 anyhow!(
                     "the binding name {name:?} of {} cannot be sent as gRPC metadata",
@@ -988,17 +1026,34 @@ impl StorageIdentity {
     /// normal on a single-box install and fatal against a service that has an
     /// `auth_secret`, so it is worth a log field wherever a client is built.
     pub fn is_proven(&self) -> bool {
-        self.token.is_some()
+        self.token.read().unwrap().as_ref().map_or(false, |t| !t.is_empty())
+    }
+
+    /// Returns the shared lock behind this identity's token so a background
+    /// renewal loop can update it.
+    pub fn token_lock(&self) -> std::sync::Arc<std::sync::RwLock<Option<String>>> {
+        std::sync::Arc::clone(&self.token)
     }
 
     /// Wrap a message in a request carrying the tenant and, when there is
     /// one, the token that proves the caller may be it.
     pub fn stamp<T>(&self, message: T) -> Request<T> {
         let mut request = self.tenant.stamp(message);
-        if let Some(token) = &self.token {
-            request
-                .metadata_mut()
-                .insert(STORAGE_TOKEN_HEADER, token.clone());
+        if let Some(ref token) = *self.token.read().unwrap() {
+            if !token.is_empty() {
+                let bearer = format!(
+                    "Bearer {}",
+                    token
+                        .parse::<MetadataValue<Ascii>>()
+                        .expect("a valid capability token is always ASCII")
+                        .to_str()
+                        .expect("ASCII capability token is valid metadata")
+                );
+                request.metadata_mut().insert(
+                    "authorization",
+                    bearer.parse().expect("bearer token is valid metadata"),
+                );
+            }
         }
         // Stamped here rather than in each client, for the reason the token
         // is: a client that stamped the tenant and forgot the binding would
@@ -1130,11 +1185,20 @@ impl AppServices {
         // split into an app and an environment, and demanding one of it here
         // would stop it from loading over storage it does not use.
         let identity = || StorageIdentity::new(tenant, wiring.storage_token.as_deref());
+        // Queue clients use a separate token because the queue audience
+        // differs from the store audience in capability tokens.
+        let queue_identity =
+            || StorageIdentity::new(tenant, wiring.queue_token.as_deref());
 
         if !store_kinds.is_empty() {
             match wiring.endpoints.store.as_deref() {
                 Some(endpoint) => {
                     let identity = identity()?;
+                    crate::deployment::capability_renewer::register(
+                        tenant,
+                        "store",
+                        identity.token_lock(),
+                    );
                     for kind in store_kinds {
                         // The unnamed namespace exists only when the manifest
                         // says `services.<kind>`. A version that declares only
@@ -1204,7 +1268,12 @@ impl AppServices {
         if declares_queue {
             match wiring.endpoints.queue.as_deref() {
                 Some(endpoint) => {
-                    let identity = identity()?;
+                    let identity = queue_identity()?;
+                    crate::deployment::capability_renewer::register(
+                        tenant,
+                        "queue",
+                        identity.token_lock(),
+                    );
                     services.queue = Some(QueueClient::connect_lazy(endpoint, &identity)?);
                     tracing::info!(
                         app_id = tenant,
@@ -1349,9 +1418,11 @@ pub fn wire_deployment_env(manifest: &deis_bundle::Manifest, env: &mut HashMap<S
         queue: non_empty(env.get(QUEUE_ENDPOINT_KEY).cloned()),
     };
     let storage_token = non_empty(env.get(STORAGE_TOKEN_KEY).cloned());
+    let queue_token = non_empty(env.get(QUEUE_TOKEN_KEY).cloned());
     strip_reserved_env(env);
     let mut wiring = ServiceWiring::from_manifest(manifest, endpoints);
     wiring.storage_token = storage_token;
+    wiring.queue_token = queue_token;
     wiring.write_to_env(env);
 }
 
@@ -1359,11 +1430,10 @@ pub fn wire_deployment_env(manifest: &deis_bundle::Manifest, env: &mut HashMap<S
 /// code never sends a message.
 ///
 /// Charged to the same tenant as the app's own client, and carrying the same
-/// capability token, so a preview polls its own queues and never leases a
-/// message production was meant to handle - and so a deis-queue with an
-/// `auth_secret` answers the poller instead of refusing it. Dropping the token
-/// here would leave an application whose own `queue.send` works while nothing
-/// is ever consumed.
+/// queue capability, so a preview polls its own queues and never leases a
+/// message production was meant to handle, and deis-queue answers the poller
+/// instead of refusing it. Dropping the token here would leave an application
+/// whose own `queue.send` works while nothing is ever consumed.
 pub(crate) fn consumer_queue_client(
     tenant: &str,
     endpoint: &str,
@@ -1372,6 +1442,9 @@ pub(crate) fn consumer_queue_client(
 ) -> Result<QueueClient> {
     let identity = StorageIdentity::new(tenant, token)
         .with_context(|| format!("building the queue consumer client for {tenant}"))?;
+    // Renewed like the app's own queue client: a poller outlives any one
+    // token, and one that stopped renewing would stop consuming.
+    crate::deployment::capability_renewer::register(tenant, "queue", identity.token_lock());
     QueueClient::connect_lazy(endpoint, &identity)?
         .with_consumer_generation(generation)
         .with_context(|| format!("building the queue consumer client for {tenant}"))

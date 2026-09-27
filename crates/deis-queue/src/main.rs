@@ -8,11 +8,9 @@
 //! anyone.
 //!
 //! Who a caller is allowed to be, it does check: a call carries a capability
-//! token for the tenant it names, derived from the `auth_secret` this service
-//! shares with deis-store and deis-control. With no secret configured it
-//! listens on loopback and believes the header, which is the default
-//! single-box install; binding anywhere else in that state is refused at
-//! startup. See the crate docs in `lib.rs` and [`deis_queue::auth`].
+//! token for the tenant it names, an Ed25519-signed JCS-JWT verified against
+//! the control plane's published keys (its JWKS). Every call must present a valid token;
+//! there is no anonymous or loopback bypass. See [`deis_queue::auth`].
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -68,7 +66,8 @@ async fn main() -> Result<()> {
     match cli.command {
         None | Some(Command::Serve) => {
             let listener = server::bind(&config).await?;
-            server::serve(config, listener, server::shutdown_signal()).await
+            let keys = capability_keys(&config);
+            server::serve(config, listener, server::shutdown_signal(), keys).await
         }
         Some(Command::Snapshot { out }) => {
             let manifest = snapshot::take(&config.data_dir, &out).with_context(|| {
@@ -121,4 +120,23 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The verifier's key ring, kept current from the control plane's JWKS.
+///
+/// Starts empty and never blocks startup: the control plane may come up
+/// after this process, and until the first fetch lands every call is refused
+/// as signed by an unknown key - which is true - and the refresher retries.
+fn capability_keys(config: &Config) -> deis_capability::KeyRing {
+    let keys = deis_capability::KeyRing::new();
+    tracing::info!(
+        url = %config.capability_jwks_url,
+        "Fetching the control plane's capability verifying keys; calls are refused until they arrive"
+    );
+    deis_capability::fetch::spawn_refresher(
+        keys.clone(),
+        config.capability_jwks_url.clone(),
+        deis_capability::fetch::RefreshPolicy::default(),
+    );
+    keys
 }

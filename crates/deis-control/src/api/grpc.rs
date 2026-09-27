@@ -575,14 +575,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(
-                    tonic::service::interceptor::InterceptedService::new(
-                        deis_wire::pb::control_service_server::ControlServiceServer::new(
-                            service,
-                        ),
-                        proving("node-a"),
-                    ),
-                )
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                    proving("node-a"),
+                ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
 
@@ -695,24 +691,18 @@ mod tests {
     async fn a_node_keeps_the_name_it_announces_across_a_reconnect() {
         let sessions = Arc::new(SessionManager::new());
         let database = Arc::new(Database::init(":memory:").await.unwrap());
-        let service = GrpcControlService::new(
-            Arc::new(ControlConfig::default()),
-            Arc::clone(&sessions),
-        )
-        .with_database(Arc::clone(&database));
+        let service =
+            GrpcControlService::new(Arc::new(ControlConfig::default()), Arc::clone(&sessions))
+                .with_database(Arc::clone(&database));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(
-                    tonic::service::interceptor::InterceptedService::new(
-                        deis_wire::pb::control_service_server::ControlServiceServer::new(
-                            service,
-                        ),
-                        proving("node-a"),
-                    ),
-                )
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                    proving("node-a"),
+                ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
 
@@ -825,14 +815,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(
-                    tonic::service::interceptor::InterceptedService::new(
-                        deis_wire::pb::control_service_server::ControlServiceServer::new(
-                            service,
-                        ),
-                        proving("node-a"),
-                    ),
-                )
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                    proving("node-a"),
+                ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
 
@@ -971,14 +957,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(
-                    tonic::service::interceptor::InterceptedService::new(
-                        deis_wire::pb::control_service_server::ControlServiceServer::new(
-                            service,
-                        ),
-                        proving("node-a"),
-                    ),
-                )
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                    proving("node-a"),
+                ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
 

@@ -3,38 +3,21 @@
 
 # Address the gRPC server binds to.
 #
-# Loopback on purpose, because the line below is commented out. With no
-# auth_secret, the service trusts the `x-deis-tenant` header it is handed and
-# has no way to tell one caller from another, so the only thing keeping an
-# unrelated client away from a tenant's messages is that it cannot reach the
-# port. Binding anywhere else in that state is refused at startup rather than
-# warned about: draining a queue is destructive, and a message somebody else's
-# consumer takes is one its owner never receives.
+# Loopback by default; every call is authenticated whatever the address.
 listen = "127.0.0.1:8091"
 
-# Shared secret the per-tenant capability tokens are derived from. Commented
-# out by default, which is the single-box install: deis-queue and deis-runtime
-# on one host, nothing else able to reach the port. The service says so at
-# startup, at warn.
-#
-# Set it, and every call must carry `x-deis-storage-token` holding
-# base64(HMAC-SHA256(auth_secret, tenant)) for the tenant it names. A token
-# only ever opens the one tenant it was minted for, so a token that leaked out
-# of one application is useless for another - and useless for another
-# environment of the same application.
-#
-# This is the same value deis-store uses and the same one the control plane
-# mints tokens from: one secret, one token per tenant, both services. Changing
-# it invalidates every token at once, so change it in all three places, or
-# every call from every node is refused.
-#
-# Required as soon as `listen` is not a loopback address.
-# auth_secret = "put a long random string here"
+# Every call must carry an Ed25519-signed capability in
+# `Authorization: Bearer <token>`, minted by the control plane for the tenant
+# it names; there is no anonymous or loopback mode. The keys those tokens are
+# checked against are the control plane's public keys, fetched from its JWKS
+# here at startup (calls are refused until the first fetch lands), every five
+# minutes after, and whenever a token names a key not yet fetched - so a key
+# rotation on the control plane needs nothing done on this host.
+capability_jwks_url = "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
 
 # Enables the separate BackendMigration gRPC service used by Control to
 # acquire durable queue writer fences and collect deterministic inventory.
-# Calls must send `Authorization: Bearer <token>` even on loopback. Do not
-# reuse auth_secret.
+# Calls must send `Authorization: Bearer <token>` even on loopback.
 # migration_admin_token = "put a different long random string here"
 
 # Directory holding queue.sqlite.
@@ -52,8 +35,9 @@ connections = 8
 
 # Largest single message body, in bytes. A queue message is a job description,
 # not a payload: anything large belongs in blob storage, with only its key
-# sent through the queue.
-max_body_bytes = 1048576
+# sent through the queue. 128 KB is the shared standard's ceiling, the largest
+# message every host accepts.
+max_body_bytes = 131072
 
 # Most messages one SendBatch may carry. The batch is one transaction, so this
 # also bounds how long a producer can hold the write lock.
@@ -76,8 +60,10 @@ max_pull_messages = 100
 
 # How many times a message may be delivered before it is dead lettered instead
 # of retried. Delivery is at-least-once, so a handler must be idempotent; this
-# is what stops a message that always fails from being retried forever.
-max_attempts = 5
+# is what stops a message that always fails from being retried forever. 3 is
+# the shared standard's count, also the number a queue consumer's declaration
+# carries by default.
+max_attempts = 3
 
 # How long a dead lettered message is kept, in seconds. Zero keeps it forever,
 # which is the default: dead letters exist to be looked at, and deleting them

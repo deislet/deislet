@@ -34,6 +34,7 @@ use rustls::{
 
 use crate::cert::name_in_certificate;
 use crate::error::IdentityError;
+use crate::names::{self, ServiceKind};
 use crate::spiffe::SpiffeId;
 
 /// Turn one of our refusals into the certificate error rustls sends and logs.
@@ -116,6 +117,105 @@ impl ClientCertVerifier for VerifyPeerIsInTrustDomain {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.inner.supported_verify_schemes()
+    }
+}
+
+/// Checks the certificate a connecting peer presents against one role.
+///
+/// [`VerifyPeerIsInTrustDomain`] accepts any machine this fleet signed. Some
+/// listeners take traffic from one kind of machine only - the runtime node's
+/// data port takes application traffic forwarded by proxies and nothing else
+/// - and a name that is in the trust domain but is a node's, or a control
+/// plane's, is refused here for the same reason the management plane refuses
+/// a node's name: a certificate signed by our own authority is still only the
+/// machine its name says it is.
+#[derive(Debug)]
+pub struct VerifyPeerIsOfKind {
+    inner: Arc<dyn ClientCertVerifier>,
+    trust_domain: String,
+    kind: ServiceKind,
+}
+
+impl VerifyPeerIsOfKind {
+    /// `trust_domain` is ours and `kind` is the only kind of machine whose
+    /// name completes a handshake.
+    pub fn new(
+        inner: Arc<dyn ClientCertVerifier>,
+        trust_domain: impl Into<String>,
+        kind: ServiceKind,
+    ) -> Self {
+        Self {
+            inner,
+            trust_domain: trust_domain.into(),
+            kind,
+        }
+    }
+}
+
+impl ClientCertVerifier for VerifyPeerIsOfKind {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        self.inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+
+        let name = name_in_certificate(end_entity).map_err(refuse)?;
+        if name.trust_domain() != self.trust_domain {
+            return Err(refuse(IdentityError::WrongTrustDomain {
+                presented: name.to_string(),
+                presented_trust_domain: name.trust_domain().to_string(),
+                expected_trust_domain: self.trust_domain.clone(),
+            }));
+        }
+        if names::service_kind(&name) != Some(self.kind) {
+            return Err(refuse(IdentityError::WrongKind {
+                presented: name.to_string(),
+                presented_kind: names::service_kind(&name).map_or_else(
+                    || "a name this fleet does not issue".to_string(),
+                    kind_label,
+                ),
+                expected_kind: kind_label(self.kind),
+            }));
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// What a [`ServiceKind`] reads as in a refusal.
+fn kind_label(kind: ServiceKind) -> String {
+    match kind {
+        ServiceKind::Control => "a control plane".to_string(),
+        ServiceKind::Node => "a runtime node".to_string(),
+        ServiceKind::Proxy => "a proxy".to_string(),
     }
 }
 

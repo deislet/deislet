@@ -1,65 +1,95 @@
-//! The node's public data port must not carry its management plane at all.
+//! The node's data port admits a caller only over mutual TLS.
 //!
-//! Two independent reviews reached `GetStatus`, `UnloadApp` and
+//! Two independent reviews once reached `GetStatus`, `UnloadApp` and
 //! `StartInspect` on a running node over its public data port with no
 //! credential at all: the two gRPC services were dispatched straight into
-//! their handlers, so anything that could reach an application on the node
-//! could also list every tenant on it, take one offline, or hand
-//! `ApplyDeployment` a bundle URL of its own.
+//! their handlers on the same socket that served application traffic. The
+//! management services left that socket first, and the socket itself now
+//! refuses the question one step earlier still - during the TLS handshake,
+//! where the caller proves a certificate naming a proxy of this fleet. A
+//! worker that can reach the address can no longer reach the applications
+//! behind it, which is what lets the port be bound where a worker can reach
+//! it.
 //!
-//! The first answer to that was a credential in front of the dispatch - a
-//! value the whole fleet shared. The answer now is that those services are
-//! not on this listener, so there is no credential to get wrong and no
-//! request to refuse: the paths fall through to the application router and
-//! are answered as any request naming no application is. What does serve them
-//! is `[machine_identity] management_listen`, where the caller proved a
-//! certificate before the connection existed; `dispatcher::machine_test`
-//! covers that side.
-//!
-//! These tests drive `dispatcher::start_server` itself - the same listener,
-//! the same router, the same dispatch - because the hole was in how the two
-//! services were mounted, not in either service.
+//! These tests drive `dispatcher::start_server` itself - the same listeners,
+//! the same routers, the same dispatch - against real certificates from a
+//! real authority, because what changed is who gets a connection at all, and
+//! that is settled before any handler runs. The management listener's own
+//! admission question, this node's control plane and nobody else, is covered
+//! where it lives in `dispatcher::machine_test`; what is covered here is the
+//! data port's answer being *a proxy*.
 
-use deis_runtime::app::ApplicationManager;
-use deis_runtime::config::RuntimeConfig;
-use deis_runtime::deployment::DeploymentManager;
-use deis_runtime::dispatcher::{self, ServerOptions};
-use deis_runtime::health::NodeHealth;
-use reqwest::StatusCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A gRPC request frame carrying an empty message.
-///
-/// One byte saying the payload is uncompressed, then its big-endian length.
-/// `GetStatusRequest { include_apps: false }` and a default `ScheduledEvent`
-/// both encode to nothing at all under proto3, so this is a complete, valid
-/// call - which is the point: the refusal has to happen before the message is
-/// looked at.
-const EMPTY_GRPC_FRAME: [u8; 5] = [0, 0, 0, 0, 0];
+use deis_identity::{names, MachineIdentity, Protocol, SpiffeId};
+use deis_identity_test_pki::{write_files, TestCa};
+use deis_runtime::app::ApplicationManager;
+use deis_runtime::config::RuntimeConfig;
+use deis_runtime::deployment::DeploymentManager;
+use deis_runtime::dispatcher::{self, MachineManagement, ServerOptions};
+use deis_runtime::health::NodeHealth;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+const TRUST_DOMAIN: &str = "deis.internal";
+const NODE_ID: &str = "auth-test-node";
 
 const GET_STATUS: &str = "/deis.management.RuntimeManagement/GetStatus";
-const ON_SCHEDULED: &str = "/deis.trigger.Trigger/OnScheduled";
 
-/// Take a port from the OS and give it straight back, so the server under
-/// test can bind it. Nothing else in this process is listening, and the
-/// alternative - a hard-coded port - collides with whatever else the machine
-/// happens to be running.
-async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
-        .await
-        .expect("the OS should hand out a port");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+/// A machine with real files on disk, loaded the way a process loads its own.
+/// Dial-only: the clients here never serve.
+fn machine(
+    ca: &TestCa,
+    directory: &tempfile::TempDir,
+    file_name: &str,
+    id: &SpiffeId,
+) -> Arc<MachineIdentity> {
+    Arc::new(
+        MachineIdentity::load(
+            write_files(directory.path(), file_name, &ca.issue(id), &ca.root_pem)
+                .as_identity_files(),
+            &[],
+        )
+        .expect("an identity"),
+    )
 }
 
-/// A node with a data listener, and optionally a management plane of its own.
-async fn start_node(port: u16) -> tokio::task::JoinHandle<()> {
+/// The node, bound and serving on ports the kernel picked.
+///
+/// Returns the data address, the node's own name (a client verifies the
+/// server by SPIFFE name, not by address) and the management address, which
+/// the tests do not dial but whose binding proves the two listeners coexist.
+async fn listening(
+    ca: &TestCa,
+    directory: &tempfile::TempDir,
+) -> (std::net::SocketAddr, SpiffeId, std::net::SocketAddr) {
+    let node_id = names::node(TRUST_DOMAIN, NODE_ID).expect("a node name");
+    let identity = Arc::new(
+        MachineIdentity::load(
+            write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem)
+                .as_identity_files(),
+            // Both listeners this node serves are built from this one
+            // identity, so it advertises what the management listener needs.
+            dispatcher::machine::SERVES,
+        )
+        .expect("an identity"),
+    );
+
+    let data_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a port")
+        .local_addr()
+        .expect("an address");
+    let management_listen = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a port")
+        .local_addr()
+        .expect("an address");
+    drop(std::net::TcpListener::bind("127.0.0.1:0").map(|_| ())); // keep ports distinct below
+
     let app_manager = Arc::new(ApplicationManager::new());
-    let data_dir = std::env::temp_dir().join(format!("deis-management-auth-{port}"));
+    let data_dir = std::env::temp_dir().join(format!("deis-management-auth-{}", data_port.port()));
     let config = RuntimeConfig {
-        data_dir: data_dir.clone(),
+        data_dir,
         ..RuntimeConfig::default()
     };
     let deployer = Arc::new(
@@ -68,21 +98,25 @@ async fn start_node(port: u16) -> tokio::task::JoinHandle<()> {
             .expect("preparing the bundle directory"),
     );
 
+    let machine_management = MachineManagement {
+        identity: Arc::clone(&identity),
+        listen: management_listen,
+        expected_control: names::control(TRUST_DOMAIN).expect("a control name"),
+    };
+
+    let node_id_for_task = NODE_ID.to_string();
     tokio::spawn(async move {
         let result = dispatcher::start_server(ServerOptions {
             app_manager,
             deployer,
             health: NodeHealth::starting(),
-            node_id: "auth-test-node".to_string(),
-            port,
+            node_id: node_id_for_task,
+            data_listen: data_port,
             started_at: std::time::Instant::now(),
             shutdown_grace: Duration::from_secs(1),
             max_request_body_bytes: deis_runtime::config::default_max_request_body_bytes(),
-            // None on purpose: this harness is about what the *data* port
-            // does, and a node with no machine management plane is the
-            // sharpest version of that question - there is nowhere else on
-            // this process for a management call to have gone.
-            machine_management: None,
+            identity,
+            machine_management: Some(machine_management),
         })
         .await;
         // Only reached when the node is torn down at the end of a test, or
@@ -90,164 +124,316 @@ async fn start_node(port: u16) -> tokio::task::JoinHandle<()> {
         if let Err(e) = result {
             eprintln!("node stopped: {e:#}");
         }
-    })
-}
+    });
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        // The control plane speaks h2c to a node, so the test does too:
-        // a refusal that only worked over HTTP/1.1 would not be the refusal a
-        // real caller meets.
-        .http2_prior_knowledge()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .expect("building the test client")
-}
-
-/// One gRPC call, retried until the node is listening.
-///
-/// The node binds its listener, loads its system application and only then
-/// starts serving, so the first attempts can be refused. Retrying the real
-/// call is the condition worth waiting on - no fixed pause would be right on
-/// both a warm and a cold machine.
-async fn grpc_call(
-    client: &reqwest::Client,
-    addr: &str,
-    path: &str,
-    credential: Option<&str>,
-) -> reqwest::Response {
-    for attempt in 0..200 {
-        let mut request = client
-            .post(format!("http://{addr}{path}"))
-            .header("content-type", "application/grpc")
-            .header("te", "trailers")
-            .body(EMPTY_GRPC_FRAME.to_vec());
-        if let Some(credential) = credential {
-            request = request.header("authorization", format!("Bearer {credential}"));
-        }
-        match request.send().await {
-            Ok(response) => return response,
-            Err(e) if attempt == 199 => panic!("{path} never answered: {e}"),
-            Err(_) => tokio::task::yield_now().await,
+    // The ports above were reserved by bind-and-drop, and the spawned task
+    // rebinds them a moment later. A caller arriving inside that window gets
+    // ECONNREFUSED, which is not what any test here is about - so wait until
+    // the data port actually answers before handing it out.
+    let mut accepting = false;
+    for attempt in 0..100 {
+        match tokio::net::TcpStream::connect(data_port).await {
+            Ok(socket) => {
+                drop(socket);
+                accepting = true;
+                break;
+            }
+            Err(_) if attempt == 99 => {}
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     }
-    unreachable!("the loop above either returns or panics")
+    assert!(
+        accepting,
+        "the data port never started accepting connections at {data_port}"
+    );
+
+    (data_port, node_id, management_listen)
 }
 
-/// The gRPC status a response carries in its headers.
+/// Dial the data port as `caller` over TLS and speak one HTTP/1.1 request,
+/// reporting the whole response as text.
 ///
-/// A refusal is a trailers-only response - HTTP 200 with `grpc-status` in the
-/// headers and no body - which is exactly how a served call differs from it
-/// here: a served call puts its status in the trailers instead and answers
-/// with a message.
-fn grpc_status(response: &reqwest::Response) -> Option<String> {
-    response
-        .headers()
-        .get("grpc-status")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
+/// A refusal anywhere in the handshake - a caller without a certificate, a
+/// certificate this fleet did not sign, a name that is not a proxy - arrives
+/// here as an `Err`, because the connection ends before any response exists.
+/// That is the refusal being asserted, so the helper hands it back as one.
+async fn http11_call(
+    caller: &MachineIdentity,
+    node_id: &SpiffeId,
+    address: std::net::SocketAddr,
+    request: &str,
+) -> Result<String, String> {
+    let config = caller
+        .client_config(node_id, &[Protocol::Http11])
+        .map_err(|e| format!("no client configuration: {e}"))?;
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let socket = TcpStream::connect(address)
+        .await
+        .map_err(|e| format!("no socket: {e}"))?;
+    // The name dialled is ignored by this fleet's verifier - see
+    // `deis_identity::verify` for why the certificate, not the address, is
+    // what answers "is this the node" - so any DNS-shaped name will do.
+    let server_name =
+        deno_runtime::deno_tls::rustls::pki_types::ServerName::try_from("deis-node.internal")
+            .expect("a server name");
+    let mut tls = connector
+        .connect(server_name, socket)
+        .await
+        .map_err(|e| format!("the handshake was refused: {e}"))?;
+    tls.write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("the request was not written: {e}"))?;
+    let mut answer = Vec::new();
+    // Read to the end, but a server that answers and then drops the
+    // connection without a TLS close_notify - which hyper does to a
+    // connection it is closing anyway, an upgrade request among them - ends
+    // a read here as an unexpected EOF. An answer already in hand is the
+    // response; a connection cut before a single byte of it is the refusal
+    // shape and stays an error.
+    loop {
+        let mut chunk = [0u8; 8192];
+        match tls.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => answer.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !answer.is_empty() => break,
+            Err(e) => return Err(format!("the answer was not read: {e}")),
+        }
+    }
+    String::from_utf8(answer).map_err(|e| format!("the answer was not text: {e}"))
 }
 
-/// Ask the data port until it answers.
+/// Open a plaintext connection to the data port and ask for something.
 ///
-/// The node builds a V8 snapshot before it binds, which takes seconds, so a
-/// request made the instant `start_node` returns is refused by nothing having
-/// opened the socket yet. `grpc_call` above carries the same retry for the
-/// same reason; this is its plain-HTTP twin.
+/// What comes back is whatever the listener does with bytes that are not a
+/// TLS handshake: the connection closes without an HTTP response, which is
+/// the assertion - the port answers nothing over plaintext.
+async fn plaintext_call(address: std::net::SocketAddr, request: &str) -> String {
+    let mut socket = TcpStream::connect(address)
+        .await
+        .expect("the port is bound, whatever it refuses after that");
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .expect("the request was written");
+    let mut answer = Vec::new();
+    // Reading to the end is the expected shape: a TLS listener that was
+    // handed plaintext closes the connection without answering it.
+    let _ = socket.read_to_end(&mut answer).await;
+    String::from_utf8_lossy(&answer).into_owned()
+}
+
+/// Wait until the data port answers an application request.
 ///
-/// A retry and not a sleep: the wait is over when the node answers, which is
-/// the condition actually being waited for, and a fixed pause would be either
-/// too short on a loaded machine or wasted on an idle one.
-async fn get_until_answered(addr: &str, path: &str) -> reqwest::Response {
-    let client = reqwest::Client::new();
-    for attempt in 0..200 {
-        match client
-            .get(format!("http://{addr}{path}"))
-            .header("x-deis-app-id", "_system")
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await
+/// The node loads its system application before it starts serving, so the
+/// first attempts can arrive at a socket that accepts and says nothing yet.
+async fn until_served(
+    caller: &MachineIdentity,
+    node_id: &SpiffeId,
+    address: std::net::SocketAddr,
+) -> String {
+    for attempt in 0..300 {
+        match http11_call(
+            caller,
+            node_id,
+            address,
+            &format!(
+                "GET /health HTTP/1.1\r\nHost: node\r\n\
+                 x-deis-app-id: _system\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await
         {
-            Ok(response) => return response,
-            Err(e) if attempt == 199 => panic!("{path} never answered: {e}"),
-            Err(_) => tokio::task::yield_now().await,
+            Ok(answer) if answer.starts_with("HTTP/1.1 ") => return answer,
+            _ if attempt == 299 => panic!("the data port never served a request"),
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
     unreachable!("the loop above either answers or panics")
 }
 
 #[tokio::test]
-async fn the_data_port_does_not_dispatch_a_management_call_at_all() {
-    let port = free_port().await;
-    let node = start_node(port).await;
-    let addr = format!("127.0.0.1:{port}");
-    let client = client();
+async fn a_proxy_is_admitted_and_served() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let (address, node_id, _management) = listening(&ca, &directory).await;
 
-    // GetStatus listed every tenant's applications, environments and op
-    // metrics to a caller with no credential. OnScheduled is the same plane:
-    // it runs an application's handler with that environment's secrets.
-    //
-    // Neither is refused now - which is a stronger statement than being
-    // refused. They are not here: the request reaches the application router,
-    // which answers a request that names no application, so there is no
-    // credential a caller could bring that would change the answer.
-    for path in [GET_STATUS, ON_SCHEDULED] {
-        for credential in [None, Some("any-string-at-all")] {
-            let response = grpc_call(&client, &addr, path, credential).await;
-            assert!(
-                response.status().is_client_error(),
-                "{path} must fall through to the application router, got {}",
-                response.status()
-            );
-            assert_eq!(
-                grpc_status(&response),
-                None,
-                "{path} must not be answered as gRPC on the data port at all"
-            );
-            let body = response.bytes().await.unwrap();
-            assert!(
-                !String::from_utf8_lossy(&body).contains("auth-test-node"),
-                "{path} must not report this node's status"
-            );
-        }
-    }
+    let proxy_id = names::proxy(TRUST_DOMAIN, "edge-test").expect("a proxy name");
+    let proxy = machine(&ca, &directory, "proxy", &proxy_id);
 
-    node.abort();
+    // A real answer, not just a completed handshake: `_system` is loaded and
+    // reports this node's readiness, which on a node with no control plane is
+    // "starting" - 503, and that is the answer being asserted, because it
+    // proves the request crossed the whole stack and came back from the
+    // application router.
+    let answer = until_served(&proxy, &node_id, address).await;
+    assert!(
+        answer.starts_with("HTTP/1.1 503"),
+        "a proxy's request is served by the application router: {answer}"
+    );
+    assert!(
+        answer.contains("x-deis-node-readiness: starting"),
+        "the edge reads its rotation decision off this header: {answer}"
+    );
 }
 
 #[tokio::test]
-async fn public_traffic_is_untouched_by_the_management_plane_moving() {
-    // The other half of the change: a node that serves nothing is not a node.
-    // Moving the management services off this listener must not have taken
-    // application traffic with them.
-    let port = free_port().await;
-    let node = start_node(port).await;
-    let addr = format!("127.0.0.1:{port}");
+async fn a_caller_without_a_certificate_is_refused() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let (address, _node_id, _management) = listening(&ca, &directory).await;
 
-    let public = get_until_answered(&addr, "/health").await;
+    // The old world answered this caller with whatever the routing headers
+    // asked for. The new one closes the connection before a request exists.
+    let answer = plaintext_call(
+        address,
+        "GET /health HTTP/1.1\r\nHost: node\r\nx-deis-app-id: _system\r\n\r\n",
+    )
+    .await;
     assert!(
-        public.status() != StatusCode::UNAUTHORIZED && public.status() != StatusCode::FORBIDDEN,
-        "public traffic must not be asked for a credential: {}",
-        public.status()
+        !answer.contains("HTTP/1.1"),
+        "a plaintext caller gets no HTTP answer at all: {answer:?}"
     );
-    // 503 and not 200, and that is the answer being asserted: this node has no
-    // control plane to ask, so it never left `Readiness::Starting`, and
-    // `_system`'s `/health` reports what the node is rather than that it is
-    // listening. A 200 here would mean the probe had gone back to answering
-    // from a constant - see `deis_runtime::health`.
-    assert_eq!(
-        public.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a node that has not been told what to run must not pass the edge's probe"
+}
+
+#[tokio::test]
+async fn a_node_of_this_same_fleet_is_refused() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let (address, node_id, _management) = listening(&ca, &directory).await;
+
+    // A real node of this fleet, with a certificate this fleet's own
+    // authority signed. It passes every check the handshake makes except the
+    // one that matters here: a node does not forward application traffic, so
+    // a node's name is not admitted to a port whose whole vocabulary is
+    // routing headers that name tenants.
+    let other_id = names::node(TRUST_DOMAIN, "runtime-other").expect("a node name");
+    let other = machine(&ca, &directory, "other", &other_id);
+
+    let refused = http11_call(
+        &other,
+        &node_id,
+        address,
+        "GET /health HTTP/1.1\r\nHost: node\r\nx-deis-app-id: _system\r\n\r\n",
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a machine that is not a proxy was served by the data port: {refused:?}"
     );
-    assert_eq!(
-        public
-            .headers()
-            .get(deis_runtime::health::READINESS_HEADER)
-            .and_then(|value| value.to_str().ok()),
-        Some("starting"),
-        "the edge reads its rotation decision off this header"
+}
+
+#[tokio::test]
+async fn a_certificate_this_fleet_did_not_sign_is_refused() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let (address, node_id, _management) = listening(&ca, &directory).await;
+
+    // The right role, correctly spelled, signed by an authority this fleet has
+    // never heard of. Refused by the TLS layer rather than the name check,
+    // which is why both are worth having.
+    let stranger = TestCa::new();
+    let proxy_id = names::proxy(TRUST_DOMAIN, "edge-stranger").expect("a proxy name");
+    let impostor = Arc::new(
+        MachineIdentity::load(
+            write_files(
+                directory.path(),
+                "impostor",
+                &stranger.issue(&proxy_id),
+                // Its trust root is this fleet's real one, so it accepts the
+                // node's certificate and the only side that can refuse
+                // anything here is the node's.
+                &ca.root_pem,
+            )
+            .as_identity_files(),
+            &[],
+        )
+        .expect("an identity"),
     );
 
-    node.abort();
+    let refused = http11_call(
+        &impostor,
+        &node_id,
+        address,
+        "GET /health HTTP/1.1\r\nHost: node\r\nx-deis-app-id: _system\r\n\r\n",
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a certificate signed outside this fleet was served by a node's data port: {refused:?}"
+    );
+}
+
+/// The management gRPC services are not on the data port even for a caller
+/// the port admits. A proxy holds exactly the credentials that make routing
+/// headers meaningful, so this is the strongest form of the original
+/// question: the paths fall through to the application router and are
+/// answered as any request naming no application is - not served as gRPC.
+#[tokio::test]
+async fn the_management_plane_is_not_dispatched_on_the_data_port() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let (address, node_id, _management) = listening(&ca, &directory).await;
+
+    let proxy_id = names::proxy(TRUST_DOMAIN, "edge-test").expect("a proxy name");
+    let proxy = machine(&ca, &directory, "proxy", &proxy_id);
+    until_served(&proxy, &node_id, address).await;
+
+    // A well-formed gRPC frame for `GetStatus`, which once listed every
+    // tenant on the node. Over HTTP/1.1, from a proxy, on the data port.
+    let answer = http11_call(
+        &proxy,
+        &node_id,
+        address,
+        &format!(
+            "POST {GET_STATUS} HTTP/1.1\r\nHost: node\r\n\
+             content-type: application/grpc\r\nte: trailers\r\n\
+             content-length: 5\r\nConnection: close\r\n\r\n\x00\x00\x00\x00\x00"
+        ),
+    )
+    .await
+    .expect("an admitted proxy gets a response, whatever it says");
+
+    assert!(
+        answer.starts_with("HTTP/1.1 4"),
+        "the management path falls through to the application router: {answer}"
+    );
+    assert!(
+        !answer.contains("grpc-status"),
+        "the data port must not answer as gRPC at all: {answer}"
+    );
+}
+
+/// The inspector channel moved to the management listener, so the data port
+/// has nothing to say about debuggers even to a proxy carrying a freshly
+/// minted token: the `_inspect:` name reaches the application router like any
+/// other name this port does not serve.
+#[tokio::test]
+async fn the_inspector_channel_is_not_on_the_data_port_any_more() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let (address, node_id, _management) = listening(&ca, &directory).await;
+
+    let proxy_id = names::proxy(TRUST_DOMAIN, "edge-test").expect("a proxy name");
+    let proxy = machine(&ca, &directory, "proxy", &proxy_id);
+    until_served(&proxy, &node_id, address).await;
+
+    let answer = http11_call(
+        &proxy,
+        &node_id,
+        address,
+        "GET /inspector HTTP/1.1\r\nHost: node\r\n\
+         x-deis-app-id: _inspect:_system\r\nx-deis-inspect-token: whatever\r\n\
+         Connection: Upgrade, close\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await
+    .expect("an admitted proxy gets a response");
+
+    assert!(
+        !answer.contains("101"),
+        "the data port must not upgrade an inspector session: {answer}"
+    );
+    assert!(
+        answer.starts_with("HTTP/1.1 4"),
+        "the inspector name is refused like any name this port does not serve: {answer}"
+    );
 }

@@ -200,7 +200,9 @@ pub(super) async fn stage_locked_dependencies(
     if !status.success() {
         anyhow::bail!(
             "EC_NPM_PACKAGE_UNRESOLVED: pinned npm install failed with status {}; stdout/stderr are withheld because registry diagnostics may contain credentials",
-            status.code().map_or_else(|| "signal".to_string(), |code| code.to_string())
+            status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string())
         );
     }
 

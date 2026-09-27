@@ -15,8 +15,8 @@
 //!
 //! # What these certificates are and are not
 //!
-//! They are a self-signed root and two leaves under it, generated fresh, kept
-//! in the dev run's own directory, and thrown away with it. The root is
+//! They are a self-signed root and three leaves under it, generated fresh,
+//! kept in the dev run's own directory, and thrown away with it. The root is
 //! trusted by exactly one process - the node this same command started, in
 //! this same directory, listening on loopback - and by nothing else on the
 //! machine or anywhere near it.
@@ -52,8 +52,16 @@ pub const DEV_TRUST_DOMAIN: &str = "deis.dev";
 /// The node id `deis dev` starts its node under.
 pub const DEV_NODE_ID: &str = "deis-dev";
 
+/// The proxy id the dev front door proves itself under.
+///
+/// The node's data port admits a caller only over mutual TLS naming a proxy
+/// of its fleet, and the front door is what plays the proxy here - the same
+/// role deis-proxy plays on a real installation.
+pub const DEV_PROXY_ID: &str = "deis-dev";
+
 /// One machine's three files, as the node's configuration and this CLI's
 /// dialler both want them.
+#[derive(Clone)]
 pub struct Machine {
     pub certificate: PathBuf,
     pub private_key: PathBuf,
@@ -61,10 +69,14 @@ pub struct Machine {
 }
 
 /// What one `deis dev` run issues itself: a node's identity for the process it
-/// starts, and a control plane's identity for this CLI.
+/// starts, a control plane's identity for this CLI, and a proxy's identity for
+/// the front door, which reaches the node the way deis-proxy does.
 pub struct DevPki {
     pub node: Machine,
     pub control: Machine,
+    /// The identity the front door presents to the node's data port, which
+    /// admits a proxy of this fleet and nothing else.
+    pub proxy: Machine,
     /// The name the node will demand of whoever drives it, which is the name
     /// on `control`. Passed to the node rather than derived there, so the two
     /// sides cannot disagree about it.
@@ -78,22 +90,31 @@ pub struct DevPki {
 /// node only serves loopback, a key that is readable for no reason is a key
 /// that will eventually be copied somewhere it matters.
 pub fn issue(directory: &Path) -> Result<DevPki> {
-    fs::create_dir_all(directory)
-        .with_context(|| format!("creating {} for this run's certificates", directory.display()))?;
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "creating {} for this run's certificates",
+            directory.display()
+        )
+    })?;
 
     let authority = Authority::new()?;
     let control_name = format!("spiffe://{DEV_TRUST_DOMAIN}/deislet/control");
     let node_name = format!("spiffe://{DEV_TRUST_DOMAIN}/deislet/node/{DEV_NODE_ID}");
+    let proxy_name = deis_identity::names::proxy(DEV_TRUST_DOMAIN, DEV_PROXY_ID)
+        .context("a proxy name for this run")?
+        .to_string();
 
     let root = directory.join("root.pem");
     write(&root, &authority.root_pem, false)?;
 
     let node = authority.issue(directory, "node", &node_name, &root)?;
     let control = authority.issue(directory, "control", &control_name, &root)?;
+    let proxy = authority.issue(directory, "proxy", &proxy_name, &root)?;
 
     Ok(DevPki {
         node,
         control,
+        proxy,
         control_name,
     })
 }
@@ -184,6 +205,7 @@ mod tests {
         let pki = issue(dir.path()).expect("certificates");
 
         assert_eq!(pki.node.trust_root, pki.control.trust_root);
+        assert_eq!(pki.proxy.trust_root, pki.node.trust_root);
         let root = fs::read_to_string(&pki.node.trust_root).expect("the root");
         assert!(root.contains("BEGIN CERTIFICATE"));
 
@@ -207,9 +229,19 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("a directory");
         let pki = issue(dir.path()).expect("certificates");
-        for key in [&pki.node.private_key, &pki.control.private_key] {
+        for key in [
+            &pki.node.private_key,
+            &pki.control.private_key,
+            &pki.proxy.private_key,
+        ] {
             let mode = fs::metadata(key).expect("the key").permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "{} is {:o}", key.display(), mode & 0o777);
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "{} is {:o}",
+                key.display(),
+                mode & 0o777
+            );
         }
     }
 }

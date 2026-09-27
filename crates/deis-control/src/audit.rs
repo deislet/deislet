@@ -13,8 +13,10 @@
 //! **refused** call is recorded whatever it was asking for. Successful reads
 //! are not: they are the overwhelming majority of the traffic, and a table
 //! that holds them is a request log in which the two lines that matter cannot
-//! be found. The one read that is always recorded is the storage-token mint,
-//! because what it hands back is a credential.
+//! be found. The two reads that are always recorded are the storage-token
+//! mint, because what it hands back is a credential, and a node's
+//! `secret.fetch` over the machine channel, because what it hands back is
+//! decrypted secret values (the line names the revisions, never a value).
 //!
 //! What never reaches this table is a value. A secret write records the
 //! secret's *name*, taken from the request path, and the recorder never reads
@@ -47,7 +49,7 @@ use crate::catalog::model::now_secs;
 use crate::catalog::pagination::{KeysetBound, KeysetResume, finish_page, sqlite_fetch_limit};
 use crate::catalog::{CatalogError, CatalogPage, CatalogResult, PageCursorStore, PagePosition};
 use crate::database::{Database, DatabaseError};
-use crate::identity::{Principal, PrincipalKind};
+use crate::identity::Principal;
 
 const AUDIT_COLUMNS: &str = "id, at, actor_kind, actor_account, actor_credential, action, \
                              app_id, environment, target, method, path, peer, outcome, \
@@ -105,11 +107,11 @@ pub struct AuditEntry {
     pub id: i64,
     /// Unix seconds.
     pub at: i64,
-    /// account, config_key or anonymous.
+    /// `account`, `bootstrap`, or `unknown`.
     pub actor_kind: String,
-    /// The account's name. `None` only when the human API is unauthenticated.
+    /// The account's name. `None` when no credential resolved.
     pub actor_account: Option<String>,
-    /// The token's public id, or a configured key's fingerprint. Never any
+    /// The token's public id. Never any
     /// part of a credential.
     pub actor_credential: Option<String>,
     /// A stable name for the operation - `deploy`, `secret.write`,
@@ -194,7 +196,11 @@ impl AuditRecord {
     pub fn by_unknown_caller() -> AuditRecordBuilder {
         AuditRecordBuilder {
             record: AuditRecord {
-                actor_kind: PrincipalKind::Anonymous.as_str().to_string(),
+                // There is no principal here: nothing the caller presented
+                // resolved to one. "unknown" is not a kind of caller the
+                // identity model admits - it is the absence of one, which is
+                // what a refusal always is.
+                actor_kind: "unknown".to_string(),
                 actor_account: None,
                 actor_credential: None,
                 action: String::new(),
@@ -406,7 +412,7 @@ impl AuditStore {
             record.method,
             record.app_id.as_deref().unwrap_or("-"),
             record.environment.as_deref().unwrap_or("-"),
-            record.actor_account.as_deref().unwrap_or("anonymous"),
+            record.actor_account.as_deref().unwrap_or("unknown"),
             record.outcome.as_str(),
             record.status
         );
@@ -577,6 +583,7 @@ mod tests {
     }
 
     fn alice() -> Principal {
+        use crate::identity::PrincipalKind;
         Principal {
             kind: PrincipalKind::Account,
             account: Some("alice".to_string()),
@@ -625,39 +632,23 @@ mod tests {
         assert_eq!(dump["requestId"], "018f2518-7e38-7f80-8000-000000000001");
     }
 
-    /// A log written before request ids were recorded is read through the
-    /// same store: the column arrives on the next start, the old lines read
-    /// back with no id, and new lines carry theirs.
+    /// A log line written before request ids were recorded (request_id left
+    /// NULL) is read through the same store as the new lines that carry one.
     #[tokio::test]
     async fn an_older_log_reads_back_with_no_request_id_and_keeps_taking_lines() {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("control.sqlite");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE audit_log (
-                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    at               INTEGER NOT NULL,
-                    actor_kind       TEXT NOT NULL,
-                    actor_account    TEXT,
-                    actor_credential TEXT,
-                    action           TEXT NOT NULL,
-                    app_id           TEXT,
-                    environment      TEXT,
-                    target           TEXT,
-                    method           TEXT NOT NULL,
-                    path             TEXT NOT NULL,
-                    peer             TEXT,
-                    outcome          TEXT NOT NULL,
-                    status           INTEGER NOT NULL,
-                    detail           TEXT
-                );
-                INSERT INTO audit_log
+            crate::database::schema::run_migrations(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO audit_log
                     (at, actor_kind, actor_account, action, app_id, environment, method,
                      path, outcome, status)
                     VALUES (1700000000, 'account', 'alice', 'deploy', 'demo', 'production',
                             'POST', '/api/apps/demo/environments/production/deployments',
                             'accepted', 201);",
+                [],
             )
             .unwrap();
         }
@@ -740,7 +731,7 @@ mod tests {
         .items;
         assert_eq!(refusals.len(), 1);
         assert_eq!(refusals[0].target.as_deref(), Some("TOKEN"));
-        assert_eq!(refusals[0].actor_kind, "anonymous");
+        assert_eq!(refusals[0].actor_kind, "unknown");
         assert_eq!(
             refusals[0].detail.as_deref(),
             Some("no credential was presented")

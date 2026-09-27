@@ -15,10 +15,9 @@
     "authorities": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["decisionIndex", "phaseAnalysis", "standardLock"],
+      "required": ["decisionIndex", "standardLock"],
       "properties": {
         "decisionIndex": {"type": "string", "minLength": 1},
-        "phaseAnalysis": {"type": "string", "minLength": 1},
         "standardLock": {"type": "string", "minLength": 1}
       }
     },

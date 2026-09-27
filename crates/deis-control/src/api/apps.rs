@@ -25,7 +25,6 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::error::{ApiError, ApiResult};
 use super::openapi;
-use super::paths::ApiPaths;
 use crate::catalog::CatalogStore;
 use crate::runtime_client::{ContestedNodeId, DepartedNode, NodeView, RuntimeNodeManager};
 
@@ -312,7 +311,6 @@ pub struct UnloadRefused {
 )]
 pub async fn unload_app(
     State(state): State<AppsState>,
-    paths: ApiPaths,
     Path((node, app_id)): Path<(String, String)>,
     Query(params): Query<UnloadParams>,
 ) -> ApiResult<Response> {
@@ -333,19 +331,12 @@ pub async fn unload_app(
             // This body is not the error envelope, so nothing downstream
             // makes it opaque: what the catalog said - an SQLite sentence
             // naming a column, a file or a lock - would travel to a caller
-            // holding nothing but a deploy scope. The legacy tree is frozen
-            // and keeps it; `/api/v1` and `/api/platform` get the fixed
+            // holding nothing but a deploy scope. The caller gets the fixed
             // sentence and the ids this answer already echoes, which is
             // what the log line above is found by.
-            let reason = if paths.surface().structured_errors() {
-                format!(
-                    "cannot read the catalog to check whether {app_id} would be reassigned to this node; quote the x-request-id of this answer to an operator, whose log has why. Nothing was sent to the node"
-                )
-            } else {
-                format!(
-                    "cannot read the catalog to check whether {app_id} would be reassigned to this node: {e}. Nothing was sent to the node"
-                )
-            };
+            let reason = format!(
+                "cannot read the catalog to check whether {app_id} would be reassigned to this node; quote the x-request-id of this answer to an operator, whose log has why. Nothing was sent to the node"
+            );
             return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(UnloadRefused {
@@ -377,7 +368,7 @@ pub async fn unload_app(
             Json(UnloadRefused {
                 success: false,
                 error: format!(
-                    "the catalog still deploys {app_id} ({}), and this node reconciles its assignment list every {refresh_secs}s, so it would be serving it again within that time. Nothing was sent to the node. Take the application off the fleet with DELETE /api/apps/{app_id}, which removes it from the catalog and unloads it everywhere at once",
+                    "the catalog still deploys {app_id} ({}), and this node reconciles its assignment list every {refresh_secs}s, so it would be serving it again within that time. Nothing was sent to the node. Take the application off the fleet with DELETE /api/v1/apps/{app_id}, which removes it from the catalog and unloads it everywhere at once",
                     assigned.join(", ")
                 ),
                 assigned_environments: Some(assigned),
@@ -460,7 +451,6 @@ async fn assigned_environments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::versioning::ApiSurface;
     use crate::database::Database;
     use axum::body::to_bytes;
 
@@ -504,9 +494,8 @@ mod tests {
             deis_identity::MachineIdentity::load(files.as_identity_files(), &[])
                 .expect("the control plane's own identity"),
         );
-        let nodes = Arc::new(
-            RuntimeNodeManager::new(Vec::new(), 15).with_machine_identity(Some(identity)),
-        );
+        let nodes =
+            Arc::new(RuntimeNodeManager::new(Vec::new(), 15).with_machine_identity(Some(identity)));
         nodes
             .register(
                 "node-a",
@@ -531,17 +520,8 @@ mod tests {
     }
 
     async fn unload(state: &AppsState, environment: Option<&str>) -> (StatusCode, String) {
-        unload_on(state, ApiSurface::Legacy, environment).await
-    }
-
-    async fn unload_on(
-        state: &AppsState,
-        surface: ApiSurface,
-        environment: Option<&str>,
-    ) -> (StatusCode, String) {
         let response = unload_app(
             State(state.clone()),
-            ApiPaths::on(surface),
             Path(("node-a".to_string(), "demo".to_string())),
             Query(UnloadParams {
                 environment: environment.map(str::to_string),
@@ -569,7 +549,7 @@ mod tests {
             "the answer has to name what is still deployed: {body}"
         );
         assert!(
-            body.contains("DELETE /api/apps/demo"),
+            body.contains("DELETE /api/v1/apps/demo"),
             "the answer has to name the operation that does stick: {body}"
         );
 
@@ -587,11 +567,10 @@ mod tests {
     }
 
     /// The catalog read that decides this answer can fail, and what it
-    /// says is an SQLite sentence. A caller on a structured surface holds
-    /// nothing but a deploy scope and must not read it; the legacy tree is
-    /// frozen and keeps the sentence it has always sent.
+    /// says is an SQLite sentence. A caller holding nothing but a deploy
+    /// scope must not read it; the answer says what to quote instead.
     #[tokio::test]
-    async fn a_catalog_failure_says_nothing_about_sqlite_on_the_structured_surfaces() {
+    async fn a_catalog_failure_says_nothing_about_sqlite_to_the_caller() {
         let (state, _) = state_with_demo_deployed().await;
         // The read the refusal stands on, broken the way a half-applied
         // migration or a dropped table breaks it.
@@ -605,29 +584,20 @@ mod tests {
             .await
             .unwrap();
 
-        let (status, legacy) = unload_on(&state, ApiSurface::Legacy, None).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{legacy}");
+        let (status, body) = unload(&state, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(
-            legacy.contains("no such table"),
-            "the legacy body is frozen and still carries what the catalog said: {legacy}"
+            !body.contains("no such table") && !body.contains("SQL"),
+            "the body carries the catalog's own text: {body}"
         );
-
-        for surface in [ApiSurface::V1, ApiSurface::Platform] {
-            let (status, body) = unload_on(&state, surface, None).await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-            assert!(
-                !body.contains("no such table") && !body.contains("SQL"),
-                "{surface} carries the catalog's own text: {body}"
-            );
-            assert!(
-                body.contains("x-request-id"),
-                "{surface} has to say what to quote instead: {body}"
-            );
-            assert!(
-                body.contains("Nothing was sent to the node"),
-                "{surface} still has to say nothing was sent: {body}"
-            );
-        }
+        assert!(
+            body.contains("x-request-id"),
+            "the answer has to say what to quote instead: {body}"
+        );
+        assert!(
+            body.contains("Nothing was sent to the node"),
+            "the answer still has to say nothing was sent: {body}"
+        );
     }
 
     /// Naming an environment does not change the answer while that

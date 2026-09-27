@@ -102,13 +102,20 @@
             "id": "018f2518-7e38-7f80-8000-000000000001",
             "name": "alice",
             "role": "viewer"
+          },
+          {
+            "created_at": 1767225600,
+            "disabled_at": null,
+            "id": "018f2518-7e38-7f80-8000-000000000001",
+            "name": "root",
+            "role": "owner"
           }
         ],
         "page": {
-          "count": 1,
+          "count": 2,
           "limit": 100,
           "nextCursor": null,
-          "total": 1
+          "total": 2
         },
         "schemaVersion": 1
       },
@@ -119,16 +126,16 @@
       "body": {
         "items": [
           {
-            "account": "alice",
+            "account": "root",
             "account_id": "018f2518-7e38-7f80-8000-000000000001",
             "created_at": 1767225600,
             "id": "0000000000000000",
-            "last_used_at": null,
-            "name": "laptop",
+            "last_used_at": 1767225600,
+            "name": "operator",
             "origin": "minted",
             "revoked_at": null,
-            "scopes": "read:*/*",
-            "unscoped": false
+            "scopes": "unscoped",
+            "unscoped": true
           }
         ],
         "page": {
@@ -168,9 +175,9 @@
         "items": [
           {
             "action": "token.revoke",
-            "actor_account": null,
-            "actor_credential": null,
-            "actor_kind": "anonymous",
+            "actor_account": "root",
+            "actor_credential": "0000000000000000",
+            "actor_kind": "account",
             "app_id": null,
             "at": 1767225600,
             "detail": null,
@@ -186,9 +193,9 @@
           },
           {
             "action": "token.mint",
-            "actor_account": null,
-            "actor_credential": null,
-            "actor_kind": "anonymous",
+            "actor_account": "root",
+            "actor_credential": "0000000000000000",
+            "actor_kind": "account",
             "app_id": null,
             "at": 1767225600,
             "detail": null,
@@ -204,9 +211,9 @@
           },
           {
             "action": "account.create",
-            "actor_account": null,
-            "actor_credential": null,
-            "actor_kind": "anonymous",
+            "actor_account": "root",
+            "actor_credential": "0000000000000000",
+            "actor_kind": "account",
             "app_id": null,
             "at": 1767225600,
             "detail": null,
@@ -896,7 +903,7 @@
           ],
           "environment": "production",
           "failed": [],
-          "phase": "legacy_apply",
+          "phase": "apply",
           "reason": "secret_change",
           "skipped": null,
           "version_id": "018f2518-7e38-7f80-8000-000000000001"
@@ -920,7 +927,7 @@
           ],
           "environment": "production",
           "failed": [],
-          "phase": "legacy_apply",
+          "phase": "apply",
           "reason": "secret_change",
           "skipped": null,
           "version_id": "018f2518-7e38-7f80-8000-000000000001"

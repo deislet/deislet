@@ -44,6 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["../deis-runtime/proto"],
         )?;
 
+    // Re-run when web/dist appears or disappears: without this, deleting the
+    // directory after a build would not recreate it, because cargo would not
+    // rerun this script at all. rust-embed tracks the embedded files itself,
+    // so watching the directory only adds the create/remove transitions.
+    println!("cargo:rerun-if-changed=web/dist");
     println!("cargo:rerun-if-changed=../deis-runtime/proto/management.proto");
     println!("cargo:rerun-if-changed=../deis-runtime/proto/trigger.proto");
     Ok(())

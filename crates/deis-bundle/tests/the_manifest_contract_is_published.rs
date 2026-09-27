@@ -78,6 +78,7 @@ fn a_manifest_holding_every_field() -> Manifest {
             name: "jobs".to_string(),
             batch_size: Some(10),
             max_concurrency: Some(2),
+            max_retries: Some(3),
         }],
         assets: vec![Asset {
             path: "index.html".to_string(),

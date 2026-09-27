@@ -1,8 +1,20 @@
 # Deislet
 
 A self-hosted mini Cloudflare Workers and Pages: you write an edge function
-once, and either compile it for somebody else's platform or run it on your own
-machines. Both paths are first class.
+once, and either run it on your own machines or compile it for Cloudflare.
+
+**Supported targets.** Self-hosted (this platform) and Cloudflare are the
+supported deployment targets. Deno Deploy and Tencent EdgeOne are frozen:
+`deis build` still emits their stateless-function artifacts, but they get no
+authentication story, no binding support and no new work.
+
+**Trust model.** deislet assumes the application code deployed into one
+installation is trusted. The V8 isolate is resource isolation, not a security
+sandbox — it keeps one application from exhausting another's CPU and memory,
+and it does not defend against malicious code or a V8 escape. The platform is
+multi-application, not multi-tenant: the boundary it draws is between
+applications and their environments, never between mutually distrusting
+customers.
 
 The execution engine is Deno — `deno_core`, embedded, one V8 isolate per
 running application. The specification an application is written against is
@@ -37,15 +49,15 @@ node.
 the platform: an upstream for the example app's `fetch` to reach, and a
 loopback certificate authority for the ACME checks. It deploys an application
 with `deis deploy` — the same command a person would run, not a `curl` against
-the REST API — and then runs ninety-four checks in twenty groups,
-printing the evidence for each. What they prove, by group — a few rows stand for two
-consecutive checks:
+the REST API — and then runs the checks its registry lists, group by group,
+printing the evidence for each. What they prove, by group — a few rows stand
+for two consecutive checks:
 
 | Check | Evidence |
 |---|---|
 | `deis deploy` takes a project from source to serving | one command builds, uploads a version, moves the pointer, and the app answers |
 | `deis versions` lists what was deployed | both versions, with the one production points at marked |
-| one project compiles for all four targets | `deis build -v all` writes a deislet bundle, a Cloudflare `index.js` with its `wrangler.toml`, a Deno handler with a generated router, and an EdgeOne `edge-functions/index.js` — each the shape that host expects, not one output copied four times |
+| one project compiles for all four build targets | `deis build -v all` writes a deislet bundle, a Cloudflare `index.js` with its `wrangler.toml`, a Deno handler with a generated router, and an EdgeOne `edge-functions/index.js` — each the shape that host expects, not one output copied four times; of the four, the deislet bundle and the Cloudflare artifact are the supported targets, the Deno and EdgeOne outputs are frozen stateless functions |
 | a handler that reaches for `WebSocketPair` is refused by the build | `deis deploy` stops at its first step with `EC_STREAM_WEBSOCKET_NONPORTABLE`, no bundle is written and no application is created — Edge Canon v1 has no portable server-side WebSocket API, so the refusal is the promise, not a 101 |
 | static asset served from the bundle | without entering an isolate |
 | `If-None-Match` answers 304 | the ETag is the asset's own sha256 |
@@ -73,7 +85,7 @@ consecutive checks:
 | `context.env.KV` round-trips | through the declared logical binding into deis-store |
 | a storage call presenting no capability token is refused | deis-store answers Unauthenticated before touching any data |
 | the storage-token endpoint refuses a caller with no API key | 401 and nothing handed out; that token works directly against deis-store and does not expire, so it goes through the same door a deploy does |
-| `deis kv` reads what the application wrote | the CLI asks the control plane for this tenant's token, then talks to deis-store with it; it never sees `storage_auth_secret` |
+| `deis kv` reads what the application wrote | the CLI asks the control plane for this tenant's token, then talks to deis-store with it; it never holds the capability signing key |
 | three named `kv` bindings of one application never see each other | `context.env.KV`, `context.env.HOT` and `context.env.COLD` hold three different values for one key |
 | a binding name cannot be made to address another tenant | five hostile names are refused before anything touches disk, and a token for one tenant cannot name another's namespace |
 | `deis kv --binding` reads the namespace a binding names | and prints `demo.production@HOT` rather than the tenant alone |
@@ -125,7 +137,7 @@ consecutive checks:
 | a certificate is obtained over ACME for the names the routing table carries | against a real ACME authority on loopback, and then served over TLS by deis-proxy |
 | the challenge path answers only what was published | a token nobody issued gets nothing |
 | a current certificate is not reissued, and a restart reuses the account | which is what keeps a restart loop from spending an issuance quota |
-| the node's log was not cut off while these checks read it | fifteen of them get their evidence by grepping it, and it is a file any unauthenticated request can add to; the demo gives it a ceiling, and a run that reached the ceiling says so instead of quoting a file that stops early |
+| the node's log was not cut off while these checks read it | the checks that grep it get their evidence from it, and it is a file any unauthenticated request can add to; the demo gives it a ceiling, and a run that reached the ceiling says so instead of quoting a file that stops early |
 
 ## The nine components
 
@@ -141,7 +153,7 @@ protocol.
 | [`deis-queue`](crates/deis-queue) | A durable queue with lease-based consumption: `Send` and `SendBatch`, `Pull` under a lease, `Ack`, `Nack` with a delay, and a dead-letter table once a message has been tried too often - with the reason it was given up on, which `deis queue dead-letters` reads and `deis queue replay` acts on. Nodes poll it; it never pushes. Consistent, digest-verified backups use `deis-queue snapshot` / `restore`. |
 | [`deis-telemetry`](crates/deis-telemetry) | Logs, metrics and invocation traces, independent of everything else. Three services side by side: batched logs with `Query` and a streaming `Tail`; one trace per invocation with `QueryTraces` and `TailTraces`, which is what `deis trace` reads; and metrics exported in Prometheus format, latency among them as a histogram rather than a high-water mark. Only deis-runtime ships to it so far; the other components still log to their own stdout. |
 | [`deis`](crates/deis) | The developer CLI, and the only interface a person needs. `init`, `dev`, `validate` and `build` work on the project on disk; `targets` reads the locked registry-derived standard status embedded at build time; and `config` holds the CLI's own settings — the credential among them, which it will not write into the project. `deploy`, `versions`, `rollback`, `status`, `secret`, `logs`, `tail`, `trace`, `kv`, `db`, `blob`, `queue`, `account`, `token` and `audit` talk to a running platform. Delegates every bit of parsing and compiling to deis-build. |
-| [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four targets — Cloudflare Workers, Deno Deploy, Tencent EdgeOne, and this platform. Translation only: it never deploys. |
+| [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four build targets. This platform and Cloudflare Workers are the supported ones; Deno Deploy and Tencent EdgeOne are frozen at stateless-function artifacts — no authentication, no bindings, no new work. Translation only: it never deploys. |
 | [`deis-wire`](crates/deis-wire) | The gRPC toolkit and, in `deis_wire::conventions`, the names both sides of every wire agree on: the header names, the tenant id, the message ceiling, the reserved environment keys. |
 
 A few more crates carry contracts rather than behaviour:
@@ -188,10 +200,11 @@ deployment reaches it as a push. The machine channel is mutually authenticated
 by certificate, on its own listener (`[machine] listen`) rather than the port
 a browser or the console reaches — each machine's certificate carries one URI
 SAN, a SPIFFE name naming exactly it, so a holder of one machine's certificate
-cannot present itself as another. `node_preshared_keys` still exists for a
-fleet part-way through the migration off the old fleet-wide value; where it is
-still configured, [docs/trust-boundaries.md](docs/trust-boundaries.md) states
-what it opens and how to rotate it.
+cannot present itself as another. The fleet-wide `node_preshared_keys` value
+is gone: it is not a field of any configuration struct, and a control plane
+whose file still sets it refuses to start rather than admit a holder the whole
+fleet shares. [docs/trust-boundaries.md](docs/trust-boundaries.md) states what
+that value opened and why it went.
 
 The gRPC methods and the bundle download path are not spelled out here on
 purpose. They are `deis.machine.MachineChannel`'s `Register`, `Deregister`,
@@ -214,8 +227,14 @@ scripts/demo.sh stop      # stop everything and wait until each process has real
 Then talk to the deployed application:
 
 ```bash
-curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
+curl -H 'x-deis-app-id: demo' http://127.0.0.1:8087/hello/world
 ```
+
+Through deis-proxy, as a visitor arrives. The node's own data port (8086 in
+the default layout) no longer takes plaintext: it answers only a connection
+presenting a certificate this fleet signed for a proxy, so the demo's checks
+reach it through `scripts/demo/lib.sh`'s `runtime_curl`, which carries the
+demo proxy's leaf and verifies the node against the fleet root.
 
 `start` needs `cargo`, `curl` and `jq`. Some checks need more, and they are
 named here by what they do rather than counted, because the count moves every
@@ -230,29 +249,52 @@ reads exactly like a passing one at a glance. The whole run takes a minute or
 two, because the cron check waits for a real occurrence.
 
 On a fresh clone, build the web console first. Its output is gitignored and
-`deis-control` embeds it at compile time, so `cargo build` fails without it and
-`scripts/demo.sh` does not do this for you:
+`deis-control` embeds it at compile time. A missing `web/dist` does **not**
+fail the build — the build script creates the directory if it is absent — but
+the dashboard then answers 404, and `scripts/demo.sh` does not build it for
+you:
 
 ```bash
 cd crates/deis-control/web && npm ci && npm run build
 ```
 
-The console is then served from the control plane's own port —
-`http://127.0.0.1:8085` for the demo. The demo runs with
-`api_auth_enabled = true`, which is the posture a real installation should be
-in, so the console asks for a key before it shows anything: paste the
-`API_KEY` line from `.demo/state.env`. A control plane with authentication off
-opens straight to the dashboard for a direct caller on its own machine,
-because that connection needs no credential and there is none to ask for. A
-reverse proxy must present a credential even when it connects over loopback.
+Three local-build pitfalls worth knowing:
 
-The last line of a `verify` run is a tally and a roll call: `94 passed, 0
-failed, 94 of the 94 checks this file lists`. The second half is there because
-the first half cannot report a check that did not run - a call deleted from
-the list turns a green run into a slightly shorter green run, and nothing in
-the output says so. The number the run is held to is `VERIFY_EXPECTED_CHECKS`
-in `scripts/demo.sh` - that constant, not this paragraph, is where the count
-lives, and adding a check means changing it (and then this sentence).
+- **Distributed compilation breaks `deis-control`.** The `rust-embed` macro
+  that inlines `web/dist` runs inside the compile job; with sccache-dist that
+  job can run on a worker with no such path, and the build fails with
+  `folder … web/dist does not exist`. Keep the crate off distributed
+  compilation (`SCCACHE_NO_DIST_COMPILE=1`) or build it locally.
+- **A deleted `web/dist` comes back — empty.** The build script emits
+  `cargo:rerun-if-changed=web/dist`, so cargo reruns it when the directory
+  appears or disappears. Deleting the directory therefore does not keep it
+  gone: the next build recreates it, with nothing in it, and the dashboard
+  pages answer 404 until `npm run build` has filled it again.
+- **A corrupt v8 cache fails with `Decompression error`.** The prebuilt v8
+  static library is cached after download; clear the cache (`~/.cache/rusty_v8`
+  or the file named by `RUSTY_V8_ARCHIVE`) and rebuild, or point
+  `RUSTY_V8_MIRROR` at a working mirror.
+
+The console is then served from the control plane's own port —
+`http://127.0.0.1:8085` for the demo. Authentication is always on; there is no
+anonymous access, on loopback or anywhere else. On first start, a control
+plane that holds no valid token writes a one-shot bootstrap token to
+`<data_dir>/bootstrap.token` (mode 0600 — the log names the file, never the
+value). That token can do exactly one thing: create the first owner account
+and its token. The moment it succeeds it is revoked and the file deleted; an
+unused bootstrap token expires after 24 hours, and the next control-plane
+start issues a fresh one. The console asks for account credentials before it
+shows anything.
+
+The last line of a `verify` run is a tally and a roll call: how many verdicts
+passed, how many failed, and how many were printed out of the number the
+script lists. The second half is there because the first half cannot report a
+check that did not run - a call deleted from the list turns a green run into a
+slightly shorter green run, and nothing in the output says so. The number a
+run is held to is `VERIFY_EXPECTED_CHECKS` in `scripts/demo.sh`, summed from
+the `group_<name>_checks` arrays under `scripts/demo/checks/`; that
+derivation, not this paragraph, is where the count lives, and adding a check
+means adding it to a group's array.
 
 ### What a green `verify` is evidence of, and what it is not
 
@@ -263,19 +305,19 @@ construction, answer several other questions:
 * **What one caller is handed that belonged to another.** A single caller
   cannot see a disclosure: the wrong answer and the right one look the same
   when there is nobody else's answer to be given. This is not hypothetical -
-  `verify` reported ninety passed and none failed on a build whose response
+  `verify` reported a complete run with no failure on a build whose response
   cache was keyed by the address alone, so one user's `POST` answer went to
-  the next anonymous `GET` of it. Two checks now put a second and a third
-  caller to the same address and compare what comes back; that is the shape
-  such a check has to take, and it is the only place in the suite that has
-  it. Every other per-caller boundary in the platform is still checked one
+  the next anonymous `GET` of it. The cross-caller checks now put a second and
+  a third caller to the same address and compare what comes back; that is the
+  shape such a check has to take, and it is the only place in the suite that
+  has it. Every other per-caller boundary in the platform is still checked one
   caller at a time.
 * **Anything that needs two nodes.** There is one. Scheduling across a fleet,
   a cache or a route table that disagrees between nodes, and what a rolling
   deployment looks like from outside are all invisible here.
-* **Anything that needs two tenants at once.** The isolation checks compare
+* **Anything that needs two applications at once.** The isolation checks compare
   two *environments* of the same application and two named bindings; the
-  neighbour is never a second customer under load.
+  neighbour is never a second, independent application under load.
 * **Load, contention and time.** Every check is one request, or a handful.
   Nothing here runs long enough to find a leak, a lock held too long, or a
   ceiling that is only reached under concurrency.
@@ -283,22 +325,23 @@ construction, answer several other questions:
   everywhere, a stub certificate authority, and a `python3` origin standing
   in for the internet.
 
-Read a green run as: these ninety-four claims were each checked, once, in
+Read a green run as: these claims were each checked, once, in
 that arrangement. It is a good deal more than a build that compiles, and it
 is not a statement about anything above.
 
 ### What runs without anyone remembering to
 
 `.github/workflows/checks.yml` is written to run, on every push to `main` and
-every pull request: the document-path check, the witness tests below, `cargo
-fmt --check`, `cargo clippy -D warnings`, `cargo build --workspace`, `cargo
-test --workspace`, and a full `start` → `verify` → `stop`. Until it grew those
-jobs it held the document-path check alone, and nothing automatic had ever
-compiled this workspace, run its tests, or run the verification the project's
-claims are quoted from. Read that as a description of the file until a run of
-it has been seen: the version with those jobs has not yet been pushed, so no
-run has been observed, and every number quoted in this document is from a
-local run. The first push that carries it is the one to watch.
+every pull request: the three document checks (path constants, link targets
+and written-down counts), the witness tests below, `cargo fmt --check`,
+`cargo clippy -D warnings`, `cargo build --workspace`, the three test shards,
+and a full `start` → `verify` → `stop`. Until it grew those jobs it held the
+document-path check alone, and nothing automatic had ever compiled this
+workspace, run its tests, or run the verification the project's claims are
+quoted from. Status: the last green run is `33848760058`, 2026-09-04. Every
+run since then has failed within seconds — a GitHub billing problem, not a
+build failure — so changes landed after that date carry local evidence only.
+This paragraph is to be updated once CI is running again.
 
 ```bash
 bash scripts/test-demo-witnesses.sh    # unit tests for verify itself; no demo needed
@@ -346,9 +389,11 @@ Everything in the table above runs end to end. What is not there yet, in the
 order it is likely to matter:
 
 - **A preview address still needs a wildcard DNS record placed by hand.** The
-  routing link itself is closed: deis-proxy polls the routing table from the
-  control plane — over the machine channel when it has an identity, over
-  `/api/routing-table` when it does not — so host routes, path prefixes and an automatic
+  routing link itself is closed: deis-proxy polls the routing table over the
+  control plane's machine channel, proving a certificate that names that one
+  proxy — a `[control]` table with no `[machine_identity]` beside it is
+  refused at startup rather than left polling a route nothing serves — so host
+  routes, path prefixes and an automatic
   per-environment address (`<env>--<app>.<zone>`, plus the shorter
   `<app>.<zone>` for the default environment) all work. Certificates are
   closed too: `[tls.acme]` turns on an RFC 8555 client that takes its names
@@ -447,7 +492,7 @@ Current evidence, compliance and support status comes only from the
 |---|---|
 | [edge-canon](https://github.com/deislet/edge-canon) | The versioned edge application standard, evidence and conformance registry. Public. |
 | coraza | A Rust port of the Coraza WAF engine, intended to run in front of deis-proxy. |
-| capkit | Capability-based multi-cloud abstraction, used for provisioning external resources. |
+| capkit | Capability-based abstraction for provisioning external resources. A proposal; not yet integrated. |
 
 ## LAN canary
 

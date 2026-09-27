@@ -1,21 +1,11 @@
 //! Operator-facing configuration.
 //!
-//! # `listen` and `auth_secret` are one decision, not two
+//! # Authentication is always enforced
 //!
-//! Whether a caller is authenticated at all is decided by `auth_secret`, and
-//! what happens when it is absent depends on `listen`:
-//!
-//! * `auth_secret` set: every call must carry a capability token for the
-//!   tenant it names, wherever the service is bound. See [`crate::auth`].
-//! * No `auth_secret`, loopback `listen`: the service runs exactly as it did
-//!   before tokens existed - the tenant header is believed, and what keeps
-//!   one tenant's data away from an unrelated client is that the client
-//!   cannot reach the port. This is the default single-box install and it is
-//!   supported; the service says so at startup, at `warn`.
-//! * No `auth_secret`, any other `listen`: the service refuses to start.
-//!   Reachable from another host with nothing checking the tenant header is
-//!   every tenant's data published to that network, and an unconfigured
-//!   secret must not be able to mean that by accident.
+//! Every call must carry an Ed25519-signed capability token in
+//! `Authorization: Bearer <token>`. There is no anonymous mode and no
+//! loopback bypass: the verifying keys are fetched from the control plane's
+//! JWKS at `capability_jwks_url` and kept current. See [`crate::auth`].
 //!
 //! # `snapshot_dir` is the difference between having backups and not
 //!
@@ -24,9 +14,20 @@
 //! `snapshot_dir` starts the scheduled snapshots in [`crate::backup`]; leaving
 //! it unset means nothing ever takes one, which the service also says at
 //! startup, at `warn`.
+//!
+//! # `durability` is the size of the window a host power failure can take
+//!
+//! Every SQLite file here is in WAL mode, where `normal` (the default) pays
+//! one fsync per checkpoint and `full` one per commit. A host that loses power
+//! under `normal` may lose the last seconds of writes it had already
+//! acknowledged - KV entries, blob metadata, and a tenant's own SQL - and
+//! under either setting it cannot corrupt the database. `full` closes that
+//! window at the cost of an fsync per commit; see [`crate::sqlite::Durability`]
+//! and ADR-012 for the component-by-component table.
 
 use crate::backup::SnapshotSchedule;
 use crate::blob::BlobLimits;
+use crate::sqlite::Durability;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -39,36 +40,54 @@ use std::time::Duration;
 pub struct Config {
     /// Address the gRPC server binds to.
     ///
-    /// Loopback by default, because the default install configures no
-    /// `auth_secret` and then the only thing keeping one tenant's data away
-    /// from an unrelated client is that the client cannot reach the port.
-    /// Binding anywhere else without an `auth_secret` is refused at startup
-    /// rather than warned about; see the module docs.
+    /// Loopback by default. Every call must carry a valid capability token
+    /// regardless of the bind address; there is no anonymous or loopback
+    /// bypass.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Shared secret the per-tenant capability tokens are derived from, or
-    /// `None` to run with no caller authentication at all.
+    /// Where the control plane publishes its capability verifying keys, as a
+    /// JWKS document.
     ///
-    /// The same value must be configured on deis-control, which mints
-    /// `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant and hands
-    /// it to the node running that tenant. Anything that reaches this service
-    /// without a token matching the tenant it names is refused. Rotating the
-    /// value invalidates every token at once, so change it here, on
-    /// deis-queue and on deis-control together.
+    /// Fetched at startup (retried with backoff until the control plane
+    /// answers, refusing every call meanwhile), every 5 minutes after that,
+    /// and whenever a token names a key this process does not hold yet - so
+    /// a control-plane key rotation needs nothing done here. Public keys
+    /// only: no credential is sent or needed.
     ///
-    /// `None` is only permitted on a loopback bind - [`crate::auth`] has the
-    /// reasoning and the refusal.
-    #[serde(default)]
-    pub auth_secret: Option<String>,
+    /// Defaults to the control plane's human API listener on its default
+    /// port.
+    #[serde(default = "default_capability_jwks_url")]
+    pub capability_jwks_url: String,
+    /// The control-plane URL for the T8 revocation-list endpoint.
+    ///
+    /// The store polls `{revocation_list_url}/capability/revocation-list`
+    /// every 30 seconds.  A successful poll feeds `auth_epoch` into the
+    /// verifier and resets the degraded-mode clock.
+    ///
+    /// Defaults to `http://127.0.0.1:8100` (the control plane's human API
+    /// listener on the default port).
+    #[serde(default = "default_revocation_list_url")]
+    pub revocation_list_url: String,
     /// Independent credential for backend migration inventory and writer
     /// fencing. When absent, the management service is not registered at
-    /// all, including on loopback. It must never reuse `auth_secret`: an
-    /// application storage capability cannot become a migration authority.
+    /// all, including on loopback.
     #[serde(default)]
     pub migration_admin_token: Option<String>,
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// How much a commit costs in durability: `"normal"` or `"full"`.
+    ///
+    /// `normal` is one fsync per checkpoint, so a host that loses power may
+    /// lose the last seconds of writes it had already acknowledged; the
+    /// database itself stays consistent either way. `full` is one fsync per
+    /// commit, and an acknowledged write survives the power failure. Blob
+    /// content files are placed before their metadata row is committed, so
+    /// `normal` can also leave content with no row - the orphan case
+    /// [`Self::remove_orphaned_blob_content`] describes - and never a row
+    /// whose content is missing.
+    #[serde(default)]
+    pub durability: Durability,
     /// Connections in the pool of each shared SQLite file (KV, blob
     /// metadata). Also the ceiling on blocking threads those stores occupy.
     #[serde(default = "default_shared_connections")]
@@ -193,6 +212,14 @@ fn default_snapshot_retention() -> usize {
     7
 }
 
+fn default_capability_jwks_url() -> String {
+    "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json".to_string()
+}
+
+fn default_revocation_list_url() -> String {
+    "http://127.0.0.1:8100".to_string()
+}
+
 /// A configured number of seconds, or `None` for the zero that means "no
 /// bound at all".
 fn optional_seconds(secs: u64) -> Option<Duration> {
@@ -207,13 +234,15 @@ impl Default for Config {
         Self {
             listen: default_listen(),
             data_dir: default_data_dir(),
+            durability: Durability::default(),
             shared_connections: default_shared_connections(),
             tenant_connections: default_tenant_connections(),
             kv_sweep_interval_secs: default_sweep_interval_secs(),
             max_object_bytes: default_max_object_bytes(),
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
-            auth_secret: None,
+            capability_jwks_url: default_capability_jwks_url(),
+            revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             snapshot_dir: None,
             snapshot_interval_secs: default_snapshot_interval_secs(),
@@ -276,8 +305,9 @@ mod tests {
 
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
-        assert_eq!(parsed.auth_secret, defaults.auth_secret);
+        assert_eq!(parsed.capability_jwks_url, defaults.capability_jwks_url);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
+        assert_eq!(parsed.durability, defaults.durability);
         assert_eq!(parsed.snapshot_dir, defaults.snapshot_dir);
         assert_eq!(
             parsed.snapshot_interval_secs,
@@ -312,10 +342,9 @@ mod tests {
 
     #[test]
     fn the_default_address_is_loopback() {
-        // With no auth_secret - which is the default - the tenant header is
-        // believed, so reachability is the only thing keeping an unrelated
-        // client away from a tenant's data. Anything else is refused at
-        // startup rather than served, so this default is load-bearing.
+        // Every call must carry a valid capability token regardless of the
+        // bind address. The default is loopback as a defence-in-depth
+        // measure.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
     }
@@ -364,6 +393,25 @@ mod tests {
         assert_eq!(parsed.max_object_bytes, 1024);
         // Untouched fields keep their defaults.
         assert_eq!(parsed.shared_connections, default_shared_connections());
+    }
+
+    /// The default is the trade this store makes on purpose: a cheap commit,
+    /// and a host power failure can take the last seconds of acknowledged
+    /// writes. An operator who cannot accept that asks for `full`.
+    #[test]
+    fn durability_defaults_to_normal_and_full_is_opt_in() {
+        assert_eq!(Config::default().durability, Durability::Normal);
+        let parsed: Config = toml::from_str(r#"durability = "normal""#).unwrap();
+        assert_eq!(parsed.durability, Durability::Normal);
+        let parsed: Config = toml::from_str(r#"durability = "full""#).unwrap();
+        assert_eq!(parsed.durability, Durability::Full);
+    }
+
+    /// A typo in the most consequential key in the file must not quietly leave
+    /// the store on the cheaper setting.
+    #[test]
+    fn an_unknown_durability_is_a_hard_error() {
+        assert!(toml::from_str::<Config>(r#"durability = "fast""#).is_err());
     }
 
     #[test]
@@ -440,7 +488,7 @@ mod tests {
     fn the_secret_and_the_snapshot_keys_are_read_from_a_file() {
         let parsed: Config = toml::from_str(
             r#"
-            auth_secret = "a-shared-secret"
+            capability_jwks_url = "https://control.internal/.well-known/deis/capability-jwks.json"
             migration_admin_token = "an-independent-migration-secret"
             snapshot_dir = "/var/backups/deis-store"
             snapshot_interval_secs = 3600
@@ -448,7 +496,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(parsed.auth_secret.as_deref(), Some("a-shared-secret"));
+        assert_eq!(
+            parsed.capability_jwks_url,
+            "https://control.internal/.well-known/deis/capability-jwks.json"
+        );
         assert_eq!(
             parsed.migration_admin_token.as_deref(),
             Some("an-independent-migration-secret")

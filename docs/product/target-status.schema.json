@@ -108,12 +108,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id", "displayName", "role", "implementation", "evidence", "certification"
+        "id", "displayName", "role", "lifecycle", "implementation", "evidence", "certification"
       ],
       "properties": {
         "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
         "displayName": {"type": "string", "minLength": 1},
         "role": {"enum": ["first-class", "experimental"]},
+        "lifecycle": {"enum": ["active", "frozen"]},
         "implementation": {"$ref": "#/$defs/implementation"},
         "evidence": {"$ref": "#/$defs/evidence"},
         "certification": {"$ref": "#/$defs/certification"}
@@ -126,6 +127,10 @@
         {
           "if": {"properties": {"certification": {"properties": {"compliant": {"const": true}}}}},
           "then": {"properties": {"evidence": {"properties": {"maturity": {"const": "conformance-passed"}}}}}
+        },
+        {
+          "if": {"properties": {"lifecycle": {"const": "frozen"}}},
+          "then": {"properties": {"certification": {"properties": {"supported": {"const": false}, "compliant": {"const": false}}}}}
         }
       ]
     }

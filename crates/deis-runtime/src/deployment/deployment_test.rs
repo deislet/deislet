@@ -674,14 +674,15 @@ export default async function handler(context) {
             .unwrap(),
         )],
     );
-    let standard_environment = StandardEnvironmentOrder::new(
+    let standard_environment = StandardEnvironmentOrder::new_without_secrets(
         declarations.clone(),
         snapshot.clone(),
         snapshot.identity().unwrap(),
-        HashMap::new(),
         "v1",
         &environment_id.to_string(),
     )
+    .unwrap()
+    .with_secrets(HashMap::new())
     .unwrap();
     let bundle = standard_bundle_with_assets(
         "demo",
@@ -777,11 +778,10 @@ async fn a_declaration_that_takes_a_platform_name_is_refused_by_the_node() {
             )],
         );
         let snapshot_id = snapshot.identity().unwrap();
-        let refusal = StandardEnvironmentOrder::new(
+        let refusal = StandardEnvironmentOrder::new_without_secrets(
             declarations,
             snapshot,
             snapshot_id,
-            HashMap::new(),
             "v1",
             &environment_id.to_string(),
         )
@@ -879,14 +879,18 @@ export default function handler(context) {
             )),
         ],
     );
-    let standard_environment = StandardEnvironmentOrder::new(
+    let standard_environment = StandardEnvironmentOrder::new_without_secrets(
         declarations.clone(),
         snapshot.clone(),
         snapshot.identity().unwrap(),
-        HashMap::from([(secret_revision.to_string(), "secret-value".to_string())]),
         "v1",
         &environment_id.to_string(),
     )
+    .unwrap()
+    .with_secrets(HashMap::from([(
+        secret_revision.to_string(),
+        "secret-value".to_string(),
+    )]))
     .unwrap();
     let bundle = standard_bundle("demo", HANDLER, &declarations);
     let control =
@@ -960,14 +964,18 @@ export default function handler(context) {
             secret.revision = "secret-revision-2".to_string();
         }
     }
-    let rotated_environment = StandardEnvironmentOrder::new(
+    let rotated_environment = StandardEnvironmentOrder::new_without_secrets(
         declarations,
         rotated_snapshot.clone(),
         rotated_snapshot.identity().unwrap(),
-        HashMap::from([("secret-revision-2".to_string(), "rotated-value".to_string())]),
         "v1",
         &environment_id.to_string(),
     )
+    .unwrap()
+    .with_secrets(HashMap::from([(
+        "secret-revision-2".to_string(),
+        "rotated-value".to_string(),
+    )]))
     .unwrap();
     let as_of = deployer.change_stamp();
     let applied = deployer
@@ -1739,14 +1747,15 @@ async fn a_standard_snapshot_is_not_recovered_without_its_memory_only_values() {
             .unwrap(),
         )],
     );
-    let standard_environment = StandardEnvironmentOrder::new(
+    let standard_environment = StandardEnvironmentOrder::new_without_secrets(
         declarations.clone(),
         snapshot.clone(),
         snapshot.identity().unwrap(),
-        HashMap::new(),
         "v1",
         &environment_id.to_string(),
     )
+    .unwrap()
+    .with_secrets(HashMap::new())
     .unwrap();
     let bundle = standard_bundle("demo", ECHO_HANDLER, &declarations);
     let control =

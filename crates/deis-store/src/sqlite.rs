@@ -76,6 +76,7 @@ use crate::error::{StoreError, StoreResult};
 use rusqlite::Connection;
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::limits::Limit;
+use serde::Deserialize;
 use std::cell::RefCell;
 use std::ffi::c_int;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,46 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// How much a commit is allowed to cost in durability.
+///
+/// Under WAL the two settings differ by one fsync per commit (`Full`) against
+/// one per checkpoint (`Normal`). What that buys is the window in which an
+/// acknowledged write exists only in the page cache: a host power failure
+/// under `Normal` may lose the last seconds of committed writes, and under
+/// either setting the database itself stays consistent - a torn or unwritten
+/// WAL frame is discarded at recovery, not half applied. See ADR-012 for the
+/// choice each component makes and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// One fsync per checkpoint. A host power failure may lose the most
+    /// recent acknowledged commits; the database cannot be corrupted by one.
+    Normal,
+    /// One fsync per commit. An acknowledged write survives a host power
+    /// failure.
+    Full,
+}
+
+impl Default for Durability {
+    /// `Normal`. This store's workload is many small writes, and its recovery
+    /// path is the snapshot in `crate::snapshot` rather than the last
+    /// millisecond of a commit; a deployment that cannot accept the loss sets
+    /// `durability = "full"` in its configuration.
+    fn default() -> Self {
+        Durability::Normal
+    }
+}
+
+impl Durability {
+    /// The value of SQLite's `synchronous` pragma this stands for.
+    fn pragma(self) -> &'static str {
+        match self {
+            Durability::Normal => "NORMAL",
+            Durability::Full => "FULL",
+        }
+    }
+}
 
 /// How long a connection waits for a competing writer before giving up.
 /// WAL keeps readers out of the way, so contention here means two writers,
@@ -94,39 +135,42 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The largest single string, blob or table row a tenant's SQL may produce
 /// or store, in bytes. SQLite's own default is a gigabyte.
 ///
-/// Eight megabytes, derived from the wire rather than from taste. A value a
-/// caller wrote arrived in one gRPC message, and a value it reads leaves in
-/// one, and that message is capped at
-/// [`crate::MAX_GRPC_MESSAGE_BYTES`] - sixteen megabytes. Half of it is the
-/// largest single value that still leaves room in the message for the row it
-/// sits in and the columns beside it. Anything larger is either unreachable
-/// from outside or was built inside SQLite by a function like `randomblob`,
-/// where the only thing it can do is cost memory: `SELECT
-/// randomblob(20000000)` took the store from 18 MB resident to 1476 MB,
-/// because a blob comes back as a JSON array of byte values, and SQLite's
-/// default would have allowed fifty times that in one call.
+/// Two megabytes - two million bytes, the shared standard's single-value
+/// ceiling.
+///
+/// Cloudflare D1 refuses a single string, blob or row over about 2,000,000
+/// bytes (developers.cloudflare.com/d1/platform/limits, checked 2026-09-25),
+/// so a value the self-hosted store accepted past that would be one an
+/// application could write here and never store there. It is also well under
+/// the wire bound it used to be derived from: a value a caller wrote arrived
+/// in one gRPC message capped at [`crate::MAX_GRPC_MESSAGE_BYTES`], and half
+/// of that is ample room for the row it sits in and the columns beside it.
+/// Anything larger is either unreachable from outside or was built inside
+/// SQLite by a function like `randomblob`, where the only thing it can do is
+/// cost memory: `SELECT randomblob(20000000)` took the store from 18 MB
+/// resident to 1476 MB, because a blob comes back as a JSON array of byte
+/// values, and SQLite's default would have allowed fifty times that in one
+/// call.
 ///
 /// This also caps the total width of a row, which is what it should do: a
-/// row wider than one message can never be read back whole either.
-const TENANT_MAX_VALUE_BYTES: i32 = 8 * 1024 * 1024;
+/// row wider than the ceiling can never be read back whole on every host.
+const TENANT_MAX_VALUE_BYTES: i32 = 2_000_000;
 
 /// The longest single statement a tenant may send, in bytes. SQLite's own
 /// default is again a gigabyte.
 ///
-/// Sixty-four kilobytes is around fifteen hundred lines of SQL, and it is
-/// also roughly where SQLite's own `SQLITE_LIMIT_VARIABLE_NUMBER` of 32766
-/// already stops an `INSERT ... VALUES (?),(?),...`: two characters a
-/// placeholder puts that statement at 64 KB give or take. So the two
-/// ceilings meet, and nothing that fits under the existing one is refused by
-/// this one.
+/// One hundred thousand bytes, the shared standard's statement ceiling:
+/// Cloudflare D1 documents about 100 KB of SQL per statement
+/// (developers.cloudflare.com/d1/platform/limits, checked 2026-09-25), so the
+/// self-hosted store holds the same line and an application cannot grow a
+/// statement the other target would refuse.
 ///
 /// It is here rather than in [`crate::database`] because the memory it
 /// bounds is not the statement's own. `Prepare` remembers statement text
 /// under a handle, up to `MAX_PREPARED_STATEMENTS` of them at once, and
 /// until this limit existed the size of each was bounded only by the gRPC
-/// message that carried it - 4096 handles of 16 MB is 64 GB of remembered
-/// SQL. With it the same table cannot exceed 256 MB.
-const TENANT_MAX_SQL_BYTES: i32 = 64 * 1024;
+/// message that carried it. With it the same table cannot exceed 256 MB.
+const TENANT_MAX_SQL_BYTES: i32 = 100_000;
 
 /// How many SQLite virtual-machine instructions run between two consultations
 /// of the cost budget.
@@ -431,6 +475,8 @@ struct Inner {
     /// Installed on every connection this pool opens, when the SQL that will
     /// run here is not this crate's own. `None` for the KV and blob pools.
     authorizer: Option<SqlAuthorizer>,
+    /// The `synchronous` setting every connection this pool opens runs under.
+    durability: Durability,
     /// Connections not currently checked out. Guarded by a std mutex that is
     /// only ever locked inside a blocking task, never across an await.
     idle: Mutex<Vec<Connection>>,
@@ -447,8 +493,13 @@ impl SqlitePool {
     /// Create a pool over `path`. No connection is opened yet: the first
     /// caller pays for it, so a per-tenant database costs nothing until that
     /// tenant actually stores something.
-    pub fn new(path: impl Into<PathBuf>, label: impl Into<String>, size: PoolSize) -> Self {
-        Self::build(path, label, size, None)
+    pub fn new(
+        path: impl Into<PathBuf>,
+        label: impl Into<String>,
+        size: PoolSize,
+        durability: Durability,
+    ) -> Self {
+        Self::build(path, label, size, None, durability)
     }
 
     /// Create a pool whose connections run SQL this crate did not write.
@@ -462,8 +513,9 @@ impl SqlitePool {
         label: impl Into<String>,
         size: PoolSize,
         authorizer: SqlAuthorizer,
+        durability: Durability,
     ) -> Self {
-        Self::build(path, label, size, Some(authorizer))
+        Self::build(path, label, size, Some(authorizer), durability)
     }
 
     fn build(
@@ -471,6 +523,7 @@ impl SqlitePool {
         label: impl Into<String>,
         size: PoolSize,
         authorizer: Option<SqlAuthorizer>,
+        durability: Durability,
     ) -> Self {
         let path = path.into();
         let label = label.into();
@@ -479,6 +532,7 @@ impl SqlitePool {
             path = %path.display(),
             connections = size.0,
             guarded = authorizer.is_some(),
+            durability = ?durability,
             "sqlite pool created, connections open lazily"
         );
         Self {
@@ -486,6 +540,7 @@ impl SqlitePool {
                 path,
                 label,
                 authorizer,
+                durability,
                 idle: Mutex::new(Vec::new()),
                 permits: Arc::new(Semaphore::new(size.0)),
             }),
@@ -633,7 +688,12 @@ impl PooledConnection {
         };
         let conn = match idle {
             Some(conn) => conn,
-            None => open(&inner.path, &inner.label, inner.authorizer)?,
+            None => open(
+                &inner.path,
+                &inner.label,
+                inner.authorizer,
+                inner.durability,
+            )?,
         };
         Ok(Self {
             inner,
@@ -705,7 +765,12 @@ impl Drop for PooledConnection {
 
 /// Open one connection with the settings every Deislet SQLite file uses,
 /// plus the authorizer if this pool has one.
-fn open(path: &Path, label: &str, authorizer: Option<SqlAuthorizer>) -> StoreResult<Connection> {
+fn open(
+    path: &Path,
+    label: &str,
+    authorizer: Option<SqlAuthorizer>,
+    durability: Durability,
+) -> StoreResult<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -723,10 +788,12 @@ fn open(path: &Path, label: &str, authorizer: Option<SqlAuthorizer>) -> StoreRes
              block each other and request latency will spike under load"
         );
     }
-    // NORMAL trades an fsync per commit for an fsync per checkpoint. With WAL
-    // that risks losing the last commits on a machine crash, not corruption,
-    // which is the right trade for this workload.
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // What that costs is the choice the operator made: `NORMAL` trades an
+    // fsync per commit for an fsync per checkpoint, which under WAL risks
+    // losing the last commits on a host power failure but not corrupting the
+    // file; `FULL` pays the fsync per commit to keep every acknowledged write.
+    // See [`Durability`] and ADR-012.
+    conn.pragma_update(None, "synchronous", durability.pragma())?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
 
@@ -782,7 +849,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn pool(dir: &TempDir) -> SqlitePool {
-        SqlitePool::new(dir.path().join("t.sqlite"), "test", PoolSize::new(4))
+        SqlitePool::new(
+            dir.path().join("t.sqlite"),
+            "test",
+            PoolSize::new(4),
+            Durability::Normal,
+        )
     }
 
     #[tokio::test]
@@ -967,7 +1039,12 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_statement_gives_its_connection_back_instead_of_finishing() {
         let dir = TempDir::new().unwrap();
-        let pool = SqlitePool::new(dir.path().join("t.sqlite"), "test", PoolSize::new(1));
+        let pool = SqlitePool::new(
+            dir.path().join("t.sqlite"),
+            "test",
+            PoolSize::new(1),
+            Durability::Normal,
+        );
         // A minute of budget, so the deadline is not what ends this one.
         let running = pool.with_conn_within(Duration::from_secs(60), |c| {
             Ok(c.query_row(COUNTS_FOREVER, [], |r| r.get::<_, i64>(0))?)
@@ -999,6 +1076,7 @@ mod tests {
             "guarded",
             PoolSize::new(2),
             |_| Authorization::Allow,
+            Durability::Normal,
         );
         let (value, sql) = guarded
             .with_conn(|c| {

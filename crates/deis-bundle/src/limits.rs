@@ -76,6 +76,17 @@ pub struct DeclaredLimits {
     /// to two and is told the moment a change makes it call ten.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_subrequests: Option<u32>,
+
+    /// How many outbound connections this application may hold open at the
+    /// same time.
+    ///
+    /// Counted concurrently, not per invocation - one long-lived outbound
+    /// WebSocket per visitor is the shape this bounds - so an application
+    /// that holds its connections only as long as a call takes never meets
+    /// even a small value, while one that pins a connection per visitor is
+    /// told when it has more visitors than it asked to serve at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_outbound_connections: Option<u32>,
 }
 
 impl DeclaredLimits {
@@ -106,6 +117,9 @@ impl DeclaredLimits {
         }
         if let Some(max) = self.max_subrequests {
             parts.push(format!("{max} subrequests per invocation"));
+        }
+        if let Some(max) = self.max_outbound_connections {
+            parts.push(format!("{max} open outbound connections"));
         }
         if parts.is_empty() {
             "nothing".to_string()
@@ -153,6 +167,13 @@ impl DeclaredLimits {
             return Err(
                 "limits.max_subrequests is 0; the application could not make a single outbound \
                         call. Leave it out to use the node's default"
+                    .to_string(),
+            );
+        }
+        if self.max_outbound_connections == Some(0) {
+            return Err(
+                "limits.max_outbound_connections is 0; the application could not hold a single \
+                        outbound connection open. Leave it out to use the node's default"
                     .to_string(),
             );
         }

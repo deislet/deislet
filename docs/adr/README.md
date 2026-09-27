@@ -2,7 +2,7 @@
 
 本目录保存从 2026-09-03 产品梳理开始已接受的 25 项决策。`Accepted` 表示 Deislet 的产品与实现方向已经确定；涉及应用标准的条款仍须经 Edge Canon 独立治理进入某个不可变标准版本。
 
-- 决策事实与问题来源：[阶段分析](../product/phase-analysis-2026-09-03.zh.md)
+- 决策事实与问题来源：[阶段分析](../archive/phase-analysis-2026-09-03.zh.md)
 - 可执行工程路线：[产品级路线](../product/roadmap.zh.md)
 - 上游标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 - 上游机器契约：[standard/contract.json](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/standard/contract.json)

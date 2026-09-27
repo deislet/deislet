@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deislet/deislet/docs/product/evidence/control-restore-drill.schema.json",
+  "title": "Deislet control plane restore drill evidence",
+  "description": "One run of scripts/control-restore-drill.sh: a Litestream replica restored into an isolated directory, integrity-checked, and served by a control plane started against the restored database. `scripts/control-restore-drill.sh` validates every report against this schema before writing it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "evidenceId",
+    "collectedAt",
+    "outcome",
+    "scope",
+    "source",
+    "restore",
+    "integrityCheck",
+    "userVersion",
+    "rowCounts",
+    "dataTimestamp",
+    "sourceComparison",
+    "databaseBytes",
+    "bundleStore",
+    "drillConfiguration",
+    "control",
+    "readOnlyApi",
+    "assertions",
+    "limitations"
+  ],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "schemaVersion": {"const": 1},
+    "evidenceId": {"type": "string", "minLength": 1},
+    "collectedAt": {"type": "string", "format": "date-time"},
+    "outcome": {
+      "enum": ["passed", "partial", "failed"],
+      "description": "passed: every assertion was checked and held. partial: every assertion that ran held, but the read-only catalogue call was not made, so the drill did not prove the restored catalogue can be read. failed: at least one assertion did not hold."
+    },
+    "scope": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["database", "configuration", "replica", "litestream", "control", "controlVersion"],
+      "properties": {
+        "database": {
+          "type": ["string", "null"],
+          "description": "The production database this replica is of, derived from the source configuration's data_dir. An installation whose unit passes --database explicitly may name it differently."
+        },
+        "configuration": {"type": ["string", "null"]},
+        "replica": {"type": ["string", "null"]},
+        "litestream": {"type": ["string", "null"]},
+        "control": {"type": ["string", "null"]},
+        "controlVersion": {"type": ["string", "null"]}
+      }
+    },
+    "restore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "startedAt",
+        "finishedAt",
+        "durationMs",
+        "exitStatus",
+        "reportedDurationMs",
+        "txid"
+      ],
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "startedAt": {"type": ["string", "null"], "format": "date-time"},
+        "finishedAt": {"type": ["string", "null"], "format": "date-time"},
+        "durationMs": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Wall-clock duration of the restore step, as the drill measured it."
+        },
+        "exitStatus": {"type": ["integer", "null"]},
+        "reportedDurationMs": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "The duration Litestream reported for the same restore."
+        },
+        "txid": {"type": ["string", "null"]}
+      }
+    },
+    "integrityCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "result"],
+      "properties": {
+        "mode": {"const": "full"},
+        "result": {"type": "string", "minLength": 1}
+      }
+    },
+    "userVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "expected", "checked"],
+      "properties": {
+        "value": {"type": ["integer", "null"], "minimum": 0},
+        "expected": {"type": ["integer", "null"], "minimum": 0},
+        "checked": {"type": "boolean"}
+      }
+    },
+    "rowCounts": {
+      "type": "object",
+      "description": "Row counts of the tables the installation's worth lives in, read from the restored database. Null means the table is not in it.",
+      "minProperties": 1,
+      "additionalProperties": {"type": ["integer", "null"], "minimum": 0}
+    },
+    "dataTimestamp": {
+      "type": ["string", "null"],
+      "description": "The newest record in the restored database (its event log or its audit log), which is the point in time the restored data represents."
+    },
+    "sourceComparison": {
+      "type": ["object", "null"],
+      "description": "The restored database against the installation it came from, read read-only, when that installation is still there to be read. Null means the replica's currency was not checked, which the limitations say.",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "tableDeltas",
+        "sourceDataTimestamp",
+        "restoredDataTimestamp",
+        "lagSeconds",
+        "maxLagSeconds"
+      ],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "tableDeltas": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "Per table: the source's row count, the restored one's, and how many rows the restored database is behind. A positive delta during a live rehearsal is the writes that landed after the replica's last sync; a large or growing one is a replica that is not keeping up.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "restored", "delta"],
+            "properties": {
+              "source": {"type": ["integer", "null"], "minimum": 0},
+              "restored": {"type": ["integer", "null"], "minimum": 0},
+              "delta": {"type": ["integer", "null"]}
+            }
+          }
+        },
+        "sourceDataTimestamp": {"type": ["string", "null"]},
+        "restoredDataTimestamp": {"type": ["string", "null"]},
+        "lagSeconds": {"type": ["integer", "null"]},
+        "maxLagSeconds": {"type": "integer", "minimum": 0}
+      }
+    },
+    "databaseBytes": {"type": ["integer", "null"], "minimum": 0},
+    "bundleStore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "exists", "zipFiles"],
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "exists": {"type": "boolean"},
+        "zipFiles": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Bundles on disk beside the database. Counted, not verified: contents are content-addressed and checked by the file-sync job."
+        }
+      }
+    },
+    "drillConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "checkConfig"],
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "checkConfig": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["exitStatus", "output"],
+          "properties": {
+            "exitStatus": {"type": ["integer", "null"]},
+            "output": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started", "port", "health", "stopped", "logPath"],
+      "properties": {
+        "started": {"type": "boolean"},
+        "port": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+        "health": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "body"],
+          "properties": {
+            "status": {"type": ["integer", "null"]},
+            "body": {"type": ["string", "null"]}
+          }
+        },
+        "stopped": {"type": "boolean"},
+        "logPath": {"type": ["string", "null"]}
+      }
+    },
+    "readOnlyApi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "status"],
+      "description": "The read-only catalogue call, made only when the drill was given a credential. Without one the drill reports /health alone, which is a constant, and its outcome is partial.",
+      "properties": {
+        "requested": {"type": "boolean"},
+        "reason": {"type": "string"},
+        "path": {"type": "string"},
+        "limit": {"type": "integer", "minimum": 1},
+        "status": {"type": ["integer", "null"]},
+        "items": {"type": ["integer", "null"], "minimum": 0},
+        "reportedTotal": {"type": ["integer", "null"], "minimum": 0},
+        "matchesDatabase": {"type": "boolean"},
+        "expected": {"type": "array", "items": {"type": "string"}},
+        "returned": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "assertions": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "passed", "detail"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "description": {"type": "string", "minLength": 1},
+          "passed": {"type": "boolean"},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  }
+}

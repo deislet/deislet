@@ -166,8 +166,8 @@ pub struct CatalogRoutes {
     wildcards: Vec<(String, CompiledRoute)>,
     any_host: Vec<CompiledRoute>,
     preview: HashMap<String, Target>,
-    /// App ids that have a default environment, for the `x-deis-app-id`
-    /// header path, which names an application and not an environment.
+    /// App ids that have a default environment, published by `describe` and
+    /// counted in `is_empty`.
     apps_with_default_env: HashMap<String, Target>,
     route_count: usize,
     environment_count: usize,
@@ -301,16 +301,14 @@ impl CatalogRoutes {
 
     /// Whether this table can answer anything at all.
     ///
-    /// Every lookup this type offers has to be covered here,
-    /// `apps_with_default_env` included:
-    /// [`CatalogRoutes::target_by_app_id`] answers the `x-deis-app-id` path
-    /// out of that set, and it is filled from the document's environments
-    /// rather than from its routes. A catalog that genuinely knows three
+    /// `apps_with_default_env` counts here even though routing no longer
+    /// resolves an application by name out of it: `describe` publishes the
+    /// set, and a table that knows applications is not "nothing is routed
+    /// here" just because its host maps are empty. A catalog that knows
     /// applications but claims no hostname - a platform before anyone
-    /// creates a route, with the preview zone off - therefore used to report
-    /// itself empty while it was still resolving names, and the caller that
-    /// reads this to decide "nothing is routed here" (`proxy::resolve_app`)
-    /// concluded the request could be forwarded untouched.
+    /// creates a route, with the preview zone off - reporting itself empty
+    /// used to make the caller conclude a request could be forwarded
+    /// untouched.
     pub fn is_empty(&self) -> bool {
         self.by_host.is_empty()
             && self.wildcards.is_empty()
@@ -417,16 +415,6 @@ impl CatalogRoutes {
                 target: route.target.clone(),
                 source: MatchSource::Route,
             })
-    }
-
-    /// The default environment of an application the catalog knows, for a
-    /// request that named the application by header instead of by host.
-    ///
-    /// The header names an application, not an environment, so there is only
-    /// one honest answer: the default one. An application whose catalog has
-    /// no default environment is not resolvable this way at all.
-    pub fn target_by_app_id(&self, app_id: &str) -> Option<Target> {
-        self.apps_with_default_env.get(app_id).cloned()
     }
 
     /// Every rule in this table, one canonical line each.
@@ -662,20 +650,6 @@ mod tests {
     }
 
     #[test]
-    fn the_header_path_resolves_to_the_default_environment_only() {
-        let table = table(SAMPLE, None);
-        assert_eq!(
-            table.target_by_app_id("api"),
-            Some(Target {
-                app_id: "api".to_string(),
-                environment: "production".to_string(),
-                deployment_generation: None,
-            })
-        );
-        assert_eq!(table.target_by_app_id("nothing-like-it"), None);
-    }
-
-    #[test]
     fn describe_is_stable_and_diffable() {
         let before = table(SAMPLE, Some("preview.test"));
         let after = table(
@@ -708,10 +682,9 @@ mod tests {
     fn a_table_that_knows_applications_is_not_empty() {
         // No route claims a hostname and the preview zone is off, so the
         // four maps a request is matched against are all empty - and the
-        // table still answers `x-deis-app-id: shop` with shop/production.
+        // table still knows two applications by their default environments.
         // Calling that empty told the caller nothing was routed here, and
-        // the caller forwards a request nothing routes carrying whatever
-        // the client asked for.
+        // the caller used to forward a request nothing routes.
         let table = table(
             r#"{"version":"v","routes":[],"environments":[
                 {"app_id":"shop","environment":"production"},
@@ -722,13 +695,8 @@ mod tests {
         );
         assert!(table.match_request("anything.test", "/").is_none());
         assert!(
-            table.target_by_app_id("shop").is_some(),
-            "the header path resolves out of this table"
-        );
-        assert!(
             !table.is_empty(),
-            "a table that resolves an application by header is not empty, whatever its host \
-             maps hold"
+            "a table that knows applications is not empty, whatever its host maps hold"
         );
     }
 

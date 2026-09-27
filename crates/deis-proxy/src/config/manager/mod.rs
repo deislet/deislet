@@ -48,9 +48,10 @@ const MAX_LOGGED_RULE_CHANGES: usize = 50;
 /// - App configs: persisted in the database, mirrored in memory, and
 ///   compiled into a [`RouteTable`] whenever they change.
 /// - Catalog routes: the control plane's routing table, fetched by
-///   [`crate::catalog`] and swapped in whole. Not persisted: it is a copy of
-///   something the control plane owns, and a stale copy read off disk at
-///   startup would be indistinguishable from a current one.
+///   [`crate::catalog`] and swapped in whole. Not this manager's to keep:
+///   the poll loop holds the last one on disk
+///   ([`crate::catalog::RoutingTableCache`]) for a restart that cannot
+///   reach the control plane, and a successful poll replaces both.
 pub struct ConfigManager {
     system_config: ArcSwap<SystemConfig>,
     /// Raw app configurations keyed by app id, as pushed by the control.

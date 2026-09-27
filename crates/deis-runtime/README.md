@@ -476,20 +476,18 @@ against an owner nothing sweeps.
 
 ## Remote debugging
 
-Chrome DevTools Protocol over the same port the node serves traffic on, so no
-extra listener is exposed:
+Chrome DevTools Protocol on the node's mutually authenticated management
+listener (`[machine_identity] management_listen`), so no extra listener is
+exposed and the caller is proved by the same TLS handshake the control plane
+is:
 
-- URL: `ws://<node>:<http_port>/`
+- URL: `wss://<node>:<management port>/`
 - Headers: `x-deis-app-id: _inspect:<app_id>`, `x-deis-inspect-token: <token>`
 
-deis-proxy validates `x-deis-app-id` against the application list, so
-`_inspect:` targets are not reachable through it — use the node's own port.
-See [docs/TESTING.md](docs/TESTING.md).
-
-No extra listener is exposed, but that cuts both ways: the debugger lives on
-the same `0.0.0.0` port that serves traffic, which is one of the reasons that
-port has to be firewalled to the proxy and the control plane. See
-[docs/trust-boundaries.md](../../docs/trust-boundaries.md).
+The session token is minted by `StartInspect` on the machine channel, and the
+connection presenting it has to be a machine of this fleet to begin with: the
+data port answers no debugger at all. See [docs/TESTING.md](docs/TESTING.md)
+and [docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 
 ## Documentation
 

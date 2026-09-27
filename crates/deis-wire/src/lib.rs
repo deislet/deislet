@@ -12,6 +12,7 @@ pub mod client;
 pub mod config;
 pub mod conventions;
 pub mod deislet_storage_key;
+pub mod durability;
 pub mod environment;
 pub mod error;
 pub mod logging;

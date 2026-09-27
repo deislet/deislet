@@ -135,20 +135,6 @@ pub struct ResourceLimits {
     #[serde(default)]
     pub memory_mb: usize,
 
-    /// A CPU *share* in Kubernetes millicores, carried on the wire since the
-    /// first version of this message and read by nothing on this node.
-    ///
-    /// Nothing enforces it and nothing is planned to: a share only means
-    /// something to a scheduler that can hand out fractions of a core, and an
-    /// isolate here is pinned to one runtime thread that its application has
-    /// to itself. What one invocation may cost the node is
-    /// `cpu_time_limit_ms` below, which is a ceiling on time consumed rather
-    /// than a share of a core, and which is enforced. Named as dead here
-    /// rather than removed because it is field 2 of the `ResourceLimits`
-    /// message and older control planes still send it.
-    #[serde(default)]
-    pub cpu_milli: u32,
-
     #[serde(default)]
     pub resource_table_max: Option<usize>,
 
@@ -203,6 +189,18 @@ pub struct ResourceLimits {
     /// introduced it.
     #[serde(default)]
     pub max_subrequests: Option<u32>,
+
+    /// Narrowing override of
+    /// `crate::config::ExecutionLimits::max_outbound_connections`: how many
+    /// outbound connections this app may hold open at once. `None` means "use
+    /// the platform default".
+    ///
+    /// Narrowing only, like every field here. Each open connection is a file
+    /// descriptor and a live socket on a runtime thread the application
+    /// shares with its neighbours, so the node's value is the ceiling and an
+    /// application may hold itself under it but never above it.
+    #[serde(default)]
+    pub max_outbound_connections: Option<u32>,
 }
 
 /// One application, in one environment, as this node holds it.

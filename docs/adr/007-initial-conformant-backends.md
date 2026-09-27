@@ -3,24 +3,24 @@
 - 状态：Accepted
 - 日期：2026-09-03
 - 决策者：产品负责人
-- 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-006
+- 关联：`../archive/phase-analysis-2026-09-03.zh.md` DEC-006
 - 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
+- 修订：2026-09-24 决策 D-5 —— EdgeOne 与 Deno 冻结，仅保留无状态函数；首批一等合规后端收缩为 deislet 与 Cloudflare
 
 ## 背景
 
 仓库当前有 Deislet、Cloudflare、Tencent 和 Deno build adapter，但后三者的完成度不等；adapter 存在也不能证明部署后的应用符合统一标准。
 
-产品目标明确包含自建后端、Cloudflare 和 Tencent EdgeOne。Deno 有现存代码价值，也能帮助检验抽象，但不是首批产品发布的必要目标。
+自建后端与 Cloudflare 是当前的产品目标。Tencent EdgeOne 与 Deno 的 adapter 已存在但完成度不足：2026-09-24 决策 D-5 将二者冻结，只保留无状态函数能力，不作为首批产品发布目标。
 
 ## 决定
 
-首批一等合规后端为：
+首批一等合规后端为（2026-09-24 决策 D-5 收缩后）：
 
 1. Deislet self-hosted。
 2. Cloudflare Workers。
-3. Tencent EdgeOne Makers。
 
-Deno adapter 保留为 experimental/reference implementation。它可以参与开发和测试，但在完整通过同一个 Edge Canon 版本的全部要求之前，不宣称支持或兼容。
+Tencent EdgeOne 与 Deno 冻结：仅生成无状态 fetch 函数产物，不提供认证，不承诺任何 bindings/resources/triggers 支持；使用绑定能力的应用在这两个 target 上编译期直接拒绝，不降级、不 warning。
 
 ## 一等合规的含义
 
@@ -67,41 +67,36 @@ provider product(s)
 - 认证明确所需 compatibility date、Wrangler/driver 版本和最低 account tier/configuration。
 - 不继续把 Cloudflare Pages 旧产品面建成另一套标准；静态与全栈体验映射到当前 Workers 产品能力。
 
-### Tencent EdgeOne Makers
+### Tencent EdgeOne（冻结）
 
-- 产品名称使用 Tencent EdgeOne Makers。
-- driver 可以透明组合 Edge Functions、Cloud Functions、KV、Blob、站点 assets/CDN 和必要 companion service。
-- 认证明确 Global/China、区域、CLI/driver 版本以及所需项目配置。
-- 应用不感知函数最终位于 Edge Functions 还是 Cloud Functions。
+- 2026-09-24 决策 D-5 起冻结：仅生成无状态函数产物，不做认证，不承诺绑定。
+- 使用 KV/SQL/Blob/Queue 或任何 bindings/callable 声明的应用在此 target 上编译期拒绝，并返回明确的错误码。
+- 保留代码、测试和 build target，仅限维护现状，不做新功能。
+- 解冻需要重新走「新后端准入」流程，完整通过同一 conformance suite。
 
 ## Target ID 命名
 
-建议规范 target ID：
+规范 target ID 与支持状态（2026-09-24 决策 D-5）：
 
-- `deislet`
-- `cloudflare`
-- `edgeone`
-- `deno`（experimental）
+- `deislet`（一等合规目标）
+- `cloudflare`（一等合规目标）
+- `edgeone`（frozen，仅无状态函数）
+- `deno`（frozen，仅无状态函数）
 
-当前 `tencent` 应迁移为 `edgeone`，因为供应商产品已从 Pages 升级为 EdgeOne Makers。为了现有项目：
+按全局决策 D-0，不保留 `tencent` 旧值的兼容 alias：新配置、文档和 artifact metadata 只生成 `edgeone`，旧值直接校验失败。
 
-- 旧 `tencent` config/CLI 值在一个明确兼容周期内作为 alias 解析。
-- validate 输出迁移提示。
-- 新配置、文档和 artifact metadata 只生成 `edgeone`。
-- alias 移除属于带迁移工具的破坏性 CLI/config 版本变化，不影响应用运行标准。
+## Deno 冻结规则
 
-## Deno experimental 规则
-
-- 保留代码、测试和 build target，便于检验标准是否过度绑定首批 provider。
-- CLI、文档和 UI 显示 `experimental — not Edge Canon compliant`。
-- 默认发布流水线不把生成 Deno artifact 视为成功认证。
-- 可以运行已实现的 conformance 子集，但公开结果必须同时显示未运行/失败项。
+- 2026-09-24 决策 D-5 起冻结：仅生成无状态函数产物，不做认证，不承诺绑定。
+- 使用 KV/SQL/Blob/Queue 或任何 bindings/callable 声明的应用在此 target 上编译期拒绝，并返回明确的错误码。
+- CLI、文档和 UI 显示 `frozen — stateless functions only, not Edge Canon compliant`。
+- 保留代码、测试和 build target，仅限维护现状，不做新功能；默认发布流水线不把生成 Deno artifact 视为成功认证。
 - 禁止用 warning 跳过标准能力后生成一个被称为 compliant 的部署。
-- 达到完整标准后，通过 implementation report 增加认证，不产生 Deno 专用能力 profile。
+- 解冻需要重新走「新后端准入」流程，完整通过同一 conformance suite；不产生 Deno 专用能力 profile。
 
 ## Release gates
 
-Edge Canon 实现版本进入产品级发布前，三个一等后端必须满足：
+Edge Canon 实现版本进入产品级发布前，两个一等后端（deislet 与 Cloudflare）必须满足：
 
 1. 同一标准 tag/schema/types/conformance version。
 2. deterministic build 与 artifact validation。
@@ -149,8 +144,8 @@ Edge Canon 实现版本进入产品级发布前，三个一等后端必须满足
 
 ## 后果
 
-- 首批产品发布必须同步推进 Deislet、Cloudflare 和 EdgeOne，任何一个未通过都不能宣称三目标统一标准已完成。
-- Deno 不阻塞首批发布，但所有产品文案需要立刻纠正其支持等级。
-- Cloudflare/Tencent adapter 当前远未达到一等定义，需要从模板生成器升级为完整 build/deploy implementation。
-- CI/CD 需要三套持续 live deployment 环境。
-- 标准设计仍应利用 Deno 和其他实现反馈，防止只围绕三家内部结构设计。
+- 首批产品发布只承诺 Deislet 与 Cloudflare；任何一个未通过都不能宣称两目标统一标准已完成。
+- EdgeOne 与 Deno 冻结期间不做新功能，所有产品文案统一为「仅无状态函数，不承诺绑定」。
+- Cloudflare adapter 当前远未达到一等定义，需要从模板生成器升级为完整 build/deploy implementation。
+- CI/CD 需要两套持续 live deployment 环境（deislet 与 Cloudflare）。
+- 标准设计仍应利用冻结 target 和其他实现反馈，防止只围绕两家内部结构设计。

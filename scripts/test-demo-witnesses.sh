@@ -33,8 +33,8 @@
 #
 # What they test
 # --------------
-# The real definitions, read out of `scripts/demo.sh` at run time rather than
-# copied here: a test that carried its own copy of `node_log` would go on
+# The real definitions, read out of the demo's sources at run time rather
+# than copied here: a test that carried its own copy of `node_log` would go on
 # passing after somebody changed the one that ships.
 #
 # Usage: test-demo-witnesses.sh [path/to/demo.sh]
@@ -49,6 +49,22 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DEMO_SH="${1:-${ROOT_DIR}/scripts/demo.sh}"
 
+# The demo is one entry point plus everything it sources beside it, under
+# `scripts/demo/`. Every test below reads the definitions as they ship, which
+# means reading whatever file holds them; a candidate copy passed as $1 is
+# searched the same way, so its tree has to sit beside it.
+DEMO_FILES=("$DEMO_SH")
+if [ -d "$(dirname "$DEMO_SH")/demo" ]; then
+  while IFS= read -r demo_file; do
+    DEMO_FILES+=("$demo_file")
+  done < <(find "$(dirname "$DEMO_SH")/demo" -name '*.sh' | sort)
+fi
+
+# A path fit for a test's name: relative to the repository when it is under it.
+demo_path() {
+  printf '%s' "${1#"$ROOT_DIR"/}"
+}
+
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -57,13 +73,20 @@ failures=0
 pass() { echo "   ✓ $1"; }
 fail() { echo "   ✗ $1"; [ -n "${2:-}" ] && echo "     $2"; failures=$((failures + 1)); return 0; }
 
-# One function's body, lifted out of demo.sh exactly as it ships.
+# One function's body, lifted out of the demo's sources exactly as it ships.
+#
+# The demo is an entry point plus one file per library and per group of
+# checks, so the body is taken from whichever of them defines the function -
+# the first file that has it, with the entry point searched first.
 definition_of() {
   local name=$1
-  local text
-  text=$(sed -n "/^${name}() {/,/^}/p" "$DEMO_SH")
+  local text="" file
+  for file in "${DEMO_FILES[@]}"; do
+    text=$(sed -n "/^${name}() {/,/^}/p" "$file")
+    [ -n "$text" ] && break
+  done
   if [ -z "$text" ]; then
-    echo "❌ ${DEMO_SH} defines no ${name}(); this test is out of date" >&2
+    echo "❌ neither ${DEMO_SH} nor anything under scripts/demo/ defines ${name}(); this test is out of date" >&2
     exit 1
   fi
   printf '%s\n' "$text"
@@ -144,9 +167,9 @@ mkdir -p "$empty_log"
 printf '2026-09-02T00:00:00.000000Z  INFO ThreadId(01) nothing to see\n' \
   > "${empty_log}/deis-runtime.log"
 
-quotations=$(grep -n '^  said=\$(node_log | grep " WARN "' "$DEMO_SH" || true)
+quotations=$(grep -nH '^  said=\$(node_log | grep " WARN "' "${DEMO_FILES[@]}" || true)
 if [ -z "$quotations" ]; then
-  echo "❌ ${DEMO_SH} has no 'said=\$(node_log | grep \" WARN \" ...' line; this test is out of date" >&2
+  echo "❌ no file under scripts/demo/ has a 'said=\$(node_log | grep \" WARN \" ...' line; this test is out of date" >&2
   exit 1
 fi
 
@@ -157,11 +180,13 @@ fi
 # with errexit really in force, which is the state `verify` runs in.
 probe="${WORK_DIR}/probe.sh"
 while IFS= read -r entry; do
-  line_no=${entry%%:*}
+  source_file=${entry%%:*}
+  line_no=${entry#*:}
+  line_no=${line_no%%:*}
   # The whole assignment, continuation lines included: these quotations now
   # name the invocation they belong to and are wrapped over two lines, and a
   # probe fed half a statement measures its own truncation.
-  statement=$(awk -v start="$line_no" 'NR >= start { print; if ($0 !~ /\\$/) exit }' "$DEMO_SH")
+  statement=$(awk -v start="$line_no" 'NR >= start { print; if ($0 !~ /\\$/) exit }' "$source_file")
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
@@ -176,10 +201,11 @@ while IFS= read -r entry; do
   } > "$probe"
   status=0
   LOG_DIR="$empty_log" bash "$probe" >/dev/null 2>&1 || status=$?
+  where=$(demo_path "$source_file")
   if [ "$status" -eq 0 ]; then
-    pass "demo.sh:${line_no} survives a log that does not carry the line it quotes"
+    pass "${where}:${line_no} survives a log that does not carry the line it quotes"
   else
-    fail "demo.sh:${line_no} survives a log that does not carry the line it quotes" \
+    fail "${where}:${line_no} survives a log that does not carry the line it quotes" \
       "the assignment exited ${status}, so under set -euo pipefail the whole verify run ends here - no failure line for the check, no summary, and nothing but the exit status to say the run did not finish"
   fi
 done <<< "$quotations"
@@ -218,9 +244,9 @@ python3 "${fixture_demo}/origin/origin.py" &
 planted=$!
 trap 'kill "$planted" 2>/dev/null; rm -rf "$WORK_DIR"' EXIT
 
-scan=$(sed -n '/^  orphans=\$(pgrep -f/,/|| true)$/p' "$DEMO_SH")
+scan=$(sed -n '/^  orphans=\$(pgrep -f/,/|| true)$/p' "${DEMO_FILES[@]}")
 if [ -z "$scan" ]; then
-  echo "❌ ${DEMO_SH} has no 'orphans=\$(pgrep -f ...' scan; this test is out of date" >&2
+  echo "❌ scripts/demo/ has no 'orphans=\$(pgrep -f ...' scan; this test is out of date" >&2
   exit 1
 fi
 
@@ -281,12 +307,20 @@ dead_port_probe() {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
     echo 'APP_ID=demo'
-    echo 'API_KEY=irrelevant'
+    echo 'OPERATOR_TOKEN=irrelevant'
     echo 'DEIS_RUNTIME_PORT=9'
     echo 'DEIS_PROXY_PORT=9'
     echo 'DEIS_CONTROL_PORT=9'
+    # The runtime helpers now carry the demo proxy's certificate, so the
+    # environment they are lifted into has to name a PKI the way the demo's
+    # does. It points at nothing here - which is the point: a curl that
+    # cannot even load a key has to die the same guarded death as one that
+    # cannot connect.
+    printf 'PKI_DIR=%q\n' "${WORK_DIR}/pki"
     printf 'LOG_DIR=%q\n' "$WORK_DIR"
     echo 'control_url() { printf "http://127.0.0.1:%s" "$DEIS_CONTROL_PORT"; }'
+    definition_of runtime_curl
+    definition_of runtime_data_url
     definition_of "$helper"
     # A plain assignment, not `local x=...`: `local` returns its own status
     # and would hide exactly the failure being tested for.
@@ -355,23 +389,28 @@ done
 # and the property wanted is that none of them can end the run - which is a
 # property of how they are written. A check whose curl exits 7 and takes the
 # run with it prints nothing, so the reader learns neither what failed nor
-# that anything did.
-unguarded=$(python3 - "$DEMO_SH" <<'SCAN'
+# that anything did. `runtime_curl` is the demo's TLS-carrying curl, so it is
+# counted with the rest: a check that reads its answer has the same duty to
+# guard the assignment.
+unguarded=$(python3 - "${DEMO_FILES[@]}" <<'SCAN'
 import re, sys
 
-lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
-i = 0
-while i < len(lines):
-    line = lines[i]
-    assignment = re.match(r"^\s*([A-Za-z_][A-Za-z_0-9]*)=\$\(\s*(curl\b.*)$", line)
-    if assignment and not re.match(r"^\s*(local|export|declare|readonly)\b", line):
-        j = i
-        while lines[j].rstrip().endswith("\\"):
-            j += 1
-        if "||" not in "\n".join(lines[i:j + 1]):
-            print(f"{i + 1}: {lines[i].strip()}")
-        i = j
-    i += 1
+bad = []
+for path in sys.argv[1:]:
+    lines = open(path, encoding="utf-8").read().split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        assignment = re.match(r"^\s*([A-Za-z_][A-Za-z_0-9]*)=\$\(\s*((?:runtime_)?curl\b.*)$", line)
+        if assignment and not re.match(r"^\s*(local|export|declare|readonly)\b", line):
+            j = i
+            while lines[j].rstrip().endswith("\\"):
+                j += 1
+            if "||" not in "\n".join(lines[i:j + 1]):
+                bad.append(f"{path}:{i + 1}: {lines[i].strip()}")
+            i = j
+        i += 1
+print("\n".join(bad))
 SCAN
 )
 if [ -z "$unguarded" ]; then
@@ -395,15 +434,18 @@ fi
 # Every one of those lines is taken out of demo.sh as it ships and run inside
 # a function, against a body that is not JSON.
 
-givers_up=$(grep -n 'answered_json .* || return' "$DEMO_SH" || true)
+givers_up=$(grep -nH 'answered_json .* || return' "${DEMO_FILES[@]}" || true)
 if [ -z "$givers_up" ]; then
-  echo "❌ ${DEMO_SH} has no 'answered_json ... || return' line; this test is out of date" >&2
+  echo "❌ no file under scripts/demo/ has an 'answered_json ... || return' line; this test is out of date" >&2
   exit 1
 fi
 
 while IFS= read -r entry; do
-  line_no=${entry%%:*}
+  source_file=${entry%%:*}
+  line_no=${entry#*:}
+  line_no=${line_no%%:*}
   statement=${entry#*:}
+  statement=${statement#*:}
   probe="${WORK_DIR}/giveup.sh"
   {
     echo '#!/usr/bin/env bash'
@@ -425,10 +467,11 @@ while IFS= read -r entry; do
   } > "$probe"
   status=0
   bash "$probe" >/dev/null 2>&1 || status=$?
+  where=$(demo_path "$source_file")
   if [ "$status" -eq 0 ]; then
-    pass "demo.sh:${line_no} gives up on the check without ending the run"
+    pass "${where}:${line_no} gives up on the check without ending the run"
   else
-    fail "demo.sh:${line_no} gives up on the check without ending the run" \
+    fail "${where}:${line_no} gives up on the check without ending the run" \
       "the check function returned ${status}, and a check that returns non-zero under set -e ends the verify run right after it has recorded its own failure"
   fi
 done <<< "$givers_up"
@@ -452,8 +495,8 @@ probe="${WORK_DIR}/stopped.sh"
   echo 'CHECKS_FAILED=0'
   definition_of pass_check
   definition_of fail_check
-  # The two traps and their flag, lifted out of demo.sh as they ship.
-  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "$DEMO_SH"
+  # The two traps and their flag, lifted out of the demo's sources as they ship.
+  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "${DEMO_FILES[@]}"
   definition_of on_verify_exit
   echo 'set -E'
   echo 'trap '"'"'on_verify_error "$LINENO" "$BASH_COMMAND" "$?"'"'"' ERR'
@@ -491,7 +534,7 @@ probe="${WORK_DIR}/stopped-clean.sh"
   echo 'CHECKS_FAILED=0'
   definition_of pass_check
   definition_of fail_check
-  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "$DEMO_SH"
+  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "${DEMO_FILES[@]}"
   definition_of on_verify_exit
   echo 'trap on_verify_exit EXIT'
   echo 'pass_check "one that passed"'
@@ -519,7 +562,7 @@ probe="${WORK_DIR}/finished.sh"
   echo 'CHECKS_FAILED=0'
   definition_of pass_check
   definition_of fail_check
-  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "$DEMO_SH"
+  sed -n '/^VERIFY_REACHED_ITS_SUMMARY=/,/^}/p' "${DEMO_FILES[@]}"
   definition_of on_verify_exit
   echo 'set -E'
   echo 'trap '"'"'on_verify_error "$LINENO" "$BASH_COMMAND" "$?"'"'"' ERR'
@@ -685,7 +728,7 @@ theirs=2222222222222222bbbbbbbbbbbbbbbb
 #
 # `start` reads the state file to find out whether a previous run is still
 # up. It used to do that by sourcing the file into its own shell, and the
-# file is a complete settings dump - SECRET, API_KEY, STORAGE_AUTH_SECRET,
+# file is a complete settings dump - SECRET, API_KEY,
 # APP_SRC_DIR, APP_ID, ENV_NAME, NODE_ID, DEMO_SECRET_VALUE and every port.
 # So every setting the person typed was replaced by the last run's, silently:
 # `--secret <hex>` came up on the previous run's node key and `--app-dir
@@ -696,9 +739,9 @@ theirs=2222222222222222bbbbbbbbbbbbbbbb
 # that touch the disk or the process table stubbed out. What is asserted is
 # that four settings given before it runs are still the same four afterwards.
 
-preamble=$(sed -n '/^start_demo() {/,/^  claim_port DEIS_RUNTIME_PORT/p' "$DEMO_SH" | sed '$d')
+preamble=$(sed -n '/^start_demo() {/,/^  claim_port DEIS_RUNTIME_PORT/p' "${DEMO_FILES[@]}" | sed '$d')
 if [ -z "$preamble" ]; then
-  echo "❌ ${DEMO_SH} has no start_demo() preamble ending at claim_port; this test is out of date" >&2
+  echo "❌ scripts/demo/ has no start_demo() preamble ending at claim_port; this test is out of date" >&2
   exit 1
 fi
 
@@ -815,9 +858,9 @@ esac
 # asserted, and two verdicts printed under one claim - which keeps the tally
 # right while the list is wrong - is its own failure.
 
-roll_call=$(sed -n '/^  # The roll call\./,/^}/p' "$DEMO_SH")
+roll_call=$(sed -n '/^  # The roll call\./,/^}/p' "${DEMO_FILES[@]}")
 if [ -z "$roll_call" ]; then
-  echo "❌ ${DEMO_SH} has no roll call in verify_demo; this test is out of date" >&2
+  echo "❌ scripts/demo.sh has no roll call in verify_demo; this test is out of date" >&2
   exit 1
 fi
 
@@ -888,9 +931,9 @@ fi
 # against a stand-in that answers the way a leaking platform answers, and it
 # has to say ✗. A witness nobody has ever seen fail is not yet a witness.
 
-route=$(grep '^PRIVATE_PAGE_ROUTE=' "$DEMO_SH" || true)
+route=$(grep -h '^PRIVATE_PAGE_ROUTE=' "${DEMO_FILES[@]}" || true)
 if [ -z "$route" ]; then
-  echo "❌ ${DEMO_SH} defines no PRIVATE_PAGE_ROUTE; this test is out of date" >&2
+  echo "❌ scripts/demo/ defines no PRIVATE_PAGE_ROUTE; this test is out of date" >&2
   exit 1
 fi
 
@@ -1387,8 +1430,8 @@ fi
 # master key, has to have `chmod 600 "$FILE"` beside it - within three lines
 # before (state.env is chmod'ed before it is written) or twelve after its
 # terminator. A regex that stopped matching would report nothing to check,
-# so the number of writers found is asserted as well: five today - state.env,
-# secret.key, and the store, queue and control-plane configurations.
+# so the number of writers found is asserted as well: two today - state.env
+# and secret.key.
 #
 # It was eight. Three configurations - the node's, the proxy's and the restart
 # proxy's - stopped carrying a credential value because nothing in this demo
@@ -1398,6 +1441,12 @@ fi
 # and the file that does hold the secret, the key itself, is held to 0600 by
 # the check below rather than by this one. (deis-telemetry's configuration
 # carries no credential and is 0600 anyway.)
+#
+# It was five. The store, queue and control-plane configurations stopped
+# carrying the fleet-wide storage secret when storage calls moved to
+# capabilities the control plane signs: its signing keys live in its own
+# database, encrypted under secret.key, and deis-store and deis-queue fetch
+# only the public halves.
 
 cat > "${WORK_DIR}/credential-writers.awk" <<'AWK'
 { lines[NR] = $0 }
@@ -1432,15 +1481,20 @@ END {
 }
 AWK
 
-writers=$(awk -v want='(^|[^_a-z])secret = "|auth_secret = "|node_preshared_keys = |api_keys = |^SECRET=|^API_KEY=|^STORAGE_AUTH_SECRET=' \
-  -f "${WORK_DIR}/credential-writers.awk" "$DEMO_SH")
+# Read file by file: the awk below counts lines from the start of what it is
+# given, and a chmod twelve lines away in another file is not twelve lines
+# away.
+writers=$(for demo_file in "${DEMO_FILES[@]}"; do
+  awk -v want='(^|[^_a-z])secret = "|auth_secret = "|node_preshared_keys = |api_keys = |^SECRET=|^API_KEY=|^OPERATOR_TOKEN=' \
+    -f "${WORK_DIR}/credential-writers.awk" "$demo_file"
+done)
 found=$(printf '%s\n' "$writers" | grep -c . || true)
 unset_writers=$(printf '%s\n' "$writers" | grep ' UNSET$' || true)
-if [ "$found" -ge 5 ] && [ -z "$unset_writers" ]; then
+if [ "$found" -ge 2 ] && [ -z "$unset_writers" ]; then
   pass "every one of the ${found} credential-bearing files demo.sh writes is chmod 600 where it is written"
 else
   fail "every one of the ${found} credential-bearing files demo.sh writes is chmod 600 where it is written" \
-    "docs/trust-boundaries.md promises 0600 for all of them; found ${found} writer(s) (at least 5 expected), without a chmod: $(printf '%s' "$unset_writers" | tr '\n' ';')"
+    "docs/trust-boundaries.md promises 0600 for all of them; found ${found} writer(s) (at least 2 expected), without a chmod: $(printf '%s' "$unset_writers" | tr '\n' ';')"
 fi
 
 # ----------------------------------------------------------------------
@@ -1459,7 +1513,8 @@ fi
 # umask, so whether it is 0600 depends on the environment the demo happened to
 # run in unless the script says so itself. Every `-keyout "..."` in demo.sh
 # therefore has to have a `chmod 600` on the same path within twelve lines.
-key_writers=$(awk '
+key_writers=$(for demo_file in "${DEMO_FILES[@]}"; do
+  awk '
   { lines[NR] = $0 }
   END {
     for (i = 1; i <= NR; i++) {
@@ -1473,7 +1528,8 @@ key_writers=$(awk '
       }
       printf "%d %s %s\n", i, v, (ok ? "0600" : "UNSET")
     }
-  }' "$DEMO_SH")
+  }' "$demo_file"
+done)
 keys_found=$(printf '%s\n' "$key_writers" | grep -c . || true)
 keys_unset=$(printf '%s\n' "$key_writers" | grep ' UNSET$' || true)
 if [ "$keys_found" -ge 2 ] && [ -z "$keys_unset" ]; then
@@ -1571,25 +1627,28 @@ else
 fi
 
 # ----------------------------------------------------------------------
-# 17. The other two three-probe checks say no for each probe on its own
+# 17. A three-probe check says no for each probe on its own
 # ----------------------------------------------------------------------
 #
 # Section 12's lesson generalises: `check_queue_capability_token` asks
-# deis-queue three things (no token, a wrong token, the real one) and
-# `check_the_node_management_plane_needs_the_node_key` asks a node three (no
-# credential, a wrong one, and the trigger service with none) plus the real
-# key. Neither had a witness at all, so a comparison dropped from either
-# would go unnoticed for the same reason. Each is run here against a stand-in
-# that admits exactly one of the callers it must refuse, and once against one
-# that refuses even the real credential, which is not a gate but an outage
-# and must not pass either.
+# deis-queue three things (no token, a wrong token, the real one). It had no
+# witness at all, so a comparison dropped from it would go unnoticed for the
+# same reason. It is run here against a stand-in that admits exactly one of
+# the callers it must refuse, and once against one that refuses even the real
+# credential, which is not a gate but an outage and must not pass either.
+#
+# The node-management counterpart this section used to witness was deleted
+# along with the fleet-shared node key it policed; the machine channel that
+# replaced it is driven over mTLS and has no key-string comparisons left to
+# stand in for.
 
 # The queue. `grpcurl` and `storage_token` are the two doors; `command -v`
 # is answered too, because the machine running this file need not have
 # grpcurl installed (CI's witness job does not).
 # $1 says who the stand-in queue serves: everyone, none (the caller with no
-# token), wrong (a token that is not this tenant's), gated (the real token
-# only) or closed (nobody, the real token included).
+# token), wrong (a garbled token), other (the control plane's deis-store
+# token, a real signature for another audience), gated (the queue token only)
+# or closed (nobody, the queue token included).
 queue_token_probe() {
   local serves=$1
   local probe="${WORK_DIR}/queue-token-${serves}.sh"
@@ -1609,14 +1668,15 @@ queue_token_probe() {
     definition_of fail_check
     cat <<'STUB'
 command() { if [ "${1:-}" = "-v" ]; then return 0; fi; builtin command "$@"; }
-storage_token() { printf 'the-token-for-%s' "$1"; }
+storage_token() { printf 'the-%s-token' "${1:-store}"; }
 grpcurl() {
   local caller="none" i args=("$@")
   for ((i = 0; i < ${#args[@]}; i++)); do
     if [ "${args[i]}" = "-H" ]; then
       case "${args[i + 1]}" in
-        "x-deis-storage-token: the-token-for-demo.production") caller="real" ;;
-        "x-deis-storage-token: "*) caller="wrong" ;;
+        "authorization: Bearer the-queue-token") caller="real" ;;
+        "authorization: Bearer the-store-token") caller="other" ;;
+        "authorization: Bearer "*) caller="wrong" ;;
       esac
     fi
   done
@@ -1631,7 +1691,11 @@ grpcurl() {
     printf '{"messages": []}\n'
     return 0
   fi
-  printf 'ERROR:\n  Code: Unauthenticated\n  Message: unauthenticated: missing or wrong x-deis-storage-token header\n'
+  if [ "$caller" = "other" ]; then
+    printf 'ERROR:\n  Code: PermissionDenied\n  Message: wrong audience\n'
+    return 1
+  fi
+  printf 'ERROR:\n  Code: Unauthenticated\n  Message: missing or malformed Authorization: Bearer <token> header\n'
   return 1
 }
 STUB
@@ -1659,8 +1723,9 @@ queue_token_case() {
 
 queue_token_case everyone "expected Code: Unauthenticated with no token (grpcurl exited 0"
 queue_token_case none "expected Code: Unauthenticated with no token (grpcurl exited 0"
-queue_token_case wrong "the same with a wrong one (exited 0"
-queue_token_case closed "the real token to be served (exited 1"
+queue_token_case wrong "the same with a garbled one (exited 0"
+queue_token_case other "PermissionDenied with the deis-store token (exited 0"
+queue_token_case closed "the queue token to be served (exited 1"
 
 out=$(queue_token_probe gated)
 if [ "${out#*verdicts: 1 passed 0 failed}" != "$out" ]; then
@@ -1670,120 +1735,7 @@ else
     "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
 fi
 
-# The node. There are now two doors to hold the check to, and they fail in
-# opposite directions, so each stand-in below opens exactly one of them and the
-# check has to notice.
-#
-# `node_grpc_status` is the plaintext management plane on the node's data port.
-# With no node key configured anywhere in this fleet, every call there is
-# refused with grpc-status 14 (UNAVAILABLE) - the node cannot tell its control
-# plane from anyone else, so it serves neither. The interesting stand-ins are
-# the ones where it serves somebody: a node left unauthenticated, or one that
-# still honours the fleet secret this demo retired.
-#
-# `curl` is stubbed for the one call the check makes directly: a plaintext gRPC
-# request at `[machine_identity] management_listen`. A caller that cannot prove
-# the control plane's name never completes a handshake there, so curl comes
-# back non-zero with no HTTP response at all; the stand-in that answers it is a
-# node whose authenticated plane is not authenticating.
-#
-# `app_request` and `control_api` are the two that confirm nothing was unloaded
-# and the platform still works, and both answer as a healthy node's would, so
-# the verdict rests on the probes alone.
-#
-# $1 says what the stand-in node opens: shut (nothing - the state this fleet is
-# in), everyone, none (no credential on GetStatus), wrong (a wrong credential),
-# key (the retired fleet secret), trigger (OnScheduled with no credential), or
-# plaintext (the mutually authenticated plane answering a plaintext call).
-node_plane_probe() {
-  local serves=$1
-  local probe="${WORK_DIR}/node-plane-${serves}.sh"
-  {
-    echo '#!/usr/bin/env bash'
-    echo 'set -euo pipefail'
-    echo 'CHECKS_PASSED=0'
-    echo 'CHECKS_FAILED=0'
-    echo 'VERIFY_CLAIMS=""'
-    printf 'LOG_DIR=%q\n' "$WORK_DIR"
-    echo 'APP_ID=demo'
-    echo 'NODE_ID=deis-runtime-demo-01'
-    echo 'SECRET=the-retired-fleet-key'
-    echo 'DEIS_RUNTIME_PORT=8086'
-    echo 'DEIS_RUNTIME_MACHINE_PORT=8097'
-    printf 'SERVES=%q\n' "$serves"
-    definition_of pass_check
-    definition_of fail_check
-    definition_of http_status
-    cat <<'STUB'
-# Prints the grpc-status header the node answered with, or nothing when the
-# call was served (a served call carries its status in the trailers).
-node_grpc_status() {
-  local path=$1 credential=$2
-  local caller
-  case "${path}|${credential}" in
-    *OnScheduled*"|") caller=trigger ;;
-    *"|") caller=none ;;
-    *"|the-retired-fleet-key") caller=key ;;
-    *) caller=wrong ;;
-  esac
-  local served=no
-  case "$SERVES" in
-    everyone) served=yes ;;
-    none|wrong|key|trigger) [ "$caller" = "$SERVES" ] && served=yes ;;
-    *) served=no ;;
-  esac
-  if [ "$served" = "yes" ]; then printf ''; else printf '14'; fi
-}
-# The only curl the check makes itself: a plaintext call at the mutually
-# authenticated plane. Non-zero means no connection, which is the answer a
-# listener that demands a certificate gives.
-curl() {
-  if [ "$SERVES" = "plaintext" ]; then return 0; fi
-  return 52
-}
-app_request() { printf 'HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n' > "$1"; }
-control_api() { printf '{"nodes":[{"id":"%s","healthy":true}]}' "$NODE_ID"; }
-STUB
-    definition_of check_the_node_management_plane_needs_the_node_key
-    echo 'check_the_node_management_plane_needs_the_node_key'
-    echo 'echo "verdicts: ${CHECKS_PASSED} passed ${CHECKS_FAILED} failed"'
-  } > "$probe"
-  bash "$probe" 2>&1
-}
 
-# $1 what the node opens; $2 what the check's report must say about it.
-# A served call has no header status, which the check prints as "none".
-node_plane_case() {
-  local serves=$1 phrase=$2
-  local name="the node-management check fails when the node serves the ${serves} caller"
-  [ "$serves" = "plaintext" ] \
-    && name="the node-management check fails when the mutually authenticated plane answers a plaintext call"
-  local out
-  out=$(node_plane_probe "$serves")
-  if [ "${out#*verdicts: 0 passed 1 failed}" != "$out" ] && [ "${out#*"$phrase"}" != "$out" ]; then
-    pass "$name"
-  else
-    fail "$name" \
-      "wanted a failure saying \"${phrase}\"; it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 400)"
-  fi
-}
-
-node_plane_case everyone 'expected grpc-status 14 with no credential (got "none")'
-node_plane_case none 'expected grpc-status 14 with no credential (got "none"), with a wrong one (got "14")'
-node_plane_case wrong 'with a wrong one (got "none"), on OnScheduled (got "14")'
-node_plane_case trigger 'on OnScheduled (got "none") and with the retired fleet secret (got "14")'
-# The one that matters most: a node that still honours the value this demo
-# stopped configuring. Nothing else in the run would notice it.
-node_plane_case key 'and with the retired fleet secret (got "none")'
-node_plane_case plaintext 'to be refused at the handshake (curl exited 0, expected non-zero)'
-
-out=$(node_plane_probe shut)
-if [ "${out#*verdicts: 1 passed 0 failed}" != "$out" ]; then
-  pass "the node-management check passes when the plaintext plane serves nobody and the authenticated one refuses a plaintext caller"
-else
-  fail "the node-management check passes when the plaintext plane serves nobody and the authenticated one refuses a plaintext caller" \
-    "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 400)"
-fi
 
 # ----------------------------------------------------------------------
 # 18. A streaming CLI that dies on startup costs one check, not the run
@@ -1822,8 +1774,9 @@ trace_stream_probe() {
   # variable ends that shell and this one goes on to report it.
   BASH_ENV=/dev/null bash --noprofile --norc -c '
     set -euo pipefail
-    DEMO_SH=$1
-    work=$2
+    work=$1
+    shift
+    DEMO_FILES=("$@")
 
     BIN_DIR="${work}/bin"
     LOG_DIR="${work}/logs"
@@ -1835,7 +1788,11 @@ trace_stream_probe() {
     fail_check() { echo "FAIL ${1}"; }
 
     for name in open_trace_stream await_trace_row close_trace_stream check_cli_tail; do
-      eval "$(sed -n "/^${name}() {/,/^}/p" "$DEMO_SH")"
+      for demo_file in "${DEMO_FILES[@]}"; do
+        body=$(sed -n "/^${name}() {/,/^}/p" "$demo_file")
+        [ -n "$body" ] && break
+      done
+      eval "$body"
     done
 
     transcript="${LOG_DIR}/transcript.log"
@@ -1859,7 +1816,7 @@ trace_stream_probe() {
     check_cli_tail
 
     echo "reached the end"
-  ' witness "$DEMO_SH" "$work" 2>&1
+  ' witness "$work" "${DEMO_FILES[@]}" 2>&1
 }
 
 probe_out=$(trace_stream_probe) || true

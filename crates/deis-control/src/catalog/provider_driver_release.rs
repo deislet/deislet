@@ -2929,6 +2929,7 @@ pub(crate) mod tests {
                 ProviderCredentialBindingSpec {
                     backend_id: "cloudflare-workers-pages".to_owned(),
                     name: "revocation-test".to_owned(),
+                    account_id: None,
                 },
                 CredentialMaterial::new(b"revocation-test-credential".to_vec()).unwrap(),
                 context("revocation-credential"),
@@ -3165,6 +3166,7 @@ pub(crate) mod tests {
                 ProviderCredentialBindingSpec {
                     backend_id: "cloudflare-workers-pages".to_owned(),
                     name: "registry-test".to_owned(),
+                    account_id: None,
                 },
                 CredentialMaterial::new(b"registry-test-credential".to_vec()).unwrap(),
                 context("registry-credential"),

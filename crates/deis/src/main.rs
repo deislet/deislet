@@ -229,6 +229,14 @@ enum Commands {
         /// Keep the bundle unminified.
         #[arg(long)]
         no_minify: bool,
+
+        /// Deploy to an external platform through its provider driver.
+        #[arg(
+            long,
+            value_name = "VENDOR",
+            help = "Provider driver vendor (e.g., cloudflare)"
+        )]
+        vendor: Option<String>,
     },
 
     /// List an application's versions and which environments run them.
@@ -468,6 +476,27 @@ enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+
+    /// Log the first owner in with the one-time bootstrap credential.
+    ///
+    /// A fresh control plane with no live credential writes one to
+    /// `<data_dir>/bootstrap.token` (mode 0600). This command trades it for
+    /// the operator's standing token, stored where every later command finds
+    /// it; the control plane revokes the bootstrap credential and deletes its
+    /// file on this login's first successful use.
+    Login {
+        /// The bootstrap.token file the control plane wrote.
+        #[arg(long, value_name = "PATH")]
+        bootstrap: std::path::PathBuf,
+
+        /// The control plane's address. Read from $DEIS_CONTROL_ENDPOINT
+        /// when left out.
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+
+        #[command(flatten)]
+        format: Format,
     },
 
     /// Manage the accounts that may call this platform.
@@ -1265,6 +1294,7 @@ async fn run(cli: Cli) -> Result<()> {
             bundle,
             no_build,
             no_minify,
+            vendor,
         } => {
             commands::deploy::execute(
                 commands::deploy::Args {
@@ -1274,6 +1304,7 @@ async fn run(cli: Cli) -> Result<()> {
                     bundle,
                     no_build,
                     no_minify,
+                    vendor,
                 },
                 format.into(),
             )
@@ -1835,6 +1866,12 @@ async fn run(cli: Cli) -> Result<()> {
             ConfigAction::Unset { key, format } => commands::config::unset(&key, format.into()),
             ConfigAction::List { format } => commands::config::list(format.into()),
         },
+
+        Commands::Login {
+            bootstrap,
+            endpoint,
+            format,
+        } => commands::login::execute(bootstrap, endpoint, format.into()).await,
     }
 }
 
@@ -2004,12 +2041,12 @@ mod tests {
         );
     }
 
-    /// Deploying targets this platform only. A `--vendor` flag here would
-    /// have suggested it could push to Cloudflare or Deno, which it cannot.
+    /// Deploying a vendor routes through the provider driver on the
+    /// control plane (preflight/plan/prepare/upload/verify/activate).
     #[test]
-    fn deploy_takes_no_vendor() {
+    fn deploy_accepts_vendor_flag() {
         assert!(
-            Cli::try_parse_from(["deis", "deploy", "--vendor", "cloudflare"]).is_err(),
+            Cli::try_parse_from(["deis", "deploy", "--vendor", "cloudflare"]).is_ok(),
             "deploy must not accept --vendor"
         );
         assert!(

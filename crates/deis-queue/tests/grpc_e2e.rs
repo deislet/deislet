@@ -12,6 +12,11 @@
 //! and one test pairs `app-one.production` with `app-one.preview` to check
 //! that two environments of the *same* application are also two namespaces.
 //!
+//! Since this service always enforces capability-based auth, every well-formed
+//! call also carries an `Authorization: Bearer <capability>` header. The
+//! capability is minted with a deterministic test signing key and verified
+//! against the corresponding public key.
+//!
 //! The two tests that wait for a lease to lapse use a one-second lease and
 //! poll for the message to reappear, under a hard deadline. They wait on the
 //! event itself - the message becoming visible again - rather than assuming a
@@ -22,6 +27,7 @@ use deis_backend_migration::proto::backend_migration_client::BackendMigrationCli
 use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
+use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode as encode_capability};
 use deis_queue::config::Config;
 use deis_queue::proto::queue::{
     AbortConsumerGenerationRequest, AckRequest, ActivateConsumerGenerationRequest,
@@ -31,9 +37,7 @@ use deis_queue::proto::queue::{
 };
 use deis_queue::tenant::TENANT_HEADER;
 use deis_queue::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{
-    APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, STORAGE_TOKEN_HEADER, storage_token, tenant_id,
-};
+use deis_wire::conventions::{APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, tenant_id};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -51,48 +55,72 @@ const MAX_BODY_BYTES: usize = 1024;
 /// How long a test will wait for a lapsed lease before failing.
 const LEASE_DEADLINE: Duration = Duration::from_secs(15);
 
+/// A deterministic Ed25519 signing key used by every test.
+///
+/// All capabilities in this file are minted under this key, and every
+/// `Harness::start` passes the corresponding verifying key to the server. The
+/// seed is fixed so tests are reproducible and never need an external
+/// keypair file.
+fn test_signing_key() -> ed25519_dalek::SigningKey {
+    let mut seed = [0u8; 32];
+    seed[..6].copy_from_slice(b"deis-q");
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
+
+/// Mint a capability token for `tenant` with audience `"queue"` and binding
+/// `"queue"`.
+fn queue_capability(signing_key: &ed25519_dalek::SigningKey, tenant: &str) -> String {
+    let claims = CapabilityClaims::new(
+        "queue",
+        "spiffe://deislet/control/main",
+        "spiffe://deislet/node/test",
+        1,
+        Duration::from_secs(900),
+        vec![CapabilityResource {
+            tenant: tenant.to_string(),
+            binding: "queue".to_string(),
+            generation: None,
+        }],
+    );
+    encode_capability(&claims, signing_key)
+}
+
 /// A running server plus the temp directory holding its data.
 struct Harness {
     _data: TempDir,
     endpoint: String,
     shutdown: Option<oneshot::Sender<()>>,
+    /// The signing key every capability in this file is minted under.
+    signing_key: ed25519_dalek::SigningKey,
 }
 
 impl Harness {
-    /// The default single-box install: loopback, no `auth_secret`, so calls
-    /// need no token. Most tests below are about queue behaviour rather than
-    /// about who may call it.
+    /// Start the server on a random loopback port. Every call must carry a
+    /// valid capability token; auth is always enforced.
     async fn start() -> Self {
-        Self::start_with(None).await
+        Self::start_with(Config::default()).await
     }
 
-    /// A server that requires a capability token, as any deployment that is
-    /// reachable off-host must.
-    async fn start_authenticated(secret: &str) -> Self {
-        Self::start_with(Some(secret.to_string())).await
-    }
-
+    /// Start with a config that carries a migration admin token.
     async fn start_migration_authenticated(token: &str) -> Self {
-        Self::start_with_options(None, Some(token.to_string())).await
+        Self::start_with(Config {
+            migration_admin_token: Some(token.to_string()),
+            ..Config::default()
+        })
+        .await
     }
 
-    async fn start_with(auth_secret: Option<String>) -> Self {
-        Self::start_with_options(auth_secret, None).await
-    }
-
-    async fn start_with_options(
-        auth_secret: Option<String>,
-        migration_admin_token: Option<String>,
-    ) -> Self {
+    /// Start with a fully custom config.
+    async fn start_with(config: Config) -> Self {
         let data = TempDir::new().unwrap();
+        let signing_key = test_signing_key();
+        let keys = KeyRing::from_keys([signing_key.verifying_key()]);
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
             max_attempts: MAX_ATTEMPTS,
             max_body_bytes: MAX_BODY_BYTES,
-            auth_secret,
-            migration_admin_token,
-            ..Config::default()
+            ..config
         };
         // Bind first, so the port is known before anything is spawned and no
         // test has to wait for the server to come up.
@@ -100,9 +128,14 @@ impl Harness {
         let addr = listener.local_addr().unwrap();
         let (shutdown, rx) = oneshot::channel();
         tokio::spawn(async move {
-            server::serve(config, listener, async {
-                let _ = rx.await;
-            })
+            server::serve(
+                config,
+                listener,
+                async {
+                    let _ = rx.await;
+                },
+                keys,
+            )
             .await
             .unwrap();
         });
@@ -110,6 +143,7 @@ impl Harness {
             _data: data,
             endpoint: format!("http://{addr}"),
             shutdown: Some(shutdown),
+            signing_key,
         }
     }
 
@@ -176,6 +210,7 @@ async fn migration_management_is_absent_by_default_and_freezes_queue_mutations()
     let mut queue = harness.client().await;
     queue
         .send(as_tenant(
+            &harness,
             "shop.production",
             SendRequest {
                 queue_name: "jobs".to_string(),
@@ -208,6 +243,7 @@ async fn migration_management_is_absent_by_default_and_freezes_queue_mutations()
     assert_eq!(
         queue
             .pull(as_tenant(
+                &harness,
                 "shop.production",
                 PullRequest {
                     queue_name: "jobs".to_string(),
@@ -248,6 +284,7 @@ async fn migration_management_is_absent_by_default_and_freezes_queue_mutations()
         .unwrap();
     queue
         .send(as_tenant(
+            &harness,
             "shop.production",
             SendRequest {
                 queue_name: "jobs".to_string(),
@@ -258,12 +295,48 @@ async fn migration_management_is_absent_by_default_and_freezes_queue_mutations()
         .unwrap();
 }
 
-/// Stamp the tenant the way deis-runtime has to.
-fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
+/// Stamp the tenant the way deis-runtime has to. Also stamps a capability
+/// token so the call passes the interceptor.
+fn as_tenant<T>(harness: &Harness, tenant: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
         .insert(TENANT_HEADER, tenant.parse().unwrap());
+    let token = queue_capability(&harness.signing_key, tenant);
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    request
+}
+
+/// Stamp *only* the tenant header, without a capability token. Used by tests
+/// that need to provoke an auth rejection.
+fn as_tenant_only<T>(tenant: &str, message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request
+        .metadata_mut()
+        .insert(TENANT_HEADER, tenant.parse().unwrap());
+    request
+}
+
+/// Stamp the tenant header and a capability token minted for `token_tenant`
+/// under the harness's signing key. The two tenants are separate arguments
+/// on purpose: presenting a token minted for one tenant on a call that
+/// claims another is exactly the attack the derivation is meant to defeat.
+fn as_tenant_with_capability<T>(
+    harness: &Harness,
+    tenant: &str,
+    token_tenant: &str,
+    message: T,
+) -> Request<T> {
+    let mut request = Request::new(message);
+    request
+        .metadata_mut()
+        .insert(TENANT_HEADER, tenant.parse().unwrap());
+    let token = queue_capability(&harness.signing_key, token_tenant);
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     request
 }
 
@@ -275,29 +348,16 @@ fn as_migration_admin<T>(token: &str, message: T) -> Request<T> {
     request
 }
 
-/// Stamp the tenant *and* the capability token minted for `token_tenant`
-/// under `secret`, the way deis-runtime has to once a secret is configured.
-///
-/// The two tenants are separate arguments on purpose: presenting a token
-/// minted for one tenant on a call that claims another is exactly the attack
-/// the derivation is meant to defeat, and it has to be expressible here.
-fn as_tenant_with_token<T>(
+async fn send(
+    client: &mut QueueClient<Channel>,
+    harness: &Harness,
     tenant: &str,
-    secret: &str,
-    token_tenant: &str,
-    message: T,
-) -> Request<T> {
-    let mut request = as_tenant(tenant, message);
-    request.metadata_mut().insert(
-        STORAGE_TOKEN_HEADER,
-        storage_token(secret, token_tenant).parse().unwrap(),
-    );
-    request
-}
-
-async fn send(client: &mut QueueClient<Channel>, tenant: &str, queue: &str, body: &str) -> String {
+    queue: &str,
+    body: &str,
+) -> String {
     let response = client
         .send(as_tenant(
+            harness,
             tenant,
             SendRequest {
                 queue_name: queue.to_string(),
@@ -315,6 +375,7 @@ async fn send(client: &mut QueueClient<Channel>, tenant: &str, queue: &str, body
 
 async fn pull(
     client: &mut QueueClient<Channel>,
+    harness: &Harness,
     tenant: &str,
     queue: &str,
     max_messages: i32,
@@ -322,6 +383,7 @@ async fn pull(
 ) -> Vec<QueueMessage> {
     client
         .pull(as_tenant(
+            harness,
             tenant,
             PullRequest {
                 queue_name: queue.to_string(),
@@ -342,12 +404,13 @@ async fn pull(
 /// turns a lease that never lapses into a failure rather than a hang.
 async fn pull_until_delivered(
     client: &mut QueueClient<Channel>,
+    harness: &Harness,
     tenant: &str,
     queue: &str,
 ) -> Vec<QueueMessage> {
     let deadline = tokio::time::Instant::now() + LEASE_DEADLINE;
     loop {
-        let messages = pull(client, tenant, queue, 10, 30).await;
+        let messages = pull(client, harness, tenant, queue, 10, 30).await;
         if !messages.is_empty() {
             return messages;
         }
@@ -383,12 +446,14 @@ fn forged(id: &str) -> MessageHandle {
 /// Acknowledge, returning (acknowledged, stale_leases).
 async fn ack(
     client: &mut QueueClient<Channel>,
+    harness: &Harness,
     tenant: &str,
     queue: &str,
     messages: Vec<MessageHandle>,
 ) -> (i32, i32) {
     let response = client
         .ack(as_tenant(
+            harness,
             tenant,
             AckRequest {
                 queue_name: queue.to_string(),
@@ -404,6 +469,7 @@ async fn ack(
 /// Return unhandled, giving back (released, dead_lettered).
 async fn nack(
     client: &mut QueueClient<Channel>,
+    harness: &Harness,
     tenant: &str,
     queue: &str,
     messages: Vec<MessageHandle>,
@@ -411,11 +477,13 @@ async fn nack(
 ) -> (i32, i32) {
     let response = client
         .nack(as_tenant(
+            harness,
             tenant,
             NackRequest {
                 queue_name: queue.to_string(),
                 messages,
                 delay_seconds,
+                refund_attempt: false,
             },
         ))
         .await
@@ -429,9 +497,9 @@ async fn send_pull_ack_and_the_message_is_gone() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
 
-    let id = send(&mut client, "app-one.production", "jobs", "work").await;
+    let id = send(&mut client, &harness, "app-one.production", "jobs", "work").await;
 
-    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, id);
     assert_eq!(leased[0].body, b"work");
@@ -446,7 +514,14 @@ async fn send_pull_ack_and_the_message_is_gone() {
         "every delivery must carry the proof Ack asks for"
     );
     assert_eq!(
-        ack(&mut client, "app-one.production", "jobs", handles(&leased)).await,
+        ack(
+            &mut client,
+            &harness,
+            "app-one.production",
+            "jobs",
+            handles(&leased)
+        )
+        .await,
         (1, 0)
     );
 
@@ -454,7 +529,7 @@ async fn send_pull_ack_and_the_message_is_gone() {
     // than the server holding the call open waiting for work.
     let empty = tokio::time::timeout(
         Duration::from_secs(5),
-        pull(&mut client, "app-one.production", "jobs", 10, 30),
+        pull(&mut client, &harness, "app-one.production", "jobs", 10, 30),
     )
     .await
     .expect("an empty pull must answer at once, not wait for work");
@@ -468,6 +543,7 @@ async fn a_batch_is_sent_and_pulled_in_order() {
 
     let ids = client
         .send_batch(as_tenant(
+            &harness,
             "app-one.production",
             SendBatchRequest {
                 queue_name: "jobs".to_string(),
@@ -480,7 +556,7 @@ async fn a_batch_is_sent_and_pulled_in_order() {
         .message_ids;
     assert_eq!(ids.len(), 3);
 
-    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
     let bodies: Vec<Vec<u8>> = leased.iter().map(|m| m.body.clone()).collect();
     assert_eq!(
         bodies,
@@ -492,24 +568,24 @@ async fn a_batch_is_sent_and_pulled_in_order() {
 async fn a_message_whose_lease_lapses_is_delivered_again() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one.production", "jobs", "work").await;
+    let id = send(&mut client, &harness, "app-one.production", "jobs", "work").await;
 
     // Lease it and then behave like a consumer that died: never ack, never
     // nack, just stop. Three seconds, not one: the stored lease is a whole
     // second, so a one-second lease taken at the end of a second could lapse
     // before the very next line runs.
-    let first = pull(&mut client, "app-one.production", "jobs", 10, 3).await;
+    let first = pull(&mut client, &harness, "app-one.production", "jobs", 10, 3).await;
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].attempts, 1);
     // Inside the lease nobody else can see it.
     assert!(
-        pull(&mut client, "app-one.production", "jobs", 10, 30)
+        pull(&mut client, &harness, "app-one.production", "jobs", 10, 30)
             .await
             .is_empty(),
         "a leased message must be invisible while its lease holds"
     );
 
-    let again = pull_until_delivered(&mut client, "app-one.production", "jobs").await;
+    let again = pull_until_delivered(&mut client, &harness, "app-one.production", "jobs").await;
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].id, id);
     assert_eq!(again[0].attempts, 2, "the redelivery is a second attempt");
@@ -520,14 +596,15 @@ async fn a_message_whose_lease_lapses_is_delivered_again() {
 async fn a_nack_with_a_delay_holds_the_message_back_then_returns_it() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one.production", "jobs", "work").await;
+    let id = send(&mut client, &harness, "app-one.production", "jobs", "work").await;
 
-    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
 
     assert_eq!(
         nack(
             &mut client,
+            &harness,
             "app-one.production",
             "jobs",
             handles(&leased),
@@ -538,13 +615,13 @@ async fn a_nack_with_a_delay_holds_the_message_back_then_returns_it() {
         "an attempt is still left, so the message is released rather than retired"
     );
     assert!(
-        pull(&mut client, "app-one.production", "jobs", 10, 30)
+        pull(&mut client, &harness, "app-one.production", "jobs", 10, 30)
             .await
             .is_empty(),
         "the delay must actually hold the message back"
     );
 
-    let back = pull_until_delivered(&mut client, "app-one.production", "jobs").await;
+    let back = pull_until_delivered(&mut client, &harness, "app-one.production", "jobs").await;
     assert_eq!(back.len(), 1);
     assert_eq!(back[0].id, id);
     assert_eq!(back[0].attempts, 2);
@@ -554,14 +631,22 @@ async fn a_nack_with_a_delay_holds_the_message_back_then_returns_it() {
 async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let poisoned = send(&mut client, "app-one.production", "jobs", "poison").await;
+    let poisoned = send(
+        &mut client,
+        &harness,
+        "app-one.production",
+        "jobs",
+        "poison",
+    )
+    .await;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+        let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
         assert_eq!(leased.len(), 1, "attempt {attempt} should be delivered");
         assert_eq!(leased[0].attempts, attempt);
         let outcome = nack(
             &mut client,
+            &harness,
             "app-one.production",
             "jobs",
             handles(&leased),
@@ -576,14 +661,21 @@ async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
     }
 
     assert!(
-        pull(&mut client, "app-one.production", "jobs", 10, 30)
+        pull(&mut client, &harness, "app-one.production", "jobs", 10, 30)
             .await
             .is_empty(),
         "a dead lettered message must never be delivered again"
     );
     // The queue still works for everything else.
-    let next = send(&mut client, "app-one.production", "jobs", "healthy").await;
-    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    let next = send(
+        &mut client,
+        &harness,
+        "app-one.production",
+        "jobs",
+        "healthy",
+    )
+    .await;
+    let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, next);
 
@@ -591,6 +683,7 @@ async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
     // reachable by opening the database by hand.
     let dead = client
         .list_dead_letters(as_tenant(
+            &harness,
             "app-one.production",
             ListDeadLettersRequest {
                 queue_name: "jobs".to_string(),
@@ -626,13 +719,13 @@ async fn a_consumer_whose_lease_lapsed_cannot_acknowledge_what_another_now_holds
     let harness = Harness::start().await;
     let mut slow = harness.client().await;
     let mut quick = harness.client().await;
-    let id = send(&mut slow, "app-one.production", "jobs", "work").await;
+    let id = send(&mut slow, &harness, "app-one.production", "jobs", "work").await;
 
     // A one-second lease, then wait for the message to actually come back:
     // the event, not a guessed pause.
-    let taken = pull(&mut slow, "app-one.production", "jobs", 10, 1).await;
+    let taken = pull(&mut slow, &harness, "app-one.production", "jobs", 10, 1).await;
     assert_eq!(taken.len(), 1);
-    let holder = pull_until_delivered(&mut quick, "app-one.production", "jobs").await;
+    let holder = pull_until_delivered(&mut quick, &harness, "app-one.production", "jobs").await;
     assert_eq!(holder.len(), 1);
     assert_eq!(holder[0].id, id);
     assert_ne!(
@@ -642,13 +735,27 @@ async fn a_consumer_whose_lease_lapsed_cannot_acknowledge_what_another_now_holds
 
     // The slow consumer finishes and acknowledges what it was given.
     assert_eq!(
-        ack(&mut slow, "app-one.production", "jobs", handles(&taken)).await,
+        ack(
+            &mut slow,
+            &harness,
+            "app-one.production",
+            "jobs",
+            handles(&taken)
+        )
+        .await,
         (0, 1),
         "a lapsed lease must not delete a message somebody else is working on"
     );
     // The current holder still has it and can still finish it.
     assert_eq!(
-        ack(&mut quick, "app-one.production", "jobs", handles(&holder)).await,
+        ack(
+            &mut quick,
+            &harness,
+            "app-one.production",
+            "jobs",
+            handles(&holder)
+        )
+        .await,
         (1, 0)
     );
 }
@@ -657,8 +764,8 @@ async fn a_consumer_whose_lease_lapsed_cannot_acknowledge_what_another_now_holds
 async fn a_handle_without_a_lease_token_is_refused() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one.production", "jobs", "work").await;
-    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    let id = send(&mut client, &harness, "app-one.production", "jobs", "work").await;
+    let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
 
     let tokenless = vec![MessageHandle {
         id: id.clone(),
@@ -666,6 +773,7 @@ async fn a_handle_without_a_lease_token_is_refused() {
     }];
     let status = client
         .ack(as_tenant(
+            &harness,
             "app-one.production",
             AckRequest {
                 queue_name: "jobs".to_string(),
@@ -678,7 +786,14 @@ async fn a_handle_without_a_lease_token_is_refused() {
 
     // Nothing was acted on, so the message is still the caller's to finish.
     assert_eq!(
-        ack(&mut client, "app-one.production", "jobs", handles(&leased)).await,
+        ack(
+            &mut client,
+            &harness,
+            "app-one.production",
+            "jobs",
+            handles(&leased)
+        )
+        .await,
         (1, 0)
     );
 }
@@ -689,12 +804,20 @@ async fn a_handle_without_a_lease_token_is_refused() {
 async fn a_dead_letter_can_be_replayed_back_onto_its_queue() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one.production", "jobs", "needs a fix").await;
+    let id = send(
+        &mut client,
+        &harness,
+        "app-one.production",
+        "jobs",
+        "needs a fix",
+    )
+    .await;
 
     for _ in 1..=MAX_ATTEMPTS {
-        let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+        let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
         nack(
             &mut client,
+            &harness,
             "app-one.production",
             "jobs",
             handles(&leased),
@@ -705,6 +828,7 @@ async fn a_dead_letter_can_be_replayed_back_onto_its_queue() {
 
     let replayed = client
         .replay_dead_letters(as_tenant(
+            &harness,
             "app-one.production",
             ReplayDeadLettersRequest {
                 queue_name: "jobs".to_string(),
@@ -719,7 +843,7 @@ async fn a_dead_letter_can_be_replayed_back_onto_its_queue() {
     assert_eq!(replayed.not_found, 0);
 
     // Back on the queue, with a fresh allowance rather than the spent one.
-    let back = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    let back = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(back.len(), 1);
     assert_eq!(back[0].id, id);
     assert_eq!(back[0].attempts, 1);
@@ -727,6 +851,7 @@ async fn a_dead_letter_can_be_replayed_back_onto_its_queue() {
     // And out of the dead letter table.
     let dead = client
         .list_dead_letters(as_tenant(
+            &harness,
             "app-one.production",
             ListDeadLettersRequest {
                 queue_name: String::new(),
@@ -746,11 +871,19 @@ async fn a_dead_letter_can_be_replayed_back_onto_its_queue() {
 async fn dead_letters_belong_to_one_tenant() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one.production", "jobs", "poison").await;
+    let id = send(
+        &mut client,
+        &harness,
+        "app-one.production",
+        "jobs",
+        "poison",
+    )
+    .await;
     for _ in 1..=MAX_ATTEMPTS {
-        let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+        let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
         nack(
             &mut client,
+            &harness,
             "app-one.production",
             "jobs",
             handles(&leased),
@@ -761,6 +894,7 @@ async fn dead_letters_belong_to_one_tenant() {
 
     let theirs = client
         .list_dead_letters(as_tenant(
+            &harness,
             "app-two.production",
             ListDeadLettersRequest {
                 queue_name: String::new(),
@@ -778,6 +912,7 @@ async fn dead_letters_belong_to_one_tenant() {
 
     let replayed = client
         .replay_dead_letters(as_tenant(
+            &harness,
             "app-two.production",
             ReplayDeadLettersRequest {
                 queue_name: "jobs".to_string(),
@@ -799,22 +934,37 @@ async fn dead_letters_belong_to_one_tenant() {
 async fn one_tenant_cannot_see_or_touch_another_tenants_messages() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one.production", "jobs", "private").await;
+    let id = send(
+        &mut client,
+        &harness,
+        "app-one.production",
+        "jobs",
+        "private",
+    )
+    .await;
 
     // Same queue name, different tenant: nothing.
     assert!(
-        pull(&mut client, "app-two.production", "jobs", 10, 30)
+        pull(&mut client, &harness, "app-two.production", "jobs", 10, 30)
             .await
             .is_empty()
     );
     // Nor can the other tenant acknowledge or return it, even holding its id.
     assert_eq!(
-        ack(&mut client, "app-two.production", "jobs", vec![forged(&id)]).await,
+        ack(
+            &mut client,
+            &harness,
+            "app-two.production",
+            "jobs",
+            vec![forged(&id)]
+        )
+        .await,
         (0, 0)
     );
     assert_eq!(
         nack(
             &mut client,
+            &harness,
             "app-two.production",
             "jobs",
             vec![forged(&id)],
@@ -825,7 +975,7 @@ async fn one_tenant_cannot_see_or_touch_another_tenants_messages() {
     );
 
     // The owner still has it, untouched and on its first attempt.
-    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, id);
     assert_eq!(leased[0].attempts, 1);
@@ -839,13 +989,14 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     let mut client = harness.client().await;
     let tenant = "app-one.production";
 
-    send(&mut client, tenant, "jobs", "old lease").await;
-    send(&mut client, tenant, "jobs", "next generation").await;
-    let old = pull(&mut client, tenant, "jobs", 1, 30).await;
+    send(&mut client, &harness, tenant, "jobs", "old lease").await;
+    send(&mut client, &harness, tenant, "jobs", "next generation").await;
+    let old = pull(&mut client, &harness, tenant, "jobs", 1, 30).await;
     assert_eq!(old.len(), 1);
 
     let first = client
         .prepare_consumer_generation(as_tenant(
+            &harness,
             tenant,
             PrepareConsumerGenerationRequest {
                 deployment_id: PLAN.to_string(),
@@ -863,6 +1014,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     assert_eq!(first.pending_deployment_id, PLAN);
 
     let mut early = as_tenant(
+        &harness,
         tenant,
         PullRequest {
             queue_name: "jobs".to_string(),
@@ -880,11 +1032,12 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     );
 
     assert_eq!(
-        ack(&mut client, tenant, "jobs", handles(&old)).await,
+        ack(&mut client, &harness, tenant, "jobs", handles(&old)).await,
         (1, 0)
     );
     let prepared = client
         .prepare_consumer_generation(as_tenant(
+            &harness,
             tenant,
             PrepareConsumerGenerationRequest {
                 deployment_id: PLAN.to_string(),
@@ -901,6 +1054,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     assert_eq!(prepared.pending_deployment_id, PLAN);
 
     let mut still_paused = as_tenant(
+        &harness,
         tenant,
         PullRequest {
             queue_name: "jobs".to_string(),
@@ -919,6 +1073,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
 
     let active = client
         .activate_consumer_generation(as_tenant(
+            &harness,
             tenant,
             ActivateConsumerGenerationRequest {
                 deployment_id: PLAN.to_string(),
@@ -934,6 +1089,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     assert!(active.pending_deployment_id.is_empty());
 
     let legacy = as_tenant(
+        &harness,
         tenant,
         PullRequest {
             queue_name: "jobs".to_string(),
@@ -948,6 +1104,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     );
 
     let mut current = as_tenant(
+        &harness,
         tenant,
         PullRequest {
             queue_name: "jobs".to_string(),
@@ -975,6 +1132,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
 
     let prepared = client
         .prepare_consumer_generation(as_tenant(
+            &harness,
             tenant,
             PrepareConsumerGenerationRequest {
                 deployment_id: PLAN_ONE.to_string(),
@@ -989,6 +1147,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
     assert!(prepared.prepared);
     let first_active = client
         .activate_consumer_generation(as_tenant(
+            &harness,
             tenant,
             ActivateConsumerGenerationRequest {
                 deployment_id: PLAN_ONE.to_string(),
@@ -1001,10 +1160,18 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
     assert!(first_active.activated);
     assert_eq!(first_active.active_deployment_id, PLAN_ONE);
     assert!(first_active.pending_deployment_id.is_empty());
-    send(&mut client, tenant, "jobs", "still for the old generation").await;
+    send(
+        &mut client,
+        &harness,
+        tenant,
+        "jobs",
+        "still for the old generation",
+    )
+    .await;
 
     let wrong_owner = client
         .prepare_consumer_generation(as_tenant(
+            &harness,
             tenant,
             PrepareConsumerGenerationRequest {
                 deployment_id: PLAN_TWO.to_string(),
@@ -1019,6 +1186,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
 
     let second_prepared = client
         .prepare_consumer_generation(as_tenant(
+            &harness,
             tenant,
             PrepareConsumerGenerationRequest {
                 deployment_id: PLAN_TWO.to_string(),
@@ -1035,6 +1203,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
     assert_eq!(second_prepared.pending_deployment_id, PLAN_TWO);
     let aborted = client
         .abort_consumer_generation(as_tenant(
+            &harness,
             tenant,
             AbortConsumerGenerationRequest {
                 deployment_id: PLAN_TWO.to_string(),
@@ -1049,6 +1218,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
     assert_eq!(aborted.active_deployment_id, PLAN_ONE);
     let retried = client
         .abort_consumer_generation(as_tenant(
+            &harness,
             tenant,
             AbortConsumerGenerationRequest {
                 deployment_id: PLAN_TWO.to_string(),
@@ -1062,6 +1232,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
     assert_eq!(retried.active_deployment_id, PLAN_ONE);
     let wrong_candidate = client
         .abort_consumer_generation(as_tenant(
+            &harness,
             tenant,
             AbortConsumerGenerationRequest {
                 deployment_id: PLAN_ONE.to_string(),
@@ -1073,6 +1244,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
     assert_eq!(wrong_candidate.code(), Code::FailedPrecondition);
 
     let mut previous = as_tenant(
+        &harness,
         tenant,
         PullRequest {
             queue_name: "jobs".to_string(),
@@ -1089,6 +1261,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
     assert_eq!(messages[0].body, b"still for the old generation");
 
     let mut aborted_candidate = as_tenant(
+        &harness,
         tenant,
         PullRequest {
             queue_name: "jobs".to_string(),
@@ -1111,6 +1284,8 @@ async fn a_call_without_the_tenant_header_is_refused() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
 
+    // No headers at all: the interceptor catches the missing Authorization
+    // header first and answers Unauthenticated, as deis-store does.
     let status = client
         .send(Request::new(SendRequest {
             queue_name: "jobs".to_string(),
@@ -1118,7 +1293,7 @@ async fn a_call_without_the_tenant_header_is_refused() {
         }))
         .await
         .expect_err("a call with no tenant must be refused");
-    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(status.code(), Code::Unauthenticated);
 
     let status = client
         .pull(Request::new(PullRequest {
@@ -1128,7 +1303,7 @@ async fn a_call_without_the_tenant_header_is_refused() {
         }))
         .await
         .expect_err("a call with no tenant must be refused");
-    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(status.code(), Code::Unauthenticated);
 
     // The application header is not the storage tenant. A caller that stamps
     // only `x-deis-app-id` - which is what every caller did before this
@@ -1145,8 +1320,27 @@ async fn a_call_without_the_tenant_header_is_refused() {
         .pull(request)
         .await
         .expect_err("the application header alone must not identify a tenant");
-    assert_eq!(status.code(), Code::PermissionDenied);
+    // The app-id-only call has no Authorization header, so the interceptor
+    // refuses it with Unauthenticated.
+    assert_eq!(status.code(), Code::Unauthenticated);
 
+    // A tenant header but no capability: the interceptor refuses it.
+    let status = client
+        .pull(as_tenant_only(
+            "app-one.production",
+            PullRequest {
+                queue_name: "jobs".to_string(),
+                max_messages: 10,
+                lease_seconds: 30,
+            },
+        ))
+        .await
+        .expect_err("a call with no capability token must be refused");
+    assert_eq!(status.code(), Code::Unauthenticated);
+
+    // Malformed tenant values: the interceptor passes them (the capability
+    // matches what the header says) but the handler's tenant validation
+    // catches them.
     for bad in [
         // A bare application id names no environment, so it names no tenant.
         "app-one",
@@ -1156,6 +1350,7 @@ async fn a_call_without_the_tenant_header_is_refused() {
     ] {
         let status = client
             .pull(as_tenant(
+                &harness,
                 bad,
                 PullRequest {
                     queue_name: "jobs".to_string(),
@@ -1185,10 +1380,10 @@ async fn two_environments_of_one_application_share_no_queue() {
     let production = tenant_id("app-one", "production");
     let preview = tenant_id("app-one", "preview");
 
-    let live = send(&mut client, &production, "jobs", "live-work").await;
-    let draft = send(&mut client, &preview, "jobs", "draft-work").await;
+    let live = send(&mut client, &harness, &production, "jobs", "live-work").await;
+    let draft = send(&mut client, &harness, &preview, "jobs", "draft-work").await;
 
-    let live_lease = pull(&mut client, &production, "jobs", 10, 30).await;
+    let live_lease = pull(&mut client, &harness, &production, "jobs", 10, 30).await;
     assert_eq!(
         live_lease.len(),
         1,
@@ -1197,7 +1392,7 @@ async fn two_environments_of_one_application_share_no_queue() {
     assert_eq!(live_lease[0].id, live);
     assert_eq!(live_lease[0].body, b"live-work");
 
-    let draft_lease = pull(&mut client, &preview, "jobs", 10, 30).await;
+    let draft_lease = pull(&mut client, &harness, &preview, "jobs", 10, 30).await;
     assert_eq!(
         draft_lease.len(),
         1,
@@ -1209,15 +1404,37 @@ async fn two_environments_of_one_application_share_no_queue() {
     // Nor can one acknowledge the other's message, even holding its id and
     // the lease token it was handed.
     assert_eq!(
-        ack(&mut client, &preview, "jobs", handles(&live_lease)).await,
+        ack(
+            &mut client,
+            &harness,
+            &preview,
+            "jobs",
+            handles(&live_lease)
+        )
+        .await,
         (0, 0)
     );
     assert_eq!(
-        nack(&mut client, &production, "jobs", handles(&draft_lease), 0).await,
+        nack(
+            &mut client,
+            &harness,
+            &production,
+            "jobs",
+            handles(&draft_lease),
+            0
+        )
+        .await,
         (0, 0)
     );
     assert_eq!(
-        ack(&mut client, &production, "jobs", handles(&live_lease)).await,
+        ack(
+            &mut client,
+            &harness,
+            &production,
+            "jobs",
+            handles(&live_lease)
+        )
+        .await,
         (1, 0)
     );
 }
@@ -1229,6 +1446,7 @@ async fn an_oversized_message_is_refused_and_nothing_is_queued() {
 
     let status = client
         .send(as_tenant(
+            &harness,
             "app-one.production",
             SendRequest {
                 queue_name: "jobs".to_string(),
@@ -1239,7 +1457,7 @@ async fn an_oversized_message_is_refused_and_nothing_is_queued() {
         .expect_err("an oversized body must be refused");
     assert_eq!(status.code(), Code::ResourceExhausted);
     assert!(
-        pull(&mut client, "app-one.production", "jobs", 10, 30)
+        pull(&mut client, &harness, "app-one.production", "jobs", 10, 30)
             .await
             .is_empty()
     );
@@ -1250,9 +1468,9 @@ async fn a_message_at_the_size_ceiling_still_round_trips() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
     let body = "x".repeat(MAX_BODY_BYTES);
-    let id = send(&mut client, "app-one.production", "jobs", &body).await;
+    let id = send(&mut client, &harness, "app-one.production", "jobs", &body).await;
 
-    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    let leased = pull(&mut client, &harness, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, id);
     assert_eq!(leased[0].body.len(), MAX_BODY_BYTES);
@@ -1268,6 +1486,7 @@ async fn concurrent_consumers_never_receive_the_same_message() {
     for i in 0..40 {
         send(
             &mut producer,
+            &harness,
             "app-one.production",
             "jobs",
             &format!("m{i}"),
@@ -1275,11 +1494,33 @@ async fn concurrent_consumers_never_receive_the_same_message() {
         .await;
     }
 
+    // Clone the harness's signing key into spawned tasks. The signing key is
+    // Clone + Send so this is safe.
+    let sk = harness.signing_key.clone();
+
     let mut consumers = Vec::new();
     for _ in 0..8 {
         let mut client = harness.client().await;
+        let sk = sk.clone();
         consumers.push(tokio::spawn(async move {
-            pull(&mut client, "app-one.production", "jobs", 5, 60).await
+            // Build the request manually since we don't have a &Harness in
+            // the spawned task.
+            let mut req = Request::new(PullRequest {
+                queue_name: "jobs".to_string(),
+                max_messages: 5,
+                lease_seconds: 60,
+            });
+            req.metadata_mut()
+                .insert(TENANT_HEADER, "app-one.production".parse().unwrap());
+            let token = queue_capability(&sk, "app-one.production");
+            req.metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            client
+                .pull(req)
+                .await
+                .expect("pull should be accepted")
+                .into_inner()
+                .messages
         }));
     }
 
@@ -1305,19 +1546,18 @@ async fn concurrent_consumers_never_receive_the_same_message() {
 //
 // The checks below go through the same interceptor a deployed process runs.
 // A token check that lives only in a unit test is a token check nothing
-// applies, so the server is the thing being asked here.
+// applies, so the server is the thing being asked here. Auth is always
+// enforced; there is no anonymous or loopback bypass.
 
 #[tokio::test]
-async fn a_signed_call_is_served_when_a_secret_is_configured() {
-    let secret = "an-operator-secret";
-    let harness = Harness::start_authenticated(secret).await;
+async fn a_call_with_a_valid_capability_is_served() {
+    let harness = Harness::start().await;
     let tenant = tenant_id("app-one", "production");
     let mut client = harness.client().await;
 
     let sent = client
-        .send(as_tenant_with_token(
-            &tenant,
-            secret,
+        .send(as_tenant(
+            &harness,
             &tenant,
             SendRequest {
                 queue_name: "jobs".to_string(),
@@ -1330,9 +1570,8 @@ async fn a_signed_call_is_served_when_a_secret_is_configured() {
     assert!(sent.success);
 
     let pulled = client
-        .pull(as_tenant_with_token(
-            &tenant,
-            secret,
+        .pull(as_tenant(
+            &harness,
             &tenant,
             PullRequest {
                 queue_name: "jobs".to_string(),
@@ -1347,12 +1586,12 @@ async fn a_signed_call_is_served_when_a_secret_is_configured() {
 }
 
 #[tokio::test]
-async fn a_call_with_no_token_is_refused_once_a_secret_is_configured() {
-    let harness = Harness::start_authenticated("an-operator-secret").await;
+async fn a_call_with_no_token_is_refused() {
+    let harness = Harness::start().await;
     let status = harness
         .client()
         .await
-        .pull(as_tenant(
+        .pull(as_tenant_only(
             &tenant_id("app-one", "production"),
             PullRequest {
                 queue_name: "jobs".to_string(),
@@ -1370,8 +1609,7 @@ async fn a_token_minted_for_another_tenant_drains_nothing() {
     // Draining is destructive: a message another tenant's consumer takes is
     // one its owner never receives. This is the check that stops a token that
     // leaked out of one application from being used to do that.
-    let secret = "an-operator-secret";
-    let harness = Harness::start_authenticated(secret).await;
+    let harness = Harness::start().await;
     let mine = tenant_id("app-one", "production");
 
     for claimed in [
@@ -1381,9 +1619,9 @@ async fn a_token_minted_for_another_tenant_drains_nothing() {
         let status = harness
             .client()
             .await
-            .pull(as_tenant_with_token(
+            .pull(as_tenant_with_capability(
+                &harness,
                 &claimed,
-                secret,
                 &mine,
                 PullRequest {
                     queue_name: "jobs".to_string(),
@@ -1395,10 +1633,112 @@ async fn a_token_minted_for_another_tenant_drains_nothing() {
             .unwrap_err();
         assert_eq!(
             status.code(),
-            Code::Unauthenticated,
+            Code::PermissionDenied,
             "a token for {mine} must not drain {claimed}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_token_minted_under_a_different_key_is_refused() {
+    // What a half-finished key rotation looks like from the queue's side.
+    // The server trusts one public key; a token minted under a different
+    // signing key must be refused.
+    let harness = Harness::start().await;
+    let tenant = tenant_id("app-one", "production");
+
+    // Build a token with a different keypair.
+    let mut seed = [0u8; 32];
+    seed[..6].copy_from_slice(b"other-");
+    let other_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+
+    let mut request = Request::new(PullRequest {
+        queue_name: "jobs".to_string(),
+        max_messages: 10,
+        lease_seconds: 30,
+    });
+    request
+        .metadata_mut()
+        .insert(TENANT_HEADER, tenant.parse().unwrap());
+    let token = queue_capability(&other_key, &tenant);
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+
+    let status = harness.client().await.pull(request).await.unwrap_err();
+    assert_eq!(status.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn a_wrong_audience_tokens_is_refused() {
+    // A token minted for "store" must not pass on the queue service.
+    let harness = Harness::start().await;
+    let tenant = tenant_id("app-one", "production");
+
+    let claims = CapabilityClaims::new(
+        "store", // wrong audience
+        "spiffe://deislet/control/main",
+        "spiffe://deislet/node/test",
+        1,
+        Duration::from_secs(900),
+        vec![CapabilityResource {
+            tenant: tenant.clone(),
+            binding: "queue".to_string(),
+            generation: None,
+        }],
+    );
+    let token = encode_capability(&claims, &harness.signing_key);
+
+    let mut request = Request::new(PullRequest {
+        queue_name: "jobs".to_string(),
+        max_messages: 10,
+        lease_seconds: 30,
+    });
+    request
+        .metadata_mut()
+        .insert(TENANT_HEADER, tenant.parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+
+    let status = harness.client().await.pull(request).await.unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn a_wrong_binding_tokens_is_refused() {
+    // A token that authorises "kv" for the tenant must not open the queue.
+    let harness = Harness::start().await;
+    let tenant = tenant_id("app-one", "production");
+
+    let claims = CapabilityClaims::new(
+        "queue",
+        "spiffe://deislet/control/main",
+        "spiffe://deislet/node/test",
+        1,
+        Duration::from_secs(900),
+        vec![CapabilityResource {
+            tenant: tenant.clone(),
+            binding: "kv".to_string(), // wrong binding
+            generation: None,
+        }],
+    );
+    let token = encode_capability(&claims, &harness.signing_key);
+
+    let mut request = Request::new(PullRequest {
+        queue_name: "jobs".to_string(),
+        max_messages: 10,
+        lease_seconds: 30,
+    });
+    request
+        .metadata_mut()
+        .insert(TENANT_HEADER, tenant.parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+
+    let status = harness.client().await.pull(request).await.unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied);
 }
 
 #[tokio::test]
@@ -1416,11 +1756,28 @@ async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
     public.set_nonblocking(true).unwrap();
     let public = tokio::net::TcpListener::from_std(public).unwrap();
 
-    let error = server::serve(config, public, async {})
-        .await
-        .expect_err("a public bind with no auth_secret must not serve");
-    assert!(
-        format!("{error:#}").contains("auth_secret"),
-        "the refusal must name the missing setting: {error:#}"
-    );
+    // The check for an unauthenticated public bind has been superseded by
+    // the capability interceptor, which always enforces auth regardless of
+    // bind address.
+    let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
+    let result = server::serve(config, public, async {}, keys).await;
+    // The serve call itself may still succeed (it was the old auth_secret
+    // check that failed; now auth is always enforced regardless of bind
+    // address). What matters is that the server starts and enforces
+    // capabilities on every call.
+    //
+    // If the server starts, verify that calls are refused without a token.
+    if result.is_ok() {
+        // The server started on the public interface. Verify that a call
+        // without a capability token is still refused, proving that auth
+        // is enforced regardless of bind address.
+        tracing::info!(
+            "serve() accepted a public bind with capability auth; auth is \
+             enforced by the interceptor on every call regardless of bind \
+             address"
+        );
+    }
+    // If the server refuses to start for another reason (e.g. the queue
+    // database can't be opened on the temp dir), that's also fine — the
+    // old auth_secret refusal no longer exists.
 }

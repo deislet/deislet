@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use sha2::Digest;
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -465,6 +466,36 @@ mod tests {
     }
 
     #[test]
+    fn a_deployment_env_keeps_both_capabilities_apart() {
+        // deis-store and deis-queue each accept only their own audience, so
+        // the two tokens the control plane ships must both survive the wiring
+        // and stay in their own slots: losing the queue one leaves every send
+        // and every consumer poll refused.
+        let mut map = env(&[
+            ("DEIS_STORE_ENDPOINT", "http://store:8090"),
+            ("DEIS_QUEUE_ENDPOINT", "http://queue:8091"),
+            (STORAGE_TOKEN_KEY, "v1.store-capability"),
+            (QUEUE_TOKEN_KEY, "v1.queue-capability"),
+        ]);
+
+        wire_deployment_env(
+            &manifest(
+                r#"{
+                    "schema": 1,
+                    "app": "demo",
+                    "entry": "worker/index.js",
+                    "services": { "kv": true, "queue": true }
+                }"#,
+            ),
+            &mut map,
+        );
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+        assert_eq!(wiring.storage_token.as_deref(), Some("v1.store-capability"));
+        assert_eq!(wiring.queue_token.as_deref(), Some("v1.queue-capability"));
+    }
+
+    #[test]
     fn a_deployment_without_addresses_declares_services_but_binds_none() {
         let mut map = env(&[("LOG_LEVEL", "info")]);
         wire_deployment_env(
@@ -678,8 +709,8 @@ mod tests {
             Some("demo.production")
         );
         assert_eq!(
-            header(deis_wire::conventions::STORAGE_TOKEN_HEADER).as_deref(),
-            Some("a-minted-token")
+            header("authorization").as_deref(),
+            Some("Bearer a-minted-token")
         );
         assert!(identity.is_proven());
     }
@@ -694,10 +725,7 @@ mod tests {
             .metadata()
             .get(deis_wire::conventions::TENANT_HEADER)
             .is_some());
-        assert!(request
-            .metadata()
-            .get(deis_wire::conventions::STORAGE_TOKEN_HEADER)
-            .is_none());
+        assert!(request.metadata().get("authorization").is_none());
         assert!(!identity.is_proven());
     }
 
@@ -729,9 +757,27 @@ mod tests {
 
         let mut map = env(&[("DEIS_SERVICES", "kv")]);
         map.insert("DEIS_STORE_ENDPOINT".to_string(), store.endpoint.clone());
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, SECRET.as_bytes());
+        let hash = sha2::Digest::finalize(hasher);
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let claims = deis_capability::CapabilityClaims::new(
+            "store",
+            "spiffe://deislet/control/main",
+            "spiffe://deislet/node/test",
+            1,
+            std::time::Duration::from_secs(900),
+            vec![deis_capability::CapabilityResource {
+                tenant: tenant.to_string(),
+                binding: "kv".to_string(),
+                generation: None,
+            }],
+        );
         map.insert(
             deis_wire::conventions::STORAGE_TOKEN_ENV.to_string(),
-            deis_wire::conventions::storage_token(SECRET, tenant),
+            deis_capability::encode(&claims, &signing_key),
         );
 
         let wiring = ServiceWiring::take_from_env(&mut map);

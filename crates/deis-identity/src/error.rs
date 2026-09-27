@@ -81,6 +81,15 @@ pub enum IdentityError {
     WrongPeer { presented: String, expected: String },
 
     #[error(
+        "a peer proved the name {presented}, which our trust root signed, but it names {presented_kind} rather than the {expected_kind} this listener takes traffic from"
+    )]
+    WrongKind {
+        presented: String,
+        presented_kind: String,
+        expected_kind: String,
+    },
+
+    #[error(
         "this connection carries no peer certificate, so there is no name to read; a listener built from this crate cannot produce such a connection"
     )]
     NoPeerCertificate,

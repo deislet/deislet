@@ -330,7 +330,11 @@ mod tests {
         "#;
 
         let config = AppConfig {
-            env: store.kv_env(),
+            env: {
+                let mut env = std::collections::HashMap::new();
+                store.kv_wiring_for("kvtest.production").write_to_env(&mut env);
+                env
+            },
             ..AppConfig::default()
         };
         manager
@@ -419,12 +423,12 @@ mod tests {
         let manager = ApplicationManager::with_threads(Some(1));
         let limits = ResourceLimits {
             memory_mb: 0,
-            cpu_milli: 0,
             resource_table_max: None,
             timeout_ms: Some(5_000),
             rate_limit_ops_per_sec: Some(10.0),
             cpu_time_limit_ms: None,
             max_subrequests: None,
+            max_outbound_connections: None,
         };
         let effective = manager.effective_limits(&key("app_b"), Some(&limits));
         assert_eq!(effective.timeout_ms, 5_000);
@@ -438,12 +442,12 @@ mod tests {
         let manager = ApplicationManager::with_threads(Some(1));
         let limits = ResourceLimits {
             memory_mb: 0,
-            cpu_milli: 0,
             resource_table_max: None,
             timeout_ms: Some(5_000),
             rate_limit_ops_per_sec: None,
             cpu_time_limit_ms: None,
             max_subrequests: None,
+            max_outbound_connections: None,
         };
         let effective = manager.effective_limits(&key("app_c"), Some(&limits));
         assert_eq!(effective.timeout_ms, 5_000);

@@ -105,23 +105,18 @@ certificate = "/etc/deis-control/certs/control.pem"
 private_key = "/etc/deis-control/certs/control-key.pem"
 trust_root = "/etc/deis-control/certs/trust-root.pem"
 
-# node_preshared_keys is OPTIONAL now, and does less than it used to: it no
-# longer reaches the assignment list, the bundle download or registration -
-# those answer only to the certificate above, on the [machine] listener.
-# With [machine] configured, leaving this empty (or leaving it out
-# entirely) is the finished state: no fleet-wide value is minted in its
-# place, because every peer proves a certificate instead and there is
-# nothing left for a shared value to decide. What the list still does,
-# only while a fleet is mid-migration: it is the credential deis-proxy's
-# own gRPC control channel falls back to when that proxy has no
-# certificate of its own yet, and the bearer this control plane presents
-# on a node's plaintext management plane when that node has none either.
-# Where it is still set, make it `openssl rand -hex 32` - deis-proxy warns
-# about a value under 32 characters. The control plane shows the first 12
-# hex characters of each value's SHA-256 (as `key_fingerprint` on
-# /api/runtime and in a retired-key error) to tell values apart during a
-# rotation. See docs/trust-boundaries.md.
-node_preshared_keys = []
+# node_preshared_keys is RETIRED.  The control plane will refuse to start
+# if this key appears anywhere in the configuration file.  Every door it
+# once guarded (assignments, bundles, registration, routing table) is now
+# served exclusively on the [machine] listener with mutual TLS — see
+# docs/adr/025-machine-identity-and-capabilities.md.
+#
+# To migrate a fleet: configure [machine] on every node and proxy, verify
+# that the fleet works with node_preshared_keys set to an empty list, then
+# delete this section and remove it from every node's [control] secret.
+# The refuse_a_retired_fleet_key check in config.rs names the exact lines
+# to remove.
+# node_preshared_keys = []
 
 # Require an API key on the dashboard and the human API (recommended).
 # This setting does not reach the machine channel above.
@@ -860,7 +855,7 @@ the console, and cannot run a single one of them.
 | The catalog database | `--database`, e.g. `/var/lib/deis-control/deis-control.db` | Applications, versions, environments, deployment pointers, routes, accounts, scoped tokens, the encrypted secrets and the audit log. |
 | **The bundle store** | `bundle_dir`, e.g. `/var/lib/deis-control/bundles` | Every version's code. The database keeps a *path*, not the bytes. A node fetching a version whose file is gone gets `500 bundle ... is recorded but missing on disk`, and re-uploading cannot repair it: the manifest is inside the archive whose sha256 **is** the version id, so an upload of the same source produces a different version. Rollback to any earlier version becomes impossible. |
 | **The secret master key** | `secret_key_file`, e.g. `/etc/deis-control/secret.key` | Every environment secret. The values in the database are encrypted with this key and decrypt with no other. Without the file, secret endpoints answer 503 and **every application that has a secret is withheld from each node's assignment list** - the list comes back marked incomplete, so a node reconciling against it keeps whatever it is already running and starts none of them. On a node that was rebuilt with the platform, that is nothing at all. |
-| The configuration file | `-c`, e.g. `/etc/deis-control/config.toml` | `api_keys` and `storage_auth_secret` are shared with the rest of the fleet; a restored control plane with new values is one the CLI and the data-plane services can't talk to. `node_preshared_keys` matters the same way only for a fleet still mid-migration - a node or a proxy that already has a `[machine_identity]` certificate does not read this file's values at all, because it authenticates by the name on its certificate instead. |
+| The configuration file | `-c`, e.g. `/etc/deis-control/config.toml` | `secret_key_file` names the master key that decrypts environment secrets and the capability signing keys in the database; a restored control plane with a different key refuses to start rather than sign with keys deis-store and deis-queue have never seen. `node_preshared_keys` matters the same way only for a fleet still mid-migration - a node or a proxy that already has a `[machine_identity]` certificate does not read this file's values at all, because it authenticates by the name on its certificate instead. |
 
 Not in this table, and not covered by this document's backup script: the
 `[machine]` table's own certificate, private key and trust root. This file

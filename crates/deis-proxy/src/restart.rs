@@ -302,7 +302,11 @@ pub fn prove_pid_file_writable(path: &str) -> Result<()> {
         .unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
         bail!(
-            "the directory holding pid_file, {}, does not exist or is not a directory. In daemon              mode pingora writes the pid file after it has taken the listening sockets over and              panics if it cannot, so this would be a daemon that serves nothing: create the              directory (a service manager usually does, e.g. systemd RuntimeDirectory=) or point              pid_file somewhere that exists",
+            "the directory holding pid_file, {}, does not exist or is not a directory. In daemon \
+             mode pingora writes the pid file after it has taken the listening sockets over and \
+             panics if it cannot, so this would be a daemon that serves nothing: create the \
+             directory (a service manager usually does, e.g. systemd RuntimeDirectory=) or point \
+             pid_file somewhere that exists",
             parent.display()
         );
     }
@@ -313,7 +317,9 @@ pub fn prove_pid_file_writable(path: &str) -> Result<()> {
     let probe = parent.join(format!(".{name}.probe.{}", std::process::id()));
     std::fs::write(&probe, b"").with_context(|| {
         format!(
-            "creating a file beside pid_file in {} to prove the pid file can be written. In              daemon mode pingora writes the pid file after it has taken the listening sockets              over and panics if it cannot, so this would be a daemon that serves nothing",
+            "creating a file beside pid_file in {} to prove the pid file can be written. In \
+             daemon mode pingora writes the pid file after it has taken the listening sockets \
+             over and panics if it cannot, so this would be a daemon that serves nothing",
             parent.display()
         )
     })?;
@@ -324,7 +330,8 @@ pub fn prove_pid_file_writable(path: &str) -> Result<()> {
         warn!(
             path = %probe.display(),
             error = %e,
-            "the file created to prove pid_file writable could not be removed again; it is empty              and can be deleted by hand"
+            "the file created to prove pid_file writable could not be removed again; it is empty \
+             and can be deleted by hand"
         );
     }
     debug!(

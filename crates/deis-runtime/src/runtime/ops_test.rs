@@ -78,7 +78,7 @@ mod tests {
             code,
             None,
             IsolateSpec::default(),
-            &store.kv_wiring(),
+            &store.kv_wiring_for(app_id),
             // No pool behind this isolate, so every service call it makes is
             // refused as "not deployed on this node" -- which is what it is.
             ServiceRouter::detached(),
@@ -117,7 +117,7 @@ mod tests {
     ) -> String {
         let code = format!("export default async function handler(ctx) {{\n{body_js}\n}}");
         let wiring =
-            store.wiring_with_bindings(["kv"], deis_bundle::BindingKind::Kv, bindings.to_vec());
+            store.wiring_with_bindings_for(app_id, ["kv"], deis_bundle::BindingKind::Kv, bindings.to_vec());
         let mut runtime = AppRuntime::new(
             app_id.to_string(),
             code,
@@ -479,7 +479,7 @@ mod tests {
             IsolateSpec::default(),
             // The store is running and reachable; this application simply
             // never declared that it uses KV.
-            &store.wiring_for(["database"]),
+            &store.wiring_for_tenant("kv_list_undeclared_app.production", ["database"]),
             // No pool behind this isolate, so every service call it makes is
             // refused as "not deployed on this node" -- which is what it is.
             ServiceRouter::detached(),
@@ -590,6 +590,40 @@ mod tests {
         );
         assert_eq!(streaming.charge(), Ok(3));
         assert_eq!(streaming.charge(), Err(3));
+    }
+
+    /// The concurrent-connection ceiling refuses at its number and gives
+    /// nothing back it never took. Unlike the subrequest allowance, which
+    /// resets per invocation, this counter is the isolate's own -- it counts
+    /// sockets open *now*, across invocations, and only a release fills it.
+    #[test]
+    fn the_outbound_connection_ceiling_refuses_at_its_number_and_saturates_on_release() {
+        use crate::runtime::ops::OutboundConnections;
+
+        let connections = OutboundConnections::new(2);
+
+        assert_eq!(connections.charge(), Ok(()));
+        assert_eq!(connections.charge(), Ok(()));
+        assert_eq!(
+            connections.charge(),
+            Err(2),
+            "the ceiling names itself in the refusal, the way the log line quotes it"
+        );
+
+        // One gives way; exactly one more is let in.
+        connections.release();
+        assert_eq!(connections.charge(), Ok(()));
+        assert_eq!(connections.charge(), Err(2));
+
+        // A wrapper that released twice -- or a bookkeeping path that did --
+        // cannot turn the counter into an unbounded allowance.
+        connections.release();
+        connections.release();
+        connections.release();
+        assert_eq!(connections.open(), 0);
+        assert_eq!(connections.charge(), Ok(()));
+        assert_eq!(connections.charge(), Ok(()));
+        assert_eq!(connections.charge(), Err(2));
     }
 
     /// Which allowance a call is charged to is decided by the scope it names,

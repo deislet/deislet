@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+/// Every configuration structure in this file refuses a file that names a
+/// field it does not know. An outdated key therefore stops this control plane
+/// at startup with a message naming the key, instead of being dropped by the
+/// deserializer without a word while the operator believes it took effect -
+/// which is the worst answer available here, and the reason no field on these
+/// structures carries special-cased refusal code any more.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     pub bind_addr: String,
     pub port: u16,
@@ -21,12 +28,27 @@ pub struct ControlConfig {
     /// interval after it goes quiet: the timeout is when the claim expires,
     /// the interval is how long it can take to be noticed.
     pub heartbeat_timeout: u64,
-    /// API Keys for HTTP API authentication (optional)
-    #[serde(default)]
-    pub api_keys: Vec<String>,
-    /// Enable API authentication (default: false for backward compatibility)
-    #[serde(default)]
-    pub api_auth_enabled: bool,
+    /// Directory holding this installation's own state: the SQLite database
+    /// by default, the bundle directory, the one-time [`bootstrap`]
+    /// credential written into it on a first start, and - in the layout
+    /// ADR-012 documents - the master key under `keys/` and the machine
+    /// channel's certificates under `machine/`.
+    ///
+    /// One directory, because a backup policy covers a directory: everything
+    /// a restore needs belongs under this one, and the startup log names
+    /// whatever an installation keeps somewhere else instead of leaving that
+    /// to be discovered by a restore.
+    ///
+    /// Must be absolute, and a relative one is refused at startup rather than
+    /// anchored: a relative value would be anchored to this process's working
+    /// directory, which is right for the run that wrote it and wrong for the
+    /// next one started from somewhere else - and what that produces is a
+    /// control plane that comes up healthy on an empty database, and a bundle
+    /// directory holding none of the versions it recorded.
+    ///
+    /// [`bootstrap`]: crate::identity::bootstrap
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
     /// Origins a web page may read this control plane's answers from, each
     /// written in full - "https://console.example.com", scheme and port
     /// included, no trailing slash.
@@ -37,16 +59,15 @@ pub struct ControlConfig {
     /// through the vite server, so that is same-origin too. An entry is
     /// needed only for a console hosted somewhere else.
     ///
-    /// It used to be `*` - every origin, all methods, all headers - and
-    /// combined with `api_auth_enabled` defaulting to off that let any page
-    /// the operator happened to visit create an owner account on their
-    /// control plane, mint a root token, deploy, and read every answer.
+    /// It used to be `*` - every origin, all methods, all headers - and that
+    /// let any page the operator happened to visit create an owner account on
+    /// their control plane, mint a root token, deploy, and read every answer.
     /// `*` is therefore rejected if it appears here: an origin that may
     /// read the audit log has to be named.
     ///
     /// Naming an origin does not hand it authority. A page on another origin
-    /// never gets the unauthenticated admission that a caller on this
-    /// machine gets - it presents a token like any other remote caller. See
+    /// presents a token like any other remote caller - there is no
+    /// unauthenticated admission anywhere on the human API. See
     /// [`crate::api::authz::authorize`].
     #[serde(default)]
     pub api_cors_allowed_origins: Vec<String>,
@@ -85,14 +106,16 @@ pub struct ControlConfig {
     /// per app and one content-addressed zip per version.
     ///
     /// This is the only copy of a version's code the platform keeps, so it
-    /// belongs on persistent storage that survives a restart.
+    /// belongs on persistent storage that survives a restart - and on the
+    /// same storage as the database, because a restore needs both and the
+    /// documented backup policy covers `data_dir` (ADR-012).
     ///
-    /// Should be absolute. A relative value - and the default is one - is
-    /// anchored to this process's working directory by
-    /// [`crate::catalog::BundleStore::new`], which is right for the run that
-    /// wrote it and wrong for the next one started from somewhere else.
-    #[serde(default = "default_bundle_dir")]
-    pub bundle_dir: PathBuf,
+    /// Unset, which is the default, means `<data_dir>/bundles`. An absolute
+    /// path elsewhere is allowed and is then a second directory the backup
+    /// has to cover explicitly; the startup log says so. A relative path is
+    /// refused, for the same reason `data_dir` is.
+    #[serde(default)]
+    pub bundle_dir: Option<PathBuf>,
     /// Absolute base URL nodes use to reach this control plane, for
     /// instance "https://control.internal:8080".
     ///
@@ -135,28 +158,6 @@ pub struct ControlConfig {
     /// identity across logs, metrics and traces.
     #[serde(default)]
     pub telemetry_endpoint: Option<String>,
-    /// Shared secret the storage capability tokens are derived from. It must
-    /// be the identical string that deis-store and deis-queue carry as their
-    /// own `auth_secret`.
-    ///
-    /// Unlike [`Self::store_endpoint`] this is a credential, so it is never
-    /// logged and never travels to a node as itself: the control plane mints
-    /// one token per tenant with
-    /// [`deis_wire::conventions::storage_token`] and ships only that. A token
-    /// authorises exactly the one tenant it was derived for, so a value that
-    /// leaks out of one application is useless against another's data.
-    ///
-    /// Unset - the single-box default - means no token is minted and none is
-    /// shipped. That is only safe while both storage services are bound to
-    /// loopback and have no `auth_secret` of their own; they refuse to start
-    /// on any other address without one. Setting it here while the services
-    /// have no secret is harmless, and setting it on the services while it is
-    /// unset here refuses every storage call every application makes.
-    ///
-    /// A blank or whitespace-only value counts as unset, so an empty string
-    /// in the file cannot become an HMAC key that happens to compute.
-    #[serde(default)]
-    pub storage_auth_secret: Option<String>,
     /// Independent administrator credential used only when Control calls the
     /// deis-store backend-migration service. It is never derived from, equal
     /// to, or sent in place of an application storage capability.
@@ -322,8 +323,15 @@ fn default_deis_runtime_poll_interval() -> u64 {
     15
 }
 
-fn default_bundle_dir() -> PathBuf {
-    PathBuf::from("data/bundles")
+/// Where an installation keeps its state when it says nothing else: the same
+/// directory the example configuration and the systemd unit use.
+///
+/// Under `/var/lib` rather than `/srv` or `/opt` because this is state the
+/// platform has to survive, not content an administrator put there - and
+/// because it has to be one directory, so that one backup policy covers an
+/// installation (ADR-012).
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("/var/lib/deis-control")
 }
 
 fn default_backend_restore_driver_timeout_secs() -> u64 {
@@ -331,6 +339,7 @@ fn default_backend_restore_driver_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeNodeConfig {
     /// Stable identifier used in API paths and logs
     pub id: String,
@@ -359,6 +368,7 @@ pub struct RuntimeNodeConfig {
 /// or renews them, and the identity is re-read on a timer so a rotation needs
 /// no restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineChannelConfig {
     /// Interface to listen on. Deliberately not defaulted to `0.0.0.0`: the
     /// point of this listener is that an operator says where it is reachable
@@ -393,6 +403,7 @@ fn default_identity_reload_seconds() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Enable TLS on the port this control plane serves, which carries the
     /// REST API and the node gRPC channel together.
@@ -411,20 +422,18 @@ impl Default for ControlConfig {
             port: 8080,
             heartbeat_interval: 30,
             heartbeat_timeout: 90,
-            api_keys: Vec::new(),
-            api_auth_enabled: false,
+            data_dir: default_data_dir(),
             api_cors_allowed_origins: Vec::new(),
             tls: None,
             machine: None,
             deis_runtime_nodes: Vec::new(),
             deis_runtime_poll_interval: default_deis_runtime_poll_interval(),
-            bundle_dir: default_bundle_dir(),
+            bundle_dir: None,
             public_base_url: None,
             secret_key_file: None,
             store_endpoint: None,
             queue_endpoint: None,
             telemetry_endpoint: None,
-            storage_auth_secret: None,
             store_migration_admin_token: None,
             queue_migration_admin_token: None,
             telemetry_migration_admin_token: None,
@@ -453,11 +462,7 @@ impl std::fmt::Debug for ControlConfig {
             .field("port", &self.port)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("heartbeat_timeout", &self.heartbeat_timeout)
-            .field(
-                "api_keys",
-                &format_args!("<redacted:{} configured>", self.api_keys.len()),
-            )
-            .field("api_auth_enabled", &self.api_auth_enabled)
+            .field("data_dir", &self.data_dir)
             .field("api_cors_allowed_origins", &self.api_cors_allowed_origins)
             .field("tls", &self.tls)
             .field("deis_runtime_nodes", &self.deis_runtime_nodes)
@@ -471,10 +476,6 @@ impl std::fmt::Debug for ControlConfig {
             .field("store_endpoint", &self.store_endpoint)
             .field("queue_endpoint", &self.queue_endpoint)
             .field("telemetry_endpoint", &self.telemetry_endpoint)
-            .field(
-                "storage_auth_secret",
-                &self.storage_auth_secret.as_ref().map(|_| "<redacted>"),
-            )
             .field(
                 "store_migration_admin_token",
                 &self
@@ -548,36 +549,79 @@ impl std::fmt::Debug for ControlConfig {
 impl ControlConfig {
     pub fn load(path: std::path::PathBuf) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)?;
-        Self::refuse_a_retired_fleet_key(&content)?;
         Ok(toml::from_str(&content)?)
     }
 
-    /// Refuses a configuration that still carries the fleet-wide node key.
+    /// Directory holding uploaded application bundles, resolved against
+    /// `data_dir` when the operator named none.
+    pub fn bundle_dir(&self) -> PathBuf {
+        self.bundle_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("bundles"))
+    }
+
+    /// Refuse a path this installation writes to that is not absolute.
     ///
-    /// Serde would drop the field without a word, and silence is the worst
-    /// answer available here. An operator whose file still reads
-    /// `node_preshared_keys = [...]` believes the fleet authenticates on that
-    /// value; it no longer does, and if they never wrote a
-    /// `[machine]` section then this control plane will admit no node at
-    /// all. They would see every node fail to attach with nothing in the
-    /// configuration to explain it. Refusing at startup puts the reason where
-    /// they are already looking.
-    fn refuse_a_retired_fleet_key(content: &str) -> Result<(), anyhow::Error> {
-        let carries_the_key = content.lines().any(|line| {
-            line.trim_start()
-                .trim_start_matches(['"', '\''])
-                .starts_with("node_preshared_keys")
-        });
-        if carries_the_key {
+    /// Every one of them names state the next process has to find again -
+    /// after a restart, an upgrade, a host rebuild - and a relative path
+    /// names a different file to each of them, according to where it was
+    /// started. The failure is quiet rather than loud: a control plane that
+    /// comes up healthy on a database it just created, and a bundle
+    /// directory whose versions are all "recorded but missing on disk".
+    ///
+    /// `database` is an argument because the flag that carries it belongs to
+    /// the binary, not to this file.
+    pub fn refuse_relative_paths(&self, database: &Path) -> Result<(), anyhow::Error> {
+        let relative: Vec<String> = [
+            ("data_dir", self.data_dir.clone()),
+            ("bundle_dir", self.bundle_dir()),
+            ("the --database path", database.to_path_buf()),
+        ]
+        .iter()
+        .filter(|(_, path)| !path.is_absolute())
+        .map(|(name, path)| format!("{name} {}", path.display()))
+        .collect();
+
+        if !relative.is_empty() {
             anyhow::bail!(
-                "this configuration sets `node_preshared_keys`, which no longer \
-                 exists: nodes and proxies now prove who they are with a \
-                 certificate rather than a shared secret. Delete the setting and \
-                 configure a `[machine]` section (bind_addr, port, certificate, \
-                 private_key, trust_root) instead - see deis-control.example.toml"
+                "these paths are relative and every one of them has to be absolute: {}. A \
+                 relative path names a different file to every process started from a different \
+                 working directory - the next start of this control plane would serve a database \
+                 it created empty and lose every uploaded version",
+                relative.join(", ")
             );
         }
         Ok(())
+    }
+
+    /// Every file and directory a restore needs, each paired with the name a
+    /// backup manifest should use for it, in the order ADR-012 lists them.
+    ///
+    /// The database comes first because its absence is the loudest, and the
+    /// whole list is what has to be captured together: a restore that has
+    /// the database and not the bundles answers `/health` with `OK`, lists
+    /// every application, and cannot run one of them.
+    ///
+    /// The one-time bootstrap credential is deliberately not here. It is a
+    /// way in rather than state, it expires 24 hours after it was minted
+    /// unused, and a restored installation mints a fresh one on its own.
+    ///
+    /// `database` is an argument for the same reason as in
+    /// [`Self::refuse_relative_paths`].
+    pub fn backup_material(&self, database: &Path) -> Vec<(&'static str, PathBuf)> {
+        let mut material = vec![
+            ("control database", database.to_path_buf()),
+            ("uploaded bundles", self.bundle_dir()),
+        ];
+        if let Some(path) = self.secret_key_file.as_ref() {
+            material.push(("secret master key", path.clone()));
+        }
+        if let Some(machine) = self.machine.as_ref() {
+            material.push(("machine channel certificate", machine.certificate.clone()));
+            material.push(("machine channel private key", machine.private_key.clone()));
+            material.push(("fleet trust root", machine.trust_root.clone()));
+        }
+        material
     }
 }
 
@@ -585,49 +629,16 @@ impl ControlConfig {
 mod tests {
     use super::*;
 
+    /// The four fields this structure has no default for: every file has to
+    /// name them, so every file below starts with them.
+    const REQUIRED: &str =
+        "bind_addr = '127.0.0.1'\nport = 8080\nheartbeat_interval = 30\nheartbeat_timeout = 90\n";
+
     /// The one file operators are told to copy has to deserialize into
     /// this struct. A `[tls]` section missing `cert_path`, for instance,
     /// turns "copy and edit" into a control plane that refuses to start
     /// with a message about a missing field - and the example is exactly
     /// where nobody thinks to look.
-    /// The file people copy has to survive the refusal this same module
-    /// makes. An example that still carried the retired setting would refuse
-    /// to start the moment it was copied, and the message would send the
-    /// operator looking at their own edits for something the example brought.
-    #[test]
-    fn the_example_configuration_is_not_refused() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/deis-control.example.toml");
-        let text = std::fs::read_to_string(path).expect("the example configuration must exist");
-        ControlConfig::refuse_a_retired_fleet_key(&text)
-            .expect("the example must not carry the retired fleet key");
-    }
-
-    #[test]
-    fn a_configuration_carrying_the_retired_fleet_key_is_refused() {
-        let refusal = ControlConfig::refuse_a_retired_fleet_key(
-            "port = 8080\nnode_preshared_keys = [\"whatever\"]\n",
-        )
-        .expect_err("a configuration still setting the fleet key must be refused");
-        let said = refusal.to_string();
-        // The message has to name both halves: what is dead, and what to
-        // write instead. Naming only the dead setting leaves an operator
-        // deleting a line and starting a control plane no node can reach.
-        assert!(said.contains("node_preshared_keys"), "got: {said}");
-        assert!(said.contains("[machine]"), "got: {said}");
-    }
-
-    /// Prose about the retired setting is not the setting. Every document and
-    /// every comment explaining why the fleet key went away would otherwise
-    /// be a configuration file that refuses to load, which would teach the
-    /// opposite of what it says.
-    #[test]
-    fn a_comment_mentioning_the_retired_fleet_key_is_not_a_refusal() {
-        ControlConfig::refuse_a_retired_fleet_key(
-            "# node_preshared_keys used to be here; it is gone\nport = 8080\n",
-        )
-        .expect("a comment must not be read as the setting");
-    }
-
     #[test]
     fn the_example_configuration_parses() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/deis-control.example.toml");
@@ -635,16 +646,191 @@ mod tests {
         let config: ControlConfig = toml::from_str(&text)
             .unwrap_or_else(|e| panic!("deis-control.example.toml does not parse: {e}"));
 
-        assert!(config.api_auth_enabled);
         // The file people copy has to show the shape that survives being
         // started from another directory; a relative example is the reason
         // every uploaded version went missing on the first restart from
         // somewhere else.
         assert!(
-            config.bundle_dir.is_absolute(),
+            config.bundle_dir().is_absolute(),
             "the example must show an absolute bundle_dir, got {}",
-            config.bundle_dir.display()
+            config.bundle_dir().display()
+        );
+        assert!(
+            config.data_dir.is_absolute(),
+            "the example must show an absolute data_dir, got {}",
+            config.data_dir.display()
         );
     }
 
+    /// A field this build does not know is refused with a message naming it,
+    /// never dropped silently: an operator whose file still carries a setting
+    /// that has been removed has to be told at startup, not left believing it
+    /// took effect. This covers retired settings generally - there is no
+    /// per-field code for any of them.
+    #[test]
+    fn an_unknown_field_is_refused_and_named() {
+        for removed in [
+            "api_keys = [\"whatever\"]",
+            "api_auth_enabled = true",
+            "node_preshared_keys = [\"whatever\"]",
+            "no_such_setting = 1",
+        ] {
+            let refusal: Result<ControlConfig, _> =
+                toml::from_str(&format!("port = 8080\n{removed}\n"));
+            let err = refusal.expect_err("an unknown field must be refused");
+            let said = err.to_string();
+            assert!(
+                said.contains("unknown field"),
+                "the refusal has to say the field is unknown: {said}"
+            );
+            assert!(
+                said.contains(removed.split('=').next().unwrap().trim()),
+                "the refusal has to name the field: {said}"
+            );
+        }
+    }
+
+    /// A nested section is held to the same rule as the top level: an
+    /// unknown key inside `[machine]` or `[tls]` is refused too, not just an
+    /// unknown top-level key.
+    #[test]
+    fn an_unknown_field_in_a_nested_section_is_refused() {
+        let refusal: Result<ControlConfig, _> = toml::from_str(
+            "[tls]\napi_enabled = true\ncert_path = '/x'\nkey_path = '/y'\nno_such_key = 1\n",
+        );
+        assert!(
+            refusal.is_err(),
+            "an unknown field in [tls] must be refused"
+        );
+    }
+
+    /// Out of the box, everything a restore needs is under one absolute
+    /// directory, because a backup policy covers a directory and this is the
+    /// policy an installation is handed: one path to capture, and the same
+    /// path to restore into. A relative default was the version of this that
+    /// only worked from the directory it happened to start in.
+    #[test]
+    fn the_defaults_are_one_absolute_directory() {
+        let config = ControlConfig::default();
+
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/deis-control"));
+        assert_eq!(
+            config.bundle_dir(),
+            PathBuf::from("/var/lib/deis-control/bundles")
+        );
+        config
+            .refuse_relative_paths(Path::new("/var/lib/deis-control/control.db"))
+            .expect("the built-in defaults are absolute");
+    }
+
+    /// A data directory of the operator's own carries the bundle directory
+    /// with it, so naming one directory keeps the database, the bundles and
+    /// the key material in one place.
+    #[test]
+    fn a_data_directory_carries_the_bundle_directory_with_it() {
+        let config: ControlConfig = toml::from_str(&format!("{REQUIRED}data_dir = '/srv/deis'\n"))
+            .expect("data_dir alone is a valid file");
+
+        assert_eq!(config.bundle_dir(), PathBuf::from("/srv/deis/bundles"));
+    }
+
+    /// And an operator who wants the bundles somewhere else still gets what
+    /// they asked for, on the filesystem that suits them.
+    #[test]
+    fn an_explicit_bundle_directory_is_honoured() {
+        let config: ControlConfig = toml::from_str(&format!(
+            "{REQUIRED}data_dir = '/srv/deis'\nbundle_dir = '/mnt/bundles'\n"
+        ))
+        .expect("both paths may be named");
+
+        assert_eq!(config.bundle_dir(), PathBuf::from("/mnt/bundles"));
+    }
+
+    /// A relative path is refused rather than anchored, and the refusal
+    /// names every one of them: an operator who fixes only the one that was
+    /// reported first would be back a restart later.
+    #[test]
+    fn a_relative_storage_path_is_refused_by_name() {
+        let config: ControlConfig = toml::from_str(&format!("{REQUIRED}data_dir = 'data'\n"))
+            .expect("the file itself parses");
+        let refusal = config
+            .refuse_relative_paths(Path::new("/srv/deis/control.db"))
+            .expect_err("a relative data directory must be refused");
+        let said = refusal.to_string();
+        assert!(
+            said.contains("data_dir data"),
+            "the refusal names it: {said}"
+        );
+
+        let config = ControlConfig::default();
+        let refusal = config
+            .refuse_relative_paths(Path::new("deis-control.db"))
+            .expect_err("a relative --database must be refused");
+        let said = refusal.to_string();
+        assert!(
+            said.contains("--database path deis-control.db"),
+            "the refusal names the flag: {said}"
+        );
+        assert!(
+            !said.contains("data_dir"),
+            "and only what is actually relative: {said}"
+        );
+    }
+
+    /// The list a backup is taken against, and the reason it is a method on
+    /// the configuration rather than a paragraph in a document: a restore
+    /// missing any one of these comes up healthy and useless.
+    #[test]
+    fn the_restore_set_names_the_database_bundles_key_and_machine_material() {
+        let config: ControlConfig = toml::from_str(&format!(
+            "{REQUIRED}data_dir = '/srv/deis'\n\
+             secret_key_file = '/srv/deis/keys/master.key'\n\
+             [machine]\n\
+             bind_addr = '127.0.0.1'\n\
+             port = 8443\n\
+             certificate = '/srv/deis/machine/control.crt.pem'\n\
+             private_key = '/srv/deis/machine/control.key.pem'\n\
+             trust_root = '/srv/deis/machine/fleet-ca.crt.pem'\n"
+        ))
+        .expect("a full installation parses");
+
+        let material = config.backup_material(Path::new("/srv/deis/control.db"));
+        assert_eq!(
+            material,
+            vec![
+                ("control database", PathBuf::from("/srv/deis/control.db")),
+                ("uploaded bundles", PathBuf::from("/srv/deis/bundles")),
+                (
+                    "secret master key",
+                    PathBuf::from("/srv/deis/keys/master.key")
+                ),
+                (
+                    "machine channel certificate",
+                    PathBuf::from("/srv/deis/machine/control.crt.pem")
+                ),
+                (
+                    "machine channel private key",
+                    PathBuf::from("/srv/deis/machine/control.key.pem")
+                ),
+                (
+                    "fleet trust root",
+                    PathBuf::from("/srv/deis/machine/fleet-ca.crt.pem")
+                ),
+            ]
+        );
+    }
+
+    /// An installation that has configured neither a master key nor a
+    /// machine channel still has a restore set - and it is exactly the two
+    /// things the database cannot be served without.
+    #[test]
+    fn the_restore_set_is_short_when_nothing_else_is_configured() {
+        let material =
+            ControlConfig::default().backup_material(Path::new("/var/lib/deis-control/control.db"));
+
+        assert_eq!(
+            material.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec!["control database", "uploaded bundles"]
+        );
+    }
 }

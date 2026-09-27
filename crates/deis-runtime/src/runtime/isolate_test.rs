@@ -1290,7 +1290,7 @@ export default function handler(context: any): Response {
                 "routing-name.production",
                 writer,
                 spec,
-                &store.kv_wiring(),
+                &store.kv_wiring_for("storage-owner.production"),
             )
             .await,
             "written"
@@ -1302,11 +1302,11 @@ export default function handler(context: any): Response {
             }
         "#;
         assert_eq!(
-            body_of_one_request("storage-owner.production", reader, &store.kv_wiring(),).await,
+            body_of_one_request("storage-owner.production", reader, &store.kv_wiring_for("storage-owner.production"),).await,
             "\"separate-authority\""
         );
         assert_eq!(
-            body_of_one_request("routing-name.production", reader, &store.kv_wiring()).await,
+            body_of_one_request("routing-name.production", reader, &store.kv_wiring_for("routing-name.production")).await,
             "null",
             "the runtime lookup name must not silently become the storage tenant"
         );
@@ -1334,7 +1334,7 @@ export default function handler(context: any): Response {
         "#;
 
         let body =
-            body_of_one_request("kv_metadata_app.production", code, &store.kv_wiring()).await;
+            body_of_one_request("kv_metadata_app.production", code, &store.kv_wiring_for("kv_metadata_app.production")).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
 
         assert_eq!(parsed["withMetadata"]["value"], "png-bytes");
@@ -1385,7 +1385,7 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body = body_of_one_request("kv_bytes_app.production", code, &store.kv_wiring()).await;
+        let body = body_of_one_request("kv_bytes_app.production", code, &store.kv_wiring_for("kv_bytes_app.production")).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         assert_eq!(parsed["length"], 256, "{body}");
         assert_eq!(parsed["first"], 0, "{body}");
@@ -1424,7 +1424,7 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body = body_of_one_request("kv_types_app.production", code, &store.kv_wiring()).await;
+        let body = body_of_one_request("kv_types_app.production", code, &store.kv_wiring_for("kv_types_app.production")).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         assert_eq!(parsed["plainIsString"], true, "{body}");
         assert_eq!(parsed["plain"], r#"{"n":7}"#, "{body}");
@@ -1464,7 +1464,7 @@ export default function handler(context: any): Response {
         "#;
 
         let body =
-            body_of_one_request("kv_bad_type_app.production", code, &store.kv_wiring()).await;
+            body_of_one_request("kv_bad_type_app.production", code, &store.kv_wiring_for("kv_bad_type_app.production")).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         let refusal = parsed["stream"].as_str().expect("a message");
         assert!(
@@ -1517,7 +1517,7 @@ export default function handler(context: any): Response {
         "#;
 
         let body =
-            body_of_one_request("kv_put_shapes_app.production", code, &store.kv_wiring()).await;
+            body_of_one_request("kv_put_shapes_app.production", code, &store.kv_wiring_for("kv_put_shapes_app.production")).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         for shape in ["string", "buffer", "view", "slice"] {
             assert_eq!(parsed[shape], "hi", "{shape} did not round trip: {body}");
@@ -1550,7 +1550,7 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body = body_of_one_request("kv_expiry_app.production", code, &store.kv_wiring()).await;
+        let body = body_of_one_request("kv_expiry_app.production", code, &store.kv_wiring_for("kv_expiry_app.production")).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
 
         let expiration = parsed["expiration"].as_i64().expect("an expiry");
@@ -1573,16 +1573,7 @@ export default function handler(context: any): Response {
         // link of that was missing before wave B.
         let store = TestStore::start().await;
 
-        let wiring = ServiceWiring {
-            storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
-            endpoints: ServiceEndpoints {
-                store: Some(store.endpoint.clone()),
-                queue: None,
-            },
-            consumers: Vec::new(),
-            ..ServiceWiring::default()
-        };
+        let wiring = store.kv_wiring_for("e2e_kv_app.production");
 
         let code = r#"
             export default async function handler(ctx) {
@@ -1678,6 +1669,100 @@ export default function handler(context: any): Response {
         assert!(
             body.contains("expirationTtl"),
             "the app must be told which option it got wrong: {body}"
+        );
+    }
+
+    /// A lifetime below the shared standard's floor (60 seconds) is refused at
+    /// the call site: it is a lifetime the other target (Cloudflare Workers
+    /// KV) cannot express, so an application must not learn to depend on one.
+    #[tokio::test]
+    async fn a_lifetime_below_the_shared_minimum_is_refused_before_the_store_sees_it() {
+        let code = r#"
+            export default async function handler(ctx) {
+                try {
+                    await ctx.services.kv.put("k", "v", { expirationTtl: 59 });
+                    return new Response("accepted");
+                } catch (e) {
+                    return new Response(String(e.message || e));
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "kv_short_ttl_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (_, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body).unwrap_or_default();
+        assert!(
+            body.contains("expirationTtl") && body.contains("at least 60"),
+            "the app must be told the shared floor: {body}"
+        );
+    }
+
+    /// Metadata over the shared standard's 1 KiB ceiling is refused at the
+    /// call site, with the encoded size named: that is the size the store
+    /// would hold, which is the size the other target bounds.
+    #[tokio::test]
+    async fn metadata_over_the_shared_ceiling_is_refused_before_the_store_sees_it() {
+        let code = r#"
+            export default async function handler(ctx) {
+                try {
+                    await ctx.services.kv.put("k", "v", { metadata: "m".repeat(1024) });
+                    return new Response("accepted");
+                } catch (e) {
+                    return new Response(String(e.message || e));
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "kv_big_metadata_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (_, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body).unwrap_or_default();
+        // A string of 1024 `m`s encodes to a 1026-byte JSON string (two
+        // quotes), one past the ceiling; 1024 encoded bytes is inside it.
+        assert!(
+            body.contains("metadata is 1026 bytes encoded, limit is 1024"),
+            "the app must be told the encoded size and the ceiling: {body}"
         );
     }
 
@@ -2567,6 +2652,7 @@ export default function handler(context: any): Response {
                     rate_limit_ops_per_sec: 42.5,
                     cpu_time_limit_ms: 1_250,
                     max_subrequests: 50,
+                    max_outbound_connections: 64,
                 },
                 ..Default::default()
             },
@@ -5509,16 +5595,7 @@ export default function handler(context: any): Response {
         // TextDecoder that this runtime did not define.
         let store = TestStore::start().await;
 
-        let wiring = ServiceWiring {
-            storage_token: None,
-            declaration: ServiceDeclaration::from_names(["blob"]),
-            endpoints: ServiceEndpoints {
-                store: Some(store.endpoint.clone()),
-                queue: None,
-            },
-            consumers: Vec::new(),
-            ..ServiceWiring::default()
-        };
+        let wiring = store.wiring_for_tenant("e2e_blob_app.production", ["blob"]);
 
         let code = r#"
             export default async function handler(ctx) {
@@ -5596,16 +5673,7 @@ export default function handler(context: any): Response {
         // unreachable if `js/runtime.js` did not spell the call.
         let store = TestStore::start().await;
 
-        let wiring = ServiceWiring {
-            storage_token: None,
-            declaration: ServiceDeclaration::from_names(["blob"]),
-            endpoints: ServiceEndpoints {
-                store: Some(store.endpoint.clone()),
-                queue: None,
-            },
-            consumers: Vec::new(),
-            ..ServiceWiring::default()
-        };
+        let wiring = store.wiring_for_tenant("e2e_blob_verbs.production", ["blob"]);
 
         let code = r#"
             export default async function handler(ctx) {

@@ -19,6 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum_server::tls_rustls::RustlsConfig;
 use deis_identity::{IdentityFiles, MachineIdentity, Protocol};
@@ -30,6 +33,7 @@ use tonic::service::Routes;
 use tracing::{error, info, warn};
 
 use crate::api::catalog::{CatalogState, versions};
+use crate::capability_issuer::CapabilityIssuer;
 use crate::config::MachineChannelConfig;
 use crate::machine::{MachineChannelService, identity_acceptor};
 
@@ -63,26 +67,53 @@ pub fn load_identity(config: &MachineChannelConfig) -> anyhow::Result<Arc<Machin
     Ok(identity)
 }
 
+/// Serve every published capability verifying key as a JWKS document.
+///
+/// Public keys only, so it needs no credential; it is on this listener for
+/// callers that hold a machine identity, and on the human one for store and
+/// queue, which do not.
+pub async fn capability_jwks(State(issuer): State<CapabilityIssuer>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        // Short: a verifier that meets an unknown kid refetches anyway, and
+        // an intermediary must not pin a set that has since rotated.
+        [(axum::http::header::CACHE_CONTROL, "max-age=60")],
+        axum::Json(issuer.jwks().await),
+    )
+}
+
 /// Everything a machine may call, and nothing else.
 ///
 /// No CORS, no console fallback and no human authentication layer: none of
 /// them has a caller here, and a layer mounted where it has no caller is a
 /// layer nobody notices is misconfigured.
-pub fn router(state: CatalogState, control: ControlServiceServer<GrpcControlService>) -> Router {
+pub fn router(
+    state: CatalogState,
+    issuer: CapabilityIssuer,
+    control: ControlServiceServer<GrpcControlService>,
+) -> Router {
+    let issuer_for_key_endpoint = issuer.clone();
     let rpcs = Routes::default()
         .add_service(MachineChannelServer::new(MachineChannelService::new(
             state.clone(),
+            issuer,
         )))
         // The long-lived channel a proxy holds open. It belongs here for the
         // same reason the rest does - it is a machine talking to a machine -
         // and it is mounted here as well as on the human listener while the
         // fleet moves, so a proxy can find it either way for one release.
         .add_service(control);
-    rpcs.into_axum_router().merge(
-        Router::new()
-            .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
-            .with_state(state),
-    )
+    rpcs.into_axum_router()
+        .merge(
+            Router::new()
+                .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
+                .with_state(state),
+        )
+        .merge(
+            Router::new()
+                .route(crate::capability_issuer::JWKS_ROUTE, get(capability_jwks))
+                .with_state(issuer_for_key_endpoint),
+        )
 }
 
 /// Serve the machine channel until `shutdown` completes.
@@ -203,7 +234,11 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
         let address = listener.local_addr().expect("an address");
-        let app = router(harness.state.clone(), test_control_service());
+        let app = router(
+            harness.state.clone(),
+            CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+            test_control_service(),
+        );
         tokio::spawn(async move {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });
@@ -260,7 +295,11 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
         let address = listener.local_addr().expect("an address");
-        let app = router(harness.state.clone(), test_control_service());
+        let app = router(
+            harness.state.clone(),
+            CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+            test_control_service(),
+        );
         tokio::spawn(async move {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });

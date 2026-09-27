@@ -411,9 +411,8 @@ impl Modify for EveryOperationCanFail {
 }
 
 /// The two ways a caller presents a credential to the authorization gate,
-/// either of which satisfies every operation. When `api_auth_enabled` is
-/// off the gate resolves every caller to an anonymous principal and no
-/// credential is needed; the document describes the enforced contract.
+/// either of which satisfies every operation. Every call needs a credential;
+/// the document describes the enforced contract.
 struct Security;
 
 impl Modify for Security {
@@ -426,8 +425,9 @@ impl Modify for Security {
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
                         "`Authorization: Bearer <token>` with an API token minted by \
-                         `POST /api/v1/accounts/{name}/tokens` or an `api_keys` entry of the \
-                         configuration file.",
+                         `POST /api/v1/accounts/{name}/tokens`; on a fresh install, log in with \
+                         `deis login --bootstrap` using the bootstrap.token file the control \
+                         plane wrote to its data directory.",
                     ))
                     .build(),
             ),
@@ -2193,6 +2193,7 @@ mod tests {
     /// gate admits without a credential while nothing is enforced.
     async fn send(
         router: &axum::Router,
+        secret: &str,
         method: &str,
         uri: &str,
         body: axum::body::Body,
@@ -2204,6 +2205,7 @@ mod tests {
             .method(method)
             .uri(uri)
             .header("content-type", content_type)
+            .header("authorization", format!("Bearer {secret}"))
             .body(body)
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(
@@ -2220,6 +2222,7 @@ mod tests {
 
     async fn send_json(
         router: &axum::Router,
+        secret: &str,
         method: &str,
         uri: &str,
         body: Value,
@@ -2229,7 +2232,7 @@ mod tests {
         } else {
             axum::body::Body::from(body.to_string())
         };
-        send(router, method, uri, body, "application/json").await
+        send(router, secret, method, uri, body, "application/json").await
     }
 
     /// The document is opt-in, so what it lists must be what the routers
@@ -2242,7 +2245,7 @@ mod tests {
         use axum::http::StatusCode;
 
         let document = rendered();
-        let (router, _dir) = crate::api::tests::full_router().await;
+        let (router, _dir, secret) = crate::api::tests::full_router().await;
         let mut misses = Vec::new();
         for (path, method, _) in paths(&document) {
             // A placeholder that every path parameter accepts as text; the
@@ -2254,6 +2257,7 @@ mod tests {
             let uri = path.replace(['{', '}'], "");
             let (status, body) = send(
                 &router,
+                &secret,
                 method.to_ascii_uppercase().as_str(),
                 &uri,
                 axum::body::Body::empty(),
@@ -2401,6 +2405,12 @@ mod tests {
             });
         };
 
+        // The helper takes a credential because the second half of this
+        // function drives the gated whole-router harness; the catalog
+        // harness below mounts its own admitted principal instead of the
+        // gate, so an empty string is fine here.
+        let secret = String::new();
+
         // The catalog, driven through its own harness: one node key, a
         // secret store, and a runtime stand-in that accepts deliveries.
         // Its routes are spelled in the legacy prefix; the bodies are the
@@ -2411,13 +2421,13 @@ mod tests {
             "App",
             "createApp",
             201,
-            send_json(r, "POST", "/api/apps", json!({"id": "demo"})).await,
+            send_json(r, &secret, "POST", "/api/apps", json!({"id": "demo"})).await,
         );
         keep(
             "ControlListPage_App",
             "listApps",
             200,
-            send_json(r, "GET", "/api/apps", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/apps", Value::Null).await,
         );
         keep(
             "Environment",
@@ -2425,6 +2435,7 @@ mod tests {
             201,
             send_json(
                 r,
+                &secret,
                 "POST",
                 "/api/apps/demo/environments",
                 json!({"name": "production"}),
@@ -2435,10 +2446,18 @@ mod tests {
             "ControlListPage_Environment",
             "listEnvironments",
             200,
-            send_json(r, "GET", "/api/apps/demo/environments", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/apps/demo/environments",
+                Value::Null,
+            )
+            .await,
         );
         let uploaded = send(
             r,
+            &secret,
             "POST",
             "/api/apps/demo/versions",
             Body::from(crate::catalog::bundle::tests::sample_bundle("demo")),
@@ -2452,7 +2471,7 @@ mod tests {
             "ControlListPage_VersionView",
             "listVersions",
             200,
-            send_json(r, "GET", "/api/apps/demo/versions", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/apps/demo/versions", Value::Null).await,
         );
         keep(
             "VersionView",
@@ -2460,6 +2479,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "GET",
                 &format!("/api/apps/demo/versions/{version_id}"),
                 Value::Null,
@@ -2468,6 +2488,7 @@ mod tests {
         );
         let deployed = send_json(
             r,
+            &secret,
             "POST",
             "/api/apps/demo/environments/production/deployments",
             json!({"version_id": version_id}),
@@ -2487,6 +2508,7 @@ mod tests {
                 200,
                 send_json(
                     r,
+                    &secret,
                     "GET",
                     &format!("/api/deployment-plans/{plan_id}"),
                     Value::Null,
@@ -2500,6 +2522,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "GET",
                 "/api/apps/demo/environments/production/deployments",
                 Value::Null,
@@ -2512,6 +2535,7 @@ mod tests {
             201,
             send_json(
                 r,
+                &secret,
                 "POST",
                 "/api/domains",
                 json!({"pattern": "demo.example.com", "app_id": "demo"}),
@@ -2522,12 +2546,13 @@ mod tests {
             "ControlListPage_DomainGrant",
             "listDomainGrants",
             200,
-            send_json(r, "GET", "/api/domains", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/domains", Value::Null).await,
         );
         // A hostname is global, so the environment must hold a grant for
         // it before it may route it.
         let route = send_json(
             r,
+            &secret,
             "POST",
             "/api/apps/demo/environments/production/routes",
             json!({"host": "demo.example.com", "path_prefix": "/", "priority": 0}),
@@ -2542,6 +2567,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "GET",
                 "/api/apps/demo/environments/production/routes",
                 Value::Null,
@@ -2552,7 +2578,7 @@ mod tests {
             "GlobalRoutesResponse",
             "listAllRoutes",
             200,
-            send_json(r, "GET", "/api/routes", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/routes", Value::Null).await,
         );
         keep(
             "RouteDeleted",
@@ -2560,6 +2586,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "DELETE",
                 &format!("/api/apps/demo/environments/production/routes/{route_id}"),
                 Value::Null,
@@ -2572,6 +2599,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "PUT",
                 "/api/apps/demo/environments/production/secrets/API_KEY",
                 json!({"value": "example-value"}),
@@ -2584,6 +2612,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "GET",
                 "/api/apps/demo/environments/production/secrets",
                 Value::Null,
@@ -2596,6 +2625,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "DELETE",
                 "/api/apps/demo/environments/production/secrets/API_KEY",
                 Value::Null,
@@ -2608,6 +2638,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "DELETE",
                 "/api/domains/demo.example.com?app_id=demo",
                 Value::Null,
@@ -2645,31 +2676,31 @@ mod tests {
                 schema,
                 operation_id,
                 200,
-                send_json(r, "GET", uri, Value::Null).await,
+                send_json(r, &secret, "GET", uri, Value::Null).await,
             );
         }
         keep(
             "DeleteAppResponse",
             "deleteApp",
             200,
-            send_json(r, "DELETE", "/api/apps/demo", Value::Null).await,
+            send_json(r, &secret, "DELETE", "/api/apps/demo", Value::Null).await,
         );
         keep(
             "ReleaseRetiredAppResponse",
             "releaseRetiredApp",
             200,
-            send_json(r, "DELETE", "/api/retired-apps/demo", Value::Null).await,
+            send_json(r, &secret, "DELETE", "/api/retired-apps/demo", Value::Null).await,
         );
 
         // Everything else through the whole router, under the prefixes the
         // document describes.
-        let (router, _dir) = crate::api::tests::full_router().await;
+        let (router, _dir, secret) = crate::api::tests::full_router().await;
         let r = &router;
         keep(
             "ErrorBody",
             "getApp",
             404,
-            send_json(r, "GET", "/api/v1/apps/no-such-app", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/v1/apps/no-such-app", Value::Null).await,
         );
         keep(
             "Account",
@@ -2677,6 +2708,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "POST",
                 "/api/v1/accounts",
                 json!({"name": "alice", "role": "viewer"}),
@@ -2687,10 +2719,11 @@ mod tests {
             "ControlListPage_Account",
             "listAccounts",
             200,
-            send_json(r, "GET", "/api/v1/accounts", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/v1/accounts", Value::Null).await,
         );
         let minted = send_json(
             r,
+            &secret,
             "POST",
             "/api/v1/accounts/alice/tokens",
             json!({"name": "laptop"}),
@@ -2698,11 +2731,21 @@ mod tests {
         .await;
         assert_eq!(minted.0, 200, "{}", minted.1);
         let token_id = minted.1["token"]["id"].as_str().unwrap().to_string();
+        // One account's tokens, so the captured page has a stable order:
+        // tokens minted in the same second tie on `created_at` and the
+        // tie-break is the random id, which would reorder between runs.
         keep(
             "ControlListPage_ApiToken",
             "listTokens",
             200,
-            send_json(r, "GET", "/api/v1/tokens", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/v1/tokens?account=root",
+                Value::Null,
+            )
+            .await,
         );
         keep(
             "ApiToken",
@@ -2710,6 +2753,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "DELETE",
                 &format!("/api/v1/tokens/{token_id}"),
                 Value::Null,
@@ -2720,13 +2764,13 @@ mod tests {
             "ControlListPage_AuditEntry",
             "listAuditLog",
             200,
-            send_json(r, "GET", "/api/v1/audit", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/v1/audit", Value::Null).await,
         );
         keep(
             "ProductInstallation",
             "getProductInstallation",
             200,
-            send_json(r, "GET", "/api/v1/installation", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/v1/installation", Value::Null).await,
         );
         keep(
             "ConfigsUpdated",
@@ -2734,6 +2778,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "POST",
                 "/api/platform/configs/node-a",
                 json!({"configs": {"port": 8080}}),
@@ -2744,19 +2789,33 @@ mod tests {
             "ConfigsListing",
             "listNodeConfigs",
             200,
-            send_json(r, "GET", "/api/platform/configs", Value::Null).await,
+            send_json(r, &secret, "GET", "/api/platform/configs", Value::Null).await,
         );
         keep(
             "NodeConfigs",
             "getNodeConfigs",
             200,
-            send_json(r, "GET", "/api/platform/configs/node-a", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/platform/configs/node-a",
+                Value::Null,
+            )
+            .await,
         );
         keep(
             "ConfigValue",
             "getNodeConfigValue",
             200,
-            send_json(r, "GET", "/api/platform/configs/node-a/port", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/platform/configs/node-a/port",
+                Value::Null,
+            )
+            .await,
         );
         keep(
             "ControlListPage_ConfigHistoryItem",
@@ -2764,6 +2823,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "GET",
                 "/api/platform/configs/node-a/history",
                 Value::Null,
@@ -2774,7 +2834,14 @@ mod tests {
             "ConfigStatsResponse",
             "getNodeConfigStats",
             200,
-            send_json(r, "GET", "/api/platform/configs/stats", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "GET",
+                "/api/platform/configs/stats",
+                Value::Null,
+            )
+            .await,
         );
         keep(
             "ConfigKeyOutcome",
@@ -2782,6 +2849,7 @@ mod tests {
             200,
             send_json(
                 r,
+                &secret,
                 "DELETE",
                 "/api/platform/configs/node-a/port",
                 Value::Null,
@@ -2792,7 +2860,14 @@ mod tests {
             "NodeConfigOutcome",
             "deleteNodeConfigs",
             200,
-            send_json(r, "DELETE", "/api/platform/configs/node-a", Value::Null).await,
+            send_json(
+                r,
+                &secret,
+                "DELETE",
+                "/api/platform/configs/node-a",
+                Value::Null,
+            )
+            .await,
         );
         for (schema, operation_id, uri) in [
             ("SessionsResponse", "listSessions", "/api/platform/sessions"),
@@ -2822,7 +2897,7 @@ mod tests {
                 schema,
                 operation_id,
                 200,
-                send_json(r, "GET", uri, Value::Null).await,
+                send_json(r, &secret, "GET", uri, Value::Null).await,
             );
         }
         examples

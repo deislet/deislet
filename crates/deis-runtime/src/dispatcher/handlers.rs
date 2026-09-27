@@ -3,6 +3,7 @@
 use super::AppState;
 use crate::app::AppKey;
 use crate::runtime::header_list;
+use crate::runtime::DispatchError;
 use crate::{
     is_platform_header, APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER,
     PLATFORM_HEADER_PREFIX,
@@ -18,7 +19,24 @@ use axum::{
 };
 use deno_core::url::Url;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Whether this overload refusal gets a warn line of its own.
+///
+/// An overload burst is exactly when a warn per refusal stops being useful:
+/// the node is doing the right thing, and a stream of requests piling up
+/// behind a wedged thread would write one line per request for as long as
+/// the burst lasts. Every one of the first few refusals of the process is
+/// logged, because the first is the moment an operator learns something new;
+/// after that one in a hundred gets the line, and the rest are in the
+/// metric `deis_runtime_overloaded_total`.
+static OVERLOAD_REFUSALS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+fn overload_refusal_is_logged() -> bool {
+    let seen = OVERLOAD_REFUSALS_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    seen <= 5 || seen.is_multiple_of(100)
+}
 
 /// How the kind of an inbound WebSocket frame reaches the isolate.
 ///
@@ -369,35 +387,15 @@ pub async fn handle_request(
         }
     };
 
-    // Check if it's a debug request
-    if let Some(target_app_id) = app_id.strip_prefix("_inspect:") {
-        let token = headers
-            .get("x-deis-inspect-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let target = AppKey::new(target_app_id, environment);
-        if !state.app_manager.validate_inspect_token(&target, token) {
-            return (StatusCode::FORBIDDEN, "Invalid or expired inspector token").into_response();
-        }
-
-        if let Some(ws_upgrade) = ws {
-            let app_manager = state.app_manager.clone();
-            return ws_upgrade
-                .on_upgrade(move |socket| handle_inspector_session(socket, target, app_manager))
-                .into_response();
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Inspector requires WebSocket connection",
-            )
-                .into_response();
-        }
-    }
-
-    // The pair names a directory on this node and a storage tenant, so a
-    // request that carries something else is refused here rather than being
-    // allowed to reach code that would build a path out of it.
+    // The inspector channel is not here. It moved to the management
+    // listener: the token it answers to is minted by `StartInspect` on the
+    // machine channel, and the WebSocket that token opens gives a debugger
+    // full access to a running isolate - a door like that belongs behind the
+    // same handshake the machine channel is behind, not on a port that used
+    // to admit anyone who could open a socket. See
+    // `handle_inspector_upgrade`, served by the management listener's router.
+    // The key that used to route it is refused here like any other name this
+    // port does not serve.
     let key = AppKey::new(app_id, environment);
     if let Err(e) = key.validate() {
         tracing::warn!(
@@ -573,8 +571,9 @@ pub async fn handle_request(
     // one for one -- so `curl -H 'x-deis-caller: admin-app'` handed a callee
     // exactly the value a service call would have stamped, and a callee that
     // followed the documented pattern granted admin to anyone who could reach
-    // this node. `x-deis-tenant`, `x-deis-storage-token` and `x-deis-binding`
-    // are the same shape one hop further in.
+    // this node. `x-deis-tenant` and `x-deis-binding` are the same shape
+    // one hop further in; `authorization` (the capability token) is stripped
+    // separately.
     //
     // deis-proxy sweeps the same namespace at the edge. This is not that fix
     // repeated for tidiness: a node is reachable without the proxy -- every
@@ -908,6 +907,115 @@ pub async fn handle_request(
             }
         }
         Err(e) => {
+            // The node's own refusal travels down this channel as itself.
+            //
+            // This is the one place the pool's two kinds of failure meet the
+            // client. An application error and a node error are different
+            // things for the caller: the first is answered with an incident
+            // so the operator can find it, the second is a scheduling answer
+            // the caller may act on -- retry after a moment, or not at all.
+            // The pool is the only sender of a [`DispatchError`], so a
+            // downcast is the whole of the check.
+            if let Some(refusal) = e.downcast_ref::<DispatchError>() {
+                return match refusal {
+                    DispatchError::Overloaded { retry_after } => {
+                        // Whole seconds, floored at one: a fractional or zero
+                        // Retry-After is not a hint a client can schedule on,
+                        // and the budget this refusal came from is already
+                        // back in the neighbourhood of zero by the time the
+                        // retry lands.
+                        let retry_after = retry_after.as_secs().max(1);
+                        crate::runtime::metrics::recorder().record_overloaded(
+                            &key.tenant_id(),
+                            crate::runtime::metrics::OVERLOAD_CLASS_ADMISSION,
+                        );
+                        if overload_refusal_is_logged() {
+                            tracing::warn!(
+                                app_id = %key.app_id(),
+                                environment = %key.environment(),
+                                method = %method,
+                                path = uri.path(),
+                                "Refusing a request as overloaded: the runtime thread for {} was at \
+                                 capacity, so the application never saw it. The caller is told to \
+                                 retry in {retry_after}s",
+                                key
+                            );
+                        } else {
+                            tracing::debug!(
+                                app_id = %key.app_id(),
+                                environment = %key.environment(),
+                                "Refusing another request as overloaded; the warn line for these \
+                                 is sampled, and the count is in the overloaded metric"
+                            );
+                        }
+                        // Built rather than unwrapped: every value here is a
+                        // fixed literal or a positive integer, so the builder
+                        // cannot fail -- and the refusal the caller is owed
+                        // must not itself be able to become a 500.
+                        let response = Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header("retry-after", retry_after.to_string())
+                            .header("x-deis-outcome", "overloaded")
+                            .header("x-deis-outcome-detail", "admission")
+                            .body(Body::from("Runtime overloaded, retry shortly"));
+                        match response {
+                            Ok(response) => response.into_response(),
+                            Err(_) => (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Runtime overloaded, retry shortly",
+                            )
+                                .into_response(),
+                        }
+                    }
+                    DispatchError::Stopped | DispatchError::GenerationNotPrepared => {
+                        // A placement answer, not an overload: the application
+                        // (or the exact generation the edge selected for it)
+                        // is not on this node at this moment. The same shape
+                        // as the other 503s this file gives out -- a fixed
+                        // sentence and no incident, because nothing failed
+                        // here; reinstalling or converging the placement is
+                        // the control plane's job, not this request's.
+                        tracing::warn!(
+                            app_id = %key.app_id(),
+                            environment = %key.environment(),
+                            method = %method,
+                            path = uri.path(),
+                            "Refusing a request for {}: the node was told to run it but its \
+                             placement is not here ({refusal})",
+                            key
+                        );
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "The application is not currently available on this node.",
+                        )
+                            .into_response()
+                    }
+                    DispatchError::NotFound => {
+                        // The check at the top of this handler said the
+                        // application was placed here; the post says it is not.
+                        // It was unloaded or moved in the between. The
+                        // established answer for a placement that is not here
+                        // yet is the 503 with no incident: nothing failed,
+                        // and the caller may retry while the placement
+                        // converges.
+                        tracing::warn!(
+                            app_id = %key.app_id(),
+                            environment = %key.environment(),
+                            method = %method,
+                            path = uri.path(),
+                            "Refusing a request for {}: it was checked as placed a moment ago \
+                             and is not on this node any more",
+                            key
+                        );
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "The application is not currently available on this node.",
+                        )
+                            .into_response()
+                    }
+                };
+            }
+
             // The other half of the same disclosure the invoke wrapper had.
             //
             // This arm is not only "the runtime thread went away". A bundle
@@ -1239,6 +1347,66 @@ async fn handle_websocket_bridged(
         key,
         ws_id
     );
+}
+
+/// Open the inspector WebSocket, from the management listener.
+///
+/// The protocol is unchanged from when this rode on the data port: the caller
+/// names its target as `x-deis-app-id: _inspect:<app>`, carries the token
+/// `StartInspect` minted in `x-deis-inspect-token`, and upgrades. What changed
+/// is the door: this handler is mounted on the listener only this fleet's
+/// machines can reach, so a stolen token no longer works from a connection
+/// that proves nothing, and the node's public port has nothing to say about
+/// debuggers at all.
+///
+/// The caller was admitted by the TLS handshake - it proved a certificate of
+/// this fleet. Nothing here re-checks *which* machine it was: minting a token
+/// already required the control plane, and the token is the answer to "who may
+/// attach", scoped to one application and one environment, with an expiry.
+pub async fn handle_inspector_upgrade(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: Option<WebSocketUpgrade>,
+) -> Response {
+    let target = match headers
+        .get(APP_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|id| id.strip_prefix("_inspect:"))
+    {
+        Some(target_app_id) => target_app_id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Missing or malformed {APP_ID_HEADER} header: expected _inspect:<app>"),
+            )
+                .into_response();
+        }
+    };
+
+    let token = headers
+        .get("x-deis-inspect-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let environment = requested_environment(&headers).to_string();
+    let target = AppKey::new(target, environment);
+    if !state.app_manager.validate_inspect_token(&target, token) {
+        return (StatusCode::FORBIDDEN, "Invalid or expired inspector token").into_response();
+    }
+
+    match ws {
+        Some(ws_upgrade) => {
+            let app_manager = state.app_manager.clone();
+            ws_upgrade
+                .on_upgrade(move |socket| handle_inspector_session(socket, target, app_manager))
+                .into_response()
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            "Inspector requires WebSocket connection",
+        )
+            .into_response(),
+    }
 }
 
 /// Handle debugger session

@@ -81,15 +81,15 @@ KV、数据库、Blob 的测试**不是** `#[ignore]` 等着谁先手动起一�
 
 ## 远程调试（README 从这里过来）
 
-Chrome DevTools Protocol 复用节点对外服务的那个 HTTP 端口，不额外开监听：
+Chrome DevTools Protocol 挂在节点的互证 TLS 管理监听上，不额外开监听：
 
-- URL：`ws://<节点>:<http_port>/`
+- URL：`wss://<节点>:<management 端口>/`
 - 请求头：`x-deis-app-id: _inspect:<app_id>`、`x-deis-inspect-token: <token>`
 
-`_inspect:` 这个前缀是在节点的分发层被识别的（`src/dispatcher/handlers.rs` 里对
-`app_id` 的 `strip_prefix`），deis-proxy 会拿 `x-deis-app-id` 去比对应用列表，
-`_inspect:xxx` 不在列表里，所以穿不过代理——必须直接打节点自己的端口。会话的
-签发与校验在 `src/management/service_test.rs` 里有覆盖。
+`_inspect:` 目标由 `src/dispatcher/handlers.rs` 的 `handle_inspector_upgrade`
+识别，只挂在 `[machine_identity] management_listen` 那个监听上——数据端口已不再
+应答它。令牌由机队通道的 `StartInspect` 签发，而连接本身要先在 TLS 握手里证明
+本机队机器的身份。会话的签发与校验在 `src/management/service_test.rs` 里有覆盖。
 
 ---
 

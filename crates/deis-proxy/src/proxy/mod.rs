@@ -2,10 +2,10 @@
 //!
 //! Request flow:
 //!
-//! 1. Resolve the application. A non-empty `x-deis-app-id` header names the
-//!    app and must match one this instance knows (an unknown id is a 404,
-//!    never a fallback to the `Host`). Otherwise `Host` plus the request
-//!    path are matched against the control plane's catalog
+//! 1. Delete every `x-deis-*` header the client sent, before any routing
+//!    input is read: the namespace is this platform's own, and a request
+//!    does not get to name its application with it. `Host` plus the request
+//!    path are then matched against the control plane's catalog
 //!    ([`crate::catalog`]) first and the locally configured application
 //!    list second - the catalog is the table an operator can change without
 //!    touching this machine, and it is the only one that knows path
@@ -39,9 +39,10 @@
 //!    conversation with no total size, not a body a node will buffer. Asking
 //!    for an upgrade is not enough; `request_body_filter` says why not.
 //! 5. A backend is picked from the shared upstream pool and the request is
-//!    forwarded, and the whole `x-deis-` namespace is taken away from the
-//!    client first. Every header under that prefix is dropped, whatever it
-//!    is; then `x-deis-app-id` is set to the id deis-proxy decided on and
+//!    forwarded carrying this edge's own account of it: the client's own
+//!    `x-deis-` headers are already gone, deleted before routing in step 1,
+//!    so what crosses the hop is what deis-proxy decided. `x-deis-app-id`
+//!    is set to the id deis-proxy decided on and
 //!    `x-deis-environment` to that app's configured environment (defaulting
 //!    to production when the route names none). In plain reverse proxy mode,
 //!    where no application was resolved, nothing is put back. Either way
@@ -102,28 +103,34 @@ pub mod service;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::modules::http::HttpModules;
 use pingora::modules::http::compression::{ResponseCompression, ResponseCompressionBuilder};
 use pingora::protocols::http::compression::Algorithm;
+use pingora::protocols::tls::CaType;
 use pingora::proxy::{ProxyHttp, Session};
+use pingora::tls::pkey::PKey;
+use pingora::tls::x509::X509;
 use pingora::upstreams::peer::HttpPeer;
+use pingora::utils::tls::CertKey;
 use pingora::{Error, ErrorType};
 use tracing::{debug, info, warn};
 
 use crate::acme::{CHALLENGE_PREFIX, ChallengeResponder};
 use crate::catalog::table::{CatalogRoutes, MatchSource};
 use crate::config::routes::{RouteTable, normalize_host};
-use crate::config::system::{CompressionAlgo, DEFAULT_MAX_REQUEST_BODY_BYTES};
+use crate::config::system::{
+    CompressionAlgo, DEFAULT_MAX_REQUEST_BODY_BYTES, MachineIdentityConfig,
+};
 use crate::config::{AppConfig, ConfigManager, SystemConfig};
 
 pub use access_log::AccessLog;
 pub use balancer::Balancer;
 pub use inherited::InheritedListeners;
 pub use service::ExitOnPanic;
-
 pub struct DeisProxy {
     config: Arc<ConfigManager>,
     balancer: Balancer,
@@ -132,6 +139,70 @@ pub struct DeisProxy {
     /// switched on. `None` means the challenge path is routed like any other
     /// path, which is what an instance with its own certificate files wants.
     acme: Option<Arc<ChallengeResponder>>,
+    /// Mutual-TLS material for the upstream leg, present only when
+    /// `[machine_identity]` is configured. A node's data port admits a caller
+    /// only over mutual TLS naming a proxy of its fleet, so a proxy holding
+    /// this reaches its nodes proved and verified; one without keeps the
+    /// plaintext leg it always had and is refused by every node it dials.
+    upstream_tls: Option<UpstreamTls>,
+}
+
+/// The upstream leg's mutual-TLS material, parsed once at startup.
+///
+/// The certificate and key come from the same files `[machine_identity]`
+/// names; on a renewal the files change on disk and the machine channel
+/// reloads its own copy, while this parsed snapshot stays as it was. The gap
+/// lasts until restart, which is acceptable for material that outlives a
+/// demo's certificates by weeks - and it is why this is logged, not hidden.
+#[derive(Clone)]
+pub struct UpstreamTls {
+    /// This proxy's certificate and key, presented to a node's data port.
+    pub client_cert_key: Arc<CertKey>,
+    /// The root a node's certificate must chain to.
+    pub ca: Arc<CaType>,
+}
+
+impl UpstreamTls {
+    /// Read and parse the three files `[machine_identity]` names.
+    pub fn load(identity: &MachineIdentityConfig) -> anyhow::Result<Self> {
+        let cert_pem = std::fs::read(&identity.certificate).with_context(|| {
+            format!(
+                "reading upstream client certificate {}",
+                identity.certificate
+            )
+        })?;
+        let key_pem = std::fs::read(&identity.private_key)
+            .with_context(|| format!("reading upstream client key {}", identity.private_key))?;
+        let root_pem = std::fs::read(&identity.trust_root)
+            .with_context(|| format!("reading the upstream trust root {}", identity.trust_root))?;
+        let certificates = X509::stack_from_pem(&cert_pem).with_context(|| {
+            format!(
+                "parsing upstream client certificate {}",
+                identity.certificate
+            )
+        })?;
+        if certificates.is_empty() {
+            anyhow::bail!(
+                "{} contains no certificate, so there is nothing to present to a node's \
+                 data port",
+                identity.certificate
+            );
+        }
+        let key = PKey::private_key_from_pem(&key_pem)
+            .with_context(|| format!("parsing upstream client key {}", identity.private_key))?;
+        let roots = X509::stack_from_pem(&root_pem)
+            .with_context(|| format!("parsing the upstream trust root {}", identity.trust_root))?;
+        if roots.is_empty() {
+            anyhow::bail!(
+                "{} contains no certificate, so no node could prove itself to this proxy",
+                identity.trust_root
+            );
+        }
+        Ok(Self {
+            client_cert_key: Arc::new(CertKey::new(certificates, key)),
+            ca: Arc::new(roots.into_boxed_slice()),
+        })
+    }
 }
 
 /// Per-request state shared between proxy phases.
@@ -212,12 +283,14 @@ impl DeisProxy {
         balancer: Balancer,
         access_log: Option<AccessLog>,
         acme: Option<Arc<ChallengeResponder>>,
+        upstream_tls: Option<UpstreamTls>,
     ) -> Self {
         Self {
             config,
             balancer,
             access_log,
             acme,
+            upstream_tls,
         }
     }
 
@@ -339,8 +412,6 @@ fn https_authority(host: &str, port: u16) -> String {
 /// changed through the API, a local one cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolvedFrom {
-    /// The `x-deis-app-id` header named it outright.
-    Header,
     /// A route in the control plane's catalog.
     Catalog,
     /// The automatic address of an environment.
@@ -352,7 +423,6 @@ enum ResolvedFrom {
 impl ResolvedFrom {
     fn as_str(self) -> &'static str {
         match self {
-            ResolvedFrom::Header => "header",
             ResolvedFrom::Catalog => "catalog-route",
             ResolvedFrom::CatalogPreview => "catalog-preview",
             ResolvedFrom::Local => "local-config",
@@ -398,8 +468,7 @@ enum Resolution {
 /// whole job. A proxy that *has* been pointed at a control plane and has
 /// never heard back is a different machine in a bad state: it has been told
 /// where its routing comes from and does not have it, so a request it cannot
-/// place must be refused rather than forwarded on the strength of the
-/// client's own `x-deis-app-id`.
+/// place must be refused rather than forwarded unplaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoutingSource {
     /// No control plane is configured. This machine's own application list
@@ -433,15 +502,10 @@ impl RoutingSource {
 
 /// The routing rule.
 ///
-/// A non-empty `x-deis-app-id` is authoritative: it must name an app this
-/// instance knows, and an unknown value is rejected rather than silently
-/// replaced by whatever the `Host` maps to, because the id is what
-/// deis-runtime routes on and the two must not disagree. An empty header
-/// counts as absent. The header names an *application* and not an
-/// environment, so an app that only the catalog knows resolves to its
-/// default environment.
-///
-/// Without the header, the catalog is consulted before the local list. The
+/// The request's `Host` is what names the application, and the client has no
+/// say in it: every header it sent under [`PLATFORM_HEADER_PREFIX`] was
+/// deleted by [`strip_client_platform_headers`] in `request_filter`, before
+/// any of this ran. The catalog is consulted before the local list. The
 /// catalog is what an operator edits through the API or the dashboard, and
 /// it is strictly more specific: it matches on host *and* path prefix where
 /// the local list matches on host alone. An application the catalog resolves
@@ -451,17 +515,15 @@ fn resolve_app(
     routes: &RouteTable,
     catalog: &CatalogRoutes,
     source: RoutingSource,
-    requested_id: Option<&str>,
     host: &str,
     path: &str,
 ) -> Resolution {
     // What it means that every lookup above failed. Checked last of all, so
-    // an app the catalog knows by id is still reachable by header on an
-    // instance whose routing table happens to hold no rule.
+    // the arms read in the order the tables are consulted.
     let nothing_claims_a_host = || match source {
         // Told where its routing comes from, and never told what it is. The
-        // `x-deis-app-id` the client sent is not an answer to that - it is
-        // the question - so this request cannot be placed and is refused.
+        // host name the client chose is not an answer to that, so this
+        // request cannot be placed and is refused.
         RoutingSource::CatalogMissing => Resolution::Unavailable,
         // The control plane answered, and its table is the whole truth about
         // what is routed here. A request outside it is a 404 even when that
@@ -479,28 +541,6 @@ fn resolve_app(
             }
         }
     };
-
-    if let Some(id) = requested_id.filter(|id| !id.is_empty()) {
-        if let Some(app) = routes.app_by_id(id) {
-            return Resolution::Found(Resolved {
-                app_id: app.id.clone(),
-                environment: app.environment.clone(),
-                deployment_generation: None,
-                config: Some(Arc::clone(app)),
-                from: ResolvedFrom::Header,
-            });
-        }
-        return match catalog.target_by_app_id(id) {
-            Some(target) => Resolution::Found(Resolved {
-                app_id: target.app_id,
-                environment: target.environment,
-                deployment_generation: target.deployment_generation,
-                config: None,
-                from: ResolvedFrom::Header,
-            }),
-            None => nothing_claims_a_host(),
-        };
-    }
 
     if let Some(found) = catalog.match_request(host, path) {
         // The same app id may also be configured locally; that entry is
@@ -531,48 +571,37 @@ fn resolve_app(
     }
 }
 
-/// Hand the node the platform's own account of this request: clear the whole
-/// [`PLATFORM_HEADER_PREFIX`] namespace of whatever the client sent, then put
-/// back the two headers deis-proxy actually decided.
+/// Delete every [`PLATFORM_HEADER_PREFIX`] header the client sent, and name
+/// what was deleted.
 ///
-/// The order is the whole rule, and it is a sweep rather than two names for a
-/// reason. pingora has already copied the downstream headers onto the
-/// upstream request by the time this runs, so anything the client wrote under
-/// `x-deis-` is sitting there addressed to a component that cannot tell it
-/// from a value this edge stamped. Overwriting only `x-deis-app-id` and
-/// `x-deis-environment` left the rest of the namespace crossing the hop
-/// untouched, and the rest of the namespace is where the evidence is.
-/// `x-deis-caller` is the header the node stamps over a service call and an
-/// application is documented as free to branch on; an outside client sent
+/// This runs at the very top of `request_filter`, before the `Host` is even
+/// read: the namespace is one component of this platform telling another
+/// something, and routing is one of the things it says. A client that set
+/// `x-deis-app-id` used to name any application the edge knew, including
+/// ones with no public route at all and the node's own `_system` - the
+/// header is an answer the node reads, not a question a client gets to ask.
+/// Deleting the whole prefix rather than the two routing names also takes
+/// back `x-deis-caller`, which the node stamps over a service call and an
+/// application is documented as free to branch on: an outside client sent
 /// `x-deis-caller: admin-app` through this hop and a callee following that
 /// documented pattern granted it admin. `x-deis-tenant` and
 /// `x-deis-storage-token` are the same shape one hop further in.
 ///
-/// So nothing under the prefix survives the edge. A client may still *ask*
-/// for an application by sending `x-deis-app-id`: that is a documented input,
-/// read and checked in `request_filter` long before this point, and what goes
-/// back on the wire here is the id this edge resolved, never the string the
-/// client typed. With no application resolved - plain reverse proxy mode, the
-/// only state that reaches here with both fields `None` - nothing is put
-/// back, because having no opinion is not the same as passing on the client's.
-/// An upstream that is not a deis-runtime never reads any of this; a
-/// deis-runtime answers 400 when the pair is absent, which is the honest
-/// outcome for a request nothing here routed.
+/// The names are lower case whatever arrived on the wire -
+/// `HeaderName::as_str` is always lower case, so a client spelling one
+/// `X-Deis-Caller` is caught by the same comparison - and a name appears
+/// once however many values it holds, because removal takes all of them.
 ///
 /// The cost is that `x-deis-` is closed to applications on the inbound path:
 /// an application that invented a header of its own under that prefix stops
 /// receiving it and has to rename it. That is the same bargain deis-bundle
 /// already strikes on the outbound path, where a bundle setting an `x-deis-`
 /// response header is refused at build time.
-fn stamp_platform_headers(
-    upstream_request: &mut RequestHeader,
-    ctx: &RequestCtx,
-) -> pingora::Result<()> {
+fn strip_client_platform_headers(request: &mut RequestHeader) -> Vec<String> {
     // Collected before anything is removed, because the map cannot be written
     // while it is being read - and the names are wanted as owned strings for
-    // the log below in any case. `HeaderName::as_str` is always lower case, so
-    // a client spelling one `X-Deis-Caller` is caught by the same comparison.
-    let from_client: Vec<String> = upstream_request
+    // the log in any case.
+    let from_client: Vec<String> = request
         .headers
         .keys()
         .map(|name| name.as_str())
@@ -580,34 +609,27 @@ fn stamp_platform_headers(
         .map(str::to_string)
         .collect();
     for name in &from_client {
-        upstream_request.remove_header(name.as_str());
+        request.remove_header(name.as_str());
     }
+    from_client
+}
 
-    // A client naming the application it wants is ordinary, documented
-    // traffic, so those two are swept without comment. Everything else under
-    // the prefix has no reader on this hop and no honest sender: a client that
-    // sent one was trying to hand the node evidence about itself, and an
-    // operator wants to see that even though it has already been defeated.
-    let forged: Vec<&str> = from_client
-        .iter()
-        .map(String::as_str)
-        .filter(|name| *name != APP_ID_HEADER && *name != ENVIRONMENT_HEADER)
-        .collect();
-    if !forged.is_empty() {
-        warn!(
-            host = %ctx.host,
-            app_id = ?ctx.app_id,
-            removed = forged.len(),
-            headers = %forged.join(", "),
-            "a client sent {} header(s) in the platform's own {} namespace; all {} were removed \
-             before the hop to the node, which reads this namespace as the platform's own \
-             evidence and cannot tell a value a client wrote from one this edge stamped",
-            forged.len(),
-            PLATFORM_HEADER_PREFIX,
-            forged.len()
-        );
-    }
-
+/// Hand the node the platform's own account of this request: the headers it
+/// decided, written onto a request whose own [`PLATFORM_HEADER_PREFIX`]
+/// namespace is empty, because [`strip_client_platform_headers`] emptied it
+/// before routing.
+///
+/// `x-deis-app-id` is the id this edge resolved and `x-deis-environment` the
+/// environment it resolved the application to. With no application resolved
+/// - plain reverse proxy mode, the only state that reaches here with both
+///   fields `None` - nothing is written, because having no opinion is not the
+///   same as passing on the client's. An upstream that is not a deis-runtime
+///   never reads any of this; a deis-runtime answers 400 when the pair is
+///   absent, which is the honest outcome for a request nothing here routed.
+fn stamp_platform_headers(
+    upstream_request: &mut RequestHeader,
+    ctx: &RequestCtx,
+) -> pingora::Result<()> {
     if let Some(app_id) = &ctx.app_id {
         upstream_request.insert_header(APP_ID_HEADER, app_id.as_str())?;
     }
@@ -637,9 +659,9 @@ fn stamp_platform_headers(
 /// [`RouteTable::https_available_for_host`] asks whether this edge holds a
 /// certificate that attests to the name the `Location` will carry, and that
 /// is the load-bearing half: the `Location` is built from the client's own
-/// `Host` header, which took no part in resolving the application whenever
-/// `x-deis-app-id` did. Without this test, a client naming any known
-/// application by header and any `Host` it liked was answered `301` to that
+/// `Host` header, a name the client chose and the one part of the routing
+/// input nothing here can vouch for. Without this test, a client pairing a
+/// known application with any `Host` it liked was answered `301` to that
 /// host - a redirect off the edge's own domain, signed by the edge's own
 /// domain, which is what makes an open redirect worth having for a phishing
 /// link. `auto_redirect_to_https` defaults to on, so no configuration had to
@@ -698,11 +720,31 @@ impl ProxyHttp for DeisProxy {
         session: &mut Session,
         ctx: &mut RequestCtx,
     ) -> pingora::Result<bool> {
+        // Before anything else, before the `Host` is even read: what the
+        // client wrote under the platform's prefix must not be able to name
+        // an application. See [`strip_client_platform_headers`].
+        let stripped = strip_client_platform_headers(session.req_header_mut());
         ctx.tls = session
             .digest()
             .and_then(|digest| digest.ssl_digest.as_ref())
             .is_some();
         ctx.host = request_host(session);
+        if !stripped.is_empty() {
+            // The count and the names, the way the forged headers were always
+            // reported upstream: deis-proxy serves no metrics endpoint, so
+            // these structured fields are the counter.
+            debug!(
+                host = %ctx.host,
+                removed = stripped.len(),
+                headers = %stripped.join(", "),
+                "a client sent {} header(s) in the platform's own {} namespace; all {} were \
+                 deleted before any routing decision, which reads only the Host and the request \
+                 path",
+                stripped.len(),
+                PLATFORM_HEADER_PREFIX,
+                stripped.len()
+            );
+        }
 
         // Checked before the route table, because refusing here costs nothing:
         // no upstream has been picked and not a byte of the body has been
@@ -744,10 +786,6 @@ impl ProxyHttp for DeisProxy {
         let routes = self.config.routes();
         let catalog = self.config.catalog_routes();
         let source = RoutingSource::of(&system, &catalog);
-        let requested_id = session
-            .get_header(APP_ID_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
         // Resolved in its own statement so the borrow of the request header
         // ends here: the arms below need the session mutably, and the path is
         // read again rather than copied, which keeps an allocation off every
@@ -756,7 +794,6 @@ impl ProxyHttp for DeisProxy {
             &routes,
             &catalog,
             source,
-            requested_id.as_deref(),
             &ctx.host,
             session.req_header().uri.path(),
         );
@@ -766,7 +803,7 @@ impl ProxyHttp for DeisProxy {
                 debug!(
                     host = %ctx.host,
                     "no control plane, no applications and no routing table: plain reverse proxy \
-                     mode, forwarding this request with its routing headers stripped"
+                     mode, forwarding this request with its platform headers already deleted"
                 );
                 return Ok(false);
             }
@@ -775,18 +812,16 @@ impl ProxyHttp for DeisProxy {
                 // healthy. What is missing is this edge's knowledge of where
                 // to send it, so the honest answer is "this instance cannot
                 // serve you yet" and the honest action is to refuse rather
-                // than route on a header the client wrote. The routing table
-                // poller logs at error, every
+                // than forward a request it has made no routing decision
+                // about. The routing table poller logs at error, every
                 // routing.control_poll_interval_secs seconds (5 by default),
                 // why the fetch is failing.
                 warn!(
                     host = %ctx.host,
                     path = %session.req_header().uri.path(),
-                    app_id = ?requested_id,
                     "a control plane is configured and no routing table has ever been fetched \
                      from it, so this instance cannot say which application this request belongs \
-                     to; refusing it with 503. Forwarding it would route it by the client's own \
-                     x-deis-app-id, which the node trusts and picks its storage tenant from"
+                     to; refusing it with 503 rather than forwarding a request it cannot place"
                 );
                 session
                     .respond_error_with_body(
@@ -802,7 +837,6 @@ impl ProxyHttp for DeisProxy {
                 debug!(
                     host = %ctx.host,
                     path = %session.req_header().uri.path(),
-                    app_id = ?requested_id,
                     catalog_version = %catalog.version(),
                     "no application for request"
                 );
@@ -853,9 +887,9 @@ impl ProxyHttp for DeisProxy {
             && let Some(port) = tls_ports.first()
         {
             if ctx.host.is_empty() {
-                // Only reachable through the explicit app id header; the
-                // redirect is a convenience, so forward rather than build a
-                // Location without a host.
+                // An HTTP/1.0 request may name no host at all; the redirect
+                // is a convenience, so forward rather than build a Location
+                // without a host.
                 debug!(app_id = %resolved.app_id, "request carries no host; cannot build an HTTPS redirect, forwarding");
                 return Ok(false);
             }
@@ -995,17 +1029,50 @@ impl ProxyHttp for DeisProxy {
         ctx.tried_upstreams.push(addr.to_string());
 
         let system = self.config.get_system_config();
-        // Offloading means the upstream leg is plain even when the client
-        // leg is TLS; otherwise TLS is carried through to the backend.
-        let tls_upstream = ctx.tls && !system.https().auto_offload_https;
-        // SNI only matters on a TLS leg; leaving it empty on plain legs keeps
-        // one connection pool per backend instead of one per client Host.
-        let sni = if tls_upstream {
-            ctx.host.clone()
-        } else {
-            String::new()
+        // The upstream leg carries the client's TLS through unless offloading
+        // is on. But a node's data port answers mutual TLS and nothing else -
+        // a caller that proved no proxy of this fleet gets no connection at
+        // all - so a proxy holding an identity dials every node over TLS and
+        // proves itself, whatever the client leg was. Without an identity
+        // there is nothing to prove, the leg stays as it was, and the node
+        // refuses it during the handshake; that refusal is the configuration
+        // gap speaking, and it is said at startup too.
+        let sni = match self.upstream_tls.as_ref() {
+            Some(_) => {
+                // Empty SNI turns pingora's verification off completely, so
+                // the leg names the node it is dialling. `ctx.host` is the
+                // authority the client asked for, which on a fleet fronted by
+                // deis-proxy is always set; the fallback keeps an odd HTTP/1.0
+                // request from silently disabling verification.
+                if ctx.host.is_empty() {
+                    "deis-node.internal".to_string()
+                } else {
+                    ctx.host.clone()
+                }
+            }
+            None => {
+                let tls_upstream = ctx.tls && !system.https().auto_offload_https;
+                if tls_upstream {
+                    ctx.host.clone()
+                } else {
+                    String::new()
+                }
+            }
         };
+        let tls_upstream =
+            self.upstream_tls.is_some() || (ctx.tls && !system.https().auto_offload_https);
         let mut peer = HttpPeer::new(addr, tls_upstream, sni);
+        if let Some(upstream_tls) = self.upstream_tls.as_ref() {
+            peer.client_cert_key = Some(Arc::clone(&upstream_tls.client_cert_key));
+            peer.options.ca = Some(Arc::clone(&upstream_tls.ca));
+            peer.options.verify_cert = true;
+            // The node names itself with a SPIFFE URI, which no DNS hostname
+            // matcher can read. The chain to this fleet's root is the answer
+            // to "is this the node I was told about"; matching the dialled
+            // address against a name the certificate deliberately does not
+            // carry would verify nothing and refuse everything.
+            peer.options.verify_hostname = false;
+        }
         peer.options.connection_timeout = Some(system.upstream_connect_timeout());
         // Bounds an in-flight write to the upstream, which only exists while
         // there are bytes to push, so it means the same thing on a tunnel as
@@ -1271,37 +1338,16 @@ mod tests {
     fn standalone(
         routes: &RouteTable,
         catalog: &CatalogRoutes,
-        requested_id: Option<&str>,
         host: &str,
         path: &str,
     ) -> Resolution {
-        resolve_app(
-            routes,
-            catalog,
-            RoutingSource::ThisMachine,
-            requested_id,
-            host,
-            path,
-        )
+        resolve_app(routes, catalog, RoutingSource::ThisMachine, host, path)
     }
 
     /// [`resolve_app`] on an instance a control plane drives and whose
     /// catalog has been fetched at least once.
-    fn driven(
-        routes: &RouteTable,
-        catalog: &CatalogRoutes,
-        requested_id: Option<&str>,
-        host: &str,
-        path: &str,
-    ) -> Resolution {
-        resolve_app(
-            routes,
-            catalog,
-            RoutingSource::Catalog,
-            requested_id,
-            host,
-            path,
-        )
+    fn driven(routes: &RouteTable, catalog: &CatalogRoutes, host: &str, path: &str) -> Resolution {
+        resolve_app(routes, catalog, RoutingSource::Catalog, host, path)
     }
 
     fn resolved(resolution: Resolution) -> Option<Resolved> {
@@ -1320,52 +1366,41 @@ mod tests {
     }
 
     #[test]
-    fn header_wins_when_it_names_a_known_app() {
+    fn a_known_app_id_header_is_deleted_and_the_host_decides() {
+        // The header used to be authoritative and name any application the
+        // edge knew; it is deleted before routing, and the Host is the whole
+        // decision. A request whose deleted header named `blog` but whose
+        // Host names shop's host goes to shop.
         let routes = table(&[("shop", "shop.example.com"), ("blog", "blog.example.com")]);
-        let resolution = standalone(
-            &routes,
-            &no_catalog(),
-            Some("blog"),
-            "shop.example.com",
-            "/",
-        );
-        assert_eq!(resolved_id(resolution).as_deref(), Some("blog"));
+        let mut request = empty_upstream_request();
+        request.insert_header(APP_ID_HEADER, "blog").unwrap();
+        let deleted = strip_client_platform_headers(&mut request);
+        assert_eq!(deleted, vec![APP_ID_HEADER.to_string()]);
+        let resolution = standalone(&routes, &no_catalog(), "shop.example.com", "/");
+        assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
     }
 
     #[test]
-    fn unknown_header_is_rejected_even_for_a_known_host() {
+    fn a_known_app_id_header_with_an_unmatched_host_is_a_404() {
+        // Header routing used to answer this request; host routing has no
+        // opinion on a host nothing claims, whatever the deleted header said.
         let routes = table(&[("shop", "shop.example.com")]);
+        let mut request = empty_upstream_request();
+        request.insert_header(APP_ID_HEADER, "shop").unwrap();
+        strip_client_platform_headers(&mut request);
         assert!(matches!(
-            standalone(
-                &routes,
-                &no_catalog(),
-                Some("Shop"),
-                "shop.example.com",
-                "/"
-            ),
-            Resolution::NotFound
-        ));
-        assert!(matches!(
-            standalone(
-                &routes,
-                &no_catalog(),
-                Some("other"),
-                "shop.example.com",
-                "/"
-            ),
+            standalone(&routes, &no_catalog(), "other.example.com", "/"),
             Resolution::NotFound
         ));
     }
 
     #[test]
-    fn empty_header_falls_back_to_the_host() {
+    fn the_host_resolves_when_no_platform_header_was_sent() {
         let routes = table(&[("shop", "shop.example.com")]);
-        let resolution = standalone(&routes, &no_catalog(), Some(""), "shop.example.com", "/");
-        assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
-        let resolution = standalone(&routes, &no_catalog(), None, "shop.example.com", "/");
+        let resolution = standalone(&routes, &no_catalog(), "shop.example.com", "/");
         assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
         assert!(matches!(
-            standalone(&routes, &no_catalog(), None, "other.example.com", "/"),
+            standalone(&routes, &no_catalog(), "other.example.com", "/"),
             Resolution::NotFound
         ));
     }
@@ -1374,13 +1409,7 @@ mod tests {
     fn no_apps_and_no_routing_table_means_passthrough() {
         let routes = table(&[]);
         assert!(matches!(
-            standalone(
-                &routes,
-                &no_catalog(),
-                Some("anything"),
-                "any.example.com",
-                "/"
-            ),
+            standalone(&routes, &no_catalog(), "any.example.com", "/"),
             Resolution::Passthrough
         ));
     }
@@ -1396,11 +1425,11 @@ mod tests {
         );
         let routes = table(&[]);
         assert_eq!(
-            resolved_id(driven(&routes, &catalog, None, "shop.example.com", "/")).as_deref(),
+            resolved_id(driven(&routes, &catalog, "shop.example.com", "/")).as_deref(),
             Some("shop")
         );
         assert!(matches!(
-            driven(&routes, &catalog, None, "other.example.com", "/"),
+            driven(&routes, &catalog, "other.example.com", "/"),
             Resolution::NotFound
         ));
     }
@@ -1417,12 +1446,12 @@ mod tests {
             None,
         );
         let routes = table(&[]);
-        let found = resolved(driven(&routes, &catalog, None, "example.com", "/api/users")).unwrap();
+        let found = resolved(driven(&routes, &catalog, "example.com", "/api/users")).unwrap();
         assert_eq!(found.app_id, "api");
         assert_eq!(found.environment, "pr-42");
         assert_eq!(found.from, ResolvedFrom::Catalog);
         assert_eq!(
-            resolved_id(driven(&routes, &catalog, None, "example.com", "/")).as_deref(),
+            resolved_id(driven(&routes, &catalog, "example.com", "/")).as_deref(),
             Some("site")
         );
     }
@@ -1438,7 +1467,7 @@ mod tests {
             r#"{"version":"v1","routes":[{"app_id":"shop","environment":"pr-9","host":"shop.example.com","path_prefix":"/"}],"environments":[]}"#,
             None,
         );
-        let found = resolved(driven(&routes, &catalog, None, "shop.example.com", "/")).unwrap();
+        let found = resolved(driven(&routes, &catalog, "shop.example.com", "/")).unwrap();
         assert_eq!(found.app_id, "shop");
         assert_eq!(found.environment, "pr-9");
         assert_eq!(found.from, ResolvedFrom::Catalog);
@@ -1455,7 +1484,7 @@ mod tests {
             r#"{"version":"v1","routes":[{"app_id":"other","environment":"production","host":"other.example.com","path_prefix":"/"}],"environments":[]}"#,
             None,
         );
-        let found = resolved(driven(&routes, &catalog, None, "shop.example.com", "/")).unwrap();
+        let found = resolved(driven(&routes, &catalog, "shop.example.com", "/")).unwrap();
         assert_eq!(found.app_id, "shop");
         assert_eq!(found.from, ResolvedFrom::Local);
     }
@@ -1470,7 +1499,6 @@ mod tests {
         let found = resolved(driven(
             &routes,
             &catalog,
-            None,
             "pr-42--shop.preview.example.com",
             "/anything",
         ))
@@ -1481,29 +1509,25 @@ mod tests {
     }
 
     #[test]
-    fn the_header_can_name_an_app_only_the_catalog_knows() {
+    fn an_app_only_the_catalog_knows_is_reached_by_its_route_not_its_name() {
+        // The header path used to resolve an application the catalog knew
+        // even when no host claimed it; the header is deleted before
+        // routing, so such an application is reachable exactly as far as its
+        // routes reach.
         let catalog = catalog(
             r#"{"version":"v1","routes":[{"app_id":"shop","environment":"production","host":"shop.example.com","path_prefix":"/"}],
                 "environments":[{"app_id":"shop","environment":"production"},{"app_id":"shop","environment":"pr-42"}]}"#,
             None,
         );
         let routes = table(&[]);
-        let found = resolved(driven(
-            &routes,
-            &catalog,
-            Some("shop"),
-            "anything.test",
-            "/",
-        ))
-        .unwrap();
+        let found = resolved(driven(&routes, &catalog, "shop.example.com", "/")).unwrap();
         assert_eq!(found.app_id, "shop");
         assert_eq!(
             found.environment,
-            deis_wire::conventions::DEFAULT_ENVIRONMENT,
-            "the header names an application, so the only honest environment is the default one"
+            deis_wire::conventions::DEFAULT_ENVIRONMENT
         );
         assert!(matches!(
-            driven(&routes, &catalog, Some("nothing"), "anything.test", "/"),
+            driven(&routes, &catalog, "anything.test", "/"),
             Resolution::NotFound
         ));
     }
@@ -1517,25 +1541,28 @@ mod tests {
         // forward it" - so a request naming any application at all reached
         // the node carrying the client's own x-deis-app-id, which is the
         // header the node picks its storage tenant from. An instance a
-        // control plane drives must answer 404 here, and an application the
-        // catalog does know by name must still resolve by header.
+        // control plane drives must answer 404 here.
         let catalog = catalog(
             r#"{"version":"v1","routes":[],"environments":[{"app_id":"demo","environment":"production"}]}"#,
             None,
         );
         let routes = table(&[]);
         assert!(matches!(
-            driven(&routes, &catalog, None, "127.0.0.1", "/"),
+            driven(&routes, &catalog, "127.0.0.1", "/"),
+            Resolution::NotFound
+        ));
+        // The node's own targets stay unreachable from the edge by name:
+        // `_system` is the node's internal application and `_inspect:*` its
+        // debugger channel, and neither is something a public host can ask
+        // for.
+        assert!(matches!(
+            driven(&routes, &catalog, "_system", "/"),
             Resolution::NotFound
         ));
         assert!(matches!(
-            driven(&routes, &catalog, Some("_system"), "victim.example", "/"),
+            driven(&routes, &catalog, "_inspect:demo", "/"),
             Resolution::NotFound
         ));
-        assert_eq!(
-            resolved_id(driven(&routes, &catalog, Some("demo"), "127.0.0.1", "/")).as_deref(),
-            Some("demo")
-        );
     }
 
     #[test]
@@ -1545,30 +1572,24 @@ mod tests {
         // -H 'x-deis-app-id: demo' -H 'x-deis-environment: preview'` reached
         // the node as demo/preview - a different storage tenant - and
         // `-H 'x-deis-app-id: _system'` reached the node's internal system
-        // application. Every one of those is a request this instance made no
-        // routing decision about.
+        // application. The header is no longer read at all, and a Host this
+        // instance has no table for is still a request it made no routing
+        // decision about.
         //
         // 503 rather than 404: the application may exist and be healthy.
         // What is missing is this edge's knowledge of where to send it.
         let routes = table(&[]);
         let catalog = no_catalog();
-        for requested_id in [None, Some("demo"), Some("_system")] {
-            assert!(
-                matches!(
-                    resolve_app(
-                        &routes,
-                        &catalog,
-                        RoutingSource::CatalogMissing,
-                        requested_id,
-                        "victim.example",
-                        "/",
-                    ),
-                    Resolution::Unavailable
-                ),
-                "a request naming {requested_id:?} must not be routed by an instance that has \
-                 never been told what it routes"
-            );
-        }
+        assert!(matches!(
+            resolve_app(
+                &routes,
+                &catalog,
+                RoutingSource::CatalogMissing,
+                "victim.example",
+                "/",
+            ),
+            Resolution::Unavailable
+        ));
     }
 
     #[test]
@@ -1582,7 +1603,6 @@ mod tests {
             &routes,
             &no_catalog(),
             RoutingSource::CatalogMissing,
-            None,
             "shop.example.com",
             "/",
         ))
@@ -1604,7 +1624,7 @@ mod tests {
         );
         let routes = table(&[]);
         assert_eq!(
-            resolved_id(driven(&routes, &catalog, None, "shop.example.com", "/")).as_deref(),
+            resolved_id(driven(&routes, &catalog, "shop.example.com", "/")).as_deref(),
             Some("shop")
         );
     }
@@ -1615,7 +1635,7 @@ mod tests {
         // pushed without one must still resolve to a concrete value rather
         // than leave it unset.
         let routes = table(&[("shop", "shop.example.com")]);
-        let resolution = standalone(&routes, &no_catalog(), None, "shop.example.com", "/");
+        let resolution = standalone(&routes, &no_catalog(), "shop.example.com", "/");
         assert_eq!(
             resolved_environment(resolution).as_deref(),
             Some(deis_wire::conventions::DEFAULT_ENVIRONMENT)
@@ -1635,7 +1655,11 @@ mod tests {
     }
 
     #[test]
-    fn stamp_overwrites_a_client_supplied_app_id_and_environment() {
+    fn a_client_supplied_routing_pair_is_deleted_before_the_stamp() {
+        // Production order: request_filter strips, upstream_request_filter
+        // stamps. After the strip the client's values are gone, and what the
+        // node reads is whatever this edge resolved - nothing at all, when it
+        // resolved nothing.
         let mut upstream_request = empty_upstream_request();
         upstream_request
             .insert_header(APP_ID_HEADER, "attacker-app")
@@ -1643,6 +1667,18 @@ mod tests {
         upstream_request
             .insert_header(ENVIRONMENT_HEADER, "attacker-env")
             .unwrap();
+        strip_client_platform_headers(&mut upstream_request);
+
+        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
+
+        assert_eq!(header_str(&upstream_request, APP_ID_HEADER), None);
+        assert_eq!(header_str(&upstream_request, ENVIRONMENT_HEADER), None);
+    }
+
+    #[test]
+    fn the_stamp_writes_the_resolved_pair_onto_a_stripped_request() {
+        let mut upstream_request = empty_upstream_request();
+        strip_client_platform_headers(&mut upstream_request);
 
         let ctx = RequestCtx {
             app_id: Some("shop".to_string()),
@@ -1662,36 +1698,14 @@ mod tests {
     }
 
     #[test]
-    fn stamp_strips_the_client_values_when_no_application_was_resolved() {
-        // No application was resolved (RequestCtx::default has both fields
-        // as None), so deis-proxy has no opinion to stamp - and leaving the
-        // client's own values in place is not "no opinion", it is the
-        // client's opinion arriving at a node that cannot tell it from the
-        // edge's. Both go.
-        let mut upstream_request = empty_upstream_request();
-        upstream_request
-            .insert_header(APP_ID_HEADER, "client-value")
-            .unwrap();
-        upstream_request
-            .insert_header(ENVIRONMENT_HEADER, "client-env")
-            .unwrap();
-
-        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
-
-        assert_eq!(header_str(&upstream_request, APP_ID_HEADER), None);
-        assert_eq!(header_str(&upstream_request, ENVIRONMENT_HEADER), None);
-    }
-
-    #[test]
-    fn stamp_clears_the_rest_of_the_platform_namespace_too() {
-        // The hole the two tests above did not cover. `x-deis-caller` is the
-        // header the node stamps over a service call and an application is
-        // told it may branch on; deis-proxy resolved this request perfectly
-        // well and still handed the node the client's own value, because the
-        // stamping only ever knew two names. An outside client set
-        // `x-deis-caller: admin-app` through the edge and a callee following
-        // the platform's documented pattern granted it admin. The storage
-        // three are the same shape a hop further in.
+    fn the_strip_takes_the_whole_platform_namespace_and_nothing_else() {
+        // The hole an overwrite-only stamp did not cover. `x-deis-caller` is
+        // the header the node stamps over a service call and an application
+        // is told it may branch on; a stamp that knew only two names handed
+        // the node the client's own value for the rest of the namespace. An
+        // outside client set `x-deis-caller: admin-app` through the edge and
+        // a callee following the platform's documented pattern granted it
+        // admin. The storage three are the same shape a hop further in.
         let mut upstream_request = empty_upstream_request();
         for (name, value) in [
             ("x-deis-caller", "admin-app.production"),
@@ -1710,12 +1724,8 @@ mod tests {
             .insert_header("x-shop-request-id", "abc123")
             .unwrap();
 
-        let ctx = RequestCtx {
-            app_id: Some("shop".to_string()),
-            environment: Some("production".to_string()),
-            ..Default::default()
-        };
-        stamp_platform_headers(&mut upstream_request, &ctx).unwrap();
+        let deleted = strip_client_platform_headers(&mut upstream_request);
+        assert_eq!(deleted.len(), 5, "every name under the prefix, once each");
 
         for name in [
             "x-deis-caller",
@@ -1727,43 +1737,14 @@ mod tests {
             assert_eq!(
                 header_str(&upstream_request, name),
                 None,
-                "{name} reached the node with a value the client chose"
+                "{name} would reach the node with a value the client chose"
             );
         }
         assert_eq!(
             header_str(&upstream_request, "x-shop-request-id").as_deref(),
             Some("abc123"),
-            "only the platform's own prefix is closed; the application's headers still arrive"
+            "only the platform's own prefix is closed; the application's headers stay"
         );
-        // And the edge's own decision is still on the request, so the sweep
-        // did not run after the stamping.
-        assert_eq!(
-            header_str(&upstream_request, APP_ID_HEADER).as_deref(),
-            Some("shop")
-        );
-        assert_eq!(
-            header_str(&upstream_request, ENVIRONMENT_HEADER).as_deref(),
-            Some("production")
-        );
-    }
-
-    #[test]
-    fn stamp_clears_the_platform_namespace_with_nothing_resolved_either() {
-        // Plain reverse proxy mode. deis-proxy made no decision at all here,
-        // which is precisely why the client's version of the namespace may
-        // not stand in for one.
-        let mut upstream_request = empty_upstream_request();
-        upstream_request
-            .insert_header("x-deis-caller", "admin-app.production")
-            .unwrap();
-        upstream_request
-            .insert_header("x-deis-storage-token", "forged")
-            .unwrap();
-
-        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
-
-        assert_eq!(header_str(&upstream_request, "x-deis-caller"), None);
-        assert_eq!(header_str(&upstream_request, "x-deis-storage-token"), None);
     }
 
     #[test]
@@ -1777,8 +1758,9 @@ mod tests {
             .insert_header("X-Deis-Caller", "admin-app.production")
             .unwrap();
 
-        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
+        let deleted = strip_client_platform_headers(&mut upstream_request);
 
+        assert_eq!(deleted, vec!["x-deis-caller".to_string()]);
         assert_eq!(header_str(&upstream_request, "x-deis-caller"), None);
     }
 
@@ -1797,7 +1779,7 @@ mod tests {
             .append_header("x-deis-caller", "second")
             .unwrap();
 
-        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
+        strip_client_platform_headers(&mut upstream_request);
 
         assert_eq!(
             upstream_request

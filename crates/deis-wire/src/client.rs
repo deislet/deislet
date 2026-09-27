@@ -376,10 +376,7 @@ mod tests {
     use super::*;
 
     fn create_test_config() -> ControlConfig {
-        ControlConfig::new(
-            "test_node".to_string(),
-            "http://localhost:8080".to_string(),
-        )
+        ControlConfig::new("test_node".to_string(), "http://localhost:8080".to_string())
     }
 
     fn create_test_node_info() -> NodeInfo {

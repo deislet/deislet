@@ -391,6 +391,14 @@ pub struct QueueConsumerConfig {
     /// and what it costs in lease time.
     #[serde(rename = "maxConcurrency", alias = "max_concurrency", default)]
     pub max_concurrency: Option<u32>,
+    /// How many times a failing delivery is retried before the message is
+    /// dead-lettered. The standard requires the number to be *declared*, so
+    /// every provider binding plan states one: an absent value means the
+    /// standard's default of 3
+    /// ([`deis_build_core::binding_plan::DEFAULT_QUEUE_MAX_RETRIES`]), which
+    /// is also the number the deislet queue service applies.
+    #[serde(rename = "maxRetries", alias = "max_retries", default)]
+    pub max_retries: Option<u32>,
 }
 
 /// What the build does with the code, as the project asks for it.
@@ -475,6 +483,14 @@ pub struct LimitsConfig {
     /// a `fetch()` that follows two redirects costs three.
     #[serde(rename = "maxSubrequests", alias = "max_subrequests", default)]
     pub max_subrequests: Option<u32>,
+    /// How many outbound connections this application may hold open at the
+    /// same time. Counted concurrently, not per invocation.
+    #[serde(
+        rename = "maxOutboundConnections",
+        alias = "max_outbound_connections",
+        default
+    )]
+    pub max_outbound_connections: Option<u32>,
 }
 
 #[cfg(test)]
@@ -607,6 +623,24 @@ mod tests {
         let outstanding: Vec<Option<u32>> =
             config.queues.iter().map(|q| q.max_concurrency).collect();
         assert_eq!(outstanding, vec![Some(2), Some(3), None]);
+    }
+
+    /// `maxRetries` is the one queue number the standard requires to be
+    /// *declared* rather than assumed: the binding plan always states one,
+    /// filling an absent value with the standard's default, so both spellings
+    /// of the key and the absent case are the only three states a project can
+    /// be in.
+    #[test]
+    fn a_queue_consumer_takes_either_spelling_of_max_retries() {
+        let mut json = minimal();
+        json["queues"] = serde_json::json!([
+            { "name": "jobs", "maxRetries": 5 },
+            { "name": "mail", "max_retries": 1 },
+            { "name": "slow" }
+        ]);
+        let config = parse(json);
+        let retries: Vec<Option<u32>> = config.queues.iter().map(|q| q.max_retries).collect();
+        assert_eq!(retries, vec![Some(5), Some(1), None]);
     }
 
     #[test]

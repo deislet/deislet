@@ -267,26 +267,10 @@ impl IdentityMigrationCoordinator {
                     .to_string(),
             ));
         }
-        if config
-            .storage_auth_secret
-            .as_deref()
-            .is_some_and(|secret| distinct_tokens.contains(secret))
-        {
-            return Err(MigrationCoordinatorError::Configuration(
-                "migration administrator credentials must not reuse storage_auth_secret"
-                    .to_string(),
-            ));
-        }
-        if config
-            .api_keys
-            .iter()
-            .any(|secret| distinct_tokens.contains(secret.as_str()))
-        {
-            return Err(MigrationCoordinatorError::Configuration(
-                "migration administrator credentials must not reuse a human API credential"
-                    .to_string(),
-            ));
-        }
+        // Human API credentials live in the database now, hashed, so this
+        // check has nothing left to compare against: no configuration field
+        // can name a live token, and a token an operator fears reusing is
+        // revoked rather than listed anywhere here.
 
         Ok(Self {
             catalog,
@@ -1931,7 +1915,6 @@ mod tests {
             store_endpoint: Some(store_endpoint),
             queue_endpoint: Some(queue_endpoint),
             telemetry_endpoint: Some(telemetry_endpoint),
-            storage_auth_secret: Some("application-storage-capability-root-000001".to_string()),
             store_migration_admin_token: Some(STORE_TOKEN.to_string()),
             queue_migration_admin_token: Some(queue_token.to_string()),
             telemetry_migration_admin_token: Some(TELEMETRY_TOKEN.to_string()),
@@ -2266,12 +2249,6 @@ mod tests {
         assert!(error.to_string().contains("must be different"));
 
         reused.queue_migration_admin_token = Some(QUEUE_TOKEN.to_string());
-        reused.storage_auth_secret = Some(STORE_TOKEN.to_string());
-        let error =
-            IdentityMigrationCoordinator::from_config(Arc::clone(&catalog), &reused).unwrap_err();
-        assert!(error.to_string().contains("storage_auth_secret"));
-
-        reused.storage_auth_secret = None;
         reused.telemetry_migration_admin_token = Some(QUEUE_TOKEN.to_string());
         let error = IdentityMigrationCoordinator::from_config(catalog, &reused).unwrap_err();
         assert!(error.to_string().contains("different from each other"));

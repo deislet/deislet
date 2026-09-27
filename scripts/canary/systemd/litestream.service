@@ -1,0 +1,46 @@
+[Unit]
+Description=Litestream continuous backup of the control plane database
+Documentation=https://github.com/deislet/deislet/blob/main/docs/control-backup-and-restore.md
+# Ordered after the control plane, not tied to it. The control plane has to
+# exist for the database to be there at all; and it must be possible to
+# restart control - including both halves of a blue-green switch, which share
+# one database file - without the one Litestream process that may ever
+# replicate that file being restarted with them.
+After=deis-control.service
+Wants=deis-control.service
+PartOf=deislet.target
+
+[Service]
+Type=simple
+User=deis
+Group=deis
+# Litestream 0.5.17, pinned: the configuration in this repository, the replica
+# format, and `-json` in the restore drill are all written for the 0.5 series.
+# Installing a different build is a change to the backup, not an upgrade to a
+# tool.
+ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream.yml
+Restart=always
+RestartSec=3
+# A stop should finish the upload it is in rather than be cut mid-file; the
+# replica's checksums are there for when that happens, but there is no reason
+# to invite it.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=litestream
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The database, its `-wal`/`-shm` files and the LTX staging directory beside
+# it (/var/lib/deis-control/.control.db-litestream). Both spellings of the
+# state directory are listed because the default layout and the canary's
+# differ; the leading `-` keeps a machine that has only one of them from
+# failing to start.
+ReadWritePaths=-/var/lib/deis-control
+ReadWritePaths=-/var/lib/deis/control
+
+[Install]
+WantedBy=deislet.target

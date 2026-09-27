@@ -31,39 +31,50 @@
 投日志、往 `deis-store` / `deis-queue` 发调用。（目前只有 `deis-runtime` 在投日志，
 其余组件还只写自己的 stdout。）
 
-启动完成后可以这样打一发请求：
+启动完成后可以这样打一发请求（经 deis-proxy，模拟一个访客）：
 
 ```bash
-curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
+curl -H 'x-deis-app-id: demo' http://127.0.0.1:8087/hello/world
 ```
 
-**8086 是节点的端口，不是 deis-proxy 的。** 演示里 deis-proxy 起着，但它自己的配置文件
-里一个应用都没写，控制面的目录里也没有人建过路由，所以它选不出应用：请求原样转发给它
-唯一的那个上游（就是节点）。走 `http://127.0.0.1:8087/hello/world` 也能通，只是它证明
-的是「pingora 在转发」，不是「deis-proxy 按域名或路径选对了应用」。
+**8086 是节点的数据端口，不是 deis-proxy 的，而且它只接受互证 TLS。** 节点在该端口上
+验证 caller 必须持有机队签发给 proxy 的证书，明文连接在握手时就被关闭——所以直连
+8086 要用演示脚本里的 `runtime_curl`（`scripts/demo/lib.sh`，带 proxy 叶子证书并校验
+节点证书）。deis-proxy 自己转发请求时就带这张证书，这也正是它的上游连接方式。
+
+8087 是 deis-proxy 的端口。演示里它自己的配置文件里一个应用都没写，控制面的目录里也
+没有人建过路由，所以它选不出应用：请求原样转发给它唯一的那个上游（就是节点）。走
+8087 通了，证明的是「pingora 在转发」；要证明「deis-proxy 按域名或路径选对了应用」，
+要的是它的域名路由（`verify` 的 routing 组检查这件事）。
 
 有一处例外要说清楚，因为它是新加的：演示的 proxy 配置里写了 `[control]` 与
 `[machine_identity]`，所以它每 5 秒经机队通道向控制面要一次整张路由表
 （`deis.machine.MachineChannel/FetchRoutingTable`，证明一张只属于这个 proxy 自己的
-证书；没配 `[machine_identity]` 的 proxy 走的还是老路，`GET /api/routing-table` 带
-`node_preshared_keys`）。那张表里没有路由，但有环境——`demo`
-的 `production` 和 `preview` 都在里面。于是一个**带着 `x-deis-app-id: demo` 头**进来的
-请求（`verify` 里那两项 WebSocket 检查就是这样打的），proxy 现在能从这张表认出
-`demo/production`，转发前把 `x-deis-app-id` 和 `x-deis-environment` 盖成这两个值。盖上去
-的值和客户端自己带的一样，所以结果没有变化；变的是「谁说了算」——以前是客户端的头原样穿
-过去，现在是控制面的目录说了算。自动预览地址**在**演示范围内：proxy 配置里写了
+证书）。从前那条 `GET /api/routing-table` 加 `node_preshared_keys` 的 HTTP 老路已经不在
+任何监听口上了：没配 `[machine_identity]` 的 proxy 不会退回老路
+——它直接拒绝启动，并点名缺的是哪张表（`verify` 专门问过这件事）。而它拿着的
+那张表里没有路由，但有环境——`demo`
+的 `production` 和 `preview` 都在里面。于是流式响应里那几项经 proxy 打来的时候
+（请求只带 `Host`），proxy 能从这张表认出 `demo/production`，转发前把 `x-deis-app-id`
+和 `x-deis-environment` 盖成这两个值。说了算的是这张表：客户端自己带的
+`x-deis-` 前缀的头在路由之前就被 proxy 剥掉了，穿过这一跳的是 proxy 的
+决定，不是客户端点的名——以前是客户端的头原样穿过去，现在是控制面
+的目录说了算。自动预览地址**在**演示范围内：proxy 配置里写了
 `routing.preview_zone`，于是 `demo.deislet.test` 与 `preview--demo.deislet.test`
 这两个地址由目录自己合成出来；证书也不用人手放，`[tls.acme]` 打开、
 `include_preview_addresses = true`，deis-proxy 就向上面那个环回 CA 各签一张。
 演示里唯一还靠手放的是**名字解析**：那两个地址没有 DNS 记录，`verify` 用
 `curl --resolve` 直接把它们指到本机的 TLS 端口。真环境里对应的是一条通配 DNS 记录。
 
-下面 `verify` 里发请求的各项，除了 WebSocket 那两项和流式响应那几项，都直接打节点，
-原因也在这里——要验的是控制面与节点这条线，让请求先绕一跳只会把失败点变多。那两类
-反过来专走 deis-proxy，理由是同一条：它们是反向代理最容易弄坏的两种交换。升级见下文
-「websockets」一节；流式响应则是**前门有可能把它攒起来**——一个按 chunk 发的响应体，
+下面 `verify` 里发请求的各项，除了路由选应用那一项、流式响应里那几项、「自动证书」里
+取证书那一项、以及「控制面不在场时平台仍在服务」那一项，都直接打节点，
+原因也在这里——要验的是控制面与节点这条线，让请求先绕一跳只会把失败点变多。那几项
+反过来专走 deis-proxy，理由各有一条：路由选应用那项验的正是**前门按域名加路径前缀
+选应用**这件事，只有请求经过前门它才生效；流式响应是**前门有可能把它攒起来**——
+一个按 chunk 发的响应体，
 只要中间任何一层先收齐再转发，看起来就和从前那条「流不出去」的缺口一模一样，所以这
-一跳必须自己证明。
+一跳必须自己证明；自动证书那一项要验的是 proxy 自己的 TLS 端口上正在提供什么；
+最后那一项要证明控制面挂掉之后 proxy 继续拿最后收下的那张表应答，而不是开始拒绝流量。
 
 ## 部署走的是真实路径
 
@@ -117,7 +128,6 @@ scripts/demo-assets/example-app/
   functions/api/bindings/[name].ts -> /api/bindings/:name 按名字读写具名绑定的命名空间
   functions/api/cache.ts           -> /api/cache     caches.default 与 caches.open() 各写一份
   functions/api/call.ts            -> /api/call      经 AUTH 服务绑定调另一个应用；也当被调方的入口
-  functions/api/ws.ts              -> /api/ws        WebSocket 回声，见下文
   functions/api/stream.ts          -> /api/stream    按 ?mode= 返回一条还在生产的响应体，见下文
   functions/api/cookies.ts         -> /api/cookies   一次设两个 Set-Cookie，见下文
   functions/api/timers.ts          -> /api/timers    点起一批定时器，再让后一个请求看它们活没活下来
@@ -126,7 +136,7 @@ scripts/demo-assets/example-app/
   functions/_scheduled.ts          cron 处理函数，同上
 ```
 
-最后五个（`ws` / `stream` / `cookies` / `timers` / `objects`）不在仓库里，`start` 只在
+最后四个（`stream` / `cookies` / `timers` / `objects`）不在仓库里，`start` 只在
 示例应用自己没带同名文件时才写进已构建好的副本，写法见下文；写 `objects.ts` 的同时还会
 把 `.config.json` 里的 `services.blob` 打开——一个不声明 `blob` 的应用调
 `context.services.blob` 拿到的是「这个服务对本应用不可用」，不是一个对象存储。
@@ -135,14 +145,13 @@ scripts/demo-assets/example-app/
 现写到 `.demo/app-callee/`）。它是「应用间调用」那一组的被调方：同意谁能调它，写在它
 **自己**的包里（`callableBy`），所以那半张纸不在调用方这边。
 
-`functions/api/ws.ts` 不在仓库里：`start` 发现示例应用自己没有这个文件时才会写一份
-进已构建好的副本（`scripts/demo.sh::add_websocket_route`），一旦示例应用自己带了同名
-文件，脚本就不再写，部署的是应用自己那份。它接一对 `WebSocketPair`，把收到的文本帧
-原样加前缀送回；收到的二进制帧则描述成「长度 + 十六进制」、用文本帧送回，而不是把
-原始字节原样送回去——`verify` 那边只比对回声的内容，不看回声帧本身是文本还是二进制，
-所以证明的是二进制帧完整抵达了 Isolate（没被当成文本、没有丢字节），不是服务端向外
-发二进制帧的能力；后者另有独立的机制（`op_ws_server_send_binary`），这个示例处理函数
-没有用到它。
+示例应用里没有 WebSocket 处理函数了：锁定的标准没有给 WebSocket 应用留可移植的形状
+（没有 `WebSocketPair`、没有服务端 `WebSocket`），因为不是它覆盖的每一家提供商都有
+这一套。演示因此也不再部署旧的 `functions/api/ws.ts` 回声端点，而是替它摆了一个单独
+的最小项目，里面唯一的处理函数就是那个旧的 echo handler，然后对它跑 `deis deploy`，
+预期构建在第一步就拒绝（下表「编译器」组里的那一项）：错误点名
+`EC_STREAM_WEBSOCKET_NONPORTABLE` 与 `WebSocketPair`，项目下没有 `dist/`，控制面的
+目录里也没有多出这个应用。平台对这种处理函数的承诺是这次拒绝，而不是一个 101。
 
 `functions/api/stream.ts` 也不在仓库里，写进去的方式和上面那份一样
 （`scripts/demo.sh::add_stream_route`）。一个处理函数覆盖了流式检查需要的全部形状，靠
@@ -219,11 +228,14 @@ API key 能不能从控制面领到那张令牌。
 
 ## verify 检查什么
 
-`./scripts/demo.sh verify` 分二十一组跑九十五项，每项打印它据以判断的证据。最后一行
-既是计数也是点名：`95 passed, 0 failed, 95 of the 95 checks this file lists`。后半句
+`./scripts/demo.sh verify` 按组逐项跑，每项打印它据以判断的证据。最后一行
+既是计数也是点名：`N passed, 0 failed, N of the N checks this file lists`，N 是
+那一行上的数。后半句
 是必须的——前半句报不了「没跑的那一项」：从清单里删掉一次调用，绿色的一轮只是变短了
-一点，输出里没有任何一句话提到这件事。那个被对照的数字是 `scripts/demo.sh` 里的
-`VERIFY_EXPECTED_CHECKS`，加检查就得改它。
+一点，输出里没有任何一句话提到这件事。N 不写在任何文档里：它是 `scripts/demo.sh`
+里的 `VERIFY_EXPECTED_CHECKS`，由各组的 `group_<组名>_checks` 数组求和得出，
+`scripts/check-doc-counts.sh` 盯着那个数与清单一致。加检查就是把它加进所属组
+的数组，文档里没有任何数要跟着改。
 
 下表按组说明这些检查各自证明了什么（有几行合并了同一组里连着的两项）：
 
@@ -232,6 +244,7 @@ API key 能不能从控制面领到那张令牌。
 | CLI 部署 | `deis deploy` 的报告 + 打一发真请求 | 一条命令从源码走到对外服务：建应用、建环境、传版本、指针指过去，节点收下并真的在应答 |
 | | `deis versions` | 两版都列出来了，且标出 production 跑的是哪一版——版本不会自称「当前」，是环境指向它 |
 | 编译器 | 拿另一个小项目跑一次 `deis build -v all` | 四个目标各出一份、各是那个宿主要的形状：deislet 的 `bundle.zip`、Cloudflare 的 `index.js` + `wrangler.toml` + `package.json`、Deno 的处理函数 + 生成的路由 + `deno.json`、EdgeOne 的 `edge-functions/index.js` + `edgeone.json`。每一份都带着处理函数自己的标记，而 Cloudflare 那份和 EdgeOne 那份彼此不同——所以是四个适配器各自生成的，不是同一份输出拷了四遍。这一项不部署：四个目标里有三个是别的平台 |
+| | 对一个用 `new WebSocketPair()` 的处理函数跑 `deis deploy` | 构建在第一步就拒绝，先于应用、环境、版本的存在：错误点名 `EC_STREAM_WEBSOCKET_NONPORTABLE` 与 `WebSocketPair`，项目下没有 `dist/`，目录里也没有这个应用。标准没有给 WebSocket 应用留可移植的形状，所以平台对这种处理函数的承诺是这次拒绝，而不是一个 101 |
 | 资产优先 | `GET /` | 返回的是包里那个文件本身，没起 Isolate；ETag 是资产自身的 sha256 |
 | | 带 `If-None-Match` 再打一次 | 回 304 且零字节 |
 | | `GET /old-home?ref=...` | `_redirects` 那条规则应了 301（写了第三个字段才是 301，两字段默认 302），`location` 是规则里的目标，而且请求带的查询串原样跟了过去——搬家不该把作者在数的那个来源参数丢掉 |
@@ -241,8 +254,6 @@ API key 能不能从控制面领到那张令牌。
 | | 同一处理函数回报的 `env.ASSETS` 是什么 | 应用在自己的 `environment.variables` 里声明了 `ASSETS`，节点在交出 `context.env` 之前把它摘掉并记了一行日志；Isolate 里 `env.ASSETS` 仍是那个带 `fetch()` 的绑定，不是应用发的字符串 |
 | 路由 | `GET /hello/world` | 路由占位符进了 `context.params` |
 | | 同一个域名下不同路径前缀各打一发，经 deis-proxy | 前门是按**域名加路径前缀**选应用的，不是只看域名——目录里的路由表真的影响了去向 |
-| WebSocket | 经 `deis-proxy` 亲手做一次握手（自己拼字节，不借客户端库） | 101 状态行、`Upgrade`/`Connection` 头与 `Sec-WebSocket-Accept` 都对得上 RFC 6455 给那个握手键定好的答案——升级是节点应的、经代理原样转发，不是代理自己应了 101 又或者把它压扁成一个普通响应 |
-| | 握手成功后各发一帧文本、一帧二进制 | 两帧都完整抵达了 Isolate：二进制帧里特意塞了几个非法 UTF-8 字节（`0xff`、`0xfe`、开头的 `0x80`），处理函数把收到的字节数与十六进制原样报回来（不是替换字符），证明这条链路没有把它当文本处理、也没有在中途丢字节。验的是字节完整送达 Isolate，不是服务端向外发二进制帧的能力——处理函数把两种输入都回成文本帧，见上文示例应用一节 |
 | 流式响应 | 经 `deis-proxy` 取一条 5 帧的 SSE，逐帧记到达时间 | 头 13 毫秒就到了，5 帧分别在 13/165/316/470/621 毫秒到——处理函数每帧之间停 150 毫秒，所以这个间隔不可能出自一个先攒齐再发的响应体。最后收到了结束块，客户端看到的是一次完整的响应 |
 | | 同一条响应的头与编码 | `Transfer-Encoding: chunked`、没有 `Content-Length`、并且请求明明带了 `Accept-Encoding: gzip` 却没有 `Content-Encoding`。有长度就说明有人收齐过它；有编码就说明前门把它压在压缩器里了——pingora 的压缩器不是每个 chunk 都 flush 的 |
 | | 经 `deis-proxy` 请求 `?mode=relay`，上游是一个慢慢往外写的地址 | 处理函数写的是 `new Response(upstream.body)`，六段照上游的节奏依次到达。一个先把上游读完再回答的处理函数，第一个字节不可能早于上游的最后一个字节 |
@@ -263,7 +274,7 @@ API key 能不能从控制面领到那张令牌。
 | 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
 | | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
 | | 不带 API key 打 `GET /api/apps/:app/environments/:env/storage-token` | 401，什么也拿不到；同一发带上 key 才拿到租户名、deis-store 地址与令牌本身（令牌不打印）。这张令牌绕过控制面直接对 deis-store 生效、而且不过期，所以它和部署走同一道门——这是「成功了算失败」的第三项 |
-| | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾看不到 `storage_auth_secret`，它只拿到这一个租户的令牌 |
+| | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾碰不到控制面的能力签名密钥，它只拿到这一个租户的令牌 |
 | | `deis db query` 发一条数到二十亿的递归查询 | deis-store 在几秒内把它停下来，而不是跑到底；拒绝的话写在响应里（跟一个 SQL 拼写错一样），并且同时点出上限是多少、要改哪里。管的是这个租户的 SQL 能花多少，跟它能碰哪些数据是两件事 |
 | | 一个租户的 SQL 去读另一个租户的表、去点它的文件名 | 两样都够不到：库是一租户一个文件，schema 和路径在查询里都不可达 |
 | | 往一行里塞二十兆的单元格 | 在分配之前就被拒，回话点名 8388608 字节这条「任何单个字符串 / blob / 行」的上限，并指向 blob 服务——这个尺寸的载荷该走那里 |
@@ -323,7 +334,7 @@ API key 能不能从控制面领到那张令牌。
 | | 打一个没人发布过的挑战令牌，以及 `../../../etc/passwd` 的原样与百分号编码两种写法 | 只有真发布过的令牌答得出内容，其余一律 404，穿越路径一个文件都不给 |
 | | 让续期任务多跑几轮（演示把 `check_interval_secs` 调成 2 秒） | 颁发数一动不动：磁盘上那几张离续期窗口还远，一次都不问 CA。重签一次就是花掉这个域名一周额度里的一张 |
 | | 用同一个存储目录再起第二个 deis-proxy | 它读到并复用了存下来的账号密钥与证书，跑完一轮续期，向 CA 一句话没说。每次启动都重新注册账号，会撞上颁发机构按 IP 计的注册限额——一台重启几次的机器自己就能把自己锁死 |
-| 这一轮凭什么 | 跑完之后回头看 `.demo/logs/deis-runtime.log` | 它没有撞上演示给它的字节上限、没有被截断，所以上面那十五项「读节点日志」的检查读的是一份完整的文件。这个上限本身也是一处修补：这个文件不只节点在写，应用自己的日志行也落在里面，而应用的日志行带着请求塞进去的任何内容——实测一发不带凭据的 `GET /hello/<7000 个字符>` 就往里加约 51KB，两万发就是一个 G，先前没有任何东西在数 |
+| 这一轮凭什么 | 跑完之后回头看 `.demo/logs/deis-runtime.log` | 它没有撞上演示给它的字节上限、没有被截断，所以上面那些「读节点日志」的检查读的是一份完整的文件。这个上限本身也是一处修补：这个文件不只节点在写，应用自己的日志行也落在里面，而应用的日志行带着请求塞进去的任何内容——实测一发不带凭据的 `GET /hello/<7000 个字符>` 就往里加约 51KB，两万发就是一个 G，先前没有任何东西在数 |
 
 额外依赖按**用途**说，不按条数说——条数每加一项检查就变一次：
 
@@ -332,7 +343,7 @@ API key 能不能从控制面领到那张令牌。
 - `openssl`：凡是要铸一张 deis-store 认的凭据令牌、要把 `--json` 里的 base64 解回原始
   字节（KV / blob 的值是应用写下的任意字节，没理由指望它是 UTF-8）、或者要算一个文件
   摘要来对比的那几项。
-- `python3`：WebSocket 那两项自己拼字节做握手、收发帧；流式响应那几项要证的是**到达
+- `python3`：流式响应那几项要证的是**到达
   时间和分帧**，`curl` 两样都报不出来，所以直接开 socket 自己解 chunked；兼容日期那两项
   手工往控制面传一个包；另外那个给应用 `fetch` 的上游本身就是 `python3 -m http.server`
   起的。
@@ -351,7 +362,7 @@ bash scripts/test-demo-witnesses.sh
 「跑完没说话」的失败，看上去都和「还没跑完」一模一样，而 `verify` 的退出码是唯一能分
 辨这两者的东西。目前它守着这些事：
 
-- **一个字节不能把日志读瞎**。有十五项检查是靠 grep 节点日志取证的。那个文件不只节点
+- **一个字节不能把日志读瞎**。有一串检查是靠 grep 节点日志取证的。那个文件不只节点
   在写，应用自己的日志行也落在里面，而应用的日志行带着请求塞进去的任何内容——一发
   `GET /hello/%00` 就能往里放一个 NUL 字节，GNU grep 从此把整条流当二进制，stdout 上
   一个字也不再输出。`node_log` 现在先把 NUL 删掉。
@@ -368,7 +379,7 @@ bash scripts/test-demo-witnesses.sh
 - **真死了也得说一声**。上面两条堵的是已知原因。`verify` 另外挂了 ERR / EXIT 两个陷阱：
   不管被什么结束，都打印是哪一行哪条命令、已经数到几项，并且**绝不以 0 退出**。实测把
   proxy 杀掉再跑：改之前打了 28 行、最后一行还是个 ✓ 就没了，退出码 7；改之后整份清单
-  全部问完，报「80 passed, 10 failed」（当时是九十项）。
+  全部问完，报出的汇总里每一项都有判决：十项失败、其余全过，总数与清单等长。
 - **前一轮留下的进程要被拒绝，而不是被抢**。`start` 的 orphan 扫描现在也认那个上游
   `origin.py` 和那个环回 CA——先前它只认六个组件，而真正漏出去的恰恰是这两个。
 - **一项检查不能因为「外面动了一下」就算过**。有两处是靠「某种措辞的日志行数涨了没有」
@@ -398,8 +409,9 @@ bash scripts/test-demo-witnesses.sh
 CI 按文件写的会跑：`.github/workflows/checks.yml` 里除了文档路径那一项，还有这套用例、整个
 workspace 的 fmt / clippy / build / test，以及一次完整的 `start` → `verify` → `stop`。
 先前这个文件里只有文档路径那一项，别的全靠谁记得在自己机器上跑一遍。带这几项作业的
-版本还没有推上去，所以还没有人见过它跑一次；在见到第一次运行之前，它说明的是「会查什么」，
-本文引用的数字都来自本机运行。
+版本推上去很久了：最后一次全绿是 2026-09-04（run `33848760058`）；此后每一次运行
+都在几秒内失败，全部是 GitHub 账号的账单问题而不是构建失败，等账号属主处理。在
+那之前，本文引用的数字都以本机运行为准；这一段在 CI 恢复后再更新。
 
 ## verify 看不见什么
 
@@ -408,7 +420,7 @@ workspace 的 fmt / clippy / build / test，以及一次完整的 `start` → `v
 
 - **甲拿到的是不是乙的东西**。一个调用方看不见串号：没有别人的答案可拿的时候，错的答
   案和对的答案长得一模一样。这不是假设——`verify` 曾经在一个「响应缓存只按地址存、一
-  个用户 `POST` 的答案被交给下一个匿名 `GET`」的构建上报出九十项全过。现在有两项摆了
+  个用户 `POST` 的答案被交给下一个匿名 `GET`」的构建上报出整份清单全过。现在有两项摆了
   第二、第三个调用方去问同一个地址并对答案，这是这类检查唯一可能的形状，也是整套里唯
   一有这个形状的地方；平台里别的「按调用方分」的边界，仍然是一个调用方一次问出来的。
 - **要两个节点才看得见的事**。这里只有一个。跨机队的调度、节点之间不一致的缓存或路由
@@ -420,7 +432,7 @@ workspace 的 fmt / clippy / build / test，以及一次完整的 `start` → `v
 - **这台机器以外的平台**。一台主机、处处环回、一个桩 CA、一个 `python3` 起的上游冒充
   整个互联网。
 
-一轮绿色的 `verify` 该这么读：这九十五条主张，各自在那个布置下被验过一次。这比「能编
+一轮绿色的 `verify` 该这么读：本文的每条主张，各自在那个布置下被验过一次。这比「能编
 译」多得多，也不是上面任何一条的结论。
 
 ## 验证日志链路（手工）
@@ -527,11 +539,12 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
 - 需要本地安装 `cargo`、`curl`、`jq`，并确保 `ss`/`lsof`/`nc` 其一可用；
   `stop` 用 `timeout` 与 `tail --pid` 等进程退出（GNU coreutils）；`python3` 一处
   用来起那个给应用 `fetch` 的上游（它同时提供一个慢慢往外写的 `/slow`，流式那一项
-  要它），另外被 `verify` 自己直接调用去拼字节做 WebSocket 握手、以及开 socket 读
+  要它），另外被 `verify` 自己直接调用去开 socket 读
   流式响应并记每一帧的到达时间，缺了会影响这几项，其余各项不受影响
 - **第一次跑之前要先构建控制面的 Web 面板**：`crates/deis-control/web/dist` 被
-  gitignore 掉了，而 `deis-control` 在编译期把它嵌进二进制，所以少了它
-  `cargo build` 直接失败。`demo.sh` 不会替你做这一步：
+  gitignore 掉了，而 `deis-control` 在编译期把它嵌进二进制。少了它
+  `cargo build` 不会失败——构建脚本会补一个空目录——但面板的每个页面都答 404。
+  `demo.sh` 不会替你做这一步：
   `cd crates/deis-control/web && npm ci && npm run build`
 - `grpcurl`、`openssl`、`python3` 各自被哪几类检查用到，写在上文「verify 检查什么」
   一节末尾。缺了谁，就是相关那几项各自报失败，其余照跑
@@ -542,8 +555,8 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
   「认证正常工作」一模一样。真人存自己那把 key 用 `deis config set control.token`；
   演示不能用文件，因为端口和密钥都是启动那一刻才定的。节点与 deis-proxy 走的是另一
   条通道——控制面的 `[machine]` 监听口，`api_auth_enabled` 管不着它；那条通道认的是
-  证书，不是这把 key，也不是 `node_preshared_keys`（那把老的机队共用密钥仍然存在，是
-  给还没切完 mTLS 的机队留的兼容路径，演示里哪个配置文件都没再写它）
+  证书，不是这把 key，也不是 `node_preshared_keys`——那把老的机队共用密钥已经
+  不存在：它不再是任何配置结构的字段，配置文件里还写着它的控制面直接拒绝启动
 - 那把现场生成的 key 是**无作用域**的，也就是升级前的老写法：能做任何事。`verify`
   里「accounts, scopes and the audit log」那一组会在它旁边建账号、铸几把带作用域的
   token（`deploy:demo/preview`、`storage:demo/production` 之类），拿它们去撞该撞的
@@ -552,9 +565,9 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
 - 出网只开了上游那一个地址（`[fetch] allow`）。想让示例应用够到别处，加
   `--deis-origin-port` 换端口或者自己改节点配置里的这一行；平台自己那几个服务地址
   改不动——它们在 allow 之后再被拒一次
-- `verify` 里发请求的各项，除 WebSocket 那两项、流式响应那几项、以及「自动证书」里
-  取 TLS 那一项要经 deis-proxy 之外（原因见上文「部署走的是真实路径」一节），都直接打
-  节点端口，不经 deis-proxy
+- `verify` 里发请求的各项，除路由选应用那一项、流式响应里那几项、「自动证书」里
+  取 TLS 那一项、以及「控制面不在场时平台仍在服务」那一项要经 deis-proxy 之外（原因
+  见上文），都直接打节点端口，不经 deis-proxy
 - deis-proxy 会去控制面拉路由表，拉不到不影响演示：目录里本来就没有路由，proxy 转发
   给它唯一的上游。控制面挂掉时 proxy 也不会开始拒绝流量——它继续用最后一次收下的那张
   表，没有期限

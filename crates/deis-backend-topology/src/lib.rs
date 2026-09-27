@@ -22,7 +22,7 @@ use deis_wire::{
     BACKEND_RESTORE_REPORT_SCHEMA_V1, BACKEND_RESTORE_SET_SCHEMA_V1, BackendRestoreExecutionReport,
     BackendRestoreExecutionState, BackendRestoreSet, BackendRestoredComponent, CanonicalId,
     RestoreBackend, RestoreBarrierKind, RestoreComponent, RestoreConsistencyBarrier, RestoreDigest,
-    RestoreScope, RestoreScopeKind, RestoreTopologyDriver,
+    RestoreScope, RestoreScopeKind, RestoreTopologyDriver, durability::sync_parent_directory,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -1483,17 +1483,6 @@ fn path_is_lexically_clean(path: &Path) -> bool {
             std::path::Component::RootDir | std::path::Component::Normal(_)
         )
     })
-}
-
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("durable directory switch has no parent")?;
-    #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = parent;
-    Ok(())
 }
 
 fn prepare_empty_directory(path: &Path, label: &str) -> Result<()> {

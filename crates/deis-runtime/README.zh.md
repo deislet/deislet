@@ -348,13 +348,14 @@ Isolate 是复用的：每个节点上每个 (应用, 环境) 一个，后续请
 
 ## 远程调试
 
-Chrome DevTools Protocol 复用节点对外服务的那个端口，不额外开监听：
+Chrome DevTools Protocol 挂在节点的互证 TLS 管理监听上（`[machine_identity]
+management_listen`），不额外开监听，caller 也由控制面同款的 TLS 握手来证明：
 
-- URL：`ws://<节点>:<http_port>/`
+- URL：`wss://<节点>:<management 端口>/`
 - 请求头：`x-deis-app-id: _inspect:<app_id>`、`x-deis-inspect-token: <token>`
 
-deis-proxy 会校验 `x-deis-app-id`，所以 `_inspect:` 这类目标穿不过它——要打节点自己
-的端口。详见 [docs/TESTING.md](docs/TESTING.md)。
+会话令牌由机队通道上的 `StartInspect` 签发，而拿令牌来连接的连接首先得是本机队的
+一台机器——数据端口对调试器一概不应答。详见 [docs/TESTING.md](docs/TESTING.md)。
 
 ## 文档
 

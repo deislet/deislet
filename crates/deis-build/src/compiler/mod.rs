@@ -1729,8 +1729,8 @@ impl Compiler {
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
-                    "EC_ARTIFACT_DOCUMENT_INVALID: runtime entrypoint kind/export is unsupported"
-                ))
+                        "EC_ARTIFACT_DOCUMENT_INVALID: runtime entrypoint kind/export is unsupported"
+                    ));
                 }
             }
         }
@@ -1989,7 +1989,10 @@ impl Compiler {
         vendor: &str,
         plan: &CanonicalApplicationPlan,
     ) -> anyhow::Result<()> {
-        if vendor == deis_build_adapter_deislet::VENDOR {
+        if matches!(
+            vendor,
+            deis_build_adapter_deislet::VENDOR | deis_build_adapter_cloudflare::VENDOR
+        ) {
             return Ok(());
         }
         let events = plan
@@ -2018,6 +2021,15 @@ impl Compiler {
     ) -> anyhow::Result<()> {
         if vendor == deis_build_adapter_deislet::VENDOR {
             return Ok(());
+        }
+        // The cloudflare target answers from the binding plan: it maps named
+        // kv/database/blob/queue bindings, queue consumers and crons onto
+        // provider resources, and refuses everything else with the same code
+        // this table has always raised. The plan is the one place that knows
+        // exactly where that boundary sits, so the decision is not copied
+        // here.
+        if vendor == deis_build_adapter_cloudflare::VENDOR {
+            return deis_build_core::build_binding_plan(config).map(|_| ());
         }
         let mut declarations = config
             .bindings
@@ -2221,6 +2233,7 @@ impl Compiler {
             let code = fs::read_to_string(&handler_path)?;
             let handler_name = Self::portable_display_path(&source_path);
             let parsed = self.parser.parse(&code, &handler_name)?;
+            Self::refuse_interactive_transactions(vendor, &handler_name, &code)?;
             Self::refuse_a_handler_with_no_default_export(&handler_name, Some(&parsed))?;
             Self::refuse_non_literal_module_loads(&handler_name, &parsed)?;
             Self::refuse_external_runtime_module_edges(&handler_name, &parsed)?;
@@ -2336,6 +2349,7 @@ impl Compiler {
                     if is_script {
                         let name = Self::portable_display_path(&dependency);
                         let parsed = self.parser.parse(code, &name)?;
+                        Self::refuse_interactive_transactions(vendor, &name, code)?;
                         Self::refuse_non_literal_module_loads(&name, &parsed)?;
                         Self::refuse_external_runtime_module_edges(&name, &parsed)?;
                         Self::refuse_provider_only_globals(&name, &parsed)?;
@@ -2900,6 +2914,35 @@ impl Compiler {
     /// table: a forgotten `queues` or `cron` declaration must not turn the
     /// root event file into HTTP. The diagnostic names only project-relative
     /// handler paths, never the build host's absolute directory.
+    /// Stop a cloudflare build whose source uses an interactive transaction.
+    ///
+    /// The standard SQL surface on the cloudflare target is D1, which has no
+    /// interactive `transaction()` - only the atomic `batch()`. The Edge
+    /// Canon proposal to remove interactive transactions from the standard
+    /// (and keep them a self-hosted capability) is pending; until it is
+    /// accepted, an application that calls `transaction()` cannot compile to
+    /// this target, and says so with the same code the resource gate raises:
+    /// this is "unimplemented on this target", not "optional". On the
+    /// self-hosted target `transaction()` keeps working - deis-store serves
+    /// it, and the standard there is not in question.
+    fn refuse_interactive_transactions(
+        vendor: &str,
+        filename: &str,
+        code: &str,
+    ) -> anyhow::Result<()> {
+        if vendor != deis_build_adapter_cloudflare::VENDOR || !code.contains(".transaction(") {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "EC_BINDING_TARGET_UNIMPLEMENTED: {filename} calls transaction(), and the cloudflare \
+             target has no interactive transactions to run it on: its SQL engine (D1) offers only \
+             the atomic batch(). An Edge Canon proposal on interactive transactions is pending; \
+             until it is accepted, an application that uses transaction() does not compile to \
+             cloudflare. Restructure the write as batch(), or build for a target that serves \
+             interactive transactions"
+        ))
+    }
+
     fn refuse_unimplemented_event_handlers(
         vendor: &str,
         routes: &[(String, String)],
@@ -2915,7 +2958,12 @@ impl Compiler {
             .iter()
             .filter_map(|(_, import_path)| {
                 let kind = deis_build_core::routes::handler_kind(import_path);
-                (kind != deis_build_core::routes::HandlerKind::Http).then(|| {
+                // The cloudflare packager now emits the provider trigger and
+                // the event wrapper: a root `_queue`/`_scheduled` file
+                // becomes the Workers `queue`/`scheduled` export, so its
+                // event handlers are encoded, not dropped.
+                let implemented = vendor == deis_build_adapter_cloudflare::VENDOR;
+                (kind != deis_build_core::routes::HandlerKind::Http && !implemented).then(|| {
                     format!(
                         "{} ({kind:?})",
                         deis_build_core::routes::staged_handler_path(import_path)
@@ -3688,7 +3736,7 @@ impl ScratchDir {
                     return Err(anyhow::anyhow!(
                         "could not create the build scratch directory {}: {error}",
                         path.display()
-                    ))
+                    ));
                 }
             }
         }

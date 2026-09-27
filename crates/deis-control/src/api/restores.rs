@@ -272,11 +272,10 @@ fn operation_context(
             "account:{}",
             principal.account.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::ConfigKey => format!(
-            "config-key:{}",
+        PrincipalKind::Bootstrap => format!(
+            "bootstrap:{}",
             principal.credential_id.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::Anonymous => "anonymous:direct-local".to_string(),
     };
     OperationRequestContext::new(
         idempotency_key,
@@ -339,13 +338,22 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::database::Database;
-    use crate::identity::Principal;
 
     use super::*;
 
     #[tokio::test]
     async fn restore_plan_is_discoverable_durable_and_body_bound() {
         let directory = TempDir::new().unwrap();
+        // The coordinator refuses symlinks, so a real executable file is
+        // written out rather than pointing at one of the system's.
+        let driver_executable = directory.path().join("restore-driver");
+        std::fs::write(&driver_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&driver_executable, std::fs::Permissions::from_mode(0o500))
+                .unwrap();
+        }
         let database = Arc::new(
             Database::init(directory.path().join("control.sqlite"))
                 .await
@@ -361,7 +369,7 @@ mod tests {
                 .unwrap();
         }
         let config = ControlConfig {
-            backend_restore_driver_executable: Some("/bin/true".into()),
+            backend_restore_driver_executable: Some(driver_executable),
             backend_restore_driver_config: Some(driver_config),
             store_endpoint: Some("http://127.0.0.1:41001/".to_string()),
             queue_endpoint: Some("http://127.0.0.1:41002/".to_string()),
@@ -375,7 +383,8 @@ mod tests {
         if let RestoreCoordinatorAvailability::Unavailable(reason) = &restore_state.coordinator {
             panic!("test restore coordinator is unavailable: {reason}");
         }
-        // Legacy prefix on purpose: the flat tree's regression coverage.
+        // Flat prefix on purpose: the same handlers under a plain mount,
+        // with no gate and no request context in the way.
         let api = router("/api", restore_state);
 
         let installation_response = api
@@ -412,7 +421,9 @@ mod tests {
                 .header(IDEMPOTENCY_KEY, "restore-api-key-2026-09-04")
                 .body(Body::from(body))
                 .map(|mut request| {
-                    request.extensions_mut().insert(Principal::anonymous());
+                    request
+                        .extensions_mut()
+                        .insert(crate::api::catalog::tests::admitted_principal());
                     request
                 })
                 .unwrap()
@@ -437,7 +448,7 @@ mod tests {
         assert_eq!(operation.state, deis_wire::OperationState::Queued);
         assert_eq!(
             location,
-            format!("/api/operations/{}", operation.operation_id)
+            format!("/api/v1/operations/{}", operation.operation_id)
         );
 
         let duplicate = api.clone().oneshot(make_request(body)).await.unwrap();

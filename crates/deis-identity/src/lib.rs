@@ -74,6 +74,7 @@ use tracing::{error, info, warn};
 pub use crate::cert::name_in_certificate;
 pub use crate::dial::Dialler;
 pub use crate::error::{FileRole, IdentityError};
+pub use crate::names::ServiceKind;
 pub use crate::spiffe::{SpiffeId, SpiffeIdError, check_path_segment};
 
 use crate::material::Material;
@@ -306,12 +307,49 @@ impl MachineIdentity {
                  restart"
             );
         }
+        // T8: the control-plane disconnect grace period needs at least 72 h
+        // of certificate validity.  If the certificate drops below 48 h it
+        // cannot survive a full 24 h grace window plus the TLS handshake
+        // skew, so the operator must be warned on every report cycle.
+        if remaining > 0 && remaining < 172_800 {
+            warn!(
+                identity = %id,
+                certificate = %certificate,
+                remaining_hours = remaining / 3600,
+                "This machine's certificate has less than 48 hours remaining. During a control \
+                 plane outage the certificate cannot be renewed, and a grace period that outlasts \
+                 it causes every machine-channel connection to fail at the TLS handshake. Issue \
+                 a new certificate with at least 72 hours of validity; it is picked up without \
+                 a restart"
+            );
+        }
     }
 
     /// A listener configuration that requires the peer to prove a name in our
     /// trust domain before the connection exists at all.
     pub fn server_config(&self) -> Arc<ServerConfig> {
         Arc::clone(&self.current.load().server)
+    }
+
+    /// A listener configuration that admits one kind of machine and no other.
+    ///
+    /// The data port of a runtime node is the reason this exists: it serves
+    /// application traffic forwarded by this fleet's proxies, so a peer must
+    /// prove not only a name in this trust domain but a proxy's name. A node's
+    /// certificate - a machine the same authority signed, for a job on the
+    /// same channel - is refused here, because being one of ours is not being
+    /// the machine this listener takes traffic from.
+    ///
+    /// Unlike [`Self::server_config`] this is built per call rather than kept
+    /// in the material: only listeners that exist serve it, and the ones this
+    /// crate knows about are built once at load. A listener that takes this
+    /// must follow [`Self::renewals`] exactly as one taking the plain
+    /// configuration does.
+    pub fn server_config_admitting(
+        &self,
+        kind: ServiceKind,
+    ) -> Result<Arc<ServerConfig>, IdentityError> {
+        self.current.load().server_config_of_kind(kind)
     }
 
     /// A signal that new material has been adopted.

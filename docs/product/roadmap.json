@@ -4,10 +4,9 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-12T00:40:00+08:00",
+  "updatedAt": "2026-09-24T13:43:21+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
-    "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
     "standardLock": "standards/edge-canon.lock.json"
   },
   "nextActions": [
@@ -16,7 +15,9 @@
     "P1-BUILD-001",
     "P1-DEPLOY-001",
     "P1-PLAT-001",
-    "P2-DATA-001"
+    "P2-DATA-001",
+    "P3-SEC-001",
+    "P1-ROUTE-001"
   ],
   "phases": [
     {
@@ -46,7 +47,7 @@
             },
             {
               "type": "local-path",
-              "value": "docs/product/phase-analysis-2026-09-03.zh.md"
+              "value": "docs/archive/phase-analysis-2026-09-03.zh.md"
             }
           ],
           "verification": "python3 scripts/check-product-governance.py"
@@ -795,71 +796,71 @@
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-b185984.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-b185984.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-b574d58.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-b574d58.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-a934ff5.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-a934ff5.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-05cbbf9.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-05cbbf9.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-2f215a8.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-2f215a8.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-56c6584.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-56c6584.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-518d3f8.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-518d3f8.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-dae492a.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-dae492a.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-69f1343.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-69f1343.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-dc9a19a.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-dc9a19a.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-3ebe108.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-3ebe108.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-3013ae2.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-3013ae2.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-c8d4f72.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-c8d4f72.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-5926363.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-5926363.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-b45a611.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-b45a611.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-1ebe13b.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-1ebe13b.json"
             },
             {
               "type": "local-path",
-              "value": "docs/product/evidence/provider-driver-dispatcher-portability-e0086eb.json"
+              "value": "docs/archive/evidence/provider-driver-dispatcher-portability-e0086eb.json"
             },
             {
               "type": "planned-path",
@@ -948,7 +949,7 @@
             },
             {
               "type": "local-path",
-              "value": "docs/product/phase-analysis-2026-09-03.zh.md"
+              "value": "docs/archive/phase-analysis-2026-09-03.zh.md"
             }
           ],
           "verification": "四项均已结清并落到代码与文档。① ProductOperation 中会序列化为 null 的八个成员如实标注为可空，与 contracts/v1/operation.schema.json 一致；v1 未发布故不升大版本，改由 scripts/check-openapi-compat.py 的 PRERELEASE_CORRECTIONS 逐条具名接受，未列出的放宽照旧拒绝。② api_page_cursors 不设硬性容量上限，清理只按年龄，另加软阈值 CURSOR_COUNT_WARNING_THRESHOLD（10,000）由 reaper 每轮报一次。③ 子操作重试上限 MAX_PROVIDER_CHILD_ATTEMPTS（10）、派发失败上限 MAX_PROVIDER_DISPATCH_FAILURES（10），耗尽后父操作 failed。④ idx_events_page_v1 退役，规划器从未选中它。四项的取舍理由记于 ADR-016 与 ADR-006，过程记于阶段分析第 98 节。"
@@ -1211,7 +1212,7 @@
               "value": "mTLS, RBAC, envelope secrets and security gates"
             }
           ],
-          "verification": "ADR-025 M1 已落地并可外部检验：node_preshared_keys 与 [control] secret 在代码中已不存在，控制面读到仍设置该项的配置文件直接拒绝启动；节点与 proxy 在配置了控制面地址却没有 [machine_identity] 时拒绝启动；节点管理面只在 mTLS socket 上服务，数据端口上的管理路径按普通应用流量处理。demo.sh verify 的 98 项在全场零共享口令下通过。剩余：ADR-025 M2/stage 5 —— assignment 列表仍未按节点裁剪（一台节点的证书仍读到全部租户的明文 secret），storage/queue/telemetry 的 auth_secret 与 storage token 仍是全场通用值，短期持有证明能力券与 dual→strict 退出门槛尚未实现。"
+          "verification": "ADR-025 M1 已落地并可外部检验：node_preshared_keys 与 [control] secret 在代码中已不存在，控制面读到仍设置该项的配置文件直接拒绝启动；节点与 proxy 在配置了控制面地址却没有 [machine_identity] 时拒绝启动；节点管理面只在 mTLS socket 上服务，数据端口上的管理路径按普通应用流量处理。demo.sh verify 的 98 项（随后 99/100/101 项：证书到期预警、节点重启回来、控制面宕机流量不断）在全场零共享口令下通过。剩余：ADR-025 M2/stage 5 —— assignment 列表仍未按节点裁剪（一台节点的证书仍读到全部租户的明文 secret），storage/queue/telemetry 的 auth_secret 与 storage token 仍是全场通用值，短期持有证明能力券与 dual→strict 退出门槛尚未实现。"
         },
         {
           "id": "P3-HA-001",

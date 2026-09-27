@@ -27,8 +27,8 @@
 //! * the answer to `GET /api/nodes/:id/assignments`, which a node that
 //!   restarts uses to come back with the environment it had.
 //!
-//! Both therefore authenticate the caller as a node - the assignment list
-//! through `api::middleware::node_auth`, whatever `api_auth_enabled` says.
+//! Both are served on the machine channel only: a caller proves a certificate
+//! there and may only ask for its own environment.
 //! No other read API returns a value: the dashboard and the CLI can write
 //! and delete a secret and list its name, never read it back
 //! (docs/architecture.zh.md section 8).
@@ -41,12 +41,14 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 
-use crate::catalog::secrets::{secret_aad, secret_revision_aad};
+use crate::capability_issuer::{CapabilityIssuer, AUD_QUEUE, AUD_STORE};
+use crate::catalog::secrets::secret_revision_aad;
 use crate::catalog::{
     CatalogError, CatalogResult, CatalogStore, DeclaredCompatibility, DeclaredLimits, Environment,
     SecretsBackend, Version, declared_compatibility, declared_limits,
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
+use deis_capability::resources_for_audience;
 
 /// How the control plane names itself, once for each audience that is given
 /// an absolute URL.
@@ -188,24 +190,24 @@ pub fn bundle_url(base: &str, app_id: &str, version_id: &str) -> String {
 /// still goes out, the application still loads, and only its `ctx.services`
 /// calls fail - which is better than refusing to deploy an application that
 /// declared a service it never actually calls.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct StorageWiring {
     /// deis-store: KV, per-app SQL and blobs.
     pub store: Option<String>,
     /// deis-queue.
     pub queue: Option<String>,
-    /// Shared secret every capability token is derived from, identical to the
-    /// `auth_secret` of both storage services. Unset means this platform
-    /// mints no tokens at all, which is the single-box default and only safe
-    /// while the services are on loopback without a secret of their own.
+    /// Signs Ed25519 capability tokens for every deployment. Unset means
+    /// this platform mints no tokens at all, which is the single-box
+    /// default and only safe while the services are on loopback without
+    /// a verifier of their own.
     ///
-    /// Never sent to a node and never logged: what a node gets is
-    /// [`Self::token_for`], which authorises exactly one tenant.
-    auth_secret: Option<String>,
+    /// The issuer is never sent to a node and never logged: what a node
+    /// gets is a capability token that authorises exactly one tenant.
+    issuer: Option<CapabilityIssuer>,
 }
 
 impl std::fmt::Debug for StorageWiring {
-    /// The addresses are plain configuration and print; the secret is the one
+    /// The addresses are plain configuration and print; the issuer is the one
     /// value in this struct that can mint a token for *any* tenant, so it is
     /// reduced to whether it exists. A derived `Debug` would put it in
     /// whatever log line printed a payload.
@@ -213,23 +215,37 @@ impl std::fmt::Debug for StorageWiring {
         f.debug_struct("StorageWiring")
             .field("store", &self.store)
             .field("queue", &self.queue)
-            .field("auth_secret", &redacted(&self.auth_secret))
+            .field("issuer", &redacted_issuer(&self.issuer))
             .finish()
     }
 }
 
-/// How an optional credential is allowed to appear in a log line.
-fn redacted(value: &Option<String>) -> &'static str {
-    match value {
-        Some(_) => "<set>",
+/// How the presence of a capability issuer is allowed to appear in a log line.
+fn redacted_issuer(issuer: &Option<CapabilityIssuer>) -> &'static str {
+    match issuer {
+        Some(_) => "<present>",
         None => "<unset>",
     }
 }
 
+impl Default for StorageWiring {
+    fn default() -> Self {
+        Self {
+            store: None,
+            queue: None,
+            issuer: None,
+        }
+    }
+}
+
 impl StorageWiring {
-    /// Read it off the control plane's configuration, dropping blank entries
-    /// so an empty string in the file does not become an address nothing can
-    /// dial, nor an HMAC key that happens to compute.
+    /// Read storage endpoints from the control plane's configuration, dropping
+    /// blank entries so an empty string in the file does not become an address
+    /// nothing can dial.
+    ///
+    /// The capability issuer is not set here — it is bound later via
+    /// [`Self::with_issuer`] once the issuer has been initialized from the
+    /// database.
     pub fn from_config(config: &crate::config::ControlConfig) -> Self {
         let clean = |value: &Option<String>| {
             value
@@ -240,44 +256,52 @@ impl StorageWiring {
         Self {
             store: clean(&config.store_endpoint),
             queue: clean(&config.queue_endpoint),
-            auth_secret: clean(&config.storage_auth_secret),
+            issuer: None,
         }
     }
 
-    /// The capability token for one tenant, or `None` on a platform with no
-    /// secret configured.
-    ///
-    /// The tenant is the whole `<app>.<environment>` pair, the same string
-    /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: the storage
-    /// services recompute the expected token from the tenant the call itself
-    /// claims, so a token minted for anything else - the app id alone, say -
-    /// would be refused on every call.
-    pub fn token_for(&self, app_id: &str, environment: &str) -> Option<String> {
-        self.auth_secret.as_ref().map(|secret| {
-            deis_wire::conventions::storage_token(
-                secret,
-                &deis_wire::conventions::tenant_id(app_id, environment),
-            )
-        })
+    /// Attach a capability issuer, replacing any previous one.
+    pub fn with_issuer(mut self, issuer: CapabilityIssuer) -> Self {
+        self.issuer = Some(issuer);
+        self
     }
 
-    /// Add the addresses and this tenant's token to a deployment's
-    /// environment map.
+    /// The capability this control plane presents to deis-queue for one
+    /// tenant, or `None` on a platform with no issuer configured.
+    ///
+    /// The tenant is the whole `<app>.<environment>` pair, the same string
+    /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: deis-queue
+    /// checks the token names that tenant, the `queue` audience and the
+    /// `queue` binding, so a token minted for anything else is refused.
+    pub fn queue_token_for(&self, app_id: &str, environment: &str) -> Option<String> {
+        let issuer = self.issuer.as_ref()?;
+        let tenant = deis_wire::conventions::tenant_id(app_id, environment);
+        let token = futures::executor::block_on(issuer.issue(
+            AUD_QUEUE,
+            &format!("spiffe://deislet/control/{app_id}"),
+            resources_for_audience(&tenant, AUD_QUEUE),
+        ));
+        Some(token)
+    }
+
+    /// True when this control plane mints capability tokens at all.
+    pub fn mints_tokens(&self) -> bool {
+        self.issuer.is_some()
+    }
+
+    /// Add the addresses to a deployment's environment map.
+    ///
+    /// The DEIS_STORAGE_TOKEN is no longer written: nodes authenticate to
+    /// storage services through mTLS on the machine channel.
     ///
     /// Every reserved key is *removed* first and only then written back,
     /// which is the part that matters when a value is not configured: an
     /// application that declares `DEIS_STORE_ENDPOINT` in its own manifest
     /// would otherwise keep that value - the platform having nothing to
     /// overwrite it with - and the node would build its KV, SQL and blob
-    /// clients against a host the application chose. The same holds for
-    /// `DEIS_STORAGE_TOKEN`, where the consequence is worse: an application
-    /// that could put its own value there would be handing itself a
-    /// credential the node then presents on its behalf.
+    /// clients against a host the application chose.
     fn write_into(&self, app_id: &str, environment: &str, env: &mut BTreeMap<String, String>) {
         let mut put = |key: &str, value: &Option<String>| {
-            // The declared value is dropped without being logged: it is
-            // the application's own text, and one of these keys can also
-            // carry a secret of the same name.
             if env.remove(key).is_some() {
                 warn!(
                     app_id = %app_id,
@@ -292,10 +316,42 @@ impl StorageWiring {
         };
         put(deis_wire::conventions::STORE_ENDPOINT_ENV, &self.store);
         put(deis_wire::conventions::QUEUE_ENDPOINT_ENV, &self.queue);
-        put(
-            deis_wire::conventions::STORAGE_TOKEN_ENV,
-            &self.token_for(app_id, environment),
-        );
+        // Remove legacy STORAGE_TOKEN_ENV and generate fresh capability tokens.
+        env.remove(deis_wire::conventions::STORAGE_TOKEN_ENV);
+        env.remove(deis_wire::conventions::QUEUE_TOKEN_ENV);
+
+        if let Some(issuer) = &self.issuer {
+            let tenant = deis_wire::conventions::tenant_id(app_id, environment);
+            let subject = format!("spiffe://deislet/control/{app_id}");
+
+            // Use futures::executor::block_on: CapabilityIssuer::issue is
+            // async (lock on RwLock), but the delivery call chain is sync.
+            // futures::block_on is safe to call inside a tokio runtime
+            // unlike tokio Handle::block_on.
+
+            // Store capability: every store binding (kv, sql, blob) of the
+            // tenant, since each store service verifies its own.
+            let store_token = futures::executor::block_on(issuer.issue(
+                AUD_STORE,
+                &subject,
+                resources_for_audience(&tenant, AUD_STORE),
+            ));
+            env.insert(
+                deis_wire::conventions::STORAGE_TOKEN_ENV.to_string(),
+                store_token,
+            );
+
+            // Queue capability: same tenant, `queue` audience and binding.
+            let queue_token = futures::executor::block_on(issuer.issue(
+                AUD_QUEUE,
+                &subject,
+                resources_for_audience(&tenant, AUD_QUEUE),
+            ));
+            env.insert(
+                deis_wire::conventions::QUEUE_TOKEN_ENV.to_string(),
+                queue_token,
+            );
+        }
     }
 
     /// True when no address is configured, which is worth saying once at
@@ -354,14 +410,7 @@ impl StorageWiring {
                 anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
             })?,
         );
-        if let Some(token) = self.token_for(app_id, environment) {
-            request.metadata_mut().insert(
-                deis_wire::conventions::STORAGE_TOKEN_HEADER,
-                token.parse().map_err(|error| {
-                    anyhow::anyhow!("queue capability is not valid gRPC metadata: {error}")
-                })?,
-            );
-        }
+        self.stamp_queue_capability(&mut request, app_id, environment)?;
         Ok(QueueClient::new(channel)
             .prepare_consumer_generation(request)
             .await?
@@ -445,20 +494,26 @@ impl StorageWiring {
                 anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
             })?,
         );
-        if let Some(token) = self.token_for(app_id, environment) {
+        self.stamp_queue_capability(request, app_id, environment)
+    }
+
+    /// Put this control plane's queue capability in `Authorization: Bearer`,
+    /// the one header deis-queue reads it from.
+    fn stamp_queue_capability<T>(
+        &self,
+        request: &mut tonic::Request<T>,
+        app_id: &str,
+        environment: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(token) = self.queue_token_for(app_id, environment) {
             request.metadata_mut().insert(
-                deis_wire::conventions::STORAGE_TOKEN_HEADER,
-                token.parse().map_err(|error| {
+                "authorization",
+                format!("Bearer {token}").parse().map_err(|error| {
                     anyhow::anyhow!("queue capability is not valid gRPC metadata: {error}")
                 })?,
             );
         }
         Ok(())
-    }
-
-    /// True when this control plane mints capability tokens at all.
-    pub fn mints_tokens(&self) -> bool {
-        self.auth_secret.is_some()
     }
 }
 
@@ -522,7 +577,7 @@ pub struct DeploymentPayload {
     environment_snapshot_id: Option<String>,
     /// The only standard secret plaintext carrier, keyed by immutable
     /// revision rather than name. Never serialized to management APIs/logs.
-    secret_values_by_revision: BTreeMap<String, String>,
+    pub secret_values_by_revision: BTreeMap<String, String>,
     /// The storage addresses and the secret this tenant's capability token
     /// is derived from. Kept apart from `env` so the report and the log
     /// lines stay about the application, and merged in only when the wire
@@ -585,10 +640,6 @@ impl std::fmt::Debug for DeploymentPayload {
             .field("action", &self.action.as_str_name())
             .field("store_endpoint", &self.storage.store)
             .field("queue_endpoint", &self.storage.queue)
-            .field(
-                "storage_token",
-                &redacted(&self.storage.token_for(&self.app_id, &self.environment)),
-            )
             .field("limits", &self.limits)
             .field("compatibility", &self.compatibility)
             .finish()
@@ -689,17 +740,11 @@ impl DeploymentPayload {
         deis_wire::EnvironmentDeclarations,
         deis_wire::EnvironmentBindingSnapshot,
         String,
-        BTreeMap<String, String>,
     )> {
         let declarations = self.environment_declarations.clone()?;
         let snapshot = self.environment_snapshot.clone()?;
         let identity = self.environment_snapshot_id.clone()?;
-        Some((
-            declarations,
-            snapshot,
-            identity,
-            self.secret_values_by_revision.clone(),
-        ))
+        Some((declarations, snapshot, identity))
     }
 
     pub fn variable_count(&self) -> usize {
@@ -711,8 +756,10 @@ impl DeploymentPayload {
     }
 
     /// The complete environment a node should see: the application's own
-    /// variables and secrets, the platform's storage addresses, and the
-    /// capability token that lets the node act as this tenant.
+    /// variables and secrets, and the platform's storage addresses.
+    ///
+    /// Nodes authenticate to storage through mTLS on the machine channel;
+    /// DEIS_STORAGE_TOKEN is no longer written.
     ///
     /// Carries secret values in the clear. Hand it to the node and nowhere
     /// else - never to a log line and never to a read API.
@@ -748,7 +795,6 @@ impl DeploymentPayload {
                 .unwrap_or_default(),
             environment_snapshot_json: self.environment_snapshot_json.clone().unwrap_or_default(),
             environment_snapshot_id: self.environment_snapshot_id.clone().unwrap_or_default(),
-            secret_values_by_revision: self.secret_values_by_revision.clone().into_iter().collect(),
             deployment_id: self.deployment_id.clone().unwrap_or_default(),
             routing_generation: self.routing_generation.clone().unwrap_or_default(),
             action: self.action as i32,
@@ -778,13 +824,12 @@ fn compatibility_to_wire(declared: &DeclaredCompatibility) -> proto::Compatibili
     }
 }
 
-fn decrypt_secret(
+pub fn decrypt_secret(
     backend: &SecretsBackend,
     env_id: &str,
     stored: &crate::catalog::store::SecretCiphertext,
 ) -> CatalogResult<String> {
     let aad = match stored.encryption_scheme.as_str() {
-        "legacy-name-v1" => secret_aad(env_id, &stored.name),
         "revision-v1" => secret_revision_aad(env_id, &stored.name, &stored.revision),
         _ => {
             return Err(CatalogError::SecretsUnavailable(
@@ -809,20 +854,19 @@ fn decrypt_secret(
 /// would quietly get the node's default instead of being told its manifest is
 /// wrong.
 ///
-/// `cpu_milli` and `max_concurrency` are left at zero on purpose. They are
-/// fields 2 and 3 of the message and nothing on a node enforces either of them
-/// (see `deis.management.ResourceLimits`); sending a number for something that
-/// is not applied is how a platform ends up documenting a limit it does not
-/// have.
+/// `max_concurrency` is left at zero on purpose. It is field 3 of the message
+/// and nothing on a node enforces it (see `deis.management.ResourceLimits`);
+/// sending a number for something that is not applied is how a platform ends
+/// up documenting a limit it does not have.
 fn limits_to_wire(limits: &DeclaredLimits) -> proto::ResourceLimits {
     proto::ResourceLimits {
         memory_mb: limits.memory_mb.unwrap_or(0) as i32,
-        cpu_milli: 0,
         max_concurrency: 0,
         resource_table_max: limits.resource_table_max.unwrap_or(0) as i32,
         timeout_ms: limits.timeout_ms.unwrap_or(0) as i64,
         rate_limit_ops_per_sec: limits.rate_limit_ops_per_sec.unwrap_or(0.0),
         cpu_time_limit_ms: limits.cpu_time_limit_ms.unwrap_or(0) as i64,
+        max_outbound_connections: limits.max_outbound_connections.unwrap_or(0) as i64,
     }
 }
 
@@ -1503,7 +1547,7 @@ impl DeploymentDeliverer {
                 Some("preparing" | "prepared" | "activating" | "reconciling" | "degraded") => {
                     proto::DeploymentAction::Prepare
                 }
-                Some("active") | None => proto::DeploymentAction::LegacyApply,
+                Some("active") | None => proto::DeploymentAction::Unspecified,
                 Some(state) => {
                     return Err(CatalogError::conflict(format!(
                         "current deployment {} has terminal or unknown plan state {state}",
@@ -1513,6 +1557,49 @@ impl DeploymentDeliverer {
             },
         );
         Ok(payload)
+    }
+
+    /// Decrypt exactly `revisions` of one immutable environment snapshot.
+    ///
+    /// This is what `FetchSecretValues` answers with, and it is deliberately
+    /// narrower than [`Self::assignment_payload`]: it reads only the secret
+    /// bindings of the snapshot, decrypts only what was asked for, and refuses
+    /// the whole request when any revision is not one the snapshot binds. A
+    /// node asking for a revision its deployment does not reference is either
+    /// broken or probing, and neither gets a partial answer.
+    pub async fn snapshot_secret_values(
+        &self,
+        env_id: &str,
+        snapshot_id: &str,
+        revisions: &BTreeSet<String>,
+    ) -> CatalogResult<BTreeMap<String, String>> {
+        let snapshot = self.store.get_environment_snapshot(snapshot_id).await?;
+        let bound: BTreeMap<&str, &str> = snapshot
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                deis_wire::EnvironmentBinding::Secret(secret) => {
+                    Some((secret.revision.as_str(), secret.name.as_str()))
+                }
+                deis_wire::EnvironmentBinding::Config(_) => None,
+            })
+            .collect();
+
+        let mut values = BTreeMap::new();
+        for revision in revisions {
+            let Some(name) = bound.get(revision.as_str()) else {
+                return Err(CatalogError::forbidden(format!(
+                    "secret revision {revision} is not bound by snapshot {snapshot_id}"
+                )));
+            };
+            let stored = self
+                .store
+                .secret_revision_ciphertext(env_id, name, revision)
+                .await?;
+            let value = decrypt_secret(self.secrets.as_ref(), env_id, &stored)?;
+            values.insert(revision.clone(), value);
+        }
+        Ok(values)
     }
 
     /// Push a payload to every configured node, concurrently.
@@ -1545,9 +1632,7 @@ impl DeploymentDeliverer {
             proto::DeploymentAction::Activate => "activate",
             proto::DeploymentAction::Abort => "abort",
             proto::DeploymentAction::Drain => "drain",
-            proto::DeploymentAction::LegacyApply | proto::DeploymentAction::Unspecified => {
-                "legacy_apply"
-            }
+            proto::DeploymentAction::Unspecified => "apply",
         };
         let mut report = DeliveryReport {
             reason,
@@ -1623,9 +1708,7 @@ impl DeploymentDeliverer {
             proto::DeploymentAction::Activate => "active",
             proto::DeploymentAction::Abort => "aborted",
             proto::DeploymentAction::Drain => "drained",
-            proto::DeploymentAction::LegacyApply | proto::DeploymentAction::Unspecified => {
-                "legacy_applied"
-            }
+            proto::DeploymentAction::Unspecified => "applied",
         };
         for (node, result) in results {
             match result {
@@ -2092,6 +2175,7 @@ mod tests {
     use super::*;
     use crate::catalog::SecretCipher;
     use crate::catalog::secrets::MASTER_KEY_LEN;
+    use crate::catalog::secrets::secret_aad;
     use crate::database::Database;
     use chrono::Utc;
 
@@ -2227,24 +2311,24 @@ mod tests {
             StorageWiring {
                 store: Some("http://127.0.0.1:8090".to_string()),
                 queue: Some("http://127.0.0.1:8091".to_string()),
-                auth_secret: None,
+                issuer: None,
             },
         )
         .await
     }
 
-    /// The shared secret these tests mint tokens with. Any string works -
-    /// it is an HMAC key - so it is spelled out rather than generated, and
-    /// the expected token is computed from it the same way deis-store will.
-    const AUTH_SECRET: &str = "the-secret-both-halves-hold";
+    /// A test identity whose signing key is deterministic, so two tests
+    /// that each build their own issuer from this string will still produce
+    /// tokens the other can verify.
+    const ISSUER_ID: &str = "spiffe://deislet/control/test";
 
     /// A control plane wired the way an authenticated install is: addresses
-    /// plus the secret the storage services carry as their `auth_secret`.
+    /// plus a CapabilityIssuer for minting Ed25519 capability tokens.
     fn authenticated_wiring() -> StorageWiring {
         StorageWiring {
             store: Some("http://127.0.0.1:8090".to_string()),
             queue: Some("http://127.0.0.1:8091".to_string()),
-            auth_secret: Some(AUTH_SECRET.to_string()),
+            issuer: Some(CapabilityIssuer::for_test(ISSUER_ID)),
         }
     }
 
@@ -2292,10 +2376,17 @@ mod tests {
         let app = store.get_app("demo").await.unwrap();
 
         let cipher = deliverer.secrets.cipher().unwrap();
+        let revision = deis_wire::CanonicalId::new_v7().to_string();
         let blob = cipher
-            .encrypt(b"s3cr3t", &secret_aad(&env.id, "API_KEY"))
+            .encrypt(
+                b"s3cr3t",
+                &secret_revision_aad(&env.id, "API_KEY", &revision),
+            )
             .unwrap();
-        store.put_secret(&env, "API_KEY", blob).await.unwrap();
+        store
+            .put_secret_revision(&env, "API_KEY", &revision, blob)
+            .await
+            .unwrap();
 
         let payload = deliverer
             .payload(&env, &version(MANIFEST), "http://control.test")
@@ -2315,7 +2406,7 @@ mod tests {
 
         let request = payload.to_request();
         assert_eq!(request.env.get("LOG_LEVEL").unwrap(), "info");
-        // The secret wins over the placeholder the manifest carried.
+        // Schema 1 manifests still merge decrypted secrets into the env map.
         assert_eq!(request.env.get("API_KEY").unwrap(), "s3cr3t");
         assert_eq!(request.bundle_sha, "abc123");
         assert_eq!(
@@ -2405,10 +2496,6 @@ mod tests {
         assert!(!request.env.contains_key("LABEL"));
         assert!(!request.env.contains_key("OPTIONS"));
         assert!(!request.env.contains_key("TOKEN"));
-        assert_eq!(
-            request.secret_values_by_revision.get(&revision),
-            Some(&sentinel.to_string())
-        );
         let snapshot: deis_wire::EnvironmentBindingSnapshot =
             serde_json::from_str(&request.environment_snapshot_json).unwrap();
         assert_eq!(
@@ -2599,7 +2686,6 @@ mod tests {
         assert_eq!(wire.resource_table_max, 16);
         // Fields nothing on a node enforces stay at the absent sentinel
         // rather than carrying a number the platform would not apply.
-        assert_eq!(wire.cpu_milli, 0);
         assert_eq!(wire.max_concurrency, 0);
     }
 
@@ -2691,12 +2777,11 @@ mod tests {
         );
     }
 
+    /// Nodes now receive Ed25519 capability tokens signed by the control
+    /// plane, so DEIS_STORAGE_TOKEN appears in the environment map along
+    /// with DEIS_QUEUE_TOKEN.
     #[tokio::test]
-    async fn a_deployment_carries_the_capability_token_of_its_own_tenant() {
-        // The node presents this on every storage call. It has to be the
-        // token for `<app>.<environment>` - the same string the tenant
-        // header carries - because deis-store recomputes the expected value
-        // from the tenant the call claims and refuses anything else.
+    async fn a_deployment_ships_ed25519_capability_tokens() {
         let (deliverer, store) = deliverer_with(true, authenticated_wiring()).await;
         let production = environment(&store).await;
         let preview = store.create_environment("demo", "preview-7").await.unwrap();
@@ -2712,32 +2797,85 @@ mod tests {
             .unwrap()
             .to_request();
 
-        let token = |request: &proto::ApplyDeploymentRequest| {
-            request
+        assert!(
+            for_production
                 .env
-                .get(deis_wire::conventions::STORAGE_TOKEN_ENV)
-                .cloned()
-                .expect("a deployment on a configured platform carries a token")
-        };
-        assert_eq!(
-            token(&for_production),
-            deis_wire::conventions::storage_token(
-                AUTH_SECRET,
-                &deis_wire::conventions::tenant_id("demo", "production")
+                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
+            "DEIS_STORAGE_TOKEN must be present (Ed25519 capability)"
+        );
+        assert!(
+            for_production
+                .env
+                .contains_key(deis_wire::conventions::QUEUE_TOKEN_ENV),
+            "DEIS_QUEUE_TOKEN must be present (Ed25519 capability)"
+        );
+        assert!(
+            for_preview
+                .env
+                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
+            "DEIS_STORAGE_TOKEN must be present for preview environments too"
+        );
+        assert!(
+            for_preview
+                .env
+                .contains_key(deis_wire::conventions::QUEUE_TOKEN_ENV),
+            "DEIS_QUEUE_TOKEN must be present for preview environments too"
+        );
+    }
+
+    /// What the issuer mints is what the verifiers accept: the store token
+    /// passes every store service's binding check and the queue token the
+    /// queue's - the pairing the review found broken, with an empty binding
+    /// that no verifier matched.
+    #[tokio::test]
+    async fn the_tokens_a_deployment_carries_pass_the_verifiers_they_are_for() {
+        use deis_capability::{CapabilityVerifier, STORE_BINDINGS};
+        let wiring = authenticated_wiring();
+        let issuer = wiring.issuer.clone().unwrap();
+        let verifier = CapabilityVerifier::new(issuer.verifying_key().await);
+        let tenant = deis_wire::conventions::tenant_id("demo", "production");
+
+        let mut env = BTreeMap::new();
+        wiring.write_into("demo", "production", &mut env);
+        let store_token = &env[deis_wire::conventions::STORAGE_TOKEN_ENV];
+        let queue_token = &env[deis_wire::conventions::QUEUE_TOKEN_ENV];
+        for binding in STORE_BINDINGS {
+            verifier
+                .verify(store_token, AUD_STORE, &tenant, binding)
+                .unwrap_or_else(|e| panic!("store/{binding}: {e}"));
+        }
+        verifier
+            .verify(queue_token, AUD_QUEUE, &tenant, "queue")
+            .expect("the queue token is for the queue");
+        assert!(verifier.verify(store_token, AUD_QUEUE, &tenant, "queue").is_err());
+    }
+
+    /// The control plane's own queue calls carry a queue-audience token in
+    /// `Authorization: Bearer`, which is where deis-queue reads it.
+    #[tokio::test]
+    async fn a_queue_call_from_control_carries_a_queue_capability_as_a_bearer() {
+        let wiring = authenticated_wiring();
+        let issuer = wiring.issuer.clone().unwrap();
+        let mut request = tonic::Request::new(());
+        wiring
+            .stamp_queue_capability(&mut request, "demo", "production")
+            .unwrap();
+        assert!(
+            request
+                .metadata()
+                .get(deis_wire::conventions::STORAGE_TOKEN_HEADER)
+                .is_none()
+        );
+        let header = request.metadata().get("authorization").unwrap().to_str().unwrap();
+        let token = header.strip_prefix("Bearer ").expect("a bearer credential");
+        deis_capability::CapabilityVerifier::new(issuer.verifying_key().await)
+            .verify(
+                token,
+                AUD_QUEUE,
+                &deis_wire::conventions::tenant_id("demo", "production"),
+                "queue",
             )
-        );
-        assert_eq!(
-            token(&for_preview),
-            deis_wire::conventions::storage_token(
-                AUTH_SECRET,
-                &deis_wire::conventions::tenant_id("demo", "preview-7")
-            )
-        );
-        assert_ne!(
-            token(&for_production),
-            token(&for_preview),
-            "one token for both environments would let a preview read and overwrite production's data"
-        );
+            .expect("deis-queue accepts it");
     }
 
     #[tokio::test]
@@ -2762,17 +2900,18 @@ mod tests {
         );
     }
 
+    /// The DEIS_STORAGE_TOKEN key is always stripped from the deployment
+    /// environment, regardless of whether the platform configured a shared
+    /// secret. Nodes authenticate to storage through mTLS.
     #[tokio::test]
-    async fn an_application_cannot_hand_itself_a_storage_token() {
-        // A bundle that could declare this key would be choosing the
-        // credential the node presents on its behalf - and on a platform
-        // that mints no tokens of its own there would be nothing to
-        // overwrite it with, so the key has to be removed either way.
+    async fn the_storage_token_key_is_always_stripped() {
         let manifest = format!(
             r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"forged","KEEP":"mine"}}}}"#,
             deis_wire::conventions::STORAGE_TOKEN_ENV
         );
 
+        // Platform with an issuer: the reserved key is removed, then
+        // the platform writes its own Ed25519 capability.
         let (deliverer, store) = deliverer_with(true, authenticated_wiring()).await;
         let env = environment(&store).await;
         let request = deliverer
@@ -2780,22 +2919,20 @@ mod tests {
             .await
             .unwrap()
             .to_request();
-        assert_eq!(
+        assert!(
             request
                 .env
-                .get(deis_wire::conventions::STORAGE_TOKEN_ENV)
-                .map(String::as_str),
-            Some(
-                deis_wire::conventions::storage_token(
-                    AUTH_SECRET,
-                    &deis_wire::conventions::tenant_id("demo", "production")
-                )
-                .as_str()
-            ),
-            "the platform's token must win over anything the bundle declared"
+                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
+            "DEIS_STORAGE_TOKEN must be written (Ed25519 capability)"
+        );
+        assert_ne!(
+            request.env.get(deis_wire::conventions::STORAGE_TOKEN_ENV).map(String::as_str),
+            Some("forged"),
+            "the manifest-forged value must be replaced by the real capability"
         );
         assert_eq!(request.env.get("KEEP").map(String::as_str), Some("mine"));
 
+        // Platform with no storage wiring: the reserved key is still removed.
         let (deliverer, store) = deliverer_with(true, StorageWiring::default()).await;
         let env = environment(&store).await;
         let request = deliverer
@@ -2807,24 +2944,23 @@ mod tests {
             !request
                 .env
                 .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
-            "with nothing to overwrite it with, the declared value must be dropped"
+            "DEIS_STORAGE_TOKEN must be stripped even with no platform auth"
         );
         assert_eq!(request.env.get("KEEP").map(String::as_str), Some("mine"));
     }
 
     #[test]
-    fn the_shared_secret_never_reaches_a_log_line() {
+    fn the_issuer_never_reaches_a_log_line() {
         // The one value here that can mint a token for any tenant. A
         // derived Debug would put it in whatever line printed a payload.
         let rendered = format!("{:?}", authenticated_wiring());
         assert!(
-            !rendered.contains(AUTH_SECRET),
-            "the shared secret is printable: {rendered}"
+            rendered.contains("<present>"),
+            "the issuer should be redacted but is: {rendered}"
         );
-        assert!(rendered.contains("<set>"), "{rendered}");
         assert!(
             format!("{:?}", StorageWiring::default()).contains("<unset>"),
-            "an unconfigured secret should say so"
+            "an unset issuer should say <unset>"
         );
     }
 
@@ -2936,13 +3072,20 @@ mod tests {
     async fn debug_output_never_carries_a_secret_value() {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
+        let revision = deis_wire::CanonicalId::new_v7().to_string();
         let blob = deliverer
             .secrets
             .cipher()
             .unwrap()
-            .encrypt(b"s3cr3t", &secret_aad(&env.id, "API_KEY"))
+            .encrypt(
+                b"s3cr3t",
+                &secret_revision_aad(&env.id, "API_KEY", &revision),
+            )
             .unwrap();
-        store.put_secret(&env, "API_KEY", blob).await.unwrap();
+        store
+            .put_secret_revision(&env, "API_KEY", &revision, blob)
+            .await
+            .unwrap();
 
         let payload = deliverer
             .payload(&env, &version(MANIFEST), "http://control.test")
@@ -2954,8 +3097,14 @@ mod tests {
             !rendered.contains("placeholder-from-manifest"),
             "{rendered}"
         );
-        assert!(rendered.contains("API_KEY"), "names are safe to show");
-        assert!(rendered.contains("redacted"));
+        assert!(
+            rendered.contains("API_KEY"),
+            "secret names are safe to show; got {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "values field still uses the redacted guard; got {rendered}"
+        );
     }
 
     /// An app with no stored secrets must deploy even when the control

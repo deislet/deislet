@@ -3,18 +3,18 @@
 //! work out what it should be running (`assignments` and the bundle
 //! download for a runtime node, `routing_table` for deis-proxy).
 //!
-//! It is built as two routers, because the two halves answer to different
+//! It is built as two surfaces, because the two halves answer to different
 //! credentials:
 //!
-//! * [`router`] is the human surface - dashboard and CLI. It is merged into
-//!   the part of the API guarded by the API key, which `api_auth_enabled`
-//!   turns on and off.
-//! * [`node_router`] is what the platform's own processes call - a runtime
-//!   node, and deis-proxy for the routing table. It carries its own
-//!   authentication ([`crate::api::middleware::node_auth`]) and ignores
-//!   `api_auth_enabled` entirely: the assignment list hands out every
-//!   environment's decrypted secrets, so that channel cannot be left open by
-//!   a flag whose purpose is to make a dashboard convenient.
+//! * [`router`] is the human surface — dashboard and CLI, behind the
+//!   credential gate (`super::authz`).
+//! * The machine channel (`[machine] listen`) is what the platform's own
+//!   processes call — a gRPC surface (`deis.machine.MachineChannel`) that
+//!   serves assignments, bundles, routing tables, and registration over
+//!   mutual TLS with per-instance SPIFFE certificates. The credential gate
+//!   does not reach it: the assignment list hands out every environment's
+//!   decrypted secrets, so admission there is a proved certificate, never a
+//!   configuration flag.
 
 pub mod apps;
 pub mod artifacts;
@@ -42,6 +42,7 @@ use crate::catalog::{
     ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore,
     ProviderDriverDispatcher, SecretsBackend,
 };
+use crate::capability_issuer::CapabilityIssuer;
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
 use crate::runtime_client::RuntimeNodeManager;
 use crate::session::SessionManager;
@@ -71,6 +72,8 @@ pub struct CatalogState {
     /// Pushes a deployment out to the nodes. Deploy, rollback and secret
     /// change all end here; see [`crate::delivery`].
     pub deliverer: Arc<DeploymentDeliverer>,
+    /// Issues Ed25519 capability tokens for storage/queue/telemetry.
+    pub issuer: CapabilityIssuer,
     /// Where storage lives and what proves a call to it may act as a tenant.
     ///
     /// The deliverer holds the same wiring and writes it into every
@@ -346,14 +349,12 @@ pub(super) fn actor_subject(principal: &crate::identity::Principal) -> String {
             "account:{}",
             principal.account.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::ConfigKey => format!(
-            "config-key:{}",
+        PrincipalKind::Bootstrap => format!(
+            "bootstrap:{}",
             principal.credential_id.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::Anonymous => "anonymous:direct-local".to_string(),
     }
 }
-
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -418,8 +419,7 @@ pub(crate) mod tests {
                 crate::runtime_client::proto::DeploymentAction::Activate => "active",
                 crate::runtime_client::proto::DeploymentAction::Abort => "aborted",
                 crate::runtime_client::proto::DeploymentAction::Drain => "drained",
-                crate::runtime_client::proto::DeploymentAction::LegacyApply
-                | crate::runtime_client::proto::DeploymentAction::Unspecified => "legacy_applied",
+                crate::runtime_client::proto::DeploymentAction::Unspecified => "applied",
             };
             Ok(tonic::Response::new(
                 crate::runtime_client::proto::ApplyDeploymentResponse {
@@ -506,7 +506,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn harness_with(secrets_ready: bool) -> Harness {
-        harness_with_storage(secrets_ready, storage_wiring(None)).await
+        harness_with_storage(secrets_ready, storage_wiring(false)).await
     }
 
     pub(crate) async fn harness_with_queue(secrets_ready: bool) -> Harness {
@@ -539,28 +539,29 @@ pub(crate) mod tests {
             queue_endpoint: Some(endpoint.clone()),
             ..Default::default()
         });
-        let mut harness =
-            harness_with_storage(secrets_ready, storage).await;
+        let mut harness = harness_with_storage(secrets_ready, storage).await;
         harness.queue_endpoint = Some(endpoint);
         harness._queue_dir = Some(queue_dir);
         harness._queue_shutdown = Some(shutdown);
         harness
     }
 
-    /// The storage secret the harness mints tokens from when it is asked to
-    /// mint any. Not a realistic secret; what matters is that a test can
-    /// recompute the token the endpoint should have answered with, from the
-    /// same convention deis-store checks it against.
-    pub(crate) const TEST_STORAGE_SECRET: &str = "harness-storage-secret";
-
     /// Wiring built the way the server builds it, so the harness cannot
     /// drift from the real assembly of a delivery.
-    pub(crate) fn storage_wiring(auth_secret: Option<&str>) -> crate::delivery::StorageWiring {
-        crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
+    pub(crate) fn storage_wiring(with_issuer: bool) -> crate::delivery::StorageWiring {
+        let wiring = crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
             store_endpoint: Some("http://127.0.0.1:8090".to_string()),
-            storage_auth_secret: auth_secret.map(str::to_string),
             ..Default::default()
-        })
+        });
+        if with_issuer {
+            wiring.with_issuer(
+                crate::capability_issuer::CapabilityIssuer::for_test(
+                    "spiffe://deislet/control/test",
+                ),
+            )
+        } else {
+            wiring
+        }
     }
 
     pub(crate) async fn harness_with_storage(
@@ -574,12 +575,7 @@ pub(crate) mod tests {
     /// that cannot acknowledge PREPARE. Used to prove a partial prepare never
     /// moves the production pointer.
     pub(crate) async fn harness_with_failed_runtime(secrets_ready: bool) -> Harness {
-        harness_with_storage_and_failed_runtime(
-            secrets_ready,
-            storage_wiring(None),
-            true,
-        )
-        .await
+        harness_with_storage_and_failed_runtime(secrets_ready, storage_wiring(false), true).await
     }
 
     async fn harness_with_storage_and_failed_runtime(
@@ -727,6 +723,7 @@ pub(crate) mod tests {
             .expect("the stand-in runtime node registers");
         let runtime_nodes_for_state = Arc::clone(&runtime_nodes);
         let sessions = Arc::new(SessionManager::new());
+        let issuer = CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await;
         let state = CatalogState {
             store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
@@ -742,6 +739,7 @@ pub(crate) mod tests {
                 address,
                 storage,
             )),
+            issuer,
             sessions: Arc::clone(&sessions),
             nodes: Arc::clone(&runtime_nodes_for_state),
             // Long enough that no test reaches it by accident; a test about
@@ -754,15 +752,12 @@ pub(crate) mod tests {
             // The human half, which since the node routes left this listener
             // is the whole of it. It is normally mounted behind
             // `crate::api::authz::authorize`, which resolves the caller and
-            // leaves a `Principal` in the request. These tests are about the
-            // catalog rather than about who may reach it, so the gate is not
-            // in the way - but the principal it would have left has to be,
-            // or a handler that names its caller would fail to extract one.
+            // leaves a `Principal` in the request, and normally nested
+            // under `/api/v1` and `/api/platform`.
             //
-            // Mounted in the legacy `/api/*` spelling on purpose, and kept
-            // so: that tree answers for the whole deprecation window, and
-            // these are its regression tests. The versioned mounts are the
-            // same routers under another prefix, covered in `api::tests`.
+            // Mounted in the unversioned `/api/*` spelling on purpose, and
+            // kept so: the handlers are the same under any prefix, and
+            // these tests are about the catalog rather than the surface.
             router: router("/api", state.clone())
                 .merge(platform_router("/api", state.clone()))
                 .layer(axum::middleware::from_fn(supply_test_principal)),
@@ -777,16 +772,28 @@ pub(crate) mod tests {
         }
     }
 
-    /// Stand in for the authorisation gate: an unauthenticated caller, which
-    /// is what a control plane with `api_auth_enabled` off resolves every
-    /// request to, and what these tests are.
+    /// Stand in for the authorisation gate: a caller the gate has admitted -
+    /// an unscoped owner token's principal, which is what a logged-in
+    /// operator holds. These tests are about the catalog rather than about
+    /// who may reach it, so the gate itself is not in the way, but the
+    /// principal it would have left has to be, or a handler that names its
+    /// caller would fail to extract one.
+    pub(crate) fn admitted_principal() -> crate::identity::Principal {
+        use crate::identity::{Authority, PrincipalKind, Role};
+        crate::identity::Principal {
+            kind: PrincipalKind::Account,
+            account: Some("root".to_string()),
+            role: Some(Role::Owner),
+            credential_id: Some("0000000000000000".to_string()),
+            authority: Authority::Unscoped,
+        }
+    }
+
     async fn supply_test_principal(
         mut request: axum::extract::Request,
         next: axum::middleware::Next,
     ) -> axum::response::Response {
-        request
-            .extensions_mut()
-            .insert(crate::identity::Principal::anonymous());
+        request.extensions_mut().insert(admitted_principal());
         next.run(request).await
     }
 
@@ -2118,7 +2125,9 @@ pub(crate) mod tests {
     }
 
     /// Without a master key the secret endpoints must refuse loudly rather
-    /// than fall back to storing plaintext.
+    /// than fall back to storing plaintext: a 503 whose body says the
+    /// control plane could not complete the request, with what the key file
+    /// was left for the log.
     #[tokio::test]
     async fn secrets_fail_loudly_without_a_master_key() {
         let h = harness(false).await;
@@ -2147,7 +2156,12 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body["error"].as_str().unwrap().contains("no key file"));
+        assert_eq!(body["error"]["code"], "service-unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            crate::api::error::OPAQUE_MESSAGE,
+            "the missing key file is for the log, not the answer: {body}"
+        );
 
         // And nothing was stored.
         let (_, body) = json(

@@ -16,7 +16,7 @@ use crate::proto::storage::{
     DeleteRequest, DeleteResponse, GetRequest, GetResponse, HasRequest, HasResponse, KvEntry,
     ListRequest, ListResponse, SetRequest, SetResponse, kv_store_server::KvStore,
 };
-use crate::sqlite::{PoolSize, SqlitePool};
+use crate::sqlite::{Durability, PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
 use crate::{prefix_upper_bound, unix_seconds};
 use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences};
@@ -24,8 +24,21 @@ use rusqlite::OptionalExtension;
 use tonic::{Request, Response, Status};
 
 /// Longest accepted key. Keys live in a SQLite primary key and in log lines;
-/// past a kilobyte they are an accident, not a design.
-const MAX_KEY_LEN: usize = 1024;
+/// past half a kilobyte they are an accident, not a design.
+///
+/// The number is the shared standard's, and it is the smaller of the two
+/// hosts: Cloudflare Workers KV refuses keys over 512 bytes
+/// (developers.cloudflare.com/kv, checked 2026-09-25). The self-hosted store
+/// holds the same ceiling so one application cannot depend on a key length
+/// the other target rejects.
+const MAX_KEY_LEN: usize = 512;
+
+/// Longest accepted metadata.
+///
+/// The shared standard takes 1 KiB, Cloudflare Workers KV's metadata ceiling
+/// (developers.cloudflare.com/kv, checked 2026-09-25); the value itself is
+/// bounded by the gRPC message ceiling, which is the larger of the two hosts.
+const MAX_METADATA_BYTES: usize = 1024;
 
 /// Keys returned by `List` when the caller does not ask for a limit.
 const DEFAULT_LIST_LIMIT: i32 = 1000;
@@ -33,7 +46,21 @@ const DEFAULT_LIST_LIMIT: i32 = 1000;
 /// Hard ceiling on how many entries one `List` page holds, whatever the
 /// caller asks for. Keeps a single request from pulling an entire namespace
 /// into one gRPC message.
-const MAX_LIST_LIMIT: i32 = 10_000;
+///
+/// One thousand, the shared standard's page size: Cloudflare Workers KV
+/// serves at most 1000 keys per page (developers.cloudflare.com/kv, checked
+/// 2026-09-25), so a page the self-hosted store returns larger would be a
+/// page an application could depend on and the other target could never
+/// answer.
+const MAX_LIST_LIMIT: i32 = 1000;
+
+/// Shortest accepted lifetime, in seconds.
+///
+/// The shared standard's floor, Cloudflare Workers KV's minimum
+/// `expirationTtl` (developers.cloudflare.com/kv, checked 2026-09-25); a
+/// lifetime the other target cannot express is not one an application can
+/// rely on.
+const MIN_TTL_SECONDS: i64 = 60;
 
 /// Hard ceiling on how much one `List` page weighs.
 ///
@@ -104,15 +131,21 @@ impl KvService {
     /// Open `<data_dir>/kv.sqlite` and make sure the schema is there.
     pub async fn open(data_dir: &std::path::Path, connections: usize) -> StoreResult<Self> {
         let fences = TenantWriteFences::open(data_dir.join("migration-fences.sqlite")).await?;
-        Self::open_with_fences(data_dir, connections, fences).await
+        Self::open_with_fences(data_dir, connections, Durability::default(), fences).await
     }
 
     pub(crate) async fn open_with_fences(
         data_dir: &std::path::Path,
         connections: usize,
+        durability: Durability,
         fences: TenantWriteFences,
     ) -> StoreResult<Self> {
-        let pool = SqlitePool::new(data_dir.join("kv.sqlite"), "kv", PoolSize::new(connections));
+        let pool = SqlitePool::new(
+            data_dir.join("kv.sqlite"),
+            "kv",
+            PoolSize::new(connections),
+            durability,
+        );
         pool.migrate(|conn| {
             // Before anything is created: a kv.sqlite from before the tenant
             // change would otherwise gain a second, empty table beside the
@@ -182,6 +215,7 @@ impl KvService {
     ) -> StoreResult<()> {
         let _permit = self.fences.permit(tenant.as_str()).await?;
         let key = check_key(key)?;
+        let metadata = check_metadata(metadata.as_deref())?;
         let tenant_id = tenant.as_str().to_string();
         self.pool
             .with_conn(move |conn| {
@@ -498,6 +532,17 @@ fn expiry_from_ttl(now: i64, ttl_seconds: Option<i64>) -> StoreResult<Option<i64
                 "ttl_seconds is {ttl}, it must be positive"
             )))
         }
+        Some(ttl) if ttl < MIN_TTL_SECONDS => {
+            tracing::warn!(
+                ttl_seconds = ttl,
+                limit = MIN_TTL_SECONDS,
+                "kv set asked for a lifetime below the shared minimum, refusing it; a lifetime \
+                 this short does not exist on every host the standard names"
+            );
+            Err(StoreError::InvalidArgument(format!(
+                "ttl_seconds is {ttl}, it must be at least {MIN_TTL_SECONDS}"
+            )))
+        }
         // A clock far enough along that `now + ttl` would wrap is not a
         // recoverable situation, but an entry that never expires is the safe
         // way to lose that argument: it costs disk, not data.
@@ -523,6 +568,25 @@ fn check_key(key: &str) -> StoreResult<String> {
         )));
     }
     Ok(key.to_string())
+}
+
+/// Reject metadata that is too long before it reaches SQLite.
+fn check_metadata(metadata: Option<&str>) -> StoreResult<Option<String>> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    if metadata.len() > MAX_METADATA_BYTES {
+        tracing::warn!(
+            len = metadata.len(),
+            limit = MAX_METADATA_BYTES,
+            "kv metadata exceeds the size limit, refusing the request"
+        );
+        return Err(StoreError::InvalidArgument(format!(
+            "metadata is {} bytes, limit is {MAX_METADATA_BYTES}",
+            metadata.len()
+        )));
+    }
+    Ok(Some(metadata.to_string()))
 }
 
 fn clamp_limit(limit: Option<i32>) -> i32 {
@@ -1080,6 +1144,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lifetime_below_the_shared_minimum_is_refused() {
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        // 59 is a second below the floor; 60 is the floor itself.
+        let request = as_tenant(
+            "app-one.production",
+            SetRequest {
+                key: "doomed".to_string(),
+                value: b"v".to_vec(),
+                ttl_seconds: Some(MIN_TTL_SECONDS - 1),
+                metadata: None,
+            },
+        );
+        let status = KvStore::set(&svc, request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("at least 60"),
+            "{}",
+            status.message()
+        );
+
+        let request = as_tenant(
+            "app-one.production",
+            SetRequest {
+                key: "kept".to_string(),
+                value: b"v".to_vec(),
+                ttl_seconds: Some(MIN_TTL_SECONDS),
+                metadata: None,
+            },
+        );
+        KvStore::set(&svc, request).await.unwrap();
+        assert!(svc.has(&a, "kept").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn metadata_over_a_kibibyte_is_refused_and_a_kibibyte_is_kept() {
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+
+        let request = as_tenant(
+            "app-one.production",
+            SetRequest {
+                key: "doomed".to_string(),
+                value: b"v".to_vec(),
+                ttl_seconds: None,
+                metadata: Some("m".repeat(MAX_METADATA_BYTES + 1)),
+            },
+        );
+        let status = KvStore::set(&svc, request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("metadata is 1025 bytes"),
+            "{}",
+            status.message()
+        );
+
+        let request = as_tenant(
+            "app-one.production",
+            SetRequest {
+                key: "kept".to_string(),
+                value: b"v".to_vec(),
+                ttl_seconds: None,
+                metadata: Some("m".repeat(MAX_METADATA_BYTES)),
+            },
+        );
+        KvStore::set(&svc, request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_of_exactly_the_shared_maximum_is_kept() {
+        // The boundary the tightening sits on: the limit is inclusive, so a
+        // 512-byte key - a size the other target also accepts - is a legal
+        // key here too, and 513 is not.
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        let key = "k".repeat(MAX_KEY_LEN);
+        svc.set(&a, &key, b"v".to_vec(), None, None).await.unwrap();
+        assert!(svc.has(&a, &key).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn rejects_empty_and_oversized_keys() {
         let (_dir, svc) = service().await;
         let a = tenant("app-one.production");
@@ -1120,9 +1265,11 @@ mod tests {
     async fn a_listing_page_stops_on_its_byte_ceiling_and_hands_back_a_cursor() {
         let (_dir, kv) = service().await;
         let tenant = tenant("demo.production");
-        // Eight entries of just over a megabyte of metadata each: well inside
-        // the entry ceiling, well past the byte one.
-        let metadata = "m".repeat(1024 * 1024 + 1);
+        // Many entries of the heaviest legal metadata each: the metadata is
+        // at its own ceiling (a kibibyte), the values are one byte, and the
+        // count is well past what one page may carry, so the page has to stop
+        // on its byte budget rather than on the entry count.
+        let metadata = "m".repeat(MAX_METADATA_BYTES);
         for i in 0..8 {
             kv.set(
                 &tenant,
@@ -1135,9 +1282,9 @@ mod tests {
             .unwrap();
         }
 
-        let (page, cursor) = kv.list(&tenant, "weighty:", None, None).await.unwrap();
+        let (page, cursor) = kv.list(&tenant, "weighty:", Some(2), None).await.unwrap();
         assert!(
-            page.len() < 8,
+            page.len() <= 2,
             "the page took all {} entries, so nothing bounded its size",
             page.len()
         );
@@ -1173,6 +1320,10 @@ mod tests {
         assert_eq!(clamp_limit(Some(0)), DEFAULT_LIST_LIMIT);
         assert_eq!(clamp_limit(Some(-5)), DEFAULT_LIST_LIMIT);
         assert_eq!(clamp_limit(Some(7)), 7);
+        // The shared standard's page ceiling: a page of 1000 is the most any
+        // host answers, so a larger ask lands on it rather than on a number
+        // only this store could serve.
+        assert_eq!(clamp_limit(Some(1_001)), MAX_LIST_LIMIT);
         assert_eq!(clamp_limit(Some(1_000_000)), MAX_LIST_LIMIT);
     }
 }

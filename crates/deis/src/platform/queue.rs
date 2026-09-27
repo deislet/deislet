@@ -12,12 +12,12 @@
 //!
 //! # Identity on the wire
 //!
-//! The same two headers `deis kv` stamps - `x-deis-tenant` and the capability
-//! token in `x-deis-storage-token` - because deis-queue checks the token the
-//! same way deis-store does, against the same shared secret and derived from
-//! the tenant the call itself claims (see `deis-queue/src/auth.rs`). So the
-//! credential this CLI already fetches for storage is the one that works
-//! here, and there is no second secret to manage.
+//! `x-deis-tenant` and the capability in `Authorization: Bearer`, the same
+//! shape `deis kv` uses. The capability is a separate one, though: deis-queue
+//! accepts only tokens minted for the `queue` audience and binding (see
+//! `deis-queue/src/auth.rs`), and the control plane's storage-token route
+//! hands one out beside the store token, so there is still no second call or
+//! secret to manage.
 //!
 //! There is no binding: a binding names a namespace inside one tenant's
 //! *storage*, and deis-queue has no such dimension - one tenant has one set
@@ -31,9 +31,7 @@ use tonic::Request;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
-use deis_wire::conventions::{
-    MAX_GRPC_MESSAGE_BYTES, STORAGE_TOKEN_HEADER, TENANT_HEADER, split_tenant,
-};
+use deis_wire::conventions::{MAX_GRPC_MESSAGE_BYTES, TENANT_HEADER, split_tenant};
 
 mod queue_proto {
     tonic::include_proto!("deis.queue");
@@ -156,9 +154,10 @@ impl Identity {
             .metadata_mut()
             .insert(TENANT_HEADER, self.tenant_header.clone());
         if let Some(token) = &self.token_header {
+            let bearer = format!("Bearer {}", token.to_str().unwrap_or(""));
             request
                 .metadata_mut()
-                .insert(STORAGE_TOKEN_HEADER, token.clone());
+                .insert("authorization", bearer.parse().expect("valid metadata"));
         }
         request
     }
@@ -331,9 +330,10 @@ fn status_error(status: tonic::Status, doing: &str) -> anyhow::Error {
     if status.code() == tonic::Code::Unauthenticated {
         return anyhow!(
             "deis-queue refused this CLI's capability token while {doing}: {message}\nThe token \
-             is minted by the control plane from `storage_auth_secret` and checked by deis-queue \
-             against its own `auth_secret`; when the two are not the same string, every call from \
-             every node is being refused as well."
+             is signed by the control plane and checked by deis-queue against the keys it fetches \
+             from `capability_jwks_url`; when that does not point at this control plane, or the \
+             fetch is failing (deis-queue logs it), every call from every node is being refused \
+             as well."
         );
     }
     anyhow!("deis-queue refused the call while {doing}: {message}")
@@ -372,8 +372,8 @@ mod tests {
             "demo.production"
         );
         assert_eq!(
-            request.metadata().get(STORAGE_TOKEN_HEADER).unwrap(),
-            "token"
+            request.metadata().get("authorization").unwrap(),
+            "Bearer token"
         );
 
         // No token is the loopback install with no secret configured, where
@@ -384,7 +384,7 @@ mod tests {
             anonymous
                 .stamp(())
                 .metadata()
-                .get(STORAGE_TOKEN_HEADER)
+                .get("authorization")
                 .is_none()
         );
     }
@@ -456,11 +456,18 @@ mod tests {
         const CEILING: i32 = 2;
 
         let data = tempfile::tempdir().unwrap();
+        let signing_key = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(SECRET.as_bytes());
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&hash);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let verifying_key = signing_key.verifying_key();
         let config = deis_queue::config::Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
             max_attempts: CEILING,
-            auth_secret: Some(SECRET.to_string()),
             ..deis_queue::config::Config::default()
         };
         // Bound before anything is spawned, so the port is known and no part
@@ -471,14 +478,26 @@ mod tests {
         let server = tokio::spawn(async move {
             deis_queue::server::serve(config, listener, async {
                 let _ = stopped.await;
-            })
+            }, deis_capability::KeyRing::from_keys([verifying_key]))
             .await
             .unwrap();
         });
 
         // The producer and consumer halves, which this CLI has no commands
         // for: an application enqueues, its node leases and hands back.
-        let token = deis_wire::conventions::storage_token(SECRET, TENANT);
+        let claims = deis_capability::CapabilityClaims::new(
+            "queue",
+            "deis-control",
+            "test-node",
+            0,
+            std::time::Duration::from_secs(900),
+            vec![deis_capability::CapabilityResource {
+                tenant: TENANT.to_string(),
+                binding: "queue".to_string(),
+                generation: None,
+            }],
+        );
+        let token = deis_capability::encode(&claims, &signing_key);
         // A function rather than a closure: it stamps three different request
         // types, and a closure would be fixed to whichever one it saw first.
         fn stamp<T>(token: &str, message: T) -> Request<T> {
@@ -486,9 +505,10 @@ mod tests {
             request
                 .metadata_mut()
                 .insert(TENANT_HEADER, TENANT.parse().unwrap());
+            let bearer = format!("Bearer {}", token);
             request
                 .metadata_mut()
-                .insert(STORAGE_TOKEN_HEADER, token.parse().unwrap());
+                .insert("authorization", bearer.parse().expect("valid metadata"));
             request
         }
         let mut producer = QueueClient::connect(endpoint.clone()).await.unwrap();
@@ -526,6 +546,7 @@ mod tests {
                     NackRequest {
                         queue_name: "jobs".to_string(),
                         delay_seconds: 0,
+                        refund_attempt: false,
                         messages: leased
                             .iter()
                             .map(|message| MessageHandle {
@@ -589,28 +610,42 @@ mod tests {
         );
 
         // A token minted for another tenant reaches nothing, and the refusal
-        // is the one this module words itself.
-        let other = deis_wire::conventions::storage_token(SECRET, "other-app.production");
+        // is the CLI error that maps to the operator-facing setting.
+        let other_claims = deis_capability::CapabilityClaims::new(
+            "queue",
+            "deis-control",
+            "test-node",
+            0,
+            std::time::Duration::from_secs(900),
+            vec![deis_capability::CapabilityResource {
+                tenant: "other-app.production".to_string(),
+                binding: "queue".to_string(),
+                generation: None,
+            }],
+        );
+        let other = deis_capability::encode(&other_claims, &signing_key);
         let refused = QueueSession::connect(&endpoint, TENANT, Some(&other))
             .unwrap()
             .dead_letters(None, None, None)
             .await
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("storage_auth_secret"), "{refused}");
+        assert!(
+            refused.contains("tenant"),
+            "{refused}"
+        );
 
         let _ = stop.send(());
         server.await.unwrap();
     }
 
     #[test]
-    fn a_refused_token_says_which_two_settings_have_to_match() {
+    fn a_refused_token_names_the_setting_the_keys_come_from() {
         let error = status_error(
-            tonic::Status::unauthenticated("the x-deis-storage-token presented is not valid"),
+            tonic::Status::unauthenticated("this node is not authorized to access deis-queue"),
             "listing the dead letters",
         )
         .to_string();
-        assert!(error.contains("storage_auth_secret"), "{error}");
-        assert!(error.contains("auth_secret"), "{error}");
+        assert!(error.contains("capability_jwks_url"), "{error}");
     }
 }

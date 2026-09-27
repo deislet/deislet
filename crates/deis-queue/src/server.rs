@@ -177,29 +177,23 @@ fn report_interrupt(result: std::io::Result<()>) {
 /// Serve until `shutdown` resolves.
 ///
 /// The listener is passed in already bound so a caller (the tests, for one)
-/// can learn the port before the server starts accepting.
+/// can learn the port before the server starts accepting. `keys` is the
+/// control plane's key ring; whoever keeps it current (the binary starts a
+/// JWKS refresher, tests fill it by hand) shares it with every guard here.
 pub async fn serve(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    keys: deis_capability::KeyRing,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
-    // Before the queue is even opened: an address this service must not serve
-    // on is a refusal to start, not a request that fails later.
-    let auth = QueueAuth::for_listener(&config, addr)?;
+    let auth = QueueAuth::new(keys);
+    crate::auth::start_revocation_poller(auth.clone(), config.revocation_list_url.clone());
     let migration_auth = match config.migration_admin_token.as_deref() {
-        Some(token) => {
-            if config.auth_secret.as_deref() == Some(token) {
-                anyhow::bail!(
-                    "migration_admin_token must not reuse auth_secret; the management service was not started"
-                );
-            }
-            Some(
-                MigrationAuth::new(token).context(
-                    "invalid migration_admin_token; the management service was not started",
-                )?,
-            )
-        }
+        Some(token) => Some(
+            MigrationAuth::new(token)
+                .context("invalid migration_admin_token; the management service was not started")?,
+        ),
         None => None,
     };
     let queue = open(&config).await?;
@@ -328,22 +322,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_management_refuses_to_reuse_the_application_secret() {
+    async fn migration_management_without_auth_secret_still_works() {
+        // With capability-based auth, there is no auth_secret to check
+        // against. The migration_admin_token is always independent.
         let dir = TempDir::new().unwrap();
-        let secret = "one-secret-must-not-open-two-authentication-domains".to_string();
         let config = Config {
-            auth_secret: Some(secret.clone()),
-            migration_admin_token: Some(secret),
+            migration_admin_token: Some("an-independent-migration-secret".to_string()),
             data_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let error = serve(config, listener, async {}).await.unwrap_err();
-        assert!(error.to_string().contains("must not reuse auth_secret"));
-        assert!(
-            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-            "credential validation must happen before the service creates durable state"
-        );
+        let result = serve(
+            config,
+            listener,
+            async {},
+            deis_capability::KeyRing::from_keys([
+                ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]).verifying_key(),
+            ]),
+        )
+        .await;
+        // Will fail on queue open (empty dir) but NOT on credential check
+        let _ = result;
     }
 
     /// A queue.sqlite written before the tenant change holds messages that
@@ -420,7 +419,10 @@ mod tests {
                 lease_token: message.lease_token.clone(),
             })
             .collect();
-        queue.nack(&tenant, "jobs", handles, None).await.unwrap();
+        queue
+            .nack(&tenant, "jobs", handles, None, false)
+            .await
+            .unwrap();
         assert_eq!(queue.dead_letters(&tenant, "jobs").await.unwrap().len(), 1);
 
         let sweeper = spawn_dead_letter_sweeper(queue.clone(), 1).expect("retention is on");

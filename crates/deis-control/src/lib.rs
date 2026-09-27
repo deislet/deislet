@@ -4,6 +4,7 @@ pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 
 pub mod api;
 pub mod audit;
+pub mod capability_issuer;
 pub mod catalog;
 pub mod command;
 pub mod config;
@@ -156,7 +157,6 @@ mod tests {
         assert!(removed.is_some());
         assert_eq!(manager.count(), 0);
     }
-
 
     #[tokio::test]
     async fn test_message_handler_register() {

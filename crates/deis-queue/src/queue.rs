@@ -120,13 +120,13 @@ impl Default for QueueLimits {
         // binary actually runs on; these are for tests and for callers
         // building the service directly.
         Self {
-            max_body_bytes: 1024 * 1024,
+            max_body_bytes: 128 * 1024,
             max_batch_messages: 100,
             default_lease_secs: 30,
             max_lease_secs: 3600,
             default_pull_messages: 10,
             max_pull_messages: 100,
-            max_attempts: 5,
+            max_attempts: 3,
             dead_letter_retention_secs: 0,
             max_pull_response_bytes: MAX_PULL_RESPONSE_BYTES,
         }
@@ -757,6 +757,20 @@ impl QueueService {
     /// `delay_seconds`, unless it has used up its attempts, in which case it
     /// is dead lettered instead.
     ///
+    /// `refund_attempt` gives a delivery attempt back: attempts are counted
+    /// the moment a message is handed out, so a consumer that never actually
+    /// ran a message would otherwise burn an attempt on a delivery that did
+    /// nothing. The dead-letter decision then weighs `attempts - 1` (a
+    /// message at its ceiling is released rather than dead lettered), and the
+    /// released row's stored count is stepped back by the same amount, so
+    /// every later check of the ceiling -- at the next nack, and at pull, when
+    /// an exhausted message retires on its own lease -- agrees with the one
+    /// made here. Only the platform's own consumer may refund, when the
+    /// runtime thread was at capacity and refused the batch before the
+    /// application saw it. A consumer that failed real work must not, or a
+    /// poison message would be retried without ever being retired by the
+    /// ceiling that exists to stop it.
+    ///
     /// The lease token is checked exactly as it is in [`Self::ack`]: a
     /// consumer whose lease lapsed must not shorten, or end, the lease of
     /// whoever holds the message now.
@@ -766,6 +780,7 @@ impl QueueService {
         queue: &str,
         handles: Vec<MessageHandle>,
         delay_seconds: Option<i32>,
+        refund_attempt: bool,
     ) -> QueueResult<NackOutcome> {
         let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
@@ -808,7 +823,12 @@ impl QueueService {
                         continue;
                     }
 
-                    if attempts >= ceiling {
+                    // The attempt this delivery burned has already been
+                    // counted at the pull, so a refund takes it back before
+                    // the ceiling is weighed. Saturating keeps the check
+                    // honest for a row that somehow has no attempts.
+                    let counted = attempts.saturating_sub(i32::from(refund_attempt));
+                    if counted >= ceiling {
                         move_to_dead_letter(
                             tx,
                             &tenant_id,
@@ -821,11 +841,24 @@ impl QueueService {
                     } else {
                         // The token goes back to empty along with the
                         // visibility: the message is nobody's again, and the
-                        // handle just used cannot be used a second time.
+                        // handle just used cannot be used a second time. A
+                        // refund also steps the stored count back: the
+                        // ceiling is weighed on this column in more than one
+                        // place -- here, and at pull, where a message whose
+                        // lease lapsed at the ceiling retires on its own --
+                        // and any of them seeing the un-refunded count would
+                        // undo the refund one delivery later.
                         tx.execute(
-                            "UPDATE messages SET visible_at = ?4, lease_token = ''
+                            "UPDATE messages SET visible_at = ?4, lease_token = '', \
+                             attempts = MAX(0, attempts - ?5)
                               WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
-                            rusqlite::params![tenant_id, table_queue, handle.id, visible_at],
+                            rusqlite::params![
+                                tenant_id,
+                                table_queue,
+                                handle.id,
+                                visible_at,
+                                i32::from(refund_attempt)
+                            ],
                         )?;
                         released += 1;
                     }
@@ -2335,6 +2368,7 @@ impl Queue for QueueService {
                 &req.queue_name,
                 handles_of(req.messages),
                 Some(req.delay_seconds),
+                false,
             )
             .await?;
         Ok(Response::new(NackResponse {
@@ -2453,6 +2487,124 @@ mod tests {
 
     fn tenant(name: &str) -> TenantId {
         TenantId::parse(name).unwrap()
+    }
+
+    /// Send and Ack throughput of one producer and one consumer, measured at
+    /// both `synchronous` settings in one process, alternating rounds, so
+    /// whatever else the host is doing lands on both and the comparison is
+    /// between paired samples rather than between two moments in time.
+    ///
+    /// Ignored by default: it is a measurement, not an assertion. Run it with
+    /// `cargo nextest run -p deis-queue --run-ignored ignored-only queue_throughput`
+    /// and read the per-mode rates off stdout; the README records the result.
+    ///
+    /// `TMPDIR` must point at a real disk before running: on a tmpfs the
+    /// commit fsync is a no-op and both modes read the in-memory speed,
+    /// which makes the setting under test invisible rather than measured.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark; run with --run-ignored ignored-only to print the send/ack rate"]
+    async fn queue_throughput() {
+        const MESSAGES: usize = 2000;
+        const ROUNDS: usize = 9;
+
+        let dir = TempDir::new().unwrap();
+        // One connection, so the mode a round pins is the mode every
+        // statement of that round runs under: `with_conn` hands out the same
+        // connection every time when the pool holds exactly one.
+        let service =
+            QueueService::open_with_clock(dir.path(), 1, QueueLimits::default(), Clock::fixed(T0))
+                .await
+                .unwrap();
+        let tenant = tenant("bench.sandbox");
+
+        let mut send_rates: Vec<(&str, f64)> = Vec::new();
+        let mut ack_rates: Vec<(&str, f64)> = Vec::new();
+        for round in 0..ROUNDS {
+            for mode in ["NORMAL", "FULL"] {
+                service
+                    .pool
+                    .with_conn(move |conn| {
+                        conn.pragma_update(None, "synchronous", mode)?;
+                        conn.execute("DELETE FROM messages", [])?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+
+                let started = std::time::Instant::now();
+                for _ in 0..MESSAGES {
+                    service
+                        .send(&tenant, "bench", vec![0u8; 256])
+                        .await
+                        .unwrap();
+                }
+                let send_rate = MESSAGES as f64 / started.elapsed().as_secs_f64();
+
+                let started = std::time::Instant::now();
+                let mut acknowledged = 0usize;
+                loop {
+                    let leased = service
+                        .pull(&tenant, "bench", Some(100), None)
+                        .await
+                        .unwrap();
+                    if leased.is_empty() {
+                        break;
+                    }
+                    acknowledged += service
+                        .ack(&tenant, "bench", handles(&leased))
+                        .await
+                        .unwrap()
+                        .acknowledged;
+                }
+                let ack_rate = acknowledged as f64 / started.elapsed().as_secs_f64();
+                assert_eq!(acknowledged, MESSAGES);
+
+                println!(
+                    "queue_throughput: round {round} {mode} send {send_rate:.0}/s ack {ack_rate:.0}/s"
+                );
+                send_rates.push((mode, send_rate));
+                ack_rates.push((mode, ack_rate));
+            }
+        }
+
+        // The rate of one mode on its own moves with whatever else the host
+        // is doing, which is worth several times the difference between the
+        // two modes. So the headline is the paired ratio within each round,
+        // whose median cancels that drift, and the medians are printed beside
+        // it only to show the absolute scale.
+        for (what, rates) in [("send", &send_rates), ("ack", &ack_rates)] {
+            let mut normal = rates_in(rates, "NORMAL");
+            let mut full = rates_in(rates, "FULL");
+            let ratios = paired_ratios(&normal, &full);
+            println!(
+                "queue_throughput: {what}: NORMAL median {:.0}/s, FULL median {:.0}/s, \
+                 paired FULL/NORMAL ratios {ratios:?}",
+                median(&mut normal),
+                median(&mut full),
+            );
+        }
+    }
+
+    /// The rates one mode reached, in round order.
+    fn rates_in(rates: &[(&str, f64)], mode: &str) -> Vec<f64> {
+        rates
+            .iter()
+            .filter(|(m, _)| *m == mode)
+            .map(|(_, rate)| *rate)
+            .collect()
+    }
+
+    fn paired_ratios(normal: &[f64], full: &[f64]) -> Vec<String> {
+        normal
+            .iter()
+            .zip(full)
+            .map(|(normal, full)| format!("{:.2}", full / normal))
+            .collect()
+    }
+
+    fn median(values: &mut [f64]) -> f64 {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values[values.len() / 2]
     }
 
     fn canonical_tenant() -> TenantId {
@@ -3123,7 +3275,7 @@ mod tests {
         );
         assert_eq!(
             f.service
-                .nack(&tenant, "jobs", vec![handle(&old[1])], Some(0))
+                .nack(&tenant, "jobs", vec![handle(&old[1])], Some(0), false)
                 .await
                 .unwrap(),
             NackOutcome {
@@ -3371,7 +3523,7 @@ mod tests {
 
         let outcome = f
             .service
-            .nack(&a, "jobs", handles(&leased), Some(45))
+            .nack(&a, "jobs", handles(&leased), Some(45), false)
             .await
             .unwrap();
         assert_eq!(
@@ -3405,7 +3557,7 @@ mod tests {
         f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service
-            .nack(&a, "jobs", handles(&leased), None)
+            .nack(&a, "jobs", handles(&leased), None, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3434,7 +3586,7 @@ mod tests {
             assert_eq!(leased[0].attempts, attempt);
             let outcome = f
                 .service
-                .nack(&a, "jobs", handles(&leased), None)
+                .nack(&a, "jobs", handles(&leased), None, false)
                 .await
                 .unwrap();
             if attempt < 3 {
@@ -3471,6 +3623,140 @@ mod tests {
         // refused this body every time, so what an operator reads next is the
         // body - not the lease, which was never the problem here.
         assert_eq!(dead[0].reason, DIED_CONSUMER_FAILED);
+    }
+
+    /// A delivery that the runtime refused at capacity burned no attempt, so
+    /// refunding it at the ceiling must release the message rather than dead
+    /// letter work nothing ever ran.
+    ///
+    /// The refund buys exactly one delivery, not an exemption: the next
+    /// attempt that is nacked for real is still the last.
+    #[tokio::test]
+    async fn a_refunded_nack_releases_a_message_at_the_ceiling_and_a_plain_one_dead_letters_it() {
+        let f = fixture_with(QueueLimits {
+            max_attempts: 3,
+            ..QueueLimits::default()
+        })
+        .await;
+        let a = tenant("app-one.production");
+        let id = f
+            .service
+            .send(&a, "jobs", b"poison".to_vec())
+            .await
+            .unwrap();
+
+        // Two failures the application really had, then the delivery that
+        // reaches the ceiling -- which the runtime refuses at capacity, so
+        // its nack gives the attempt back.
+        for attempt in 1..=3 {
+            let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+            assert_eq!(leased.len(), 1, "attempt {attempt} should be delivered");
+            assert_eq!(leased[0].attempts, attempt);
+            let refund = attempt == 3;
+            let outcome = f
+                .service
+                .nack(&a, "jobs", handles(&leased), None, refund)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                NackOutcome {
+                    released: 1,
+                    dead_lettered: 0,
+                    stale_leases: 0
+                },
+                "a refund at the ceiling releases instead of dead lettering"
+            );
+        }
+
+        // Visible again, and the refund only bought one delivery: the stored
+        // count was stepped back by the refunded attempt, so this pull is the
+        // third counted one and the last.
+        let again = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id, id);
+        assert_eq!(
+            again[0].attempts, 3,
+            "the refunded attempt is not counted, so the ceiling still binds"
+        );
+
+        // Nacked without a refund, it retires the way the test above ended:
+        // the refund is one more delivery, not a new ceiling.
+        let outcome = f
+            .service
+            .nack(&a, "jobs", handles(&again), None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NackOutcome {
+                released: 0,
+                dead_lettered: 1,
+                stale_leases: 0
+            },
+            "a plain nack of the delivery the refund bought must still dead letter"
+        );
+        assert!(
+            f.service
+                .pull(&a, "jobs", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let dead = f.service.dead_letters(&a, "jobs").await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].id, id);
+        assert_eq!(dead[0].attempts, 3);
+    }
+
+    /// One below the ceiling the refund cannot change the outcome -- the
+    /// message is released either way -- but the stored count is still
+    /// stepped back, so the ceiling still binds where it is supposed to.
+    #[tokio::test]
+    async fn a_refunded_nack_below_the_ceiling_releases_the_message() {
+        let f = fixture_with(QueueLimits {
+            max_attempts: 3,
+            ..QueueLimits::default()
+        })
+        .await;
+        let a = tenant("app-one.production");
+        let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+
+        // The first failure is real, so it keeps its attempt.
+        let first = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        f.service
+            .nack(&a, "jobs", handles(&first), None, false)
+            .await
+            .unwrap();
+
+        // The second failure is an overload refusal, one below the ceiling:
+        // released, and the refunded attempt is taken back off the row.
+        let second = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        assert_eq!(second[0].attempts, 2);
+        let outcome = f
+            .service
+            .nack(&a, "jobs", handles(&second), None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NackOutcome {
+                released: 1,
+                dead_lettered: 0,
+                stale_leases: 0
+            }
+        );
+
+        // The refund did not just make the message visible: it rewound the
+        // count, so the next delivery is the second again rather than the
+        // third and final one.
+        let third = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].id, id);
+        assert_eq!(
+            third[0].attempts, 2,
+            "the refunded attempt was stepped back off the row"
+        );
     }
 
     /// The consumer never reports anything - it crashes every time. The
@@ -3576,7 +3862,7 @@ mod tests {
 
         let outcome = f
             .service
-            .nack(&a, "jobs", handles(&slow), Some(600))
+            .nack(&a, "jobs", handles(&slow), Some(600), false)
             .await
             .unwrap();
         assert_eq!(
@@ -3638,7 +3924,7 @@ mod tests {
         f.clock.advance(120);
         assert_eq!(
             f.service
-                .nack(&a, "jobs", handles(&leased), None)
+                .nack(&a, "jobs", handles(&leased), None, false)
                 .await
                 .unwrap(),
             NackOutcome {
@@ -3662,7 +3948,7 @@ mod tests {
         f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service
-            .nack(&a, "jobs", handles(&leased), None)
+            .nack(&a, "jobs", handles(&leased), None, false)
             .await
             .unwrap();
 
@@ -3700,7 +3986,9 @@ mod tests {
             Err(QueueError::InvalidArgument(_))
         ));
         assert!(matches!(
-            f.service.nack(&a, "jobs", vec![tokenless], None).await,
+            f.service
+                .nack(&a, "jobs", vec![tokenless], None, false)
+                .await,
             Err(QueueError::InvalidArgument(_))
         ));
         // Nothing was acted on, so the message is still leased to whoever
@@ -3729,7 +4017,7 @@ mod tests {
             .unwrap();
         let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service
-            .nack(&a, "jobs", handles(&leased), None)
+            .nack(&a, "jobs", handles(&leased), None, false)
             .await
             .unwrap();
 
@@ -3790,7 +4078,7 @@ mod tests {
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service
-            .nack(&a, "jobs", handles(&leased), None)
+            .nack(&a, "jobs", handles(&leased), None, false)
             .await
             .unwrap();
 
@@ -3877,7 +4165,7 @@ mod tests {
                 .unwrap();
             let leased = f.service.pull(&a, queue, None, None).await.unwrap();
             f.service
-                .nack(&a, queue, handles(&leased), None)
+                .nack(&a, queue, handles(&leased), None, false)
                 .await
                 .unwrap();
             expected.push(id);
@@ -3890,7 +4178,7 @@ mod tests {
             .unwrap();
         let theirs = f.service.pull(&other, "jobs", None, None).await.unwrap();
         f.service
-            .nack(&other, "jobs", handles(&theirs), None)
+            .nack(&other, "jobs", handles(&theirs), None, false)
             .await
             .unwrap();
 
@@ -3953,7 +4241,7 @@ mod tests {
             f.service.send(&a, "jobs", vec![b'x'; 512]).await.unwrap();
             let leased = f.service.pull(&a, "jobs", Some(1), None).await.unwrap();
             f.service
-                .nack(&a, "jobs", handles(&leased), None)
+                .nack(&a, "jobs", handles(&leased), None, false)
                 .await
                 .unwrap();
             f.clock.advance(1);
@@ -4133,7 +4421,7 @@ mod tests {
         );
         assert_eq!(
             f.service
-                .nack(&two, "jobs", vec![forged(&id)], None)
+                .nack(&two, "jobs", vec![forged(&id)], None, false)
                 .await
                 .unwrap(),
             NackOutcome::default()
@@ -4221,6 +4509,33 @@ mod tests {
         assert_eq!(
             bodies(&f.service.pull(&a, "jobs", None, None).await.unwrap()),
             vec!["one".to_string(), "two".to_string()]
+        );
+    }
+
+    /// The boundary of the shared standard's message ceiling: a message of
+    /// exactly 128 KB - the most Cloudflare Queues accepts - is stored, and
+    /// one byte more is refused with the size named. The default limits are
+    /// the ones under test, so a drift in the default and the standard shows
+    /// here.
+    #[tokio::test]
+    async fn a_message_at_the_shared_ceiling_is_kept_and_one_byte_more_is_refused() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+
+        f.service
+            .send(&a, "jobs", vec![b'x'; 128 * 1024])
+            .await
+            .expect("a message at the shared ceiling is a legal message");
+
+        let err = f
+            .service
+            .send(&a, "jobs", vec![b'x'; 129 * 1024])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QueueError::TooLarge(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("132096") && err.to_string().contains("131072"),
+            "the refusal names the size and the shared ceiling: {err}"
         );
     }
 
@@ -4364,7 +4679,7 @@ mod tests {
             Err(QueueError::TooLarge(_))
         ));
         assert!(matches!(
-            f.service.nack(&a, "jobs", named, None).await,
+            f.service.nack(&a, "jobs", named, None, false).await,
             Err(QueueError::TooLarge(_))
         ));
     }
@@ -4411,7 +4726,7 @@ mod tests {
         f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service
-            .nack(&a, "jobs", handles(&leased), None)
+            .nack(&a, "jobs", handles(&leased), None, false)
             .await
             .unwrap();
         assert_eq!(f.service.dead_letters(&a, "jobs").await.unwrap().len(), 1);
@@ -4437,7 +4752,7 @@ mod tests {
         f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service
-            .nack(&a, "jobs", handles(&leased), None)
+            .nack(&a, "jobs", handles(&leased), None, false)
             .await
             .unwrap();
 

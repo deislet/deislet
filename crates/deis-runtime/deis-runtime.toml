@@ -2,7 +2,7 @@
 #
 # Every setting below can also be given as an environment variable, whose name
 # is the TOML path with "DEIS_RUNTIME_" in front, upper-cased and joined by
-# underscores: "http_port" is DEIS_RUNTIME_HTTP_PORT, and
+# underscores: "data_listen" is DEIS_RUNTIME_DATA_LISTEN, and
 # "[default_execution_limits] timeout_ms" is
 # DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS. There are no aliases, so the
 # guess made from the TOML key always works. DEIS_RUNTIME_CONFIG, which selects
@@ -16,8 +16,11 @@
 # would ask for and report on the same assignment list.
 # node_id = "node-a"
 
-# Port serving both HTTP traffic and the gRPC management interface.
-http_port = 8000
+# Where the data port binds, as an ip:port literal. Application traffic is
+# served here over mutual TLS - a proxy proves a certificate naming it during
+# the handshake, and there is no plaintext port. `127.0.0.1` when the proxy
+# runs beside this node; `0.0.0.0` when it is in front of it on the network.
+data_listen = "127.0.0.1:8000"
 
 # Directory holding this node's SQLite database and other local state.
 data_dir = "./data"
@@ -57,6 +60,30 @@ max_request_body_bytes = 33554432
 # Must be at least 32; below that the runtime's own bootstrap exhausts the heap
 # and no application would ever run.
 default_memory_limit_mb = 256
+
+# How long work posted to an application's runtime thread may wait for it
+# before the node refuses that work, in milliseconds. One application runs on
+# one runtime thread, and a thread runs what it has been given one piece at a
+# time, so a slow invocation makes everything behind it wait. Work still queued
+# when this runs out is answered 503 with a Retry-After header instead of being
+# started: by then the caller has probably gone, and starting it would take the
+# thread away from the next request that is still waiting.
+#
+# It must be below deis-proxy's upstream_read_timeout, or the answer may be
+# written to a connection the edge has already abandoned. The edge's default is
+# 30 seconds; this node warns at startup when the budget is not below that
+# default, since it cannot read what the edge was configured with.
+#
+# Must be greater than 0; 0 refuses every request that had to wait at all,
+# which is every request that finds the thread busy.
+admission_wait_ms = 10000
+
+# How long, in whole seconds, a caller refused as overloaded is told to wait
+# before retrying: the value of the Retry-After header the node sends with
+# the refusal. A busy thread is usually free again within one invocation, so
+# the hint stays short; a longer value only makes a caller that honours it
+# come back later. Must be greater than 0.
+overload_retry_after_seconds = 1
 
 # Default execution limits applied to each app's isolate. An individual app may
 # override timeout_ms, rate_limit_ops_per_sec and cpu_time_limit_ms through its
@@ -211,21 +238,15 @@ max_pending_entries = 10000
 # runs without them until the control plane redelivers. Once contact comes back
 # it registers again, because a control plane that restarted may have forgotten
 # it.
+#
+# Everything this node asks of a control plane - registering itself, the
+# assignment list, the bundle download - is served on the control plane's
+# machine channel, configured in [machine_identity] below. A control plane of
+# this version does not serve the HTTP forms of those routes at all, so
+# endpoint without [machine_identity] is a startup error rather than a node
+# that quietly loads nothing.
 [control]
 # endpoint = "http://127.0.0.1:8080"
-
-# The control plane's machine channel is configured in [machine_identity]
-# below, address included: what this node proves and where it proves it are two
-# halves of one act, and keeping them apart let one be set without the other.
-# Registration and deregistration stay on the endpoint above either way - they
-# are still HTTP routes guarded by the fleet key, and they have not moved yet.
-
-# One of the control plane's node_preshared_keys. The assignment list carries
-# this node's decrypted secrets, so a control plane that has node keys
-# configured refuses to serve it - and the bundle download - to a caller that
-# cannot present one; without this the node gets 401 and never loads a version
-# it was assigned. It is only ever sent to the endpoint above.
-# secret = "the-same-value-as-the-control-plane-node_preshared_keys"
 
 # Seconds one assignment request may take before it is abandoned.
 request_timeout_secs = 30
@@ -242,59 +263,6 @@ retry_interval_secs = 15
 # secrets - until the process was restarted. A pass that finds nothing to change
 # does nothing and logs nothing.
 reconcile_interval_secs = 60
-
-# This node's own management plane: the gRPC the control plane drives it
-# through.
-#
-# deis.management.RuntimeManagement and deis.trigger.Trigger between them apply
-# a deployment, unload an application, list every tenant's applications and op
-# metrics, mint an inspector session for an isolate, and fire a queue or cron
-# handler. That is administrative control of this node, so every call must
-# present a node key: one of the control plane's node_preshared_keys, in
-# "authorization: Bearer <key>". The key is [control] secret above - the same
-# value this node already needs to fetch its assignments, so a node has one
-# credential and not two.
-#
-# With no key at all this plane is shut rather than open: every call is refused
-# with UNAVAILABLE naming this setting, including the health check, so the
-# control plane lists the node as unreachable. Public application traffic is
-# unaffected. The one exception is a management plane bound to a loopback
-# address, which no other host can reach: that keeps working unauthenticated,
-# with a warning at startup, the same way deis-store does on a loopback bind
-# with no auth_secret.
-[management]
-# Address this plane binds, as ip:port. Unset - the default - shares the data
-# listener on 0.0.0.0:http_port, which is the address a control plane's
-# deis_runtime_nodes entry and this node's own registration already name, so
-# nothing on either side has to be re-addressed.
-#
-# Setting it moves both gRPC services onto their own socket; the data port stops
-# carrying them and answers those paths the way it answers any request that
-# names no application, so public application traffic and administrative control
-# no longer arrive through one door.
-#
-# The node registers the new port, so a control plane that learned this node
-# from its registration follows on its own. One that has this node written down
-# in deis_runtime_nodes does not - there the file's address wins and the
-# disagreement is only logged - so move that entry to the new port in the same
-# change. A loopback address here is reachable only by a control plane on this
-# same host. A hostname is refused: whether this address is reachable from another
-# host decides whether a node with no key may serve at all, and that must not
-# depend on what DNS answers.
-# listen = "127.0.0.1:8186"
-
-# Node keys this plane accepts in addition to [control] secret. Empty, the
-# default, is the normal case: one key, in one place.
-#
-# This list is for a rotation, because a fleet cannot change a shared secret on
-# the control plane and on every node in the same instant. Add the new key here
-# on every node and restart them, so each node answers to both; put the new key
-# first in the control plane's node_preshared_keys, so it is what the control
-# plane presents while the old one still works for the pull direction; move
-# each node's [control] secret to the new value and drop the old one from here;
-# then drop the old key from the control plane. No step of that leaves a node
-# the control plane cannot drive.
-# keys = ["the-key-being-rotated-out"]
 
 # Downloaded application bundles.
 [bundles]
@@ -364,10 +332,21 @@ allow = []
 # endpoints, are unaffected. The trade is logged at warn on every start.
 proxy_from_env = false
 
-# This node's identity on the control plane's machine channel, and where that
-# channel is. Leave the whole section out - the default - and this node fetches
-# its assignments and its bundles over [control] endpoint with the shared fleet
-# key, exactly as it always has.
+# This node's identity. Required, not optional: the data port admits a caller
+# only over mutual TLS - a proxy proves a certificate naming it during the
+# handshake, and this node presents its own on every connection to the control
+# plane - so there is no plaintext fallback and no node without one. Point the
+# three paths at this node's real certificate, key and trust root.
+#
+# control_endpoint is the control plane's machine listener; without it the
+# node asks no one for assignments and runs only what is pushed to it.
+#
+# management_listen is where deis.management.RuntimeManagement and
+# deis.trigger.Trigger answer - the control plane drives this node through
+# them, over mutual TLS, on this address. Leave it out and the node has no
+# management plane, so nothing can deploy to it, unload from it or fire its
+# crons; a node driven entirely by `deis dev` beside it is the one case that
+# may.
 #
 # All of it or none of it: a certificate with nowhere to present it, and an
 # address with nothing to prove when it gets there, are both useless in a way
@@ -376,10 +355,11 @@ proxy_from_env = false
 #
 # Nothing here issues or renews these files. The three are re-read on the
 # interval below, so a renewal needs no restart.
-# [machine_identity]
-# control_endpoint = "https://127.0.0.1:8443"
-# certificate = "/etc/deislet/node.crt"
-# private_key = "/etc/deislet/node.key"
-# trust_root = "/etc/deislet/fleet-root.pem"
-# trust_domain = "deis.internal"
+[machine_identity]
+control_endpoint = "https://127.0.0.1:8443"
+# management_listen = "0.0.0.0:8187"
+certificate = "/etc/deislet/node.crt"
+private_key = "/etc/deislet/node.key"
+trust_root = "/etc/deislet/fleet-root.pem"
+trust_domain = "deis.internal"
 # identity_reload_seconds = 60

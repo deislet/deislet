@@ -85,21 +85,24 @@ impl TestCa {
     /// place, which means going around [`SpiffeId::parse`] rather than through
     /// it.
     pub fn issue_named(&self, spiffe_id: &str) -> Issued {
-        self.sign(vec![uri_san(spiffe_id)])
+        self.sign(spiffe_id, vec![uri_san(spiffe_id)])
     }
 
     /// A certificate that proves nothing about who holds it: it chains to this
     /// authority, and carries a host name where a machine name should be.
     pub fn issue_without_a_name(&self, dns_name: &str) -> Issued {
-        self.sign(vec![SanType::DnsName(
-            Ia5String::try_from(dns_name.to_string()).expect("an ia5 string"),
-        )])
+        self.sign(
+            dns_name,
+            vec![SanType::DnsName(
+                Ia5String::try_from(dns_name.to_string()).expect("an ia5 string"),
+            )],
+        )
     }
 
     /// A certificate carrying two machine names, so that "which one is it" has
     /// no answer.
     pub fn issue_with_two_names(&self, first: &str, second: &str) -> Issued {
-        self.sign(vec![uri_san(first), uri_san(second)])
+        self.sign(first, vec![uri_san(first), uri_san(second)])
     }
 
     /// A certificate naming one machine, with additional subject alternative
@@ -119,13 +122,23 @@ impl TestCa {
     pub fn issue_with_addresses(&self, spiffe_id: &SpiffeId, addresses: &[IpAddr]) -> Issued {
         let mut subject_alt_names = vec![uri_san(spiffe_id.as_str())];
         subject_alt_names.extend(addresses.iter().copied().map(SanType::IpAddress));
-        self.sign(subject_alt_names)
+        self.sign(spiffe_id.as_str(), subject_alt_names)
     }
 
-    fn sign(&self, subject_alt_names: Vec<SanType>) -> Issued {
+    fn sign(&self, holder: &str, subject_alt_names: Vec<SanType>) -> Issued {
         let key = KeyPair::generate().expect("a key pair");
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf parameters");
         params.subject_alt_names = subject_alt_names;
+        // A subject of this leaf's own, distinct from the root's. rcgen would
+        // otherwise stamp every certificate it makes - the authority included
+        // - with one shared subject, and a leaf whose subject names its issuer
+        // is indistinguishable from a self-signed one to a verifier that
+        // matches by name: openssl refuses such a leaf with UnknownCA where
+        // rustls, which reads the key identifiers, accepts it. A real
+        // authority never signs two certificates with one subject either.
+        let mut distinguished_name = rcgen::DistinguishedName::new();
+        distinguished_name.push(rcgen::DnType::CommonName, holder);
+        params.distinguished_name = distinguished_name;
         // Every process in this fleet dials some peers and accepts connections
         // from others - the control plane serves nodes and proxies but also
         // dials out to them for management calls, and a node likewise accepts

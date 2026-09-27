@@ -37,7 +37,7 @@ cargo run -p deis-control -- --config deis-control.toml
 |---|---|
 | `-c, --config <PATH>` | Configuration file. Missing file means built-in defaults. |
 | `-p, --port <PORT>` | Override the port from the configuration. |
-| `--database <PATH>` | SQLite file (default `deis-control.db`). |
+| `--database <PATH>` | SQLite file (default `<data_dir>/control.db`). Absolute, or absent. |
 
 `LOG_FORMAT=json` switches structured output; `RUST_LOG` sets the level.
 

@@ -249,7 +249,7 @@ use crate::proto::storage::{
     QueryInTransactionRequest, QueryPreparedRequest, QueryRequest, QueryResponse,
     RollbackTransactionRequest, RollbackTransactionResponse, database_server::Database,
 };
-use crate::sqlite::{self, PoolSize, PooledConnection, SqlitePool};
+use crate::sqlite::{self, Durability, PoolSize, PooledConnection, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
 use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences, WritePermit};
 use rusqlite::ffi;
@@ -1281,6 +1281,8 @@ pub struct DatabaseService {
     root: PathBuf,
     pools: Arc<Mutex<HashMap<TenantId, SqlitePool>>>,
     connections_per_tenant: usize,
+    /// The `synchronous` setting every tenant's file is opened with.
+    durability: Durability,
     statements: Arc<StatementRegistry>,
     transactions: Arc<TransactionRegistry>,
     limits: TransactionLimits,
@@ -1292,12 +1294,18 @@ impl DatabaseService {
     /// Prepare `<data_dir>/db/`. Nothing is opened until a tenant asks.
     pub fn open(data_dir: &std::path::Path, connections_per_tenant: usize) -> StoreResult<Self> {
         let fences = TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?;
-        Self::open_with_fences(data_dir, connections_per_tenant, fences)
+        Self::open_with_fences(
+            data_dir,
+            connections_per_tenant,
+            Durability::default(),
+            fences,
+        )
     }
 
     pub(crate) fn open_with_fences(
         data_dir: &std::path::Path,
         connections_per_tenant: usize,
+        durability: Durability,
         fences: TenantWriteFences,
     ) -> StoreResult<Self> {
         let root = data_dir.join("db");
@@ -1328,6 +1336,7 @@ impl DatabaseService {
             root,
             pools: Arc::new(Mutex::new(HashMap::new())),
             connections_per_tenant,
+            durability,
             statements: Arc::new(StatementRegistry::default()),
             transactions: Arc::new(TransactionRegistry::default()),
             limits: clamp_to_pool(TransactionLimits::default(), connections_per_tenant),
@@ -1447,6 +1456,7 @@ impl DatabaseService {
             format!("db:{tenant}"),
             PoolSize::new(self.connections_per_tenant),
             tenant_sql_authorizer,
+            self.durability,
         );
         pools.insert(tenant.clone(), pool.clone());
         pool
@@ -4407,9 +4417,26 @@ mod tests {
         assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
         let message = err.to_string();
         assert!(
-            message.contains("8388608") && message.contains("blob service"),
+            message.contains("2000000") && message.contains("blob service"),
             "the refusal has to name the ceiling and where such a payload belongs: {message}"
         );
+    }
+
+    /// The boundary of the shared single-value ceiling: exactly 2,000,000
+    /// bytes fits, one byte more does not. The other target draws the same
+    /// line, so an application at the boundary runs identically on both.
+    #[tokio::test]
+    async fn a_value_at_the_shared_ceiling_is_kept_and_one_byte_more_is_refused() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        svc.fetch_rows(&app, "SELECT length(randomblob(2000000)) AS n", &[])
+            .await
+            .expect("a value at the ceiling is a legal value");
+        let err = svc
+            .fetch_rows(&app, "SELECT randomblob(2000001) AS b", &[])
+            .await
+            .expect_err("one byte over the ceiling is over the ceiling");
+        assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
     }
 
     /// The same shape one layer over: `Prepare` remembers statement text
@@ -4421,16 +4448,16 @@ mod tests {
         let (_dir, svc) = service();
         let app = tenant("app-one.production");
         // The padding is a comment, so this is one ordinary `SELECT 1` that
-        // happens to weigh 70 KB - the ceiling is on the bytes, not on what
-        // they say.
-        let padded = format!("/*{}*/ SELECT 1 AS n", "x".repeat(70_000));
+        // happens to weigh just over the shared 100 KB statement ceiling - the
+        // ceiling is on the bytes, not on what they say.
+        let padded = format!("/*{}*/ SELECT 1 AS n", "x".repeat(100_500));
 
         let err = svc
             .register_statement(&app, &padded)
             .await
             .expect_err("Prepare must not remember a statement this size");
         assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
-        assert!(err.to_string().contains("65536"), "{err}");
+        assert!(err.to_string().contains("100000"), "{err}");
         assert_eq!(
             svc.statements.len(),
             0,

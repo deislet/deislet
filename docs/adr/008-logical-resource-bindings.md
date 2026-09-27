@@ -3,7 +3,7 @@
 - 状态：Accepted
 - 日期：2026-09-03
 - 决策者：产品负责人
-- 关联：`../product/phase-analysis-2026-09-03.zh.md` DEC-007
+- 关联：`../archive/phase-analysis-2026-09-03.zh.md` DEC-007
 - 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 背景
@@ -172,6 +172,39 @@ Rollback：
 - Service → Service Binding。
 - Secret → Worker secret/Secrets Store 的合适映射。
 - Wrangler/API 配置由 driver 确定性生成，禁止空 ID 留给用户。
+
+**实现状态（2026-09，T5-2）**：named binding 映射已由 binding plan 落地——`deis-build-core`
+解析 `bindings`/`queues`/`cron` 为 plan（`{kind, name, provider_resource_ref}`），Cloudflare
+适配器按 plan 生成 `[[kv_namespaces]]`/`[[d1_databases]]`/`[[r2_buckets]]`/`[[queues.producers]]`/
+`[[queues.consumers]]`/`[triggers]`/`[vars]`；`provider_resource_ref` 是占位引用
+（`deis:unresolved/<kind>/<name>`），由 provider driver 在 prepare 阶段从 deployment state
+回填，编译期不发明任何资源 ID。Service Binding（应用间调用）与 `callableBy` 在 Edge Canon
+proposal 落地前属于「未实现」，编译期报 `EC_BINDING_TARGET_UNIMPLEMENTED`。
+
+**差异处理表**。Edge Canon 不允许按厂商拆分 profile，也不允许用 warning 或 no-op
+降级：每一项差异只能「标准取交集（a）」「实现补齐（b）」或「从标准中移除（c）」。
+下表是 SQL、KV、Queue 各差异的处置与现状（数值以公开文档为准并注明核对日期）：
+
+| 资源 | 差异 | 处理 | 现状 |
+|---|---|---|---|
+| KV | 一致性：deislet 单文件强一致，Cloudflare 最终一致（跨地域传播约 60 秒） | (a) 标准只保证「写后在同一 invocation 内可读、跨 invocation 最终一致」 | deislet 强一致是超集，不改实现；conformance 不断言跨请求立即可见 |
+| KV | key 上限：deislet 1024B → Cloudflare 512B | (a) 标准取 512B | 已收紧：`deis-store` `MAX_KEY_LEN = 512`，runtime.js 同口径拒绝；512B 可用、513B 报 `InvalidArgument` |
+| KV | metadata 上限：deislet 无限制（仅受 gRPC 消息约束）→ Cloudflare 1 KiB | (a) 标准取 1 KiB | 已收紧：`MAX_METADATA_BYTES = 1024`（服务端与 runtime.js 双侧校验），1025B 编码字节拒绝 |
+| KV | TTL 下限：deislet > 0 → Cloudflare ≥ 60 秒 | (a) 标准取 60 秒 | 已收紧：`MIN_TTL_SECONDS = 60`，runtime.js 报「expirationTtl must be at least 60 seconds」 |
+| KV | list 单页：deislet 上限 10000 → Cloudflare 每页 ≤ 1000 | (a) 标准取 1000 | 已收紧：`MAX_LIST_LIMIT = 1000`，超出部分用 cursor 翻页 |
+| SQL | 交互式事务：deislet 有 `transaction()`，D1 只有原子 `batch()` | (c) 向 Edge Canon 提议标准 SQL 仅含 `prepare/bind/first/all/run/batch`；proposal 通过前编译到 Cloudflare 的应用使用 `transaction()` 报 `EC_BINDING_TARGET_UNIMPLEMENTED` | 已实现编译期拒绝；proposal 草稿见 `standards/proposals/0002-shared-limits-and-interactive-transactions.zh.md` |
+| SQL | 单值上限：deislet 8 MiB → D1 约 2,000,000 字节（developers.cloudflare.com/d1/platform/limits，核对 2026-09-25） | (a) 标准取两者较小值 | 已收紧：`TENANT_MAX_VALUE_BYTES = 2_000_000`；2,000,000 可写、2,000,001 报 `TooLarge` |
+| SQL | 单条 SQL 长度：deislet 64 KiB → D1 约 100 KB（同上核对日期） | (a) 标准取两者较大值（本项 deislet 放宽到交集外沿） | 已调整：`TENANT_MAX_SQL_BYTES = 100_000` |
+| SQL | schema 迁移：deislet 应用自执行 DDL，D1 有 migrations 目录 | (b) driver 在 activate 之前执行应用声明的迁移；标准规定迁移声明格式 | T5-3（driver）范围 |
+| Blob | 元数据/大对象/httpMetadata 差异 | (a) 标准 etag 只保证「内容变化 ⇒ etag 变化」；customMetadata/完整 httpMetadata 暂不进标准 | 未进入本轮；需要时走 proposal 后由 deislet 补齐 |
+| Queue | 投递语义：双方均为 at-least-once | 一致 | conformance 覆盖 |
+| Queue | 重试次数：deislet 默认 5 → Cloudflare `max_retries` 默认 3 | (b) 标准要求显式声明 `maxRetries`，默认 3 | 已实现：`.config.json` 消费者可声明 `maxRetries`，binding plan 总是写出显式值（缺省 3）；deis-queue 默认改为 3，双端同数 |
+| Queue | 消息大小：deislet 1 MiB → Cloudflare 128 KB（developers.cloudflare.com/queues/platform/limits，核对 2026-09-25） | (a) 标准取 128 KB | 已收紧：`max_body_bytes` 默认 131072；128 KB 可发、129 KB 报 `TooLarge` |
+| Queue | 生产端 delay：Cloudflare 有 `send({delaySeconds})`，deislet 仅 nack/replay 支持 | (b) deislet 补生产端 delay（先走 proposal 确认标准字段） | 未进入本轮；proposal 草稿已列为待决项 |
+| Queue | batch 与并发：双方 `max_batch_size` ≤ 100 | 一致 | conformance 覆盖 |
+| Queue | 死信保留：deislet 永久保留，Cloudflare 有保留期 | (a) 标准只保证「进入死信」，不保证保留时长 | 文档口径（本行）；deislet 永久保留是超集 |
+
+（Deno、EdgeOne 已冻结，只保证无状态函数，不在此表范围内。）
 
 ### EdgeOne Makers
 

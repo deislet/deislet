@@ -72,24 +72,15 @@
 //! Every request names its tenant in `x-deis-tenant`. On its own that is a
 //! claim: the header says which namespace the caller wants, and nothing in
 //! it says the caller is entitled to it. What goes with the claim is a
-//! capability token in `x-deis-storage-token`,
-//! `base64(HMAC-SHA256(auth_secret, tenant))`, minted by deis-control from a
-//! secret this service is configured with and handed to a node together with
-//! that tenant's deployment. The check derives the expected token from the
-//! tenant *the request itself claims*, so a token that leaked out of one
-//! application opens nothing for another. See [`auth`].
+//! capability token in `Authorization: Bearer <token>`, an Ed25519-signed
+//! JCS-JWT minted by deis-control and verified against the control plane's
+//! public key. The token's resources must include a (tenant, binding) pair
+//! that matches the request, so a token minted for one application opens
+//! nothing for another. See [`auth`].
 //!
-//! Two things follow, and they are deliberately different:
-//!
-//! * With no `auth_secret` and a **loopback** `listen`, the service runs as
-//!   it always has: the tenant header is believed, and what keeps one
-//!   tenant's data away from an unrelated client is only that the client
-//!   cannot reach the port. This is the default single-box install, it is
-//!   supported, and the service says exactly this at startup at `warn`.
-//! * With no `auth_secret` and any **other** address, the service refuses to
-//!   start. Reachable from another host with nothing checking the tenant
-//!   header means every tenant's data is published to that network, and an
-//!   unconfigured secret must never be able to mean that by accident.
+//! Every call must carry a valid capability token. There is no anonymous or
+//! loopback bypass. The verifying key is obtained from the control plane's
+//! well-known endpoint on startup.
 //!
 //! The health service is answered without a token: it names no tenant and
 //! reads no data, and a liveness probe that needed a tenant credential is a

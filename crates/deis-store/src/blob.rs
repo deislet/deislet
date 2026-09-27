@@ -46,7 +46,7 @@ use crate::proto::blob::{
     ListRequest, ListResponse, PreconditionFailure, PutRequest, PutResponse, RangeInfo,
     blob_store_server::BlobStore, byte_range, get_response, precondition, put_request,
 };
-use crate::sqlite::{PoolSize, SqlitePool};
+use crate::sqlite::{Durability, PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
 use crate::unix_seconds;
 // Body slice size for `Get`, and the size clients are expected to use for
@@ -58,6 +58,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -149,6 +151,11 @@ pub struct BlobService {
     /// runs. Always `None` in a real process.
     #[cfg(test)]
     dedup_pause: Option<DedupPause>,
+    /// Test-only counter of directory fsyncs this service issued, so a test
+    /// can pin that the durability calls are made. Always `None` in a real
+    /// process.
+    #[cfg(test)]
+    dir_fsyncs: Option<Arc<AtomicUsize>>,
 }
 
 impl BlobService {
@@ -160,12 +167,13 @@ impl BlobService {
         limits: BlobLimits,
     ) -> StoreResult<Self> {
         let fences = TenantWriteFences::open(data_dir.join("migration-fences.sqlite")).await?;
-        Self::open_with_fences(data_dir, connections, limits, fences).await
+        Self::open_with_fences(data_dir, connections, Durability::default(), limits, fences).await
     }
 
     pub(crate) async fn open_with_fences(
         data_dir: &Path,
         connections: usize,
+        durability: Durability,
         limits: BlobLimits,
         fences: TenantWriteFences,
     ) -> StoreResult<Self> {
@@ -179,6 +187,7 @@ impl BlobService {
             data_dir.join("blob.sqlite"),
             "blob",
             PoolSize::new(connections),
+            durability,
         );
         pool.migrate(|conn| {
             crate::legacy::reject_pre_tenant_table(conn, "blob")?;
@@ -206,6 +215,8 @@ impl BlobService {
             content_locks: ContentLocks::default(),
             #[cfg(test)]
             dedup_pause: None,
+            #[cfg(test)]
+            dir_fsyncs: None,
         };
         service.discard_incoming();
         // The orphan sweep runs after `open` returns rather than inside it:
@@ -775,7 +786,7 @@ impl BlobService {
 
         let destination = self.content_path(tenant, &sha256);
         if let Some(parent) = destination.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            self.create_dir_all_durable(parent).await?;
         }
 
         let meta = ObjectMeta {
@@ -814,6 +825,17 @@ impl BlobService {
                 // now may the temporary stop being tracked. A rename that
                 // failed leaves `temp` armed and its file is removed on drop.
                 temp.forget();
+                // The bytes were fsynced before the rename, but the name is
+                // not: until the directory that now lists this digest is
+                // fsynced, a power loss can undo the rename and leave the
+                // metadata row written just below pointing at nothing. Like
+                // the row that follows it, this belongs on the critical path;
+                // a unit test can pin only that the call happens, not that a
+                // power loss is survived.
+                if let Err(e) = self.sync_parent_of(&destination).await {
+                    remove_placed_content(tenant, &meta, &destination, &e).await;
+                    return Err(e);
+                }
                 true
             };
             match self.record(tenant, &meta, precondition.as_ref()).await {
@@ -964,6 +986,60 @@ impl BlobService {
         if let Some(pause) = self.dedup_pause.clone() {
             pause().await;
         }
+    }
+
+    /// Create `dir` and every missing ancestor, then fsync each new
+    /// directory's parent so the chain of names is durable, not just visible.
+    ///
+    /// `create_dir_all` alone leaves every entry it made recoverable-nothing:
+    /// the prefix directories the shard layout builds sit in the page cache
+    /// with the content file that is renamed into them immediately after, and
+    /// a power loss that undoes the directory entries undoes the rename with
+    /// them. Each fsync targets the parent of the directory that was just
+    /// created, which is the directory whose entry the new name is.
+    async fn create_dir_all_durable(&self, dir: &Path) -> StoreResult<()> {
+        // The ancestors that do not exist yet, collected shallowest-last; the
+        // order only decides the order of the fsyncs, and each fsync targets
+        // its own parent.
+        let mut missing = Vec::new();
+        let mut probe = dir;
+        while let Some(parent) = probe.parent() {
+            match tokio::fs::metadata(probe).await {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            missing.push(probe.to_path_buf());
+            probe = parent;
+        }
+        tokio::fs::create_dir_all(dir).await?;
+        for path in &missing {
+            self.sync_parent_of(path).await?;
+        }
+        Ok(())
+    }
+
+    /// fsync the directory that lists `path`, off the async worker threads.
+    ///
+    /// [`deis_wire::durability::sync_parent_directory`] is a plain blocking
+    /// `fsync` and can sit on the disk for milliseconds; run it in
+    /// `spawn_blocking` so a slow platter does not stall every other upload.
+    /// A failed fsync is a failed durability promise and fails the caller,
+    /// which is why this returns the error rather than only logging it.
+    async fn sync_parent_of(&self, path: &Path) -> StoreResult<()> {
+        let path = path.to_path_buf();
+        #[cfg(test)]
+        let counter = self.dir_fsyncs.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = deis_wire::durability::sync_parent_directory(&path);
+            #[cfg(test)]
+            if let Some(counter) = counter.as_ref() {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        })
+        .await??;
+        Ok(())
     }
 
     /// Upsert the metadata row, returning the digest it replaced, if any - or
@@ -3299,6 +3375,56 @@ mod tests {
             svc.store_object(&a, "", None, None, chunks(vec![])).await,
             Err(StoreError::InvalidArgument(_))
         ));
+    }
+
+    /// The durability calls a put owes the disk are made, and are not made
+    /// again when there is nothing new to make them for.
+    ///
+    /// The counted hook can pin only that the fsyncs happen on the paths that
+    /// need them: a unit test cannot cut the power and inspect what survived,
+    /// so the guarantee itself rests on `sync_all` semantics - the file's
+    /// bytes before the rename, the listing directory after it, and the
+    /// parent of every directory the shard layout had to create.
+    #[tokio::test]
+    async fn a_put_fsyncs_the_directory_entries_it_created_and_renamed() {
+        let (_dir, mut svc) = service().await;
+        let a = tenant("app-one.production");
+        let counter = Arc::new(AtomicUsize::new(0));
+        svc.dir_fsyncs = Some(Arc::clone(&counter));
+
+        // A first write into a fresh tenant creates the tenant directory, the
+        // two shard levels and the content name, and each owes a fsync: one
+        // per created directory's parent, plus one for the rename.
+        let digest = put(&svc, &a, "first", b"durable bytes").await;
+        assert!(
+            counter.load(Ordering::Relaxed) >= 2,
+            "a first write must fsync the directories it created and the rename's parent, saw {}",
+            counter.load(Ordering::Relaxed)
+        );
+
+        // The same bytes under another key take the deduplication path: the
+        // content is already on disk, so no rename and no directory is
+        // created and no fsync is owed.
+        let before = counter.load(Ordering::Relaxed);
+        put(&svc, &a, "second", b"durable bytes").await;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            before,
+            "a deduplicated write must not fsync anything: it created no directory entry"
+        );
+
+        // A write into a tenant whose shard directories already exist owes
+        // only the rename's parent fsync.
+        let other = tenant("app-two.production");
+        put(&svc, &other, "first", b"more bytes").await;
+        // (The other tenant's first write creates its own directories, so
+        // this only checks the counter moved; the exact count is covered
+        // above.)
+        assert!(counter.load(Ordering::Relaxed) > before);
+        assert_eq!(
+            svc.head(&a, "first").await.unwrap().map(|m| m.sha256),
+            Some(digest)
+        );
     }
 
     /// The interleaving that used to lose an object for good.

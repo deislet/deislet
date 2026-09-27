@@ -81,10 +81,12 @@ impl Feature {
     /// Name of the mapping emitted by Deislet's current target packager.
     pub fn target_implementation_name(&self, platform: Platform) -> Option<&'static str> {
         match (self, platform) {
-            // The old adapter writes empty D1 placeholders and no standard
-            // binding plan. A placeholder is neither a resource mapping nor a
-            // deployable artifact.
-            (Feature::SQLDatabase, Platform::Cloudflare) => None,
+            // The binding plan maps a named `database` binding onto a D1
+            // database; the wrangler.toml `database_id` is the plan's
+            // placeholder, resolved by the provider driver at prepare time.
+            (Feature::SQLDatabase, Platform::Cloudflare) => {
+                Some("D1 database mapped from the binding plan")
+            }
             // No database declaration or connection wiring is generated in
             // the Deno artifact today.
             (Feature::SQLDatabase, Platform::Deno) => None,
@@ -94,10 +96,12 @@ impl Feature {
             // manifest's logical bindings, so `context.env.<NAME>` reaches it.
             (Feature::SQLDatabase, Platform::Deislet) => Some("Per-app SQLite in deis-store"),
 
-            // No R2 declaration or binding plan is emitted by the current
-            // Cloudflare packager. Naming the vendor product here used to
-            // turn an absent implementation into apparent coverage.
-            (Feature::ObjectStorage, Platform::Cloudflare) => None,
+            // The binding plan maps a named `blob` binding onto an R2
+            // bucket; the `bucket_name` is the plan's placeholder, resolved
+            // by the provider driver at prepare time.
+            (Feature::ObjectStorage, Platform::Cloudflare) => {
+                Some("R2 bucket mapped from the binding plan")
+            }
             (Feature::ObjectStorage, Platform::Deno) => None,
             (Feature::ObjectStorage, Platform::Tencent) => None,
             // Same shape as the database: deis-store serves the blobs and
@@ -113,10 +117,11 @@ impl Feature {
             (Feature::NodeRuntime, Platform::Tencent) => Some("Node Functions"),
             (Feature::NodeRuntime, Platform::Deislet) => Some("locked Node façade in deis-runtime"),
 
-            // The products expose similarly named facilities, but these
-            // packagers do not yet emit their trigger declarations or event
-            // wrappers. Product availability is not artifact coverage.
-            (Feature::CronJobs, Platform::Cloudflare) => None,
+            // The cloudflare packager writes the project's cron expressions
+            // into `[triggers]` and exports the `scheduled` handler.
+            (Feature::CronJobs, Platform::Cloudflare) => Some("[triggers] crons"),
+            // The packagers that do not yet emit trigger declarations or
+            // event wrappers. Product availability is not artifact coverage.
             (Feature::CronJobs, Platform::Deno) => None,
             (Feature::CronJobs, Platform::Tencent) => None,
             // A bundle carries `cron`; the control plane keeps one schedule per
@@ -126,7 +131,12 @@ impl Feature {
                 Some("Scheduled by deis-control, run on one node")
             }
 
-            (Feature::Queues, Platform::Cloudflare) => None,
+            // The binding plan maps a named `queue` binding onto a queue
+            // producer and each declared consumer onto a `[[queues.consumers]]`
+            // entry; the queue is named, and the driver provisions it.
+            (Feature::Queues, Platform::Cloudflare) => {
+                Some("Cloudflare Queues producers/consumers from the binding plan")
+            }
             (Feature::Queues, Platform::Deno) => None,
             (Feature::Queues, Platform::Tencent) => None,
             // deis-queue is its own process; a declared queue binding's `send`
@@ -268,12 +278,15 @@ mod tests {
     fn cloudflare_packager_coverage_is_explicit() {
         let caps = TargetArtifactCoverage::new(Platform::Cloudflare);
 
-        // Only mappings the current packager actually writes.
-        assert!(!caps.implements(Feature::SQLDatabase));
+        // Only mappings the current packager actually writes. The four
+        // services are mapped through the binding plan; each provider
+        // identifier in the emitted wrangler.toml is the plan's placeholder,
+        // resolved by the driver at prepare time.
+        assert!(caps.implements(Feature::SQLDatabase));
         assert!(caps.implements(Feature::NodeRuntime));
-        assert!(!caps.implements(Feature::ObjectStorage));
-        assert!(!caps.implements(Feature::CronJobs));
-        assert!(!caps.implements(Feature::Queues));
+        assert!(caps.implements(Feature::ObjectStorage));
+        assert!(caps.implements(Feature::CronJobs));
+        assert!(caps.implements(Feature::Queues));
     }
 
     #[test]

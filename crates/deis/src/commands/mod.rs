@@ -10,6 +10,7 @@ pub mod dev;
 pub mod domains;
 pub mod init;
 pub mod kv;
+pub mod login;
 pub mod logs;
 pub mod provider_deployments;
 pub mod queue;
@@ -265,10 +266,10 @@ impl Session {
 
     /// Open a connection to this tenant's queues.
     ///
-    /// The credential is the same one [`Self::storage`] uses and is fetched
-    /// the same way: deis-queue checks the capability token against the same
-    /// shared secret deis-store does, so an operator who can already run
-    /// `deis kv` needs nothing further to read the dead letters.
+    /// The credential comes from the same call [`Self::storage`] makes: the
+    /// control plane mints a queue-audience capability beside the store one,
+    /// so an operator who can already run `deis kv` needs nothing further to
+    /// read the dead letters.
     ///
     /// The *address*, though, comes from the project settings rather than
     /// from the control plane, which is the one difference worth knowing:
@@ -281,7 +282,7 @@ impl Session {
         let endpoint = self.settings.queue_endpoint()?.to_string();
 
         let credentials = self.control.storage_credentials(app, environment).await?;
-        QueueSession::connect(&endpoint, &tenant, credentials.token.as_deref())
+        QueueSession::connect(&endpoint, &tenant, credentials.queue_token.as_deref())
     }
 }
 

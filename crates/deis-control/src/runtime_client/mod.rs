@@ -938,12 +938,12 @@ impl RuntimeNodeManager {
         // the socket where it proves who it is.
         let holder = {
             let nodes = self.read();
-            nodes.get(id.trim()).and_then(|entry| {
-                match (&entry.identity, &entry.machine_addr) {
+            nodes
+                .get(id.trim())
+                .and_then(|entry| match (&entry.identity, &entry.machine_addr) {
                     (Some(identity), Some(addr)) => Some((identity.clone(), addr.clone())),
                     _ => None,
-                }
-            })
+                })
         };
         self.register_claim_with(id, claim, now, |_holder_addr| async move {
             match holder {
@@ -1817,9 +1817,7 @@ impl NodeError {
     pub fn left_the_outcome_unknown(&self) -> bool {
         use tonic::Code;
         match self {
-            NodeError::UnknownNode
-            | NodeError::Transport(_)
-            | NodeError::NotReachable { .. } => {
+            NodeError::UnknownNode | NodeError::Transport(_) | NodeError::NotReachable { .. } => {
                 false
             }
             NodeError::Rpc { code, .. } => !matches!(

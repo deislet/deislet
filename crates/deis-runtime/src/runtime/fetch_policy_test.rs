@@ -40,7 +40,10 @@ mod tests {
             "http://[::ffff:127.0.0.1]:8090/",
         ] {
             match refusal(&policy(), url).await {
-                Refusal::BlockedAddress { kind, .. } => {
+                // The mapped form is refused through its transition variant,
+                // which still says which inner address and why.
+                Refusal::BlockedAddress { kind, .. }
+                | Refusal::BlockedTransitionAddress { kind, .. } => {
                     assert!(kind.contains("loopback"), "{url} was refused as {kind}");
                 }
                 other => panic!("{url} was refused as {other:?}, expected a loopback refusal"),
@@ -69,6 +72,116 @@ mod tests {
                 ),
                 other => panic!("{url} was refused as {other:?}, expected a blocked address"),
             }
+        }
+    }
+
+    /// The transition forms. An IPv6 address that carries an IPv4 address
+    /// inside it -- NAT64, 6to4 -- reaches the machine that inner address
+    /// names, so it is judged as that address, and the refusal names both
+    /// spellings.
+    #[tokio::test]
+    async fn the_transition_forms_are_judged_by_the_ipv4_they_carry() {
+        for (url, embedded, expected) in [
+            // NAT64, well-known prefix. `7f00:1` is 127.0.0.1: with a NAT64
+            // gateway on the network this *is* a call to this node's own
+            // loopback, which is exactly what the rule exists for.
+            ("http://[64:ff9b::7f00:1]/", "127.0.0.1", "loopback"),
+            ("http://[64:ff9b::a00:1]/", "10.0.0.1", "private"),
+            // NAT64, local-use prefix (RFC 8215).
+            ("http://[64:ff9b:1::7f00:1]/", "127.0.0.1", "loopback"),
+            ("http://[64:ff9b:1::a00:1]/", "10.0.0.1", "private"),
+            // 6to4: the inner address in bits 16-48.
+            ("http://[2002:7f00:1::1]/", "127.0.0.1", "loopback"),
+            ("http://[2002:a00:1::]/", "10.0.0.1", "private"),
+            // The mapped form, judged the same way.
+            ("http://[::ffff:10.0.0.1]/", "10.0.0.1", "private"),
+        ] {
+            match refusal(&policy(), url).await {
+                Refusal::BlockedTransitionAddress {
+                    embedded: found,
+                    kind,
+                    ..
+                } => {
+                    let expected_v4 = embedded.parse::<std::net::Ipv4Addr>().unwrap();
+                    assert_eq!(found, expected_v4, "{url} carries {found}, not {embedded}");
+                    assert!(
+                        kind.contains(expected),
+                        "{url} was refused as {kind}, expected something about {expected}"
+                    );
+                    // The refusal names the inner address, so whoever reads
+                    // the message sees which machine was actually refused.
+                    let text = refusal(&policy(), url).await.to_string();
+                    let literal = url
+                        .trim_start_matches("http://")
+                        .trim_end_matches('/')
+                        .trim_matches(['[', ']']);
+                    assert!(
+                        text.contains(embedded) && text.contains(literal),
+                        "the refusal must name both the literal and the inner address: {text}"
+                    );
+                }
+                other => {
+                    panic!("{url} was refused as {other:?}, expected a transition-form refusal")
+                }
+            }
+        }
+    }
+
+    /// Teredo and the discard-only range carry no address that can be judged
+    /// (Teredo's halves are obfuscated), so they are refused outright.
+    #[tokio::test]
+    async fn teredo_and_the_discard_only_range_are_refused_outright() {
+        for (url, expected) in [
+            ("http://[2001:0:5555:0:0:0:7f00:1]/", "Teredo"),
+            ("http://[100::1]/", "discard-only"),
+        ] {
+            match refusal(&policy(), url).await {
+                Refusal::BlockedAddress { kind, .. } => assert!(
+                    kind.contains(expected),
+                    "{url} was refused as {kind}, expected something about {expected}"
+                ),
+                other => panic!("{url} was refused as {other:?}, expected an outright refusal"),
+            }
+        }
+    }
+
+    /// DNS64/NAT64 is how an IPv6-only node reaches the public IPv4 internet,
+    /// so a transition form carrying a public address is the ordinary case
+    /// and must go through.
+    #[tokio::test]
+    async fn a_transition_form_carrying_a_public_ipv4_address_is_allowed() {
+        policy()
+            .check("http://[64:ff9b::808:808]/")
+            .await
+            .expect("8.8.8.8 through a NAT64 gateway is public");
+        policy()
+            .check("http://[2002:808:808::]/")
+            .await
+            .expect("8.8.8.8 through 6to4 is public");
+    }
+
+    /// `js/bootstrap.js` follows the redirect chain itself and checks every
+    /// `Location:` with the same policy. The first hop here is a destination
+    /// the operator opened; the second is a NAT64 spelling of loopback, which
+    /// must be judged by the address it carries.
+    #[tokio::test]
+    async fn a_redirect_hop_into_a_transition_form_is_refused() {
+        let policy =
+            FetchPolicy::new(["93.184.216.34"], Vec::<String>::new()).expect("the entry parses");
+        policy
+            .check("http://93.184.216.34/")
+            .await
+            .expect("the operator opened the first hop");
+
+        // The upstream answers 302 with
+        // `Location: http://[64:ff9b::7f00:1]/`, and bootstrap.js hands that
+        // URL back to the guard for the next hop.
+        match refusal(&policy, "http://[64:ff9b::7f00:1]/").await {
+            Refusal::BlockedTransitionAddress { embedded, kind, .. } => {
+                assert_eq!(embedded, "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap());
+                assert!(kind.contains("loopback"), "{kind}");
+            }
+            other => panic!("the hop was refused as {other:?}, expected a transition-form refusal"),
         }
     }
 
@@ -104,6 +217,46 @@ mod tests {
             refusal(&policy, "http://store.internal:8090/kv/get").await,
             Refusal::PlatformService
         );
+    }
+
+    /// The node's own address on a public interface (or the public address a
+    /// cloud 1:1 NAT maps onto it) is a route to the data port just like
+    /// loopback: the dispatcher trusts the `x-deis-app-id` header it is
+    /// handed, so a worker that could call the port over that address could
+    /// invoke another tenant's code on this node. The startup code enumerates
+    /// the interface addresses and takes the operator-configured
+    /// `node.advertised_addresses` on top; this holds the policy to its half
+    /// of that promise -- a platform endpoint spelled as a non-loopback
+    /// address is refused as such.
+    #[tokio::test]
+    async fn a_platform_endpoint_on_a_non_loopback_address_of_the_node_is_refused() {
+        let policy = FetchPolicy::new(
+            Vec::<String>::new(),
+            ["http://203.0.113.7:8000", "http://[2001:db8::10]:8000"],
+        )
+        .expect("the entries parse");
+
+        assert_eq!(
+            refusal(&policy, "http://203.0.113.7:8000/").await,
+            Refusal::PlatformService
+        );
+        assert_eq!(
+            refusal(&policy, "http://[2001:db8::10]:8000/").await,
+            Refusal::PlatformService
+        );
+        // ... while a neighbour at the next address is just a public host.
+        assert!(matches!(
+            refusal(&policy, "http://203.0.113.8:8000/").await,
+            Refusal::BlockedAddress { .. }
+        ));
+
+        // An entry that names a port is port-exact, like every platform
+        // entry: the generated ones carry the node's own data port, and other
+        // ports on that address are judged by the address ranges alone.
+        assert!(matches!(
+            refusal(&policy, "http://203.0.113.7:9000/").await,
+            Refusal::BlockedAddress { .. }
+        ));
     }
 
     #[tokio::test]

@@ -73,42 +73,40 @@ heartbeat_timeout = 90
 # Any CA that can mint a certificate with a URI subjectAltName will do.
 
 # ========================================
-# API authentication configuration
+# API authentication
 # ========================================
 
-# Enable HTTP API authentication (default: false)
+# Authentication is always on. Every endpoint on the human API except /health
+# requires a credential - a token minted with `deis token create` - and each
+# one is checked against the scopes it carries. /health is the only exception,
+# because it answers the constant "OK" and the orchestrator probing it has
+# nothing to present.
 #
-# Covers the dashboard and the human API: with it on, every endpoint except
-# /health requires a credential - one of the api_keys below, or a token
-# minted with `deis token create` - and each one is checked against the scopes
-# it carries. /health is the only exception, because it answers the constant
-# "OK" and the orchestrator probing it has nothing to present.
+# A control plane that starts with no live credential anywhere mints one
+# bootstrap token and writes it to <data_dir>/bootstrap.token (mode 0600). The
+# log names the file and the token id, never the value. The bootstrap token
+# can do one thing: create the first owner account and its first token, after
+# which it is revoked and the file deleted. It expires 24 hours after it was
+# minted if unused. Log in with:
 #
-# /api/metrics used to be an exception too, and is not: it hands out the
-# cluster size, the node count, the uptime and the event totals. A Prometheus
-# on another host scrapes it with a token of its own -
+#   deis login --bootstrap <data_dir>/bootstrap.token
+#
+# For a headless install you can preset your own bootstrap token instead:
+#
+#   deis-control bootstrap --token-file /secure/path/bootstrap.token
+#
+# /api/metrics is not an exception either: it hands out the cluster size, the
+# node count, the uptime and the event totals. A Prometheus on another host
+# scrapes it with a token of its own -
 #
 #   deis account create prometheus --role viewer
 #   deis token create --account prometheus --scope 'read:*/*' scrape
 #
-# - which goes in the scrape config's `authorization` block. A direct scrape
-# from this machine needs nothing while this setting is off, like any other
-# read; one relayed by a reverse proxy still presents a credential.
+# - which goes in the scrape config's `authorization` block.
 #
-# With it OFF no credential is REQUIRED, which is not the same as the human
-# API being published. A caller that presents nothing is served only over a
-# direct connection from the machine the control plane runs on. A request
-# carrying standard reverse-proxy forwarding headers is refused even when its
-# TCP peer is loopback, as is a page loaded from another origin whichever
-# machine its browser is on - see api_cors_allowed_origins below. A credential
-# that IS presented is held to its scopes whatever this setting says. The audit
-# log is written either way, attributing an unauthenticated call to "anonymous".
-#
-# It does not reach the machine channel at all: that is a different listener
-# on a different port, and what admits a caller there is a certificate, not
-# anything set here. Turning this off makes a dashboard convenient; it must
-# never be able to publish the platform's secrets.
-api_auth_enabled = true
+# A file naming a setting this build does not know - `api_keys`,
+# `api_auth_enabled`, anything retired - is refused at startup with a message
+# naming the key, rather than silently ignored.
 
 # Origins a web page may read this control plane's answers from
 # (default: none)
@@ -118,16 +116,14 @@ api_auth_enabled = true
 # vite server, so the development console is same-origin too. An entry is
 # needed only for a console hosted somewhere else.
 #
-# This used to be `*` - any origin, all methods, all headers. Combined with
-# api_auth_enabled defaulting to off, that meant any page the operator
-# happened to visit in a browser on the box could call this control plane
-# with no credential, create an owner account, mint a root token, deploy,
-# and READ every answer. `*` is therefore refused here: an origin that may
-# read the audit log has to be named.
+# This used to be `*` - any origin, all methods, all headers. That meant any
+# page the operator happened to visit in a browser on the box could call this
+# control plane, create an owner account, mint a root token, deploy, and READ
+# every answer. `*` is therefore refused here: an origin that may read the
+# audit log has to be named.
 #
-# Naming an origin is not authority. A page on another origin never gets the
-# admission that needs no credential; it presents a token like any other
-# remote caller.
+# Naming an origin is not authority. A page on another origin presents a
+# token like any other remote caller.
 #
 # Write each origin in full, with the scheme and the port, and no trailing
 # slash - that is what a browser sends, and an entry in any other shape can
@@ -135,39 +131,6 @@ api_auth_enabled = true
 #
 # api_cors_allowed_origins = ["https://console.example.com"]
 api_cors_allowed_origins = []
-
-# API Keys list
-# Clients can provide the API Key in either of the following ways:
-# 1. Authorization: Bearer <api_key>
-# 2. X-API-Key: <api_key>
-#
-# Every entry here is UNSCOPED: it may deploy any application, rotate any
-# secret, mint any tenant's storage capability token and delete anything, and
-# an audit line can only name the key rather than a person. That is what a
-# key in this list has always been, and it still is - upgrading changes
-# nothing about them.
-#
-# What to do instead, once the platform is running:
-#
-#   deis account create alice --role owner
-#   deis token create --account alice --scope 'admin:*/*' --scope 'deploy:*/*' laptop
-#   deis account create ci --role deployer
-#   deis token create --account ci --scope 'deploy:myapp/preview' preview-pipeline
-#
-# A minted token is shown once and stored only as a SHA-256, so a copy of the
-# database hands out no working credential. `deis token list` shows every
-# credential including these, marks the unscoped ones and counts them; drive
-# that count to zero by emptying this list. Removing an entry from here
-# revokes it at the next restart - this file is the authority for these keys,
-# and the database only records that they exist.
-#
-# With api_auth_enabled = true and this list empty, a first start mints one
-# owner token and prints it once, so an empty list is a way in rather than a
-# lock-out.
-api_keys = [
-    "deis-control-admin-key-1234567890abcdef",      # Admin key
-    "deis-control-readonly-key-fedcba0987654321",   # Read-only key (reserved for future use)
-]
 
 # ========================================
 # Which runtime nodes exist
@@ -235,17 +198,43 @@ api_keys = [
 
 # Directory holding uploaded application bundles: one sub-directory per
 # app, one content-addressed zip per version. This is the only copy of a
-# version's code the platform keeps, so put it on persistent storage.
+# version's code the platform keeps, so put it on persistent storage -
+# and on the same storage as the database, because a restore needs both.
 #
-# Make it absolute. A relative path is anchored to the directory the control
-# plane process was started in, which is fine until it is started from
-# somewhere else - a systemd unit, another shell, a container with a different
-# WORKDIR - and every uploaded version is suddenly somewhere the process is not
-# looking. Existing installations are repaired at startup: a version row whose
-# path was stored relative is re-anchored under whatever bundle_dir now
+# Left out, it is <data_dir>/bundles below. Give it a path elsewhere only
+# when there is a reason, and then back that path up too: the documented
+# policy covers data_dir, and a restore of it alone would find the
+# database's version rows and none of the zips they name.
+#
+# It has to be absolute. A relative path is refused at startup, because it
+# names a different directory to every process started from a different
+# working directory - and every uploaded version is then somewhere the
+# process is not looking.
+#
+# One thing is repaired at startup: a version row whose path was stored
+# relative by an earlier run is re-anchored under whatever bundle_dir now
 # resolves to, and the startup log says how many were moved and how many of
 # them have no file there.
 bundle_dir = "/var/lib/deis-control/bundles"
+
+# Directory holding this installation's own state, and the one directory a
+# backup policy has to cover (ADR-012):
+#
+#   control.db        the catalogue                            (--database)
+#   bundles/          every version's code                    (bundle_dir)
+#   keys/             the master key that decrypts what the database holds
+#   machine/          the machine channel's certificate, its key and the
+#                     trust root every node and proxy chains to
+#
+# The one-time bootstrap credential is written here on a first start too,
+# and is deliberately not part of a restore: it is a way in rather than
+# state, and a restored installation mints a fresh one by itself.
+#
+# Absolute, and for the same reason as bundle_dir. A control plane started
+# with a relative one writes its database, its bundles and its keys into
+# whatever directory it was started in, and looks perfectly healthy doing
+# it.
+data_dir = "/var/lib/deis-control"
 
 # Absolute base URL nodes use to reach this control plane. It ends up in
 # the bundle download links handed out with each assignment. Leave it unset
@@ -253,12 +242,13 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # host or reach the control plane through a proxy.
 # public_base_url = "https://control.internal:8080"
 
-# File holding the 32-byte master key that encrypts environment secrets
-# (AES-256-GCM, nonce prefixed). Either 32 raw bytes or 64 hex characters:
+# File holding the 32-byte master key that encrypts environment secrets and
+# the capability signing keys (AES-256-GCM, nonce prefixed). Either 32 raw
+# bytes or 64 hex characters:
 #   openssl rand -hex 32 > /etc/deis/secret.key && chmod 600 /etc/deis/secret.key
-# The key never enters the database and is never logged. Without it the
-# control plane still runs, but every secret endpoint answers 503 rather
-# than storing a value in the clear.
+# The key never enters the database and is never logged. Required: the
+# control plane refuses to start without it, because it cannot sign a single
+# storage or queue capability without a signing key it can keep.
 # secret_key_file = "/etc/deis/secret.key"
 
 # ========================================
@@ -325,23 +315,12 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # queue_endpoint = "http://127.0.0.1:8091"
 # telemetry_endpoint = "http://127.0.0.1:8092"
 
-# Shared secret the storage capability tokens are derived from.
-#
-# THIS MUST BE THE IDENTICAL STRING AS auth_secret ON BOTH deis-store AND
-# deis-queue. All three are one setting spelled in three files: set it here
-# and mint the wrong thing, or set it on the services and not here, and every
-# storage and queue call every application makes is refused with no hint why
-# in this file - the reason is on the *other* process's log line. Rotate it
-# by changing all three together.
-#
-# Leave it unset - the default - and no token is minted or shipped, which is
-# only safe while store_endpoint and queue_endpoint above point at services
-# that likewise have no auth_secret of their own and are bound to loopback.
-# The moment either service is configured with an auth_secret, every call
-# from every node is refused until this is set to match.
-#
-#   openssl rand -hex 32
-# storage_auth_secret = "put a long random string here"
+# There is no storage secret to configure. Calls to deis-store and deis-queue
+# carry Ed25519 capabilities this control plane signs with keys it keeps in
+# its own database, encrypted under secret_key_file above and rotated on
+# their own; the two services fetch the public keys from
+# /.well-known/deis/capability-jwks.json on this listener (their
+# capability_jwks_url setting).
 
 # Independent backend-migration administrator credentials. Each value must
 # match migration_admin_token on the corresponding service, contain at least
@@ -430,19 +409,21 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # ========================================
 
 # 1. Copy this file to deis-control.toml
-# 2. Change api_keys to secure random strings, and fill in the [machine]
-#    section with this control plane's certificate, key and trust root
-# 3. To enable the API key requirement, set api_auth_enabled = true
-# 3a. Then create accounts and scoped tokens with `deis account create` and
-#     `deis token create`, and empty api_keys - see the note above it
-# 4. Start Control: ./deis-control --config deis-control.toml
+# 2. Fill in the [machine] section with this control plane's certificate,
+#    key and trust root
+# 3. Start Control: ./deis-control --config deis-control.toml
+#    A first start writes <data_dir>/bootstrap.token; log in with
+#    `deis login --bootstrap <data_dir>/bootstrap.token`
 #
 # This is the only example configuration for deis-control, matching
 # deis-store.example.toml / deis-queue.example.toml /
 # deis-telemetry.example.toml.
 
-# Example API requests (with authentication enabled):
-# curl -H "X-API-Key: deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/sessions
+# Example API requests:
+# deis login --bootstrap data/bootstrap.token
+# deis account create alice --role owner
+# deis token create --account alice --scope 'read:*/*' scrape
+# curl -H "Authorization: Bearer <token>" http://localhost:8080/api/platform/sessions
 # or
 # curl -H "Authorization: Bearer deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/runtime
 

@@ -51,7 +51,7 @@ use deis_wire::machine::machine_channel_server::{MachineChannel, MachineChannelS
 use deis_wire::machine::{
     DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
     FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
-    RegisterNodeRequest, RegisterNodeResponse,
+    IssueCapabilityRequest, IssueCapabilityResponse, RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::transport::Endpoint;
 use tonic::Status;
@@ -120,6 +120,23 @@ impl MachineChannel for MachinePlane {
         Err(Status::unimplemented(
             "this node never asks for the routing table",
         ))
+    }
+
+    async fn fetch_secret_values(
+        &self,
+        _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
+    ) -> std::result::Result<
+        tonic::Response<deis_wire::machine::FetchSecretValuesResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("fetch_secret_values"))
+    }
+
+    async fn issue_capability(
+        &self,
+        _request: tonic::Request<IssueCapabilityRequest>,
+    ) -> std::result::Result<tonic::Response<IssueCapabilityResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("issue_capability"))
     }
 }
 
@@ -371,11 +388,8 @@ async fn a_machine_channel_without_the_rpc_is_a_permanent_answer() {
 /// to be a wrong credential and is now a connection that never authenticated.
 #[tokio::test]
 async fn a_control_plane_that_cannot_authenticate_this_node_is_a_refusal_too() {
-    let (registrar, _plane) = machine_registrar(
-        Err(Status::unauthenticated("no name was proved")),
-        Ok(true),
-    )
-    .await;
+    let (registrar, _plane) =
+        machine_registrar(Err(Status::unauthenticated("no name was proved")), Ok(true)).await;
 
     let error = registrar
         .register()

@@ -1,0 +1,22 @@
+[Unit]
+Description=Deislet platform services resource boundary
+Documentation=https://github.com/deislet/deislet
+# Every deislet service joins this slice, so the whole platform runs inside
+# one accountable share of the machine and whatever the services' own
+# MemoryMax values fail to bound - memory they allocate together - is
+# answered here. The per-service ceilings live in each unit file; the node
+# sizing behind the numbers is in docs/deploy-canary.md.
+#
+# The kernel needs a slice with DefaultDependencies=no only if it must exist
+# before anything on the machine starts; these services all come up after
+# basic.target, so the defaults are right and this file stays a boundary,
+# not a boot dependency.
+
+[Slice]
+# The platform's process ceiling. Each service also sets its own TasksMax;
+# this bounds the sum. Runtime threads dominate the count (one per
+# application plus pool reserves); see docs/deploy-canary.md for sizing.
+TasksMax=512
+# A middle weight: the runtime's isolate threads do latency-sensitive work,
+# but this slice must not starve the host's own agent stack either.
+CPUWeight=100

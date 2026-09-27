@@ -1,24 +1,8 @@
 //! Operator-facing configuration.
 //!
-//! # `listen` and `auth_secret` are one decision, not two
-//!
-//! Whether a caller is authenticated at all is decided by `auth_secret`, and
-//! what happens when it is absent depends on `listen`:
-//!
-//! * `auth_secret` set: every call must carry a capability token for the
-//!   tenant it names, wherever the service is bound. See [`crate::auth`].
-//! * No `auth_secret`, loopback `listen`: the service runs exactly as it did
-//!   before tokens existed - the tenant header is believed, and what keeps
-//!   one tenant's messages away from an unrelated client is that the client
-//!   cannot reach the port. This is the default single-box install and it is
-//!   supported; the service says so at startup, at `warn`.
-//! * No `auth_secret`, any other `listen`: the service refuses to start.
-//!   Reachable from another host with nothing checking the tenant header is
-//!   every tenant's queue published to that network, and an unconfigured
-//!   secret must not be able to mean that by accident.
-//!
-//! The value is the same one deis-store is configured with: one secret, one
-//! token per tenant, both services.
+//! Every call must carry an Ed25519-signed capability token in
+//! `Authorization: Bearer <token>`. The verifying keys are fetched from the
+//! control plane's JWKS at `capability_jwks_url` and kept current.
 
 use crate::queue::QueueLimits;
 use serde::Deserialize;
@@ -33,27 +17,29 @@ use std::time::Duration;
 pub struct Config {
     /// Address the gRPC server binds to.
     ///
-    /// Loopback by default, because the default install configures no
-    /// `auth_secret` and then the only thing keeping one tenant's messages
-    /// away from an unrelated client is that the client cannot reach the
-    /// port. Binding anywhere else without an `auth_secret` is refused at
-    /// startup rather than warned about; see the module docs.
+    /// Loopback by default. Every call must carry a valid capability token
+    /// regardless of the bind address; there is no anonymous or loopback
+    /// bypass.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Shared secret the per-tenant capability tokens are derived from, or
-    /// `None` to run with no caller authentication at all.
+    /// Where the control plane publishes its capability verifying keys, as a
+    /// JWKS document.
     ///
-    /// The same value must be configured on deis-store and on deis-control,
-    /// which mints `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant
-    /// and hands it to the node running that tenant. Anything that reaches
-    /// this service without a token matching the tenant it names is refused.
-    /// Rotating the value invalidates every token at once, so change it here,
-    /// on deis-store and on deis-control together.
+    /// Fetched at startup (retried with backoff until the control plane
+    /// answers, refusing every call meanwhile), every 5 minutes after that,
+    /// and whenever a token names a key this process does not hold yet - so
+    /// a control-plane key rotation needs nothing done here. Public keys
+    /// only: no credential is sent or needed.
     ///
-    /// `None` is only permitted on a loopback bind - [`crate::auth`] has the
-    /// reasoning and the refusal.
-    #[serde(default)]
-    pub auth_secret: Option<String>,
+    /// Defaults to the control plane's human API listener on its default
+    /// port.
+    #[serde(default = "default_capability_jwks_url")]
+    pub capability_jwks_url: String,
+    /// The control-plane URL for the T8 revocation-list endpoint.
+    ///
+    /// Defaults to `http://127.0.0.1:8100`.
+    #[serde(default = "default_revocation_list_url")]
+    pub revocation_list_url: String,
     /// Independent credential for migration inventory and writer fencing.
     /// If absent, the management gRPC service does not exist; there is no
     /// loopback bypass and this must not reuse the application data secret.
@@ -96,6 +82,13 @@ pub struct Config {
     /// on a timer would quietly destroy the evidence of why a queue failed.
     /// The cost of the default is that the table grows until an operator
     /// prunes it.
+    ///
+    /// Note what the standard guarantees and what it does not: a message
+    /// that exhausts its deliveries enters the dead-letter table, and that is
+    /// all the standard says. How long it is kept afterwards is this
+    /// deployment's choice - the other target keeps dead letters on a
+    /// retention clock, so nothing an application does may depend on a
+    /// dead letter outliving this host's own retention policy.
     #[serde(default = "default_dead_letter_retention_secs")]
     pub dead_letter_retention_secs: i64,
     /// How often expired dead letters are deleted. Only consulted when
@@ -125,8 +118,13 @@ fn default_connections() -> usize {
 
 /// A queue message is a job description, not a payload: anything large
 /// belongs in blob storage with its key sent through the queue.
+///
+/// 128 KB, the shared standard's message ceiling: Cloudflare Queues refuses
+/// a message over 128 KB (developers.cloudflare.com/queues/platform/limits,
+/// checked 2026-09-25), so a larger one would be a message an application
+/// could send on this host and never on the other.
 fn default_max_body_bytes() -> usize {
-    1024 * 1024
+    128 * 1024
 }
 
 fn default_max_batch_messages() -> usize {
@@ -151,9 +149,13 @@ fn default_max_pull_messages() -> i32 {
     100
 }
 
-/// The ceiling the implementation plan names.
+/// The shared standard's delivery count, and also the number a queue
+/// consumer's declaration carries by default: Cloudflare Queues retries a
+/// message 3 times before dead-lettering it (developers.cloudflare.com/queues,
+/// checked 2026-09-25), so a message fails onto the dead-letter table the
+/// same number of deliveries in on both hosts.
 fn default_max_attempts() -> i32 {
-    5
+    3
 }
 
 fn default_dead_letter_retention_secs() -> i64 {
@@ -168,11 +170,20 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
+fn default_capability_jwks_url() -> String {
+    "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json".to_string()
+}
+
+fn default_revocation_list_url() -> String {
+    "http://127.0.0.1:8100".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
-            auth_secret: None,
+            capability_jwks_url: default_capability_jwks_url(),
+            revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             data_dir: default_data_dir(),
             connections: default_connections(),
@@ -239,7 +250,7 @@ mod tests {
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
         assert_eq!(parsed.listen, defaults.listen);
-        assert_eq!(parsed.auth_secret, defaults.auth_secret);
+        assert_eq!(parsed.capability_jwks_url, defaults.capability_jwks_url);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.connections, defaults.connections);
@@ -268,17 +279,26 @@ mod tests {
 
     #[test]
     fn the_default_address_is_loopback() {
-        // With no auth_secret - which is the default - the tenant header is
-        // believed, so reachability is the only thing keeping an unrelated
-        // client away from a tenant's messages. Anything else is refused at
-        // startup rather than served, so this default is load-bearing.
+        // Every call must carry a valid capability token regardless of the
+        // bind address. The default is loopback as a defence-in-depth
+        // measure.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
     }
 
     #[test]
-    fn the_attempt_ceiling_defaults_to_five() {
-        assert_eq!(Config::default().max_attempts, 5);
+    fn the_attempt_ceiling_matches_the_shared_standard() {
+        // 3, Cloudflare Queues' retry count too (checked 2026-09-25): a
+        // message fails onto the dead-letter table the same number of
+        // deliveries in on both hosts, and a queue consumer's declaration
+        // states the same default.
+        assert_eq!(Config::default().max_attempts, 3);
+    }
+
+    #[test]
+    fn the_message_ceiling_matches_the_shared_standard() {
+        // 128 KB, the largest message every host accepts.
+        assert_eq!(Config::default().max_body_bytes, 128 * 1024);
     }
 
     #[test]
@@ -320,19 +340,24 @@ mod tests {
     }
 
     #[test]
-    fn the_secret_is_read_from_a_file() {
+    fn the_jwks_url_is_read_from_a_file() {
         let parsed: Config = toml::from_str(
-            "auth_secret = \"a-shared-secret\"\nmigration_admin_token = \"an-independent-migration-secret\"",
+            "capability_jwks_url = \"https://control.internal/.well-known/deis/capability-jwks.json\"\nmigration_admin_token = \"an-independent-migration-secret\"",
         )
         .unwrap();
-        assert_eq!(parsed.auth_secret.as_deref(), Some("a-shared-secret"));
+        assert_eq!(
+            parsed.capability_jwks_url,
+            "https://control.internal/.well-known/deis/capability-jwks.json"
+        );
         assert_eq!(
             parsed.migration_admin_token.as_deref(),
             Some("an-independent-migration-secret")
         );
-        // Unset by default, which is what makes the loopback install work
-        // with no configuration at all.
-        assert_eq!(Config::default().auth_secret, None);
+        // The control plane on this host by default.
+        assert_eq!(
+            Config::default().capability_jwks_url,
+            "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
+        );
     }
 
     #[test]

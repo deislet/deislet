@@ -5,6 +5,7 @@
 //! adding another; see the module comment in [`super`] for why the table is
 //! polled at all.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,23 +13,36 @@ use async_trait::async_trait;
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::CatalogClient;
+use super::persist::RoutingTableCache;
+use super::wire::RoutingTableDocument;
 use crate::config::ConfigManager;
 
 pub struct CatalogPoller {
     client: CatalogClient,
     config: Arc<ConfigManager>,
     interval: Duration,
+    /// The file every published table is kept in, or nothing when the caller
+    /// asked for none. A real configuration always names a path
+    /// ([`crate::SystemConfig::routing_cache_path`]); a test that is about
+    /// the poll and not about the file leaves it out.
+    cache: Option<RoutingTableCache>,
 }
 
 impl CatalogPoller {
-    pub fn new(client: CatalogClient, config: Arc<ConfigManager>, interval: Duration) -> Self {
+    pub fn new(
+        client: CatalogClient,
+        config: Arc<ConfigManager>,
+        interval: Duration,
+        cache_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             client,
             config,
             interval,
+            cache: cache_path.map(RoutingTableCache::new),
         }
     }
 
@@ -52,6 +66,7 @@ impl CatalogPoller {
                 }
                 self.config.apply_routing_table(&document);
                 self.client.observe_routing_table(document.version.clone());
+                self.persist(&document);
                 0
             }
             Err(e) => {
@@ -86,6 +101,55 @@ impl CatalogPoller {
             }
         }
     }
+
+    /// Put the table this instance last published back in force.
+    ///
+    /// Called once before the first poll, which is what a proxy restarted
+    /// while the control plane is unreachable has instead of a fetch: without
+    /// it, a restart an hour into an outage would leave every route created
+    /// through the control plane unroutable until the control plane came
+    /// back. The file is not trusted over a live answer - the first
+    /// successful poll replaces the table and the file together.
+    fn restore_persisted_table(&self) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let Some(stored) = cache.load() else {
+            return;
+        };
+        self.config.apply_routing_table(&stored.document);
+        info!(
+            path = %cache.path().display(),
+            generation = stored.generation,
+            version = %stored.document.version,
+            built_at = stored.document.generated_at,
+            written_at = stored.written_at,
+            routes = stored.document.routes.len(),
+            environments = stored.document.environments.len(),
+            "the routing table this instance last published was loaded from disk and is in force; \
+             a control plane that does not answer leaves it routing, and the next successful poll \
+             replaces it"
+        );
+    }
+
+    /// Keep the table just published for the next start.
+    ///
+    /// A failure is logged and otherwise ignored: routing is unaffected, and
+    /// the only thing lost is the case this exists for - a restart before
+    /// the control plane answers again.
+    fn persist(&self, document: &RoutingTableDocument) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        if let Err(error) = cache.persist(document) {
+            warn!(
+                path = %cache.path().display(),
+                %error,
+                "the routing table could not be persisted; a restart before the control plane \
+                 answers again would leave every route it created unroutable"
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -112,6 +176,8 @@ impl BackgroundService for CatalogPoller {
         // poll that took longer than the interval must not be followed by a
         // burst of catch-up polls at a control plane that is already slow.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        self.restore_persisted_table();
 
         let mut failures: u64 = 0;
         loop {
@@ -140,6 +206,7 @@ mod tests {
     use super::*;
     use crate::catalog::CatalogClient;
     use crate::catalog::mock::{Answer, MockControl};
+    use crate::catalog::persist::RoutingTableCache;
     use crate::config::system::RoutingConfig;
     use crate::config::{ConfigManager, SystemConfig};
 
@@ -162,8 +229,13 @@ mod tests {
     /// A poller dialling `control` as the proxy `edge-1`, over the same
     /// mutual TLS handshake a real proxy's machine channel uses: a
     /// certificate `control` minted from its own root, naming this proxy and
-    /// nothing else.
-    fn poller(control: &MockControl, config: Arc<ConfigManager>) -> CatalogPoller {
+    /// nothing else. `cache_path` is where it keeps the tables it publishes,
+    /// or nothing when the test is about the poll and not about the file.
+    fn poller(
+        control: &MockControl,
+        config: Arc<ConfigManager>,
+        cache_path: Option<PathBuf>,
+    ) -> CatalogPoller {
         CatalogPoller::new(
             CatalogClient::over_machine_channel(
                 control.addr.clone(),
@@ -175,6 +247,7 @@ mod tests {
             .with_proxy_id("edge-1".to_string()),
             config,
             Duration::from_secs(5),
+            cache_path,
         )
     }
 
@@ -189,7 +262,7 @@ mod tests {
     async fn a_route_created_in_the_control_plane_reaches_the_data_plane() {
         let control = MockControl::start(Answer::Ok(V2.to_string())).await;
         let config = config_manager().await;
-        let poller = poller(&control, Arc::clone(&config));
+        let poller = poller(&control, Arc::clone(&config), None);
 
         assert_eq!(poller.poll_once(0).await, 0);
         assert_eq!(
@@ -223,8 +296,9 @@ mod tests {
                 1024 * 1024,
             )
             .with_proxy_id("proxy-a".to_string()),
-            config,
+            Arc::clone(&config),
             Duration::from_secs(5),
+            None,
         );
 
         assert_eq!(poller.poll_once(0).await, 0);
@@ -238,17 +312,14 @@ mod tests {
         );
 
         assert_eq!(poller.poll_once(0).await, 0);
-        assert_eq!(
-            control.last_request().observed_routing_table_version,
-            "v1"
-        );
+        assert_eq!(control.last_request().observed_routing_table_version, "v1");
     }
 
     #[tokio::test]
     async fn an_unreachable_control_plane_leaves_the_last_table_in_force() {
         let mut control = MockControl::start(Answer::Ok(V1.to_string())).await;
         let config = config_manager().await;
-        let poller = poller(&control, Arc::clone(&config));
+        let poller = poller(&control, Arc::clone(&config), None);
         assert_eq!(poller.poll_once(0).await, 0);
         assert_eq!(
             app_for(&config, "shop.test", "/").as_deref(),
@@ -276,7 +347,7 @@ mod tests {
     async fn a_table_cut_short_is_refused_whole() {
         let control = MockControl::start(Answer::Ok(V1.to_string())).await;
         let config = config_manager().await;
-        let poller = poller(&control, Arc::clone(&config));
+        let poller = poller(&control, Arc::clone(&config), None);
         poller.poll_once(0).await;
 
         // The second answer's routing table document is cut off partway
@@ -296,7 +367,7 @@ mod tests {
     async fn one_unusable_entry_refuses_the_whole_table() {
         let control = MockControl::start(Answer::Ok(V1.to_string())).await;
         let config = config_manager().await;
-        let poller = poller(&control, Arc::clone(&config));
+        let poller = poller(&control, Arc::clone(&config), None);
         poller.poll_once(0).await;
 
         // The first entry is perfectly good; the second is not. Neither is
@@ -325,7 +396,7 @@ mod tests {
         // a table under a name its connection did not prove.
         let control = MockControl::start(Answer::Ok(V1.to_string())).await;
         let config = config_manager().await;
-        let poller = poller(&control, Arc::clone(&config));
+        let poller = poller(&control, Arc::clone(&config), None);
         poller.poll_once(0).await;
 
         control.answer(Answer::Denied(
@@ -354,6 +425,7 @@ mod tests {
             ),
             Arc::clone(&config),
             Duration::from_secs(5),
+            None,
         );
         assert_eq!(poller.poll_once(0).await, 1);
         assert!(config.catalog_routes().version().is_empty());
@@ -363,7 +435,104 @@ mod tests {
     async fn the_failure_count_resets_once_the_control_plane_answers() {
         let control = MockControl::start(Answer::Ok(V1.to_string())).await;
         let config = config_manager().await;
-        let poller = poller(&control, Arc::clone(&config));
+        let poller = poller(&control, Arc::clone(&config), None);
         assert_eq!(poller.poll_once(4).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_restart_during_a_control_plane_outage_keeps_routing() {
+        // The case the persisted copy exists for: the control plane is down
+        // and the edge comes back up, so nothing can be fetched and what it
+        // routes on is what it wrote before it stopped.
+        let mut control = MockControl::start(Answer::Ok(V1.to_string())).await;
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("routing-table.json");
+
+        let before = config_manager().await;
+        let first = poller(&control, Arc::clone(&before), Some(path.clone()));
+        assert_eq!(first.poll_once(0).await, 0);
+        assert_eq!(before.catalog_routes().version(), "v1");
+        drop(first);
+
+        control.stop().await;
+
+        // A new process: a manager with nothing in force, a poller, and the
+        // same file. What `start` does first is load it.
+        let after = config_manager().await;
+        assert!(after.catalog_routes().version().is_empty());
+        let restarted = poller(&control, Arc::clone(&after), Some(path));
+        restarted.restore_persisted_table();
+        assert_eq!(after.catalog_routes().version(), "v1");
+        assert_eq!(
+            app_for(&after, "shop.test", "/").as_deref(),
+            Some("shop/production")
+        );
+
+        // And the failures that follow - every poll for as long as the
+        // control plane is down - change nothing about that.
+        assert_eq!(restarted.poll_once(0).await, 1);
+        assert_eq!(
+            app_for(&after, "shop.test", "/").as_deref(),
+            Some("shop/production")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_table_replaces_the_one_on_disk() {
+        // The stored copy is never a second source of truth: a poll that
+        // brings a newer table is in force immediately and on disk a moment
+        // later, so a restart an hour afterwards starts from the newest table
+        // rather than from whichever one the file happened to hold.
+        let control = MockControl::start(Answer::Ok(V1.to_string())).await;
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("routing-table.json");
+        let config = config_manager().await;
+        let polling = poller(&control, Arc::clone(&config), Some(path.clone()));
+        assert_eq!(polling.poll_once(0).await, 0);
+
+        control.answer(Answer::Ok(V2.to_string()));
+        assert_eq!(polling.poll_once(0).await, 0);
+        assert_eq!(config.catalog_routes().version(), "v2");
+
+        let stored = RoutingTableCache::new(path)
+            .load()
+            .expect("the table just polled");
+        assert_eq!(stored.document.version, "v2");
+        assert_eq!(stored.document.routes.len(), 2);
+        assert_eq!(
+            stored.generation, 2,
+            "the second table this instance published is the second write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_persisted_table_starts_empty_and_the_poll_still_works() {
+        let control = MockControl::start(Answer::Ok(V1.to_string())).await;
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("routing-table.json");
+        std::fs::write(&path, b"{ this is not a routing table").expect("a corrupt file");
+
+        let config = config_manager().await;
+        let polling = poller(&control, Arc::clone(&config), Some(path.clone()));
+        polling.restore_persisted_table();
+        assert!(
+            config.catalog_routes().version().is_empty(),
+            "a file that cannot be read is not a routing table"
+        );
+
+        assert_eq!(polling.poll_once(0).await, 0);
+        assert_eq!(
+            app_for(&config, "shop.test", "/").as_deref(),
+            Some("shop/production")
+        );
+        assert_eq!(
+            RoutingTableCache::new(path)
+                .load()
+                .expect("a table")
+                .document
+                .version,
+            "v1",
+            "the live answer is what ends up on disk"
+        );
     }
 }

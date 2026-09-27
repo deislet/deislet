@@ -65,7 +65,6 @@ use std::net::SocketAddr;
 
 use deis_identity::SpiffeId;
 
-
 /// What guards this node's management plane.
 #[derive(Clone)]
 enum Guard {
@@ -139,4 +138,3 @@ impl std::fmt::Debug for ManagementAuth {
             .finish()
     }
 }
-

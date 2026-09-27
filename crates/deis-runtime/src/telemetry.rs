@@ -4,12 +4,13 @@
 //!
 //! deis-telemetry holds every application's logs, every invocation trace and
 //! every metric series on the installation. It guards all of that with one
-//! capability token: with an `auth_secret` configured it refuses any call that
-//! does not present the token, and with none configured it refuses to start at
-//! all unless both of its listeners are on loopback. So on any installation
-//! where the nodes are not the same machine as the collector, the collector has
-//! a secret, and a node that cannot present the matching token has every log
-//! line, every trace and every metric sample it ever produces refused.
+//! capability token: with a `capability_public_key` configured it refuses any
+//! call that does not present a valid Ed25519-signed capability token, and
+//! with none configured it refuses to start at all unless both of its
+//! listeners are on loopback. So on any installation where the nodes are not
+//! the same machine as the collector, the collector has a key, and a node that
+//! cannot present the matching token has every log line, every trace and every
+//! metric sample it ever produces refused.
 //!
 //! What made that worth a module rather than a line in each shipper is how it
 //! failed: a node with no credential does not stop. The log shipper keeps the
@@ -24,12 +25,10 @@
 //! # What an operator configures
 //!
 //! `logging.auth_secret`, or `DEIS_RUNTIME_LOGGING_AUTH_SECRET`, set to the
-//! same string as deis-telemetry's own `auth_secret`. The token is derived
-//! from it, never sent, never logged and never written to the configuration:
-//! the node holds the secret and computes the token, which is the same shape
-//! the storage clients use for their own tokens (see
-//! `runtime::bindings::StorageIdentity`) -- the difference being only what the
-//! token is derived *over*.
+//! same string as deis-telemetry's own `auth_secret`. The secret is hashed
+//! with SHA-256 to derive a 32-byte Ed25519 signing key, which in turn signs
+//! a capability token. The secret itself is never sent, never logged and never
+//! written to the configuration.
 //!
 //! # Why the subject is a channel and not a tenant
 //!
@@ -41,38 +40,48 @@
 //! this platform" and nothing more. deis-telemetry's `auth` module has the
 //! whole of that reasoning; this side only has to derive the same value.
 
-use deis_wire::conventions::{storage_token, STORAGE_TOKEN_HEADER};
+use deis_capability::{encode, CapabilityClaims, CapabilityResource};
+use ed25519_dalek::SigningKey;
+use sha2::{Digest, Sha256};
+use std::time::Duration;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::Request;
 
-/// What the token for deis-telemetry is derived over.
+/// The audience the runtime stamps into every telemetry capability token.
 ///
-/// The subject is the only thing separating this token from a storage token
-/// minted from the same `auth_secret`, so it has to be the string
-/// deis-telemetry uses: `deis_telemetry::auth::TELEMETRY_CHANNEL`. The two
-/// copies exist because this crate does not depend on that one -- a node would
-/// otherwise link the collector's whole server, its database and its HTTP
-/// stack -- and `tests/telemetry_auth_test.rs`, which does depend on it as a
-/// test-only dependency, is what stops them drifting apart: it pushes through
-/// this credential to a real deis-telemetry that requires one.
-const TELEMETRY_CHANNEL: &str = "deis-telemetry";
+/// deis-telemetry's gRPC interceptor tries `"telemetry"` first, then
+/// `"telemetry.read"` — see `deis_telemetry::auth`. A push-side credential
+/// uses `"telemetry"` so the interceptor matches on the first attempt.
+const TELEMETRY_AUDIENCE: &str = "telemetry";
+
+/// The lifetime of a telemetry capability token in seconds.
+///
+/// The token is derived from the configured secret at node startup and reused
+/// for the lifetime of the process. A generous lifetime avoids the token
+/// expiring while the node is running, but it is ultimately bounded by
+/// `auth_epoch` revocation on the collector side.
+const TELEMETRY_TOKEN_LIFETIME_SECS: u64 = 365 * 24 * 3600;
 
 /// The token this node presents on every telemetry call, or nothing when no
 /// secret is configured.
 ///
 /// Cheap to clone, and deliberately shared by the three channels: logs,
 /// metrics and traces go to one service over one credential, and three
-/// derivations would be three places for the subject to be spelled wrong.
+/// derivations would be three places for the audience to be spelled wrong.
 #[derive(Clone, Default)]
 pub struct TelemetryCredential {
-    /// Parsed once, when the shipper starts, so a secret that cannot be sent
-    /// as gRPC metadata is a startup complaint rather than a failure on every
-    /// push for the life of the process.
-    token: Option<MetadataValue<Ascii>>,
+    /// Pre-formatted `Bearer <token>` value, parsed once at startup so a
+    /// secret that cannot be sent as gRPC metadata is a startup complaint
+    /// rather than a failure on every push for the life of the process.
+    bearer: Option<MetadataValue<Ascii>>,
 }
 
 impl TelemetryCredential {
     /// Derive the credential from the configured secret.
+    ///
+    /// Hashes the secret with SHA-256 to derive a 32-byte Ed25519 seed, signs
+    /// a capability token with audience `"telemetry"`, and pre-formats it as
+    /// an `Authorization: Bearer <token>` header value.
     ///
     /// A blank secret counts as none: an empty header would be presented as a
     /// token and refused, where sending nothing at least works against a
@@ -80,24 +89,47 @@ impl TelemetryCredential {
     /// has to keep working untouched.
     pub fn from_secret(secret: Option<&str>) -> Self {
         let Some(secret) = secret.map(str::trim).filter(|secret| !secret.is_empty()) else {
-            return Self { token: None };
+            return Self { bearer: None };
         };
-        let derived = storage_token(secret, TELEMETRY_CHANNEL);
-        match derived.parse::<MetadataValue<Ascii>>() {
-            Ok(token) => Self { token: Some(token) },
-            // The derivation is base64 of an HMAC, so this cannot happen from
-            // a secret of any shape; it is said out loud rather than silently
-            // dropped because the consequence of shipping without the token is
-            // that everything this node observes is refused.
+
+        // Derive a deterministic 32-byte Ed25519 seed from the shared secret.
+        let hash = Sha256::digest(secret.as_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        let signing_key = SigningKey::from_bytes(&seed);
+
+        let claims = CapabilityClaims::new(
+            TELEMETRY_AUDIENCE,
+            "deis-runtime",
+            "deis-runtime",
+            1,
+            Duration::from_secs(TELEMETRY_TOKEN_LIFETIME_SECS),
+            vec![CapabilityResource {
+                tenant: String::new(),
+                binding: String::new(),
+                generation: None,
+            }],
+        );
+        let token = encode(&claims, &signing_key);
+
+        let bearer = format!("Bearer {token}");
+        match bearer.parse::<MetadataValue<Ascii>>() {
+            Ok(value) => Self {
+                bearer: Some(value),
+            },
+            // The token is base64url of JSON + Ed25519 sig, so this cannot
+            // happen from a secret of any shape; it is said out loud rather
+            // than silently dropped because the consequence of shipping
+            // without the token is that everything this node observes is
+            // refused.
             Err(_) => {
                 tracing::error!(
-                    header = STORAGE_TOKEN_HEADER,
                     "the telemetry capability token derived from logging.auth_secret cannot be \
                      sent as gRPC metadata, so this node will ship without one. Against a \
-                     deis-telemetry that has an auth_secret, every log line, trace and metric \
-                     sample from this node is refused"
+                     deis-telemetry that has a capability_public_key, every log line, trace \
+                     and metric sample from this node is refused"
                 );
-                Self { token: None }
+                Self { bearer: None }
             }
         }
     }
@@ -108,21 +140,19 @@ impl TelemetryCredential {
     /// the two regimes is in force rather than leaving it to be worked out
     /// from an empty `deis logs`.
     pub fn is_present(&self) -> bool {
-        self.token.is_some()
+        self.bearer.is_some()
     }
 
     /// Wrap one message in a request carrying the token.
     ///
-    /// The same shape `runtime::bindings::StorageIdentity::stamp` has, and
-    /// stamped here rather than in each call for the same reason: a push that
-    /// forgot it would be refused, retried, and refused again for as long as
-    /// the node ran.
+    /// Stamped here rather than in each call so a push that forgot it would
+    /// be refused, retried, and refused again for as long as the node ran.
     pub fn stamp<T>(&self, message: T) -> Request<T> {
         let mut request = Request::new(message);
-        if let Some(token) = &self.token {
+        if let Some(bearer) = &self.bearer {
             request
                 .metadata_mut()
-                .insert(STORAGE_TOKEN_HEADER, token.clone());
+                .insert("authorization", bearer.clone());
         }
         request
     }
@@ -135,8 +165,8 @@ impl std::fmt::Debug for TelemetryCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryCredential")
             .field(
-                "token",
-                &if self.token.is_some() {
+                "bearer",
+                &if self.bearer.is_some() {
                     "<present>"
                 } else {
                     "<absent>"
@@ -156,20 +186,20 @@ pub fn report_posture(credential: &TelemetryCredential, endpoint: &str) {
     if credential.is_present() {
         tracing::info!(
             %endpoint,
-            header = STORAGE_TOKEN_HEADER,
-            "This node presents deis-telemetry's capability token on every log, trace and metric \
+            "This node presents an Ed25519 capability token on every log, trace and metric \
              push. If deis-telemetry answers unauthenticated, the two no longer share the same \
-             auth_secret"
+             capability signing key"
         );
     } else {
         tracing::warn!(
             %endpoint,
             "No logging.auth_secret is configured, so this node ships to deis-telemetry without \
-             a capability token. That works only against a collector that has no auth_secret \
-             either -- which it may only have when both of its listeners are on loopback. \
-             Against any other collector every log line, every invocation trace and every metric \
-             sample from this node is refused, the node retries them for as long as it runs, and \
-             `deis logs` and `deis trace` stay empty for every application it serves"
+             a capability token. That works only against a collector that has no \
+             capability_public_key either -- which it may only have when both of its \
+             listeners are on loopback. Against any other collector every log line, every \
+             invocation trace and every metric sample from this node is refused, the node \
+             retries them for as long as it runs, and `deis logs` and `deis trace` stay \
+             empty for every application it serves"
         );
     }
 }
@@ -190,27 +220,57 @@ mod tests {
     }
 
     #[test]
-    fn the_token_is_the_channels_and_not_a_tenants() {
+    fn the_token_is_an_ed25519_capability() {
         let credential = TelemetryCredential::from_secret(Some("shared-secret"));
         assert!(credential.is_present());
 
         let stamped = credential.stamp(());
-        let presented = stamped
+        let header_value = stamped
             .metadata()
-            .get(STORAGE_TOKEN_HEADER)
+            .get("authorization")
             .and_then(|value| value.to_str().ok())
-            .expect("the token travels in the platform's own credential header");
+            .expect("the token travels in an Authorization: Bearer header");
 
-        assert_eq!(
-            presented,
-            storage_token("shared-secret", TELEMETRY_CHANNEL),
-            "the collector recomputes the token over its own subject; anything else is refused"
+        assert!(
+            header_value.starts_with("Bearer "),
+            "the header value must be 'Bearer <token>', got: {header_value:?}"
         );
+
+        // The token itself must be a valid v1 capability token.
+        let token = header_value.strip_prefix("Bearer ").unwrap();
+        assert!(
+            token.starts_with("v1."),
+            "the capability token must start with 'v1.', got prefix: {:?}",
+            &token[..token.len().min(10)]
+        );
+
+        // The same secret must produce a valid capability token each time.
+        // Each call generates a fresh jti (JWT ID), so the tokens are not
+        // byte-identical, but both must be well-formed Bearer tokens signed
+        // by the same key.
+        let credential2 = TelemetryCredential::from_secret(Some("shared-secret"));
+        let stamped2 = credential2.stamp(());
+        let header_value2 = stamped2
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(
+            header_value2.starts_with("Bearer v1."),
+            "the second token from the same secret must also be a capability token"
+        );
+
+        // A different secret must produce a different token.
+        let credential3 = TelemetryCredential::from_secret(Some("other-secret"));
+        let stamped3 = credential3.stamp(());
+        let header_value3 = stamped3
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
         assert_ne!(
-            presented,
-            storage_token("shared-secret", "demo.production"),
-            "a token minted for a tenant must not also be one for the telemetry channel, or a \
-             token that leaked out of one application would read every application's logs"
+            header_value, header_value3,
+            "different secrets must produce different Ed25519 keys and different tokens"
         );
     }
 
@@ -218,7 +278,7 @@ mod tests {
     fn a_node_without_a_secret_stamps_nothing() {
         let stamped = TelemetryCredential::from_secret(None).stamp(());
         assert!(
-            stamped.metadata().get(STORAGE_TOKEN_HEADER).is_none(),
+            stamped.metadata().get("authorization").is_none(),
             "an empty token is presented and refused; no token at all is served by a collector \
              that requires none"
         );

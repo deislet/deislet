@@ -174,6 +174,64 @@ pub const QUEUE_MESSAGE_FAILURES_TOTAL: &str = "deis_runtime_queue_message_failu
 pub const QUEUE_POLL_ERRORS_TOTAL: &str = "deis_runtime_queue_poll_errors_total";
 /// Executions cut off because the isolate reached its V8 heap ceiling.
 pub const MEMORY_CUTOFFS_TOTAL: &str = "deis_runtime_memory_cutoffs_total";
+/// Isolates discarded and rebuilt because they were no longer fit to serve
+/// from, counted by why.
+///
+/// The `reason` label says what disqualified the isolate. Today there is one:
+/// `memory`, an isolate whose V8 heap ceiling was tripped. Its heap limit was
+/// raised by the cut-off itself (the room the termination needs), and V8
+/// offers no way to lower a limit back, so the isolate is dropped and the
+/// next request for the application is served on a freshly built one. Without
+/// this counter a node either kept raising the ceiling forever or recycled
+/// invisibly; an operator watching `deis_runtime_memory_cutoffs_total` climb
+/// without any recycle in reply would be reading a node that reuses poisoned
+/// isolates.
+pub const ISOLATE_RECYCLES_TOTAL: &str = "deis_runtime_isolate_recycled_total";
+/// `reason` on [`ISOLATE_RECYCLES_TOTAL`]: the isolate's V8 heap ceiling was
+/// tripped, so it was discarded and rebuilt on its thread.
+pub const RECYCLE_REASON_MEMORY: &str = "memory";
+/// Label carrying why an isolate was recycled on [`ISOLATE_RECYCLES_TOTAL`].
+const RECYCLE_REASON_LABEL: &str = "reason";
+/// Requests dropped when the runtime thread reached them and their caller had
+/// already gone away.
+///
+/// A caller hangs up, or the edge's own read timeout fires, while the request
+/// waits its turn behind whatever the application's runtime thread is already
+/// running. The thread is still holding the message; before starting it, it
+/// finds nobody waiting for the answer and runs nothing. Counted apart from
+/// every other outcome because no isolate was entered: it is neither the
+/// application failing nor the node failing, and a node losing many of these
+/// is saying that requests are waiting a long time rather than that anything
+/// is broken. It is also not counted in [`REQUESTS_TOTAL`]: there was no
+/// invocation to observe.
+pub const ABANDONED_BEFORE_START_TOTAL: &str = "deis_runtime_abandoned_before_start_total";
+/// Work the node refused as overloaded because the application's runtime
+/// thread was at capacity: either the thread's queue was full when the work
+/// was posted, or the work waited past the node's admission budget before
+/// the thread reached it.
+///
+/// A refusal, not an invocation: no isolate was entered and the application
+/// never did the work, so a retry of what was refused is not a duplicate
+/// side effect. Counted apart from [`REQUEST_ERRORS_TOTAL`] the way
+/// [`ABANDONED_BEFORE_START_TOTAL`] is, and its mirror image: that counter
+/// counts the work whose caller went away and owes no answer, and this one
+/// counts the work whose caller is still waiting and was told to come back.
+/// A node that is full says it in both numbers at once.
+///
+/// The `class` label says which of the node's own capacity checks turned the
+/// work away, so a counter that several sources share stays readable: today
+/// there is one, admission (a full queue or a spent wait budget), and an
+/// isolate that gets recycled mid-invocation is the next one that lands here.
+pub const OVERLOADED_TOTAL: &str = "deis_runtime_overloaded_total";
+/// `class` on [`OVERLOADED_TOTAL`]: the refusal happened at admission, the
+/// moment work is posted to an application's runtime thread, and nothing was
+/// run.
+pub const OVERLOAD_CLASS_ADMISSION: &str = "admission";
+/// `class` on [`OVERLOADED_TOTAL`]: the application's own ceiling on
+/// concurrently open outbound connections refused the call, in the outbound
+/// fetch guard, before anything was dialled. Admission would have passed it;
+/// what it ran into was its own configured concurrency.
+pub const OVERLOAD_CLASS_OUTBOUND: &str = "outbound";
 /// Invocations this node built a trace record for.
 pub const TRACES_RECORDED_TOTAL: &str = "deis_runtime_traces_recorded_total";
 /// Invocations sampling deliberately did not record. Policy, not loss.
@@ -497,6 +555,14 @@ impl MetricsRegistry {
         self.note_cut_off(app_id, InvocationOutcome::MemoryLimit);
     }
 
+    /// One isolate was discarded and rebuilt, and why.
+    pub fn record_isolate_recycled(&self, app_id: &str, reason: &str) {
+        self.add(
+            SampleKey::new(ISOLATE_RECYCLES_TOTAL, app_id).with_label(RECYCLE_REASON_LABEL, reason),
+            1.0,
+        );
+    }
+
     /// CPU time one stretch of an app's code spent on a runtime thread.
     ///
     /// Recorded when the stretch ends, whatever ended it. See [`CPU_MS_SUM`].
@@ -533,6 +599,25 @@ impl MetricsRegistry {
     pub fn record_queue_poll_error(&self, app_id: &str, queue: &str) {
         self.add(
             SampleKey::new(QUEUE_POLL_ERRORS_TOTAL, app_id).with_label("queue", queue),
+            1.0,
+        );
+    }
+
+    /// One request dropped before its isolate was entered because the caller
+    /// had already gone away. See [`ABANDONED_BEFORE_START_TOTAL`].
+    pub fn record_abandoned_before_start(&self, app_id: &str) {
+        self.add(SampleKey::new(ABANDONED_BEFORE_START_TOTAL, app_id), 1.0);
+    }
+
+    /// One work item refused as overloaded: the application's runtime thread
+    /// was at capacity and nothing was run. See [`OVERLOADED_TOTAL`].
+    ///
+    /// `class` is which check refused it (see the label's note on the counter);
+    /// [`OVERLOAD_CLASS_ADMISSION`] today, and the counter is read apart by it
+    /// rather than split into one series per source.
+    pub fn record_overloaded(&self, app_id: &str, class: &str) {
+        self.add(
+            SampleKey::new(OVERLOADED_TOTAL, app_id).with_label("class", class),
             1.0,
         );
     }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use structopt::StructOpt;
 use tonic::service::Routes;
@@ -11,8 +11,16 @@ struct Opts {
     config: Option<PathBuf>,
     #[structopt(short, long)]
     port: Option<u16>,
-    #[structopt(long, default_value = "deis-control.db")]
-    database: String,
+    /// The SQLite file this installation keeps its catalogue in.
+    ///
+    /// Leave it out and it is `<data_dir>/control.db`, which is inside the
+    /// one directory a backup policy covers (ADR-012). A relative path is
+    /// refused rather than resolved: it names a different file to every
+    /// process started from a different working directory, and the failure
+    /// that produces is quiet - this control plane coming up healthy on a
+    /// database it has just created empty.
+    #[structopt(long, parse(from_os_str))]
+    database: Option<PathBuf>,
     /// Load the configuration, say whether it is usable, and exit without
     /// binding anything.
     ///
@@ -23,6 +31,26 @@ struct Opts {
     /// answer that was wanted.
     #[structopt(long)]
     check_config: bool,
+    #[structopt(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(StructOpt, Debug)]
+enum Command {
+    /// Install a bootstrap credential the operator generated offline, for a
+    /// headless install that cannot read a file the control plane wrote.
+    ///
+    /// The token string must be well formed (`deis_pat_<16 hex>_<64 hex>`);
+    /// its id and secret hash are stored, the value itself nowhere. It
+    /// expires 24 hours after it is installed if never used, and installing
+    /// a new one stops the previous one - there is one way in, and it is the
+    /// one just installed. The control plane must not be running: this opens
+    /// the same SQLite database by itself.
+    Bootstrap {
+        /// A file holding the token string and nothing else.
+        #[structopt(long, parse(from_os_str))]
+        token_file: PathBuf,
+    },
 }
 
 /// Initialize logging system
@@ -74,15 +102,77 @@ fn init_logging() {
     }
 }
 
+/// Say what one backup has to cover, and which parts of it are outside the
+/// directory the documented policy captures.
+///
+/// ADR-012's policy is one directory - `data_dir`, with the database in it.
+/// An installation that keeps the master key or the machine channel's
+/// certificates somewhere else is not wrong; permissions on a key file are a
+/// good reason for it. It does have a restore set that spans two places, and
+/// the failure this prevents is the quiet one: a restore of `data_dir`
+/// alone, coming up healthy, listing every application and unable to decrypt
+/// one secret or reach one node.
+fn announce_restore_set(config: &deis_control::ControlConfig, database: &Path) {
+    let outside: Vec<(&str, PathBuf)> = config
+        .backup_material(database)
+        .into_iter()
+        .filter(|(_, path)| !path.starts_with(&config.data_dir))
+        .collect();
+
+    if outside.is_empty() {
+        info!(
+            data_dir = %config.data_dir.display(),
+            "Everything a restore needs is under data_dir: capturing that one directory is the whole \
+             backup (ADR-012)"
+        );
+        return;
+    }
+
+    warn!(
+        data_dir = %config.data_dir.display(),
+        "A restore needs more than data_dir: {}. Capture each of these as well, or a restore will \
+         come up healthy with the database and be unable to decrypt a secret or reach a node \
+         (ADR-012)",
+        outside
+            .iter()
+            .map(|(what, path)| format!("{what} at {}", path.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// The master key the capability signing keys are encrypted under.
+///
+/// Required, unlike for secrets (which answer 503 without it): the control
+/// plane cannot mint a single storage or queue capability without a signing
+/// key, and the only alternatives to an encrypted stored key are one that
+/// dies with the process - every token in the fleet failing after each
+/// restart - or one stored in the clear in `control.db` and every replica of
+/// it.
+fn load_capability_vault(
+    config: &deis_control::ControlConfig,
+) -> anyhow::Result<Arc<deis_control::catalog::secrets::SecretCipher>> {
+    let path = config.secret_key_file.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "secret_key_file is not set. The capability signing keys are stored encrypted under the \
+             master key it names and this control plane will not start without it; generate one \
+             with `openssl rand -hex 32 > <data_dir>/keys/master.key` and name it in the \
+             configuration file"
+        )
+    })?;
+    let cipher = deis_control::catalog::secrets::SecretCipher::load_from_file(path)
+        .map_err(|e| anyhow::anyhow!("the capability signing keys need the master key: {e}"))?;
+    Ok(Arc::new(cipher))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     init_logging();
 
     let opts = Opts::from_args();
-    info!("Starting Control v{}", deis_control::VERSION);
 
     let mut config = deis_control::ControlConfig::default();
-    if let Some(path) = opts.config {
+    if let Some(path) = opts.config.clone() {
         // A path that was given and is not there is an error, not a shrug.
         // Ignoring it silently started this process on the built-in defaults
         // - port 8080, no API authentication, no machine channel - which is a
@@ -102,6 +192,39 @@ async fn main() -> Result<(), anyhow::Error> {
         config.port = port;
     }
 
+    // The database is the second thing inside `data_dir`; the bundle
+    // directory and the key material are resolved by the configuration (see
+    // `ControlConfig::bundle_dir`). Everything a restore needs is therefore
+    // under one directory by default, which is what makes one backup policy
+    // enough for an installation (ADR-012) - and what is not under it is
+    // named below rather than left to be found by a restore.
+    let database_path = opts
+        .database
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("control.db"));
+    config.refuse_relative_paths(&database_path)?;
+    announce_restore_set(&config, &database_path);
+
+    if let Some(Command::Bootstrap { token_file }) = &opts.command {
+        let secret = std::fs::read_to_string(token_file)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", token_file.display()))?
+            .trim()
+            .to_string();
+        let database = Arc::new(deis_control::Database::init(&database_path).await?);
+        let identity = deis_control::IdentityStore::new(database);
+        let id = identity
+            .install_preset_bootstrap_token(&secret)
+            .await
+            .map_err(|e| anyhow::anyhow!("the bootstrap token was not installed: {e}"))?;
+        info!(
+            token = %id,
+            "Installed the preset bootstrap credential; it expires 24 hours from now if never used, and any previous bootstrap credential has stopped working"
+        );
+        return Ok(());
+    }
+
+    info!("Starting Control v{}", deis_control::VERSION);
+
     if opts.check_config {
         // Every rule startup would apply, applied here. A check that only
         // parsed would pass a file this process then refuses to start on -
@@ -114,13 +237,21 @@ async fn main() -> Result<(), anyhow::Error> {
                  and the routing table. Without it no machine can reach this control plane at all"
             )
         })?;
+        // The capability signing keys are stored encrypted under the master
+        // key and startup refuses without it; the same check, here.
+        load_capability_vault(&config)?;
         println!(
-            "configuration is usable: port {}, machine channel {}:{}, api auth {}",
+            "configuration is usable: port {}, machine channel {}:{}, human API authenticated \
+             (bootstrap credential written to {} on a first start with no live token)",
             config.port,
             machine.bind_addr,
             machine.port,
-            if config.api_auth_enabled { "on" } else { "off" }
+            config.data_dir.join("bootstrap.token").display()
         );
+        println!("one backup has to cover all of this, together:");
+        for (what, path) in config.backup_material(&database_path) {
+            println!("  {what}: {}", path.display());
+        }
         return Ok(());
     }
 
@@ -129,8 +260,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!("Listening on {}:{}", bind_addr, port);
 
-    let database = Arc::new(deis_control::Database::init(&opts.database).await?);
-    info!("Database initialized: {}", opts.database);
+    let database = Arc::new(deis_control::Database::init(&database_path).await?);
+    info!("Database initialized: {}", database_path.display());
 
     // Before anything can connect: take back what the previous process was
     // still claiming. Nothing is connected yet and nothing is waiting on a
@@ -168,6 +299,20 @@ async fn main() -> Result<(), anyhow::Error> {
     // `CatalogStore::anchor_bundle_paths`.
     deis_control::api::anchor_bundle_paths(&database, &api_config).await;
 
+    // Persistent, encrypted under the master key, and rotated on a schedule;
+    // see `capability_issuer`. Loaded before anything can issue a token.
+    let capability_vault = load_capability_vault(&config)?;
+    let capability_issuer = database
+        .with_connection(move |conn| {
+            deis_control::capability_issuer::CapabilityIssuer::open(
+                conn,
+                capability_vault,
+                "spiffe://deislet/control/main",
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot load the capability signing keys: {e}"))?;
+
     // One stop signal for the whole process, taken before anything is
     // started so every part gets the same edge: the listener stops
     // accepting, the node control channels are closed instead of being left
@@ -181,6 +326,12 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let sessions = server.sessions();
     let db = server.database().expect("Database not initialized");
+
+    // Stops on the signal by itself; a step cut short is one transaction
+    // that either landed or did not.
+    capability_issuer
+        .clone()
+        .spawn_maintenance(Arc::clone(&db), shutdown.clone());
 
     let config_manager = Arc::new(deis_control::ConfigManager::new(
         Arc::clone(&db),
@@ -306,6 +457,7 @@ async fn main() -> Result<(), anyhow::Error> {
         metrics_collector,
         Arc::clone(&deis_runtime_manager),
         Arc::clone(&api_config),
+        capability_issuer.clone(),
     )
     .await;
     let provider_background = api
@@ -331,17 +483,14 @@ async fn main() -> Result<(), anyhow::Error> {
             deis_control::api::static_files::serve_fallback,
         ));
 
-    // Before the listener opens: record the configured api_keys so an
-    // operator can see which of their credentials are unscoped, mint a first
-    // owner token if this control plane demands authentication and has none,
-    // and say what the audit log already holds.
+    // Before the listener opens: mint a one-time bootstrap credential if
+    // this control plane has no live token, and say what the audit log
+    // already holds.
     deis_control::api::announce_authorization(&api.authz).await;
 
     deis_control::api::log_api_ready(
         port,
         api.tls_enabled,
-        api_config.api_auth_enabled,
-        api_config.api_keys.len(),
         &api.cors_origins,
         true,
         api_config.machine.is_some(),
@@ -375,6 +524,7 @@ async fn main() -> Result<(), anyhow::Error> {
             machine_listener.set_nonblocking(true)?;
             let machine_app = deis_control::machine::listen::router(
                 api.catalog_state.clone(),
+                capability_issuer.clone(),
                 // A second server value, not the one merged into the human
                 // app: a tonic service is consumed by the router it is added
                 // to, and both listeners carry this service while the fleet

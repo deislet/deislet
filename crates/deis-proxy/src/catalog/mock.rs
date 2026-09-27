@@ -98,6 +98,20 @@ impl MachineChannel for MockService {
             Answer::Denied(message) => Err(Status::permission_denied(message.clone())),
         }
     }
+
+    async fn fetch_secret_values(
+        &self,
+        _request: Request<deis_wire::machine::FetchSecretValuesRequest>,
+    ) -> Result<Response<deis_wire::machine::FetchSecretValuesResponse>, Status> {
+        Err(Status::unimplemented("fetch_secret_values"))
+    }
+
+    async fn issue_capability(
+        &self,
+        _request: Request<deis_wire::machine::IssueCapabilityRequest>,
+    ) -> Result<Response<deis_wire::machine::IssueCapabilityResponse>, Status> {
+        Err(Status::unimplemented("issue_capability"))
+    }
 }
 
 /// A TLS connection tonic will serve on.
@@ -164,7 +178,12 @@ impl MockControl {
         let directory = tempfile::tempdir().expect("a directory");
         let ca = TestCa::new();
         let control_id = names::control(TRUST_DOMAIN).expect("a control name");
-        let files = write_files(directory.path(), "control", &ca.issue(&control_id), &ca.root_pem);
+        let files = write_files(
+            directory.path(),
+            "control",
+            &ca.issue(&control_id),
+            &ca.root_pem,
+        );
         let control_identity = MachineIdentity::load(files.as_identity_files(), &[Protocol::Http2])
             .expect("a control identity");
 

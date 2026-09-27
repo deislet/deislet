@@ -272,6 +272,7 @@ pub const LIMITS_FIELDS: &[&str] = &[
     "cpu_time_limit_ms",
     "resource_table_max",
     "max_subrequests",
+    "max_outbound_connections",
 ];
 
 /// Every key [`crate::DeclaredCompatibility`] reads.
@@ -633,6 +634,7 @@ mod tests {
                 name: "jobs".to_string(),
                 batch_size: Some(10),
                 max_concurrency: Some(2),
+                max_retries: Some(3),
             }],
             assets: vec![Asset {
                 path: "index.html".to_string(),
@@ -669,6 +671,7 @@ mod tests {
                 cpu_time_limit_ms: Some(250),
                 resource_table_max: Some(64),
                 max_subrequests: Some(4),
+                max_outbound_connections: Some(16),
             }),
             table(LIMITS_FIELDS),
             "LIMITS_FIELDS is not what a DeclaredLimits serialises as"

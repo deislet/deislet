@@ -156,11 +156,7 @@ impl RuntimeManagement for RuntimeManagementService {
                 }));
             }
         };
-        if !matches!(
-            action,
-            DeploymentAction::Unspecified | DeploymentAction::LegacyApply
-        ) && instruction.0.is_none()
-        {
+        if !matches!(action, DeploymentAction::Unspecified) && instruction.0.is_none() {
             return Ok(Response::new(ApplyDeploymentResponse {
                 success: false,
                 message: format!(
@@ -278,7 +274,6 @@ impl RuntimeManagement for RuntimeManagementService {
             &req.environment_declarations_json,
             &req.environment_snapshot_json,
             &req.environment_snapshot_id,
-            req.secret_values_by_revision.clone(),
             &req.version_id,
             &req.canonical_environment_id,
         ) {
@@ -756,20 +751,12 @@ fn decode_standard_environment(
     declarations_json: &str,
     snapshot_json: &str,
     snapshot_id: &str,
-    secrets: std::collections::HashMap<String, String>,
     version_id: &str,
     environment_id: &str,
 ) -> Result<Option<StandardEnvironmentOrder>, String> {
     let absent = declarations_json.is_empty() && snapshot_json.is_empty() && snapshot_id.is_empty();
     if absent {
-        return if secrets.is_empty() {
-            Ok(None)
-        } else {
-            Err(
-                "EC_ENV_SNAPSHOT_INVALID: secret revisions arrived without environment documents"
-                    .to_string(),
-            )
-        };
+        return Ok(None);
     }
     if declarations_json.is_empty()
         || snapshot_json.is_empty()
@@ -786,11 +773,10 @@ fn decode_standard_environment(
     })?;
     let snapshot = serde_json::from_str(snapshot_json)
         .map_err(|_| "EC_ENV_SNAPSHOT_INVALID: environment snapshot JSON is invalid".to_string())?;
-    StandardEnvironmentOrder::new(
+    StandardEnvironmentOrder::new_without_secrets(
         declarations,
         snapshot,
         snapshot_id.to_string(),
-        secrets,
         version_id,
         environment_id,
     )
@@ -811,17 +797,13 @@ fn decode_standard_environment(
 /// node's own configuration is in scope.
 fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
     ResourceLimits {
-        // `max_subrequests` has no field in this message and is left absent
-        // here. It is not lost: `crate::deployment` fills in every limit the
-        // deployment did not carry from the version's own manifest, which is
-        // where the declaration was written in the first place. A control
-        // plane that grows a field for it will simply agree with what the
-        // bundle already says.
+        // `max_subrequests` has no field in this message version's carrier and
+        // is left absent here. It is not lost: `crate::deployment` fills in
+        // every limit the deployment did not carry from the version's own
+        // manifest, which is where the declaration was written in the first
+        // place. A control plane that grows a field for it will simply agree
+        // with what the bundle already says.
         memory_mb: limits.memory_mb.max(0) as usize,
-        // Field 2 of the message, enforced by nothing on this node; carried
-        // into the struct only so that what the control plane sent and what
-        // the node holds are the same value.
-        cpu_milli: limits.cpu_milli.max(0) as u32,
         resource_table_max: (limits.resource_table_max > 0)
             .then_some(limits.resource_table_max as usize),
         timeout_ms: (limits.timeout_ms > 0).then_some(limits.timeout_ms as u64),
@@ -829,7 +811,12 @@ fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
             .then_some(limits.rate_limit_ops_per_sec),
         cpu_time_limit_ms: (limits.cpu_time_limit_ms > 0)
             .then_some(limits.cpu_time_limit_ms as u64),
+        // The wire does carry this one; `max_subrequests` above is the
+        // same story. A zero means the control plane said nothing, which
+        // is "use the platform default" here too.
         max_subrequests: None,
+        max_outbound_connections: (limits.max_outbound_connections > 0)
+            .then_some(limits.max_outbound_connections as u32),
     }
 }
 

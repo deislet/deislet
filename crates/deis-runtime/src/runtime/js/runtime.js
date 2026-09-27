@@ -2467,11 +2467,19 @@ class NativeKV {
   //
   // expirationTtl is a lifetime in whole seconds, counted from the moment
   // deis-store accepts the write; leave it out and the entry never lapses.
+  // It must be at least 60: that is the shared standard's floor, which is
+  // the shorter of the two hosts' minimums (Cloudflare Workers KV refuses
+  // expirationTtl below 60), so a lifetime below it does not exist on every
+  // host an application may run on. deis-store refuses it too; the check
+  // here is the one the author sees.
   //
   // metadata is stored alongside the value and returned untouched by
   // deis-store; getWithMetadata() reads it back. It is JSON-encoded here,
   // strings included, so that decoding it there is a plain JSON.parse and an
-  // object, a number and a string all round-trip as themselves.
+  // object, a number and a string all round-trip as themselves. The shared
+  // standard bounds it at 1 KiB, Cloudflare Workers KV's metadata ceiling,
+  // so a larger one is refused here rather than stored somewhere only this
+  // host can read.
   async put(key, value, options) {
     // Own members only: read the ordinary way, an `Object.prototype`
     // an application wrote to would have given a lifetime to every later
@@ -2486,12 +2494,22 @@ class NativeKV {
             String(askedTtl)
         );
       }
+      if (ttl < 60) {
+        throw new TypeError(
+          "kv.put: expirationTtl must be at least 60 seconds, got " + String(askedTtl)
+        );
+      }
     }
 
     const askedMetadata = optionOf(options, "metadata");
     let metadata = null;
     if (askedMetadata !== undefined && askedMetadata !== null) {
       metadata = JSON.stringify(askedMetadata);
+      if (metadata.length > 1024) {
+        throw new TypeError(
+          "kv.put: metadata is " + metadata.length + " bytes encoded, limit is 1024"
+        );
+      }
     }
 
     await DenoCore.ops.op_kv_set(this.#binding, key, kvEncode(value), {
@@ -2565,8 +2583,9 @@ class NativeKV {
       // The op takes a 32-bit count, and a number past that would be refused
       // by the argument decoder with a message about integers rather than
       // about keys. Hand over the largest one it can hold instead: deis-store
-      // caps every limit at its own ceiling anyway, so an absurd request has
-      // always answered with the ceiling and a cursor, and that stays true.
+      // caps every limit at the shared standard's page size (1000) anyway, so
+      // an absurd request has always answered with the ceiling and a cursor,
+      // and that stays true.
       if (limit > 2147483647) limit = 2147483647;
     }
 

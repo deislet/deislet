@@ -763,11 +763,10 @@ fn operation_context(
             "account:{}",
             principal.account.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::ConfigKey => format!(
-            "config-key:{}",
+        PrincipalKind::Bootstrap => format!(
+            "bootstrap:{}",
             principal.credential_id.as_deref().unwrap_or("unknown")
         ),
-        PrincipalKind::Anonymous => "anonymous:direct-local".to_string(),
     };
     let fingerprint = format!("POST\n/api/apps/{application_name}/identity-migration\nv1");
     OperationRequestContext::new(
@@ -870,7 +869,8 @@ mod tests {
             running: Arc::new(Mutex::new(BTreeSet::new())),
             cancelling: Arc::new(Mutex::new(BTreeSet::new())),
         };
-        // Legacy prefix on purpose: the flat tree's regression coverage.
+        // Flat prefix on purpose: the same handlers under a plain mount,
+        // with no gate and no request context in the way.
         let api = router("/api", state);
 
         let response = api
@@ -901,7 +901,7 @@ mod tests {
                     .uri("/api/apps/shop/identity-migration")
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -953,7 +953,7 @@ mod tests {
             builder
                 .body(Body::empty())
                 .map(|mut request| {
-                    request.extensions_mut().insert(Principal::anonymous());
+                    request.extensions_mut().insert(admitted_principal());
                     request
                 })
                 .unwrap()
@@ -1023,7 +1023,7 @@ mod tests {
             telemetry_migration_admin_token: Some("t".repeat(32)),
             ..Default::default()
         };
-        let api = router("/api", MigrationApiState::new(store, &config));
+        let api = router("/api/v1", MigrationApiState::new(store, &config));
         let request_id = CanonicalId::new_v7();
         let correlation_id = CanonicalId::new_v7();
         let idempotency_key = "migration-shop-2026-09-04";
@@ -1031,7 +1031,7 @@ mod tests {
         let make_request = move || {
             Request::builder()
                 .method("POST")
-                .uri("/api/apps/shop/identity-migration")
+                .uri("/api/v1/apps/shop/identity-migration")
                 .header(IDEMPOTENCY_KEY, idempotency_key)
                 .header(REQUEST_ID, request_id.to_string())
                 .header(CORRELATION_ID, correlation_id.to_string())
@@ -1040,7 +1040,7 @@ mod tests {
                 .header(header::IF_MATCH, format!("\"{revision}\""))
                 .body(Body::empty())
                 .map(|mut request| {
-                    request.extensions_mut().insert(Principal::anonymous());
+                    request.extensions_mut().insert(admitted_principal());
                     request
                 })
                 .unwrap()
@@ -1065,7 +1065,7 @@ mod tests {
         assert_eq!(operation.state, deis_wire::OperationState::Queued);
         assert_eq!(
             location,
-            format!("/api/operations/{}", operation.operation_id)
+            format!("/api/v1/operations/{}", operation.operation_id)
         );
         assert!(
             !String::from_utf8(body.to_vec())
@@ -1089,12 +1089,12 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/apps/shop/identity-migration")
+                    .uri("/api/v1/apps/shop/identity-migration")
                     .header(IDEMPOTENCY_KEY, "different-migration-request")
                     .header(header::IF_MATCH, format!("\"{revision}\""))
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1109,7 +1109,7 @@ mod tests {
                     .uri(location)
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1158,7 +1158,7 @@ mod tests {
                     .uri(&path)
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1179,7 +1179,7 @@ mod tests {
                     .header(IF_MATCH, "\"9\"")
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1197,7 +1197,7 @@ mod tests {
                     .header(IF_MATCH, "1")
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1214,7 +1214,7 @@ mod tests {
                     .header(IF_MATCH, "\"1\"")
                     .body(Body::empty())
                     .map(|mut request| {
-                        request.extensions_mut().insert(Principal::anonymous());
+                        request.extensions_mut().insert(admitted_principal());
                         request
                     })
                     .unwrap(),
@@ -1259,6 +1259,19 @@ mod tests {
             cancelling: Arc::new(Mutex::new(BTreeSet::new())),
         };
         router("/api", state).layer(Extension(principal))
+    }
+
+    /// The principal the gate would leave for an admitted caller with every
+    /// authority - what an unscoped owner token resolves to. Tests here
+    /// insert it directly instead of mounting the real gate.
+    fn admitted_principal() -> Principal {
+        Principal {
+            kind: PrincipalKind::Account,
+            account: Some("root".to_string()),
+            role: Some(crate::identity::Role::Owner),
+            credential_id: Some("0000000000000000".to_string()),
+            authority: crate::identity::Authority::Unscoped,
+        }
     }
 
     fn scoped_principal(scopes: &str) -> Principal {
@@ -1324,6 +1337,11 @@ mod tests {
         let etag = |revision: u64| format!("\"{revision}\"");
         let deployment_uri =
             format!("/api/apps/demo/environments/production/provider-deployments/{operation_id}");
+        // The header is spelled for the surface the request context names;
+        // this mount carries none, so it is spelled for v1.
+        let deployment_location = format!(
+            "/api/v1/apps/demo/environments/production/provider-deployments/{operation_id}"
+        );
         let cancel_uri = format!("/api/operations/{operation_id}/cancel");
 
         // The deploy scope of the operation's own application/environment is
@@ -1369,7 +1387,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         // The answer is the scoped route's answer: the deployment the same
         // credential can read, its new revision, and no caching.
-        assert_eq!(response.headers()[header::LOCATION], deployment_uri);
+        assert_eq!(response.headers()[header::LOCATION], deployment_location);
         assert_eq!(response.headers()[header::ETAG], etag(revision + 1));
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert!(response.headers().contains_key(REQUEST_ID));
@@ -1613,7 +1631,7 @@ mod tests {
         let cancel_uri = format!("/api/operations/{operation_id}/cancel");
 
         // An administrator is told there is no controller, as before.
-        let api = generic_router(Arc::clone(&store), Principal::anonymous());
+        let api = generic_router(Arc::clone(&store), admitted_principal());
         let response = api
             .oneshot(cancel_request(&cancel_uri, Some("build-cancel"), "\"1\""))
             .await
@@ -1668,7 +1686,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
             response.headers()[header::LOCATION],
-            format!("/api/apps/demo/environments/production/provider-deployments/{operation_id}")
+            format!(
+                "/api/v1/apps/demo/environments/production/provider-deployments/{operation_id}"
+            )
         );
         assert_eq!(response.headers()[header::ETAG], etag(revision + 1));
         let cancelling = json(response).await;
@@ -1709,31 +1729,28 @@ mod gated_tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
-    use axum::response::IntoResponse;
     use axum::{Router, middleware::from_fn_with_state};
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use super::{
-        CORRELATION_ID, CoordinatorAvailability, MigrationApiState, OperationAccess, REQUEST_ID,
-        router,
-    };
+    use super::{CORRELATION_ID, CoordinatorAvailability, MigrationApiState, REQUEST_ID, router};
     use crate::api::authz::{AuthzState, authorize};
     use crate::api::catalog::providers::tests::{
         attach_artifact, begin_deployment, provider_fixture,
     };
-    use crate::api::error::{ApiError, codes};
+    use crate::api::error::codes;
     use crate::api::versioning::{ApiSurface, attach_request_context, render_errors};
     use crate::audit::{AuditQuery, AuditStore, Outcome};
     use crate::catalog::CatalogStore;
     use crate::identity::{Authority, Denial, IdentityStore, Role, Scope, Verb};
     use deis_wire::CanonicalId;
 
-    const ROOT_KEY: &str = "the-operators-root-key";
-
     struct Gated {
         router: Router,
         audit: Arc<AuditStore>,
+        /// The secret of the unscoped owner token standing in for the
+        /// administrator.
+        root_secret: String,
         /// The secret of a token scoped to `deploy:demo/production`.
         deploy_secret: String,
     }
@@ -1742,8 +1759,13 @@ mod gated_tests {
         let database = store.database();
         let identity = Arc::new(IdentityStore::new(Arc::clone(&database)));
         let audit = Arc::new(AuditStore::new(database));
-        let config_keys = vec![ROOT_KEY.to_string()];
-        identity.sync_config_keys(&config_keys).await.unwrap();
+        // The administrator of these tests is an unscoped owner token: the
+        // old flat configuration key no longer exists.
+        identity.create_account("root", Role::Owner).await.unwrap();
+        let (_, root_secret) = identity
+            .create_token("root", "operator", Authority::Unscoped)
+            .await
+            .unwrap();
         identity.create_account("ci", Role::Deployer).await.unwrap();
         let (_, deploy_secret) = identity
             .create_token(
@@ -1754,10 +1776,9 @@ mod gated_tests {
             .await
             .unwrap();
         let authz = AuthzState {
-            enforced: true,
-            config_keys: Arc::new(config_keys),
             identity,
             audit: Arc::clone(&audit),
+            bootstrap_file: None,
         };
         let state = MigrationApiState {
             store,
@@ -1770,7 +1791,9 @@ mod gated_tests {
                 .layer(from_fn_with_state(surface, render_errors))
                 .layer(from_fn_with_state(surface, attach_request_context))
         };
-        let router = surfaced(ApiSurface::Legacy, router("/api", state.clone()))
+        // The flat mount is the spelling the gate's table is written in;
+        // the nested one proves a versioned path reads as the route it is.
+        let router = surfaced(ApiSurface::V1, router("/api", state.clone()))
             .merge(surfaced(
                 ApiSurface::V1,
                 Router::new().nest("/api/v1", router("", state)),
@@ -1779,6 +1802,7 @@ mod gated_tests {
         Gated {
             router,
             audit,
+            root_secret,
             deploy_secret,
         }
     }
@@ -1823,7 +1847,7 @@ mod gated_tests {
         }
     }
 
-    /// The gate is layered outside all three mounts, so a call it refuses
+    /// The gate is layered outside both mounts, so a call it refuses
     /// never reaches the request-context middleware and the answer is built
     /// by the gate itself. Both ids still come back: a client that sent a
     /// correlation id has to be able to tie the refusal to the calls it
@@ -2010,37 +2034,35 @@ mod gated_tests {
             (&elsewhere.to_string(), "deploy"),
             (&migration, "migrate"),
         ] {
-            let (status, answer) = get(&gated, &format!("/api/v1/operations/{id}"), ROOT_KEY).await;
+            let (status, answer) = get(
+                &gated,
+                &format!("/api/v1/operations/{id}"),
+                &gated.root_secret,
+            )
+            .await;
             assert_eq!(status, StatusCode::OK, "{id}: {}", answer.text());
             assert_eq!(answer.json()["kind"], kind, "{id}");
             assert!(answer.headers.contains_key(header::ETAG), "{id}");
         }
-        let (status, answer) =
-            get(&gated, &format!("/api/v1/operations/{unknown}"), ROOT_KEY).await;
+        let (status, answer) = get(
+            &gated,
+            &format!("/api/v1/operations/{unknown}"),
+            &gated.root_secret,
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{}", answer.text());
         assert_eq!(answer.json()["error"]["code"], codes::NOT_FOUND);
 
-        // (e) The legacy spelling refuses with the legacy body, byte for
-        // byte what `insufficient_scope` has always rendered there: two
-        // strings and nothing structured.
+        // (e) The unversioned spelling the gate's table is written in
+        // refuses the same way: the gate reads the record the path names
+        // and answers the envelope with the denial, whatever prefix the
+        // route was spelled under.
         let (status, answer) = get(&gated, &format!("/api/operations/{migration}"), &deploy).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{}", answer.text());
-        let expected = ApiError::insufficient_scope(
-            OperationAccess::Read.refusal_scope(),
-            OperationAccess::Read.refusal_detail(),
-        )
-        .into_response();
-        let expected = to_bytes(expected.into_body(), 1024 * 1024).await.unwrap();
-        assert_eq!(answer.bytes, expected.to_vec());
-        let text = answer.text();
-        assert!(
-            text.starts_with(r#"{"error":"This credential may not do that: "#),
-            "{text}"
-        );
-        assert!(
-            !text.contains("requestId") && !text.contains("\"code\""),
-            "{text}"
-        );
+        let denied = answer.json();
+        assert_eq!(denied["error"]["code"], codes::INSUFFICIENT_SCOPE);
+        assert_eq!(denied["error"]["requestId"], REQUEST);
+        assert_eq!(denied["error"]["retryable"], false);
         let (status, answer) = get(&gated, &format!("/api/operations/{own}"), &deploy).await;
         assert_eq!(status, StatusCode::OK, "{}", answer.text());
 

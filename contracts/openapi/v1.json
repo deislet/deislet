@@ -376,21 +376,21 @@
             "type": "string"
           },
           "actor_account": {
-            "description": "The account's name. `None` only when the human API is unauthenticated.",
+            "description": "The account's name. `None` when no credential resolved.",
             "type": [
               "string",
               "null"
             ]
           },
           "actor_credential": {
-            "description": "The token's public id, or a configured key's fingerprint. Never any\npart of a credential.",
+            "description": "The token's public id. Never any\npart of a credential.",
             "type": [
               "string",
               "null"
             ]
           },
           "actor_kind": {
-            "description": "account, config_key or anonymous.",
+            "description": "`account`, `bootstrap`, or `unknown`.",
             "type": "string"
           },
           "app_id": {
@@ -1969,21 +1969,21 @@
                   "type": "string"
                 },
                 "actor_account": {
-                  "description": "The account's name. `None` only when the human API is unauthenticated.",
+                  "description": "The account's name. `None` when no credential resolved.",
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "actor_credential": {
-                  "description": "The token's public id, or a configured key's fingerprint. Never any\npart of a credential.",
+                  "description": "The token's public id. Never any\npart of a credential.",
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "actor_kind": {
-                  "description": "account, config_key or anonymous.",
+                  "description": "`account`, `bootstrap`, or `unknown`.",
                   "type": "string"
                 },
                 "app_id": {
@@ -4141,7 +4141,7 @@
             ]
           },
           "unscoped": {
-            "description": "Ask for a credential subject to no scope at all - the old flat\n`api_keys` behaviour. Spelled out rather than implied by an empty\nscope list, because \"everything\" and \"nothing\" must not be one typo\napart.",
+            "description": "Ask for a credential subject to no scope at all - everything its\naccount's role permits. Spelled out rather than implied by an empty\nscope list, because \"everything\" and \"nothing\" must not be one typo\napart.",
             "type": "boolean"
           }
         },
@@ -7036,6 +7036,13 @@
       "ProvisionCredentialRequest": {
         "additionalProperties": false,
         "properties": {
+          "accountId": {
+            "description": "Provider-specific account identifier (e.g., Cloudflare account ID).\nPassed as `account_id` to the credential binding spec.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "backendId": {
             "type": "string"
           },
@@ -7496,23 +7503,28 @@
       "StorageTokenResponse": {
         "description": "What a caller needs in order to act as one tenant of deis-store.\n\nEvery field is always present: an answer carrying an empty token would be\none the caller cannot use, so that case is a refusal rather than a field\nleft blank.",
         "properties": {
+          "queue_token": {
+            "description": "The Ed25519 capability token for deis-queue, for the same header on\ncalls to deis-queue. A separate token because deis-queue accepts only\nits own audience.",
+            "type": "string"
+          },
           "store_endpoint": {
             "description": "Where deis-store listens, as configured on this control plane.",
             "type": "string"
           },
           "tenant": {
-            "description": "The `<app>.<environment>` pair the token authorises, which the caller\nmust send back in `x-deis-tenant` on every storage call. Included so\na caller never has to rebuild it, and so the one this control plane\nsigned is visible to anyone debugging a refused call.",
+            "description": "The `<app>.<environment>` pair the token authorises. Included so\na caller never has to rebuild it, and so the tenant this control\nplane signed is visible to anyone debugging a refused call.",
             "type": "string"
           },
           "token": {
-            "description": "The capability token, for `x-deis-storage-token`.",
+            "description": "The Ed25519 capability token for deis-store (kv, sql and blob), for\nthe `Authorization: Bearer` header.",
             "type": "string"
           }
         },
         "required": [
           "tenant",
           "store_endpoint",
-          "token"
+          "token",
+          "queue_token"
         ],
         "type": "object"
       },
@@ -7549,7 +7561,7 @@
         "description": "Where a credential came from.",
         "enum": [
           "minted",
-          "config"
+          "bootstrap"
         ],
         "type": "string"
       },
@@ -7708,7 +7720,7 @@
         "type": "apiKey"
       },
       "bearerToken": {
-        "description": "`Authorization: Bearer <token>` with an API token minted by `POST /api/v1/accounts/{name}/tokens` or an `api_keys` entry of the configuration file.",
+        "description": "`Authorization: Bearer <token>` with an API token minted by `POST /api/v1/accounts/{name}/tokens`; on a fresh install, log in with `deis login --bootstrap` using the bootstrap.token file the control plane wrote to its data directory.",
         "scheme": "bearer",
         "type": "http"
       }

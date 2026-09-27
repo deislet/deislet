@@ -16,7 +16,6 @@
 //! be exact for the same reason it always did - a host that merely looks like
 //! the control plane must not be treated as it.
 
-
 /// `scheme://host:port` in a form two spellings of the same origin share.
 ///
 /// The default port is filled in so `http://host` and `http://host:80` are one

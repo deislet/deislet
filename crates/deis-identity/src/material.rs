@@ -28,8 +28,9 @@ use sha2::{Digest, Sha256};
 use crate::IdentityFiles;
 use crate::cert::{name_in_certificate, validity_of};
 use crate::error::{FileRole, IdentityError};
+use crate::names::ServiceKind;
 use crate::spiffe::SpiffeId;
-use crate::verify::{VerifyPeerIs, VerifyPeerIsInTrustDomain};
+use crate::verify::{VerifyPeerIs, VerifyPeerIsInTrustDomain, VerifyPeerIsOfKind};
 
 /// One consistent set of identity material, and the configurations built from
 /// it. Nothing in here is edited after it is built; a rotation produces a new
@@ -124,6 +125,45 @@ impl Material {
             validity,
             digest,
         })
+    }
+
+    /// A listener configuration that admits one kind of machine only.
+    ///
+    /// The trust-domain check is the same one the plain server configuration
+    /// makes; this one additionally refuses every name that is not a `kind`
+    /// of this fleet. The runtime node's data port is built on this: it takes
+    /// traffic from proxies and from nothing else, so the check runs where
+    /// the connection is made rather than in a handler a later route could
+    /// forget.
+    pub(crate) fn server_config_of_kind(
+        &self,
+        kind: ServiceKind,
+    ) -> Result<Arc<ServerConfig>, IdentityError> {
+        let peer_verifier = WebPkiClientVerifier::builder_with_provider(
+            Arc::clone(&self.roots),
+            Arc::clone(&self.provider),
+        )
+        .build()
+        .map_err(|source| {
+            IdentityError::Tls(rustls::Error::General(format!(
+                "the trust root does not build a client-certificate verifier: {source}"
+            )))
+        })?;
+
+        let mut server = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
+            .with_safe_default_protocol_versions()?
+            .with_client_cert_verifier(Arc::new(VerifyPeerIsOfKind::new(
+                peer_verifier,
+                self.id.trust_domain(),
+                kind,
+            )))
+            .with_single_cert(self.chain.clone(), self.key.clone_key())?;
+        // The ALPN list is set by the caller through `MachineIdentity::load`'s
+        // `serves`, the same way the plain server configuration gets it; carry
+        // the same answer here so the two listeners a process serves do not
+        // silently disagree about what they advertise.
+        server.alpn_protocols = self.server.alpn_protocols.clone();
+        Ok(Arc::new(server))
     }
 
     /// A configuration for dialling exactly one other machine.

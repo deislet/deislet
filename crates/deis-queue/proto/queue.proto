@@ -269,6 +269,15 @@ message NackRequest {
   // Handles from a previous Pull. A handle whose message is no longer there
   // is ignored.
   repeated MessageHandle messages = 4;
+  // Whether this nack gives the delivery attempt back. Attempts are counted
+  // when the message is handed out, so a plain nack of a message that has
+  // reached its ceiling dead letters it. Only the platform's own consumer
+  // may set this: when the runtime refused the batch before it reached the
+  // application at all (its thread was at capacity), the delivery burned no
+  // attempt and dead lettering would retire work nothing ever ran. A
+  // consumer nacking work the application actually failed must leave it
+  // false. Defaults to false.
+  bool refund_attempt = 5;
 }
 
 message NackResponse {

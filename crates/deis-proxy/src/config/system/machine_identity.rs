@@ -268,7 +268,9 @@ impl Validatable for MachineIdentityConfig {
         .collect();
         if !missing.is_empty() {
             return refuse(format!(
-                "{} {} required. A [machine_identity] table names all three files or none of                  them: this proxy's certificate chain, the private key that goes with it, and                  the trust root every peer must chain to",
+                "{} {} required. A [machine_identity] table names all three files or none of \
+                 them: this proxy's certificate chain, the private key that goes with it, and \
+                 the trust root every peer must chain to",
                 missing.join(", "),
                 if missing.len() == 1 { "is" } else { "are" }
             ));
@@ -278,14 +280,16 @@ impl Validatable for MachineIdentityConfig {
                 "machine_identity.identity_reload_seconds must be at least 1".to_string(),
             );
         }
-        // The other half of the same rule the missing-file check enforces. An
-        // identity is material for proving who this proxy is to one named
-        // machine; without an address it has no machine to prove it to, and
-        // the process would start, load the certificate, log that it did, and
-        // then fetch no routing table at all - serving whatever its own file
-        // routes while looking like a proxy that had attached.
-        if let Err(reason) = check_control_endpoint(&self.control_endpoint) {
-            return refuse(reason);
+        // The address is required only when this proxy is meant to reach a
+        // control plane over the machine channel: a standalone proxy's
+        // identity is for the upstream leg, where it presents the certificate
+        // to nodes' data ports and has no control plane to dial. Demanding an
+        // endpoint there would make the data port's mutual TLS unusable
+        // without inventing a control plane to name.
+        if !self.control_endpoint.is_empty() {
+            if let Err(reason) = check_control_endpoint(&self.control_endpoint) {
+                return refuse(reason);
+            }
         }
         if let Err(error) = self.expected_control_identity() {
             return refuse(format!(
@@ -446,13 +450,31 @@ control_endpoint = "https://control.internal:8443"
     }
 
     #[test]
-    fn an_identity_with_nowhere_to_dial_is_refused_by_name() {
-        // The failure this catches is silent otherwise: the certificate
-        // loads, the log says so, and no routing table is ever fetched,
-        // because there is no address to fetch it from and no second way to
-        // reach a control plane left to fall back to.
+    fn an_identity_with_nowhere_to_dial_serves_the_upstream_leg_standalone() {
+        // An empty control_endpoint is how a standalone proxy says it has no
+        // control plane to dial: its certificate's second use is the upstream
+        // leg, where it presents itself to nodes' data ports, and demanding a
+        // machine channel here would make that use impossible to configure.
+        // The pairing rule that used to live in this table - "no endpoint, no
+        // identity" - moved to `SystemConfig::validate`, which is the only
+        // place that can see both sections at once: a configuration that
+        // names [control] without an endpoint is still refused, there.
         let config = MachineIdentityConfig {
             control_endpoint: String::new(),
+            ..filled()
+        };
+        config
+            .validate()
+            .expect("a standalone identity has no control plane to name");
+    }
+
+    #[test]
+    fn a_malformed_endpoint_is_refused_by_name() {
+        // Written but wrong is still refused: an http:// endpoint reads as a
+        // way to turn the certificates off, and a portless one would dial
+        // whatever else listens on 443.
+        let config = MachineIdentityConfig {
+            control_endpoint: "http://control.internal:8443".to_string(),
             ..filled()
         };
         let error = config.validate().unwrap_err().to_string();

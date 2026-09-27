@@ -2016,10 +2016,12 @@ dependencies = [
  "colored",
  "deis-build",
  "deis-bundle",
+ "deis-capability",
  "deis-identity",
  "deis-queue",
  "deis-telemetry",
  "deis-wire",
+ "ed25519-dalek",
  "hex",
  "libc",
  "notify 6.1.1",
@@ -2148,6 +2150,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deis-build-core",
+ "deis-wire",
  "handlebars",
  "serde",
  "serde_json",
@@ -2223,6 +2226,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "deis-capability"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "deis-wire",
+ "ed25519-dalek",
+ "reqwest",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "deis-control"
 version = "0.1.0"
 dependencies = [
@@ -2238,10 +2259,12 @@ dependencies = [
  "deis-artifact",
  "deis-backend-migration",
  "deis-bundle",
+ "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",
  "deis-provider-driver",
  "deis-queue",
+ "deis-store",
  "deis-wire",
  "ed25519-dalek",
  "futures",
@@ -2342,6 +2365,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "deis-provider-driver-cloudflare"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "deis-build-core",
+ "deis-provider-driver",
+ "deis-wire",
+ "flate2",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "deis-proxy"
 version = "0.1.0"
 dependencies = [
@@ -2380,10 +2429,14 @@ dependencies = [
  "anyhow",
  "clap 4.6.6",
  "deis-backend-migration",
+ "deis-capability",
  "deis-wire",
+ "ed25519-dalek",
+ "hex",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2415,6 +2468,7 @@ dependencies = [
  "ctor",
  "dashmap 5.5.3",
  "deis-bundle",
+ "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",
  "deis-node-contract",
@@ -2427,6 +2481,7 @@ dependencies = [
  "deno_node_crypto",
  "deno_resolver",
  "deno_runtime",
+ "ed25519-dalek",
  "fs2",
  "futures-util",
  "hex",
@@ -2434,6 +2489,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "if-addrs",
  "moka",
  "num_cpus",
  "once_cell",
@@ -2471,10 +2527,14 @@ dependencies = [
  "anyhow",
  "clap 4.6.6",
  "deis-backend-migration",
+ "deis-capability",
  "deis-wire",
+ "ed25519-dalek",
+ "hex",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2500,10 +2560,14 @@ dependencies = [
  "chrono",
  "clap 4.6.6",
  "deis-backend-migration",
+ "deis-capability",
  "deis-wire",
+ "ed25519-dalek",
+ "hex",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2528,7 +2592,6 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
- "hmac",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
@@ -5605,6 +5668,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -5836,6 +5900,16 @@ checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9382,6 +9456,8 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -9389,6 +9465,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tokio-util",
  "tower 0.5.3",
  "tower-http 0.6.11",
@@ -9398,6 +9475,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -10048,6 +10126,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",

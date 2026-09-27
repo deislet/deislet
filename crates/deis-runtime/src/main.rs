@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
@@ -63,6 +63,20 @@ struct Cli {
     /// one, reports a port clash instead of the answer that was wanted.
     #[arg(long)]
     check_config: bool,
+
+    /// Build the startup snapshot named by DEIS_RUNTIME_SNAPSHOT_PATH and
+    /// exit without binding anything or starting an isolate.
+    ///
+    /// What it is for: the service unit runs with `ProtectHome=true` (and
+    /// would have every other read of the install tree closed off), so the
+    /// runtime can only start from a snapshot that already exists -- building
+    /// one means reading this crate's embedded extension scripts back from
+    /// the install tree, which a hardened unit must never do. The installer
+    /// runs this flag as root, as the same binary that will serve, after
+    /// every upgrade and before the first start: see
+    /// `scripts/canary/remote-install.sh`.
+    #[arg(long)]
+    warm_snapshot: bool,
 }
 
 /// The log level filter for this node: `RUST_LOG` when it is set, `info`
@@ -80,7 +94,13 @@ fn log_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
-/// Load this node's machine identity, if `[machine_identity]` was configured.
+/// Load this node's machine identity.
+///
+/// Configuration validation has already refused a node with no
+/// `[machine_identity]` at all - the data port is mutual TLS now, and a node
+/// that cannot present a certificate cannot serve the handshake it binds - so
+/// reaching here with a configuration that names none is a bug, not a state
+/// to survive.
 ///
 /// Fails rather than starting degraded, the same choice `deis-control`'s own
 /// `machine::listen::load_identity` makes: a node that was told to have an
@@ -101,28 +121,27 @@ fn log_filter() -> EnvFilter {
 /// refused an identity with no `machine_identity.control_endpoint` to dial, so the only
 /// way this returns `Err` is a file that does not read as the certificate, key
 /// or trust root it claims to be.
-fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIdentity>>> {
-    let Some(identity_config) = config.machine_identity.as_ref() else {
-        info!(
-            "No machine_identity configured; this node reaches no control plane and serves no \
-             management plane. A configuration naming [control] endpoint without it is refused \
-             before this point, so reaching here means a node that was asked to run alone"
-        );
-        return Ok(None);
-    };
+fn load_machine_identity(config: &RuntimeConfig) -> Result<Arc<MachineIdentity>> {
+    let identity_config = config.machine_identity.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "this node has no [machine_identity] table, which the configuration check should \
+             have refused: the data port admits a caller only over mutual TLS, and there is no \
+             certificate to serve that handshake with"
+        )
+    })?;
 
     // What this node's own listener will advertise, if it has one.
     //
     // `machine_identity.management_listen` is what decides that: with it set,
-    // this node serves its management plane over this identity and has to say
-    // during the handshake that the socket carries HTTP/2, because a gRPC
-    // client offering `h2` to a listener that advertised nothing leaves the
-    // two with no agreed protocol - which happens to work with hyper on both
-    // ends and stops working the moment anything stricter is in the path.
-    // Without it this process only dials, and a process that only dials
-    // advertises nothing. Either way what a *dialler* wants is decided per
-    // call - HTTP/2 for the assignment RPC, HTTP/1.1 for the bundle download
-    // - see `MachineIdentity::client_config`.
+    // this node serves its management plane over this identity and has to
+    // name its protocols during the handshake, because a gRPC client offering
+    // `h2` to a listener that advertised nothing leaves the two with no
+    // agreed protocol - which happens to work with hyper on both ends and
+    // stops working the moment anything stricter is in the path. Without it
+    // this process only dials, and a process that only dials advertises
+    // nothing. Either way what a *dialler* wants is decided per call -
+    // HTTP/2 for the assignment RPC, HTTP/1.1 for the bundle download - see
+    // `MachineIdentity::client_config`.
     let serves: &[deis_identity::Protocol] = match identity_config.management_listen_addr()? {
         Some(_) => dispatcher::machine::SERVES,
         None => &[],
@@ -193,7 +212,7 @@ fn load_machine_identity(config: &RuntimeConfig) -> Result<Option<Arc<MachineIde
         ),
     }
 
-    Ok(Some(identity))
+    Ok(identity)
 }
 
 /// Everything that has to happen while this process is still single-threaded.
@@ -225,9 +244,9 @@ fn main() -> Result<()> {
             .validate()
             .context("the configuration loaded but is not usable")?;
         println!(
-            "configuration is usable ({:?}): http port {}, machine channel {}, management plane {}",
+            "configuration is usable ({:?}): data port {}, machine channel {}, management plane {}",
             config_source,
-            config.http_port,
+            config.data_listen,
             config
                 .machine_identity
                 .as_ref()
@@ -239,6 +258,26 @@ fn main() -> Result<()> {
                 .and_then(|identity| identity.management_listen.clone())
                 .unwrap_or_else(|| "not configured - nothing can drive this node".to_string()),
         );
+        return Ok(());
+    }
+
+    if cli.warm_snapshot {
+        // Logging is not set up yet and does not need to be: this mode runs
+        // from an installer, and the operator reads its one line of output.
+        // Without DEIS_RUNTIME_SNAPSHOT_PATH there is nothing to warm -- the
+        // runtime would build its snapshot in memory every start, which is
+        // exactly the fs read at startup `ProtectHome=true` forbids.
+        let path = std::env::var("DEIS_RUNTIME_SNAPSHOT_PATH").map_err(|_| {
+            anyhow::anyhow!(
+                "--warm-snapshot needs DEIS_RUNTIME_SNAPSHOT_PATH set to the file the \n                 service will load its startup snapshot from"
+            )
+        })?;
+        match deis_runtime::runtime::load_or_create_startup_snapshot()? {
+            Some(_) => println!("startup snapshot is warm at {path}"),
+            None => anyhow::bail!(
+                "the startup snapshot did not load or build; the service would fail to start \n                 the same way this did"
+            ),
+        }
         return Ok(());
     }
 
@@ -267,12 +306,10 @@ async fn run(
     // built.
     let started_at = std::time::Instant::now();
 
-    let port = config.http_port;
-    // What this node registers as its address: its data port. It is what the
-    // fleet list shows and what the console links to, and it is not what the
-    // control plane drives - driving goes to the mutually authenticated
-    // management plane, whose address this node reports separately.
-    let management_port = port;
+    // Where the data port binds, parsed once: it decides the listener's
+    // address, the fetch policy's refusal of this node's own addresses, and
+    // the port the registration carries as this node's data address.
+    let data_addr = config.data_listen_addr()?;
     let node_id = config.resolved_node_id();
 
     let log_buffer = Arc::new(LogBuffer::new(config.logging.buffer_size));
@@ -308,7 +345,7 @@ async fn run(
     info!("====================================");
 
     info!("Node ID: {}", node_id);
-    info!("HTTP Port: {}", port);
+    info!("Data port: {} (mutual TLS)", data_addr);
     // Named out loud because it is the one thing an operator most often gets
     // wrong and least often sees: two nodes on one host, a unit file with a
     // stale path, a container whose file was never mounted. "Defaults" here
@@ -364,24 +401,60 @@ async fn run(
     // file; `AppRuntime::new` adds them when it builds the isolate.
     //
     // This node's own listener is in the list as well, on every spelling of
-    // the local machine. It is a service endpoint like the others: the
+    // the local machine: loopback, every address on every interface, and the
+    // addresses the operator says route to this node from outside it
+    // (`node.advertised_addresses`, for the public IP a cloud 1:1 NAT maps
+    // onto this node). They are all service endpoints like the others: the
     // dispatcher decides which application a request belongs to from the
     // `x-deis-app-id` header it is handed, so a handler that could open a
-    // connection to it -- headers of its own choosing included -- would be
-    // invoking another tenant's code on this node.
-    let own_listener = |host: &str| format!("http://{host}:{}", config.http_port);
-    let platform_endpoints: Vec<String> = config
+    // connection to the data port -- headers of its own choosing included --
+    // would be invoking another tenant's code on this node. Loopback alone
+    // would not cover the rest: on a machine whose public address sits on the
+    // NIC (or is hairpinned by the provider's NAT), `http://<public-ip>:<port>`
+    // reaches the same socket `127.0.0.1` does.
+    //
+    // The interface enumeration is a startup snapshot; an address that
+    // appears later (DHCP renewal, hot-plugged NIC) is not picked up, which
+    // is what `node.advertised_addresses` is the escape hatch for. The data
+    // port authenticates its callers now, so this refusal is layered on top
+    // of that handshake rather than standing in for it: an application that
+    // could reach the port at all is stopped before the conversation starts.
+    let own_listener = |host: String| format!("http://{host}:{}", data_addr.port());
+    let interface_addresses = local_addresses().map_err(|e| {
+        anyhow::anyhow!(
+            "listing this machine's interface addresses, which the outbound fetch policy \
+             needs so the node's own data port is refused under every address it answers \
+             at: {e}"
+        )
+    })?;
+    let mut platform_endpoints: Vec<String> = config
         .control
         .endpoint
         .iter()
         .chain(config.logging.endpoint.iter())
         .cloned()
         .chain([
-            own_listener("127.0.0.1"),
-            own_listener("[::1]"),
-            own_listener("localhost"),
+            own_listener("127.0.0.1".to_string()),
+            own_listener("[::1]".to_string()),
+            own_listener("localhost".to_string()),
         ])
+        .chain(
+            interface_addresses
+                .iter()
+                .map(|addr| own_listener(url_host(*addr))),
+        )
+        .chain(
+            config
+                .node
+                .advertised_addresses
+                .iter()
+                .map(|addr| own_listener(addr.to_string())),
+        )
         .collect();
+    // The enumeration finds loopback again beside the spellings above; one
+    // entry per endpoint keeps the startup line and deno's deny list tidy.
+    let mut seen_endpoints = std::collections::HashSet::new();
+    platform_endpoints.retain(|endpoint| seen_endpoints.insert(endpoint.clone()));
     let fetch_policy = FetchPolicy::new(&config.fetch.allow, &platform_endpoints)
         .map_err(|e| anyhow::anyhow!("building the outbound fetch policy: {e}"))?;
 
@@ -390,6 +463,8 @@ async fn run(
         ApplicationManager::new_with_repo(app_repo.clone())
             .with_limits(config.default_execution_limits.clone())
             .with_memory_limit_mb(config.default_memory_limit_mb)
+            .with_admission_wait_ms(config.admission_wait_ms)
+            .with_overload_retry_after_secs(config.overload_retry_after_seconds)
             .with_fetch_policy(fetch_policy.clone()),
     );
     info!(
@@ -418,9 +493,13 @@ async fn run(
     // Deployment delivery: bundles land here and versions are loaded from
     // here, whether the control plane pushed them or this node asked for them.
     let deployer = Arc::new(
-        DeploymentManager::from_config(app_manager.clone(), &config, machine_identity.clone())
-            .await
-            .context("preparing the bundle directory")?,
+        DeploymentManager::from_config(
+            app_manager.clone(),
+            &config,
+            Some(Arc::clone(&machine_identity)),
+        )
+        .await
+        .context("preparing the bundle directory")?,
     );
     info!(
         bundle_dir = %config.bundle_dir().display(),
@@ -434,8 +513,34 @@ async fn run(
     // answer that says "starting" rather than a refused connection.
     let health = NodeHealth::starting();
 
+    // The last resort against a runaway isolate is the kernel's, not this
+    // process's: a cgroup v2 memory.max, with the unit file's OOMPolicy
+    // deciding what a trip costs. Look for it once, now, and let readiness
+    // carry the answer -- a node without one still serves, but says so
+    // (docs/adr/018-resource-backstops.md).
+    match deis_runtime::resource::backstop::detect(
+        Path::new("/proc/self/cgroup"),
+        Path::new("/sys/fs/cgroup"),
+    ) {
+        Ok(backstop) => {
+            health.note_resource_backstop(backstop.limit_bytes, backstop.where_from.clone());
+            if let Some(bytes) = backstop.limit_bytes {
+                info!(
+                    limit_bytes = bytes,
+                    "This node's memory backstop is a cgroup v2 memory.max of {} bytes", bytes
+                );
+            }
+        }
+        Err(err) => {
+            health.note_resource_backstop(
+                None,
+                format!("/proc/self/cgroup could not be read: {err}"),
+            );
+        }
+    }
+
     let assignment_client =
-        AssignmentClient::from_config(&config, &node_id, machine_identity.clone())
+        AssignmentClient::from_config(&config, &node_id, Some(Arc::clone(&machine_identity)))
             .context("building the control plane client")?;
     match &assignment_client {
         Some(client) => info!(
@@ -449,18 +554,32 @@ async fn run(
         ),
     }
 
+    // Secret values are fetched over the same machine channel, right before
+    // a deployment that binds them is built. Set before the control loop and
+    // the management plane start, so no deployment can arrive ahead of it.
+    if let Some(channel) = assignment_client
+        .as_ref()
+        .and_then(AssignmentClient::machine_channel_client)
+    {
+        deployer.fetch_secrets_through(deis_runtime::deployment::SecretSource::new(
+            channel,
+            node_id.clone(),
+        ));
+    }
+
     // Which door this node announces itself at is the configuration's to
     // decide, the same way the assignment fetch's is; without an endpoint of
     // either kind there is nobody to register with, which is the standalone
     // case the loop below says out loud before reporting the node ready.
     //
-    // The management port, not the data port: a registration is the address
-    // the control plane dials ApplyDeployment and OnScheduled at, and
-    // `[management] listen` may have moved that plane off the public listener.
+    // The data port is what the fleet list shows and what the console links
+    // to; it is not what the control plane drives with. Driving goes to the
+    // mutually authenticated management plane, whose address this node
+    // reports separately as `machine_address`.
     let registrar = NodeRegistrar::from_config(
         &config,
-        NodeRegistration::of_this_node(node_id.clone(), management_port),
-        machine_identity.clone(),
+        NodeRegistration::of_this_node(node_id.clone(), data_addr.port()),
+        Some(Arc::clone(&machine_identity)),
     )
     .context("building the node registration client")?;
     if let Some(registrar) = &registrar {
@@ -484,34 +603,22 @@ async fn run(
 
     info!("====================================");
     info!("✅ Runtime Platform ready to serve!");
-    info!("📡 Accepting traffic on port {}", port);
-    match config
-        .machine_identity
-        .as_ref()
-        .and_then(|identity| identity.management_listen_addr().ok().flatten())
-    {
-        Some(addr) => info!(
-            "🔧 Management API (gRPC) on {addr}, mutual TLS only - the data port above serves \
-             no management call at all"
-        ),
-        None => warn!(
-            "🔧 No management API: this node has no [machine_identity] management_listen, so \
-             its control plane has nowhere to push a deployment or fire a cron. It serves what it \
-             pulled and nothing changes it"
-        ),
-    }
+    info!(
+        "📡 Data port on {} - mutual TLS only, a proxy's certificate is what admits",
+        data_addr
+    );
     info!("====================================");
 
-    // The mutually authenticated management plane, when this node has both
-    // an identity and an address to serve it on. The identity is the same one
-    // the assignment client and the bundle fetcher dial with, so one renewal
-    // reaches everything this node proves itself with.
-    let machine_management = match (&machine_identity, config.machine_identity.as_ref()) {
-        (Some(identity), Some(identity_config)) => identity_config
+    // The mutually authenticated management plane, when this node names an
+    // address to serve it on. The identity is the same one the assignment
+    // client and the bundle fetcher dial with, so one renewal reaches
+    // everything this node proves itself with.
+    let machine_management = match config.machine_identity.as_ref() {
+        Some(identity_config) => identity_config
             .management_listen_addr()?
             .map(|listen| -> Result<MachineManagement> {
                 Ok(MachineManagement {
-                    identity: identity.clone(),
+                    identity: Arc::clone(&machine_identity),
                     listen,
                     // The same name this node dials, and for the same reason:
                     // a node takes its instructions from the control plane it
@@ -521,7 +628,7 @@ async fn run(
                 })
             })
             .transpose()?,
-        _ => None,
+        None => None,
     };
 
     // Start HTTP + gRPC server (reuse same port). Returns once a shutdown
@@ -531,10 +638,11 @@ async fn run(
         deployer,
         health,
         node_id,
-        port,
+        data_listen: data_addr,
         started_at,
         shutdown_grace: config.shutdown_grace_period(),
         max_request_body_bytes: config.max_request_body_bytes,
+        identity: Arc::clone(&machine_identity),
         machine_management,
     })
     .await?;
@@ -558,6 +666,29 @@ async fn run(
     info!("👋 Runtime Platform stopped");
 
     Ok(())
+}
+
+/// Every unicast address on this machine's interfaces, loopback included.
+///
+/// A startup snapshot: an interface that appears or changes while the node
+/// runs is not picked up. This is the stopgap half of refusing the node's
+/// own data port to applications; authentication on the port itself is the
+/// fix that retires both.
+fn local_addresses() -> std::io::Result<Vec<std::net::IpAddr>> {
+    Ok(if_addrs::get_if_addrs()?
+        .into_iter()
+        .map(|interface| interface.ip())
+        .collect())
+}
+
+/// An IP address spelled the way a URL's host component wants it: an IPv6
+/// address in brackets, without which `http://::1:8086` parses as an empty
+/// host and the fetch policy refuses to build at startup.
+fn url_host(addr: std::net::IpAddr) -> String {
+    match addr {
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+    }
 }
 
 #[cfg(test)]

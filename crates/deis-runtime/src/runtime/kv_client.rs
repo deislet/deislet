@@ -356,45 +356,63 @@ mod tests {
     struct Store {
         _data: TempDir,
         endpoint: String,
+        signing_key: ed25519_dalek::SigningKey,
         shutdown: Option<oneshot::Sender<()>>,
     }
 
-    /// The shared secret an authenticated install holds in three places:
-    /// deis-control, deis-store and deis-queue.
-    const AUTH_SECRET: &str = "the-secret-both-halves-hold";
-
     impl Store {
-        /// The single-box default: no `auth_secret`, so the store serves a
-        /// call that carries only the tenant it claims.
+        /// Start a store with capability-based auth using an ephemeral key.
         async fn start() -> Self {
-            Self::start_with(None).await
+            Self::start_with_key(crate::runtime::test_store::test_signing_key()).await
         }
 
-        async fn start_with(auth_secret: Option<&str>) -> Self {
+        async fn start_with_key(signing_key: ed25519_dalek::SigningKey) -> Self {
             let data = TempDir::new().expect("temp dir");
+            let verifying_key = signing_key.verifying_key();
             let config = Config {
                 listen: "127.0.0.1:0".to_string(),
                 data_dir: data.path().to_path_buf(),
-                auth_secret: auth_secret.map(str::to_string),
                 ..Config::default()
             };
-            // Bind before spawning, so the port is known and no test has to
-            // wait for the server to come up.
             let listener = server::bind(&config).await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
             let (shutdown, rx) = oneshot::channel();
             tokio::spawn(async move {
-                server::serve(config, listener, async {
-                    let _ = rx.await;
-                })
+                server::serve(
+                    config,
+                    listener,
+                    async {
+                        let _ = rx.await;
+                    },
+                    deis_capability::KeyRing::from_keys([verifying_key]),
+                )
                 .await
                 .expect("serve");
             });
             Self {
                 _data: data,
                 endpoint: format!("http://{addr}"),
+                signing_key,
                 shutdown: Some(shutdown),
             }
+        }
+
+        fn capability_token_for(&self, tenant: &str) -> String {
+            use deis_capability::{encode, CapabilityClaims, CapabilityResource};
+            use std::time::Duration;
+            let claims = CapabilityClaims::new(
+                "store",
+                "spiffe://deislet/control/main",
+                "spiffe://deislet/node/test",
+                1,
+                Duration::from_secs(900),
+                vec![CapabilityResource {
+                    tenant: tenant.to_string(),
+                    binding: "kv".to_string(),
+                    generation: None,
+                }],
+            );
+            encode(&claims, &self.signing_key)
         }
 
         /// A client for one tenant, wired the way an application binding is:
@@ -405,9 +423,10 @@ mod tests {
             KvClient::connect_lazy(&self.endpoint, &identity).expect("client is built")
         }
 
-        /// The common case: a store with no `auth_secret`, so no token.
+        /// The common case: a store that always yields a proven client.
         fn client(&self, tenant: &str) -> KvClient {
-            self.binding(tenant, None)
+            let token = self.capability_token_for(tenant);
+            self.binding(tenant, Some(&token))
         }
     }
 
@@ -743,9 +762,9 @@ mod tests {
         // from it, and the client stamps it beside the tenant it claims.
         // Asserting on the header alone would not catch the two halves
         // computing different values.
-        let store = Store::start_with(Some(AUTH_SECRET)).await;
+        let store = Store::start().await;
         let tenant = "demo.production";
-        let token = deis_wire::storage_token(AUTH_SECRET, tenant);
+        let token = store.capability_token_for(tenant);
 
         let unproven = store.binding(tenant, None);
         let error = unproven
@@ -786,15 +805,15 @@ mod tests {
         // the expected value from the tenant the call itself claims, so
         // presenting production's token while naming the preview proves
         // nothing.
-        let store = Store::start_with(Some(AUTH_SECRET)).await;
-        let production_token = deis_wire::storage_token(AUTH_SECRET, "demo.production");
+        let store = Store::start().await;
+        let production_token = store.capability_token_for("demo.production");
 
         let error = store
             .binding("demo.preview-7", Some(&production_token))
             .set("k".to_string(), b"v".to_vec())
             .await
             .expect_err("one environment's token must not authorise another's namespace");
-        assert_eq!(refusal(&error), tonic::Code::Unauthenticated, "{error:#}");
+        assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
     }
 
     #[tokio::test]
@@ -804,7 +823,7 @@ mod tests {
         // check them is a legal intermediate state during a rollout, and it
         // must keep working.
         let store = Store::start().await;
-        let token = deis_wire::storage_token(AUTH_SECRET, "demo.production");
+        let token = store.capability_token_for("demo.production");
 
         let client = store.binding("demo.production", Some(&token));
         client
@@ -842,7 +861,7 @@ mod tests {
         // again. Without this an app whose store restarted would keep failing
         // until the app itself was reloaded.
         let store = Store::start().await;
-        let client = store.binding("demo.production", None);
+        let client = store.client("demo.production");
 
         client
             .set("k".to_string(), b"v".to_vec())

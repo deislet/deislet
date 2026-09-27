@@ -5,6 +5,15 @@
 //! `deis-build-adapter-cloudflare`. That correspondence is the whole naming
 //! rule, and [`VENDOR`] plus the test at the bottom of this file is what
 //! keeps a rename from quietly breaking it.
+//!
+//! The adapter builds from the standard
+//! [`binding plan`](deis_build_core::build_binding_plan): every logical
+//! resource the project declares is mapped onto the provider section that
+//! hosts it, and what the build emits for the resource itself is only the
+//! plan's unresolved placeholder. The provider driver resolves those
+//! placeholders from the deployment state at prepare time, before any
+//! provider tool runs - so the build never invents a resource identifier,
+//! and nothing it emits can deploy against the wrong one.
 
 /// The `--vendor` value this adapter answers for.
 ///
@@ -14,7 +23,8 @@
 pub const VENDOR: &str = "cloudflare";
 
 use deis_build_core::{
-    javascript_runtime_module, javascript_string, AdapterArtifacts, ProjectConfig, StaticAsset,
+    build_binding_plan, javascript_runtime_module, javascript_string, AdapterArtifacts,
+    BindingKind, ProjectConfig, StaticAsset,
 };
 
 /// Where the compiler stages this project's static files inside the Cloudflare
@@ -24,6 +34,15 @@ use deis_build_core::{
 /// whatever `[assets] directory` names and nothing else, so a copy that landed
 /// anywhere else would be uploaded as inert weight.
 pub const ASSETS_DIR: &str = "assets";
+
+/// The file the adapter writes the binding plan into, beside `wrangler.toml`.
+///
+/// `wrangler.toml` has to be valid wrangler configuration, so it carries the
+/// placeholders *inline* where wrangler's own schema wants an identifier. This
+/// file is the machine-readable half the provider driver reads first: it names
+/// every logical binding, its kind and its placeholder, so the driver resolves
+/// from the plan instead of scraping TOML.
+pub const BINDING_PLAN_FILE: &str = "binding-plan.json";
 
 pub fn generate(
     routes: &[(String, String)],
@@ -43,47 +62,48 @@ pub fn generate_with_node_compat(
     assets: &[StaticAsset],
     node_compat: bool,
 ) -> anyhow::Result<AdapterArtifacts> {
-    refuse_unplanned_resources(config)?;
+    // The plan is the gate and the source of truth. A project that asks for
+    // something this target does not map - a service binding, `callableBy`,
+    // an unnamed legacy service, a name the provider environment cannot
+    // spell - fails here with `EC_BINDING_TARGET_UNIMPLEMENTED`, before any
+    // artifact is emitted. Everything below plans only what the plan agreed
+    // to.
+    let plan = build_binding_plan(config)?;
+    let plan_json = serde_json::to_string_pretty(&plan)?;
+
+    // Everything above runs only for a planned Worker: the resources that
+    // reach wrangler.toml come from the plan's placeholders, and nothing is
+    // invented here.
     let environment_declarations =
         deis_build_core::resolve_environment_declaration_entries(config)?;
     let environment_declarations_json = serde_json::to_string(&environment_declarations)?;
-    let has_kv = config
-        .services
-        .as_ref()
-        .and_then(|s| s.kv.as_ref())
-        .map(|kv| kv.enabled)
-        .unwrap_or(false);
 
-    let has_database = config
-        .services
-        .as_ref()
-        .and_then(|s| s.database.as_ref())
-        .map(|db| db.enabled)
-        .unwrap_or(false);
+    // Deployment-time `config` values become `[vars]`, one placeholder per
+    // declared name. The build has no values - they are deployment-only and
+    // deliberately kept out of canonical build identity - so the driver
+    // resolves each one at prepare from the deployment's config, exactly as
+    // it resolves resource identifiers. Secrets are never written here: they
+    // go to the provider through its secret command, not through a file.
+    let config_var_names = environment_declarations
+        .iter()
+        .filter(|declaration| declaration.kind == deis_wire::EnvironmentKind::Config)
+        .map(|declaration| declaration.name.clone())
+        .collect::<Vec<_>>();
 
     // 1. Generate Context Builder Code
-    let context_builder_code =
-        generate_context_builder_code(has_kv, &environment_declarations_json);
+    let context_builder_code = generate_context_builder_code(&environment_declarations_json);
 
-    // 2. Generate KV Adapter Code
-    let kv_adapter_code = if has_kv {
-        Some(generate_kv_adapter_code())
-    } else {
-        None
-    };
+    // 2. Generate Router Code
+    let router_code = generate_router_code(routes, node_compat, &environment_declarations_json);
 
-    // 3. Generate Router Code
-    let router_code =
-        generate_router_code(routes, has_kv, node_compat, &environment_declarations_json);
-
-    // 4. Generate Config Files
+    // 3. Generate Config Files
     let mut config_files = Vec::new();
 
     // wrangler.toml
     //
-    // Everything in it comes from the project file. Three things used to be
-    // invented here instead, and all three were wrong in the same way - the
-    // author read them back as their own:
+    // Everything in it comes from the project file or the binding plan.
+    // Three things used to be invented here instead, and all three were
+    // wrong in the same way - the author read them back as their own:
     //
     //   * `compatibility_date = "2024-09-23"`, a fixed day, whatever date the
     //     project pinned. A compatibility date is the whole mechanism for
@@ -119,52 +139,16 @@ pub fn generate_with_node_compat(
         ));
     }
 
-    let wrangler_toml = format!(
-        r#"name = "{}"
-main = "index.js"
-compatibility_date = "{compatibility_date}"
-{}{}{}{}"#,
-        config.name,
-        if node_compat {
-            "compatibility_flags = [\"nodejs_compat\"]\n"
-        } else {
-            ""
-        },
-        if assets.is_empty() {
-            String::new()
-        } else {
-            // What makes wrangler upload and serve the project's static files.
-            // Without it the directory is deployed and never looked at, which
-            // is what happened to every Cloudflare build before this: the files
-            // were not even copied.
-            format!(
-                r#"
-[assets]
-directory = "./{ASSETS_DIR}"
-"#
-            )
-        },
-        if has_kv {
-            r#"
-[[kv_namespaces]]
-binding = "KV"
-id = ""  # Add your KV namespace ID
-"#
-        } else {
-            ""
-        },
-        if has_database {
-            r#"
-[[d1_databases]]
-binding = "DB"
-database_name = ""  # Add your D1 database name
-database_id = ""    # Add your D1 database ID
-"#
-        } else {
-            ""
-        }
+    let wrangler_toml = generate_wrangler_toml(
+        &plan,
+        &config.name,
+        &config_var_names,
+        compatibility_date,
+        assets,
+        node_compat,
     );
     config_files.push(("wrangler.toml".to_string(), wrangler_toml));
+    config_files.push((BINDING_PLAN_FILE.to_string(), plan_json));
 
     // package.json
     let package_json = format!(
@@ -180,7 +164,7 @@ database_id = ""    # Add your D1 database ID
     Ok(AdapterArtifacts {
         router_code,
         context_builder_code,
-        kv_adapter_code,
+        kv_adapter_code: None,
         config_files,
         support_files: vec![(
             "edge-canon-runtime.js".to_string(),
@@ -189,36 +173,142 @@ database_id = ""    # Add your D1 database ID
     })
 }
 
-fn refuse_unplanned_resources(config: &ProjectConfig) -> anyhow::Result<()> {
-    let enabled_service = config.services.as_ref().is_some_and(|services| {
-        [
-            services.kv.as_ref(),
-            services.database.as_ref(),
-            services.blob.as_ref(),
-            services.queue.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|service| service.enabled)
-    });
-    if !config.bindings.is_empty() || enabled_service || !config.callable_by.is_empty() {
-        anyhow::bail!(
-            "EC_BINDING_TARGET_UNIMPLEMENTED: the cloudflare adapter requires a resolved standard binding plan; it does not emit empty provider resource identifiers"
-        );
+/// Render `wrangler.toml` from the binding plan.
+///
+/// Every provider resource identifier this writes is the plan's unresolved
+/// placeholder - never an empty string, never an invented one. The comment
+/// above each says what resolves it, so a person reading the file meets the
+/// same contract the driver enforces.
+fn generate_wrangler_toml(
+    plan: &deis_build_core::BindingPlan,
+    project_name: &str,
+    config_var_names: &[String],
+    compatibility_date: &str,
+    assets: &[StaticAsset],
+    node_compat: bool,
+) -> String {
+    // Assembled section by section rather than formatted in one giant
+    // literal: a stable section order is what keeps the output deterministic
+    // across builds (and across the driver's placeholder rewrites), and each
+    // section's tests can assert on its own slice.
+    let mut sections = String::new();
+
+    sections.push_str(&format!(
+        "name = {}\nmain = \"index.js\"\ncompatibility_date = \"{compatibility_date}\"\n",
+        javascript_string(project_name),
+    ));
+
+    if node_compat {
+        sections.push_str("compatibility_flags = [\"nodejs_compat\"]\n");
     }
-    Ok(())
+
+    // Cron triggers, verbatim from the project file.
+    if !plan.crons.is_empty() {
+        let crons = plan
+            .crons
+            .iter()
+            .map(|cron| javascript_string(cron))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sections.push_str(&format!("\n[triggers]\ncrons = [{crons}]\n"));
+    }
+
+    for binding in &plan.bindings {
+        match binding.kind {
+            BindingKind::Kv => sections.push_str(&format!(
+                "\n[[kv_namespaces]]\nbinding = {}\n# Resolved by the deis provider driver at \
+                 prepare time from the deployment state; this placeholder is replaced, never \
+                 deployed.\nid = {}\n",
+                javascript_string(&binding.name),
+                javascript_string(&binding.provider_resource_ref),
+            )),
+            BindingKind::Database => sections.push_str(&format!(
+                "\n[[d1_databases]]\nbinding = {}\ndatabase_name = {}\n# Resolved by the deis \
+                 provider driver at prepare time from the deployment state; this placeholder is \
+                 replaced, never deployed.\ndatabase_id = {}\n",
+                javascript_string(&binding.name),
+                javascript_string(&binding.name),
+                javascript_string(&binding.provider_resource_ref),
+            )),
+            BindingKind::Blob => sections.push_str(&format!(
+                "\n[[r2_buckets]]\nbinding = {}\n# The bucket name is the driver's provisioning \
+                 decision; the placeholder is replaced at prepare time from the deployment \
+                 state.\nbucket_name = {}\n",
+                javascript_string(&binding.name),
+                javascript_string(&binding.provider_resource_ref),
+            )),
+            BindingKind::Queue => sections.push_str(&format!(
+                "\n[[queues.producers]]\nbinding = {}\n# The queue is named, not identified: the \
+                 driver provisions a queue with this logical name at prepare time.\nqueue = {}\n",
+                javascript_string(&binding.name),
+                javascript_string(&binding.provider_resource_ref),
+            )),
+        }
+    }
+
+    for consumer in &plan.queue_consumers {
+        sections.push_str(&format!(
+            "\n[[queues.consumers]]\nqueue = {}\nmax_retries = {}\n",
+            javascript_string(&consumer.queue),
+            consumer.max_retries,
+        ));
+        if let Some(batch_size) = consumer.max_batch_size {
+            sections.push_str(&format!("max_batch_size = {batch_size}\n"));
+        }
+        if let Some(concurrency) = consumer.max_concurrency {
+            sections.push_str(&format!("max_concurrency = {concurrency}\n"));
+        }
+    }
+
+    if !config_var_names.is_empty() {
+        sections.push_str("\n[vars]\n");
+        for name in config_var_names {
+            sections.push_str(&format!(
+                "{name} = {}\n",
+                javascript_string(&format!("deis:unresolved/config/{name}"))
+            ));
+        }
+    }
+
+    if !assets.is_empty() {
+        // What makes wrangler upload and serve the project's static files.
+        // Without it the directory is deployed and never looked at, which
+        // is what happened to every Cloudflare build before this: the files
+        // were not even copied.
+        sections.push_str(&format!("\n[assets]\ndirectory = \"./{ASSETS_DIR}\"\n"));
+    }
+
+    // One piece, top to bottom.
+    sections
 }
 
 fn generate_router_code(
     routes: &[(String, String)],
-    has_kv: bool,
     node_compat: bool,
     environment_declarations_json: &str,
 ) -> String {
     let mut imports = String::new();
     let mut route_handlers = String::new();
+    let mut queue_import: Option<String> = None;
+    let mut scheduled_import: Option<String> = None;
 
     for (i, (route, import_path)) in routes.iter().enumerate() {
+        // A root `_queue` or `_scheduled` file is an event handler the
+        // platform calls, not a request route. It gets an export of its own
+        // below, never a place in the fetch table.
+        match deis_build_core::routes::handler_kind(import_path) {
+            deis_build_core::routes::HandlerKind::Queue => {
+                queue_import = Some(import_path.clone());
+                continue;
+            }
+            deis_build_core::routes::HandlerKind::Scheduled => {
+                scheduled_import = Some(import_path.clone());
+                continue;
+            }
+            deis_build_core::routes::HandlerKind::Reserved
+            | deis_build_core::routes::HandlerKind::Http => {}
+        }
+
         let import_literal = javascript_string(import_path);
         let route_literal = javascript_string(route);
         let wildcard_name = deis_build_core::routes::wildcard_name(
@@ -245,11 +335,39 @@ fn generate_router_code(
         ));
     }
 
-    let _kv_import = if has_kv {
-        "import { createKVAdapter } from './adapters/kv-adapter';\n"
-    } else {
-        ""
-    };
+    // The platform-called handlers. On this target the Workers runtime calls
+    // them with the native `(batch|event, env, ctx)`; the exports below are
+    // the bridge that builds the standard context from the native pieces and
+    // hands the handler the same three arguments Edge Canon fixes -
+    // `(batch, env, context)` and `(event, env, context)` - so a handler
+    // written to the canon runs here exactly as it runs on the self-hosted
+    // target (SPECIFICATION_EXT.md sections 3.1 and 3.2).
+    let mut event_exports = String::new();
+    if let Some(import) = &queue_import {
+        event_exports.push_str(&format!(
+            "\n// Queue consumer. Workers hands it a batch of messages; the export builds the\n\
+             \x20// standard context the canon's queue handler is defined against.\n\
+             import queueHandler from {};\n\
+             export async function queue(batch, env, ctx) {{\n\
+             \x20 const context = buildEventContext(env, ctx);\n\
+             \x20 return queueHandler(batch, context.env, context);\n\
+             }}\n",
+            javascript_string(import)
+        ));
+    }
+    if let Some(import) = &scheduled_import {
+        event_exports.push_str(&format!(
+            "\n// Cron handler. Workers triggers it on the `[triggers]` schedule; the export\n\
+             \x20// builds the standard context the canon's scheduled handler is defined against.\n\
+             import scheduledHandler from {};\n\
+             export async function scheduled(event, env, ctx) {{\n\
+             \x20 const context = buildEventContext(env, ctx);\n\
+             \x20 return scheduledHandler(event, context.env, context);\n\
+             }}\n",
+            javascript_string(import)
+        ));
+    }
+
     let node_runtime_import = if node_compat {
         "import { runWithEdgeCanonNodeEnv } from 'edge-canon:node-runtime';\nimport { edgeCanonProcessEnvironment } from './edge-canon-runtime.js';\n"
     } else {
@@ -268,11 +386,22 @@ fn generate_router_code(
  * See: https://developers.cloudflare.com/workers/
  */
 
-import {{ invokeEdgeCanonHandler, edgeCanonFailureResponse, matchRoute }} from './edge-canon-runtime.js';
+import {{ invokeEdgeCanonHandler, edgeCanonFailureResponse, matchRoute, createEdgeCanonContext, materializeEdgeCanonEnvironment }} from './edge-canon-runtime.js';
 import {{ createContextBuilder }} from './adapters/context-builder';
 {node_runtime_import}{imports}
 const EDGE_CANON_ENVIRONMENT_DECLARATIONS = {environment_declarations_json};
 
+// The context a queue batch or a cron tick is answered with: no request, no
+// path, the provider's execution context for `waitUntil`.
+function buildEventContext(env, ctx) {{
+  return createEdgeCanonContext(
+    null,
+    materializeEdgeCanonEnvironment(env, EDGE_CANON_ENVIRONMENT_DECLARATIONS),
+    {{}},
+    ctx && typeof ctx.waitUntil === 'function' ? ctx.waitUntil.bind(ctx) : undefined
+  );
+}}
+{event_exports}
 export default {{
   async fetch(request, env, ctx) {{
     try {{
@@ -292,17 +421,7 @@ export default {{
     )
 }
 
-fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &str) -> String {
-    let kv_import = if has_kv {
-        "import { createKVAdapter } from './kv-adapter';\n"
-    } else {
-        ""
-    };
-    let kv_binding = if has_kv {
-        "if (env && env.KV) standardEnv.KV = createKVAdapter(env.KV);"
-    } else {
-        ""
-    };
+fn generate_context_builder_code(environment_declarations_json: &str) -> String {
     format!(
         r#"/**
  * Edge Canon context bridge for Cloudflare Workers.
@@ -311,7 +430,7 @@ fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &s
  * request, env, params and waitUntil, as required by EC-WEB v1.
  */
 
-{kv_import}import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
+import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
 
 const EDGE_CANON_ENVIRONMENT_DECLARATIONS = {environment_declarations_json};
 
@@ -322,7 +441,6 @@ export function createContextBuilder(env: any, ctx: any) {{
       env,
       EDGE_CANON_ENVIRONMENT_DECLARATIONS
     );
-    {kv_binding}
     return createEdgeCanonContext(
       request,
       standardEnv,
@@ -333,57 +451,6 @@ export function createContextBuilder(env: any, ctx: any) {{
 }}
 "#
     )
-}
-
-fn generate_kv_adapter_code() -> String {
-    r#"/**
- * Cloudflare KV Adapter
- */
-
-export function createKVAdapter(namespace: any) {
-  return {
-    async get(key: string): Promise<string | null> {
-      return namespace.get(key);
-    },
-
-    async getJSON<T = any>(key: string): Promise<T | null> {
-      return namespace.get(key, 'json');
-    },
-
-    async put(key: string, value: string, options?: any): Promise<void> {
-      await namespace.put(key, value, {
-        expirationTtl: options?.expirationTtl,
-        metadata: options?.metadata
-      });
-    },
-
-    async putJSON<T = any>(key: string, value: T, options?: any): Promise<void> {
-      await namespace.put(key, JSON.stringify(value), {
-        expirationTtl: options?.expirationTtl,
-        metadata: options?.metadata
-      });
-    },
-
-    async delete(key: string): Promise<void> {
-      await namespace.delete(key);
-    },
-
-    async list(options?: any) {
-      const result = await namespace.list(options);
-      return {
-        keys: result.keys,
-        list_complete: result.list_complete,
-        cursor: result.cursor
-      };
-    },
-
-    async exists(key: string): Promise<boolean> {
-      return (await namespace.get(key)) !== null;
-    }
-  };
-}
-"#
-    .to_string()
 }
 
 #[cfg(test)]

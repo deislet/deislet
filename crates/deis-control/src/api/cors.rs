@@ -2,14 +2,13 @@
 //!
 //! # Why this is not `CorsLayer::permissive()` any more
 //!
-//! It was, and that was the third leg of a takeover. `api_auth_enabled`
-//! defaults to off, an unauthenticated caller is admitted when the peer is on
-//! this machine, and `CorsLayer::permissive()` answered every preflight with
-//! `access-control-allow-origin: *`. Put together, any page the operator
-//! visited in a browser on the box could `fetch()` the control plane with no
-//! credential, create an owner account, mint an unscoped root token, deploy,
-//! and read the audit log - and *read every answer*, because `*` is exactly
-//! the permission to read the response.
+//! It was, and that was the third leg of a takeover. `CorsLayer::permissive()`
+//! answered every preflight with `access-control-allow-origin: *`, so any
+//! page the operator visited in a browser could `fetch()` the control plane -
+//! and *read every answer*, because `*` is exactly the permission to read the
+//! response. The gate now demands a credential from every caller, but the
+//! permissive layer let the page read refusals too, and an origin list is
+//! what stops that.
 //!
 //! The console this binary serves needs none of that. It is delivered from
 //! this same port, so its calls are same-origin and a browser sends them
@@ -31,10 +30,9 @@
 //! to be written down. Cookies are never in play (the credential is a header
 //! on every route), so `Access-Control-Allow-Credentials` stays off.
 //!
-//! Being listed here grants no authority. A page on another origin does not
-//! get the unauthenticated admission a directly connected tool on this
-//! machine gets; it presents a token like any other remote caller. See
-//! [`crate::api::authz::authorize`].
+//! Being listed here grants no authority. A page on another origin presents a
+//! token like any other remote caller; the origin list is what lets the
+//! browser read the answers at all. See [`crate::api::authz::authorize`].
 
 use std::time::Duration;
 

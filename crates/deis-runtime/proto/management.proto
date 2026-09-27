@@ -186,16 +186,15 @@ message ApplyDeploymentRequest {
     string canonical_environment_id = 10;
 
     // Exact Edge Canon declaration and version-bound binding snapshot. JSON is
-    // RFC 8785 canonical UTF-8. Both are present together for schema-2 native
-    // bundles and absent together only on legacy schema-1 deployments.
+    // RFC 8785 canonical UTF-8. Always present.
     string environment_declarations_json = 11;
     string environment_snapshot_json = 12;
     string environment_snapshot_id = 13;
 
-    // Plaintext secret values keyed by the opaque revision ids named in the
-    // snapshot. Names and config values remain in the canonical snapshot;
-    // this map is the only secret-bearing addition and must never be logged.
-    map<string, string> secret_values_by_revision = 14;
+    // Secret values no longer travel in the deployment message; nodes fetch
+    // them on demand through FetchSecretValues on the machine channel.
+    reserved 14;
+    reserved "secret_values_by_revision";
 
     // Durable control-plane operation identity. Empty only for an older
     // producer or local development. It is echoed in every observation so a
@@ -210,19 +209,20 @@ message ApplyDeploymentRequest {
 
     // PREPARE builds and verifies a candidate without moving production;
     // ACTIVATE enables triggers/current-version bookkeeping after the route
-    // selector has committed; ABORT discards an unactivated candidate. The
-    // unspecified/legacy value preserves rolling compatibility with an older
-    // control plane and performs the historical one-call apply.
+    // selector has committed; ABORT discards an unactivated candidate.
     DeploymentAction action = 17;
 }
 
 enum DeploymentAction {
     DEPLOYMENT_ACTION_UNSPECIFIED = 0;
-    LEGACY_APPLY = 1;
+    // LEGACY_APPLY = 1 was the historical one-call apply.  Schema-1 bundles
+    // are removed; a deployment now always arrives as Prepare + Activate.
+    reserved 1;
+    reserved "LEGACY_APPLY";
     PREPARE = 2;
     ACTIVATE = 3;
-  ABORT = 4;
-  DRAIN = 5;
+    ABORT = 4;
+    DRAIN = 5;
 }
 
 // A version's compatibility declaration, exactly as its manifest spells it.
@@ -284,12 +284,11 @@ message ResourceLimits {
     // Memory limit (MB)
     int32 memory_mb = 1;
 
-    // CPU *share* in millicores. Carried since the first version of this
-    // message and enforced by nothing: a share only means something to a
-    // scheduler that hands out fractions of a core, and a node here pins one
-    // isolate to one thread. What is actually enforced is cpu_time_limit_ms
-    // below. Kept so older control planes keep parsing.
-    int32 cpu_milli = 2;
+    // Field 2 was cpu_milli, a Kubernetes-style CPU *share* that nothing on a
+    // node here could enforce: an isolate is pinned to one thread, and the
+    // enforced ceiling is cpu_time_limit_ms. Removed rather than left dead;
+    // the number is reserved so a future field cannot silently reuse it.
+    reserved 2;
 
     // Maximum concurrent requests
     int32 max_concurrency = 3;
@@ -312,6 +311,16 @@ message ResourceLimits {
     // node's is applied. CPU time is the node's resource, not the
     // application's, so an app may give itself less of it but never more.
     int64 cpu_time_limit_ms = 7;
+
+    // Per-app override of the platform default ceiling on this app's
+    // concurrently open outbound connections. 0 means "use the platform
+    // default".
+    //
+    // Narrowing only, like every field here. Every open outbound connection
+    // is a file descriptor and a live socket on a runtime thread the
+    // application shares with its neighbours, so the node's number is the
+    // ceiling and an app may hold itself below it but never above.
+    int64 max_outbound_connections = 8;
 }
 
 // Routing rule.

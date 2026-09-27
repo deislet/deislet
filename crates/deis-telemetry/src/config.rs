@@ -1,25 +1,11 @@
 //! Operator-facing configuration.
 //!
-//! # `listen`, `metrics_listen` and `auth_secret` are one decision, not three
+//! Every call must carry an Ed25519-signed capability token in
+//! `Authorization: Bearer <token>`. Writes use `aud="telemetry"` and reads
+//! and scrapes use `aud="telemetry.read"`. The verifying key is configured
+//! via `capability_public_key` or fetched from the control plane.
 //!
-//! Whether a caller is authenticated at all is decided by `auth_secret`, and
-//! what happens when it is absent depends on where the two ports are bound:
-//!
-//! * `auth_secret` set: every application telemetry gRPC call and every
-//!   scrape must carry the capability token for this service, wherever it is
-//!   bound. Health is public and optional migration management has its own
-//!   credential. See [`crate::auth`].
-//! * No `auth_secret`, both ports on loopback: the service runs exactly as it
-//!   did before tokens existed - callers are believed, and what keeps one
-//!   application's logs away from an unrelated client is that the client
-//!   cannot reach the ports. This is the default single-box install and it is
-//!   supported; the service says so at startup, at `warn`.
-//! * No `auth_secret`, either port anywhere else: the service refuses to
-//!   start.
-//!
-//! Both ports count, because both hand out other people's data: the gRPC port
-//! serves logs and traces, the Prometheus port serves every application's
-//! metric series.
+//! Health is public and optional migration management has its own credential.
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -30,11 +16,8 @@ use std::path::PathBuf;
 pub struct Config {
     /// Address the gRPC server binds to.
     ///
-    /// Loopback by default, because the default install configures no
-    /// `auth_secret` and then the only thing keeping one application's logs
-    /// away from an unrelated client is that the client cannot reach the
-    /// port. Binding anywhere else without an `auth_secret` is refused at
-    /// startup rather than warned about; see the module documentation.
+    /// Loopback by default. Every call must carry a valid capability token
+    /// regardless of the bind address.
     #[serde(default = "default_listen")]
     pub listen: String,
     /// Address the Prometheus text endpoint binds to. It is a separate port
@@ -45,19 +28,17 @@ pub struct Config {
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    /// Shared secret this service's capability token is derived from, or
-    /// `None` to run with no caller authentication at all.
+    /// The control plane's capability verifying key, in hex.
     ///
-    /// The token is `base64(HMAC-SHA256(auth_secret, "deis-telemetry"))` and
-    /// every producer, reader and scraper must present it once this is set.
-    /// It authenticates the channel, not the application: see [`crate::auth`]
-    /// for why this service cannot derive a token per tenant the way
-    /// deis-store does, and for what that does and does not buy.
-    ///
-    /// `None` is only permitted with both ports on loopback - [`crate::auth`]
-    /// has the reasoning and the refusal.
+    /// This is the Ed25519 public key that deis-control uses to sign
+    /// capability tokens.
     #[serde(default)]
-    pub auth_secret: Option<String>,
+    pub capability_public_key: Option<String>,
+    /// The control-plane URL for the T8 revocation-list endpoint.
+    ///
+    /// Defaults to `http://127.0.0.1:8100`.
+    #[serde(default = "default_revocation_list_url")]
+    pub revocation_list_url: String,
     /// Independent bearer credential for the backend migration management
     /// RPCs. When absent those RPCs are not registered; ingest still opens
     /// and enforces the durable fence journal so removing this credential
@@ -161,13 +142,18 @@ fn default_metrics_export_window_secs() -> u64 {
     300
 }
 
+fn default_revocation_list_url() -> String {
+    "http://127.0.0.1:8100".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
-            auth_secret: None,
+            capability_public_key: None,
+            revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             log_retention_days: default_log_retention_days(),
             metric_retention_days: default_metric_retention_days(),
@@ -190,8 +176,8 @@ impl std::fmt::Debug for Config {
             .field("metrics_listen", &self.metrics_listen)
             .field("data_dir", &self.data_dir)
             .field(
-                "auth_secret",
-                &self.auth_secret.as_ref().map(|_| "<redacted>"),
+                "capability_public_key",
+                &self.capability_public_key.as_ref().map(|_| "<redacted>"),
             )
             .field(
                 "migration_admin_token",
@@ -316,7 +302,7 @@ mod tests {
     #[test]
     fn credentials_are_parsed_but_never_printed_by_debug() {
         let config: Config = toml::from_str(
-            "auth_secret = \"application-telemetry-secret\"\nmigration_admin_token = \"migration-administrator-secret-000001\"",
+            "capability_public_key = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\nmigration_admin_token = \"migration-administrator-secret-000001\"",
         )
         .unwrap();
         assert_eq!(
@@ -324,7 +310,6 @@ mod tests {
             Some("migration-administrator-secret-000001")
         );
         let debug = format!("{config:?}");
-        assert!(!debug.contains("application-telemetry-secret"));
         assert!(!debug.contains("migration-administrator-secret-000001"));
         assert!(debug.contains("<redacted>"));
     }

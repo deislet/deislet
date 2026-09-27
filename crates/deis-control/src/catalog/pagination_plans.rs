@@ -1171,6 +1171,7 @@ async fn seed_provider_rows(
             ProviderCredentialBindingSpec {
                 backend_id: "cloudflare-workers-pages".to_owned(),
                 name: "plan-evidence".to_owned(),
+                account_id: None,
             },
             CredentialMaterial::new(b"plan-evidence-credential".to_vec()).unwrap(),
             operation_context("plan-evidence-credential"),

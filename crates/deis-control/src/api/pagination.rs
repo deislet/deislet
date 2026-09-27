@@ -236,10 +236,14 @@ mod tests {
     /// control plane runs on - the shape `api::tests` builds, so these two
     /// refusals are asserted on the same mounts a client meets.
     async fn get(uri: &str) -> (StatusCode, Value) {
-        let (router, _dir) = crate::api::tests::full_router().await;
+        let (router, _dir, secret) = crate::api::tests::full_router().await;
         let mut request = Request::builder()
             .method("GET")
             .uri(uri)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {secret}"),
+            )
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(
@@ -251,9 +255,8 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    /// What a client of the structured surfaces reads when it asks for a
-    /// page it cannot have: the code and the parameter, on both refusals -
-    /// while the flat tree keeps answering the one string it always did.
+    /// What a client reads when it asks for a page it cannot have: the
+    /// code and the parameter, on both refusals.
     #[tokio::test]
     async fn the_v1_surface_names_the_page_parameter_it_refused() {
         let (status, body) = get("/api/v1/apps?limit=1001").await;
@@ -273,19 +276,11 @@ mod tests {
         );
         assert_eq!(body["error"]["target"]["field"], "cursor");
 
-        // The legacy tree is untouched: one key, the same sentence.
+        // The old flat spelling is not a route of this listener any more:
+        // the refusal is the route fallback's, not the pagination one.
         let (status, body) = get("/api/apps?limit=1001").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body,
-            serde_json::json!({"error": "limit must be between 1 and 1000"})
-        );
-        let (status, body) = get("/api/apps?cursor=not-a-cursor").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body,
-            serde_json::json!({ "error": crate::catalog::INVALID_CURSOR_MESSAGE })
-        );
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "route-not-found");
     }
 
     #[test]
@@ -295,8 +290,8 @@ mod tests {
         assert_eq!(bounded_limit(Some(MAX_LIST_LIMIT)).unwrap(), MAX_LIST_LIMIT);
     }
 
-    /// The sentence is frozen (the legacy tree answers it byte for byte);
-    /// the code and the target are what a structured client reads.
+    /// The code and the target are what a client reads; the message is the
+    /// same sentence the code names.
     #[test]
     fn a_limit_outside_the_range_is_refused_as_limit_out_of_range() {
         for limit in [0, MAX_LIST_LIMIT + 1, usize::MAX] {
@@ -304,7 +299,6 @@ mod tests {
             assert_eq!(error.status(), StatusCode::BAD_REQUEST);
             assert_eq!(error.code(), codes::LIMIT_OUT_OF_RANGE);
             let detail = error.into_detail();
-            assert_eq!(detail.legacy_message, "limit must be between 1 and 1000");
             assert_eq!(detail.message, "limit must be between 1 and 1000");
             let target = detail.target.expect("the refusal names the parameter");
             assert_eq!(target.resource, "query");
@@ -355,7 +349,7 @@ mod tests {
             .expect_err("a uuid is not an event id");
         assert_eq!(error.code(), codes::CURSOR_INVALID);
         assert_eq!(
-            error.into_detail().legacy_message,
+            error.into_detail().message,
             "events cursor position is malformed"
         );
         // A position without the sort text was issued for an integer-sorted

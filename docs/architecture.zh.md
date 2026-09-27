@@ -7,6 +7,8 @@
 
 > v0.4 · 2026-08-29
 > 定位：**mini 版 Cloudflare Workers + Pages，执行引擎换成 Deno（deno_core）**，面向自己/团队内部使用。
+> 信任模型：deislet 假设同一安装内的应用代码可信；V8 isolate 是资源隔离，不是安全沙箱。
+> 目标口径：自托管（deislet）与 Cloudflare 为支持的目标；Deno、EdgeOne 仅生成无状态函数产物，不做认证，不承诺绑定。
 > 配套 [`implementation-plan.zh.md`](implementation-plan.zh.md)：那份讲「照着写什么」，这份讲「为什么这么分」。
 
 **现在这套东西是通的。** 波次 A 与波次 B 已经合入：`deis build --vendor deislet`
@@ -57,14 +59,14 @@ flowchart TB
         平台侧：deploy / versions / rollback / status / secret<br/>logs / tail / trace / kv / db / blob"]
         deis-build["<b>deis-build</b> · 编译器
         SWC 解析 + rolldown 打包 + 目标产物实现检查
-        四个目标：cloudflare / deno / tencent / deislet"]
+        构建目标：deislet / cloudflare（支持）；deno / tencent（冻结，仅无状态函数）"]
     end
 
     subgraph third["线 B · 第三方平台"]
         direction LR
-        CFW["Cloudflare Workers"]
-        DD["Deno Deploy"]
-        EO["腾讯 EdgeOne"]
+        CFW["Cloudflare Workers（支持目标）"]
+        DD["Deno Deploy（冻结：仅无状态函数）"]
+        EO["腾讯 EdgeOne（冻结：仅无状态函数）"]
     end
 
     subgraph self["线 A · 自建平台"]
@@ -89,7 +91,7 @@ flowchart TB
     REST + React 面板 + Prometheus"]
 
     coraza["<b>coraza</b> · WAF"]
-    capkit["<b>capkit</b> · 多云能力"]
+    capkit["<b>capkit</b> · 外部资源供应（提案，未接入）"]
 
     canon -.规范.-> deis-build
     canon -.规范.-> deis-runtime
@@ -353,10 +355,10 @@ flowchart TB
 **原来卡住的两件事已经通了**：
 
 - **路径级路由**。deis-proxy 现在每 5 秒向控制面要一次整张路由表，按拉到的表选应用，
-  所以 `example.com/api/*` 给 API 应用、`example.com/*` 给站点应用可以共存了。配了
-  `[machine_identity]` 的 proxy 走机队通道，`deis.machine.MachineChannel/FetchRoutingTable`，
-  证明一张只属于这个 proxy 自己的证书；没配的仍走老路，`GET /api/routing-table`
-  带 `node_preshared_keys`。这条链路的三个关键取舍：**用轮询不用推送**，因为轮询自愈——不管
+  所以 `example.com/api/*` 给 API 应用、`example.com/*` 给站点应用可以共存了。proxy
+  走 `deis.machine.MachineChannel/FetchRoutingTable`，证明一张只属于这个 proxy 自己的
+  证书。老路（`GET /api/routing-table` 带 `node_preshared_keys`）在 a7ba508 起已关闭——
+  没配 `[machine_identity]` 的 proxy 启动即拒。这条链路的三个关键取舍：**用轮询不用推送**，因为轮询自愈——不管
   是断连、控制面重启还是某次校验没过，下一次拉取都会修好，而推送方案最后都得再配
   一个周期性全量对齐才敢信；**控制面不可达时最后一张表无限期继续生效**，一次管理面
   故障不该变成一次用户可见的故障（只有从来没拉成功过的 proxy 例外，它退回本机配置里
@@ -456,8 +458,8 @@ sequenceDiagram
 再来一次。RPC 叫 `Register`：登记是在陈述「这个节点是什么」，不是请求创建一条记录，
 所以掉线又回来的节点原样再证一次就行；同一个通道上的 `Deregister` 是节点主动离场。
 注册不是拿活的方式——没注册的节点照样自取并服务它拉到的每个应用，只是收不到推送、
-也不会被选中跑 cron。`node_preshared_keys` 这个字段仍然存在，是给一支还没把每台
-机器都换上证书的机队留的兼容路径；配了 `[machine_identity]` 的节点，登记认的是证书。
+也不会被选中跑 cron。`node_preshared_keys` 这个字段在 a7ba508 起已删除——
+现在根本没有机队共用的凭据了。配了 `[machine_identity]` 的节点，登记认的是证书。
 
 **「一把凭据整支机队共用」已经不是现状了。** 现在每台机器——deis-control、每个
 deis-runtime 节点、每个 deis-proxy——都持有自己的一张证书，证书上唯一的 URI SAN 是
@@ -466,9 +468,9 @@ deis-runtime 节点、每个 deis-proxy——都持有自己的一张证书，�
 私钥、一份信任根，进程按周期重新读这三个文件，续期不必重启。机队通道认的是这张
 证书，拿到一张节点证书的人只能代表它命名的那一台节点说话，读不到别的节点的
 assignments（全部环境的明文密钥、每个租户的存储 capability token）、下载不了跟它无关
-的 bundle、也驱动不了别的节点的管理面。`node_preshared_keys` 若还配着，`[machine]`
-留空这个列表时这次运行干脆不铸一把机队共用的值；旧模型下「一个值等于全部机队」那种
-风险仍是残留在还没切完 mTLS 的部分该防的东西，节点数据端口 `0.0.0.0` 这道信任边界
+的 bundle、也驱动不了别的节点的管理面。`node_preshared_keys` 在 a7ba508 起已删除——
+现在根本没有机队共用的凭据了，`[machine_identity]` 本身就是 entry 条件。旧模型下「一个值等于全部机队」那种
+风险在 mTLS 迁移完成后已不存在，节点数据端口 `0.0.0.0` 这道信任边界
 也仍然存在。这些细节、各端口该对谁开放、每个配置文件的权限要求，写在
 [docs/trust-boundaries.md](trust-boundaries.md)（英文）。
 
@@ -589,10 +591,9 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 - **非回环地址 + 未配置**：**拒绝启动**，不是打 warn 放行。未配置不能悄悄等于
   「不设防也照样监听公网」——一旦真的绑定到别处，曾经顶替鉴权的那层收敛就不存在了。
   这一条曾经和控制面的节点通道是同一个形状：预共享密钥列表一旦为空，那条通道直接
-  关闭，而不是打开。现在两者分岔了——配了 `[machine]` 机队身份之后，这条通道认的
-  是证书，`node_preshared_keys` 留空是常态，不是关闭的理由；没配 `[machine]` 时才
-  回到旧形状：一个空列表会当场铸一把只在这次运行内有效的值，而不是打开一条谁都能
-  冒充节点的路。
+  关闭，而不是打开。a7ba508 起两者已统一——这条通道只认证书；
+  `node_preshared_keys` 这个字段已删除，`[machine_identity]` 本身就是 entry 条件，
+  没配的直接拒绝启动。
 
 配了 `auth_secret` 却没带令牌、令牌对不上租户、或者干脆没带 `x-deis-tenant`，三种
 情况都在拿到任何数据**之前**被拒——tonic 拦截器挡在每个 handler 前面
@@ -788,11 +789,12 @@ fence，不把这种管理能力交给普通 producer/reader。
   `api_auth_enabled` 影响，也不接受面板 API Key。这条路会把全部环境的明文密钥当
   JSON 返回，所以它根本不在人用的那个监听口上——早前它挂在那儿，靠的是默认关闭的
   面板鉴权管不着的另一把凭据（`node_preshared_keys`），等于任何能连到控制面 HTTP
-  端口、又握着这把值的人 curl 一次就能拿走整个平台的密钥；`node_preshared_keys` 这
-  个字段还在，是给还没切完 mTLS 的机队留的兼容路径。
+  端口、又握着这把值的人 curl 一次就能拿走整个平台的密钥。`node_preshared_keys`
+  a7ba508 起已删除——这也是为什么 mTLS 一到位就立刻关掉老路的理由：留着这条路径
+  本身就是在留一把能打开整个平台的万能钥匙。
 - 本版**没有**做按租户分密钥（信封加密）：全部环境的密钥都用 `secret_key_file` 里的
-  同一把主密钥加密，清单接口再明文发下去。所以一张能代表某台机器的证书，或者一支
-  机队里仍在起作用的 `node_preshared_keys` 值，打开的都是全部租户的明文。这条结论
+  同一把主密钥加密，清单接口再明文发下去。所以一张能代表某台机器的证书打开的就是
+  全部租户的明文（`node_preshared_keys` 路径在 a7ba508 已关闭）。这条结论
   连同它要求的端口边界与轮换步骤见
   [docs/trust-boundaries.md](trust-boundaries.md)（英文）。
 
@@ -947,8 +949,8 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
   （默认 7 天）记 `ERROR`，两种都写清第几次失败、还剩几天、下次什么时候试。
   **仍然要人手放的只剩通配证书**：RFC 8555 只允许 `dns-01` 签通配，这个实现不说那套
   协议。`crates/deis-proxy/tests/support/acme_ca.rs` 是一个只跑在环回口上的假 CA，
-  八个集成测试跑的都是真的 `deis-proxy` 进程；`scripts/demo.sh verify` 的「automatic
-  certificates」一组另有五条检查。
+  集成测试跑的都是真的 `deis-proxy` 进程；`scripts/demo.sh verify` 的「automatic
+  certificates」一组把同一件事在整套演示里再走一遍。
 - （已定）`deis dev` 怎么执行用户代码：起一个本地 `deis-runtime`，用控制面同一个
   `ApplyDeployment` 把包交给它。另外两条路——调 deno CLI、把 deno_core 嵌进 deis
   ——都不再考虑，因为它们跑的都不是线上那个引擎。
@@ -1221,7 +1223,7 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | WebAssembly | 成立 | V8 自带 |
 | WebSocket | 成立 | 服务端（`WebSocketPair` 桥接）与客户端（走 `fetch_policy.rs` 出网策略的 `WebSocket` 全局）都有；HTTP 升级、经过 deis-proxy 的一跳、文本帧与二进制帧都有真测试覆盖（`websocket_bridging_test.rs`、`websocket_through_proxy_test.rs`，见 §11） |
 | BroadcastChannel | **不成立** | `deno_web` 带着 `01_broadcast_channel.js` 被 import 进来了，但没有把 `BroadcastChannel` 装到 `globalThis` 上——8.1 节没要求它，`bootstrap.js` 补全局时就没带上。探针实测：`typeof BroadcastChannel === "undefined"`。真要开还有一层要想清楚：进程内广播是跨应用的，得先按 (应用, 环境) 隔离 |
-| 版本化 Node/npm 子集 | 部分成立，产品项仍 active | 构建器已按统一 Node 24.20.0 契约校验并内联锁定 npm 依赖；自建 runtime 以受限 façade 提供 18 个标准模块、`Buffer`、受限 `process` 与调度函数，且不暴露宿主 cwd/PID/Deno。运行时通用 `require`、文件系统和清单外 builtin 仍明确不可用；三个一等后端的同源 mandatory suite 与真实 provider evidence 尚未完成，不能据此宣称完整 Node runtime 或后端合规 |
+| 版本化 Node/npm 子集 | 部分成立，产品项仍 active | 构建器已按统一 Node 24.20.0 契约校验并内联锁定 npm 依赖；自建 runtime 以受限 façade 提供 18 个标准模块、`Buffer`、受限 `process` 与调度函数，且不暴露宿主 cwd/PID/Deno。运行时通用 `require`、文件系统和清单外 builtin 仍明确不可用；deislet 与 Cloudflare 两个支持目标的同源 mandatory suite 与真实 provider evidence 尚未完成，不能据此宣称完整 Node runtime 或后端合规 |
 | 服务端渲染 | 不成立（形态上没有） | 处理函数当然可以自己拼 HTML，但没有框架挂钩，也没有 npm 生态 |
 | 增量静态再生 | 不成立（形态上没有） | 同上 |
 | Durable Objects | 不成立（形态上没有） | 全量复制模型下没有「唯一可寻址实例」这回事 |
@@ -1298,7 +1300,7 @@ Workers AI 在项目配置里根本没有可声明的地方，所以编译器检
 - **可观测那一格加了按次调用的轨迹**：deis-telemetry 多了 `TraceService`，节点每处理
   完一次调用发一条，`deis trace` 读它；延迟从只升不降的高水位改成直方图，
   `histogram_quantile` 能直接算分位数。
-- **依赖**：前门从 pingora 0.5 升到 0.8.1（0.5 带两个请求走私漏洞，在多租户边缘上
+- **依赖**：前门从 pingora 0.5 升到 0.8.1（0.5 带两个请求走私漏洞，在多应用边缘上
   意味着一个租户的请求被交给另一个租户的应用），顺带堵上我们自己一个洞——请求体上限
   原来对任何带 `Upgrade` 头的请求一律放行，0.8 能看到节点到底有没有回 101，现在问的是
   这个。运行时离开 deno 私有分支改用发布版 `deno_runtime` 0.266，`cargo audit` 从 13

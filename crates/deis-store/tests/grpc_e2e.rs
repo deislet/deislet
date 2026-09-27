@@ -15,6 +15,7 @@ use deis_backend_migration::proto::backend_migration_client::BackendMigrationCli
 use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
+use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode};
 use deis_store::config::Config;
 use deis_store::proto::blob::{
     BlobInfo, PutHeader, PutRequest, blob_store_client::BlobStoreClient, get_response, put_request,
@@ -26,11 +27,68 @@ use deis_store::proto::storage::{
 };
 use deis_store::tenant::{BINDING_HEADER, TENANT_HEADER};
 use deis_store::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{APP_ID_HEADER, STORAGE_TOKEN_HEADER, storage_token, tenant_id};
+use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
+use ed25519_dalek::SigningKey;
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::Request;
 use tonic::transport::Channel;
+
+const AUTHORIZATION: &str = "authorization";
+const TOKEN_LIFETIME_SECS: u64 = 900;
+
+fn test_signing_key() -> SigningKey {
+    let mut seed = [0u8; 32];
+    seed[0..8].copy_from_slice(b"e2e-test");
+    SigningKey::from_bytes(&seed)
+}
+
+fn make_store_token(tenant: &str, binding: &str) -> String {
+    let claims = CapabilityClaims::new(
+        "store",
+        "spiffe://deislet/control/main",
+        "spiffe://deislet/node/test-node",
+        1,
+        Duration::from_secs(TOKEN_LIFETIME_SECS),
+        vec![CapabilityResource {
+            tenant: tenant.to_string(),
+            binding: binding.to_string(),
+            generation: None,
+        }],
+    );
+    encode(&claims, &test_signing_key())
+}
+
+/// Create a token that authorises all three storage bindings for one tenant.
+/// This lets any test call KvStore, Database or BlobStore with the same token.
+fn make_store_token_all_bindings(tenant: &str) -> String {
+    let claims = CapabilityClaims::new(
+        "store",
+        "spiffe://deislet/control/main",
+        "spiffe://deislet/node/test-node",
+        1,
+        Duration::from_secs(TOKEN_LIFETIME_SECS),
+        vec![
+            CapabilityResource {
+                tenant: tenant.to_string(),
+                binding: "kv".to_string(),
+                generation: None,
+            },
+            CapabilityResource {
+                tenant: tenant.to_string(),
+                binding: "sql".to_string(),
+                generation: None,
+            },
+            CapabilityResource {
+                tenant: tenant.to_string(),
+                binding: "blob".to_string(),
+                generation: None,
+            },
+        ],
+    );
+    encode(&claims, &test_signing_key())
+}
 
 /// A running server plus the temp directory holding its data.
 struct Harness {
@@ -42,41 +100,35 @@ struct Harness {
 }
 
 impl Harness {
-    /// The default single-box install: loopback, no `auth_secret`, so calls
-    /// need no token. Most tests below are about storage rather than about
-    /// who may call it.
+    /// All servers now require capability-based auth. The test key is used
+    /// so every test can mint valid tokens.
     async fn start() -> Self {
-        Self::start_with(None).await
+        let data = TempDir::new().unwrap();
+        let data_dir = data.path().to_path_buf();
+        Self::start_over(Some(data), data_dir, None).await
     }
 
     /// A server that requires a capability token, as any deployment that is
-    /// reachable off-host must.
-    async fn start_authenticated(secret: &str) -> Self {
-        Self::start_with(Some(secret.to_string())).await
+    /// reachable off-host must. The global test key is used.
+    async fn start_authenticated() -> Self {
+        Self::start().await
     }
 
     /// A server over a data directory the caller keeps, so the same one can
     /// be served twice.
     async fn start_on(data_dir: &std::path::Path) -> Self {
-        Self::start_over(None, data_dir.to_path_buf(), None, None).await
+        Self::start_over(None, data_dir.to_path_buf(), None).await
     }
 
     async fn start_migration_authenticated(token: &str) -> Self {
         let data = TempDir::new().unwrap();
         let data_dir = data.path().to_path_buf();
-        Self::start_over(Some(data), data_dir, None, Some(token.to_string())).await
-    }
-
-    async fn start_with(auth_secret: Option<String>) -> Self {
-        let data = TempDir::new().unwrap();
-        let data_dir = data.path().to_path_buf();
-        Self::start_over(Some(data), data_dir, auth_secret, None).await
+        Self::start_over(Some(data), data_dir, Some(token.to_string())).await
     }
 
     async fn start_over(
         owned: Option<TempDir>,
         data_dir: std::path::PathBuf,
-        auth_secret: Option<String>,
         migration_admin_token: Option<String>,
     ) -> Self {
         let config = Config {
@@ -85,7 +137,6 @@ impl Harness {
             // Small enough that the size limit is reachable in a test, large
             // enough for the multi-chunk object below.
             max_object_bytes: 8 * 1024 * 1024,
-            auth_secret,
             migration_admin_token,
             ..Config::default()
         };
@@ -94,10 +145,16 @@ impl Harness {
         let listener = server::bind(&config).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown, rx) = oneshot::channel();
+        let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
         tokio::spawn(async move {
-            server::serve(config, listener, async {
-                let _ = rx.await;
-            })
+            server::serve(
+                config,
+                listener,
+                async {
+                    let _ = rx.await;
+                },
+                keys,
+            )
             .await
             .unwrap();
         });
@@ -149,12 +206,18 @@ impl Drop for Harness {
     }
 }
 
-/// Stamp the tenant the way deis-runtime will have to.
+/// Stamp the tenant and a capability token the way deis-runtime will.
 fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
         .insert(TENANT_HEADER, tenant.parse().unwrap());
+    request.metadata_mut().insert(
+        AUTHORIZATION,
+        format!("Bearer {}", make_store_token_all_bindings(tenant))
+            .parse()
+            .unwrap(),
+    );
     request
 }
 
@@ -166,12 +229,19 @@ fn as_migration_admin<T>(token: &str, message: T) -> Request<T> {
     request
 }
 
+/// Stamp the tenant header WITHOUT a capability token. Only use this
+/// in tests that deliberately check that calls without tokens are refused.
+fn as_tenant_no_token<T>(tenant: &str, message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request
+        .metadata_mut()
+        .insert(TENANT_HEADER, tenant.parse().unwrap());
+    request
+}
+
 /// Stamp the tenant *and* the binding, the way deis-runtime does for a
-/// declared `db`, `kv` or `blob` binding.
-///
-/// The two are separate headers because they are separate facts: the tenant
-/// is what the capability token authorises, and the binding only says which
-/// namespace *inside* it the call wants.
+
+/// Stamp the tenant, binding, and capability token.
 fn as_binding<T>(tenant: &str, binding: &str, message: T) -> Request<T> {
     let mut request = as_tenant(tenant, message);
     request
@@ -179,24 +249,23 @@ fn as_binding<T>(tenant: &str, binding: &str, message: T) -> Request<T> {
         .insert(BINDING_HEADER, binding.parse().unwrap());
     request
 }
-
-/// Stamp the tenant *and* the capability token minted for `token_tenant`
-/// under `secret`, the way deis-runtime will have to once a secret is
-/// configured.
+/// authorising `binding`, the way deis-runtime will have to.
 ///
 /// The two tenants are separate arguments on purpose: presenting a token
 /// minted for one tenant on a call that claims another is exactly the attack
 /// the derivation is meant to defeat, and it has to be expressible here.
 fn as_tenant_with_token<T>(
     tenant: &str,
-    secret: &str,
     token_tenant: &str,
+    binding: &str,
     message: T,
 ) -> Request<T> {
     let mut request = as_tenant(tenant, message);
     request.metadata_mut().insert(
-        STORAGE_TOKEN_HEADER,
-        storage_token(secret, token_tenant).parse().unwrap(),
+        AUTHORIZATION,
+        format!("Bearer {}", make_store_token(token_tenant, binding))
+            .parse()
+            .unwrap(),
     );
     request
 }
@@ -477,7 +546,7 @@ async fn a_request_without_a_usable_tenant_is_refused() {
         }))
         .await
         .unwrap_err();
-    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
     for bad in [
         // Would escape the data directory.
@@ -1331,7 +1400,7 @@ async fn the_application_header_alone_does_not_identify_a_tenant() {
         .metadata_mut()
         .insert(APP_ID_HEADER, "app-one".parse().unwrap());
     let status = kv.get(request).await.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
 
 // ---- the capability token, over a real server -------------------------
@@ -1344,15 +1413,14 @@ async fn the_application_header_alone_does_not_identify_a_tenant() {
 
 #[tokio::test]
 async fn a_signed_call_is_served_when_a_secret_is_configured() {
-    let secret = "an-operator-secret";
-    let harness = Harness::start_authenticated(secret).await;
+    let harness = Harness::start_authenticated().await;
     let tenant = tenant_id("app-one", "production");
     let mut kv = harness.kv().await;
 
     kv.set(as_tenant_with_token(
         &tenant,
-        secret,
         &tenant,
+        "kv",
         SetRequest {
             key: "greeting".to_string(),
             value: b"hello".to_vec(),
@@ -1366,8 +1434,8 @@ async fn a_signed_call_is_served_when_a_secret_is_configured() {
     let got = kv
         .get(as_tenant_with_token(
             &tenant,
-            secret,
             &tenant,
+            "kv",
             GetRequest {
                 key: "greeting".to_string(),
             },
@@ -1382,14 +1450,13 @@ async fn a_signed_call_is_served_when_a_secret_is_configured() {
 async fn every_service_refuses_a_call_that_carries_no_token() {
     // One case per service: they are registered one by one, so this is three
     // separate pieces of evidence that the guard was applied.
-    let secret = "an-operator-secret";
-    let harness = Harness::start_authenticated(secret).await;
+    let harness = Harness::start_authenticated().await;
     let tenant = tenant_id("app-one", "production");
 
     let status = harness
         .kv()
         .await
-        .get(as_tenant(
+        .get(as_tenant_no_token(
             &tenant,
             GetRequest {
                 key: "greeting".to_string(),
@@ -1402,7 +1469,7 @@ async fn every_service_refuses_a_call_that_carries_no_token() {
     let status = harness
         .database()
         .await
-        .query(as_tenant(
+        .query(as_tenant_no_token(
             &tenant,
             QueryRequest {
                 sql: "SELECT 1".to_string(),
@@ -1416,7 +1483,7 @@ async fn every_service_refuses_a_call_that_carries_no_token() {
     let status = harness
         .blob()
         .await
-        .delete(as_tenant(
+        .delete(as_tenant_no_token(
             &tenant,
             deis_store::proto::blob::DeleteRequest {
                 precondition: None,
@@ -1433,7 +1500,7 @@ async fn every_service_refuses_a_call_that_carries_no_token() {
     let status = harness
         .blob()
         .await
-        .get(as_tenant(
+        .get(as_tenant_no_token(
             &tenant,
             deis_store::proto::blob::GetRequest {
                 range: None,
@@ -1456,8 +1523,7 @@ async fn a_token_minted_for_another_tenant_opens_nothing() {
     // one fleet-wide bearer credential: a token that leaked out of one
     // application must be useless against another, and against another
     // environment of its own.
-    let secret = "an-operator-secret";
-    let harness = Harness::start_authenticated(secret).await;
+    let harness = Harness::start_authenticated().await;
     let mine = tenant_id("app-one", "production");
 
     for claimed in [
@@ -1469,8 +1535,8 @@ async fn a_token_minted_for_another_tenant_opens_nothing() {
             .await
             .get(as_tenant_with_token(
                 &claimed,
-                secret,
                 &mine,
+                "kv",
                 GetRequest {
                     key: "greeting".to_string(),
                 },
@@ -1479,7 +1545,7 @@ async fn a_token_minted_for_another_tenant_opens_nothing() {
             .unwrap_err();
         assert_eq!(
             status.code(),
-            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
             "a token for {mine} must not open {claimed}"
         );
     }
@@ -1487,22 +1553,40 @@ async fn a_token_minted_for_another_tenant_opens_nothing() {
 
 #[tokio::test]
 async fn a_token_from_a_different_secret_is_refused() {
-    // What a half-finished rotation looks like from the store's side.
-    let harness = Harness::start_authenticated("the-new-secret").await;
+    // What a half-finished key rotation looks like from the store's side.
+    // The server verifies with test_signing_key, but we mint a token with
+    // a different key — the signature will not verify.
+    let harness = Harness::start_authenticated().await;
     let tenant = tenant_id("app-one", "production");
-    let status = harness
-        .kv()
-        .await
-        .get(as_tenant_with_token(
-            &tenant,
-            "the-old-secret",
-            &tenant,
-            GetRequest {
-                key: "greeting".to_string(),
-            },
-        ))
-        .await
-        .unwrap_err();
+
+    // Sign with a different key than the one the server trusts.
+    let mut other_seed = [0u8; 32];
+    other_seed[0..8].copy_from_slice(b"otherkey");
+    let other_key = SigningKey::from_bytes(&other_seed);
+    let bad_claims = CapabilityClaims::new(
+        "store",
+        "spiffe://deislet/control/main",
+        "spiffe://deislet/node/test-node",
+        1,
+        Duration::from_secs(TOKEN_LIFETIME_SECS),
+        vec![CapabilityResource {
+            tenant: tenant.to_string(),
+            binding: "kv".to_string(),
+            generation: None,
+        }],
+    );
+    let bad_token = encode(&bad_claims, &other_key);
+    let mut request = as_tenant(
+        &tenant,
+        GetRequest {
+            key: "greeting".to_string(),
+        },
+    );
+    request.metadata_mut().insert(
+        AUTHORIZATION,
+        format!("Bearer {bad_token}").parse().unwrap(),
+    );
+    let status = harness.kv().await.get(request).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
 
@@ -1511,7 +1595,7 @@ async fn health_answers_without_a_token() {
     // The control plane probes liveness without knowing any tenant, and the
     // answer names none: a probe that needed a tenant credential is a probe
     // that cannot be made.
-    let harness = Harness::start_authenticated("an-operator-secret").await;
+    let harness = Harness::start_authenticated().await;
     let mut health = tonic_health::pb::health_client::HealthClient::new(harness.channel().await);
     let status = health
         .check(tonic_health::pb::HealthCheckRequest {
@@ -1527,10 +1611,9 @@ async fn health_answers_without_a_token() {
 }
 
 #[tokio::test]
-async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
-    // The fail-closed half. An operator who widens `listen` and changes
-    // nothing else gets a process that stops with an explanation, rather than
-    // one that serves every tenant's data to that network.
+async fn a_public_bind_still_works_when_authenticated() {
+    // All servers require capability-based auth. Serving on a public
+    // interface is fine as long as a verifying key is provided.
     let data = TempDir::new().unwrap();
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
@@ -1538,20 +1621,17 @@ async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
         ..Config::default()
     };
     let listener = server::bind(&config).await.unwrap();
-    // The listener is loopback, so the refusal is provoked with the address
-    // the process would actually be serving on.
     let public = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
     public.set_nonblocking(true).unwrap();
     let public = tokio::net::TcpListener::from_std(public).unwrap();
     drop(listener);
 
-    let error = server::serve(config, public, async {})
-        .await
-        .expect_err("a public bind with no auth_secret must not serve");
-    assert!(
-        format!("{error:#}").contains("auth_secret"),
-        "the refusal must name the missing setting: {error:#}"
-    );
+    let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
+    let result = server::serve(config, public, async {}, keys).await;
+    // With a verifying key always provided, binding on a public interface
+    // is allowed — capability auth secures every call regardless of
+    // interface.
+    assert!(result.is_ok());
 }
 
 /// The whole-node outage a named binding caused, driven over the wire and
@@ -1789,7 +1869,7 @@ async fn migration_management_is_absent_by_default_and_independently_authenticat
     let mut application_credential = Request::new(request(&backend_incarnation_id));
     application_credential
         .metadata_mut()
-        .insert(STORAGE_TOKEN_HEADER, "not-an-admin-token".parse().unwrap());
+        .insert(AUTHORIZATION, "Bearer not-an-admin-token".parse().unwrap());
     assert_eq!(
         migration
             .acquire_write_fence(application_credential)
@@ -1809,8 +1889,10 @@ async fn migration_management_is_absent_by_default_and_independently_authenticat
     let error = harness
         .kv()
         .await
-        .set(as_tenant(
+        .set(as_tenant_with_token(
             "shop.production",
+            "shop.production",
+            "kv",
             SetRequest {
                 key: "blocked".to_string(),
                 value: b"value".to_vec(),

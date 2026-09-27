@@ -1060,11 +1060,9 @@ async fn only_departed_targets_are_left(
         Some(at) => now.saturating_sub(at.timestamp()),
         None => age,
     };
-    if report
-        .failed
-        .iter()
-        .any(|failure| state.nodes.node(&failure.node).is_some() || gone_for(&failure.node) < deadline)
-    {
+    if report.failed.iter().any(|failure| {
+        state.nodes.node(&failure.node).is_some() || gone_for(&failure.node) < deadline
+    }) {
         return Ok(false);
     }
 
@@ -1166,15 +1164,14 @@ async fn abandon_departed_proxies(
 
         state
             .store
-            .record_deployment_proxy_observation(
-                DeploymentProxyObservation {
-                    plan_id: plan.id.clone(),
-                    proxy_id: proxy.clone(),
-                    observed_state: ABANDONED.to_string(),
-                    routing_table_version: String::new(),
-                    routing_generation: generation.to_string(),
-                    observed_at: now_secs(),
-                })
+            .record_deployment_proxy_observation(DeploymentProxyObservation {
+                plan_id: plan.id.clone(),
+                proxy_id: proxy.clone(),
+                observed_state: ABANDONED.to_string(),
+                routing_table_version: String::new(),
+                routing_generation: generation.to_string(),
+                observed_at: now_secs(),
+            })
             .await?;
     }
     Ok(())
@@ -1990,7 +1987,9 @@ async fn abort_prepared_plan(
         .push_to(payload, reason, &plan.target_ids)
         .await;
     record_target_report(state, plan, &report, "aborted", lease).await?;
-    if !report.fully_delivered() && !only_departed_targets_are_left(state, plan, &report, lease).await? {
+    if !report.fully_delivered()
+        && !only_departed_targets_are_left(state, plan, &report, lease).await?
+    {
         return Ok(false);
     }
     let terminal = state
@@ -2161,12 +2160,6 @@ mod tests {
     fn mutation_location_identifies_the_durable_plan_status_resource() {
         let plan = "018f2518-7e38-7f80-8000-000000000001";
         let headers =
-            deployment_plan_location(ApiPaths::on(ApiSurface::Legacy), "demo", "production", plan);
-        assert_eq!(
-            headers.get(LOCATION).unwrap(),
-            "/api/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001"
-        );
-        let headers =
             deployment_plan_location(ApiPaths::on(ApiSurface::V1), "demo", "production", plan);
         assert_eq!(
             headers.get(LOCATION).unwrap(),
@@ -2174,9 +2167,10 @@ mod tests {
         );
     }
 
-    /// The same deployment route, reached through the legacy tree and
-    /// through `/api/v1`, points the caller at the plan under the prefix it
-    /// used: a v1 client is never sent back to a deprecated path.
+    /// The same deployment route, reached under the prefix the request
+    /// context names, points the caller at the plan under that prefix: a
+    /// v1 client is never handed a path this router does not serve. The
+    /// harness carries no surface, so its answer is spelled for v1.
     #[tokio::test]
     async fn a_plan_location_is_spelled_for_the_surface_the_caller_used() {
         let h = harness(true).await;
@@ -2218,7 +2212,7 @@ mod tests {
             (
                 &h.router,
                 "/api/apps/demo/environments/production/deployments",
-                "/api/apps/demo/environments/production/deployment-plans/",
+                "/api/v1/apps/demo/environments/production/deployment-plans/",
             ),
             (
                 &v1,
@@ -2523,7 +2517,12 @@ mod tests {
             .get_environment("demo", "production")
             .await
             .unwrap();
-        let version = h.state.store.get_version("demo", &version_id).await.unwrap();
+        let version = h
+            .state
+            .store
+            .get_version("demo", &version_id)
+            .await
+            .unwrap();
 
         // A machine that was on the fleet when the plan was made and is not on
         // it now. Never registered here, which is the same thing this control
@@ -2696,7 +2695,12 @@ mod tests {
             .get_environment("demo", "production")
             .await
             .unwrap();
-        let version = h.state.store.get_version("demo", &version_id).await.unwrap();
+        let version = h
+            .state
+            .store
+            .get_version("demo", &version_id)
+            .await
+            .unwrap();
         let owner = CanonicalId::new_v7();
         let plan = h
             .state

@@ -405,10 +405,9 @@ async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_an
             environment_declarations_json: String::new(),
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
-            secret_values_by_revision: Default::default(),
             deployment_id: String::new(),
             routing_generation: String::new(),
-            action: DeploymentAction::LegacyApply as i32,
+            action: DeploymentAction::Unspecified as i32,
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -464,10 +463,9 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_i
             environment_declarations_json: String::new(),
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
-            secret_values_by_revision: Default::default(),
             deployment_id: String::new(),
             routing_generation: String::new(),
-            action: DeploymentAction::LegacyApply as i32,
+            action: DeploymentAction::Unspecified as i32,
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -514,10 +512,9 @@ async fn a_partial_canonical_identity_is_refused_before_the_bundle_is_fetched() 
             environment_declarations_json: String::new(),
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
-            secret_values_by_revision: Default::default(),
             deployment_id: String::new(),
             routing_generation: String::new(),
-            action: DeploymentAction::LegacyApply as i32,
+            action: DeploymentAction::Unspecified as i32,
         }))
         .await
         .unwrap()
@@ -615,19 +612,18 @@ mod decoding_the_limits_a_deployment_carries {
     fn every_field_an_application_can_narrow_survives_the_wire() {
         let decoded = decode_limits(Wire {
             memory_mb: 48,
-            cpu_milli: 500,
             max_concurrency: 0,
             resource_table_max: 16,
             timeout_ms: 2_000,
             rate_limit_ops_per_sec: 40.0,
             cpu_time_limit_ms: 250,
+            max_outbound_connections: 0,
         });
         assert_eq!(decoded.memory_mb, 48);
         assert_eq!(decoded.timeout_ms, Some(2_000));
         assert_eq!(decoded.rate_limit_ops_per_sec, Some(40.0));
         assert_eq!(decoded.cpu_time_limit_ms, Some(250));
         assert_eq!(decoded.resource_table_max, Some(16));
-        assert_eq!(decoded.cpu_milli, 500, "carried, though nothing applies it");
     }
 
     /// proto3 signs its integers, so a negative value is representable even

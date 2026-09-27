@@ -17,7 +17,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use deis_wire::conventions::{STORAGE_TOKEN_HEADER, storage_token};
+use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+use sha2::{Digest, Sha256};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
@@ -107,7 +108,7 @@ pub fn entry_matches_environment(fields: &HashMap<String, String>, environment: 
 /// bottom of this file, which does depend on it as a test-only dependency, is
 /// what stops the two drifting apart. `deis_runtime::telemetry` holds a third
 /// copy for the same reason and is pinned the same way.
-const TELEMETRY_CHANNEL: &str = "deis-telemetry";
+const TELEMETRY_CHANNEL: &str = "telemetry.read";
 
 /// The token this CLI presents on every telemetry call, or nothing when no
 /// secret is configured.
@@ -151,7 +152,23 @@ impl TelemetryCredential {
         };
         // A blank secret is already filtered out by the resolver, so anything
         // arriving here is a real value.
-        let derived = storage_token(&setting.value, TELEMETRY_CHANNEL);
+        let hash = Sha256::digest(setting.value.as_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let claims = CapabilityClaims::new(
+            "telemetry.read",
+            "deis-control",
+            "deis-cli",
+            0,
+            std::time::Duration::from_secs(900),
+            vec![CapabilityResource {
+                tenant: String::new(),
+                binding: String::new(),
+                generation: None,
+            }],
+        );
+        let derived = encode(&claims, &signing_key);
         let token = derived.parse::<MetadataValue<Ascii>>().map_err(|_| {
             // The derivation is base64 of an HMAC, so no secret of any shape
             // produces this. Said out loud rather than silently dropped,
@@ -176,9 +193,10 @@ impl TelemetryCredential {
     fn stamp<T>(&self, message: T) -> tonic::Request<T> {
         let mut request = tonic::Request::new(message);
         if let Some(token) = &self.token {
+            let bearer = format!("Bearer {}", token.to_str().unwrap_or(""));
             request
                 .metadata_mut()
-                .insert(STORAGE_TOKEN_HEADER, token.clone());
+                .insert("authorization", bearer.parse().expect("valid metadata"));
         }
         request
     }
@@ -223,9 +241,9 @@ fn refusal(
     match &credential.source {
         Some(source) => anyhow::anyhow!(
             "deis-telemetry at {endpoint} refused {doing}: {message}\nThis command presented the \
-             token derived from the secret in {source}. deis-telemetry derives what it expects \
-             from its own `auth_secret`; when the two are not the same string every node's log, \
-             trace and metric push is being refused as well."
+             token derived from the secret in {source}. deis-telemetry verifies it against its \
+             own `capability_public_key`; when the secret does not derive the same keypair, every \
+             node's log, trace and metric push is being refused as well."
         ),
         None => anyhow::anyhow!(
             "deis-telemetry at {endpoint} refused {doing}: {message}\nThis command presented no \
@@ -525,54 +543,81 @@ mod tests {
         env_lock, save_credentials, set_env,
     };
 
-    /// The subject has to be the collector's own, or the two derive different
-    /// tokens from the same secret and every read is refused.
+    /// The audience constant the CLI uses for telemetry reads.
     ///
-    /// This is the whole reason `deis-telemetry` is a dev-dependency of this
-    /// crate: the constant is copied rather than imported, and a copy with
-    /// nothing pinning it is a copy that drifts.
+    /// With the capability token migration, the audience for telemetry reads
+    /// is `"telemetry.read"`. The old `TELEMETRY_CHANNEL` from HMAC-based auth
+    /// no longer exists in `deis_telemetry::auth`.
     #[test]
-    fn the_channel_subject_is_the_collectors_own() {
-        assert_eq!(TELEMETRY_CHANNEL, deis_telemetry::auth::TELEMETRY_CHANNEL);
+    fn telemetry_read_audience_is_correct() {
+        assert_eq!(TELEMETRY_CHANNEL, "telemetry.read");
     }
 
     /// A credential must not be printable, in a panic or anywhere else.
     #[test]
     fn the_token_never_reaches_a_debug_line() {
         let secret = "shared-secret";
+        let hash = Sha256::digest(secret.as_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let claims = CapabilityClaims::new(
+            "telemetry.read",
+            "deis-control",
+            "deis-cli",
+            0,
+            std::time::Duration::from_secs(900),
+            vec![CapabilityResource {
+                tenant: String::new(),
+                binding: String::new(),
+                generation: None,
+            }],
+        );
+        let token = encode(&claims, &signing_key);
         let credential = TelemetryCredential {
             token: Some(
-                storage_token(secret, TELEMETRY_CHANNEL)
+                token
                     .parse()
-                    .expect("an HMAC in base64 is a legal header value"),
+                    .expect("a v1 capability token is a legal header value"),
             ),
             source: Some("credentials.toml".to_string()),
         };
         let rendered = format!("{credential:?}");
         assert!(rendered.contains("<present>"), "{rendered}");
         assert!(
-            !rendered.contains(&storage_token(secret, TELEMETRY_CHANNEL)),
+            !rendered.contains(&encode(&claims, &signing_key)),
             "the derived token is the whole authority to read every application's telemetry: \
              {rendered}"
         );
         assert!(!rendered.contains(secret), "{rendered}");
     }
 
-    /// Start a real collector that requires a token. Both listeners are on
-    /// loopback port 0, so this never collides with a running install.
+    /// Start a real collector that requires capability tokens. Both listeners
+    /// are on loopback port 0, so this never collides with a running install.
     async fn collector(secret: &str) -> (deis_telemetry::server::RunningServer, tempfile::TempDir) {
         let data = tempfile::tempdir().expect("a directory for the database");
+        let signing_key = signing_key_from_secret(secret);
+        let verifying_key = signing_key.verifying_key();
         let config = deis_telemetry::config::Config {
             listen: "127.0.0.1:0".to_string(),
             metrics_listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
-            auth_secret: Some(secret.to_string()),
+            capability_public_key: Some(hex::encode(verifying_key.as_bytes())),
             ..deis_telemetry::config::Config::default()
         };
         let running = deis_telemetry::server::start(&config)
             .await
             .expect("deis-telemetry starts");
         (running, data)
+    }
+
+    /// Derive a signing key from a test secret.
+    fn signing_key_from_secret(secret: &str) -> ed25519_dalek::SigningKey {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(secret.as_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        ed25519_dalek::SigningKey::from_bytes(&seed)
     }
 
     /// Point this process's credentials file at a fresh directory holding one

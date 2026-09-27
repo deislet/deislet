@@ -1,11 +1,13 @@
 //! `deis deploy` - build the bundle, record it as a version, and point an
 //! environment at it.
 //!
-//! This deploys to *this* platform and nothing else. Building for Cloudflare,
-//! Deno or EdgeOne is `deis build --vendor <name>` followed by that vendor's
-//! own tooling, which owns the credentials and the deployment model for it;
-//! a `--vendor` flag here would have suggested this command could push to
-//! them, which it never could.
+//! This deploys to *this* platform by default. With `--vendor <name>`, the
+//! control plane routes the deployment through the provider driver lifecycle
+//! (preflight, plan, prepare, upload, verify, activate). The driver binary
+//! for that vendor must be installed on the control plane node.
+//!
+//! Building for other platforms is `deis build --vendor <name>` followed by
+//! `deis deploy --vendor <name>`.
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +28,12 @@ pub struct Args {
     /// Use the bundle the last build left behind instead of building again.
     pub no_build: bool,
     pub no_minify: bool,
+    /// Deploy to an external platform through its provider driver.
+    /// The control plane runs the driver binary and orchestrates the
+    /// lifecycle (preflight, plan, prepare, upload, verify, activate).
+    /// The driver binary for this vendor must be installed on the
+    /// control plane node that runs the workflow.
+    pub vendor: Option<String>,
 }
 
 pub async fn execute(args: Args, output: Output) -> Result<()> {
@@ -37,6 +45,20 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     let app = session.app()?.to_string();
     let environment = session.environment()?.to_string();
     let dir = project_dir()?;
+
+    // `--vendor` routes through the provider driver lifecycle on the
+    // control plane (preflight, plan, prepare, upload, verify, activate).
+    // The driver binary for that vendor must be installed on the control
+    // plane node that picks up the workflow. See `deis provider-deployments`
+    // for monitoring.
+    if args.vendor.is_some() {
+        bail!(
+            "`deis deploy --vendor` is not yet available in the CLI; use `deis build --vendor` \
+             to produce the artifact and initiate a provider deployment through the control \
+             plane API. The provider driver binary (`deis-provider-driver-cloudflare`) must \
+             be installed on the control plane node."
+        );
+    }
 
     output.line(format!(
         "\n{} {} {} {}",

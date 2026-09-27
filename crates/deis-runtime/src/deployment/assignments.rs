@@ -119,8 +119,6 @@ pub struct Assignment {
     pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
     #[serde(default)]
     pub environment_snapshot_id: Option<String>,
-    #[serde(default)]
-    pub secret_values_by_revision: std::collections::HashMap<String, String>,
 }
 
 /// Hand-written so a `{:?}` on an assignment - in a log line, in an error
@@ -144,7 +142,6 @@ impl std::fmt::Debug for Assignment {
             .field("limits", &self.limits)
             .field("compatibility", &self.compatibility)
             .field("environment_snapshot_id", &self.environment_snapshot_id)
-            .field("secret_values", &"<redacted>")
             .finish()
     }
 }
@@ -200,13 +197,12 @@ impl Assignment {
             self.environment_snapshot,
             self.environment_snapshot_id,
         ) {
-            (None, None, None) if self.secret_values_by_revision.is_empty() => None,
+            (None, None, None) => None,
             (Some(declarations), Some(snapshot), Some(snapshot_id)) => {
-                Some(super::StandardEnvironmentOrder::new(
+                Some(super::StandardEnvironmentOrder::new_without_secrets(
                     declarations,
                     snapshot,
                     snapshot_id,
-                    self.secret_values_by_revision,
                     &self.version_id,
                     standard_environment_id.as_deref().ok_or_else(|| {
                         "EC_ENV_SNAPSHOT_INVALID: canonical environment identity is missing"
@@ -278,34 +274,23 @@ impl std::error::Error for AssignmentError {}
 
 /// Asks the control plane what this node should run.
 ///
-/// # Two transports, one question
+/// The question and the answer are the same regardless of transport:
+/// which versions this node should be running, and whether that list is
+/// the whole truth.  Since the machine channel landed (ADR-025), the only
+/// transport is mutual TLS over the machine listener — the connection
+/// itself proves which machine is asking, and the control plane refuses a
+/// call whose `node_id` is not the name the certificate proved.
 ///
-/// The question and the answer are the same either way: which versions this
-/// node should be running, and whether that list is the whole truth. What
-/// differs is the door it is asked at and what the control plane knows about
-/// the caller when it answers.
-///
-/// * [`AssignmentClient::new`] asks over HTTP on the control plane's human
-///   listener, presenting `[control] secret` - the key every node in the fleet
-///   holds. Any holder of that one value can ask for any node's list, secrets
-///   and all.
-/// * [`AssignmentClient::over_machine_channel`] asks over the machine
-///   channel, where the connection itself proves which machine is asking. The
-///   control plane refuses a call whose `node_id` is not the name the
-///   certificate proved, so this node can only ever be handed its own
-///   assignments.
-///
-/// Which one exists is decided once, at startup, by
-/// [`AssignmentClient::from_config`]. A node with no `[machine_identity]`
-/// configured gets the first and behaves in every respect as it did before
-/// this channel existed.
+/// The transport is decided once at startup by
+/// [`AssignmentClient::from_config`].  A node without a configured
+/// `[machine_identity]` refuses to start rather than silently failing to
+/// fetch assignments on a path that is no longer served.
 pub struct AssignmentClient {
     transport: Transport,
-    /// What every log line and every error names. For HTTP that is the URL
-    /// being fetched; for the machine channel it is the endpoint followed by
-    /// the RPC's own path, which is literally what goes on the wire over
-    /// HTTP/2 - so either way an operator can match this against the control
-    /// plane's own log.
+    /// What every log line and every error names — the machine channel
+    /// endpoint followed by the RPC's path, which is literally what goes
+    /// on the wire over HTTP/2, so an operator can match this against the
+    /// control plane's own log.
     url: String,
 }
 
@@ -339,8 +324,6 @@ enum Transport {
 const FETCH_ASSIGNMENTS_PATH: &str = "/deis.machine.MachineChannel/FetchAssignments";
 
 impl AssignmentClient {
-
-
     /// Ask over the machine channel, proving `identity` and refusing to talk
     /// to anything that cannot prove it is `control_identity`.
     ///
@@ -416,6 +399,24 @@ impl AssignmentClient {
                 node_id: node_id.to_string(),
             },
             url,
+        }
+    }
+
+    /// Returns a clone of the inner machine channel client, if this
+    /// assignment client is backed by one.  Background tasks such as the
+    /// capability renewal loop use this to reach the control plane without
+    /// sharing `&mut self` with the main reconciliation loop.
+    pub fn machine_channel_client(&self) -> Option<MachineChannelClient<Channel>> {
+        match &self.transport {
+            Transport::Machine { client, .. } => Some(client.clone()),
+        }
+    }
+
+    /// The node name this client speaks for, or the empty string if there
+    /// is no machine transport.
+    pub fn node_id(&self) -> &str {
+        match &self.transport {
+            Transport::Machine { node_id, .. } => node_id,
         }
     }
 
@@ -502,7 +503,6 @@ impl AssignmentClient {
         self.fetch_over_machine_channel(client, identity, node_id)
             .await
     }
-
 
     async fn fetch_over_machine_channel(
         &self,
@@ -646,7 +646,6 @@ fn machine_failure(
     }
 }
 
-
 /// One answer from the control plane.
 ///
 /// The array on its own cannot be acted on for removal: an application that is
@@ -664,7 +663,6 @@ pub struct AssignmentList {
     /// Assignments the control plane left out, when `complete` is false.
     pub withheld: u32,
 }
-
 
 /// Result of one pass over the assignment list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -857,6 +855,10 @@ impl<'a> Reconciler<'a> {
             })
             .collect();
         report_drift(&assigned, &running, complete, &self.absent_before);
+        let assigned_deployments: HashSet<String> = assignments
+            .iter()
+            .filter_map(|assignment| assignment.deployment_id.clone())
+            .collect();
 
         let mut outcome = SyncOutcome {
             assigned: assignments.len(),
@@ -942,6 +944,10 @@ impl<'a> Reconciler<'a> {
             );
             return Ok(outcome);
         }
+
+        // Only a complete answer bounds the secret cache: a deployment an
+        // incomplete one left out may still be running here.
+        self.deployer.retain_secrets(&assigned_deployments);
 
         let mut absent_now: HashSet<AppKey> = HashSet::new();
         for (key, installed) in running {
@@ -1248,6 +1254,13 @@ pub async fn run_control_loop(
     let mut degraded: u32 = 0;
     let mut registration = RegistrationState::Pending;
     let mut reconciler = Reconciler::new(&client, &deployer);
+
+    // Spawn the background capability renewal loop.  It shares the same
+    // machine-channel identity and endpoint, and reads the global token
+    // registry that AppServices::connect() populates.
+    let _renewal_metrics = client.machine_channel_client().map(|channel| {
+        crate::deployment::capability_renewer::spawn(channel, client.node_id().to_string())
+    });
 
     loop {
         if unreachable > 0 {

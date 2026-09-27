@@ -27,27 +27,127 @@
 //! exactly that, and one environment's deploy credential could stop every
 //! environment of the application on a node with it.
 //!
-//! # What `api_auth_enabled = false` means, and what it does not
+//! # Every call carries a credential
 //!
-//! It means no credential is *required*. It has never been allowed to mean
-//! that a credential which *is* presented goes unchecked, and it must not
-//! mean that the whole human API is published to whatever can route to this
-//! port. With it off, [`resolve`] admits an unauthenticated caller only over a
-//! direct connection from the machine this control plane runs on *and* only
-//! when the caller is not a web page on another origin. A loopback reverse
-//! proxy is not treated as the caller: forwarding headers withhold the local
-//! exception. A credential that resolves is held to its own scopes exactly as
-//! it would be with the flag on.
+//! There is no credential-free admission, from any peer address, under any
+//! `Host`, through any proxy. What a caller without one gets is the identical
+//! 401 of [`UNAUTHENTICATED_DETAIL`], audited as a caller nobody
+//! authenticated; the one way in on a fresh install is the one-time bootstrap
+//! credential, which is good for one successful call (see
+//! [`BOOTSTRAP_ACTIONS`]). A credential that resolves is held to its own
+//! scopes, and its account's role is the ceiling over them.
 //!
-//! The second half of that is [`from_another_origin`], and it exists because
-//! "on this machine" turned out not to mean what it sounds like. A browser
-//! running on the operator's box is on this machine, so every page it has
-//! open is - and with `CorsLayer::permissive()` in front of this gate, a page
-//! on any origin could `fetch()` the human API with no credential, create an
-//! owner account, mint an unscoped root token, deploy, and read every answer.
-//! The permissive layer is gone (see [`crate::api::cors`]), and this is the
-//! other half: the admission is for the operator's own tools, not for
-//! whatever their browser happens to have loaded.
+//! A loopback peer address is not an identity, and neither is a page the
+//! operator's own browser has open. The gate reads no peer address and no
+//! browser header for admission: what admits a caller is a credential that
+//! resolves, nothing else.
+//!
+//! # The query string is read for exactly one route
+//!
+//! `DELETE /api/runtime/:node/apps/:app` takes one environment of an
+//! application off a node with `?environment=<name>`, and *every* environment
+//! of it without. The path is identical either way, so the table reads that
+//! one parameter; see [`narrowing_query_value`] for why it narrows the demand
+//! only for a spelling that can mean one environment and nothing else.
+//!
+//! # The body is read for exactly four routes
+//!
+//! `POST /api/apps` and `POST /api/apps/:app/environments` name the thing
+//! they create in the request body, not in the path, and `deis deploy` calls
+//! both of them for a CI credential that is scoped to one environment. So the
+//! gate peeks at those two bodies and narrows the demand to the name it finds.
+//!
+//! The two route writes - `POST` and `PUT` on
+//! `/api/apps/:app/environments/:env/routes` - are read for a different
+//! reason, and it is worth being exact about which. Their body names a
+//! **hostname**, and a hostname is global: `deploy:<app>/<env>` has no
+//! spelling for one, so there is nothing here for the demand to become. What
+//! decides whether this application may claim that name is the platform's
+//! grant registry, read in `catalog::store::CatalogStore::create_route`
+//! inside the same database call that writes the row - one rule, in one
+//! place. What the gate takes from the body is the *record*: the host, the
+//! path prefix and the priority go into the audit line's target, on the
+//! refusals as well as on the successes. Before that, the three rows a
+//! hostname hijack left in the log were byte-identical with `"target": null`,
+//! and the one record that could have found the abuse afterwards did not
+//! contain the hostname.
+//!
+//! Four bodies, and only those four, capped at [`MAX_BODY_PEEK_BYTES`], with
+//! the body handed on to the handler unchanged. No route that carries a
+//! secret is on that list, which is what keeps a value out of the audit log
+//! by construction rather than by care.
+//!
+//! # Two routes' demands are settled from a record
+//!
+//! `GET /api/operations/:id` and `POST /api/operations/:id/cancel` name an
+//! operation by an id that carries no application or environment, and which
+//! application and environment it is about - and therefore which scope may
+//! read or cancel it - is written in the operation record: the application
+//! and environment of a provider `deploy` or `rollback` (`read:<app>/<env>`
+//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for an
+//! identity migration, a backend restore, and every other kind. This gate
+//! holds no catalog handle and reads no record, so the table marks both
+//! routes [`RecordClaim::OperationScope`], demands only that the caller hold
+//! *some* scope, and the handlers (`api::migrations::get_operation` and
+//! `api::migrations::cancel_operation`, through one shared check) load the
+//! record and check the caller against the exact demand before anything
+//! else, refusing with the same `insufficient-scope` 403 this gate would
+//! give and with one fixed body whether or not the id exists. The 403 is
+//! audited here like every other refusal: the audit line is written from the
+//! status the response actually had, so a handler's refusal is recorded the
+//! way the gate's own is. The marker is what keeps this table the one place
+//! that says what a route is: a route so marked and a handler that forgot
+//! the check would be visible as a pair, not as a line that is present.
+
+//! One gate in front of the human API: who is calling, may they, and write
+//! it down.
+//!
+//! Everything the dashboard and the `deis` CLI reach goes through
+//! [`authorize`]. That is deliberate. Spreading the check across handlers is
+//! how a route ends up shipped with no check at all - this repository has
+//! produced that defect before - so the requirement for every route lives in
+//! one table ([`classify`]) which is a pure function of the method, the path
+//! and the query, and the middleware that applies it is layered where no
+//! route can be mounted around it.
+//!
+//! # Fail closed
+//!
+//! [`classify`] has a final arm that demands `admin:*/*` for anything it does
+//! not recognise. A route added without a line in the table therefore becomes
+//! reachable only by an administrator, and is visible as such the first time
+//! a scoped token is refused - rather than becoming an unguarded hole.
+//!
+//! The same rule governs the two [`Resource`] cases that are not a name.
+//! [`Resource::Any`] is answered by *any one* scope the caller holds, so it
+//! belongs only on a call whose effect is confined to one of the things the
+//! caller can already reach - reading the application record, uploading a
+//! bundle that is stored and put nowhere. A call that acts on all of them at
+//! once is [`Resource::Every`], which only a `*` answers. Writing `Any` where
+//! the effect is `Every` does not look like a hole in the table; it looks
+//! like a line that is present. `DELETE /api/runtime/:node/apps/:app` was
+//! exactly that, and one environment's deploy credential could stop every
+//! environment of the application on a node with it.
+//!
+//! # No credential, no admission
+//!
+//! Every caller presents a token; there is no anonymous path. A loopback peer
+//! address is not an identity - other users on the same machine, containers
+//! sharing its network namespace, an SSRF from another local service and a
+//! DNS-rebinding page in the operator's browser all present a loopback
+//! credential-free connection - so nothing about where a request came from
+//! admits it. A caller who presents nothing, or something that resolves to
+//! no token, is refused with 401 whatever their peer address, whatever the
+//! `Host` header says, and whatever forwarding headers a proxy added. The
+//! dev and demo flows log in through the bootstrap credential like
+//! production does (see [`crate::identity::store`] and the bootstrap file).
+//!
+//! # The bootstrap credential is good for exactly one thing
+//!
+//! A request that resolved to [`PrincipalKind::Bootstrap`] may only create
+//! the first owner account or mint its first token (the two actions in
+//! [`BOOTSTRAP_ACTIONS`]); anything else is refused with 403. Its first
+//! successful use revokes it and deletes the bootstrap file, so it is
+//! one-time even though nothing on the wire marks it as such.
 //!
 //! # The query string is read for exactly one route
 //!
@@ -111,20 +211,24 @@ use std::sync::Arc;
 
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode},
     middleware::Next,
     response::Response,
 };
 use deis_wire::CanonicalId;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::api::error::{ApiError, ErrorDetail};
 use crate::api::versioning::{ApiSurface, REQUEST_ID_HEADER, RequestContext};
 use crate::audit::{AuditRecord, AuditStore, Outcome};
 use crate::identity::store::Resolution;
-use crate::identity::{Demand, IdentityStore, Principal, Selector, Verb};
+use crate::identity::{Demand, IdentityStore, Principal, PrincipalKind, Selector, Verb};
 
-use crate::identity::token::secret_eq;
+/// The route actions the one-time bootstrap credential may perform: create
+/// the first owner account, and mint its first token. Everything else is
+/// refused, and the first successful one of these revokes the credential and
+/// deletes the bootstrap file.
+const BOOTSTRAP_ACTIONS: [&str; 2] = ["account.create", "token.mint"];
 
 /// Largest request body the gate will read in order to learn which
 /// application or environment a call is about. The two routes it applies to
@@ -134,46 +238,13 @@ pub const MAX_BODY_PEEK_BYTES: usize = 64 * 1024;
 /// The identical answer every unusable credential gets. A caller must not be
 /// able to tell "no such token" from "revoked" from "the account is switched
 /// off" - that is a free oracle for anyone holding a stolen credential - so
-/// the three cases differ only in the control plane's own log.
+/// those cases differ only in the control plane's own log.
 const UNAUTHENTICATED_DETAIL: &str = "A valid credential is required. Present it as \
                                       'Authorization: Bearer <token>' or 'X-API-Key: <token>'. \
-                                      Mint one with `deis token create`.";
-
-/// What a caller off the box is told when this control plane demands no
-/// credential at all. It names the setting rather than repeating
-/// [`UNAUTHENTICATED_DETAIL`], because there is no token to ask anyone for:
-/// nothing has been minted, and an operator sent looking for one would find
-/// nothing. Nothing is given away by saying so - a caller who cannot present
-/// a credential learns only that there is none to steal.
-const UNCONFIGURED_OFF_BOX_DETAIL: &str = "This control plane requires no credential \
-                                          (api_auth_enabled is off), so it serves the human API \
-                                          only to callers on the machine it runs on. Set \
-                                          api_auth_enabled = true in its configuration and \
-                                          restart: it prints one owner token at startup, and \
-                                          every caller - on this machine or not - presents that.";
-
-/// What a web page on another origin is told when it calls a control plane
-/// that demands no credential.
-///
-/// It says the same thing [`UNCONFIGURED_OFF_BOX_DETAIL`] says - there is no
-/// token to ask anyone for - and adds the one instruction that gets a console
-/// hosted elsewhere working, because a developer looking at a 401 in a
-/// browser console has nothing else to go on.
-const CROSS_ORIGIN_DETAIL: &str = "This control plane requires no credential \
-                                   (api_auth_enabled is off), and that admission is for callers \
-                                   on the machine it runs on - never for a page loaded from \
-                                   another origin, whichever machine the browser is on. A console \
-                                   hosted elsewhere presents a token (`deis token create`) and \
-                                   needs its own origin listed in api_cors_allowed_origins.";
-
-/// What an anonymous call relayed by a proxy is told. The TCP peer is the
-/// proxy, not the original caller, so loopback is no evidence that the caller
-/// is on this machine.
-const PROXIED_DETAIL: &str = "This request reached the control plane through a proxy. \
-                              A proxy's loopback connection does not prove that the original \
-                              caller is local, so proxied human API requests require a \
-                              credential. Set api_auth_enabled = true and present the owner \
-                              token printed at startup.";
+                                      Mint one with `deis token create`; on a fresh install, \
+                                      log in with `deis login --bootstrap` using the \
+                                      bootstrap.token file the control plane wrote to its \
+                                      data directory.";
 
 /// Every path [`authorize`] hands straight to the handler without resolving a
 /// caller, checking a scope or writing a line.
@@ -415,9 +486,9 @@ fn narrowing_query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a st
 /// [`axum::http::Uri::query`] hands it over. One route reads it; see the
 /// module header.
 ///
-/// The table is written once, in the legacy spelling. A path under
+/// The table is written once, in the unversioned spelling. A path under
 /// `/api/v1` or `/api/platform` is the same route with its surface named, and
-/// is folded onto the legacy spelling by [`canonical_segments`] before the
+/// is folded onto that spelling by [`canonical_segments`] before the
 /// match; a route folded from the *wrong* surface - `/api/v1/runtime`,
 /// `/api/platform/apps` - is nothing this control plane mounts, and is
 /// answered with the closing arm rather than with the requirement of a route
@@ -429,26 +500,28 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
 
     let requirement = classify_canonical(method, &segments, query, writing);
     match (surface, requirement.scope) {
-        (ApiSurface::V1, RequirementScope::Operator)
-        | (ApiSurface::Platform, RequirementScope::Product) => unclassified(),
+        (Some(ApiSurface::V1), RequirementScope::Operator)
+        | (Some(ApiSurface::Platform), RequirementScope::Product) => unclassified(),
         _ => requirement,
     }
 }
 
-/// The legacy spelling of a path's segments, and the surface the path named.
+/// The unversioned spelling of a path's segments, and the surface the path
+/// named, when it named one.
 ///
 /// `["api", "v1", rest..]` and `["api", "platform", rest..]` become
 /// `["api", rest..]`. Exactly one marker is folded, and only in second
 /// position, so `/api/v1/v1/apps` and `/api/platform/v1/apps` keep their extra
 /// segment and fall to the closing arm; the comparison is byte-exact, so
-/// `/api/V1/apps` does too. Nothing else is touched: `/api/nodes/..` and
-/// `/api/routing-table` are the node channel, which is never versioned and
-/// never reaches this gate.
-fn canonical_segments<'a>(segments: &[&'a str]) -> (ApiSurface, Vec<&'a str>) {
+/// `/api/V1/apps` does too. A path under neither prefix is the table's own
+/// spelling with no surface - `/api/nodes/..` and `/api/routing-table` are
+/// the node channel, which is never versioned and never reaches this gate -
+/// and answers from the table row as written.
+fn canonical_segments<'a>(segments: &[&'a str]) -> (Option<ApiSurface>, Vec<&'a str>) {
     match segments {
-        ["api", "v1", rest @ ..] => (ApiSurface::V1, fold(rest)),
-        ["api", "platform", rest @ ..] => (ApiSurface::Platform, fold(rest)),
-        _ => (ApiSurface::Legacy, segments.to_vec()),
+        ["api", "v1", rest @ ..] => (Some(ApiSurface::V1), fold(rest)),
+        ["api", "platform", rest @ ..] => (Some(ApiSurface::Platform), fold(rest)),
+        _ => (None, segments.to_vec()),
     }
 }
 
@@ -1234,8 +1307,8 @@ fn classify_canonical(
         // A scrape from another host therefore carries a token minted for it
         // (`deis token create --scopes 'read:*/*'`), which is a real
         // requirement Prometheus meets with `authorization` in the scrape
-        // config. A scrape from this machine needs none while
-        // `api_auth_enabled` is off, exactly like every other read.
+        // config. A scrape from this machine needs one too, exactly like
+        // every other read.
         ["api", "metrics", ..] => {
             Requirement::new("metrics.read", Verb::Read, Resource::Every, Resource::Every)
                 .operator()
@@ -1314,38 +1387,32 @@ fn classify_canonical(
 /// What the gate needs in order to answer a request.
 #[derive(Clone)]
 pub struct AuthzState {
-    /// `api_auth_enabled`. It decides one thing only: whether a caller has to
-    /// present a credential at all. It has never decided whether a credential
-    /// that *is* presented is checked - see [`authorize`] - and with it off
-    /// the caller who presents nothing is admitted only from this machine,
-    /// see [`resolve`].
-    pub enforced: bool,
-    /// The `api_keys` entries from the configuration file. Still checked
-    /// here, against the file, and never against the database.
-    pub config_keys: Arc<Vec<String>>,
     pub identity: Arc<IdentityStore>,
     pub audit: Arc<AuditStore>,
+    /// Where the one-time bootstrap credential file lives
+    /// (`<data_dir>/bootstrap.token`). The gate deletes it right after the
+    /// bootstrap token's first successful use, next to the revocation. `None`
+    /// only in tests that never present a bootstrap credential: a binary
+    /// always knows its data directory, and a bootstrap credential whose file
+    /// cannot be located could never be cleaned up.
+    pub bootstrap_file: Option<Arc<crate::identity::bootstrap::BootstrapFile>>,
 }
 
 /// Authenticate, authorise, and record.
 ///
 /// The order matters and is the same on every route:
 ///
-/// 1. resolve the presented credential into a [`Principal`], or refuse;
+/// 1. resolve the presented credential into a [`Principal`], or refuse with
+///    401 - there is no credential-free admission, from any peer address,
+///    under any `Host`, through any proxy;
 /// 2. work out what this route needs from [`classify`], reading the body only
-///    for the two routes that name their resource there;
-/// 3. check the principal against it;
+///    for the routes that name their resource there;
+/// 3. check the principal against it; a bootstrap credential is further held
+///    to [`BOOTSTRAP_ACTIONS`];
 /// 4. run the request;
-/// 5. write the audit line, with the outcome the response actually had.
-///
-/// With `api_auth_enabled` off, step 1 admits a caller who presented nothing
-/// as anonymous - but only from a direct loopback peer that is neither a web
-/// page on another origin nor a request relayed by a proxy. A reverse proxy's
-/// TCP connection is local even when its caller is not. Step 3 runs whatever the
-/// flag says: not requiring a credential cannot mean that a `deploy:app/preview`
-/// token which is presented may mint a storage capability for another tenant.
-/// Step 5 runs on every path, so even an unauthenticated platform gets a
-/// record of every deploy, rollback and secret change.
+/// 5. write the audit line, with the outcome the response actually had - and
+///    for a bootstrap credential, revoke it and delete its file after the
+///    first successful use.
 pub async fn authorize(State(state): State<AuthzState>, request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     // The one route in front of this gate, and the only one that can be:
@@ -1355,12 +1422,9 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
     //
     // `/api/metrics` used to be on this line too. It is not a probe: it hands
     // out the cluster size, the node count, the uptime and the event totals,
-    // and being here meant it ignored `api_auth_enabled` and the loopback
-    // rule together, so any host that could route to the port read them. A
-    // scrape now goes through the gate like every other read - which is also
-    // what makes the `["api", "metrics", ..]` line in [`classify`] mean
-    // something, having been unreachable for `/api/metrics` itself while this
-    // returned first.
+    // and being here meant it ignored the credential requirement
+    // altogether, so any host that could route to the port read them. A
+    // scrape goes through the gate like every other read.
     if UNGATED_PATHS.contains(&path.as_str()) {
         return next.run(request).await;
     }
@@ -1376,31 +1440,12 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
     let context = gate_request_context(&request);
     let request_id = context.request_id;
     let surface = ApiSurface::of_path(&path);
-    // The address this request was actually sent to, as the sender wrote it:
-    // `:authority` over HTTP/2 and absolute-form URIs, the `Host` header over
-    // HTTP/1.1. Compared with `Origin` to tell the console this port serves
-    // from a page somewhere else.
-    let own_authority = request
-        .uri()
-        .authority()
-        .map(|authority| authority.as_str().to_string())
-        .or_else(|| {
-            headers
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        });
-    let another_origin = from_another_origin(&headers, own_authority.as_deref());
-    let proxied = came_through_proxy(&headers);
-    // Kept as an address and not only as text: with nothing enforced it is
-    // what decides whether an unauthenticated caller is admitted at all.
-    let peer_addr = request
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| *addr);
-    let peer = peer_addr.map(|addr| addr.to_string());
+        .map(|ConnectInfo(addr)| addr.to_string());
 
-    let principal = match resolve(&state, &headers, peer_addr, another_origin, proxied).await {
+    let principal = match resolve(&state, &headers).await {
         Ok(principal) => principal,
         Err(refusal) => {
             let requirement = classify(&method, &path, query.as_deref());
@@ -1458,14 +1503,52 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
         environment: requirement.environment.selector(),
     };
 
-    // Unconditionally, whatever `api_auth_enabled` says. That flag decides
-    // whether a credential is *required*; a credential that was presented and
-    // resolved carries scopes its holder was given on the understanding that
-    // they are the limit, and skipping this handed a token scoped to one
-    // preview environment the whole platform on every install that had not
-    // turned the flag on. The anonymous caller of such an install is
-    // `Authority::Unscoped` and still passes here, exactly as it always did.
-    if let Err(denial) = principal.permits(&demand) {
+    // A credential that was presented and resolved carries scopes its holder
+    // was given on the understanding that they are the limit. The bootstrap
+    // credential is narrower still: it exists to create the first owner
+    // account and a first token for it, and anything else it might reach for
+    // - a deploy, a secret, the audit log - is refused before the demand is
+    // even considered.
+    if principal.kind == PrincipalKind::Bootstrap
+        && !BOOTSTRAP_ACTIONS.contains(&requirement.action)
+    {
+        warn!(
+            %method,
+            path = %path,
+            caller = %principal.label(),
+            action = requirement.action,
+            "Refused a call made with the one-time bootstrap credential: it may only create the first owner account or mint its first token, and this route is neither"
+        );
+        let detail = "The one-time bootstrap credential may only create the first owner \
+                      account or mint its first token. Log in with `deis login --bootstrap`, \
+                      then mint a token with `deis token create`.";
+        state
+            .audit
+            .record(
+                AuditRecord::by(&principal)
+                    .action(requirement.action)
+                    .request(method.as_str(), &path)
+                    .resource(requirement.app.name(), requirement.environment.name())
+                    .target(requirement.target.clone())
+                    .peer(peer)
+                    .outcome(Outcome::Refused, 403)
+                    .detail(detail)
+                    .request_id(Some(request_id.to_string()))
+                    .build(),
+            )
+            .await;
+        return ApiError::insufficient_scope("admin:*/*", detail)
+            .into_response_for(surface, context);
+    }
+    // The bootstrap credential carries no scope list - there is nothing to
+    // hold it to. Its limit is [`BOOTSTRAP_ACTIONS`], checked above, and its
+    // account's role; the empty list is not a denial.
+    let permitted = if principal.kind == PrincipalKind::Bootstrap {
+        Ok(())
+    } else {
+        principal.permits(&demand)
+    };
+    if let Err(denial) = permitted {
         warn!(
             %method,
             path = %path,
@@ -1496,9 +1579,7 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
             .into_response_for(surface, context);
     }
 
-    // Handlers that want to know who is calling read it from here. Inserted
-    // even when nothing is enforced, so a handler never has to ask whether
-    // there is a caller.
+    // Handlers that want to know who is calling read it from here.
     let mut request = request;
     request.extensions_mut().insert(principal.clone());
 
@@ -1537,6 +1618,32 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
         state.audit.record(record.build()).await;
     }
 
+    // The bootstrap credential is one-time, and this is where "once" is
+    // decided: its first successful use revokes it in the database and
+    // deletes the file that held it, so neither half of the credential can
+    // ever be presented again. A failed attempt uses nothing up - an
+    // operator's first spelling of the account name must not lock them out.
+    if principal.kind == PrincipalKind::Bootstrap && response.status().is_success() {
+        if let Some(credential) = principal.credential_id.as_deref()
+            && let Err(e) = state.identity.revoke_bootstrap_token(credential).await
+        {
+            error!(
+                error = %e,
+                token = %credential,
+                "The bootstrap credential was used successfully but could not be revoked; present it again and this control plane revokes it then, but until then a copy of the file still admits its holder"
+            );
+        }
+        if let Some(file) = state.bootstrap_file.as_ref()
+            && let Err(e) = file.delete()
+        {
+            warn!(
+                error = %e,
+                path = %file.path().display(),
+                "The bootstrap credential was revoked but its file could not be deleted; remove it by hand - the credential it held no longer works"
+            );
+        }
+    }
+
     response
 }
 
@@ -1544,176 +1651,17 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
 /// the caller on purpose; it exists for the control plane's own log.
 struct Refusal {
     log_reason: &'static str,
-    /// What the caller is told. Every unusable *credential* gets
-    /// [`UNAUTHENTICATED_DETAIL`] and nothing else, because telling them
-    /// apart is a free oracle. The one refusal that says something different
-    /// is the caller who presented nothing to a control plane that demands
-    /// nothing: there is no credential there to keep anything from, and an
-    /// operator whose CLI has just started answering 401 has to be able to
-    /// tell "you need a token" from "this port answers only its own machine".
+    /// What the caller is told. Every refusal gets
+    /// [`UNAUTHENTICATED_DETAIL`] and nothing else, because telling reasons
+    /// apart is a free oracle: whoever holds a stolen credential must not be
+    /// able to learn from the answer whether it has been noticed.
     caller_detail: &'static str,
     /// The public half of whatever was presented, when there was one to name.
     credential: Option<String>,
 }
 
-/// Whether a peer is on the machine this control plane runs on.
-///
-/// A caller that reached a dual-stack socket over IPv4 arrives as
-/// `::ffff:127.0.0.1`, and `Ipv6Addr::is_loopback` is false for that address -
-/// the loopback it names is the IPv4 one. Unmapping first is what stops a
-/// local `deis` from being refused as remote on a control plane bound to
-/// `::`.
-///
-/// `None` - no `ConnectInfo` on the request - is not local. The binary always
-/// serves with one (`api::serve`), so an address this cannot see means the
-/// router was mounted by something other than the server, and "we cannot tell
-/// where this came from" must not be the single case that gets in.
-fn is_local_peer(peer: Option<SocketAddr>) -> bool {
-    match peer.map(|addr| addr.ip()) {
-        Some(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
-        Some(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.is_loopback(),
-            None => v6.is_loopback(),
-        },
-        None => false,
-    }
-}
-
-/// The header a browser sets to say what relation the page that made this
-/// request has to the address it went to. It is a forbidden header name, so
-/// script cannot write it, and no non-browser client sends it at all.
-const SEC_FETCH_SITE: &str = "sec-fetch-site";
-
-/// Whether a browser says this request came from a page on another origin.
-///
-/// The unauthenticated admission below is for the operator's own tools on
-/// the operator's own machine - `deis`, curl, the console this port serves. A
-/// browser is on that machine too, and so is every page it has open, which is
-/// how a page on `https://evil.example` came to be able to drive this API. So
-/// the peer address is not the whole question; what the browser says about
-/// the page is the other half.
-///
-/// Two signals, in order of how much they are worth:
-///
-/// 1. `Sec-Fetch-Site`. The browser computes it from the two origins itself
-///    and script cannot set it, so it is better evidence than anything this
-///    process could work out - and it survives a reverse proxy rewriting the
-///    address, which the comparison below does not. `same-origin` is the
-///    console this port serves; `none` is an address typed into the bar or a
-///    bookmark. Anything else is another page, including `same-site`, which
-///    is a *different* origin on the same registrable domain, and including
-///    any value a later browser invents.
-/// 2. `Origin` against the address the request was actually sent to, for the
-///    browsers old enough not to send the first. A page on another origin
-///    cannot forge either half: the browser fills in `Origin` from the page
-///    and the authority from the URL being fetched.
-///
-/// A client that sends neither - every non-browser caller there is - is not a
-/// page, and is left alone.
-fn from_another_origin(headers: &HeaderMap, own_authority: Option<&str>) -> bool {
-    if let Some(site) = headers.get(SEC_FETCH_SITE).and_then(|v| v.to_str().ok()) {
-        return !matches!(site.trim(), "same-origin" | "none");
-    }
-
-    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    // `null` - a sandboxed frame, a `data:` document, some redirect chains -
-    // splits into nothing and is another origin, which is the answer it
-    // should get: an opaque origin is precisely one this cannot vouch for.
-    match (origin.split_once("://"), own_authority) {
-        (Some((_, stated)), Some(own)) => !stated.eq_ignore_ascii_case(own),
-        // An origin this cannot parse, or a request whose own address this
-        // cannot see, is not evidence of same-origin.
-        _ => true,
-    }
-}
-
-/// Whether an intermediary says it relayed this request.
-///
-/// These values are not trusted as client identity. Their presence is used in
-/// one direction only: to withhold the anonymous loopback exception. A remote
-/// caller can forge one and turn its own request into a 401, but can never use
-/// one to be admitted. This avoids believing an arbitrary `X-Forwarded-For`
-/// value without an explicit trusted-proxy list.
-fn came_through_proxy(headers: &HeaderMap) -> bool {
-    [
-        "forwarded",
-        "x-forwarded-for",
-        "x-forwarded-proto",
-        "x-real-ip",
-        "via",
-    ]
-    .iter()
-    .any(|name| headers.contains_key(*name))
-}
-
-/// The caller nobody authenticated, on a control plane that requires nobody
-/// to be - admitted on a direct local call, refused otherwise.
-///
-/// This is the whole of the "unconfigured is not unguarded" rule for the
-/// human API, and it is the one shape that fits. deis-queue answers the same
-/// question by refusing to start on a non-loopback bind, and that remedy is
-/// not available here: this listener also carries the node gRPC channel, the
-/// assignment fetch and the bundle download, so every node in the fleet needs
-/// the port reachable and moving it to loopback would leave a one-machine
-/// platform. The address therefore stays open and the peer plus request shape
-/// decide. Turning `api_auth_enabled` on by default was the other candidate
-/// and is worse: it stops an existing installation's dashboard, CLI and deploy
-/// pipeline the moment the binary is replaced. This leaves direct local tools
-/// working while refusing calls whose origin cannot be shown to be local.
-///
-/// "On this machine" is two questions, not one, because a browser on the
-/// operator's machine is on it and every page it has open is too. A page from
-/// another origin is refused here whatever its peer address, and reaches this
-/// API the way any other remote caller does: with a token. See
-/// [`from_another_origin`]. A reverse proxy is the other case: its own socket
-/// may be loopback even though the caller behind it is remote, so standard
-/// forwarding headers withhold the exception as well.
-fn anonymous_from(
-    peer: Option<SocketAddr>,
-    from_another_origin: bool,
-    came_through_proxy: bool,
-) -> Result<Principal, Refusal> {
-    if !is_local_peer(peer) {
-        return Err(Refusal {
-            log_reason: "this control plane requires no credential, so it admits an \
-                         unauthenticated caller only from its own machine, and this one is not \
-                         on it",
-            caller_detail: UNCONFIGURED_OFF_BOX_DETAIL,
-            credential: None,
-        });
-    }
-    if from_another_origin {
-        return Err(Refusal {
-            log_reason: "this call came from a web page on another origin, and the admission \
-                         for an unauthenticated caller is for this machine's own tools rather \
-                         than for whatever a browser on it has loaded",
-            caller_detail: CROSS_ORIGIN_DETAIL,
-            credential: None,
-        });
-    }
-    if came_through_proxy {
-        return Err(Refusal {
-            log_reason: "the TCP peer is loopback but forwarding headers show that a proxy \
-                         relayed this request, so the original caller cannot use the direct-local \
-                         anonymous exception",
-            caller_detail: PROXIED_DETAIL,
-            credential: None,
-        });
-    }
-    Ok(Principal::anonymous())
-}
-
-/// Turn what a request carries into the caller it belongs to.
-///
-/// A configured `api_keys` entry is checked against the configuration file,
-/// in constant time, exactly as it was before accounts existed; the database
-/// holds no copy of it and cannot admit anyone. Anything shaped like a minted
-/// token is looked up by its public id and its secret compared against a
-/// stored digest.
 /// The credentials a request carries, in the two forms this API accepts:
-/// `Authorization: Bearer <key>` (or the bare key) and `X-API-Key: <key>`.
+/// `Authorization: Bearer <token>` (or the bare token) and `X-API-Key: <token>`.
 ///
 /// Private to this module because this module is the only thing that reads a
 /// caller's credential. It was shared while the endpoints that served nodes
@@ -1733,22 +1681,20 @@ fn presented_credentials(headers: &HeaderMap) -> Vec<&str> {
     found
 }
 
-async fn resolve(
-    state: &AuthzState,
-    headers: &HeaderMap,
-    peer: Option<SocketAddr>,
-    from_another_origin: bool,
-    came_through_proxy: bool,
-) -> Result<Principal, Refusal> {
+/// Turn what a request carries into the caller it belongs to, or refuse.
+///
+/// Every caller presents a token; there is no credential-free admission from
+/// any peer address, under any `Host`, through any proxy. The only forms a
+/// credential takes are the minted tokens this control plane knows - the
+/// one-time bootstrap credential among them, indistinguishable on the wire
+/// from any other token and narrowed to its two routes after it resolves.
+async fn resolve(state: &AuthzState, headers: &HeaderMap) -> Result<Principal, Refusal> {
     let presented: Vec<String> = presented_credentials(headers)
         .into_iter()
         .map(|c| c.to_string())
         .collect();
 
     if presented.is_empty() {
-        if !state.enforced {
-            return anonymous_from(peer, from_another_origin, came_through_proxy);
-        }
         return Err(Refusal {
             log_reason: "no credential was presented",
             caller_detail: UNAUTHENTICATED_DETAIL,
@@ -1763,40 +1709,21 @@ async fn resolve(
     };
 
     for candidate in &presented {
-        if state
-            .config_keys
-            .iter()
-            .any(|key| secret_eq(key, candidate))
-        {
-            let fingerprint = crate::identity::token::fingerprint(candidate);
-            match state.identity.resolve_config_key(&fingerprint).await {
-                Ok(principal) => return Ok(principal),
-                Err(e) => {
-                    // The file says this key is good, so the caller gets in
-                    // whatever the database says; what is lost is the
-                    // attribution, and that is worth a line.
-                    warn!(
-                        error = %e,
-                        credential = %fingerprint,
-                        "Could not read the record of a configured api_keys entry; the call is still allowed because the configuration file is the authority for these keys, and the audit line names the key rather than an account"
-                    );
-                    return Ok(Principal {
-                        kind: crate::identity::PrincipalKind::ConfigKey,
-                        account: None,
-                        role: Some(crate::identity::Role::Owner),
-                        credential_id: Some(fingerprint),
-                        authority: crate::identity::Authority::Unscoped,
-                    });
-                }
-            }
-        }
-
         match state.identity.resolve_token(candidate).await {
             Ok(Resolution::Allowed(principal)) => return Ok(principal),
             Ok(Resolution::Revoked { token, .. }) => {
                 refusal = Refusal {
                     log_reason: "the token presented was revoked, so something out there is still \
                                  configured with a credential that has been withdrawn",
+                    caller_detail: UNAUTHENTICATED_DETAIL,
+                    credential: Some(token),
+                };
+            }
+            Ok(Resolution::Expired { token, .. }) => {
+                refusal = Refusal {
+                    log_reason: "the token presented stayed past its expiry, which is reported \
+                                 like a revocation: both mean a withdrawn credential is still \
+                                 out there",
                     caller_detail: UNAUTHENTICATED_DETAIL,
                     credential: Some(token),
                 };
@@ -1818,13 +1745,6 @@ async fn resolve(
         }
     }
 
-    if !state.enforced {
-        // Nothing was required, and what was offered did not resolve. The
-        // call is treated as the one that offered nothing at all - admitted
-        // from this machine, refused from anywhere else - and the audit line
-        // says anonymous rather than inventing an account.
-        return anonymous_from(peer, from_another_origin, came_through_proxy);
-    }
     Err(refusal)
 }
 
@@ -1957,7 +1877,7 @@ fn describe_route_address(body: Option<&serde_json::Value>) -> String {
 /// what the caller quotes is what the log holds; anything a client sent
 /// that is not an id is never either.
 ///
-/// The gate is layered outside all three mounts, so this is the only place
+/// The gate is layered outside both mounts, so this is the only place
 /// a refused call's ids come from: a 401 or a 403 that did not echo the
 /// correlation id would leave the caller unable to tie the refusal to the
 /// calls it sent around it.
@@ -1979,33 +1899,19 @@ fn echoed_request_id(response: &Response) -> Option<String> {
 
 /// Say, once, what the human API answers to.
 ///
-/// Printed at startup next to the node credential so an operator sees both,
-/// and says out loud how many credentials are still unscoped - which is the
-/// number the whole model exists to let them drive to zero.
-pub fn log_authorization_ready(enforced: bool, config_keys: usize, unscoped: usize) {
-    if !enforced {
-        warn!(
-            unscoped,
-            "api_auth_enabled is off, so a direct caller on THIS machine can deploy, rotate a \
-             secret and mint a storage token as \"anonymous\", and every change of theirs is in \
-             the audit log under that name. A caller from any other host, through a reverse \
-             proxy, or from a web page on another origin is refused with 401 rather than served. \
-             A credential that IS presented is held to its scopes either way. Set \
-             api_auth_enabled = true to require one from everybody"
-        );
-        return;
-    }
+/// Printed at startup so an operator sees how the API admits callers, and
+/// how many credentials are still unscoped - which is the number the whole
+/// model exists to let them drive to zero.
+pub fn log_authorization_ready(unscoped: usize) {
     if unscoped > 0 {
         warn!(
             unscoped,
-            config_keys,
             "The human API is authenticated, and that many live credentials are UNSCOPED: each one \
              may deploy any application, rotate any secret and mint any tenant's storage token. \
              `deis token list` names them; replace them with scoped tokens and revoke these"
         );
     } else {
         info!(
-            config_keys,
             "The human API is authenticated and every live credential is scoped; every change and \
              every refusal is in the audit log"
         );
@@ -3564,105 +3470,6 @@ mod tests {
     /// What the browser says about the page, which is the other half of "on
     /// this machine": the operator's browser is on it, and so is every page
     /// they have open.
-    #[test]
-    fn a_page_on_another_origin_is_told_apart_from_this_machines_own_tools() {
-        let with = |pairs: &[(&str, &str)]| {
-            let mut headers = HeaderMap::new();
-            for (name, value) in pairs {
-                headers.insert(
-                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                    value.parse().unwrap(),
-                );
-            }
-            headers
-        };
-        let own = Some("localhost:8080");
-
-        // `deis`, curl, a node, Prometheus: no browser headers at all.
-        assert!(!from_another_origin(&with(&[]), own));
-
-        // The console this port serves, and an address typed into the bar.
-        assert!(!from_another_origin(
-            &with(&[("sec-fetch-site", "same-origin")]),
-            own
-        ));
-        assert!(!from_another_origin(
-            &with(&[("sec-fetch-site", "none")]),
-            own
-        ));
-        assert!(!from_another_origin(
-            &with(&[("origin", "http://localhost:8080")]),
-            own
-        ));
-
-        // The page that could take this control plane over. `same-site` is a
-        // different origin on the same domain and counts; so does a value no
-        // browser sends today, because the fallback has to be the closed one.
-        for site in ["cross-site", "same-site", "something-new"] {
-            assert!(
-                from_another_origin(&with(&[("sec-fetch-site", site)]), own),
-                "sec-fetch-site: {site} was taken for this machine's own tools"
-            );
-        }
-        assert!(from_another_origin(
-            &with(&[("origin", "https://evil.example")]),
-            own
-        ));
-        // An opaque origin - a sandboxed frame, a `data:` document - vouches
-        // for nothing, so it is not the one case that gets in.
-        assert!(from_another_origin(&with(&[("origin", "null")]), own));
-        // Nor is a request whose own address this cannot see.
-        assert!(from_another_origin(
-            &with(&[("origin", "http://localhost:8080")]),
-            None
-        ));
-
-        // The browser's own word beats the comparison, because it is computed
-        // from the two real origins and survives a proxy rewriting the
-        // address - which is what `npm run dev` does when it forwards /api.
-        assert!(!from_another_origin(
-            &with(&[
-                ("sec-fetch-site", "same-origin"),
-                ("origin", "http://localhost:5173"),
-            ]),
-            own
-        ));
-    }
-
-    /// A peer this cannot place is not on this machine. The mapped-IPv4 case
-    /// is the one that bites: a local `deis` reaching a control plane bound
-    /// to `::` arrives as ::ffff:127.0.0.1, whose `Ipv6Addr::is_loopback` is
-    /// false.
-    #[test]
-    fn only_an_address_on_this_machine_counts_as_local() {
-        for local in [
-            "127.0.0.1:1",
-            "127.0.0.53:1",
-            "[::1]:1",
-            "[::ffff:127.0.0.1]:1",
-        ] {
-            assert!(
-                is_local_peer(Some(local.parse().unwrap())),
-                "{local} is on this machine"
-            );
-        }
-        for remote in [
-            "10.0.0.7:1",
-            "192.168.1.4:1",
-            "[2001:db8::1]:1",
-            "[::ffff:10.0.0.7]:1",
-        ] {
-            assert!(
-                !is_local_peer(Some(remote.parse().unwrap())),
-                "{remote} is not on this machine"
-            );
-        }
-        assert!(
-            !is_local_peer(None),
-            "an address this cannot see must not be the one case that gets in"
-        );
-    }
-
     /// The storage-token route asks for a verb nothing else implies, over
     /// this exact application and environment.
     #[test]
@@ -3721,9 +3528,9 @@ mod gate_tests {
     /// and on what the audit log then holds, which is the only pair that
     /// matters.
     ///
-    /// The routes are mounted in the legacy `/api/*` spelling on purpose, and
-    /// stay so: that tree keeps answering for the whole deprecation window,
-    /// and these are its regression tests. The two routes spelled under
+    /// The routes are mounted in the unversioned `/api/*` spelling on
+    /// purpose, and stay so: that is the spelling the gate's table is written
+    /// in, and these are its regression tests. The two routes spelled under
     /// `/api/v1` and `/api/platform` are there for the one test that proves
     /// the gate reads a versioned path as the route it is.
     struct Gate {
@@ -3731,17 +3538,30 @@ mod gate_tests {
         state: AuthzState,
     }
 
-    async fn gate(enforced: bool, config_keys: Vec<String>) -> Gate {
+    async fn gate() -> Gate {
+        gate_with_bootstrap_file(None).await
+    }
+
+    /// The gate over a real store, with an optional bootstrap file. Most
+    /// tests pass `None`: they never present a bootstrap credential, and a
+    /// test that does wants to see the file itself.
+    async fn gate_with_bootstrap_file(
+        bootstrap_file: Option<Arc<crate::identity::bootstrap::BootstrapFile>>,
+    ) -> Gate {
         let db = Arc::new(Database::init(":memory:").await.unwrap());
         let identity = Arc::new(IdentityStore::new(Arc::clone(&db)));
         let audit = Arc::new(AuditStore::new(Arc::clone(&db)));
-        identity.sync_config_keys(&config_keys).await.unwrap();
+        // The account every installation has, which the tests mint their
+        // operator credential off.
+        identity
+            .create_account(crate::identity::store::BOOTSTRAP_ACCOUNT, Role::Owner)
+            .await
+            .unwrap();
 
         let state = AuthzState {
-            enforced,
-            config_keys: Arc::new(config_keys),
             identity,
             audit,
+            bootstrap_file,
         };
 
         async fn ok() -> &'static str {
@@ -3784,7 +3604,7 @@ mod gate_tests {
             // the mount, inside the gate. A refusal is answered before it
             // runs; an accepted call comes back with the id it settled.
             .layer(axum::middleware::from_fn_with_state(
-                ApiSurface::Legacy,
+                ApiSurface::V1,
                 crate::api::versioning::attach_request_context,
             ))
             .layer(axum::middleware::from_fn_with_state(
@@ -3866,6 +3686,17 @@ mod gate_tests {
         (status, String::from_utf8_lossy(&bytes).to_string())
     }
 
+    /// The operator credential, minted off the bootstrap account the way a
+    /// first login does: unscoped, so its account's role is its only limit.
+    async fn owner_credential(gate: &Gate) -> String {
+        gate.state
+            .identity
+            .create_token("bootstrap", "operator", Authority::Unscoped)
+            .await
+            .unwrap()
+            .1
+    }
+
     async fn lines(gate: &Gate) -> Vec<crate::audit::AuditEntry> {
         gate.state
             .audit
@@ -3875,12 +3706,15 @@ mod gate_tests {
             .items
     }
 
-    /// The migration promise: a control plane upgraded with an `api_keys`
-    /// entry in its file authenticates exactly as it did, and that key can
-    /// still do everything - including mint a storage token.
+    /// The operator's own credential - the unscoped token a first login mints
+    /// off the bootstrap account - can still do everything, including mint a
+    /// storage token. It is the one credential with no scope list, and it is
+    /// visible as unscoped, which is the thing an operator has to be able to
+    /// see in order to retire it.
     #[tokio::test]
-    async fn an_existing_api_key_keeps_working_and_is_still_root() {
-        let gate = gate(true, vec!["an-existing-key".to_string()]).await;
+    async fn an_unscoped_owner_credential_can_still_do_everything() {
+        let gate = gate().await;
+        let secret = owner_credential(&gate).await;
 
         for (method, path) in [
             ("POST", "/api/apps/demo/versions"),
@@ -3896,14 +3730,12 @@ mod gate_tests {
             ("GET", "/api/audit"),
         ] {
             assert_eq!(
-                call(&gate, method, path, Some("an-existing-key")).await,
+                call(&gate, method, path, Some(&secret)).await,
                 StatusCode::OK,
-                "{method} {path} was refused a key that used to be able to do everything"
+                "{method} {path} was refused the owner's own credential"
             );
         }
 
-        // And it is visible as unscoped, which is the thing an operator has
-        // to be able to see in order to retire it.
         let listed = gate
             .state
             .identity
@@ -3926,7 +3758,7 @@ mod gate_tests {
     /// it deploys to.
     #[tokio::test]
     async fn a_ci_token_deploys_to_one_environment_and_nothing_else() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)
@@ -4037,7 +3869,7 @@ mod gate_tests {
     /// log.
     #[tokio::test]
     async fn a_refusal_tells_the_caller_which_scope_would_have_worked() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)
@@ -4072,7 +3904,7 @@ mod gate_tests {
     /// whoever holds a stolen token learns whether it was noticed.
     #[tokio::test]
     async fn a_revoked_token_is_refused_and_looks_exactly_like_an_unknown_one() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("alice", Role::Owner)
@@ -4091,20 +3923,29 @@ mod gate_tests {
         );
         gate.state.identity.revoke_token(&token.id).await.unwrap();
 
-        let revoked = call_with_body(
+        // Both refusals carry the same request id, so the only thing that
+        // may differ is the id - and the id is the same, so the bodies are
+        // the same.
+        const SAME_ID: &str = "01a0d763-1234-7abc-8def-000000000001";
+        let marks = [(REQUEST_ID_HEADER, SAME_ID)];
+        let revoked = call_marked(
             &gate,
+            ON_THE_BOX,
             "POST",
             "/api/apps/demo/versions",
             Some(&secret),
             "{}",
+            &marks,
         )
         .await;
-        let never_existed = call_with_body(
+        let never_existed = call_marked(
             &gate,
+            ON_THE_BOX,
             "POST",
             "/api/apps/demo/versions",
             Some("deis_pat_00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff0011"),
             "{}",
+            &marks,
         )
         .await;
         assert_eq!(revoked.0, StatusCode::UNAUTHORIZED);
@@ -4138,7 +3979,7 @@ mod gate_tests {
     /// Disabling an account stops its tokens at once, without revoking them.
     #[tokio::test]
     async fn a_disabled_account_stops_working_immediately() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("bob", Role::Owner)
@@ -4170,7 +4011,7 @@ mod gate_tests {
     /// of them being reissued.
     #[tokio::test]
     async fn demoting_an_account_narrows_the_tokens_it_already_issued() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("carol", Role::Maintainer)
@@ -4208,13 +4049,14 @@ mod gate_tests {
     /// first two, and not the third.
     #[tokio::test]
     async fn the_log_holds_changes_and_refusals_and_not_successful_reads() {
-        let gate = gate(true, vec!["an-existing-key".to_string()]).await;
+        let gate = gate().await;
+        let secret = owner_credential(&gate).await;
 
         call_with_body(
             &gate,
             "PUT",
             "/api/apps/demo/environments/production/secrets/DB_PASSWORD",
-            Some("an-existing-key"),
+            Some(&secret),
             r#"{"value":"hunter2-do-not-log-me"}"#,
         )
         .await;
@@ -4222,7 +4064,7 @@ mod gate_tests {
             &gate,
             "GET",
             "/api/apps/demo/environments/production/deployments",
-            Some("an-existing-key"),
+            Some(&secret),
         )
         .await;
         call(&gate, "POST", "/api/apps/demo/versions", None).await;
@@ -4244,7 +4086,7 @@ mod gate_tests {
         assert_eq!(write.environment.as_deref(), Some("production"));
         assert_eq!(write.target.as_deref(), Some("DB_PASSWORD"));
         assert_eq!(write.outcome, Outcome::Accepted);
-        assert_eq!(write.actor_kind, "config_key");
+        assert_eq!(write.actor_kind, "account");
 
         // The value is never in the log, whatever else is.
         let dump = serde_json::to_string(&lines).unwrap();
@@ -4257,15 +4099,15 @@ mod gate_tests {
         let refusal = lines
             .iter()
             .find(|line| line.outcome == Outcome::Refused)
-            .expect("an anonymous call has to be recorded");
+            .expect("an unauthenticated call has to be recorded");
         assert_eq!(refusal.action, "version.upload");
         assert_eq!(refusal.status, 401);
-        assert_eq!(refusal.actor_kind, "anonymous");
+        assert_eq!(refusal.actor_kind, "unknown");
     }
 
-    /// With `api_auth_enabled` off, a direct local caller stays compatible and
-    /// the audit log still records every change, so an operator who has not
-    /// turned authentication on still gets a history.
+    /// A caller with no credential is refused, and the attempt is still
+    /// audited: an operator who reads the log sees who reached for the
+    /// control plane and what they reached for.
     /// The audit line of a hostname claim names the hostname - on the
     /// refusal as much as on the success, because the refusal is where the
     /// attempt shows up.
@@ -4276,7 +4118,7 @@ mod gate_tests {
     /// contain the name that was seized.
     #[tokio::test]
     async fn a_hostname_claim_is_recorded_with_the_hostname() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)
@@ -4337,8 +4179,8 @@ mod gate_tests {
     }
 
     #[tokio::test]
-    async fn an_unauthenticated_control_plane_is_still_audited() {
-        let gate = gate(false, vec![]).await;
+    async fn an_unauthenticated_call_is_refused_and_audited() {
+        let gate = gate().await;
 
         assert_eq!(
             call(
@@ -4348,16 +4190,23 @@ mod gate_tests {
                 None
             )
             .await,
-            StatusCode::OK,
-            "turning accounts on must not brick a platform that never demanded a credential"
+            StatusCode::UNAUTHORIZED,
+            "a caller with no credential is refused like any other"
         );
-        assert_eq!(call(&gate, "GET", "/api/audit", None).await, StatusCode::OK);
+        assert_eq!(
+            call(&gate, "GET", "/api/audit", None).await,
+            StatusCode::UNAUTHORIZED
+        );
 
+        // And the attempt is on the record, as the caller nobody
+        // authenticated: that is the line an operator reads afterwards.
         let lines = lines(&gate).await;
         let deploy = lines.iter().find(|line| line.action == "deploy").unwrap();
-        assert_eq!(deploy.actor_kind, "anonymous");
+        assert_eq!(deploy.actor_kind, "unknown");
         assert_eq!(deploy.actor_account, None);
         assert_eq!(deploy.app_id.as_deref(), Some("demo"));
+        assert_eq!(deploy.outcome, Outcome::Refused);
+        assert_eq!(deploy.status, 401);
     }
 
     /// The probe stays open, and it is now the only thing that is. It
@@ -4366,7 +4215,7 @@ mod gate_tests {
     /// to present.
     #[tokio::test]
     async fn the_health_probe_is_not_behind_the_gate() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         assert_eq!(
             call_from(&gate, OFF_THE_BOX, "GET", "/health", None, "{}")
                 .await
@@ -4376,47 +4225,32 @@ mod gate_tests {
         assert!(lines(&gate).await.is_empty());
     }
 
-    /// `/api/metrics` used to be next to `/health` on that line, and it is
-    /// not a probe: it hands out the cluster size, the node count, the uptime
-    /// and the event totals. Sitting in front of the gate meant it ignored
-    /// `api_auth_enabled` *and* the loopback rule at once, so any host that
-    /// could route to the port read all of it with nothing to present.
+    /// `/api/metrics` used to sit next to `/health` outside the gate, and it
+    /// is not a probe: it hands out the cluster size, the node count, the
+    /// uptime and the event totals. A scrape needs the credential the rest of
+    /// the API needs, whichever spelling of the route is asked for.
     #[tokio::test]
-    async fn a_metrics_scrape_obeys_the_same_two_rules_as_every_other_read() {
-        // Rule one: a control plane that demands a credential demands it here
-        // too, whichever spelling of the route is asked for.
-        let enforced = gate(true, vec!["a-key".to_string()]).await;
-        for path in ["/api/metrics", "/api/metrics/summary"] {
-            assert_eq!(
-                call(&enforced, "GET", path, None).await,
-                StatusCode::UNAUTHORIZED,
-                "{path} was served with no credential by a control plane that demands one"
-            );
-            assert_eq!(
-                call(&enforced, "GET", path, Some("a-key")).await,
-                StatusCode::OK,
-                "{path} refused the credential this control plane is configured with"
-            );
-        }
+    async fn a_metrics_scrape_needs_the_credential_every_other_read_needs() {
+        let gate = gate().await;
+        let secret = owner_credential(&gate).await;
 
-        // Rule two: with nothing required, a scrape from another host is
-        // still refused, because that is the rule that guards everything else
-        // on such an install.
-        let open = gate(false, vec![]).await;
         for path in ["/api/metrics", "/api/metrics/summary"] {
             assert_eq!(
-                call_from(&open, OFF_THE_BOX, "GET", path, None, "{}")
+                call(&gate, "GET", path, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{path} was served with no credential"
+            );
+            assert_eq!(
+                call(&gate, "GET", path, Some(&secret)).await,
+                StatusCode::OK,
+                "{path} refused a valid credential"
+            );
+            assert_eq!(
+                call_from(&gate, OFF_THE_BOX, "GET", path, None, "{}")
                     .await
                     .0,
                 StatusCode::UNAUTHORIZED,
                 "{path} was served to a host off this machine with nothing presented"
-            );
-            // And the local scrape - the sidecar on the box, the demo - keeps
-            // working with nothing, exactly as every other read does.
-            assert_eq!(
-                call(&open, "GET", path, None).await,
-                StatusCode::OK,
-                "{path} stopped working for a scrape on this machine"
             );
         }
     }
@@ -4425,7 +4259,7 @@ mod gate_tests {
     /// scoped to reading, and nothing more than reading.
     #[tokio::test]
     async fn a_read_scoped_token_scrapes_from_another_host_and_can_do_nothing_else() {
-        let gate = gate(false, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("prometheus", Role::Viewer)
@@ -4469,7 +4303,7 @@ mod gate_tests {
     /// environment must not be able to make it.
     #[tokio::test]
     async fn a_credential_for_one_environment_cannot_unload_the_application_from_a_node() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)
@@ -4535,18 +4369,17 @@ mod gate_tests {
         assert_eq!(refused.len(), 4, "{refused:?}");
     }
 
-    /// The other half of "on this machine". A browser on the operator's box
-    /// is a loopback peer, so every page it has open was one too: with
-    /// `CorsLayer::permissive()` in front of this gate, a page on any origin
-    /// could create an owner account, mint a root token, deploy and read the
-    /// audit log, with no credential and with the answers readable. The
-    /// permissive layer is gone; this is the half that does not depend on it.
+    /// A browser on the operator's box is on this machine's network, but
+    /// being a browser changes nothing: every page it has open is refused
+    /// exactly like a caller off the box. What a console needs is a
+    /// credential, and the CORS configuration to let a foreign origin read
+    /// the answers at all.
     #[tokio::test]
-    async fn a_page_on_another_origin_gets_nothing_from_a_control_plane_that_requires_nothing() {
-        let gate = gate(false, vec![]).await;
+    async fn a_page_on_another_origin_gets_nothing_without_a_credential() {
+        let gate = gate().await;
 
-        // Every way a browser says "this came from somewhere else", against
-        // the two calls that end the game: mint a credential, read the log.
+        // Every way a browser says "this came from somewhere else", and the
+        // two calls that end the game: mint a credential, read the log.
         for marks in [
             vec![("origin", "https://evil.example")],
             vec![("sec-fetch-site", "cross-site")],
@@ -4569,14 +4402,14 @@ mod gate_tests {
                     "{method} {path} was served to a page marked {marks:?}"
                 );
                 assert!(
-                    body.contains("api_cors_allowed_origins"),
-                    "the refusal has to say what a console hosted elsewhere does instead: {body}"
+                    body.contains("A valid credential is required"),
+                    "the refusal has to say what is missing: {body}"
                 );
             }
         }
 
-        // The console this port serves, on the same box, is untouched - and
-        // so is `deis`, which sends none of these headers at all.
+        // No marking admits anything: the console this port serves holds a
+        // credential, and `deis` sends none of these headers anyway.
         for marks in [
             vec![("sec-fetch-site", "same-origin")],
             vec![("sec-fetch-site", "none")],
@@ -4587,8 +4420,8 @@ mod gate_tests {
                 call_marked(&gate, ON_THE_BOX, "GET", "/api/audit", None, "{}", &marks).await;
             assert_eq!(
                 status,
-                StatusCode::OK,
-                "the console on this machine stopped working, marked {marks:?}"
+                StatusCode::UNAUTHORIZED,
+                "a call with no credential was admitted, marked {marks:?}"
             );
         }
 
@@ -4599,16 +4432,81 @@ mod gate_tests {
             .into_iter()
             .filter(|line| line.outcome == Outcome::Refused)
             .collect();
-        assert_eq!(refused.len(), 12, "{refused:?}");
-        assert!(refused.iter().all(|line| line.actor_kind == "anonymous"));
+        assert_eq!(refused.len(), 16, "{refused:?}");
+        assert!(refused.iter().all(|line| line.actor_kind == "unknown"));
     }
 
     /// A reverse proxy connects from loopback on behalf of callers that may be
-    /// anywhere. Treating its socket as the original caller turns the local
-    /// compatibility exception into remote anonymous access to the whole API.
+    /// anywhere. The gate reads no proxy header for admission: a call with no
+    /// credential is refused whatever the forwarding marks say, and a real
+    /// credential resolves the same way it does without them.
+    #[tokio::test]
+    async fn a_proxied_request_gets_the_same_answer_as_a_direct_one() {
+        let gate = gate().await;
+
+        for marks in [
+            vec![("forwarded", "for=203.0.113.7;proto=https")],
+            vec![("x-forwarded-for", "203.0.113.7")],
+            vec![("x-real-ip", "203.0.113.7")],
+            vec![("x-forwarded-proto", "https")],
+            vec![("via", "1.1 reverse-proxy")],
+        ] {
+            let (status, _) = call_marked(
+                &gate,
+                ON_THE_BOX,
+                "POST",
+                "/api/apps/demo/environments/production/deployments",
+                None,
+                "{}",
+                &marks,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "marks: {marks:?}");
+        }
+
+        // The proxy does not make the API unusable: a real credential still
+        // resolves exactly as it would on a direct call.
+        let secret = owner_credential(&gate).await;
+        let (status, _) = call_marked(
+            &gate,
+            ON_THE_BOX,
+            "GET",
+            "/api/audit",
+            Some(&secret),
+            "{}",
+            &[("x-forwarded-for", "203.0.113.7")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A page on another origin holding a credential is a console the
+    /// operator set up, and it works: the gate is about who is calling, not
+    /// from what page.
+    #[tokio::test]
+    async fn a_credential_still_works_from_a_page_on_another_origin() {
+        let gate = gate().await;
+        let secret = owner_credential(&gate).await;
+        let (status, _) = call_marked(
+            &gate,
+            ON_THE_BOX,
+            "GET",
+            "/api/audit",
+            Some(&secret),
+            "{}",
+            &[("origin", "https://console.example.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A reverse proxy connects from loopback on behalf of callers that may be
+    /// anywhere. The gate reads no forwarding header, so a proxied call gets
+    /// exactly the answer a direct one would: refused with no credential,
+    /// served with one.
     #[tokio::test]
     async fn a_proxied_request_cannot_use_the_anonymous_loopback_exception() {
-        let open = gate(false, vec![]).await;
+        let open = gate().await;
 
         for marks in [
             vec![("forwarded", "for=203.0.113.7;proto=https")],
@@ -4628,18 +4526,22 @@ mod gate_tests {
             )
             .await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "marks: {marks:?}");
-            assert!(body.contains("through a proxy"), "{body}");
+            assert!(
+                body.contains("A valid credential is required"),
+                "the refusal has to say what is missing: {body}"
+            );
         }
 
         // The proxy does not make the API unusable: a real credential still
-        // resolves before the anonymous exception is considered.
-        let with_key = gate(false, vec!["proxy-key".to_string()]).await;
+        // resolves exactly as it would on a direct call.
+        let with_key = gate().await;
+        let secret = owner_credential(&with_key).await;
         let (status, _) = call_marked(
             &with_key,
             ON_THE_BOX,
             "GET",
             "/api/audit",
-            Some("proxy-key"),
+            Some(&secret),
             "{}",
             &[("x-forwarded-for", "203.0.113.7")],
         )
@@ -4647,37 +4549,17 @@ mod gate_tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// A page on another origin holding a credential is a console the
-    /// operator set up, and it works: this rule withholds the admission that
-    /// needs no credential, not the API.
+    /// Being on this machine's network is not an admission either: the
+    /// refusal is the same from the box as from anywhere else, and the
+    /// storage-token mint - which hands back a credential that never expires
+    /// - is behind the same gate as everything else. The refusals are in the
+    /// log with the address, which is how an operator sees that something was
+    /// reaching for this control plane.
     #[tokio::test]
-    async fn a_credential_still_works_from_a_page_on_another_origin() {
-        let gate = gate(false, vec!["a-key".to_string()]).await;
-        let (status, _) = call_marked(
-            &gate,
-            ON_THE_BOX,
-            "GET",
-            "/api/audit",
-            Some("a-key"),
-            "{}",
-            &[("origin", "https://console.example.com")],
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-    }
+    async fn a_caller_on_this_machine_needs_a_credential_like_any_other() {
+        let gate = gate().await;
 
-    /// `api_auth_enabled = false` means no credential is required. It does
-    /// not mean the human API is published: an operator who never turned it
-    /// on used to be handing every application, the audit log, the account
-    /// list and the storage-token mint to anything that could route to the
-    /// port.
-    #[tokio::test]
-    async fn a_control_plane_that_requires_no_credential_answers_only_its_own_machine() {
-        let gate = gate(false, vec![]).await;
-
-        // On the box: exactly as open as it always was. This is the demo,
-        // the single-host install and the operator who is mid-upgrade with a
-        // dashboard on localhost.
+        // On the box, with nothing to present: refused like anything else.
         assert_eq!(
             call(
                 &gate,
@@ -4686,13 +4568,12 @@ mod gate_tests {
                 None
             )
             .await,
-            StatusCode::OK
+            StatusCode::UNAUTHORIZED
         );
 
         // From anywhere else: nothing at all, including the two calls that
         // hurt most - the audit log, which names every application and
-        // everybody who touched one, and the storage-token mint, which hands
-        // back a credential that never expires.
+        // everybody who touched one, and the storage-token mint.
         for (method, path) in [
             ("POST", "/api/apps/demo/environments/production/deployments"),
             ("GET", "/api/audit"),
@@ -4708,8 +4589,8 @@ mod gate_tests {
                 "{method} {path} was served to a caller off the box"
             );
             assert!(
-                body.contains("api_auth_enabled"),
-                "the answer has to name the one setting that fixes this: {body}"
+                body.contains("A valid credential is required"),
+                "the refusal has to say what is missing: {body}"
             );
         }
 
@@ -4720,22 +4601,17 @@ mod gate_tests {
             .into_iter()
             .filter(|line| line.outcome == Outcome::Refused)
             .collect();
-        assert_eq!(refusals.len(), 3, "{refusals:?}");
-        assert!(
-            refusals
-                .iter()
-                .all(|line| line.peer.as_deref() == Some(OFF_THE_BOX)),
-            "{refusals:?}"
-        );
+        assert_eq!(refusals.len(), 4, "{refusals:?}");
+        assert!(refusals.iter().all(|line| line.actor_kind == "unknown"));
     }
 
-    /// The other half of the same flag. Not requiring a credential cannot
-    /// mean that one which is presented goes unchecked: the scopes on it were
-    /// written down as its limit, and a control plane that ignores them hands
-    /// a preview pipeline the storage credential of any tenant it names.
+    /// A credential that is presented is held to its scopes, whoever holds
+    /// it: the scopes on it were written down as its limit, and a control
+    /// plane that ignores them hands a preview pipeline the storage
+    /// credential of any tenant it names.
     #[tokio::test]
-    async fn a_credential_that_is_presented_is_held_to_its_scopes_even_when_none_is_required() {
-        let gate = gate(false, vec![]).await;
+    async fn a_credential_is_held_to_its_scopes() {
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)
@@ -4793,7 +4669,7 @@ mod gate_tests {
     /// spelled, so an operator can see which surface a client is on.
     #[tokio::test]
     async fn the_gate_reads_a_versioned_path_as_the_route_it_is() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)
@@ -4872,7 +4748,7 @@ mod gate_tests {
     /// in the header is never written down.
     #[tokio::test]
     async fn an_audit_line_carries_the_request_id_the_caller_holds() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)
@@ -5008,13 +4884,11 @@ mod gate_tests {
         );
     }
 
-    /// The gate answers in the shape of the prefix it was called through:
-    /// the two-key legacy body under `/api`, byte for byte as before, and
-    /// the structured envelope with the request id under `/api/v1` and
-    /// `/api/platform`.
+    /// The gate's refusals answer in the envelope shape whatever prefix the
+    /// path was spelled under, and echo the id the caller sent.
     #[tokio::test]
-    async fn a_refusal_takes_the_shape_of_the_prefix_it_was_called_through() {
-        let gate = gate(true, vec![]).await;
+    async fn a_gate_refusal_answers_the_envelope_under_any_prefix() {
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)
@@ -5031,13 +4905,16 @@ mod gate_tests {
             .await
             .unwrap();
 
+        // The unversioned spelling the gate's table is written in answers
+        // the same envelope: the body no longer follows the prefix.
         let (status, body) =
             call_with_body(&gate, "POST", "/api/apps/other/versions", None, "{}").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(
-            body.starts_with(r#"{"error":"Unauthorized","details":"#),
-            "{body}"
-        );
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "unauthenticated");
+        assert!(body["error"]["requestId"].is_string(), "{body}");
+        assert_eq!(body["error"]["retryable"], false);
+
         let (status, body) = call_with_body(
             &gate,
             "POST",
@@ -5047,10 +4924,8 @@ mod gate_tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(
-            body.starts_with(r#"{"error":"This credential may not do that: "#),
-            "{body}"
-        );
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "insufficient-scope");
 
         let (status, body) =
             call_with_body(&gate, "POST", "/api/v1/apps/other/versions", None, "{}").await;
@@ -5094,7 +4969,7 @@ mod gate_tests {
 
     #[tokio::test]
     async fn a_padded_name_in_the_body_is_judged_as_the_name_that_gets_created() {
-        let gate = gate(true, vec![]).await;
+        let gate = gate().await;
         gate.state
             .identity
             .create_account("ci", Role::Deployer)

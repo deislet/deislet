@@ -34,6 +34,7 @@ use deis_telemetry::proto::{LogEntry, PushLogsRequest};
 use deis_telemetry::server::{self, RunningServer};
 use deis_telemetry::stats::ServiceStats;
 use deis_telemetry::{MAX_GRPC_MESSAGE_BYTES, now_us};
+use ed25519_dalek::SigningKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tonic::transport::Channel;
@@ -70,8 +71,11 @@ fn entry(message: &str) -> LogEntry {
     }
 }
 
-/// Minimal HTTP/1.1 GET. `Connection: close` makes the server end the body,
-/// so reading to EOF is a deterministic way to know the response is complete.
+/// Deterministic verifying key for tests that don't need to sign tokens.
+fn test_verifying_key() -> ed25519_dalek::VerifyingKey {
+    let seed: [u8; 32] = [0x42; 32];
+    SigningKey::from_bytes(&seed).verifying_key()
+}
 async fn http_get(addr: SocketAddr, path: &str) -> String {
     let mut stream = TcpStream::connect(addr)
         .await

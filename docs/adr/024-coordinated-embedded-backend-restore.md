@@ -3,7 +3,7 @@
 - 状态：Accepted
 - 日期：2026-09-04
 - 决策者：产品负责人已确认的统一标准、行业主流语义交集与产品级推进方向
-- 关联：[ADR-019](019-coordinated-data-lifecycle.md)、[ADR-023](023-backend-migration-fence-and-inventory.md)、`../product/phase-analysis-2026-09-03.zh.md` 第 25 节、`../../contracts/v1/backend-restore-set.schema.json`、`../../contracts/v1/backend-restore-report.schema.json`
+- 关联：[ADR-019](019-coordinated-data-lifecycle.md)、[ADR-023](023-backend-migration-fence-and-inventory.md)、`../archive/phase-analysis-2026-09-03.zh.md` 第 25 节、`../../contracts/v1/backend-restore-set.schema.json`、`../../contracts/v1/backend-restore-report.schema.json`
 - 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 决策
@@ -25,7 +25,7 @@ Deislet embedded 模式的 store、queue、telemetry 恢复是一项 installatio
 
 取消只允许尚未进入 topology driver 的 `planned` restore。`waiting` 表示外部结果未知而不是未开始，必须以相同 operation 对账到 verified success 或 rollback；不得通过 catalog-only cancel 释放互斥并遗留半完成的物理 journal。
 
-这里的 `full-platform-outage` 指 embedded 数据面的完整写入停机屏障：应用/runtime 写入入口关闭，store、queue、telemetry 全部停止。Control 保持运行以记录 Operation，但 restore 与 migration 互斥，且它不能在屏障期间向这三个后端执行数据变更。Control catalog 本身不属于该 restore set，也不会被目录切换。
+这里的 `full-platform-outage` 指 embedded 数据面的完整写入停机屏障：应用/runtime 写入入口关闭，store、queue、telemetry 全部停止。Control 保持运行以记录 Operation，但 restore 与 migration 互斥，且它不能在屏障期间向这三个后端执行数据变更。Control catalog 本身不属于该 restore set，也不会被目录切换：它不是 snapshot 也不是 topology driver 的一步，而是由 Litestream 持续复制的单个 SQLite 文件，恢复它走另一条 runbook（ADR-012 的 embedded control 一节与 `docs/control-backup-and-restore.md`）。两者不共用停机屏障：协同快照定的是三个 embedded 数据后端的 barrier 时间，control 副本的 RPO 由 Litestream 的 `sync-interval` 决定。
 
 ## 标准与平台实现
 
