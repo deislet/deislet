@@ -2715,11 +2715,25 @@ mod tests {
             )
             .await,
         );
+        // Accounts are listed `(created_at ASC, name ASC)` and `created_at`
+        // is in whole seconds. `root` is created while the router is built
+        // and `alice` just above, so the two share a second on an idle
+        // machine and `alice` sorts first - and on a loaded one the second
+        // turns over in between and `root` does. The normaliser then writes
+        // the same placeholder instant into both, which leaves a file that
+        // differs only in an order it cannot explain. Sorting by name here is
+        // the order the handler gives two accounts created in the same
+        // second, which is the order the placeholder instants claim.
+        let (status, mut accounts) =
+            send_json(r, &secret, "GET", "/api/v1/accounts", Value::Null).await;
+        if let Some(items) = accounts["items"].as_array_mut() {
+            items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        }
         keep(
             "ControlListPage_Account",
             "listAccounts",
             200,
-            send_json(r, &secret, "GET", "/api/v1/accounts", Value::Null).await,
+            (status, accounts),
         );
         let minted = send_json(
             r,
