@@ -105,7 +105,7 @@ impl QueueAuth {
         self.verifier
             .lock()
             .expect("lock poisoned")
-            .verify(&token, "queue", &tenant, "queue")
+            .verify_with_grace(&token, "queue", &tenant, "queue")
     }
 }
 
@@ -131,7 +131,7 @@ impl tonic::service::Interceptor for QueueAuth {
         let v = verifier.lock().expect("lock poisoned");
         let t = token.as_deref().unwrap_or("");
         let ten = tenant.as_deref().unwrap_or("");
-        let result = v.verify(t, "queue", ten, "queue");
+        let result = v.verify_with_grace(t, "queue", ten, "queue");
 
         match result {
             Ok(verified) => {

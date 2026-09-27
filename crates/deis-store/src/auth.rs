@@ -123,7 +123,7 @@ impl StorageAuth {
         self.verifier
             .lock()
             .expect("lock poisoned")
-            .verify(&token, "store", &tenant, self.binding)
+            .verify_with_grace(&token, "store", &tenant, self.binding)
     }
 }
 
@@ -149,7 +149,7 @@ impl tonic::service::Interceptor for StorageAuth {
         let v = verifier.lock().expect("lock poisoned");
         let t = token.as_deref().unwrap_or("");
         let ten = tenant.as_deref().unwrap_or("");
-        let result = v.verify(t, "store", ten, binding);
+        let result = v.verify_with_grace(t, "store", ten, binding);
 
         match result {
             Ok(verified) => {

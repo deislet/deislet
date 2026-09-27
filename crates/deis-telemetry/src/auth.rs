@@ -133,6 +133,8 @@ impl TelemetryAuth {
                 node_id: "noop".to_string(),
                 canonical_tenant_id: "noop".to_string(),
                 binding: "noop".to_string(),
+                grace_accepted: false,
+                exp: u64::MAX,
             });
         }
         let token = headers
@@ -150,7 +152,7 @@ impl TelemetryAuth {
         self.verifier
             .read()
             .expect("lock poisoned")
-            .verify(token, "telemetry.read", "", "")
+            .verify_with_grace(token, "telemetry.read", "", "")
     }
 }
 
@@ -184,8 +186,8 @@ impl tonic::service::Interceptor for TelemetryAuth {
         // routing layer after the interceptor runs.  Try both audiences:
         // "telemetry" (for push) first, then "telemetry.read" (for query/tail).
         let result = v
-            .verify(t, "telemetry", "", "")
-            .or_else(|_| v.verify(t, "telemetry.read", "", ""));
+            .verify_with_grace(t, "telemetry", "", "")
+            .or_else(|_| v.verify_with_grace(t, "telemetry.read", "", ""));
 
         match result {
             Ok(verified) => {
