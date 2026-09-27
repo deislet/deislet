@@ -388,6 +388,8 @@ const _: () = assert!(STREAM_CHUNK_BYTES * 2 < MAX_GRPC_MESSAGE_BYTES);
 /// of secret revision ids the calling node needs plaintext values for.
 ///
 /// This is the wire type for the `entries_json` field of the gRPC request.
+/// `revisions` must be non-empty and every one of them bound by the
+/// deployment's snapshot; there is no "all secrets of this deployment" form.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SecretFetchEntry {
     pub deployment_id: String,

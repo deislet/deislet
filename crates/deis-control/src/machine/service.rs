@@ -19,7 +19,7 @@
 //! who chooses a node's id is the same person who has its certificate issued -
 //! so the id is in the certificate already, and reading it there is free.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use deis_identity::{SpiffeId, names};
 use deis_wire::machine::machine_channel_server::MachineChannel;
@@ -30,7 +30,7 @@ use deis_wire::machine::{
     IssueCapabilityResponse, RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::{Request, Response, Status};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::api::catalog::CatalogState;
 use crate::api::catalog::{assignments, routing_table};
@@ -90,6 +90,21 @@ fn refuse_mismatch(kind: &str, proved: &SpiffeId, claimed: &str) -> Status {
         "this connection proved {proved}, which does not name the {kind} {claimed} the call asks \
          for; a machine may only ask for its own"
     ))
+}
+
+/// The audit line for a refused secret fetch. Names who asked and for what,
+/// never a value; the accepted counterpart is written inline where the
+/// revisions and count are known.
+fn audit_secret_fetch_refused(node: &str, deployment_id: Option<&str>, reason: &str) {
+    warn!(
+        target: "deis_control::audit",
+        event = "secret.fetch",
+        outcome = "refused",
+        node = %node,
+        deployment_id = deployment_id.unwrap_or(""),
+        reason,
+        "Refused a node's request for secret values"
+    );
 }
 
 #[tonic::async_trait]
@@ -265,10 +280,13 @@ impl MachineChannel for MachineChannelService {
             .ok_or_else(no_proved_identity)?
             .clone();
         let claimed = &request.get_ref().node_id;
-        match names::node_id_of(&proved) {
-            Some(node_id) if node_id == claimed => {}
-            _ => return Err(refuse_mismatch("node", &proved, claimed)),
-        }
+        let node_id = match names::node_id_of(&proved) {
+            Some(node_id) if node_id == claimed => node_id.to_string(),
+            _ => {
+                audit_secret_fetch_refused(claimed, None, "the certificate names another node");
+                return Err(refuse_mismatch("node", &proved, claimed));
+            }
+        };
 
         let entries: Vec<deis_wire::conventions::SecretFetchEntry> =
             serde_json::from_str(&request.get_ref().entries_json).map_err(|error| {
@@ -276,65 +294,95 @@ impl MachineChannel for MachineChannelService {
                     "secret fetch entries could not be parsed: {error}"
                 ))
             })?;
+        if entries.is_empty() || entries.iter().any(|entry| entry.revisions.is_empty()) {
+            return Err(Status::invalid_argument(
+                "every secret fetch entry must name at least one revision; there is no \
+                 \"everything for this deployment\" request",
+            ));
+        }
 
-        let all_assignments =
-            self.state.store.list_assignments().await.map_err(|error| {
-                Status::internal(format!("could not list assignments: {error:?}"))
+        // The node's own name, from the certificate, decides what it may
+        // read - never anything the request says about itself.
+        let visible = assignments::deployments_visible_to(&self.state, &node_id)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("could not list visible deployments: {error:?}"))
             })?;
 
-        // Use a dummy base URL since FetchSecretValues does not need
-        // bundle download URLs — only the secret values matter here.
-        let base = "";
-        let mut values: BTreeMap<String, String> = BTreeMap::new();
-
+        // Every entry is checked before anything is decrypted, and one bad
+        // entry refuses the whole request: a partial answer would let a
+        // caller map out which deployments exist by what came back.
+        let mut wanted = Vec::with_capacity(entries.len());
         for entry in &entries {
-            let Some(assignment) = all_assignments
-                .assignments
-                .iter()
-                .find(|a| a.deployment_id == entry.deployment_id)
-            else {
-                debug!(
-                    node = %proved,
-                    deployment_id = %entry.deployment_id,
-                    "FetchSecretValues: deployment not found"
+            let Some(deployment) = visible.get(&entry.deployment_id) else {
+                audit_secret_fetch_refused(
+                    &node_id,
+                    Some(&entry.deployment_id),
+                    "the deployment is not assigned to this node",
                 );
-                continue;
+                return Err(Status::permission_denied(format!(
+                    "deployment {} is not assigned to node {node_id}",
+                    entry.deployment_id
+                )));
             };
+            let Some(snapshot_id) = deployment.snapshot_id.as_deref() else {
+                audit_secret_fetch_refused(
+                    &node_id,
+                    Some(&entry.deployment_id),
+                    "the deployment binds no secret revisions",
+                );
+                return Err(Status::permission_denied(format!(
+                    "deployment {} binds no secret revisions",
+                    entry.deployment_id
+                )));
+            };
+            let revisions: BTreeSet<String> = entry.revisions.iter().cloned().collect();
+            wanted.push((entry, deployment.env_id.as_str(), snapshot_id, revisions));
+        }
 
-            let payload = match self
+        let mut values: BTreeMap<String, String> = BTreeMap::new();
+        for (entry, env_id, snapshot_id, revisions) in wanted {
+            let fetched = self
                 .state
                 .deliverer
-                .assignment_payload(assignment, base)
+                .snapshot_secret_values(env_id, snapshot_id, &revisions)
                 .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    warn!(
-                        node = %proved,
-                        deployment_id = %entry.deployment_id,
-                        error = ?error,
-                        "FetchSecretValues: could not build payload"
+                .map_err(|error| {
+                    audit_secret_fetch_refused(
+                        &node_id,
+                        Some(&entry.deployment_id),
+                        &error.to_string(),
                     );
-                    continue;
-                }
-            };
-
-            for (revision, value) in &payload.secret_values_by_revision {
-                let key = format!("{}\x00{revision}", entry.deployment_id);
-                values.insert(key, value.clone());
+                    match error {
+                        crate::catalog::CatalogError::Forbidden(message) => {
+                            Status::permission_denied(message)
+                        }
+                        crate::catalog::CatalogError::NotFound(message) => {
+                            Status::not_found(message)
+                        }
+                        other => {
+                            Status::internal(format!("secret values could not be read: {other}"))
+                        }
+                    }
+                })?;
+            info!(
+                target: "deis_control::audit",
+                event = "secret.fetch",
+                outcome = "accepted",
+                node = %node_id,
+                deployment_id = %entry.deployment_id,
+                revisions = ?revisions,
+                count = fetched.len(),
+                "A node fetched secret values over the machine channel"
+            );
+            for (revision, value) in fetched {
+                values.insert(format!("{}\x00{revision}", entry.deployment_id), value);
             }
         }
 
         let values_json = serde_json::to_string(&values).map_err(|error| {
             Status::internal(format!("could not encode secret values: {error}"))
         })?;
-
-        debug!(
-            node = %proved,
-            entries = entries.len(),
-            values = values.len(),
-            "Served secret values over the machine channel"
-        );
         Ok(Response::new(FetchSecretValuesResponse { values_json }))
     }
 
@@ -641,5 +689,256 @@ mod tests {
             "{}",
             refusal.message()
         );
+    }
+
+    /// One schema-2 deployment of `demo` whose only binding is the secret
+    /// `TOKEN`. Returns the deployment id and the bound revision.
+    async fn deployed_with_secret(h: &crate::api::catalog::tests::Harness) -> (String, String) {
+        use crate::api::catalog::tests::{call, json};
+        use axum::body::Body;
+        use axum::http::StatusCode;
+
+        let declarations = deis_wire::EnvironmentDeclarations::new(
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "TOKEN".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        );
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let manifest = serde_json::json!({
+            "schema": 2,
+            "app": "demo",
+            "entry": "worker/index.js",
+            "environment": declarations,
+        })
+        .to_string();
+        let (status, uploaded) = call(
+            &h.router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(crate::catalog::bundle::tests::bundle_with_manifest(
+                &manifest, true,
+            )),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{uploaded}");
+        let version_id = uploaded["version"]["id"].as_str().unwrap().to_string();
+        json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+        let (status, stored) = json(
+            &h.router,
+            "PUT",
+            "/api/apps/demo/environments/production/secrets/TOKEN",
+            serde_json::json!({"value": "first-value"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{stored}");
+        let (status, deployed) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({"version_id": version_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{deployed}");
+        let deployment_id = deployed["deployment"]["id"].as_str().unwrap().to_string();
+        let snapshot_id = deployed["deployment"]["snapshot_id"].as_str().unwrap();
+        let snapshot = h
+            .state
+            .store
+            .get_environment_snapshot(snapshot_id)
+            .await
+            .unwrap();
+        let revision = snapshot
+            .bindings
+            .iter()
+            .find_map(|binding| match binding {
+                deis_wire::EnvironmentBinding::Secret(secret) => Some(secret.revision.clone()),
+                deis_wire::EnvironmentBinding::Config(_) => None,
+            })
+            .expect("the snapshot binds TOKEN");
+        (deployment_id, revision)
+    }
+
+    fn secret_request(
+        node_id: &str,
+        deployment_id: &str,
+        revisions: &[&str],
+    ) -> FetchSecretValuesRequest {
+        FetchSecretValuesRequest {
+            node_id: node_id.to_string(),
+            entries_json: serde_json::to_string(&[deis_wire::conventions::SecretFetchEntry {
+                deployment_id: deployment_id.to_string(),
+                revisions: revisions.iter().map(|r| r.to_string()).collect(),
+            }])
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_fetches_exactly_the_revisions_it_asked_for() {
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+
+        let answer = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect("a node may fetch its own deployment's secrets");
+        let values: BTreeMap<String, String> =
+            serde_json::from_str(&answer.get_ref().values_json).unwrap();
+        assert_eq!(
+            values,
+            BTreeMap::from([(
+                format!("{deployment_id}\x00{revision}"),
+                "first-value".to_string()
+            )])
+        );
+    }
+
+    /// A revision the deployment's snapshot does not bind - another
+    /// environment's, or one made up - refuses the whole request rather than
+    /// being skipped.
+    #[tokio::test]
+    async fn a_revision_the_deployment_does_not_bind_refuses_the_whole_request() {
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision, "not-bound"]),
+            ))
+            .await
+            .expect_err("an unbound revision was answered");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[]),
+            ))
+            .await
+            .expect_err("an entry naming no revision was answered with everything");
+        assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_deployment_is_refused() {
+        let h = harness(true).await;
+        let (_, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", "no-such-deployment", &[&revision]),
+            ))
+            .await
+            .expect_err("a deployment that does not exist was answered");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// The node the answer is for comes from the certificate: claiming
+    /// another node's id is refused, and a deployment in flight only to
+    /// another node is not visible to this one.
+    #[tokio::test]
+    async fn a_node_cannot_fetch_another_nodes_deployment_secrets() {
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-other"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect_err("one node fetched secrets as another");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        // A plan still preparing, frozen to `runtime-test` only.
+        let env = h
+            .state
+            .store
+            .get_environment("demo", "production")
+            .await
+            .unwrap();
+        let current = h
+            .state
+            .store
+            .current_deployment(&env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let version = h
+            .state
+            .store
+            .get_version("demo", &current.version_id)
+            .await
+            .unwrap();
+        let snapshot = h
+            .state
+            .store
+            .get_environment_snapshot(current.snapshot_id.as_deref().unwrap())
+            .await
+            .unwrap();
+        let plan = h
+            .state
+            .store
+            .create_deployment_plan(
+                &env,
+                &version,
+                crate::catalog::store::DeploymentPlanSpec {
+                    snapshot: Some(snapshot),
+                    expected_secret_heads: Default::default(),
+                    compare_secret_heads: false,
+                    target_ids: vec!["runtime-test".to_string()],
+                    proxy_ids: Vec::new(),
+                    queue_fence: false,
+                    operation_kind: "deployment".to_string(),
+                    secret_change: None,
+                    note: None,
+                },
+                deis_wire::CanonicalId::new_v7(),
+                30,
+            )
+            .await
+            .unwrap();
+
+        service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &plan.id, &[&revision]),
+            ))
+            .await
+            .expect("the plan's target may fetch while preparing");
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-other"),
+                secret_request("runtime-other", &plan.id, &[&revision]),
+            ))
+            .await
+            .expect_err("a node fetched secrets of a plan that does not target it");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
     }
 }

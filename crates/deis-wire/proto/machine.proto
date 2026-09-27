@@ -144,8 +144,9 @@ message FetchSecretValuesRequest {
 
 message FetchSecretValuesResponse {
   // A JSON object mapping `{deployment_id}\x00{revision}` to the plaintext
-  // secret value. A key absent from this map means the value is not
-  // available (unknown deployment, revision not found, or unauthorized).
+  // secret value, for exactly the requested revisions. A request naming a
+  // deployment not assigned to the caller, or a revision that deployment's
+  // snapshot does not bind, is refused as a whole with PERMISSION_DENIED.
   string values_json = 1;
 }
 

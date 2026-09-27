@@ -1559,6 +1559,49 @@ impl DeploymentDeliverer {
         Ok(payload)
     }
 
+    /// Decrypt exactly `revisions` of one immutable environment snapshot.
+    ///
+    /// This is what `FetchSecretValues` answers with, and it is deliberately
+    /// narrower than [`Self::assignment_payload`]: it reads only the secret
+    /// bindings of the snapshot, decrypts only what was asked for, and refuses
+    /// the whole request when any revision is not one the snapshot binds. A
+    /// node asking for a revision its deployment does not reference is either
+    /// broken or probing, and neither gets a partial answer.
+    pub async fn snapshot_secret_values(
+        &self,
+        env_id: &str,
+        snapshot_id: &str,
+        revisions: &BTreeSet<String>,
+    ) -> CatalogResult<BTreeMap<String, String>> {
+        let snapshot = self.store.get_environment_snapshot(snapshot_id).await?;
+        let bound: BTreeMap<&str, &str> = snapshot
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                deis_wire::EnvironmentBinding::Secret(secret) => {
+                    Some((secret.revision.as_str(), secret.name.as_str()))
+                }
+                deis_wire::EnvironmentBinding::Config(_) => None,
+            })
+            .collect();
+
+        let mut values = BTreeMap::new();
+        for revision in revisions {
+            let Some(name) = bound.get(revision.as_str()) else {
+                return Err(CatalogError::forbidden(format!(
+                    "secret revision {revision} is not bound by snapshot {snapshot_id}"
+                )));
+            };
+            let stored = self
+                .store
+                .secret_revision_ciphertext(env_id, name, revision)
+                .await?;
+            let value = decrypt_secret(self.secrets.as_ref(), env_id, &stored)?;
+            values.insert(revision.clone(), value);
+        }
+        Ok(values)
+    }
+
     /// Push a payload to every configured node, concurrently.
     ///
     /// Never fails as a whole: a node that is down is represented in the

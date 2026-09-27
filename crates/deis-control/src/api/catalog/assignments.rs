@@ -337,3 +337,46 @@ pub(crate) async fn assignments_for(
         withheld,
     })
 }
+
+/// Where one deployment's secrets live, for a node that may read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisibleDeployment {
+    /// Primary key of the environment row: the half of a secret revision's
+    /// storage key and AAD that the snapshot does not carry.
+    pub env_id: String,
+    /// `None` for a deployment that predates typed snapshots, which binds no
+    /// secret revisions and so has nothing to fetch.
+    pub snapshot_id: Option<String>,
+}
+
+/// Which deployments `node_id` may read secret values for, keyed by id.
+///
+/// The single place that decides it, so that a placement model narrows it
+/// here and nowhere else. Today every node runs every application, so this is
+/// every current assignment plus every in-flight plan that names this node as
+/// a target: a PREPARE push reaches the node before the deployment pointer is
+/// written, and the node fetches its secrets while preparing.
+pub(crate) async fn deployments_visible_to(
+    state: &CatalogState,
+    node_id: &str,
+) -> crate::catalog::CatalogResult<BTreeMap<String, VisibleDeployment>> {
+    let mut visible = BTreeMap::new();
+    for assignment in state.store.list_assignments().await?.assignments {
+        visible.insert(
+            assignment.deployment_id,
+            VisibleDeployment {
+                env_id: assignment.environment_id,
+                snapshot_id: assignment.snapshot_id,
+            },
+        );
+    }
+    for plan in state.store.nonterminal_deployment_plans().await? {
+        if plan.target_ids.iter().any(|target| target == node_id) {
+            visible.entry(plan.id).or_insert(VisibleDeployment {
+                env_id: plan.env_id,
+                snapshot_id: plan.snapshot_id,
+            });
+        }
+    }
+    Ok(visible)
+}
