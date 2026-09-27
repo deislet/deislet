@@ -31,7 +31,7 @@ use base64::Engine;
 use deis_wire::CanonicalTenantId;
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---- wire format constants ------------------------------------------------
 
@@ -43,6 +43,26 @@ const TOKEN_SEPARATOR: char = '.';
 
 /// How many seconds ahead we allow for clock skew when checking expiry.
 const CLOCK_SKEW_SECS: u64 = 30;
+
+// ---- T8 degraded-mode constants -------------------------------------------
+
+/// Maximum grace period for expired node capabilities when the control plane
+/// is unreachable: 24 hours (86 400 seconds).  Per decision D-8, this is the
+/// hard upper bound — `grace_max_secs` is capped at this value.
+pub const MAX_GRACE_PERIOD_SECS: u64 = 86_400;
+
+/// Default grace period: 24 hours.
+pub const DEFAULT_GRACE_PERIOD_SECS: u64 = 86_400;
+
+/// Default clock-skew tolerance for degraded-mode expiry checks: 30 seconds.
+pub const DEFAULT_DEGRADED_SKEW_SECS: u64 = 30;
+
+/// Default revocation-list pull interval: 30 seconds.
+pub const DEFAULT_PULL_INTERVAL_SECS: u64 = 30;
+
+/// Degraded mode activates when `last_sync` is older than this factor ×
+/// `pull_interval_secs`.
+const DEGRADED_PULL_INTERVAL_FACTOR: u64 = 2;
 
 // ---- error types ----------------------------------------------------------
 
@@ -301,6 +321,11 @@ pub struct VerifiedCapability {
     pub canonical_tenant_id: String,
     /// The binding type authorized.
     pub binding: String,
+    /// `true` when the token was accepted under T8 degraded-mode grace rules
+    /// (it was expired but within the grace window).
+    pub grace_accepted: bool,
+    /// Token expiry as Unix seconds, for observability and alerting.
+    pub exp: u64,
 }
 
 /// Fully verify a capability token: signature, expiry, audience, and
@@ -376,6 +401,8 @@ pub fn verify_for_request(
         node_id: claims.sub.clone(),
         canonical_tenant_id: tenant.to_string(),
         binding: binding.to_string(),
+        grace_accepted: false,
+        exp: claims.exp,
     })
 }
 
@@ -384,7 +411,8 @@ pub fn verify_for_request(
 /// A reusable verifier for capability tokens.
 ///
 /// Bundles the verifying key with the two revocation-state inputs
-/// (`min_auth_epoch` and `revoked_jtis`) so a service can construct one
+/// (`min_auth_epoch` and `revoked_jtis`) and the T8 degraded-mode state
+/// (`last_sync`, `grace_max_secs`) so a service can construct one
 /// verifier at startup and reuse it for every request.
 #[derive(Debug, Clone)]
 pub struct CapabilityVerifier {
@@ -394,15 +422,31 @@ pub struct CapabilityVerifier {
     min_auth_epoch: u64,
     /// List of revoked JTIs (loaded from revocation feed).
     revoked_jtis: Vec<String>,
+    /// Last successful revocation-list pull, as a monotonic instant.
+    /// `None` means never synced → degraded from the start.
+    last_sync: Option<Instant>,
+    /// Maximum grace period in seconds, capped at [`MAX_GRACE_PERIOD_SECS`].
+    grace_max_secs: u64,
+    /// Clock-skew tolerance in seconds for grace-condition
+    /// `exp ≥ last_sync − skew`.
+    skew_secs: u64,
+    /// Revocation-list pull interval in seconds.
+    pull_interval_secs: u64,
 }
 
 impl CapabilityVerifier {
-    /// Create a verifier with `min_auth_epoch = 0` and an empty revoked list.
+    /// Create a verifier with `min_auth_epoch = 0`, an empty revoked list,
+    /// and T8 defaults (grace period = 24 h, skew = 30 s,
+    /// pull interval = 30 s).
     pub fn new(verifying_key: ed25519_dalek::VerifyingKey) -> Self {
         Self {
             verifying_key,
             min_auth_epoch: 0,
             revoked_jtis: Vec::new(),
+            last_sync: None,
+            grace_max_secs: DEFAULT_GRACE_PERIOD_SECS,
+            skew_secs: DEFAULT_DEGRADED_SKEW_SECS,
+            pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
         }
     }
 
@@ -414,6 +458,50 @@ impl CapabilityVerifier {
     /// Replace the revoked JTI list.
     pub fn set_revoked_jtis(&mut self, jtis: Vec<String>) {
         self.revoked_jtis = jtis;
+    }
+
+    /// Set the maximum grace period in seconds, silently capped at
+    /// [`MAX_GRACE_PERIOD_SECS`] (24 hours).
+    pub fn set_grace_max_secs(&mut self, secs: u64) {
+        self.grace_max_secs = secs.min(MAX_GRACE_PERIOD_SECS);
+    }
+
+    /// Set the revocation-list pull interval in seconds.
+    pub fn set_pull_interval_secs(&mut self, secs: u64) {
+        self.pull_interval_secs = secs;
+    }
+
+    /// Record a successful revocation-list pull, resetting the degraded-mode
+    /// clock.
+    pub fn record_sync(&mut self) {
+        self.last_sync = Some(Instant::now());
+    }
+
+    /// Whether the verifier is in degraded mode.
+    ///
+    /// Returns `true` when:
+    /// - `last_sync` has never been set (the verifier has never synced), or
+    /// - the elapsed time since `last_sync` exceeds
+    ///   `DEGRADED_PULL_INTERVAL_FACTOR × pull_interval_secs`.
+    pub fn is_degraded(&self) -> bool {
+        match self.last_sync {
+            None => true,
+            Some(last) => {
+                last.elapsed()
+                    > Duration::from_secs(
+                        self.pull_interval_secs * DEGRADED_PULL_INTERVAL_FACTOR,
+                    )
+            }
+        }
+    }
+
+    /// The approximate Unix time of the last successful sync, or `None` if
+    /// the verifier has never synced.
+    pub fn last_sync_unix(&self) -> Option<u64> {
+        self.last_sync.map(|last| {
+            let elapsed = last.elapsed().as_secs();
+            now_secs().saturating_sub(elapsed)
+        })
     }
 
     /// Verify a token against an expected audience, tenant, and binding.
@@ -434,9 +522,119 @@ impl CapabilityVerifier {
             Some(&self.revoked_jtis),
         )
     }
+
+    /// Verify with T8 degraded-mode grace period.
+    ///
+    /// When the token's `sub` identifies a node SPIFFE identity
+    /// (`spiffe://deislet/node/…`) and the verifier is in degraded mode,
+    /// expired tokens are accepted if:
+    /// 1. `exp ≥ last_sync_unix − skew_secs` (the token was still valid when
+    ///    the control plane was last reachable), and
+    /// 2. `now ≤ exp + grace_max_secs` (within the grace window).
+    ///
+    /// Human / CLI tokens are never eligible for grace — their `sub` starts
+    /// with `spiffe://deislet/human/`.
+    pub fn verify_with_grace(
+        &self,
+        token: &str,
+        expected_aud: &str,
+        tenant: &str,
+        binding: &str,
+    ) -> Result<VerifiedCapability, CapabilityError> {
+        let claims = decode(token, &self.verifying_key)?;
+        let now = now_secs();
+        let is_node = is_node_subject(&claims.sub);
+        let grace_accepted = claims.is_expired()
+            && is_node
+            && self.is_degraded()
+            && self.grace_applies(&claims, now);
+
+        // Check expiry with grace.
+        if claims.is_expired() && !grace_accepted {
+            return Err(CapabilityError::Expired {
+                exp: claims.exp,
+                now,
+            });
+        }
+
+        // Iat must not be in the future (checked even in grace).
+        if !grace_accepted && claims.is_not_yet_valid() {
+            return Err(CapabilityError::NotYetValid {
+                iat: claims.iat,
+                now,
+            });
+        }
+
+        // Check audience.
+        if claims.aud != expected_aud {
+            return Err(CapabilityError::WrongAudience {
+                expected: expected_aud.to_string(),
+                got: claims.aud,
+            });
+        }
+
+        // Check auth epoch.
+        if claims.auth_epoch < self.min_auth_epoch {
+            return Err(CapabilityError::AuthEpochTooLow {
+                got: claims.auth_epoch,
+                minimum: self.min_auth_epoch,
+            });
+        }
+
+        // Check revocation.
+        if self.revoked_jtis.iter().any(|jti| *jti == claims.jti) {
+            return Err(CapabilityError::Revoked {
+                jti: claims.jti.clone(),
+            });
+        }
+
+        // Check tenant + binding.
+        if !claims.authorizes_binding(tenant, binding) {
+            if !claims.authorizes_tenant(tenant) {
+                return Err(CapabilityError::TenantNotAuthorized {
+                    tenant: tenant.to_string(),
+                });
+            }
+            return Err(CapabilityError::BindingNotAuthorized {
+                tenant: tenant.to_string(),
+                binding: binding.to_string(),
+            });
+        }
+
+        Ok(VerifiedCapability {
+            node_id: claims.sub.clone(),
+            canonical_tenant_id: tenant.to_string(),
+            binding: binding.to_string(),
+            grace_accepted,
+            exp: claims.exp,
+        })
+    }
+
+    /// Check whether the two grace-period conditions are satisfied.
+    fn grace_applies(&self, claims: &CapabilityClaims, now: u64) -> bool {
+        let last_unix = match self.last_sync_unix() {
+            Some(t) => t,
+            None => return false,
+        };
+        let last_allowed = last_unix.saturating_sub(self.skew_secs);
+        if claims.exp < last_allowed {
+            return false;
+        }
+        if now > claims.exp.saturating_add(self.grace_max_secs) {
+            return false;
+        }
+        true
+    }
 }
 
 // ---- helpers --------------------------------------------------------------
+
+/// Returns `true` if the subject identifies a node principal
+/// (SPIFFE `spiffe://deislet/node/…`).  Human and CLI tokens use
+/// `spiffe://deislet/human/…` and are excluded from T8 grace.
+fn is_node_subject(sub: &str) -> bool {
+    sub.starts_with("spiffe://deislet/node/")
+}
 
 /// JCS-canonicalize the claims to deterministic bytes for signing.
 fn serialize_claims(claims: &CapabilityClaims) -> Vec<u8> {
@@ -933,5 +1131,256 @@ mod tests {
             verify_for_request(&token, &verifying, "store", "some-tenant", "kv", None, None,),
             Err(CapabilityError::TenantNotAuthorized { .. })
         ));
+    }
+
+    // ---- T8 degraded-mode / grace-period tests ---------------------------
+
+    /// Make a token for a node principal that expires in `offset_secs`
+    /// (negative = already expired).
+    fn make_node_token(
+        signing: &SigningKey,
+        offset_secs: i64,
+    ) -> String {
+        let now = now_secs();
+        let exp = (now as i64 + offset_secs) as u64;
+        let iat = exp.saturating_sub(900);
+        let claims = CapabilityClaims {
+            aud: "store".into(),
+            iss: "spiffe://deislet/control/main".into(),
+            sub: "spiffe://deislet/node/n1".into(),
+            jti: uuid::Uuid::now_v7().to_string(),
+            exp,
+            iat,
+            auth_epoch: 1,
+            resources: vec![CapabilityResource::new(
+                &"v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002"
+                    .parse()
+                    .unwrap(),
+                "kv",
+            )],
+        };
+        encode(&claims, signing)
+    }
+
+    /// Make a token for a human principal that expires in `offset_secs`
+    /// (negative = already expired).
+    fn make_human_token(
+        signing: &SigningKey,
+        offset_secs: i64,
+    ) -> String {
+        let now = now_secs();
+        let exp = (now as i64 + offset_secs) as u64;
+        let iat = exp.saturating_sub(900);
+        let claims = CapabilityClaims {
+            aud: "store".into(),
+            iss: "spiffe://deislet/control/main".into(),
+            sub: "spiffe://deislet/human/alice".into(),
+            jti: uuid::Uuid::now_v7().to_string(),
+            exp,
+            iat,
+            auth_epoch: 1,
+            resources: vec![CapabilityResource::new(
+                &"v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002"
+                    .parse()
+                    .unwrap(),
+                "kv",
+            )],
+        };
+        encode(&claims, signing)
+    }
+
+    #[test]
+    fn is_node_subject_identifies_node_spiffe() {
+        assert!(is_node_subject("spiffe://deislet/node/n1"));
+        assert!(is_node_subject("spiffe://deislet/node/runtime-42"));
+    }
+
+    #[test]
+    fn is_node_subject_rejects_human_spiffe() {
+        assert!(!is_node_subject("spiffe://deislet/human/root"));
+        assert!(!is_node_subject("spiffe://deislet/human/alice"));
+    }
+
+    #[test]
+    fn is_node_subject_rejects_arbitrary_sub() {
+        assert!(!is_node_subject("admin"));
+        assert!(!is_node_subject("spiffe://other/node/n1"));
+    }
+
+    #[test]
+    fn degraded_when_never_synced() {
+        let (_, verifying) = make_keypair();
+        let verifier = CapabilityVerifier::new(verifying);
+        assert!(verifier.is_degraded());
+    }
+
+    #[test]
+    fn not_degraded_after_sync() {
+        let (_, verifying) = make_keypair();
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.record_sync();
+        assert!(!verifier.is_degraded());
+    }
+
+    #[test]
+    fn verify_with_grace_accepts_valid_token_normally() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, 600); // expires in 10 min
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.record_sync();
+
+        let result = verifier.verify_with_grace(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        );
+        match result {
+            Ok(cap) => {
+                assert!(!cap.grace_accepted, "valid token must not be grace_accepted");
+                assert_eq!(cap.node_id, "spiffe://deislet/node/n1");
+            }
+            Err(e) => panic!("valid token should pass: {e}"),
+        }
+    }
+
+    #[test]
+    fn verify_with_grace_accepts_expired_node_token_in_degraded_mode() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, -60); // expired 60s ago
+        let mut verifier = CapabilityVerifier::new(verifying);
+        // Record sync, then simulate disconnection by not syncing.
+        verifier.record_sync();
+        // The verifier is NOT degraded (just synced), so the only way to
+        // trigger grace is to skip record_sync and let time pass.  We
+        // override last_sync to the distant past via manual field
+        // manipulation.
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(verifier.is_degraded());
+
+        let result = verifier.verify_with_grace(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        );
+        match result {
+            Ok(cap) => {
+                assert!(cap.grace_accepted, "expired node token in degraded mode must be grace_accepted");
+                assert_eq!(cap.node_id, "spiffe://deislet/node/n1");
+            }
+            Err(e) => panic!("grace should accept recently-expired node token: {e}"),
+        }
+    }
+
+    #[test]
+    fn verify_with_grace_rejects_expired_human_token_even_in_degraded() {
+        let (signing, verifying) = make_keypair();
+        let token = make_human_token(&signing, -60); // expired 60s ago
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(verifier.is_degraded());
+
+        let result = verifier.verify_with_grace(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        );
+        assert!(
+            matches!(result, Err(CapabilityError::Expired { .. })),
+            "human tokens must not receive grace"
+        );
+    }
+
+    #[test]
+    fn verify_with_grace_rejects_expired_node_when_not_degraded() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, -60); // expired 60s ago
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.record_sync(); // just synced = not degraded
+        assert!(!verifier.is_degraded());
+
+        let result = verifier.verify_with_grace(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        );
+        assert!(
+            matches!(result, Err(CapabilityError::Expired { .. })),
+            "expired tokens must be refused when not degraded"
+        );
+    }
+
+    #[test]
+    fn verify_with_grace_rejects_token_expired_before_disconnection() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, -7200); // expired 2h ago
+        let mut verifier = CapabilityVerifier::new(verifying);
+        // last_sync was 1 min ago, but token expired 2h ago.
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(60));
+        assert!(verifier.is_degraded());
+
+        let result = verifier.verify_with_grace(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        );
+        assert!(
+            matches!(result, Err(CapabilityError::Expired { .. })),
+            "token expired before control-plane disconnection must not be revived"
+        );
+    }
+
+    #[test]
+    fn verify_with_grace_rejects_token_past_grace_window() {
+        let (signing, verifying) = make_keypair();
+        // Token expired 25h ago (past 24h grace window).
+        let token = make_node_token(&signing, -90_000);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(7200));
+        assert!(verifier.is_degraded());
+
+        let result = verifier.verify_with_grace(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        );
+        assert!(
+            matches!(result, Err(CapabilityError::Expired { .. })),
+            "token past grace window must be refused"
+        );
+    }
+
+    #[test]
+    fn grace_max_is_capped_at_24_hours() {
+        let (_, verifying) = make_keypair();
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.set_grace_max_secs(172_800); // 48h — should be capped
+        assert_eq!(verifier.grace_max_secs, MAX_GRACE_PERIOD_SECS);
+    }
+
+    #[test]
+    fn verify_with_grace_checks_binding_even_in_grace() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, -60);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(verifier.is_degraded());
+
+        // Token has binding "kv", but we ask for "sql"
+        let result = verifier.verify_with_grace(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "sql",
+        );
+        assert!(
+            matches!(result, Err(CapabilityError::BindingNotAuthorized { .. })),
+            "binding must be checked even in grace mode"
+        );
     }
 }
