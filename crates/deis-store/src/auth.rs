@@ -253,6 +253,59 @@ fn map_capability_error(e: CapabilityError) -> Status {
     }
 }
 
+/// The JSON body returned by `GET /capability/revocation-list`.
+#[derive(Debug, serde::Deserialize)]
+struct RevocationListResponse {
+    auth_epoch: u64,
+    revoked_jtis: Vec<String>,
+}
+
+/// Start a background task that polls the control plane's revocation-list
+/// endpoint every 30 seconds, feeding the current `auth_epoch` and revoked
+/// JTIs into the verifier.  A successful poll calls [`StorageAuth::record_sync`]
+/// which resets the T8 degraded-mode clock.
+///
+/// The task is spawned on the tokio runtime and runs until the process exits.
+/// Failures are logged at `warn` level and do not crash the process.
+pub fn start_revocation_poller(auth: StorageAuth, revocation_list_url: String) {
+    let url = format!("{revocation_list_url}/capability/revocation-list");
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        // First tick fires immediately; skip it so the interval is consistent.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match client.get(&url).send().await {
+                Ok(response) => match response.json::<RevocationListResponse>().await {
+                    Ok(body) => {
+                        auth.set_min_auth_epoch(body.auth_epoch);
+                        auth.set_revoked_jtis(body.revoked_jtis);
+                        auth.record_sync();
+                        tracing::debug!(
+                            auth_epoch = body.auth_epoch,
+                            "Refreshed revocation list from control plane"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to parse revocation-list response; will retry"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        url = %url,
+                        "Failed to reach control-plane revocation-list endpoint; will retry"
+                    );
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

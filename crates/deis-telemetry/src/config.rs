@@ -34,6 +34,11 @@ pub struct Config {
     /// capability tokens.
     #[serde(default)]
     pub capability_public_key: Option<String>,
+    /// The control-plane URL for the T8 revocation-list endpoint.
+    ///
+    /// Defaults to `http://127.0.0.1:8100`.
+    #[serde(default = "default_revocation_list_url")]
+    pub revocation_list_url: String,
     /// Independent bearer credential for the backend migration management
     /// RPCs. When absent those RPCs are not registered; ingest still opens
     /// and enforces the durable fence journal so removing this credential
@@ -137,6 +142,10 @@ fn default_metrics_export_window_secs() -> u64 {
     300
 }
 
+fn default_revocation_list_url() -> String {
+    "http://127.0.0.1:8100".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -144,6 +153,7 @@ impl Default for Config {
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
             capability_public_key: None,
+            revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             log_retention_days: default_log_retention_days(),
             metric_retention_days: default_metric_retention_days(),

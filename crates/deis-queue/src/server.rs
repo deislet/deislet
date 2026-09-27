@@ -186,6 +186,7 @@ pub async fn serve(
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
     let auth = QueueAuth::new(verifying_key);
+    crate::auth::start_revocation_poller(auth.clone(), config.revocation_list_url.clone());
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => Some(
             MigrationAuth::new(token)

@@ -28,6 +28,11 @@ pub struct Config {
     /// capability tokens.
     #[serde(default)]
     pub capability_public_key: Option<String>,
+    /// The control-plane URL for the T8 revocation-list endpoint.
+    ///
+    /// Defaults to `http://127.0.0.1:8100`.
+    #[serde(default = "default_revocation_list_url")]
+    pub revocation_list_url: String,
     /// Independent credential for migration inventory and writer fencing.
     /// If absent, the management gRPC service does not exist; there is no
     /// loopback bypass and this must not reuse the application data secret.
@@ -158,11 +163,16 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
+fn default_revocation_list_url() -> String {
+    "http://127.0.0.1:8100".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             capability_public_key: None,
+            revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             data_dir: default_data_dir(),
             connections: default_connections(),

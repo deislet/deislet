@@ -196,6 +196,7 @@ pub async fn serve(
     let auth_kv = StorageAuth::new(verifying_key, "kv");
     let auth_sql = StorageAuth::new(verifying_key, "sql");
     let auth_blob = StorageAuth::new(verifying_key, "blob");
+    crate::auth::start_revocation_poller(auth_kv.clone(), config.revocation_list_url.clone());
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => Some(
             MigrationAuth::new(token)

@@ -57,6 +57,16 @@ pub struct Config {
     /// to `http://127.0.0.1:8100/.well-known/deis/capability-public-key`.
     #[serde(default)]
     pub capability_public_key: Option<String>,
+    /// The control-plane URL for the T8 revocation-list endpoint.
+    ///
+    /// The store polls `{revocation_list_url}/capability/revocation-list`
+    /// every 30 seconds.  A successful poll feeds `auth_epoch` into the
+    /// verifier and resets the degraded-mode clock.
+    ///
+    /// Defaults to `http://127.0.0.1:8100` (the control plane's human API
+    /// listener on the default port).
+    #[serde(default = "default_revocation_list_url")]
+    pub revocation_list_url: String,
     /// Independent credential for backend migration inventory and writer
     /// fencing. When absent, the management service is not registered at
     /// all, including on loopback.
@@ -201,6 +211,10 @@ fn default_snapshot_retention() -> usize {
     7
 }
 
+fn default_revocation_list_url() -> String {
+    "http://127.0.0.1:8100".to_string()
+}
+
 /// A configured number of seconds, or `None` for the zero that means "no
 /// bound at all".
 fn optional_seconds(secs: u64) -> Option<Duration> {
@@ -223,6 +237,7 @@ impl Default for Config {
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
             capability_public_key: None,
+            revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             snapshot_dir: None,
             snapshot_interval_secs: default_snapshot_interval_secs(),
