@@ -868,12 +868,19 @@ pub(crate) fn streaming_channel(endpoint: &str) -> Result<Channel> {
 /// deis-store or deis-queue with no `auth_secret` accepts. That is why nothing
 /// here is conditional on a feature or a mode: the same code is correct
 /// against both configurations.
+///
+/// The token is held behind an [`Arc`]`<`[`RwLock`]`>` so that the node's
+/// background capability renewal loop can refresh it without rebuilding the
+/// isolate. A caller that creates one with [`StorageIdentity::new`] gets a
+/// private lock populated from the initial value; one created with
+/// [`StorageIdentity::from_lock`] shares its lock with other clients.
 #[derive(Clone)]
 pub struct StorageIdentity {
     tenant: Tenant,
-    /// Parsed once, so a token that cannot be sent as metadata is refused
-    /// when the client is built rather than on every call.
-    token: Option<MetadataValue<Ascii>>,
+    /// Held behind a lock so the renewal loop can refresh it. An empty or
+    /// missing token is `None` (or `Some("")`): both mean no credential was
+    /// handed to this node, and every call stamps only the tenant.
+    token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     /// Which namespace inside the tenant this client speaks for, or `None`
     /// for the tenant's unnamed one.
     ///
@@ -901,7 +908,7 @@ impl std::fmt::Debug for StorageIdentity {
             )
             .field(
                 "token",
-                &if self.token.is_some() {
+                &if self.token.read().unwrap().as_ref().map_or(false, |t| !t.is_empty()) {
                     "<present>"
                 } else {
                     "<absent>"
@@ -920,6 +927,10 @@ impl StorageIdentity {
     /// presented as a token and refused, where sending nothing at least
     /// works against a service that requires no proof.
     ///
+    /// The token is wrapped in a private [`Arc`]`<`[`RwLock`]`>` so callers
+    /// that also hold a reference through [`Self::token_lock`] can update
+    /// it.
+    ///
     /// Fails on a tenant that is not two legal parts, and on a token that is
     /// not sendable as gRPC metadata. Both are configuration faults that no
     /// retry fixes: the control plane's token is base64, so a value that will
@@ -928,17 +939,51 @@ impl StorageIdentity {
     /// the tenant rather than about the credential.
     pub fn new(tenant: impl Into<String>, token: Option<&str>) -> Result<Self> {
         let tenant = Tenant::new(tenant)?;
-        let token = match token.map(str::trim).filter(|token| !token.is_empty()) {
-            Some(token) => Some(token.parse::<MetadataValue<Ascii>>().map_err(|_| {
-                anyhow!(
-                    "the storage capability token handed to {} cannot be sent as gRPC metadata, \
-                     so every storage call of this application would be refused; the control \
-                     plane mints it as base64, which means this value did not come from one",
-                    tenant.as_str()
-                )
-            })?),
+        let packed = match token.map(str::trim).filter(|token| !token.is_empty()) {
+            Some(token) => {
+                // Parse eagerly: a token that cannot be sent as metadata is
+                // caught before the first storage call.
+                let _ = token.parse::<MetadataValue<Ascii>>().map_err(|_| {
+                    anyhow!(
+                        "the storage capability token handed to {} cannot be sent as gRPC \
+                         metadata, so every storage call of this application would be refused; \
+                         the control plane mints it as base64, which means this value did not \
+                         come from one",
+                        tenant.as_str()
+                    )
+                })?;
+                Some(token.to_string())
+            }
             None => None,
         };
+        Ok(Self {
+            tenant,
+            token: std::sync::Arc::new(std::sync::RwLock::new(packed)),
+            binding: None,
+            binding_name: None,
+        })
+    }
+
+    /// Bind to one tenant, sharing the token lock with other clients so a
+    /// background renewal loop can refresh all of them at once.
+    ///
+    /// The lock already holds the parsed token (or `None`), having been
+    /// populated by the caller from the initial deployment env.
+    pub fn from_lock(
+        tenant: impl Into<String>,
+        token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    ) -> Result<Self> {
+        let tenant = Tenant::new(tenant)?;
+        // Validate whatever is in the lock now so a bad initial token fails
+        // fast.
+        if let Some(ref t) = *token.read().unwrap() {
+            let _ = t.parse::<MetadataValue<Ascii>>().map_err(|_| {
+                anyhow!(
+                    "the storage capability token handed to {} cannot be sent as gRPC metadata",
+                    tenant.as_str()
+                )
+            })?;
+        }
         Ok(Self {
             tenant,
             token,
@@ -960,7 +1005,7 @@ impl StorageIdentity {
         let Some(name) = binding.map(str::trim).filter(|name| !name.is_empty()) else {
             return Ok(Self {
                 tenant: self.tenant.clone(),
-                token: self.token.clone(),
+                token: std::sync::Arc::clone(&self.token),
                 binding: None,
                 binding_name: None,
             });
@@ -975,7 +1020,7 @@ impl StorageIdentity {
         }
         Ok(Self {
             tenant: self.tenant.clone(),
-            token: self.token.clone(),
+            token: std::sync::Arc::clone(&self.token),
             binding: Some(name.parse::<MetadataValue<Ascii>>().map_err(|_| {
                 anyhow!(
                     "the binding name {name:?} of {} cannot be sent as gRPC metadata",
@@ -1010,24 +1055,34 @@ impl StorageIdentity {
     /// normal on a single-box install and fatal against a service that has an
     /// `auth_secret`, so it is worth a log field wherever a client is built.
     pub fn is_proven(&self) -> bool {
-        self.token.is_some()
+        self.token.read().unwrap().as_ref().map_or(false, |t| !t.is_empty())
+    }
+
+    /// Returns the shared lock behind this identity's token so a background
+    /// renewal loop can update it.
+    pub fn token_lock(&self) -> std::sync::Arc<std::sync::RwLock<Option<String>>> {
+        std::sync::Arc::clone(&self.token)
     }
 
     /// Wrap a message in a request carrying the tenant and, when there is
     /// one, the token that proves the caller may be it.
     pub fn stamp<T>(&self, message: T) -> Request<T> {
         let mut request = self.tenant.stamp(message);
-        if let Some(token) = &self.token {
-            let bearer = format!(
-                "Bearer {}",
-                token
-                    .to_str()
-                    .expect("a valid capability token is always ASCII")
-            );
-            request.metadata_mut().insert(
-                "authorization",
-                bearer.parse().expect("bearer token is valid metadata"),
-            );
+        if let Some(ref token) = *self.token.read().unwrap() {
+            if !token.is_empty() {
+                let bearer = format!(
+                    "Bearer {}",
+                    token
+                        .parse::<MetadataValue<Ascii>>()
+                        .expect("a valid capability token is always ASCII")
+                        .to_str()
+                        .expect("ASCII capability token is valid metadata")
+                );
+                request.metadata_mut().insert(
+                    "authorization",
+                    bearer.parse().expect("bearer token is valid metadata"),
+                );
+            }
         }
         // Stamped here rather than in each client, for the reason the token
         // is: a client that stamped the tenant and forgot the binding would
@@ -1168,6 +1223,11 @@ impl AppServices {
             match wiring.endpoints.store.as_deref() {
                 Some(endpoint) => {
                     let identity = identity()?;
+                    crate::deployment::capability_renewer::register(
+                        tenant,
+                        "store",
+                        identity.token_lock(),
+                    );
                     for kind in store_kinds {
                         // The unnamed namespace exists only when the manifest
                         // says `services.<kind>`. A version that declares only
@@ -1238,6 +1298,11 @@ impl AppServices {
             match wiring.endpoints.queue.as_deref() {
                 Some(endpoint) => {
                     let identity = queue_identity()?;
+                    crate::deployment::capability_renewer::register(
+                        tenant,
+                        "queue",
+                        identity.token_lock(),
+                    );
                     services.queue = Some(QueueClient::connect_lazy(endpoint, &identity)?);
                     tracing::info!(
                         app_id = tenant,

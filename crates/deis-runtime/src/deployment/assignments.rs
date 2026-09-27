@@ -402,6 +402,24 @@ impl AssignmentClient {
         }
     }
 
+    /// Returns a clone of the inner machine channel client, if this
+    /// assignment client is backed by one.  Background tasks such as the
+    /// capability renewal loop use this to reach the control plane without
+    /// sharing `&mut self` with the main reconciliation loop.
+    pub fn machine_channel_client(&self) -> Option<MachineChannelClient<Channel>> {
+        match &self.transport {
+            Transport::Machine { client, .. } => Some(client.clone()),
+        }
+    }
+
+    /// The node name this client speaks for, or the empty string if there
+    /// is no machine transport.
+    pub fn node_id(&self) -> &str {
+        match &self.transport {
+            Transport::Machine { node_id, .. } => node_id,
+        }
+    }
+
     /// The client this configuration calls for, or `None` when this node was
     /// told about no control plane at all and so asks nobody.
     ///
@@ -1228,6 +1246,13 @@ pub async fn run_control_loop(
     let mut degraded: u32 = 0;
     let mut registration = RegistrationState::Pending;
     let mut reconciler = Reconciler::new(&client, &deployer);
+
+    // Spawn the background capability renewal loop.  It shares the same
+    // machine-channel identity and endpoint, and reads the global token
+    // registry that AppServices::connect() populates.
+    let _renewal_metrics = client.machine_channel_client().map(|channel| {
+        crate::deployment::capability_renewer::spawn(channel, client.node_id().to_string())
+    });
 
     loop {
         if unreachable > 0 {

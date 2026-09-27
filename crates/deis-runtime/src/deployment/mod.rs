@@ -29,6 +29,7 @@
 //! both of them.
 
 mod assignments;
+pub(crate) mod capability_renewer;
 mod credential;
 mod fetch;
 mod registration;
