@@ -4,14 +4,21 @@ use axum::{
     http::{Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use rust_embed::Embed;
 
 use crate::api::error::ApiError;
 use crate::api::versioning::{ApiSurface, RequestContext};
 
-#[derive(Embed)]
-#[folder = "web/dist"]
-struct WebAssets;
+// `WEB_ASSETS`: every file under `web/dist`, keyed by the path it is served
+// at and sorted by it. Written by build.rs, which says why it is not a derive.
+include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
+
+/// The embedded file served at `path`, if there is one.
+fn embedded(path: &str) -> Option<&'static [u8]> {
+    WEB_ASSETS
+        .binary_search_by(|(served, _)| (*served).cmp(path))
+        .ok()
+        .map(|index| WEB_ASSETS[index].1)
+}
 
 pub async fn serve_index() -> impl IntoResponse {
     serve_embedded_file("index.html")
@@ -117,26 +124,19 @@ fn percent_decoded(path: &str) -> String {
 }
 
 fn try_serve_file(path: &str) -> Option<Response> {
-    WebAssets::get(path).map(|content| {
+    embedded(path).map(|content| {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime.as_ref())
-            .body(Body::from(content.data.into_owned()))
+            .body(Body::from(content))
             .unwrap()
     })
 }
 
 fn serve_embedded_file(path: &str) -> Response {
-    match WebAssets::get(path) {
-        Some(content) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime.as_ref())
-                .body(Body::from(content.data.into_owned()))
-                .unwrap()
-        }
+    match try_serve_file(path) {
+        Some(response) => response,
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not Found"))
@@ -262,6 +262,20 @@ mod tests {
         assert_eq!(percent_decoded("100%/api"), "100%/api");
         assert_eq!(percent_decoded("api%2"), "api%2");
         assert_eq!(percent_decoded("%2Fapi"), "/api");
+    }
+
+    /// `embedded` binary-searches the generated table, so the table has to be
+    /// sorted, unique, and hold what the directory held when it was built.
+    #[test]
+    fn the_embedded_table_is_sorted_and_answers_for_every_entry() {
+        assert!(
+            WEB_ASSETS.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "build.rs wrote WEB_ASSETS out of order"
+        );
+        for (served, data) in WEB_ASSETS {
+            assert_eq!(embedded(served), Some(*data), "{served}");
+        }
+        assert_eq!(embedded("no/such/file"), None);
     }
 
     /// An unknown page path still belongs to the console's own router.

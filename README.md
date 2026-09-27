@@ -260,16 +260,18 @@ cd crates/deis-control/web && npm ci && npm run build
 
 Three local-build pitfalls worth knowing:
 
-- **Distributed compilation breaks `deis-control`.** The `rust-embed` macro
-  that inlines `web/dist` runs inside the compile job; with sccache-dist that
-  job can run on a worker with no such path, and the build fails with
-  `folder … web/dist does not exist`. Keep the crate off distributed
-  compilation (`SCCACHE_NO_DIST_COMPILE=1`) or build it locally.
+- **The console is embedded as it was at the last build.** `build.rs` lists
+  `web/dist` into a table of `include_bytes!` inputs and reruns whenever a
+  file or directory under it changes, so a new `npm run build` is picked up by
+  the next cargo build; nothing is read from disk at run time. (It used to be
+  a `rust-embed` derive, which listed the directory during macro expansion and
+  so failed on sccache-dist workers; plain `include_bytes!` inputs are shipped
+  to the worker like any other source file.)
 - **A deleted `web/dist` comes back — empty.** The build script emits
-  `cargo:rerun-if-changed=web/dist`, so cargo reruns it when the directory
-  appears or disappears. Deleting the directory therefore does not keep it
-  gone: the next build recreates it, with nothing in it, and the dashboard
-  pages answer 404 until `npm run build` has filled it again.
+  `cargo:rerun-if-changed` for `web/dist` and everything under it, so cargo
+  reruns it when the directory disappears. Deleting the directory therefore
+  does not keep it gone: the next build recreates it, with nothing in it, and
+  the dashboard pages answer 404 until `npm run build` has filled it again.
 - **A corrupt v8 cache fails with `Decompression error`.** The prebuilt v8
   static library is cached after download; clear the cache (`~/.cache/rusty_v8`
   or the file named by `RUSTY_V8_ARCHIVE`) and rebuild, or point

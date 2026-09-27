@@ -90,8 +90,7 @@ hkdf = "0.12"
 hmac = "0.12"
 ed25519-dalek = "2.2"
 
-# Embedded static files
-rust-embed = "8"
+# Content types for the embedded console (see build.rs for the embedding)
 mime_guess = "2"
 
 # OpenAPI document of the human API (`api::openapi`). Core crate only: the
