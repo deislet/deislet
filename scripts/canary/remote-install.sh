@@ -302,7 +302,7 @@ max_subrequests = 50
 
 [logging]
 enabled = true
-endpoint = "http://${LAN_IP}:${TELEMETRY_PORT}"
+endpoint = "http://127.0.0.1:${TELEMETRY_PORT}"
 auth_secret = "${TELEMETRY_AUTH}"
 buffer_size = 10000
 flush_interval_secs = 5
@@ -435,11 +435,14 @@ EOF
 
   # deis-telemetry takes no shared secret: it verifies control-signed
   # capabilities by capability_public_key, and without one it does not
-  # enforce. The node still presents a token derived from TELEMETRY_AUTH
-  # ([logging] above), which is accepted either way.
+  # enforce - its query and tail endpoints would serve every tenant's logs
+  # and traces to anyone who can reach them. So both listeners stay on
+  # loopback, which the service itself names as the only safe place for a
+  # non-enforcing telemetry; the runtime ([logging] above) and the operator
+  # CLI on this host reach it at 127.0.0.1.
   cat >/etc/deis/telemetry.toml <<EOF
-listen = "0.0.0.0:${TELEMETRY_PORT}"
-metrics_listen = "0.0.0.0:${TELEMETRY_METRICS_PORT}"
+listen = "127.0.0.1:${TELEMETRY_PORT}"
+metrics_listen = "127.0.0.1:${TELEMETRY_METRICS_PORT}"
 data_dir = "/var/lib/deis/telemetry"
 log_retention_days = 7
 metric_retention_days = 30
@@ -518,7 +521,7 @@ write_operator_env() {
 # Source this file to talk to this canary from a shell.
 export DEIS_CONTROL_ENDPOINT=http://${LAN_IP}:${CONTROL_PORT}
 export DEIS_CONTROL_TOKEN=${operator_token}
-export DEIS_TELEMETRY_ENDPOINT=http://${LAN_IP}:${TELEMETRY_PORT}
+export DEIS_TELEMETRY_ENDPOINT=http://127.0.0.1:${TELEMETRY_PORT}
 export DEIS_TELEMETRY_AUTH_SECRET=${TELEMETRY_AUTH}
 export DEIS_QUEUE_ENDPOINT=http://${LAN_IP}:${QUEUE_PORT}
 EOF
@@ -531,13 +534,13 @@ EOF
 [endpoints."http://${LAN_IP}:${CONTROL_PORT}"]
 token = "${operator_token}"
 
-[telemetry."http://${LAN_IP}:${TELEMETRY_PORT}"]
+[telemetry."http://127.0.0.1:${TELEMETRY_PORT}"]
 auth_secret = "${TELEMETRY_AUTH}"
 EOF
     cat >/home/leo/.config/deis/env <<EOF
 export DEIS_CONTROL_ENDPOINT=http://${LAN_IP}:${CONTROL_PORT}
 export DEIS_CONTROL_TOKEN=${operator_token}
-export DEIS_TELEMETRY_ENDPOINT=http://${LAN_IP}:${TELEMETRY_PORT}
+export DEIS_TELEMETRY_ENDPOINT=http://127.0.0.1:${TELEMETRY_PORT}
 export DEIS_TELEMETRY_AUTH_SECRET=${TELEMETRY_AUTH}
 export DEIS_QUEUE_ENDPOINT=http://${LAN_IP}:${QUEUE_PORT}
 EOF
@@ -715,7 +718,7 @@ print_status() {
   log "  preview     http://<env>--<app>.${ZONE}/  (production: http://<app>.${ZONE}/)"
   log "  store gRPC  ${LAN_IP}:${STORE_PORT}"
   log "  queue gRPC  ${LAN_IP}:${QUEUE_PORT}"
-  log "  telemetry   ${LAN_IP}:${TELEMETRY_PORT}  (metrics ${LAN_IP}:${TELEMETRY_METRICS_PORT})"
+  log "  telemetry   127.0.0.1:${TELEMETRY_PORT}  (metrics 127.0.0.1:${TELEMETRY_METRICS_PORT}; loopback only, auth is not enforcing)"
   log "credentials:  /etc/deis/operator.env (minted through the bootstrap token;"
   log "              a fresh database that has not been logged in yet keeps its token at /var/lib/deis/control/bootstrap.token)"
   if [[ -f /var/lib/deis/RELEASE ]]; then
