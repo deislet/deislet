@@ -118,7 +118,6 @@ ensure_secrets() {
     return
   fi
 
-  STORAGE_AUTH="$(openssl rand -hex 32)"
   TELEMETRY_AUTH="$(openssl rand -hex 32)"
   MASTER_KEY="$(openssl rand -hex 32)"
 
@@ -129,7 +128,6 @@ LAN_IP=${LAN_IP}
 ZONE=${ZONE}
 NODE_ID=${NODE_ID}
 PROXY_ID=${PROXY_ID}
-STORAGE_AUTH=${STORAGE_AUTH}
 TELEMETRY_AUTH=${TELEMETRY_AUTH}
 MASTER_KEY=${MASTER_KEY}
 CONTROL_PORT=${CONTROL_PORT}
@@ -254,7 +252,6 @@ public_base_url = "http://${LAN_IP}:${CONTROL_PORT}"
 secret_key_file = "/etc/deis/secret.key"
 store_endpoint = "http://${LAN_IP}:${STORE_PORT}"
 queue_endpoint = "http://${LAN_IP}:${QUEUE_PORT}"
-storage_auth_secret = "${STORAGE_AUTH}"
 deis_runtime_poll_interval = 15
 node_registration_ttl_secs = 90
 cron_tick_seconds = 60
@@ -412,9 +409,14 @@ control_poll_interval_secs = 5
 preview_zone = "${ZONE}"
 EOF
 
+  # deis-store and deis-queue hold no secret: every call carries a capability
+  # the control plane signed, checked against the public keys they fetch from
+  # its JWKS (and refresh on their own when it rotates). Both default to the
+  # control plane's default port, so both addresses are spelled out.
   cat >/etc/deis/store.toml <<EOF
 listen = "0.0.0.0:${STORE_PORT}"
-auth_secret = "${STORAGE_AUTH}"
+capability_jwks_url = "http://127.0.0.1:${CONTROL_PORT}/.well-known/deis/capability-jwks.json"
+revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/store"
 snapshot_dir = "/var/lib/deis/store-snapshots"
 snapshot_interval_secs = 86400
@@ -425,15 +427,19 @@ EOF
 
   cat >/etc/deis/queue.toml <<EOF
 listen = "0.0.0.0:${QUEUE_PORT}"
-auth_secret = "${STORAGE_AUTH}"
+capability_jwks_url = "http://127.0.0.1:${CONTROL_PORT}/.well-known/deis/capability-jwks.json"
+revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/queue"
 connections = 8
 EOF
 
+  # deis-telemetry takes no shared secret: it verifies control-signed
+  # capabilities by capability_public_key, and without one it does not
+  # enforce. The node still presents a token derived from TELEMETRY_AUTH
+  # ([logging] above), which is accepted either way.
   cat >/etc/deis/telemetry.toml <<EOF
 listen = "0.0.0.0:${TELEMETRY_PORT}"
 metrics_listen = "0.0.0.0:${TELEMETRY_METRICS_PORT}"
-auth_secret = "${TELEMETRY_AUTH}"
 data_dir = "/var/lib/deis/telemetry"
 log_retention_days = 7
 metric_retention_days = 30

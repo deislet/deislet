@@ -728,7 +728,7 @@ theirs=2222222222222222bbbbbbbbbbbbbbbb
 #
 # `start` reads the state file to find out whether a previous run is still
 # up. It used to do that by sourcing the file into its own shell, and the
-# file is a complete settings dump - SECRET, API_KEY, STORAGE_AUTH_SECRET,
+# file is a complete settings dump - SECRET, API_KEY,
 # APP_SRC_DIR, APP_ID, ENV_NAME, NODE_ID, DEMO_SECRET_VALUE and every port.
 # So every setting the person typed was replaced by the last run's, silently:
 # `--secret <hex>` came up on the previous run's node key and `--app-dir
@@ -1430,8 +1430,8 @@ fi
 # master key, has to have `chmod 600 "$FILE"` beside it - within three lines
 # before (state.env is chmod'ed before it is written) or twelve after its
 # terminator. A regex that stopped matching would report nothing to check,
-# so the number of writers found is asserted as well: five today - state.env,
-# secret.key, and the store, queue and control-plane configurations.
+# so the number of writers found is asserted as well: two today - state.env
+# and secret.key.
 #
 # It was eight. Three configurations - the node's, the proxy's and the restart
 # proxy's - stopped carrying a credential value because nothing in this demo
@@ -1441,6 +1441,12 @@ fi
 # and the file that does hold the secret, the key itself, is held to 0600 by
 # the check below rather than by this one. (deis-telemetry's configuration
 # carries no credential and is 0600 anyway.)
+#
+# It was five. The store, queue and control-plane configurations stopped
+# carrying the fleet-wide storage secret when storage calls moved to
+# capabilities the control plane signs: its signing keys live in its own
+# database, encrypted under secret.key, and deis-store and deis-queue fetch
+# only the public halves.
 
 cat > "${WORK_DIR}/credential-writers.awk" <<'AWK'
 { lines[NR] = $0 }
@@ -1479,16 +1485,16 @@ AWK
 # given, and a chmod twelve lines away in another file is not twelve lines
 # away.
 writers=$(for demo_file in "${DEMO_FILES[@]}"; do
-  awk -v want='(^|[^_a-z])secret = "|auth_secret = "|node_preshared_keys = |api_keys = |^SECRET=|^API_KEY=|^STORAGE_AUTH_SECRET=' \
+  awk -v want='(^|[^_a-z])secret = "|auth_secret = "|node_preshared_keys = |api_keys = |^SECRET=|^API_KEY=|^OPERATOR_TOKEN=' \
     -f "${WORK_DIR}/credential-writers.awk" "$demo_file"
 done)
 found=$(printf '%s\n' "$writers" | grep -c . || true)
 unset_writers=$(printf '%s\n' "$writers" | grep ' UNSET$' || true)
-if [ "$found" -ge 5 ] && [ -z "$unset_writers" ]; then
+if [ "$found" -ge 2 ] && [ -z "$unset_writers" ]; then
   pass "every one of the ${found} credential-bearing files demo.sh writes is chmod 600 where it is written"
 else
   fail "every one of the ${found} credential-bearing files demo.sh writes is chmod 600 where it is written" \
-    "docs/trust-boundaries.md promises 0600 for all of them; found ${found} writer(s) (at least 5 expected), without a chmod: $(printf '%s' "$unset_writers" | tr '\n' ';')"
+    "docs/trust-boundaries.md promises 0600 for all of them; found ${found} writer(s) (at least 2 expected), without a chmod: $(printf '%s' "$unset_writers" | tr '\n' ';')"
 fi
 
 # ----------------------------------------------------------------------
@@ -1640,8 +1646,9 @@ fi
 # is answered too, because the machine running this file need not have
 # grpcurl installed (CI's witness job does not).
 # $1 says who the stand-in queue serves: everyone, none (the caller with no
-# token), wrong (a token that is not this tenant's), gated (the real token
-# only) or closed (nobody, the real token included).
+# token), wrong (a garbled token), other (the control plane's deis-store
+# token, a real signature for another audience), gated (the queue token only)
+# or closed (nobody, the queue token included).
 queue_token_probe() {
   local serves=$1
   local probe="${WORK_DIR}/queue-token-${serves}.sh"
@@ -1661,14 +1668,15 @@ queue_token_probe() {
     definition_of fail_check
     cat <<'STUB'
 command() { if [ "${1:-}" = "-v" ]; then return 0; fi; builtin command "$@"; }
-storage_token() { printf 'the-token-for-%s' "$1"; }
+storage_token() { printf 'the-%s-token' "${1:-store}"; }
 grpcurl() {
   local caller="none" i args=("$@")
   for ((i = 0; i < ${#args[@]}; i++)); do
     if [ "${args[i]}" = "-H" ]; then
       case "${args[i + 1]}" in
-        "x-deis-storage-token: the-token-for-demo.production") caller="real" ;;
-        "x-deis-storage-token: "*) caller="wrong" ;;
+        "authorization: Bearer the-queue-token") caller="real" ;;
+        "authorization: Bearer the-store-token") caller="other" ;;
+        "authorization: Bearer "*) caller="wrong" ;;
       esac
     fi
   done
@@ -1683,7 +1691,11 @@ grpcurl() {
     printf '{"messages": []}\n'
     return 0
   fi
-  printf 'ERROR:\n  Code: Unauthenticated\n  Message: unauthenticated: missing or wrong x-deis-storage-token header\n'
+  if [ "$caller" = "other" ]; then
+    printf 'ERROR:\n  Code: PermissionDenied\n  Message: wrong audience\n'
+    return 1
+  fi
+  printf 'ERROR:\n  Code: Unauthenticated\n  Message: missing or malformed Authorization: Bearer <token> header\n'
   return 1
 }
 STUB
@@ -1711,8 +1723,9 @@ queue_token_case() {
 
 queue_token_case everyone "expected Code: Unauthenticated with no token (grpcurl exited 0"
 queue_token_case none "expected Code: Unauthenticated with no token (grpcurl exited 0"
-queue_token_case wrong "the same with a wrong one (exited 0"
-queue_token_case closed "the real token to be served (exited 1"
+queue_token_case wrong "the same with a garbled one (exited 0"
+queue_token_case other "PermissionDenied with the deis-store token (exited 0"
+queue_token_case closed "the queue token to be served (exited 1"
 
 out=$(queue_token_probe gated)
 if [ "${out#*verdicts: 1 passed 0 failed}" != "$out" ]; then

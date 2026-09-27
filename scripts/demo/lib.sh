@@ -627,7 +627,6 @@ DEIS_QUEUE_CONFIG=$DEIS_QUEUE_CONFIG
 DEIS_TELEMETRY_CONFIG=$DEIS_TELEMETRY_CONFIG
 SECRET=$SECRET
 OPERATOR_TOKEN=$OPERATOR_TOKEN
-STORAGE_AUTH_SECRET=$STORAGE_AUTH_SECRET
 SECRET_KEY_FILE=$SECRET_KEY_FILE
 APP_ID=$APP_ID
 CALLEE_APP_ID=$CALLEE_APP_ID
@@ -656,15 +655,16 @@ load_state() {
   source "$STATE_FILE"
 }
 
-# Bring up the three services the platform stores things in or reports to:
-# deis-store (KV/DB/Blob), deis-queue and deis-telemetry. They are started
-# before the control plane on purpose: none of them depends on it, while
-# every other component ships logs at deis-telemetry, so it should already be
-# listening when the rest come up.
+# Bring up deis-telemetry, the service every other component reports to. It
+# is started before the control plane on purpose: it depends on nothing,
+# while every other component ships logs at it, so it should already be
+# listening when the rest come up. Its HTTP scrape endpoint is a real answer
+# and so a stronger readiness signal than a TCP probe.
 #
-# Each one is a gRPC service. deis-telemetry additionally exposes a plain
-# HTTP scrape endpoint, which is a real answer and so a stronger readiness
-# signal; the other two can only be probed at the TCP level.
+# deis-store and deis-queue come up in start_storage_services, after the
+# control plane: they verify every call against the keys the control plane
+# publishes, and the address they fetch those from carries the port the
+# control plane ends up bound to.
 # Build every demo binary once, up front.
 #
 # The services are then launched as binaries rather than through `cargo run`,
@@ -700,31 +700,46 @@ data_dir = "${DEMO_DIR}/deis-telemetry-data"
 EOF
   chmod 600 "$DEIS_TELEMETRY_CONFIG"
 
-  # auth_secret turns on the capability-token check
-  # (crates/deis-store/src/auth.rs): every call must then present
-  # x-deis-storage-token for the tenant it names, or it is refused before any
-  # data is touched. Configured here, on deis-queue below and as
-  # storage_auth_secret on deis-control, so the demo proves the feature
-  # rather than leaving it dark the way an all-loopback install with no
-  # secret configured would.
+  echo "🚀 Starting Telemetry (gRPC: ${DEIS_TELEMETRY_PORT}, metrics: ${DEIS_TELEMETRY_METRICS_PORT})"
+  "${BIN_DIR}/deis-telemetry" --config "$DEIS_TELEMETRY_CONFIG" \
+    > "${LOG_DIR}/deis-telemetry.log" 2>&1 &
+  DEIS_TELEMETRY_PID=$!
+
+  local rc=0
+  wait_for_service wait_for_http \
+    "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" "$DEIS_TELEMETRY_PID" 60 || rc=$?
+  report_service "Telemetry" "$rc" "${LOG_DIR}/deis-telemetry.log" \
+    "logs and metrics pushed at it are dropped"
+}
+
+# deis-store (KV/DB/Blob) and deis-queue, once the control plane is up.
+#
+# Neither has a secret of its own. Every call must carry an Ed25519
+# capability the control plane signed for the tenant, audience and binding it
+# names (crates/deis-store/src/auth.rs), and the keys it is checked against
+# are fetched from the control plane's JWKS at capability_jwks_url - at
+# startup, every few minutes, and whenever a token names a key not yet seen,
+# so a key rotation needs nothing done here. revocation_list_url is where
+# both poll for revoked tokens. Both default to the control plane's default
+# port, which this demo may not have been given, so both are spelled out.
+start_storage_services() {
+  local control_url="http://127.0.0.1:${DEIS_CONTROL_PORT}"
+
   cat > "$DEIS_STORE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_STORE_PORT}"
 data_dir = "${DEMO_DIR}/deis-store-data"
-auth_secret = "${STORAGE_AUTH_SECRET}"
+capability_jwks_url = "${control_url}/.well-known/deis/capability-jwks.json"
+revocation_list_url = "${control_url}"
 EOF
   chmod 600 "$DEIS_STORE_CONFIG"
 
   cat > "$DEIS_QUEUE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_QUEUE_PORT}"
 data_dir = "${DEMO_DIR}/deis-queue-data"
-auth_secret = "${STORAGE_AUTH_SECRET}"
+capability_jwks_url = "${control_url}/.well-known/deis/capability-jwks.json"
+revocation_list_url = "${control_url}"
 EOF
   chmod 600 "$DEIS_QUEUE_CONFIG"
-
-  echo "🚀 Starting Telemetry (gRPC: ${DEIS_TELEMETRY_PORT}, metrics: ${DEIS_TELEMETRY_METRICS_PORT})"
-  "${BIN_DIR}/deis-telemetry" --config "$DEIS_TELEMETRY_CONFIG" \
-    > "${LOG_DIR}/deis-telemetry.log" 2>&1 &
-  DEIS_TELEMETRY_PID=$!
 
   echo "🚀 Starting Store (gRPC: ${DEIS_STORE_PORT})"
   "${BIN_DIR}/deis-store" --config "$DEIS_STORE_CONFIG" \
@@ -736,14 +751,9 @@ EOF
     > "${LOG_DIR}/deis-queue.log" 2>&1 &
   DEIS_QUEUE_PID=$!
 
-  # All three are launched before any is probed, so they come up in parallel.
+  # Both are launched before either is probed, so they come up in parallel.
+  # Only a TCP probe is possible for a gRPC service here.
   local rc
-
-  rc=0
-  wait_for_service wait_for_http \
-    "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" "$DEIS_TELEMETRY_PID" 60 || rc=$?
-  report_service "Telemetry" "$rc" "${LOG_DIR}/deis-telemetry.log" \
-    "logs and metrics pushed at it are dropped"
 
   rc=0
   wait_for_service wait_for_tcp "$DEIS_STORE_PORT" "$DEIS_STORE_PID" 60 || rc=$?
@@ -2367,18 +2377,18 @@ node_log_window_named() {
   fi
 }
 
-# base64(HMAC-SHA256(STORAGE_AUTH_SECRET, tenant)) - the identical
-# construction deis_wire::conventions::storage_token uses on every side of
-# the storage wire (crates/deis-wire/src/conventions.rs), so a call made with
-# this is indistinguishable to deis-store or deis-queue from one deis-runtime
-# itself made. Needed here only to let check_kv_roundtrip's direct call to
-# deis-store present a token now that auth_secret is configured; the
-# capability-token check itself proves the *absence* of a token is refused,
-# which needs no token to be computed at all.
+# A capability for this demo's application and environment, minted by the
+# control plane through the same route `deis kv` uses
+# (GET /api/v1/apps/:app/environments/:env/storage-token) and presented by the
+# operator token, which carries storage:${APP_ID}/${ENV_NAME}. `store` (the
+# default) answers the token deis-store accepts for kv, sql and blob; `queue`
+# answers the one deis-queue accepts. Nothing in this script can compute one
+# itself: they are Ed25519 signatures by a key only the control plane holds.
 storage_token() {
-  local tenant=$1
-  printf '%s' "$tenant" | openssl dgst -sha256 -hmac "$STORAGE_AUTH_SECRET" -binary \
-    | openssl base64 -A
+  local field=token
+  [ "${1:-store}" = "queue" ] && field=queue_token
+  control_api "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/storage-token" \
+    | jq -r --arg f "$field" '.[$f] // empty' 2>/dev/null || true
 }
 
 # One request through deis-proxy for a host the catalog claims, with no

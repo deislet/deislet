@@ -295,22 +295,22 @@ check_queue_dead_letters() {
 # The capability token on the queue, asked the one question nothing else in
 # this demo asks it.
 #
-# `start` writes the same auth_secret onto deis-store, deis-queue and
-# deis-control, and every queue check above reaches the queue through the
-# node - which always carries the token the control plane handed it with the
-# deployment. So DEIS_QUEUE_PORT was configured, started, waited on and
-# printed in the summary, and never dialled by anything without a credential:
-# deis-queue could have been started with no auth_secret at all, or its
-# interceptor could have been left off the service, and every queue check
+# Every queue check above reaches the queue through the node, which always
+# carries the capability the control plane handed it with the deployment. So
+# DEIS_QUEUE_PORT was configured, started, waited on and printed in the
+# summary, and never dialled by anything without a credential: deis-queue's
+# interceptor could have been left off the service and every queue check
 # would still have been green. That is the hole check_storage_capability_token
 # closes on deis-store; this is the queue's half of it
 # (crates/deis-queue/src/auth.rs).
 #
 # ListDeadLetters is the call to ask it with: it is the operator's read of the
 # dead letter table and changes nothing, so neither the refusal nor the served
-# call moves a message the rest of the demo depends on. Three probes, because
+# call moves a message the rest of the demo depends on. Four probes, because
 # a refusal alone would also be what a queue that refuses everything looks
-# like: no token, a wrong token, and the real one.
+# like: no token, a garbled one, the control plane's deis-store token (a real
+# signature for this very tenant, but not for deis-queue's audience), and the
+# queue token the control plane mints for it.
 check_queue_capability_token() {
   local title="a queue call presenting no capability token is refused"
 
@@ -318,18 +318,10 @@ check_queue_capability_token() {
     fail_check "$title" "grpcurl is not installed, so this check could not be run"
     return
   fi
-  if ! command -v openssl >/dev/null 2>&1; then
-    fail_check "$title" \
-      "openssl is not installed, so this check could not mint the token its third probe needs"
-    return
-  fi
 
-  # The same tenant form the node presents for this application and
-  # environment, and the same token construction every side of the platform
-  # uses (deis_wire::conventions::storage_token).
   local tenant="${APP_ID}.${ENV_NAME}"
   local request='{"queue_name":"jobs","limit":1}'
-  local none wrong served none_rc wrong_rc served_rc
+  local none wrong other served none_rc wrong_rc other_rc served_rc
 
   none=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
@@ -340,27 +332,35 @@ check_queue_capability_token() {
   wrong=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
     -H "x-deis-tenant: ${tenant}" \
-    -H "x-deis-storage-token: not-the-token-for-this-tenant" \
+    -H "authorization: Bearer not-a-capability" \
     -d "$request" \
     "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && wrong_rc=0 || wrong_rc=$?
+
+  other=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -H "authorization: Bearer $(storage_token store)" \
+    -d "$request" \
+    "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && other_rc=0 || other_rc=$?
 
   served=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
     -H "x-deis-tenant: ${tenant}" \
-    -H "x-deis-storage-token: $(storage_token "$tenant")" \
+    -H "authorization: Bearer $(storage_token queue)" \
     -d "$request" \
     "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && served_rc=0 || served_rc=$?
 
   if [ "$none_rc" -ne 0 ] && echo "$none" | grep -q 'Code: Unauthenticated' \
     && [ "$wrong_rc" -ne 0 ] && echo "$wrong" | grep -q 'Code: Unauthenticated' \
+    && [ "$other_rc" -ne 0 ] && echo "$other" | grep -q 'Code: PermissionDenied' \
     && [ "$served_rc" -eq 0 ]; then
     pass_check "$title" \
-      "ListDeadLetters at deis-queue's own port for tenant ${tenant} was refused with no x-deis-storage-token header - $(echo "$none" | tr '\n' ' ' | sed 's/  */ /g' | head -c 120) - and refused again with a token that is not this tenant's, while the same call carrying the token the control plane mints from the same secret was served. Nothing that can merely reach the queue's port can list this tenant's dead letters. Drain and replay were not probed here: they sit behind the same interceptor (crates/deis-queue/src/server.rs wraps the whole service in it), which this check shows is switched on and does not show is complete"
+      "ListDeadLetters at deis-queue's own port for tenant ${tenant} was refused with no Authorization header - $(echo "$none" | tr '\n' ' ' | sed 's/  */ /g' | head -c 120) - refused again with a garbled token, and refused as PermissionDenied with the control plane's genuine deis-store token for this tenant, while the same call carrying the queue capability the control plane mints was served. Nothing that can merely reach the queue's port can list this tenant's dead letters, and a token for one service does not open another. Drain and replay were not probed here: they sit behind the same interceptor (crates/deis-queue/src/server.rs wraps the whole service in it), which this check shows is switched on and does not show is complete"
     return
   fi
 
   fail_check "$title" \
-    "expected Code: Unauthenticated with no token (grpcurl exited ${none_rc}, said $(echo "$none" | tr '\n' ' ' | head -c 140)), the same with a wrong one (exited ${wrong_rc}, said $(echo "$wrong" | tr '\n' ' ' | head -c 140)), and the real token to be served (exited ${served_rc}, said $(echo "$served" | tr '\n' ' ' | head -c 140))"
+    "expected Code: Unauthenticated with no token (grpcurl exited ${none_rc}, said $(echo "$none" | tr '\n' ' ' | head -c 140)), the same with a garbled one (exited ${wrong_rc}, said $(echo "$wrong" | tr '\n' ' ' | head -c 140)), PermissionDenied with the deis-store token (exited ${other_rc}, said $(echo "$other" | tr '\n' ' ' | head -c 140)), and the queue token to be served (exited ${served_rc}, said $(echo "$served" | tr '\n' ' ' | head -c 140))"
 }
 
 # The checks this group asks, in the order a run asks them, and the

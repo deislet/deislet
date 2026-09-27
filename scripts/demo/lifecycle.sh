@@ -20,7 +20,7 @@ start_demo() {
   # is read in a subshell rather than sourced here.
   #
   # Sourcing it here is what this used to do, and the file is a complete
-  # settings dump: SECRET, OPERATOR_TOKEN, STORAGE_AUTH_SECRET, APP_SRC_DIR, APP_ID,
+  # settings dump: SECRET, OPERATOR_TOKEN, APP_SRC_DIR, APP_ID,
   # ENV_NAME, NODE_ID, DEMO_SECRET_VALUE and every port. So every one of them
   # was silently replaced by the last run's value, and the option the person
   # typed on the command line lost to a file they had never opened:
@@ -104,29 +104,19 @@ start_demo() {
   # doors it used to open are not locked against it but absent.
   SECRET=${SECRET:-$(generate_secret)}
 
-  # The shared secret deis-store's, deis-queue's and deis-control's
-  # per-tenant capability tokens are all derived from - see
-  # crates/deis-store/src/auth.rs. This one is live, and it authenticates a
-  # *storage call* to whichever tenant it claims - a fleet-wide value still,
-  # which is the next thing to go the way the node key went. Configured on all
-  # three of deis-store,
-  # deis-queue and deis-control below - see check_storage_capability_token for
-  # what it looks like when only some of the three carry it.
-  STORAGE_AUTH_SECRET=${STORAGE_AUTH_SECRET:-$(generate_secret)}
-
   # No credential for a person is generated here, and none goes into any
   # configuration file. The control plane's human API has no unauthenticated
   # path, and a first start with an empty database mints a one-time bootstrap
   # token into its data directory; `bootstrap_operator_session` below logs
   # the first owner in through it and mints the scoped operator token the
-  # rest of this script presents. A different channel again:
-  # STORAGE_AUTH_SECRET authenticates a *storage call*, and the operator
-  # token authenticates *a caller who may deploy*.
+  # rest of this script presents. A different channel again: a storage call
+  # is authenticated by a capability the control plane signs per tenant, and
+  # the operator token authenticates *a caller who may deploy*.
 
-  # The master key that encrypts environment secrets. 32 bytes as 64 hex
-  # characters, which is what `openssl rand -hex 32` produces. It never enters
-  # the database and is never logged; without it every secret endpoint answers
-  # 503 instead of storing anything in the clear.
+  # The master key that encrypts environment secrets and the control plane's
+  # capability signing keys. 32 bytes as 64 hex characters, which is what
+  # `openssl rand -hex 32` produces. It never enters the database and is never
+  # logged; the control plane refuses to start without it.
   SECRET_KEY_FILE="${DEMO_DIR}/secret.key"
   if [ ! -f "$SECRET_KEY_FILE" ]; then
     generate_secret > "$SECRET_KEY_FILE"
@@ -165,15 +155,12 @@ start_demo() {
     # bundle_dir is where an uploaded version's zip lives and where nodes
     # fetch it from; public_base_url is the address those download links
     # carry, which has to be reachable from the node rather than from the
-    # control plane's own point of view. secret_key_file is what makes the
-    # secret endpoints work at all: without it they answer 503 rather than
-    # storing anything in the clear. store_endpoint / queue_endpoint are the
+    # control plane's own point of view. secret_key_file is required: it
+    # encrypts environment secrets and the capability signing keys this
+    # control plane keeps in its database, whose public halves deis-store and
+    # deis-queue fetch from its JWKS. store_endpoint / queue_endpoint are the
     # addresses handed down to nodes with every deployment - a node never
-    # learns where storage lives from its own file. storage_auth_secret must
-    # be the identical string as auth_secret on both deis-store and
-    # deis-queue above - it is what this control plane mints each tenant's
-    # capability token from; set it here and not on the two services, or on
-    # the services and not here, and every storage call is refused.
+    # learns where storage lives from its own file.
     cat > "$DEIS_CONTROL_CONFIG" <<EOF
 bind_addr = "0.0.0.0"
 port = ${DEIS_CONTROL_PORT}
@@ -200,7 +187,6 @@ public_base_url = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 secret_key_file = "${SECRET_KEY_FILE}"
 store_endpoint = "http://127.0.0.1:${DEIS_STORE_PORT}"
 queue_endpoint = "http://127.0.0.1:${DEIS_QUEUE_PORT}"
-storage_auth_secret = "${STORAGE_AUTH_SECRET}"
 
 # The machine channel. Everything only Deislet's own processes call is served
 # here and nowhere else: the assignment list, which carries every environment's
@@ -224,9 +210,9 @@ public_base_url = "https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
 id = "${NODE_ID}"
 addr = "http://127.0.0.1:${DEIS_RUNTIME_PORT}"
 EOF
-    # Every generated configuration is the operator's alone: this one holds
-    # storage_auth_secret, and every machine's names the private
-    # key behind its own certificate (docs/trust-boundaries.md).
+    # Every generated configuration is the operator's alone: this one names
+    # the master key file, and every machine's names the private key behind
+    # its own certificate (docs/trust-boundaries.md).
     chmod 600 "$DEIS_CONTROL_CONFIG"
 
     # [control] is architecture principle 8: on startup the node asks the
@@ -418,6 +404,10 @@ EOF
   # later step presents. Nothing else in this demo carries a human
   # credential.
   bootstrap_operator_session
+
+  # deis-store and deis-queue only now: the keys they verify every call
+  # against are fetched from this control plane, at the port it just bound.
+  start_storage_services
 
   echo "🚀 Starting Runtime (HTTP: ${DEIS_RUNTIME_PORT})"
   # Through `bounded_log` rather than straight into the file: this is the one

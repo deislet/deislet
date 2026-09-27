@@ -45,7 +45,7 @@ check_kv_roundtrip() {
   fi
   if ! command -v openssl >/dev/null 2>&1; then
     fail_check "$title" \
-      "PUT then GET returned ${value} from the node, but openssl is not installed so this check could not mint the capability token deis-store now requires to be asked directly"
+      "PUT then GET returned ${value} from the node, but openssl is not installed so this check could not decode deis-store's direct answer"
     return
   fi
 
@@ -60,7 +60,7 @@ check_kv_roundtrip() {
   direct=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" \
-    -H "x-deis-storage-token: $(storage_token "$tenant")" \
+    -H "authorization: Bearer $(storage_token)" \
     -H "x-deis-binding: KV" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1)
@@ -77,12 +77,11 @@ check_kv_roundtrip() {
 
 # The other half of the capability-token feature: not that a call carrying
 # the right token succeeds (check_kv_roundtrip's direct call already proves
-# that, now that this demo configures auth_secret), but that a call carrying
-# none is refused before it touches any data. Without this check, `start`
-# could configure auth_secret on none of the three places it belongs and
-# every check above would still pass - loopback alone would still be
-# standing in for the whole of it, silently, which is exactly the gap
-# crates/deis-store/src/auth.rs exists to close.
+# that), but that a call carrying none is refused before it touches any data.
+# Without this check an interceptor left off the service would go unnoticed:
+# every check above would still pass, with loopback silently standing in for
+# the whole of it - exactly the gap crates/deis-store/src/auth.rs exists to
+# close.
 # ---- named bindings ---------------------------------------------------
 #
 # The claim: an application can declare any number of namespaces of a kind,
@@ -137,17 +136,17 @@ check_named_bindings_are_separate_namespaces() {
 
   local tenant token direct_hot direct_kv
   tenant="${APP_ID}.${ENV_NAME}"
-  token=$(storage_token "$tenant")
+  token=$(storage_token)
   direct_hot=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${tenant}" -H "x-deis-storage-token: ${token}" \
+    -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: HOT" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
     | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
   direct_kv=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${tenant}" -H "x-deis-storage-token: ${token}" \
+    -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: KV" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
@@ -165,14 +164,14 @@ check_named_bindings_are_separate_namespaces() {
 check_a_binding_cannot_reach_another_tenant() {
   local title="a binding name cannot be made to address another tenant"
 
-  if ! command -v grpcurl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
-    fail_check "$title" "grpcurl or openssl is missing, so this check could not be run"
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is missing, so this check could not be run"
     return
   fi
 
   local tenant token
   tenant="${APP_ID}.${ENV_NAME}"
-  token=$(storage_token "$tenant")
+  token=$(storage_token)
 
   # Every shape that would have to work for a binding to escape its tenant:
   # the tenant separator, the namespace separator, a traversal, and a name
@@ -185,7 +184,7 @@ check_a_binding_cannot_reach_another_tenant() {
     local answer
     answer=$(grpcurl -plaintext -max-time 5 \
       -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-      -H "x-deis-tenant: ${tenant}" -H "x-deis-storage-token: ${token}" \
+      -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
       -H "x-deis-binding: ${hostile}" \
       -d '{"key":"anything"}' \
       "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true)
@@ -201,12 +200,12 @@ check_a_binding_cannot_reach_another_tenant() {
   local cross
   cross=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${CALLEE_APP_ID}.${ENV_NAME}" -H "x-deis-storage-token: ${token}" \
+    -H "x-deis-tenant: ${CALLEE_APP_ID}.${ENV_NAME}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: HOT" \
     -d '{"key":"anything"}' \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true)
 
-  if [ "$refused" -eq "$total" ] && echo "$cross" | grep -qi "unauthenticated\|token"; then
+  if [ "$refused" -eq "$total" ] && echo "$cross" | grep -q "Code: PermissionDenied"; then
     pass_check "$title" \
       "deis-store refused all ${total} hostile binding names for tenant ${tenant} (\"${sample}\"), and the capability token minted for ${tenant} was refused when it named ${CALLEE_APP_ID}.${ENV_NAME} even with a legal binding: the token authorises the tenant and the binding only chooses a namespace inside it"
     return
@@ -276,7 +275,7 @@ check_storage_capability_token() {
 
   if [ "$rc" -ne 0 ] && echo "$out" | grep -q 'Code: Unauthenticated'; then
     pass_check "$title" \
-      "KvStore.Get for tenant ${tenant} with no x-deis-storage-token header was refused before deis-store looked at any data: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
+      "KvStore.Get for tenant ${tenant} with no Authorization header was refused before deis-store looked at any data: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
   else
     fail_check "$title" \
       "expected the call to be refused as Code: Unauthenticated with no token; deis-store answered: $(echo "$out" | tr '\n' ' ' | head -c 300)"
@@ -332,7 +331,7 @@ check_data_cli_reads_the_apps_write() {
   if [ "$found" = "true" ] && [ "$read_back" = "$value" ] \
     && [ "$tenant" = "${APP_ID}.${ENV_NAME}@KV" ]; then
     pass_check "$title" \
-      "the handler stored ${key} through context.env.KV; \`deis kv get --binding KV\` asked the control plane for a storage token, presented it to deis-store as namespace ${tenant}, and read back \"${read_back}\" ($(printf '%s' "$read_back" | wc -c) bytes). The CLI never sees storage_auth_secret: it is handed a token for this one tenant"
+      "the handler stored ${key} through context.env.KV; \`deis kv get --binding KV\` asked the control plane for a storage token, presented it to deis-store as namespace ${tenant}, and read back \"${read_back}\" ($(printf '%s' "$read_back" | wc -c) bytes). The CLI never holds a signing key: it is handed a token for this one tenant"
   else
     fail_check "$title" \
       "deis kv get ${key} --binding KV reports namespace '${tenant:-<none>}', found=${found}, value '${read_back:-<none>}'; expected ${APP_ID}.${ENV_NAME}@KV and \"${value}\""
