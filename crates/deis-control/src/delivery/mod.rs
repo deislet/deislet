@@ -41,7 +41,7 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 
-use crate::capability_issuer::{CapabilityIssuer, AUD_QUEUE, AUD_STORE};
+use crate::capability_issuer::{AUD_QUEUE, CapabilityIssuer};
 use crate::catalog::secrets::secret_revision_aad;
 use crate::catalog::{
     CatalogError, CatalogResult, CatalogStore, DeclaredCompatibility, DeclaredLimits, Environment,
@@ -177,14 +177,18 @@ pub fn bundle_url(base: &str, app_id: &str, version_id: &str) -> String {
     format!("{base}/api/apps/{app_id}/versions/{version_id}/bundle")
 }
 
-/// What the platform tells a node about storage: where the services live,
-/// and what proves a call to them may act as the tenant it names.
+/// What the platform tells a node about storage: where the services live.
 ///
-/// The control plane owns all three; a node never reads them from its own file
-/// (docs/architecture.zh.md section 6). The addresses and the per-tenant token
-/// travel in the same `env` map as an application's variables, under reserved
-/// keys spelled once in [`deis_wire::conventions`], and deis-runtime lifts
-/// them back out before the application sees the map.
+/// The control plane owns the addresses; a node never reads them from its own
+/// file (docs/architecture.zh.md section 6). They travel in the same `env`
+/// map as an application's variables, under reserved keys spelled once in
+/// [`deis_wire::conventions`], and deis-runtime lifts them back out before the
+/// application sees the map.
+///
+/// No credential travels with them. A node proves itself to deis-store and
+/// deis-queue with capabilities it asks for itself over the machine channel
+/// (`IssueCapability`, subject = the node's own SPIFFE name), so nothing in a
+/// deployment message can be replayed as access to a tenant.
 ///
 /// An unset address means "this platform has no such service": the deployment
 /// still goes out, the application still loads, and only its `ctx.services`
@@ -196,45 +200,22 @@ pub struct StorageWiring {
     pub store: Option<String>,
     /// deis-queue.
     pub queue: Option<String>,
-    /// Signs Ed25519 capability tokens for every deployment. Unset means
-    /// this platform mints no tokens at all, which is the single-box
-    /// default and only safe while the services are on loopback without
-    /// a verifier of their own.
-    ///
-    /// The issuer is never sent to a node and never logged: what a node
-    /// gets is a capability token that authorises exactly one tenant.
-    issuer: Option<CapabilityIssuer>,
+    /// Signs the capabilities this control plane presents on its own calls
+    /// to deis-queue (the consumer-generation barrier). Never sent to a node
+    /// and never logged.
+    issuer: CapabilityIssuer,
 }
 
 impl std::fmt::Debug for StorageWiring {
     /// The addresses are plain configuration and print; the issuer is the one
     /// value in this struct that can mint a token for *any* tenant, so it is
-    /// reduced to whether it exists. A derived `Debug` would put it in
-    /// whatever log line printed a payload.
+    /// left out entirely. A derived `Debug` would put it in whatever log line
+    /// printed a payload.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageWiring")
             .field("store", &self.store)
             .field("queue", &self.queue)
-            .field("issuer", &redacted_issuer(&self.issuer))
-            .finish()
-    }
-}
-
-/// How the presence of a capability issuer is allowed to appear in a log line.
-fn redacted_issuer(issuer: &Option<CapabilityIssuer>) -> &'static str {
-    match issuer {
-        Some(_) => "<present>",
-        None => "<unset>",
-    }
-}
-
-impl Default for StorageWiring {
-    fn default() -> Self {
-        Self {
-            store: None,
-            queue: None,
-            issuer: None,
-        }
+            .finish_non_exhaustive()
     }
 }
 
@@ -242,11 +223,7 @@ impl StorageWiring {
     /// Read storage endpoints from the control plane's configuration, dropping
     /// blank entries so an empty string in the file does not become an address
     /// nothing can dial.
-    ///
-    /// The capability issuer is not set here — it is bound later via
-    /// [`Self::with_issuer`] once the issuer has been initialized from the
-    /// database.
-    pub fn from_config(config: &crate::config::ControlConfig) -> Self {
+    pub fn new(config: &crate::config::ControlConfig, issuer: CapabilityIssuer) -> Self {
         let clean = |value: &Option<String>| {
             value
                 .as_ref()
@@ -256,18 +233,12 @@ impl StorageWiring {
         Self {
             store: clean(&config.store_endpoint),
             queue: clean(&config.queue_endpoint),
-            issuer: None,
+            issuer,
         }
     }
 
-    /// Attach a capability issuer, replacing any previous one.
-    pub fn with_issuer(mut self, issuer: CapabilityIssuer) -> Self {
-        self.issuer = Some(issuer);
-        self
-    }
-
     /// The capability this control plane presents to deis-queue for one
-    /// tenant, or `None` on a platform with no issuer configured.
+    /// tenant.
     ///
     /// The tenant is the whole `<app>.<environment>` pair, the same string
     /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: deis-queue
@@ -277,31 +248,19 @@ impl StorageWiring {
         &self,
         app_id: &str,
         environment: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let Some(issuer) = self.issuer.as_ref() else {
-            return Ok(None);
-        };
+    ) -> anyhow::Result<String> {
         let tenant = deis_wire::conventions::tenant_id(app_id, environment);
-        let token = issuer
+        self.issuer
             .issue(
                 AUD_QUEUE,
                 &format!("spiffe://deislet/control/{app_id}"),
                 resources_for_audience(&tenant, AUD_QUEUE),
             )
             .await
-            .map_err(|error| anyhow::anyhow!("could not issue a queue capability: {error}"))?;
-        Ok(Some(token))
-    }
-
-    /// True when this control plane mints capability tokens at all.
-    pub fn mints_tokens(&self) -> bool {
-        self.issuer.is_some()
+            .map_err(|error| anyhow::anyhow!("could not issue a queue capability: {error}"))
     }
 
     /// Add the addresses to a deployment's environment map.
-    ///
-    /// The DEIS_STORAGE_TOKEN is no longer written: nodes authenticate to
-    /// storage services through mTLS on the machine channel.
     ///
     /// Every reserved key is *removed* first and only then written back,
     /// which is the part that matters when a value is not configured: an
@@ -309,7 +268,7 @@ impl StorageWiring {
     /// would otherwise keep that value - the platform having nothing to
     /// overwrite it with - and the node would build its KV, SQL and blob
     /// clients against a host the application chose.
-    fn write_into(&self, app_id: &str, environment: &str, env: &mut BTreeMap<String, String>) {
+    fn write_into(&self, app_id: &str, env: &mut BTreeMap<String, String>) {
         let mut put = |key: &str, value: &Option<String>| {
             if env.remove(key).is_some() {
                 warn!(
@@ -325,46 +284,6 @@ impl StorageWiring {
         };
         put(deis_wire::conventions::STORE_ENDPOINT_ENV, &self.store);
         put(deis_wire::conventions::QUEUE_ENDPOINT_ENV, &self.queue);
-        // Remove legacy STORAGE_TOKEN_ENV and generate fresh capability tokens.
-        env.remove(deis_wire::conventions::STORAGE_TOKEN_ENV);
-        env.remove(deis_wire::conventions::QUEUE_TOKEN_ENV);
-
-        if let Some(issuer) = &self.issuer {
-            let tenant = deis_wire::conventions::tenant_id(app_id, environment);
-            let subject = format!("spiffe://deislet/control/{app_id}");
-
-            // Use futures::executor::block_on: CapabilityIssuer::issue is
-            // async (lock on RwLock), but the delivery call chain is sync.
-            // futures::block_on is safe to call inside a tokio runtime
-            // unlike tokio Handle::block_on.
-
-            // Store capability: every store binding (kv, sql, blob) of the
-            // tenant, since each store service verifies its own.
-            let store_token = futures::executor::block_on(issuer.issue(
-                AUD_STORE,
-                &subject,
-                resources_for_audience(&tenant, AUD_STORE),
-            ));
-            match store_token {
-                Ok(token) => {
-                    env.insert(deis_wire::conventions::STORAGE_TOKEN_ENV.to_string(), token);
-                }
-                Err(error) => warn!(app_id = %app_id, %error, "Could not issue a store capability for this deployment's environment; the node obtains its own through IssueCapability"),
-            }
-
-            // Queue capability: same tenant, `queue` audience and binding.
-            let queue_token = futures::executor::block_on(issuer.issue(
-                AUD_QUEUE,
-                &subject,
-                resources_for_audience(&tenant, AUD_QUEUE),
-            ));
-            match queue_token {
-                Ok(token) => {
-                    env.insert(deis_wire::conventions::QUEUE_TOKEN_ENV.to_string(), token);
-                }
-                Err(error) => warn!(app_id = %app_id, %error, "Could not issue a queue capability for this deployment's environment; the node obtains its own through IssueCapability"),
-            }
-        }
     }
 
     /// True when no address is configured, which is worth saying once at
@@ -522,14 +441,13 @@ impl StorageWiring {
         app_id: &str,
         environment: &str,
     ) -> anyhow::Result<()> {
-        if let Some(token) = self.queue_token_for(app_id, environment).await? {
-            request.metadata_mut().insert(
-                "authorization",
-                format!("Bearer {token}").parse().map_err(|error| {
-                    anyhow::anyhow!("queue capability is not valid gRPC metadata: {error}")
-                })?,
-            );
-        }
+        let token = self.queue_token_for(app_id, environment).await?;
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().map_err(|error| {
+                anyhow::anyhow!("queue capability is not valid gRPC metadata: {error}")
+            })?,
+        );
         Ok(())
     }
 }
@@ -777,18 +695,14 @@ impl DeploymentPayload {
     /// The complete environment a node should see: the application's own
     /// variables and the platform's storage addresses.
     ///
-    /// Nodes authenticate to storage through mTLS on the machine channel;
-    /// DEIS_STORAGE_TOKEN is no longer written.
-    ///
-    /// Carries secret values in the clear. Hand it to the node and nowhere
-    /// else - never to a log line and never to a read API.
+    /// No secret value and no credential is in it: secrets reach a node
+    /// through the snapshot and `FetchSecretValues`, and storage
+    /// capabilities through the node's own `IssueCapability` calls.
     pub fn env_for_wire(&self) -> BTreeMap<String, String> {
         let mut env: BTreeMap<String, String> = self.env.clone();
         // Written last, so an application variable spelled like a reserved
-        // key cannot point the app's storage client somewhere else, nor hand
-        // itself a token the node would then present on its behalf.
-        self.storage
-            .write_into(&self.app_id, &self.environment, &mut env);
+        // key cannot point the app's storage client somewhere else.
+        self.storage.write_into(&self.app_id, &mut env);
         env
     }
 
@@ -2313,11 +2227,7 @@ mod tests {
     async fn deliverer(secrets_ready: bool) -> (DeploymentDeliverer, Arc<CatalogStore>) {
         deliverer_with(
             secrets_ready,
-            StorageWiring {
-                store: Some("http://127.0.0.1:8090".to_string()),
-                queue: Some("http://127.0.0.1:8091".to_string()),
-                issuer: None,
-            },
+            authenticated_wiring(),
         )
         .await
     }
@@ -2327,13 +2237,22 @@ mod tests {
     /// tokens the other can verify.
     const ISSUER_ID: &str = "spiffe://deislet/control/test";
 
-    /// A control plane wired the way an authenticated install is: addresses
-    /// plus a CapabilityIssuer for minting Ed25519 capability tokens.
+    /// A control plane wired the way every install is: addresses plus the
+    /// CapabilityIssuer its own queue calls are signed by.
     fn authenticated_wiring() -> StorageWiring {
         StorageWiring {
             store: Some("http://127.0.0.1:8090".to_string()),
             queue: Some("http://127.0.0.1:8091".to_string()),
-            issuer: Some(CapabilityIssuer::for_test(ISSUER_ID)),
+            issuer: CapabilityIssuer::for_test(ISSUER_ID),
+        }
+    }
+
+    /// The same issuer, and no service configured at all.
+    fn no_services_wiring() -> StorageWiring {
+        StorageWiring {
+            store: None,
+            queue: None,
+            issuer: CapabilityIssuer::for_test(ISSUER_ID),
         }
     }
 
@@ -2791,77 +2710,31 @@ mod tests {
         );
     }
 
-    /// Nodes now receive Ed25519 capability tokens signed by the control
-    /// plane, so DEIS_STORAGE_TOKEN appears in the environment map along
-    /// with DEIS_QUEUE_TOKEN.
+    /// No credential travels with a deployment: a node asks for its own
+    /// capabilities over the machine channel, under its own name. A token in
+    /// the env map would be a bearer credential for the tenant that anyone
+    /// who saw the deployment message could replay.
     #[tokio::test]
-    async fn a_deployment_ships_ed25519_capability_tokens() {
+    async fn a_deployment_carries_no_storage_or_queue_credential() {
         let (deliverer, store) = deliverer_with(true, authenticated_wiring()).await;
         let production = environment(&store).await;
         let preview = store.create_environment("demo", "preview-7").await.unwrap();
 
-        let for_production = deliverer
-            .payload(&production, &version(MANIFEST), "http://control.test")
-            .await
-            .unwrap()
-            .to_request();
-        let for_preview = deliverer
-            .payload(&preview, &version(MANIFEST), "http://control.test")
-            .await
-            .unwrap()
-            .to_request();
-
-        assert!(
-            for_production
-                .env
-                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
-            "DEIS_STORAGE_TOKEN must be present (Ed25519 capability)"
-        );
-        assert!(
-            for_production
-                .env
-                .contains_key(deis_wire::conventions::QUEUE_TOKEN_ENV),
-            "DEIS_QUEUE_TOKEN must be present (Ed25519 capability)"
-        );
-        assert!(
-            for_preview
-                .env
-                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
-            "DEIS_STORAGE_TOKEN must be present for preview environments too"
-        );
-        assert!(
-            for_preview
-                .env
-                .contains_key(deis_wire::conventions::QUEUE_TOKEN_ENV),
-            "DEIS_QUEUE_TOKEN must be present for preview environments too"
-        );
-    }
-
-    /// What the issuer mints is what the verifiers accept: the store token
-    /// passes every store service's binding check and the queue token the
-    /// queue's - the pairing the review found broken, with an empty binding
-    /// that no verifier matched.
-    #[tokio::test]
-    async fn the_tokens_a_deployment_carries_pass_the_verifiers_they_are_for() {
-        use deis_capability::{CapabilityVerifier, STORE_BINDINGS};
-        let wiring = authenticated_wiring();
-        let issuer = wiring.issuer.clone().unwrap();
-        let verifier = CapabilityVerifier::new(issuer.verifying_key().await);
-        let tenant = deis_wire::conventions::tenant_id("demo", "production");
-
-        let mut env = BTreeMap::new();
-        wiring.write_into("demo", "production", &mut env);
-        let store_token = &env[deis_wire::conventions::STORAGE_TOKEN_ENV];
-        let queue_token = &env[deis_wire::conventions::QUEUE_TOKEN_ENV];
-        for binding in STORE_BINDINGS {
-            verifier
-                .verify(store_token, AUD_STORE, &tenant, binding)
-                .unwrap_or_else(|e| panic!("store/{binding}: {e}"));
+        for env in [&production, &preview] {
+            let request = deliverer
+                .payload(env, &version(MANIFEST), "http://control.test")
+                .await
+                .unwrap()
+                .to_request();
+            for (key, value) in &request.env {
+                assert!(
+                    !key.contains("TOKEN") && !value.starts_with("v1."),
+                    "{key} travelled in the deployment of {}",
+                    env.name
+                );
+            }
+            assert!(request.env.contains_key(deis_wire::conventions::STORE_ENDPOINT_ENV));
         }
-        verifier
-            .verify(queue_token, AUD_QUEUE, &tenant, "queue")
-            .expect("the queue token is for the queue");
-        assert!(verifier.verify(store_token, AUD_QUEUE, &tenant, "queue").is_err());
     }
 
     /// The control plane's own queue calls carry a queue-audience token in
@@ -2869,7 +2742,7 @@ mod tests {
     #[tokio::test]
     async fn a_queue_call_from_control_carries_a_queue_capability_as_a_bearer() {
         let wiring = authenticated_wiring();
-        let issuer = wiring.issuer.clone().unwrap();
+        let issuer = wiring.issuer.clone();
         let mut request = tonic::Request::new(());
         wiring
             .stamp_queue_capability(&mut request, "demo", "production")
@@ -2893,97 +2766,20 @@ mod tests {
             .expect("deis-queue accepts it");
     }
 
-    #[tokio::test]
-    async fn a_control_plane_with_no_shared_secret_ships_no_token() {
-        // The single-box default. The storage services accept an unproven
-        // call only while they have no auth_secret of their own, which they
-        // only allow on loopback.
-        let (deliverer, store) = deliverer(true).await;
-        let env = environment(&store).await;
-
-        let request = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
-            .await
-            .unwrap()
-            .to_request();
-
-        assert!(
-            !request
-                .env
-                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
-            "a platform with no secret must ship no token rather than an empty one"
-        );
-    }
-
-    /// The DEIS_STORAGE_TOKEN key is always stripped from the deployment
-    /// environment, regardless of whether the platform configured a shared
-    /// secret. Nodes authenticate to storage through mTLS.
-    #[tokio::test]
-    async fn the_storage_token_key_is_always_stripped() {
-        let manifest = format!(
-            r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"forged","KEEP":"mine"}}}}"#,
-            deis_wire::conventions::STORAGE_TOKEN_ENV
-        );
-
-        // Platform with an issuer: the reserved key is removed, then
-        // the platform writes its own Ed25519 capability.
-        let (deliverer, store) = deliverer_with(true, authenticated_wiring()).await;
-        let env = environment(&store).await;
-        let request = deliverer
-            .payload(&env, &version(&manifest), "http://control.test")
-            .await
-            .unwrap()
-            .to_request();
-        assert!(
-            request
-                .env
-                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
-            "DEIS_STORAGE_TOKEN must be written (Ed25519 capability)"
-        );
-        assert_ne!(
-            request.env.get(deis_wire::conventions::STORAGE_TOKEN_ENV).map(String::as_str),
-            Some("forged"),
-            "the manifest-forged value must be replaced by the real capability"
-        );
-        assert_eq!(request.env.get("KEEP").map(String::as_str), Some("mine"));
-
-        // Platform with no storage wiring: the reserved key is still removed.
-        let (deliverer, store) = deliverer_with(true, StorageWiring::default()).await;
-        let env = environment(&store).await;
-        let request = deliverer
-            .payload(&env, &version(&manifest), "http://control.test")
-            .await
-            .unwrap()
-            .to_request();
-        assert!(
-            !request
-                .env
-                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
-            "DEIS_STORAGE_TOKEN must be stripped even with no platform auth"
-        );
-        assert_eq!(request.env.get("KEEP").map(String::as_str), Some("mine"));
-    }
-
     #[test]
     fn the_issuer_never_reaches_a_log_line() {
         // The one value here that can mint a token for any tenant. A
         // derived Debug would put it in whatever line printed a payload.
         let rendered = format!("{:?}", authenticated_wiring());
-        assert!(
-            rendered.contains("<present>"),
-            "the issuer should be redacted but is: {rendered}"
-        );
-        assert!(
-            format!("{:?}", StorageWiring::default()).contains("<unset>"),
-            "an unset issuer should say <unset>"
-        );
+        assert!(!rendered.contains("issuer"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1:8090"), "{rendered}");
     }
 
     #[tokio::test]
     async fn a_control_plane_without_storage_configured_sends_no_addresses() {
         // A valid setup: the deployment still goes out, and only the app's
         // ctx.services calls fail.
-        let (deliverer, store) = deliverer_with(true, StorageWiring::default()).await;
+        let (deliverer, store) = deliverer_with(true, no_services_wiring()).await;
         let env = environment(&store).await;
 
         let request = deliverer
@@ -3010,7 +2806,7 @@ mod tests {
     /// clients dial.
     #[tokio::test]
     async fn an_application_cannot_name_a_storage_address_the_platform_never_configured() {
-        let (deliverer, store) = deliverer_with(true, StorageWiring::default()).await;
+        let (deliverer, store) = deliverer_with(true, no_services_wiring()).await;
         let env = environment(&store).await;
         let manifest = format!(
             r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"http://attacker.invalid","{}":"http://attacker.invalid","KEEP":"mine"}}}}"#,
@@ -3054,7 +2850,7 @@ mod tests {
                 15,
             )),
             Arc::clone(&ready.address),
-            StorageWiring::default(),
+            no_services_wiring(),
         );
 
         let report = deliverer
@@ -3175,7 +2971,7 @@ mod tests {
             )),
             Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
             Arc::clone(&ready.address),
-            StorageWiring::default(),
+            no_services_wiring(),
         );
         let err = broken
             .payload(
@@ -3239,7 +3035,7 @@ mod tests {
                 15,
             )),
             Arc::clone(&ready.address),
-            StorageWiring::default(),
+            no_services_wiring(),
         );
 
         let payload = deliverer
@@ -3343,7 +3139,7 @@ mod tests {
             Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
             fleet_with_one_refused_machine().await,
             Arc::clone(&ready.address),
-            StorageWiring::default(),
+            no_services_wiring(),
         );
 
         let payload = deliverer
@@ -3380,7 +3176,7 @@ mod tests {
             Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
             fleet_with_one_lost_node(),
             Arc::clone(&ready.address),
-            StorageWiring::default(),
+            no_services_wiring(),
         );
 
         let payload = deliverer
@@ -3415,7 +3211,7 @@ mod tests {
             Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
             fleet_with_one_lost_node(),
             Arc::clone(&ready.address),
-            StorageWiring::default(),
+            no_services_wiring(),
         );
 
         let report = deliverer
@@ -3442,7 +3238,7 @@ mod tests {
             Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
             Arc::clone(&nodes),
             Arc::clone(&ready.address),
-            StorageWiring::default(),
+            no_services_wiring(),
         );
 
         nodes

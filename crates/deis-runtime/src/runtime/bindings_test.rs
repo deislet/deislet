@@ -117,7 +117,6 @@ mod tests {
         // halves disagree the symptom is a service that is silently absent,
         // so they are the same code and this test holds them together.
         let original = ServiceWiring {
-            storage_token: Some("a-minted-token".to_string()),
             declaration: ServiceDeclaration::from_names(["kv", "database", "blob", "queue"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://store:8090".to_string()),
@@ -466,18 +465,21 @@ mod tests {
     }
 
     #[test]
-    fn a_deployment_env_keeps_both_capabilities_apart() {
-        // deis-store and deis-queue each accept only their own audience, so
-        // the two tokens the control plane ships must both survive the wiring
-        // and stay in their own slots: losing the queue one leaves every send
-        // and every consumer poll refused.
+    fn a_deployment_env_is_never_a_source_of_capabilities() {
+        // A node asks the control plane for its own capabilities. A value in
+        // the env map spelled like the old token keys is an ordinary variable
+        // of the application, and never the proof this node presents.
         let mut map = env(&[
             ("DEIS_STORE_ENDPOINT", "http://store:8090"),
             ("DEIS_QUEUE_ENDPOINT", "http://queue:8091"),
-            (STORAGE_TOKEN_KEY, "v1.store-capability"),
-            (QUEUE_TOKEN_KEY, "v1.queue-capability"),
+            ("DEIS_STORAGE_TOKEN", "forged"),
+            ("DEIS_QUEUE_TOKEN", "forged"),
         ]);
+        let dropped = strip_reserved_env(&mut map);
+        assert_eq!(dropped, vec!["DEIS_STORE_ENDPOINT", "DEIS_QUEUE_ENDPOINT"]);
 
+        map.insert("DEIS_STORE_ENDPOINT".to_string(), "http://store:8090".to_string());
+        map.insert("DEIS_QUEUE_ENDPOINT".to_string(), "http://queue:8091".to_string());
         wire_deployment_env(
             &manifest(
                 r#"{
@@ -491,8 +493,12 @@ mod tests {
         );
 
         let wiring = ServiceWiring::take_from_env(&mut map);
-        assert_eq!(wiring.storage_token.as_deref(), Some("v1.store-capability"));
-        assert_eq!(wiring.queue_token.as_deref(), Some("v1.queue-capability"));
+        assert_eq!(wiring.storage_token, None);
+        assert_eq!(wiring.queue_token, None);
+        assert_eq!(
+            map,
+            env(&[("DEIS_STORAGE_TOKEN", "forged"), ("DEIS_QUEUE_TOKEN", "forged")])
+        );
     }
 
     #[test]
@@ -601,91 +607,11 @@ mod tests {
     }
 
     #[test]
-    fn the_capability_token_never_reaches_the_application_s_own_variables() {
-        // An application that could read this value would be able to call
-        // deis-store and deis-queue directly as its own tenant, with none of
-        // the checks this node makes on its behalf.
-        let mut map = env(&[
-            ("DEIS_SERVICES", "kv"),
-            ("DEIS_STORE_ENDPOINT", "http://127.0.0.1:8090"),
-            (deis_wire::conventions::STORAGE_TOKEN_ENV, "a-minted-token"),
-            ("LOG_LEVEL", "info"),
-        ]);
-
-        let wiring = ServiceWiring::take_from_env(&mut map);
-
-        assert_eq!(map, env(&[("LOG_LEVEL", "info")]));
-        assert_eq!(wiring.storage_token.as_deref(), Some("a-minted-token"));
-    }
-
-    #[test]
-    fn a_bundle_cannot_hand_itself_a_capability_token() {
-        // A bundle recovered from this node's own disk never passed through
-        // deis-control, so its manifest may name anything. Keeping the value
-        // would make the node present a credential the application chose on
-        // every storage call it made for it. The order here is the loader's
-        // (`deployment::mod`): strip what the manifest declared, merge what
-        // the delivery carried, then wire.
-        let mut map = env(&[
-            (deis_wire::conventions::STORAGE_TOKEN_ENV, "forged"),
-            ("LOG_LEVEL", "info"),
-        ]);
-        let dropped = strip_reserved_env(&mut map);
-        assert!(dropped.contains(&deis_wire::conventions::STORAGE_TOKEN_ENV));
-
-        wire_deployment_env(
-            &manifest(
-                r#"{
-                    "schema": 1,
-                    "app": "demo",
-                    "entry": "worker/index.js",
-                    "services": { "kv": true }
-                }"#,
-            ),
-            &mut map,
-        );
-
-        let wiring = ServiceWiring::take_from_env(&mut map);
-        assert_eq!(
-            wiring.storage_token, None,
-            "the bundle's own value must not become the proof this node presents"
-        );
-        assert_eq!(map, env(&[("LOG_LEVEL", "info")]));
-    }
-
-    #[test]
-    fn a_delivered_token_survives_being_rewired_against_the_manifest() {
-        // `wire_deployment_env` clears every reserved key before writing the
-        // manifest's own answer back. Dropping the token there would leave an
-        // app that loads and whose every storage call is then refused.
-        let mut map = env(&[
-            ("DEIS_STORE_ENDPOINT", "http://127.0.0.1:8090"),
-            (deis_wire::conventions::STORAGE_TOKEN_ENV, "a-minted-token"),
-        ]);
-
-        wire_deployment_env(
-            &manifest(
-                r#"{
-                    "schema": 1,
-                    "app": "demo",
-                    "entry": "worker/index.js",
-                    "services": { "kv": true }
-                }"#,
-            ),
-            &mut map,
-        );
-
-        let wiring = ServiceWiring::take_from_env(&mut map);
-        assert_eq!(wiring.storage_token.as_deref(), Some("a-minted-token"));
-        assert!(wiring.declaration.declares(ServiceKind::Kv));
-    }
-
-    #[test]
     fn a_blank_token_counts_as_absent() {
-        // An empty header would be presented as a token and refused, where
-        // sending nothing at least works against a service that checks none.
-        let mut map = env(&[(deis_wire::conventions::STORAGE_TOKEN_ENV, "   ")]);
-        assert_eq!(ServiceWiring::take_from_env(&mut map).storage_token, None);
+        // An empty header would be presented as a token and refused, which
+        // reads as a bad credential rather than as none yet.
+        let identity = StorageIdentity::new("demo.production", Some("   ")).expect("a tenant");
+        assert!(!identity.is_proven());
     }
 
     #[test]
@@ -747,8 +673,8 @@ mod tests {
     #[tokio::test]
     async fn a_delivered_token_reaches_the_store_through_the_clients_this_module_builds() {
         // The node's half of the chain, end to end and over a real socket:
-        // the token arrives in the deployment's env map, is lifted out of it,
-        // and comes back out of a client this module built as the proof
+        // the token the node holds for its tenant comes back out of a client
+        // this module built as the proof
         // deis-store demands. Asserting the field alone would not catch a
         // client that holds the token and never sends it.
         const SECRET: &str = "the-secret-both-halves-hold";
@@ -775,12 +701,8 @@ mod tests {
                 generation: None,
             }],
         );
-        map.insert(
-            deis_wire::conventions::STORAGE_TOKEN_ENV.to_string(),
-            deis_capability::encode(&claims, &signing_key),
-        );
-
-        let wiring = ServiceWiring::take_from_env(&mut map);
+        let mut wiring = ServiceWiring::take_from_env(&mut map);
+        wiring.storage_token = Some(deis_capability::encode(&claims, &signing_key));
         let services = connect_or_panic(tenant, &wiring);
         let kv = services
             .kv

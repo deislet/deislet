@@ -194,7 +194,7 @@ mod tests {
     const MINT: &str = "/api/apps/demo/environments/production/storage-token";
 
     async fn platform() -> Harness {
-        let h = harness_with_storage(true, storage_wiring(false)).await;
+        let h = harness_with_storage(true, storage_wiring()).await;
         json(&h.router, "POST", "/api/apps", serde_json::json!({"id": "demo"})).await;
         json(
             &h.router,

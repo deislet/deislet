@@ -114,7 +114,7 @@ Loopback、容器私网或“位于反向代理之后”都不是可靠身份边
 只允许：
 
 - 读取分配给自己的 version/artifact。
-- 获取当前 version 的最小 secret/binding capabilities。
+- 获取当前 version 的最小 secret/binding capabilities：capability 由节点以自己的证书身份经 `IssueCapability` 申领，不随部署下发。
 - 调用对应 data resources。
 - 上报 invocation telemetry。
 

@@ -491,7 +491,7 @@ mod tests {
     }
 
     async fn platform() -> Harness {
-        harness_with_storage(true, storage_wiring(true)).await
+        harness_with_storage(true, storage_wiring()).await
     }
 
     async fn app_with_production(h: &Harness, app: &str) {

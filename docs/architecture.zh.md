@@ -572,11 +572,11 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 `base64(HMAC-SHA256(auth_secret, tenant))`（`deis_wire::conventions::storage_token`
 / `storage_token_matches`）。deis-store 与 deis-queue 各自配一份 `auth_secret`，
 控制面配同一份 `storage_auth_secret`——三处必须是同一个字符串，改一处就要三处一起
-改，改完之前旧令牌全部失效。控制面在给节点下发一次部署时，用这份密钥给部署所属的
-租户现算一个令牌，塞进 `env` 表里保留键 `DEIS_STORAGE_TOKEN`（`bindings.rs` 在应用
-看到自己的环境变量之前把它取走，应用摸不到自己的令牌，更摸不到别的租户的）；节点侧
+改，改完之前旧令牌全部失效。部署消息里不带任何令牌：节点经机器通道用自己的证书身份调用
+`IssueCapability`，为自己运行的租户申领 15 分钟的 capability（注册时立即申领，剩余
+5 分钟时续签，见 `crates/deis-runtime/src/deployment/capability_renewer.rs`）；节点侧
 每一次 KV / SQL / Blob / Queue 调用都把它带上（`crates/deis-store/src/auth.rs`、
-`deis-queue` 的对应实现）。
+`deis-queue` 的对应实现），应用代码摸不到它。
 
 验证的顺序刻意是「先看调用方声称的租户，再用这个租户算出期望的令牌，最后才比较」，
 而不是反过来拿令牌去查它对应哪个租户——这样一份从某个应用那里泄漏出去的令牌，换到

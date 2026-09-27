@@ -1260,7 +1260,7 @@ pub async fn run_control_loop(
     // machine-channel identity and endpoint, and reads the global token
     // registry that AppServices::connect() populates.
     let _renewal_metrics = client.machine_channel_client().map(|channel| {
-        crate::deployment::capability_renewer::spawn(channel, client.node_id().to_string())
+        crate::deployment::capability_renewer::spawn(channel, client.node_id().to_string(), None)
     });
 
     loop {

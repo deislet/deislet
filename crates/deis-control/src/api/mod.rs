@@ -617,7 +617,7 @@ async fn build_catalog_state(
         );
     }
 
-    let storage = StorageWiring::from_config(config).with_issuer(issuer.clone());
+    let storage = StorageWiring::new(config, issuer.clone());
     if storage.has_no_endpoints() {
         warn!(
             "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so every ctx.services.kv / database / blob / queue call an application makes answers \"service not available\" and declared queue consumers never start"
@@ -627,19 +627,6 @@ async fn build_catalog_state(
             store_endpoint = ?storage.store,
             queue_endpoint = ?storage.queue,
             "Storage addresses will be handed to nodes with every deployment"
-        );
-    }
-
-    // Which of the two modes this platform runs in is not something an
-    // operator can see from a deployment: both send the same message, and
-    // the difference only shows up as every storage call being refused.
-    if storage.mints_tokens() {
-        info!(
-            "Capability issuer is configured: every deployment carries Ed25519-signed capability tokens minted for its own tenant"
-        );
-    } else {
-        warn!(
-            "No capability issuer: deployments carry no storage capability token, so anything that can reach deis-store or deis-queue may name any tenant and be served"
         );
     }
 

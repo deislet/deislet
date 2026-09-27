@@ -126,6 +126,25 @@ impl TestStore {
         encode(&claims, &self.signing_key)
     }
 
+    /// Give this node's capability renewer a capability for `tenant`, the
+    /// way a renewal would, so any client built for the tenant afterwards
+    /// presents it.
+    pub(crate) fn hand_node_capability(&self, tenant: &str) {
+        let token = self.capability_token_for_all_bindings(tenant);
+        crate::deployment::capability_renewer::adopt(vec![
+            crate::deployment::capability_renewer::HeldCapability {
+                tenant: tenant.to_string(),
+                audience: "store".to_string(),
+                token,
+                exp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 900,
+            },
+        ]);
+    }
+
     /// Wiring that declares only KV and points it at this store, minting a
     /// capability token for `tenant`.
     pub(crate) fn kv_wiring_for(&self, tenant: &str) -> ServiceWiring {
