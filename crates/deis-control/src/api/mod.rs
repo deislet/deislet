@@ -20,6 +20,7 @@ pub mod pagination;
 pub mod paths;
 pub mod registration;
 pub mod restores;
+pub mod revocation;
 pub mod static_files;
 pub mod versioning;
 
@@ -122,7 +123,7 @@ pub async fn build_api_router(
         Arc::clone(&deis_runtime_manager),
         Arc::clone(&sessions),
         &config,
-        issuer,
+        issuer.clone(),
     )
     .await;
     let provider_deployment_reconciler =
@@ -217,6 +218,13 @@ pub async fn build_api_router(
         .route("/health", get(handle_health))
         .route("/deis.svg", get(static_files::serve_favicon))
         .route("/assets/*path", get(static_files::serve_assets))
+        .route(
+            "/capability/revocation-list",
+            get(revocation::revocation_list),
+        )
+        .with_state(revocation::RevocationState {
+            issuer: issuer.clone(),
+        })
         .merge(protected_routes);
 
     // Cross-origin access to the human API, which is off unless the file
