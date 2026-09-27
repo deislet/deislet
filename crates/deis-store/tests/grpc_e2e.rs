@@ -15,7 +15,7 @@ use deis_backend_migration::proto::backend_migration_client::BackendMigrationCli
 use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
-use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode};
 use deis_store::config::Config;
 use deis_store::proto::blob::{
     BlobInfo, PutHeader, PutRequest, blob_store_client::BlobStoreClient, get_response, put_request,
@@ -103,8 +103,9 @@ impl Harness {
     /// All servers now require capability-based auth. The test key is used
     /// so every test can mint valid tokens.
     async fn start() -> Self {
-        let pk = hex::encode(test_signing_key().verifying_key().as_bytes());
-        Self::start_with(Some(pk)).await
+        let data = TempDir::new().unwrap();
+        let data_dir = data.path().to_path_buf();
+        Self::start_over(Some(data), data_dir, None).await
     }
 
     /// A server that requires a capability token, as any deployment that is
@@ -116,27 +117,18 @@ impl Harness {
     /// A server over a data directory the caller keeps, so the same one can
     /// be served twice.
     async fn start_on(data_dir: &std::path::Path) -> Self {
-        let pk = Some(hex::encode(test_signing_key().verifying_key().as_bytes()));
-        Self::start_over(None, data_dir.to_path_buf(), pk, None).await
+        Self::start_over(None, data_dir.to_path_buf(), None).await
     }
 
     async fn start_migration_authenticated(token: &str) -> Self {
         let data = TempDir::new().unwrap();
         let data_dir = data.path().to_path_buf();
-        let pk = Some(hex::encode(test_signing_key().verifying_key().as_bytes()));
-        Self::start_over(Some(data), data_dir, pk, Some(token.to_string())).await
-    }
-
-    async fn start_with(capability_public_key: Option<String>) -> Self {
-        let data = TempDir::new().unwrap();
-        let data_dir = data.path().to_path_buf();
-        Self::start_over(Some(data), data_dir, capability_public_key, None).await
+        Self::start_over(Some(data), data_dir, Some(token.to_string())).await
     }
 
     async fn start_over(
         owned: Option<TempDir>,
         data_dir: std::path::PathBuf,
-        capability_public_key: Option<String>,
         migration_admin_token: Option<String>,
     ) -> Self {
         let config = Config {
@@ -145,7 +137,6 @@ impl Harness {
             // Small enough that the size limit is reachable in a test, large
             // enough for the multi-chunk object below.
             max_object_bytes: 8 * 1024 * 1024,
-            capability_public_key,
             migration_admin_token,
             ..Config::default()
         };
@@ -154,7 +145,7 @@ impl Harness {
         let listener = server::bind(&config).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown, rx) = oneshot::channel();
-        let vk = test_signing_key().verifying_key();
+        let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
         tokio::spawn(async move {
             server::serve(
                 config,
@@ -162,7 +153,7 @@ impl Harness {
                 async {
                     let _ = rx.await;
                 },
-                vk,
+                keys,
             )
             .await
             .unwrap();
@@ -1635,8 +1626,8 @@ async fn a_public_bind_still_works_when_authenticated() {
     let public = tokio::net::TcpListener::from_std(public).unwrap();
     drop(listener);
 
-    let vk = test_signing_key().verifying_key();
-    let result = server::serve(config, public, async {}, vk).await;
+    let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
+    let result = server::serve(config, public, async {}, keys).await;
     // With a verifying key always provided, binding on a public interface
     // is allowed — capability auth secures every call regardless of
     // interface.

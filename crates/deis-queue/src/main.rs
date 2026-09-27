@@ -9,7 +9,7 @@
 //!
 //! Who a caller is allowed to be, it does check: a call carries a capability
 //! token for the tenant it names, an Ed25519-signed JCS-JWT verified against
-//! the control plane's public key. Every call must present a valid token;
+//! the control plane's published keys (its JWKS). Every call must present a valid token;
 //! there is no anonymous or loopback bypass. See [`deis_queue::auth`].
 
 use anyhow::{Context, Result};
@@ -66,8 +66,8 @@ async fn main() -> Result<()> {
     match cli.command {
         None | Some(Command::Serve) => {
             let listener = server::bind(&config).await?;
-            let verifying_key = load_verifying_key(&config)?;
-            server::serve(config, listener, server::shutdown_signal(), verifying_key).await
+            let keys = capability_keys(&config);
+            server::serve(config, listener, server::shutdown_signal(), keys).await
         }
         Some(Command::Snapshot { out }) => {
             let manifest = snapshot::take(&config.data_dir, &out).with_context(|| {
@@ -122,32 +122,21 @@ async fn main() -> Result<()> {
     }
 }
 
-fn load_verifying_key(config: &Config) -> Result<ed25519_dalek::VerifyingKey> {
-    use ed25519_dalek::VerifyingKey;
-
-    // Try the config file first
-    if let Some(ref hex_key) = config.capability_public_key {
-        let bytes =
-            hex::decode(hex_key).context("capability_public_key in config is not valid hex")?;
-        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-            anyhow::anyhow!("capability_public_key must be 32 bytes (64 hex chars)")
-        })?;
-        return Ok(VerifyingKey::from_bytes(&bytes)
-            .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {e}"))?);
-    }
-
-    // Try the environment variable
-    if let Ok(hex_key) = std::env::var("DEIS_CAPABILITY_PUBLIC_KEY") {
-        let bytes = hex::decode(&hex_key).context("DEIS_CAPABILITY_PUBLIC_KEY is not valid hex")?;
-        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-            anyhow::anyhow!("DEIS_CAPABILITY_PUBLIC_KEY must be 32 bytes (64 hex chars)")
-        })?;
-        return Ok(VerifyingKey::from_bytes(&bytes)
-            .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {e}"))?);
-    }
-
-    anyhow::bail!(
-        "No capability verifying key configured. Set capability_public_key in the config \
-         file, or set the DEIS_CAPABILITY_PUBLIC_KEY environment variable."
-    )
+/// The verifier's key ring, kept current from the control plane's JWKS.
+///
+/// Starts empty and never blocks startup: the control plane may come up
+/// after this process, and until the first fetch lands every call is refused
+/// as signed by an unknown key - which is true - and the refresher retries.
+fn capability_keys(config: &Config) -> deis_capability::KeyRing {
+    let keys = deis_capability::KeyRing::new();
+    tracing::info!(
+        url = %config.capability_jwks_url,
+        "Fetching the control plane's capability verifying keys; calls are refused until they arrive"
+    );
+    deis_capability::fetch::spawn_refresher(
+        keys.clone(),
+        config.capability_jwks_url.clone(),
+        deis_capability::fetch::RefreshPolicy::default(),
+    );
+    keys
 }

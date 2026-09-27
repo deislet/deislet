@@ -2,13 +2,15 @@
 //!
 //! Every request names its tenant in `x-deis-tenant` and carries an
 //! Ed25519-signed capability token in `Authorization: Bearer <token>`.
-//! The capability is verified against the control plane's public key, and
+//! The capability is verified against the control plane's published keys
+//! (picked by the token's `kid`), and
 //! the token's resources must include at least one (tenant, binding) pair
 //! that matches the request.
 //!
 //! There is no loopback bypass and no anonymous mode: every call must
-//! present a valid capability token. The verifying key is obtained from
-//! the control plane's well-known endpoint on startup.
+//! present a valid capability token. The verifying keys come from the
+//! control plane's JWKS, kept current by a background refresher the binary
+//! starts (see `deis_capability::fetch`); this module only reads them.
 //!
 //! # Where the check runs
 //!
@@ -21,7 +23,7 @@
 //! probe that needs a tenant credential is a probe the control plane cannot
 //! make.
 
-use deis_capability::{CapabilityError, CapabilityVerifier, VerifiedCapability};
+use deis_capability::{CapabilityError, CapabilityVerifier, KeyRing, VerifiedCapability};
 use deis_wire::conventions::TENANT_HEADER;
 use tonic::{Request, Status};
 
@@ -49,13 +51,13 @@ pub struct StorageAuth {
 }
 
 impl StorageAuth {
-    /// Build a new interceptor from a verifying key and the binding
-    /// this service guards (`"kv"`, `"sql"`, or `"blob"`).
-    pub fn new(verifying_key: ed25519_dalek::VerifyingKey, binding: &'static str) -> Self {
+    /// Build a new interceptor over the control plane's key ring and the
+    /// binding this service guards (`"kv"`, `"sql"`, or `"blob"`).
+    pub fn new(keys: KeyRing, binding: &'static str) -> Self {
         Self {
-            verifier: std::sync::Arc::new(std::sync::Mutex::new(CapabilityVerifier::new(
-                verifying_key,
-            ))),
+            verifier: std::sync::Arc::new(std::sync::Mutex::new(
+                CapabilityVerifier::with_key_ring(keys),
+            )),
             binding,
         }
     }
@@ -330,9 +332,10 @@ mod tests {
     #[test]
     fn binding_is_baked_in_at_construction() {
         let (_, vk) = test_key();
-        let kv_auth = StorageAuth::new(vk, "kv");
-        let sql_auth = StorageAuth::new(vk, "sql");
-        let blob_auth = StorageAuth::new(vk, "blob");
+        let keys = KeyRing::from_keys([vk]);
+        let kv_auth = StorageAuth::new(keys.clone(), "kv");
+        let sql_auth = StorageAuth::new(keys.clone(), "sql");
+        let blob_auth = StorageAuth::new(keys, "blob");
         assert_eq!(kv_auth.binding, "kv");
         assert_eq!(sql_auth.binding, "sql");
         assert_eq!(blob_auth.binding, "blob");

@@ -54,7 +54,6 @@ impl TestStore {
         let config = deis_store::config::Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
-            capability_public_key: Some(hex::encode(verifying_key.as_bytes())),
             ..deis_store::config::Config::default()
         };
         let listener = deis_store::server::bind(&config).await.expect("bind");
@@ -67,7 +66,7 @@ impl TestStore {
                 async {
                     let _ = rx.await;
                 },
-                verifying_key,
+                deis_capability::KeyRing::from_keys([verifying_key]),
             )
             .await
             .expect("serve");

@@ -376,7 +376,6 @@ mod tests {
             let config = Config {
                 listen: "127.0.0.1:0".to_string(),
                 data_dir: data.path().to_path_buf(),
-                capability_public_key: Some(hex::encode(verifying_key.as_bytes())),
                 ..Config::default()
             };
             let listener = server::bind(&config).await.expect("bind");
@@ -389,7 +388,7 @@ mod tests {
                     async {
                         let _ = rx.await;
                     },
-                    verifying_key,
+                    deis_capability::KeyRing::from_keys([verifying_key]),
                 )
                 .await
                 .expect("serve");

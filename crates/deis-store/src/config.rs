@@ -4,8 +4,8 @@
 //!
 //! Every call must carry an Ed25519-signed capability token in
 //! `Authorization: Bearer <token>`. There is no anonymous mode and no
-//! loopback bypass: the verifying key is fetched from the control plane's
-//! well-known endpoint on startup. See [`crate::auth`].
+//! loopback bypass: the verifying keys are fetched from the control plane's
+//! JWKS at `capability_jwks_url` and kept current. See [`crate::auth`].
 //!
 //! # `snapshot_dir` is the difference between having backups and not
 //!
@@ -45,18 +45,19 @@ pub struct Config {
     /// bypass.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// The control plane's capability verifying key, in hex.
+    /// Where the control plane publishes its capability verifying keys, as a
+    /// JWKS document.
     ///
-    /// This is the Ed25519 public key that deis-control uses to sign
-    /// capability tokens. Every call must carry a token signed by the
-    /// matching private key. The key can also be fetched from
-    /// `/.well-known/deis/capability-public-key` on the machine listener.
+    /// Fetched at startup (retried with backoff until the control plane
+    /// answers, refusing every call meanwhile), every 5 minutes after that,
+    /// and whenever a token names a key this process does not hold yet - so
+    /// a control-plane key rotation needs nothing done here. Public keys
+    /// only: no credential is sent or needed.
     ///
-    /// If this is not set, the service fetches the key from the
-    /// `DEIS_CAPABILITY_PUBLIC_KEY_URL` environment variable, or defaults
-    /// to `http://127.0.0.1:8100/.well-known/deis/capability-public-key`.
-    #[serde(default)]
-    pub capability_public_key: Option<String>,
+    /// Defaults to the control plane's human API listener on its default
+    /// port.
+    #[serde(default = "default_capability_jwks_url")]
+    pub capability_jwks_url: String,
     /// The control-plane URL for the T8 revocation-list endpoint.
     ///
     /// The store polls `{revocation_list_url}/capability/revocation-list`
@@ -211,6 +212,10 @@ fn default_snapshot_retention() -> usize {
     7
 }
 
+fn default_capability_jwks_url() -> String {
+    "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json".to_string()
+}
+
 fn default_revocation_list_url() -> String {
     "http://127.0.0.1:8100".to_string()
 }
@@ -236,7 +241,7 @@ impl Default for Config {
             max_object_bytes: default_max_object_bytes(),
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
-            capability_public_key: None,
+            capability_jwks_url: default_capability_jwks_url(),
             revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             snapshot_dir: None,
@@ -300,7 +305,7 @@ mod tests {
 
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
-        assert_eq!(parsed.capability_public_key, defaults.capability_public_key);
+        assert_eq!(parsed.capability_jwks_url, defaults.capability_jwks_url);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.durability, defaults.durability);
         assert_eq!(parsed.snapshot_dir, defaults.snapshot_dir);
@@ -483,7 +488,7 @@ mod tests {
     fn the_secret_and_the_snapshot_keys_are_read_from_a_file() {
         let parsed: Config = toml::from_str(
             r#"
-            capability_public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            capability_jwks_url = "https://control.internal/.well-known/deis/capability-jwks.json"
             migration_admin_token = "an-independent-migration-secret"
             snapshot_dir = "/var/backups/deis-store"
             snapshot_interval_secs = 3600
@@ -492,8 +497,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            parsed.capability_public_key.as_deref(),
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            parsed.capability_jwks_url,
+            "https://control.internal/.well-known/deis/capability-jwks.json"
         );
         assert_eq!(
             parsed.migration_admin_token.as_deref(),

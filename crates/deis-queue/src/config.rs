@@ -1,8 +1,8 @@
 //! Operator-facing configuration.
 //!
 //! Every call must carry an Ed25519-signed capability token in
-//! `Authorization: Bearer <token>`. The verifying key is configured via
-//! `capability_public_key` or fetched from the control plane.
+//! `Authorization: Bearer <token>`. The verifying keys are fetched from the
+//! control plane's JWKS at `capability_jwks_url` and kept current.
 
 use crate::queue::QueueLimits;
 use serde::Deserialize;
@@ -22,12 +22,19 @@ pub struct Config {
     /// bypass.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// The control plane's capability verifying key, in hex.
+    /// Where the control plane publishes its capability verifying keys, as a
+    /// JWKS document.
     ///
-    /// This is the Ed25519 public key that deis-control uses to sign
-    /// capability tokens.
-    #[serde(default)]
-    pub capability_public_key: Option<String>,
+    /// Fetched at startup (retried with backoff until the control plane
+    /// answers, refusing every call meanwhile), every 5 minutes after that,
+    /// and whenever a token names a key this process does not hold yet - so
+    /// a control-plane key rotation needs nothing done here. Public keys
+    /// only: no credential is sent or needed.
+    ///
+    /// Defaults to the control plane's human API listener on its default
+    /// port.
+    #[serde(default = "default_capability_jwks_url")]
+    pub capability_jwks_url: String,
     /// The control-plane URL for the T8 revocation-list endpoint.
     ///
     /// Defaults to `http://127.0.0.1:8100`.
@@ -163,6 +170,10 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
+fn default_capability_jwks_url() -> String {
+    "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json".to_string()
+}
+
 fn default_revocation_list_url() -> String {
     "http://127.0.0.1:8100".to_string()
 }
@@ -171,7 +182,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
-            capability_public_key: None,
+            capability_jwks_url: default_capability_jwks_url(),
             revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             data_dir: default_data_dir(),
@@ -239,7 +250,7 @@ mod tests {
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
         assert_eq!(parsed.listen, defaults.listen);
-        assert_eq!(parsed.capability_public_key, defaults.capability_public_key);
+        assert_eq!(parsed.capability_jwks_url, defaults.capability_jwks_url);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.connections, defaults.connections);
@@ -329,21 +340,24 @@ mod tests {
     }
 
     #[test]
-    fn the_public_key_is_read_from_a_file() {
+    fn the_jwks_url_is_read_from_a_file() {
         let parsed: Config = toml::from_str(
-            "capability_public_key = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\nmigration_admin_token = \"an-independent-migration-secret\"",
+            "capability_jwks_url = \"https://control.internal/.well-known/deis/capability-jwks.json\"\nmigration_admin_token = \"an-independent-migration-secret\"",
         )
         .unwrap();
         assert_eq!(
-            parsed.capability_public_key.as_deref(),
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            parsed.capability_jwks_url,
+            "https://control.internal/.well-known/deis/capability-jwks.json"
         );
         assert_eq!(
             parsed.migration_admin_token.as_deref(),
             Some("an-independent-migration-secret")
         );
-        // Unset by default.
-        assert_eq!(Config::default().capability_public_key, None);
+        // The control plane on this host by default.
+        assert_eq!(
+            Config::default().capability_jwks_url,
+            "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
+        );
     }
 
     #[test]

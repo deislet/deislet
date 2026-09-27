@@ -27,7 +27,7 @@ use deis_backend_migration::proto::backend_migration_client::BackendMigrationCli
 use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
-use deis_capability::{CapabilityClaims, CapabilityResource, encode as encode_capability};
+use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode as encode_capability};
 use deis_queue::config::Config;
 use deis_queue::proto::queue::{
     AbortConsumerGenerationRequest, AckRequest, ActivateConsumerGenerationRequest,
@@ -114,7 +114,7 @@ impl Harness {
     async fn start_with(config: Config) -> Self {
         let data = TempDir::new().unwrap();
         let signing_key = test_signing_key();
-        let verifying_key = signing_key.verifying_key();
+        let keys = KeyRing::from_keys([signing_key.verifying_key()]);
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
@@ -134,7 +134,7 @@ impl Harness {
                 async {
                     let _ = rx.await;
                 },
-                verifying_key,
+                keys,
             )
             .await
             .unwrap();
@@ -1756,14 +1756,11 @@ async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
     public.set_nonblocking(true).unwrap();
     let public = tokio::net::TcpListener::from_std(public).unwrap();
 
-    // Always use a verifying key now. The refusal check has moved:
-    // capability_public_key must be configured in production, and the
-    // main entry point enforces that before calling serve(). The test
-    // exercises serve() directly, so we pass a key; the check for an
-    // unauthenticated public bind has been superseded by the capability
-    // interceptor which always enforces auth regardless of bind address.
-    let verifying_key = test_signing_key().verifying_key();
-    let result = server::serve(config, public, async {}, verifying_key).await;
+    // The check for an unauthenticated public bind has been superseded by
+    // the capability interceptor, which always enforces auth regardless of
+    // bind address.
+    let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
+    let result = server::serve(config, public, async {}, keys).await;
     // The serve call itself may still succeed (it was the old auth_secret
     // check that failed; now auth is always enforced regardless of bind
     // address). What matters is that the server starts and enforces

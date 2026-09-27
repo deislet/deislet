@@ -2,14 +2,16 @@
 //!
 //! Every request names its tenant in `x-deis-tenant` and carries an
 //! Ed25519-signed capability token in `Authorization: Bearer <token>`.
-//! The capability is verified against the control plane's public key, and
+//! The capability is verified against the control plane's published keys
+//! (picked by the token's `kid`), and
 //! the token's resources must include at least one (tenant, "queue") pair.
 //!
 //! There is no loopback bypass and no anonymous mode: every call must
-//! present a valid capability token. The verifying key is obtained from
-//! the control plane's well-known endpoint on startup.
+//! present a valid capability token. The verifying keys come from the
+//! control plane's JWKS, kept current by a background refresher the binary
+//! starts (see `deis_capability::fetch`); this module only reads them.
 
-use deis_capability::{CapabilityError, CapabilityVerifier, VerifiedCapability};
+use deis_capability::{CapabilityError, CapabilityVerifier, KeyRing, VerifiedCapability};
 use deis_wire::conventions::TENANT_HEADER;
 use tonic::{Request, Status};
 
@@ -31,12 +33,12 @@ pub struct QueueAuth {
 }
 
 impl QueueAuth {
-    /// Build a new interceptor from a verifying key.
-    pub fn new(verifying_key: ed25519_dalek::VerifyingKey) -> Self {
+    /// Build a new interceptor over the control plane's key ring.
+    pub fn new(keys: KeyRing) -> Self {
         Self {
-            verifier: std::sync::Arc::new(std::sync::Mutex::new(CapabilityVerifier::new(
-                verifying_key,
-            ))),
+            verifier: std::sync::Arc::new(std::sync::Mutex::new(
+                CapabilityVerifier::with_key_ring(keys),
+            )),
         }
     }
 

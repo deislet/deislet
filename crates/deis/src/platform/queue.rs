@@ -330,9 +330,10 @@ fn status_error(status: tonic::Status, doing: &str) -> anyhow::Error {
     if status.code() == tonic::Code::Unauthenticated {
         return anyhow!(
             "deis-queue refused this CLI's capability token while {doing}: {message}\nThe token \
-             is minted by the control plane from `capability_public_key` and checked by deis-queue \
-             against its own `capability_public_key`; when the two are not the same key, every call from \
-             every node is being refused as well."
+             is signed by the control plane and checked by deis-queue against the keys it fetches \
+             from `capability_jwks_url`; when that does not point at this control plane, or the \
+             fetch is failing (deis-queue logs it), every call from every node is being refused \
+             as well."
         );
     }
     anyhow!("deis-queue refused the call while {doing}: {message}")
@@ -467,7 +468,6 @@ mod tests {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
             max_attempts: CEILING,
-            capability_public_key: Some(hex::encode(verifying_key.as_bytes())),
             ..deis_queue::config::Config::default()
         };
         // Bound before anything is spawned, so the port is known and no part
@@ -478,7 +478,7 @@ mod tests {
         let server = tokio::spawn(async move {
             deis_queue::server::serve(config, listener, async {
                 let _ = stopped.await;
-            }, verifying_key)
+            }, deis_capability::KeyRing::from_keys([verifying_key]))
             .await
             .unwrap();
         });
@@ -640,12 +640,12 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_token_says_which_two_settings_have_to_match() {
+    fn a_refused_token_names_the_setting_the_keys_come_from() {
         let error = status_error(
             tonic::Status::unauthenticated("this node is not authorized to access deis-queue"),
             "listing the dead letters",
         )
         .to_string();
-        assert!(error.contains("capability_public_key"), "{error}");
+        assert!(error.contains("capability_jwks_url"), "{error}");
     }
 }

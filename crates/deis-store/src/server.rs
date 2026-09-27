@@ -185,17 +185,19 @@ fn report_interrupt(result: std::io::Result<()>) {
 /// Serve until `shutdown` resolves.
 ///
 /// The listener is passed in already bound so a caller (the tests, for one)
-/// can learn the port before the server starts accepting.
+/// can learn the port before the server starts accepting. `keys` is the
+/// control plane's key ring; whoever keeps it current (the binary starts a
+/// JWKS refresher, tests fill it by hand) shares it with every guard here.
 pub async fn serve(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
-    verifying_key: ed25519_dalek::VerifyingKey,
+    keys: deis_capability::KeyRing,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
-    let auth_kv = StorageAuth::new(verifying_key, "kv");
-    let auth_sql = StorageAuth::new(verifying_key, "sql");
-    let auth_blob = StorageAuth::new(verifying_key, "blob");
+    let auth_kv = StorageAuth::new(keys.clone(), "kv");
+    let auth_sql = StorageAuth::new(keys.clone(), "sql");
+    let auth_blob = StorageAuth::new(keys, "blob");
     crate::auth::start_revocation_poller(auth_kv.clone(), config.revocation_list_url.clone());
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => Some(
@@ -402,7 +404,9 @@ mod tests {
             config,
             listener,
             async {},
-            ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]).verifying_key(),
+            deis_capability::KeyRing::from_keys([
+                ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]).verifying_key(),
+            ]),
         )
         .await;
         // This will fail on store open (empty data dir structure) but NOT on
