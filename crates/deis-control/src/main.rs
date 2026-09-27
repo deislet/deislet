@@ -415,6 +415,7 @@ async fn main() -> Result<(), anyhow::Error> {
         metrics_collector,
         Arc::clone(&deis_runtime_manager),
         Arc::clone(&api_config),
+        capability_issuer.clone(),
     )
     .await;
     let provider_background = api

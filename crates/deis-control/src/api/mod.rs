@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     audit::AuditStore,
+    capability_issuer::CapabilityIssuer,
     catalog::{
         ArtifactStore, BundleStore, CatalogStore, ProviderDeploymentReconciler, SecretsBackend,
     },
@@ -92,6 +93,7 @@ pub async fn build_api_router(
     metrics_collector: Arc<MetricsCollector>,
     deis_runtime_manager: Arc<RuntimeNodeManager>,
     config: Arc<ControlConfig>,
+    issuer: CapabilityIssuer,
 ) -> ApiRouter {
     let app_state = AppState {
         sessions: Arc::clone(&sessions),
@@ -120,6 +122,7 @@ pub async fn build_api_router(
         Arc::clone(&deis_runtime_manager),
         Arc::clone(&sessions),
         &config,
+        issuer,
     )
     .await;
     let provider_deployment_reconciler =
@@ -542,6 +545,7 @@ async fn build_catalog_state(
     nodes: Arc<RuntimeNodeManager>,
     sessions: Arc<SessionManager>,
     config: &ControlConfig,
+    issuer: CapabilityIssuer,
 ) -> catalog::CatalogState {
     let bundles = BundleStore::new(config.bundle_dir());
     let artifacts = ArtifactStore::beside_bundles(bundles.root());
@@ -765,6 +769,7 @@ async fn build_catalog_state(
         abandon_departed_target_after: std::time::Duration::from_secs(
             config.deployment_target_abandon_after_secs,
         ),
+        issuer,
     }
 }
 
@@ -964,6 +969,7 @@ pub async fn start_api_server(
         metrics_collector,
         deis_runtime_manager,
         config,
+        CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
     )
     .await;
     let provider_background = api
@@ -1072,6 +1078,7 @@ pub(crate) mod tests {
             metrics_collector,
             Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
             Arc::new(config),
+            CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
         )
         .await;
         // The operator the tests act as: an unscoped owner token, which is

@@ -42,6 +42,7 @@ use crate::catalog::{
     ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore,
     ProviderDriverDispatcher, SecretsBackend,
 };
+use crate::capability_issuer::CapabilityIssuer;
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
 use crate::runtime_client::RuntimeNodeManager;
 use crate::session::SessionManager;
@@ -71,6 +72,8 @@ pub struct CatalogState {
     /// Pushes a deployment out to the nodes. Deploy, rollback and secret
     /// change all end here; see [`crate::delivery`].
     pub deliverer: Arc<DeploymentDeliverer>,
+    /// Issues Ed25519 capability tokens for storage/queue/telemetry.
+    pub issuer: CapabilityIssuer,
     /// Where storage lives and what proves a call to it may act as a tenant.
     ///
     /// The deliverer holds the same wiring and writes it into every
@@ -718,6 +721,7 @@ pub(crate) mod tests {
             .expect("the stand-in runtime node registers");
         let runtime_nodes_for_state = Arc::clone(&runtime_nodes);
         let sessions = Arc::new(SessionManager::new());
+        let issuer = CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await;
         let state = CatalogState {
             store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
@@ -733,6 +737,7 @@ pub(crate) mod tests {
                 address,
                 storage,
             )),
+            issuer,
             sessions: Arc::clone(&sessions),
             nodes: Arc::clone(&runtime_nodes_for_state),
             // Long enough that no test reaches it by accident; a test about

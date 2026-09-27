@@ -590,8 +590,28 @@ mod tests {
         .await;
         let after = storage_token(&h, "victim").await;
         assert_eq!(after["tenant"], before["tenant"]);
-        assert_eq!(
-            after["token"], before["token"],
+
+        // Both tokens must be valid Ed25519 capabilities for the same tenant.
+        // They differ byte-for-byte (random jti), but authorise the same tenant
+        // because releasing a name means someone else can now use it under the
+        // same `<app>.<environment>` string.
+        let verifying_key = h.state.issuer.verifying_key().await;
+        let before_claims = deis_capability::decode(
+            before["token"].as_str().unwrap(),
+            &verifying_key,
+        )
+        .expect("before token must be a valid Ed25519 capability");
+        let after_claims = deis_capability::decode(
+            after["token"].as_str().unwrap(),
+            &verifying_key,
+        )
+        .expect("after token must be a valid Ed25519 capability");
+        assert!(
+            before_claims.authorizes_tenant("victim.production"),
+            "before token must authorise the tenant"
+        );
+        assert!(
+            after_claims.authorizes_tenant("victim.production"),
             "the tenant key is (application, environment) by design; releasing the name is the \
              moment somebody accepted that"
         );
