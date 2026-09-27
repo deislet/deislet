@@ -61,6 +61,7 @@ pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle, MachineTra
 pub use registration::{
     Deregistered, NodeRegistrar, NodeRegistration, Registered, RegistrationError,
 };
+pub use secret_cache::SecretSource;
 pub use store::{
     check_identifier, BundleStore, CanonicalTenantConflict, InstalledRecord, InvalidIdentifier,
 };
@@ -124,7 +125,7 @@ pub struct DeploymentOrder {
 
 /// Typed Edge Canon environment material sent beside a schema-2 bundle.
 /// Secret values are keyed by immutable revision and deliberately omitted
-/// from Debug output.  Secrets arrive through [`SecretCache`] rather than
+/// from Debug output.  Secrets arrive through [`SecretSource`] rather than
 /// the deployment wire message; the snapshot structure is validated when
 /// the order is received, while secret values are validated when
 /// [`Self::with_secrets`] is called.
@@ -404,6 +405,9 @@ pub struct DeploymentManager {
     /// unit test that builds a manager and asks nothing of its health leaves
     /// it as. A missing handle is silence, never a guess.
     health: ArcSwapOption<NodeHealth>,
+    /// Where secret values come from, on a node that has a machine channel
+    /// to ask over. Unset, a deployment that binds a secret is refused.
+    secrets: std::sync::OnceLock<SecretSource>,
 }
 
 impl DeploymentManager {
@@ -466,7 +470,59 @@ impl DeploymentManager {
             changes: AtomicU64::new(0),
             last_change: DashMap::new(),
             health: ArcSwapOption::empty(),
+            secrets: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Fetch secret values through `source` from now on.
+    ///
+    /// Set once, at startup, before anything is deployed; a second call is
+    /// ignored, because two sources would be two caches that could disagree.
+    pub fn fetch_secrets_through(&self, source: SecretSource) {
+        if self.secrets.set(source).is_err() {
+            warn!("A secret source was already configured for this node; keeping the first");
+        }
+    }
+
+    /// Forget cached secret values of every deployment not in
+    /// `deployment_ids`, which is the deployments of a complete assignment
+    /// list.
+    pub fn retain_secrets(&self, deployment_ids: &std::collections::HashSet<String>) {
+        if let Some(source) = self.secrets.get() {
+            source.retain(deployment_ids);
+        }
+    }
+
+    /// Give a standard-environment order the secret values it binds.
+    ///
+    /// An order that already carries all of them - one built in-process - is
+    /// passed through. Otherwise they are fetched, and an order whose values
+    /// cannot be had is refused before its bundle is even downloaded.
+    async fn resolve_secrets(
+        &self,
+        deployment_id: Option<&str>,
+        order: StandardEnvironmentOrder,
+    ) -> Result<StandardEnvironmentOrder, DeployError> {
+        let complete = order.snapshot.bindings.iter().all(|binding| match binding {
+            deis_wire::EnvironmentBinding::Secret(secret) => order
+                .secret_values_by_revision
+                .contains_key(&secret.revision),
+            deis_wire::EnvironmentBinding::Config(_) => true,
+        });
+        if complete {
+            return Ok(order);
+        }
+        let Some(source) = self.secrets.get() else {
+            return Err(DeployError::Environment(
+                "EC_ENV_SECRET_REVISION_UNAVAILABLE: this deployment binds secrets and this node \
+                 has no machine channel to fetch them over"
+                    .to_string(),
+            ));
+        };
+        source
+            .resolve(deployment_id, order)
+            .await
+            .map_err(DeployError::Environment)
     }
 
     /// Report what happens here to the node's readiness as well.
@@ -1142,6 +1198,15 @@ impl DeploymentManager {
             })
         })?;
         check_identifier("version_id", &order.version_id).map_err(DeployError::Identifier)?;
+
+        // Before the download: a deployment whose secrets cannot be had is
+        // refused without spending a bundle fetch on it.
+        if let Some(environment) = order.standard_environment.take() {
+            order.standard_environment = Some(
+                self.resolve_secrets(order.deployment_id.as_deref(), environment)
+                    .await?,
+            );
+        }
 
         let (bytes, reused_bundle) = self.bundle_bytes(&key, &order, local_only).await?;
         let bundle_bytes = bytes.len();

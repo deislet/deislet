@@ -1751,3 +1751,313 @@ async fn a_node_that_names_no_control_plane_builds_no_client() {
         "a node with no control plane must not be handed a client that would dial one"
     );
 }
+
+/// The node's half of `FetchSecretValues`: a schema-2 deployment that binds a
+/// secret starts only once its value has been fetched over the machine
+/// channel, and the isolate sees it.
+mod secret_fetch {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use deis_wire::machine::{FetchSecretValuesRequest, FetchSecretValuesResponse};
+
+    use super::*;
+    use crate::deployment::SecretSource;
+
+    const SECRET_HANDLER: &str =
+        "export default function handler(context) { return new Response(context.env.TOKEN); }";
+
+    /// A stand-in control plane that answers `FetchSecretValues` by the same
+    /// rules deis-control does: only for the node the deployments are
+    /// assigned to, only deployments on its list, only revisions they bind,
+    /// and exactly the revisions asked for.
+    struct SecretPlane {
+        assignments: serde_json::Value,
+        /// `(deployment_id, revision)` to plaintext - the catalog.
+        secrets: HashMap<(String, String), String>,
+        /// The node these deployments are assigned to. A lock so a test can
+        /// reassign them between two passes.
+        assigned_to: Arc<parking_lot::Mutex<String>>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl MachineChannel for SecretPlane {
+        async fn fetch_assignments(
+            &self,
+            _request: tonic::Request<FetchAssignmentsRequest>,
+        ) -> Result<tonic::Response<FetchAssignmentsResponse>, Status> {
+            Ok(tonic::Response::new(FetchAssignmentsResponse {
+                assignments_json: self.assignments.to_string(),
+                complete: true,
+                withheld: 0,
+            }))
+        }
+
+        async fn fetch_secret_values(
+            &self,
+            request: tonic::Request<FetchSecretValuesRequest>,
+        ) -> Result<tonic::Response<FetchSecretValuesResponse>, Status> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let request = request.into_inner();
+            if request.node_id != *self.assigned_to.lock() {
+                return Err(Status::permission_denied("not assigned to this node"));
+            }
+            let entries: Vec<deis_wire::conventions::SecretFetchEntry> =
+                serde_json::from_str(&request.entries_json).unwrap();
+            let mut values = HashMap::new();
+            for entry in entries {
+                if entry.revisions.is_empty() {
+                    return Err(Status::invalid_argument("no revisions"));
+                }
+                for revision in entry.revisions {
+                    let key = (entry.deployment_id.clone(), revision.clone());
+                    let value = self
+                        .secrets
+                        .get(&key)
+                        .ok_or_else(|| Status::permission_denied("not bound"))?;
+                    values.insert(
+                        format!("{}\x00{revision}", entry.deployment_id),
+                        value.clone(),
+                    );
+                }
+            }
+            Ok(tonic::Response::new(FetchSecretValuesResponse {
+                values_json: serde_json::to_string(&values).unwrap(),
+            }))
+        }
+
+        async fn register(
+            &self,
+            _request: tonic::Request<RegisterNodeRequest>,
+        ) -> Result<tonic::Response<RegisterNodeResponse>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+
+        async fn deregister(
+            &self,
+            _request: tonic::Request<DeregisterNodeRequest>,
+        ) -> Result<tonic::Response<DeregisterNodeResponse>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+
+        async fn fetch_routing_table(
+            &self,
+            _request: tonic::Request<FetchRoutingTableRequest>,
+        ) -> Result<tonic::Response<FetchRoutingTableResponse>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+
+        async fn issue_capability(
+            &self,
+            _request: tonic::Request<IssueCapabilityRequest>,
+        ) -> Result<tonic::Response<IssueCapabilityResponse>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+    }
+
+    fn declarations() -> deis_wire::EnvironmentDeclarations {
+        deis_wire::EnvironmentDeclarations::new(
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            vec![deis_wire::EnvironmentDeclaration {
+                name: "TOKEN".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            }],
+        )
+    }
+
+    /// A schema-2 bundle declaring `TOKEN`, laid out as `deis build` does.
+    fn standard_bundle(declarations: &deis_wire::EnvironmentDeclarations) -> (Vec<u8>, String) {
+        let manifest = serde_json::json!({
+            "schema": 2,
+            "app": "demo",
+            "entry": "worker/index.js",
+            "runtime": "standard-v1",
+            "environment": declarations,
+            "assets": [],
+        });
+        let document = declarations.canonical_json().unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::FileOptions::default();
+            writer
+                .start_file(deis_bundle::MANIFEST_ENTRY, options)
+                .unwrap();
+            writer.write_all(manifest.to_string().as_bytes()).unwrap();
+            writer.start_file("worker/index.js", options).unwrap();
+            writer.write_all(SECRET_HANDLER.as_bytes()).unwrap();
+            writer
+                .start_file("documents/environment-secrets.json", options)
+                .unwrap();
+            writer.write_all(&document).unwrap();
+            writer.finish().unwrap();
+        }
+        let sha = sha256_hex(&buf);
+        (buf, sha)
+    }
+
+    async fn serve_bundle(bytes: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let bytes = Arc::new(bytes);
+        let router = Router::new().route(
+            "/bundle",
+            get(move || {
+                let bytes = Arc::clone(&bytes);
+                async move { Response::new(Body::from(bytes.as_ref().clone())) }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("{base}/bundle")
+    }
+
+    async fn served_token(apps: &ApplicationManager) -> String {
+        let (_status, _headers, body) = apps
+            .execute_app(
+                &AppKey::production("demo"),
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        String::from_utf8(body.into_bytes().unwrap().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_binds_a_secret_starts_with_the_fetched_value() {
+        let declarations = declarations();
+        let (bundle, sha) = standard_bundle(&declarations);
+        let bundle_url = serve_bundle(bundle).await;
+
+        let application_id = deis_wire::CanonicalId::new_v7();
+        let environment_id = deis_wire::CanonicalId::new_v7();
+        let deployment_id = deis_wire::CanonicalId::new_v7().to_string();
+        let revision = "secret-revision-1";
+        let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+            declarations.standard_version.clone(),
+            "v1",
+            environment_id.to_string(),
+            declarations.identity().unwrap(),
+            vec![deis_wire::EnvironmentBinding::Secret(
+                deis_wire::EnvironmentSecretBinding::new("TOKEN", revision),
+            )],
+        );
+        let line = serde_json::json!({
+            "app_id": "demo",
+            "canonical_application_id": application_id,
+            "version_id": "v1",
+            "deployment_id": deployment_id,
+            "environment": "production",
+            "canonical_environment_id": environment_id,
+            "bundle_url": bundle_url,
+            "bundle_sha": sha,
+            "environment_declarations": declarations,
+            "environment_snapshot_id": snapshot.identity().unwrap(),
+            "environment_snapshot": snapshot,
+        });
+        // The line itself carries no value; only the RPC does.
+        assert!(!line.to_string().contains("s3cret-value"));
+
+        let ca = TestCa::new();
+        let assigned_to = Arc::new(parking_lot::Mutex::new("node-other".to_string()));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let (endpoint, control_identity) = serve_machine_channel(
+            &ca,
+            SecretPlane {
+                assignments: serde_json::json!([line]),
+                secrets: HashMap::from([(
+                    (deployment_id.clone(), revision.to_string()),
+                    "s3cret-value".to_string(),
+                )]),
+                assigned_to: assigned_to.clone(),
+                fetches: fetches.clone(),
+            },
+        );
+        let client = AssignmentClient::over_machine_channel(
+            &endpoint,
+            "node-1",
+            Duration::from_secs(10),
+            node_identity(&ca, "node-1"),
+            control_identity,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let apps = Arc::new(ApplicationManager::new());
+        let deployer = deployer(dir.path(), apps.clone()).await;
+        deployer.fetch_secrets_through(SecretSource::new(
+            client.machine_channel_client().unwrap(),
+            "node-1",
+        ));
+        let mut reconciler = Reconciler::new(&client, &deployer);
+
+        // Assigned to another node: the control plane refuses this node the
+        // values, so the deployment is refused rather than started without
+        // them.
+        let outcome = reconciler.once().await.unwrap();
+        assert_eq!(outcome.failed, 1, "{outcome:?}");
+        assert_eq!(deployer.installed_app_count(), 0);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        // Now this node's: the next pass fetches and starts it.
+        *assigned_to.lock() = "node-1".to_string();
+        let outcome = reconciler.once().await.unwrap();
+        assert_eq!(outcome.installed, 1, "{outcome:?}");
+        assert_eq!(served_token(&apps).await, "s3cret-value");
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+
+        // Already running: nothing is fetched again.
+        let outcome = reconciler.once().await.unwrap();
+        assert_eq!(outcome.unchanged, 1, "{outcome:?}");
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            deployer.secrets.get().unwrap().cached_deployments(),
+            1,
+            "the running deployment keeps its values cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_list_evicts_values_of_deployments_no_longer_assigned() {
+        let ca = TestCa::new();
+        let (endpoint, control_identity) = serve_machine_channel(
+            &ca,
+            SecretPlane {
+                assignments: serde_json::json!([]),
+                secrets: HashMap::new(),
+                assigned_to: Arc::new(parking_lot::Mutex::new("node-1".to_string())),
+                fetches: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        let client = AssignmentClient::over_machine_channel(
+            &endpoint,
+            "node-1",
+            Duration::from_secs(10),
+            node_identity(&ca, "node-1"),
+            control_identity,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let deployer = deployer(dir.path(), Arc::new(ApplicationManager::new())).await;
+        deployer.fetch_secrets_through(SecretSource::new(
+            client.machine_channel_client().unwrap(),
+            "node-1",
+        ));
+        deployer
+            .secrets
+            .get()
+            .unwrap()
+            .insert_for_test("gone-deployment", "r1", "stale");
+        assert_eq!(deployer.secrets.get().unwrap().cached_deployments(), 1);
+
+        Reconciler::new(&client, &deployer).once().await.unwrap();
+        assert_eq!(deployer.secrets.get().unwrap().cached_deployments(), 0);
+    }
+}

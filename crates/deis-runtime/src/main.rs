@@ -554,6 +554,19 @@ async fn run(
         ),
     }
 
+    // Secret values are fetched over the same machine channel, right before
+    // a deployment that binds them is built. Set before the control loop and
+    // the management plane start, so no deployment can arrive ahead of it.
+    if let Some(channel) = assignment_client
+        .as_ref()
+        .and_then(AssignmentClient::machine_channel_client)
+    {
+        deployer.fetch_secrets_through(deis_runtime::deployment::SecretSource::new(
+            channel,
+            node_id.clone(),
+        ));
+    }
+
     // Which door this node announces itself at is the configuration's to
     // decide, the same way the assignment fetch's is; without an endpoint of
     // either kind there is nobody to register with, which is the standalone

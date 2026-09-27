@@ -855,6 +855,10 @@ impl<'a> Reconciler<'a> {
             })
             .collect();
         report_drift(&assigned, &running, complete, &self.absent_before);
+        let assigned_deployments: HashSet<String> = assignments
+            .iter()
+            .filter_map(|assignment| assignment.deployment_id.clone())
+            .collect();
 
         let mut outcome = SyncOutcome {
             assigned: assignments.len(),
@@ -940,6 +944,10 @@ impl<'a> Reconciler<'a> {
             );
             return Ok(outcome);
         }
+
+        // Only a complete answer bounds the secret cache: a deployment an
+        // incomplete one left out may still be running here.
+        self.deployer.retain_secrets(&assigned_deployments);
 
         let mut absent_now: HashSet<AppKey> = HashSet::new();
         for (key, installed) in running {
