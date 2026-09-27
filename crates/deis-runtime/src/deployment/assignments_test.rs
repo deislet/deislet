@@ -209,7 +209,10 @@ impl MachineChannel for AssignmentsService {
     async fn fetch_secret_values(
         &self,
         _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
-    ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
+    ) -> std::result::Result<
+        tonic::Response<deis_wire::machine::FetchSecretValuesResponse>,
+        tonic::Status,
+    > {
         Err(tonic::Status::unimplemented("fetch_secret_values"))
     }
 
@@ -1174,7 +1177,10 @@ async fn counting_registrar() -> (NodeRegistrar, Arc<std::sync::atomic::AtomicUs
         async fn fetch_secret_values(
             &self,
             _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
-        ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
+        ) -> std::result::Result<
+            tonic::Response<deis_wire::machine::FetchSecretValuesResponse>,
+            tonic::Status,
+        > {
             Err(tonic::Status::unimplemented("fetch_secret_values"))
         }
 
@@ -1481,7 +1487,10 @@ impl MachineChannel for MachineControlPlane {
     async fn fetch_secret_values(
         &self,
         _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
-    ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
+    ) -> std::result::Result<
+        tonic::Response<deis_wire::machine::FetchSecretValuesResponse>,
+        tonic::Status,
+    > {
         Err(tonic::Status::unimplemented("fetch_secret_values"))
     }
 

@@ -383,9 +383,14 @@ mod tests {
             let addr = listener.local_addr().expect("local addr");
             let (shutdown, rx) = oneshot::channel();
             tokio::spawn(async move {
-                server::serve(config, listener, async {
-                    let _ = rx.await;
-                }, verifying_key)
+                server::serve(
+                    config,
+                    listener,
+                    async {
+                        let _ = rx.await;
+                    },
+                    verifying_key,
+                )
                 .await
                 .expect("serve");
             });
@@ -397,8 +402,8 @@ mod tests {
             }
         }
 
-fn capability_token_for(&self, tenant: &str) -> String {
-            use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+        fn capability_token_for(&self, tenant: &str) -> String {
+            use deis_capability::{encode, CapabilityClaims, CapabilityResource};
             use std::time::Duration;
             let claims = CapabilityClaims::new(
                 "store",
@@ -423,9 +428,10 @@ fn capability_token_for(&self, tenant: &str) -> String {
             KvClient::connect_lazy(&self.endpoint, &identity).expect("client is built")
         }
 
-        /// The common case: a store with no `auth_secret`, so no token.
+        /// The common case: a store that always yields a proven client.
         fn client(&self, tenant: &str) -> KvClient {
-            self.binding(tenant, None)
+            let token = self.capability_token_for(tenant);
+            self.binding(tenant, Some(&token))
         }
     }
 
@@ -812,7 +818,7 @@ fn capability_token_for(&self, tenant: &str) -> String {
             .set("k".to_string(), b"v".to_vec())
             .await
             .expect_err("one environment's token must not authorise another's namespace");
-        assert_eq!(refusal(&error), tonic::Code::Unauthenticated, "{error:#}");
+        assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
     }
 
     #[tokio::test]
@@ -860,7 +866,7 @@ fn capability_token_for(&self, tenant: &str) -> String {
         // again. Without this an app whose store restarted would keep failing
         // until the app itself was reloaded.
         let store = Store::start().await;
-        let client = store.binding("demo.production", None);
+        let client = store.client("demo.production");
 
         client
             .set("k".to_string(), b"v".to_vec())

@@ -82,7 +82,11 @@ async fn capability_public_key(State(issuer): State<CapabilityIssuer>) -> impl I
 /// No CORS, no console fallback and no human authentication layer: none of
 /// them has a caller here, and a layer mounted where it has no caller is a
 /// layer nobody notices is misconfigured.
-pub fn router(state: CatalogState, issuer: CapabilityIssuer, control: ControlServiceServer<GrpcControlService>) -> Router {
+pub fn router(
+    state: CatalogState,
+    issuer: CapabilityIssuer,
+    control: ControlServiceServer<GrpcControlService>,
+) -> Router {
     let issuer_for_key_endpoint = issuer.clone();
     let rpcs = Routes::default()
         .add_service(MachineChannelServer::new(MachineChannelService::new(
@@ -94,16 +98,17 @@ pub fn router(state: CatalogState, issuer: CapabilityIssuer, control: ControlSer
         // and it is mounted here as well as on the human listener while the
         // fleet moves, so a proxy can find it either way for one release.
         .add_service(control);
-    rpcs.into_axum_router().merge(
-        Router::new()
-            .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
-            .with_state(state),
-    )
-    .merge(
-        Router::new()
-            .route(CAPABILITY_KEY_ROUTE, get(capability_public_key))
-            .with_state(issuer_for_key_endpoint),
-    )
+    rpcs.into_axum_router()
+        .merge(
+            Router::new()
+                .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
+                .with_state(state),
+        )
+        .merge(
+            Router::new()
+                .route(CAPABILITY_KEY_ROUTE, get(capability_public_key))
+                .with_state(issuer_for_key_endpoint),
+        )
 }
 
 /// Serve the machine channel until `shutdown` completes.
@@ -224,7 +229,11 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
         let address = listener.local_addr().expect("an address");
-        let app = router(harness.state.clone(), CapabilityIssuer::for_test("spiffe://deislet/control/test"), test_control_service());
+        let app = router(
+            harness.state.clone(),
+            CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+            test_control_service(),
+        );
         tokio::spawn(async move {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });
@@ -281,7 +290,11 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
         let address = listener.local_addr().expect("an address");
-        let app = router(harness.state.clone(), CapabilityIssuer::for_test("spiffe://deislet/control/test"), test_control_service());
+        let app = router(
+            harness.state.clone(),
+            CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+            test_control_service(),
+        );
         tokio::spawn(async move {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });

@@ -46,7 +46,9 @@ pub async fn execute_operation(
         DriverOperation::Prepare => prepare(wrangler, credential, request, work_dir, journal).await,
         DriverOperation::Upload => upload(wrangler, credential, request, work_dir).await,
         DriverOperation::Verify => verify(wrangler, credential, request, work_dir).await,
-        DriverOperation::Activate => activate(wrangler, credential, request, work_dir, journal).await,
+        DriverOperation::Activate => {
+            activate(wrangler, credential, request, work_dir, journal).await
+        }
         DriverOperation::Observe => observe(wrangler, credential, request, work_dir).await,
         DriverOperation::Rollback => rollback(wrangler, credential, request).await,
         DriverOperation::Inspect => inspect(wrangler, credential, request, work_dir).await,
@@ -67,7 +69,12 @@ async fn preflight(
         .await
     {
         Ok(_) => Ok(succeeded(request, None, None, None)),
-        Err(error) => Err(to_driver_error(request, DriverOperation::Preflight, &error, false)),
+        Err(error) => Err(to_driver_error(
+            request,
+            DriverOperation::Preflight,
+            &error,
+            false,
+        )),
     }
 }
 
@@ -81,7 +88,12 @@ async fn plan(
     match std::fs::read_to_string(&plan_path) {
         Ok(contents) => {
             journal.binding_plan_json = Some(contents);
-            Ok(succeeded_with_state(request, DeploymentState::Planned, None, None))
+            Ok(succeeded_with_state(
+                request,
+                DeploymentState::Planned,
+                None,
+                None,
+            ))
         }
         Err(error) => Err(DriverError {
             operation_id: request.operation_id,
@@ -89,7 +101,10 @@ async fn plan(
             desired_state_digest: request.desired_state_digest.clone(),
             category: DriverErrorCategory::Build,
             code: "BINDING_PLAN_MISSING".to_owned(),
-            message: format!("binding-plan.json not found at {}: {error}", plan_path.display()),
+            message: format!(
+                "binding-plan.json not found at {}: {error}",
+                plan_path.display()
+            ),
             retryable: false,
             side_effect: SideEffect::None,
             next_action: DriverNextAction::None,
@@ -146,7 +161,9 @@ async fn prepare(
         match result {
             Ok(id) => {
                 info!(kind, name, id, "Created Cloudflare resource");
-                journal.created_resources.insert(name.to_owned(), id.clone());
+                journal
+                    .created_resources
+                    .insert(name.to_owned(), id.clone());
                 resource_ids.insert(ref_name.to_owned(), id);
             }
             Err(error) if is_already_exists_error(&error) => {
@@ -160,7 +177,9 @@ async fn prepare(
                 match import_result {
                     Ok(id) => {
                         info!(kind, name, id, "Imported existing Cloudflare resource");
-                        journal.created_resources.insert(name.to_owned(), id.clone());
+                        journal
+                            .created_resources
+                            .insert(name.to_owned(), id.clone());
                         resource_ids.insert(ref_name.to_owned(), id);
                     }
                     Err(ie) => {
@@ -174,12 +193,22 @@ async fn prepare(
                 }
             }
             Err(error) => {
-                return Err(to_driver_error(request, DriverOperation::Prepare, &error, true));
+                return Err(to_driver_error(
+                    request,
+                    DriverOperation::Prepare,
+                    &error,
+                    true,
+                ));
             }
         }
     }
 
-    Ok(succeeded_with_state(request, DeploymentState::Preparing, None, Some(resource_ids)))
+    Ok(succeeded_with_state(
+        request,
+        DeploymentState::Preparing,
+        None,
+        Some(resource_ids),
+    ))
 }
 
 /// Upload an artifact version.
@@ -190,7 +219,13 @@ async fn upload(
     work_dir: &Path,
 ) -> Result<DriverReceipt, DriverError> {
     match wrangler
-        .run(credential, &["versions", "upload"], Some(work_dir), None, UPLOAD_TIMEOUT)
+        .run(
+            credential,
+            &["versions", "upload"],
+            Some(work_dir),
+            None,
+            UPLOAD_TIMEOUT,
+        )
         .await
     {
         Ok(output) => {
@@ -205,7 +240,12 @@ async fn upload(
                 None,
             ))
         }
-        Err(error) => Err(to_driver_error(request, DriverOperation::Upload, &error, true)),
+        Err(error) => Err(to_driver_error(
+            request,
+            DriverOperation::Upload,
+            &error,
+            true,
+        )),
     }
 }
 
@@ -217,11 +257,27 @@ async fn verify(
     work_dir: &Path,
 ) -> Result<DriverReceipt, DriverError> {
     match wrangler
-        .run(credential, &["versions", "list"], Some(work_dir), None, DEFAULT_COMMAND_TIMEOUT)
+        .run(
+            credential,
+            &["versions", "list"],
+            Some(work_dir),
+            None,
+            DEFAULT_COMMAND_TIMEOUT,
+        )
         .await
     {
-        Ok(_) => Ok(succeeded_with_state(request, DeploymentState::Verifying, None, None)),
-        Err(error) => Err(to_driver_error(request, DriverOperation::Verify, &error, false)),
+        Ok(_) => Ok(succeeded_with_state(
+            request,
+            DeploymentState::Verifying,
+            None,
+            None,
+        )),
+        Err(error) => Err(to_driver_error(
+            request,
+            DriverOperation::Verify,
+            &error,
+            false,
+        )),
     }
 }
 
@@ -243,7 +299,13 @@ async fn activate(
     }
 
     match wrangler
-        .run(credential, &args, Some(work_dir), None, DEFAULT_COMMAND_TIMEOUT)
+        .run(
+            credential,
+            &args,
+            Some(work_dir),
+            None,
+            DEFAULT_COMMAND_TIMEOUT,
+        )
         .await
     {
         Ok(output) => {
@@ -252,7 +314,12 @@ async fn activate(
                 .and_then(|v| v["deployment_id"].as_str().map(String::from));
             Ok(succeeded(request, None, deployment_id, None))
         }
-        Err(error) => Err(to_driver_error(request, DriverOperation::Activate, &error, true)),
+        Err(error) => Err(to_driver_error(
+            request,
+            DriverOperation::Activate,
+            &error,
+            true,
+        )),
     }
 }
 
@@ -264,11 +331,27 @@ async fn observe(
     work_dir: &Path,
 ) -> Result<DriverReceipt, DriverError> {
     match wrangler
-        .run(credential, &["versions", "list"], Some(work_dir), None, DEFAULT_COMMAND_TIMEOUT)
+        .run(
+            credential,
+            &["versions", "list"],
+            Some(work_dir),
+            None,
+            DEFAULT_COMMAND_TIMEOUT,
+        )
         .await
     {
-        Ok(_) => Ok(succeeded_with_state(request, DeploymentState::Active, None, None)),
-        Err(error) => Err(to_driver_error(request, DriverOperation::Observe, &error, false)),
+        Ok(_) => Ok(succeeded_with_state(
+            request,
+            DeploymentState::Active,
+            None,
+            None,
+        )),
+        Err(error) => Err(to_driver_error(
+            request,
+            DriverOperation::Observe,
+            &error,
+            false,
+        )),
     }
 }
 
@@ -278,20 +361,25 @@ async fn rollback(
     credential: &CloudflareCredential,
     request: &DriverRequest,
 ) -> Result<DriverReceipt, DriverError> {
-    let target = request.rollback_target.as_ref().ok_or_else(|| DriverError {
-        operation_id: request.operation_id,
-        operation: request.operation,
-        desired_state_digest: request.desired_state_digest.clone(),
-        category: DriverErrorCategory::Configuration,
-        code: "ROLLBACK_TARGET_MISSING".to_owned(),
-        message: "rollback request has no rollback target".to_owned(),
-        retryable: false,
-        side_effect: SideEffect::None,
-        next_action: DriverNextAction::None,
-        provider_request_id: None,
-    })?;
-    let version_id = target.provider_version_id.as_deref().ok_or_else(|| {
-        DriverError {
+    let target = request
+        .rollback_target
+        .as_ref()
+        .ok_or_else(|| DriverError {
+            operation_id: request.operation_id,
+            operation: request.operation,
+            desired_state_digest: request.desired_state_digest.clone(),
+            category: DriverErrorCategory::Configuration,
+            code: "ROLLBACK_TARGET_MISSING".to_owned(),
+            message: "rollback request has no rollback target".to_owned(),
+            retryable: false,
+            side_effect: SideEffect::None,
+            next_action: DriverNextAction::None,
+            provider_request_id: None,
+        })?;
+    let version_id = target
+        .provider_version_id
+        .as_deref()
+        .ok_or_else(|| DriverError {
             operation_id: request.operation_id,
             operation: request.operation,
             desired_state_digest: request.desired_state_digest.clone(),
@@ -302,8 +390,7 @@ async fn rollback(
             side_effect: SideEffect::None,
             next_action: DriverNextAction::None,
             provider_request_id: None,
-        }
-    })?;
+        })?;
 
     match wrangler
         .run(
@@ -321,7 +408,12 @@ async fn rollback(
                 .and_then(|v| v["deployment_id"].as_str().map(String::from));
             Ok(succeeded(request, None, deployment_id, None))
         }
-        Err(error) => Err(to_driver_error(request, DriverOperation::Rollback, &error, true)),
+        Err(error) => Err(to_driver_error(
+            request,
+            DriverOperation::Rollback,
+            &error,
+            true,
+        )),
     }
 }
 
@@ -333,11 +425,22 @@ async fn inspect(
     work_dir: &Path,
 ) -> Result<DriverReceipt, DriverError> {
     match wrangler
-        .run(credential, &["deploy", "status"], Some(work_dir), None, DEFAULT_COMMAND_TIMEOUT)
+        .run(
+            credential,
+            &["deploy", "status"],
+            Some(work_dir),
+            None,
+            DEFAULT_COMMAND_TIMEOUT,
+        )
         .await
     {
         Ok(_) => Ok(succeeded(request, None, None, None)),
-        Err(error) => Err(to_driver_error(request, DriverOperation::Inspect, &error, false)),
+        Err(error) => Err(to_driver_error(
+            request,
+            DriverOperation::Inspect,
+            &error,
+            false,
+        )),
     }
 }
 
@@ -386,15 +489,17 @@ async fn reconcile(
                             observed_at: Utc::now(),
                             next_action: DriverNextAction::Reconcile,
                             diagnostic: Some(
-                                "No versions found; the upload may not have completed"
-                                    .to_owned(),
+                                "No versions found; the upload may not have completed".to_owned(),
                             ),
                         })
                     }
                 }
-                Err(error) => {
-                    Err(to_driver_error(request, DriverOperation::Reconcile, &error, true))
-                }
+                Err(error) => Err(to_driver_error(
+                    request,
+                    DriverOperation::Reconcile,
+                    &error,
+                    true,
+                )),
             }
         }
         _ => Ok(DriverReceipt {
@@ -426,7 +531,13 @@ async fn delete(
     work_dir: &Path,
 ) -> Result<DriverReceipt, DriverError> {
     match wrangler
-        .run(credential, &["deploy", "status"], Some(work_dir), None, DEFAULT_COMMAND_TIMEOUT)
+        .run(
+            credential,
+            &["deploy", "status"],
+            Some(work_dir),
+            None,
+            DEFAULT_COMMAND_TIMEOUT,
+        )
         .await
     {
         Ok(_) => Ok(succeeded(request, None, None, None)),
@@ -435,7 +546,12 @@ async fn delete(
             if msg.contains("not found") || msg.contains("404") {
                 Ok(succeeded(request, None, None, None))
             } else {
-                Err(to_driver_error(request, DriverOperation::Delete, &error, true))
+                Err(to_driver_error(
+                    request,
+                    DriverOperation::Delete,
+                    &error,
+                    true,
+                ))
             }
         }
     }
@@ -450,7 +566,10 @@ async fn cleanup(
     journal: &DeploymentJournal,
 ) -> Result<DriverReceipt, DriverError> {
     for (name, id) in &journal.created_resources {
-        warn!(name, id, "Resource cleanup: deletion commands vary by resource type");
+        warn!(
+            name,
+            id, "Resource cleanup: deletion commands vary by resource type"
+        );
     }
     Ok(succeeded(request, None, None, None))
 }
@@ -473,7 +592,12 @@ async fn create_kv_namespace(
         .await?;
     output
         .last_ndjson()
-        .and_then(|v| v["namespace_id"].as_str().or_else(|| v["id"].as_str()).map(String::from))
+        .and_then(|v| {
+            v["namespace_id"]
+                .as_str()
+                .or_else(|| v["id"].as_str())
+                .map(String::from)
+        })
         .ok_or_else(|| WranglerError::OutputParse {
             command: format!("kv namespace create {name}"),
             message: "no namespace_id in output".to_owned(),
@@ -487,11 +611,22 @@ async fn create_d1_database(
     name: &str,
 ) -> Result<String, WranglerError> {
     let output = wrangler
-        .run(credential, &["d1", "create", name], None, None, DEFAULT_COMMAND_TIMEOUT)
+        .run(
+            credential,
+            &["d1", "create", name],
+            None,
+            None,
+            DEFAULT_COMMAND_TIMEOUT,
+        )
         .await?;
     output
         .last_ndjson()
-        .and_then(|v| v["uuid"].as_str().or_else(|| v["database_id"].as_str()).map(String::from))
+        .and_then(|v| {
+            v["uuid"]
+                .as_str()
+                .or_else(|| v["database_id"].as_str())
+                .map(String::from)
+        })
         .ok_or_else(|| WranglerError::OutputParse {
             command: format!("d1 create {name}"),
             message: "no uuid in output".to_owned(),
@@ -532,7 +667,12 @@ async fn create_queue(
         .await?;
     output
         .last_ndjson()
-        .and_then(|v| v["queue_id"].as_str().or_else(|| v["id"].as_str()).map(String::from))
+        .and_then(|v| {
+            v["queue_id"]
+                .as_str()
+                .or_else(|| v["id"].as_str())
+                .map(String::from)
+        })
         .ok_or_else(|| WranglerError::OutputParse {
             command: format!("queues create {name}"),
             message: "no queue_id in output".to_owned(),
@@ -574,7 +714,13 @@ async fn import_d1_database(
     name: &str,
 ) -> Result<String, WranglerError> {
     let output = wrangler
-        .run(credential, &["d1", "list"], None, None, DEFAULT_COMMAND_TIMEOUT)
+        .run(
+            credential,
+            &["d1", "list"],
+            None,
+            None,
+            DEFAULT_COMMAND_TIMEOUT,
+        )
         .await?;
     for line in output.ndjson_lines() {
         if line["name"].as_str() == Some(name) {
@@ -655,7 +801,10 @@ fn load_binding_plan(
                 desired_state_digest: request.desired_state_digest.clone(),
                 category: DriverErrorCategory::Build,
                 code: "BINDING_PLAN_MISSING".to_owned(),
-                message: format!("binding-plan.json not found at {}: {error}", plan_path.display()),
+                message: format!(
+                    "binding-plan.json not found at {}: {error}",
+                    plan_path.display()
+                ),
                 retryable: false,
                 side_effect: SideEffect::None,
                 next_action: DriverNextAction::None,

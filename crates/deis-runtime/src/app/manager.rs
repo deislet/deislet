@@ -6,7 +6,7 @@ use crate::app_repo::AppRepo;
 use crate::assets::AssetBundle;
 use crate::config::ExecutionLimits;
 use crate::runtime::{FetchPolicy, IsolateSpec, OpMetricsSummary, RuntimePool};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 
 /// Compare two credentials in time that does not depend on how many leading
@@ -25,8 +25,8 @@ fn constant_time_eq(expected: &str, presented: &str) -> bool {
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 

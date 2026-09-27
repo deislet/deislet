@@ -84,7 +84,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use deis_wire::conventions::{BINDING_HEADER, STORAGE_TOKEN_HEADER};
+use deis_wire::conventions::BINDING_HEADER;
 use deno_core::OpState;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
@@ -996,9 +996,16 @@ impl StorageIdentity {
     pub fn stamp<T>(&self, message: T) -> Request<T> {
         let mut request = self.tenant.stamp(message);
         if let Some(token) = &self.token {
-            request
-                .metadata_mut()
-                .insert(STORAGE_TOKEN_HEADER, token.clone());
+            let bearer = format!(
+                "Bearer {}",
+                token
+                    .to_str()
+                    .expect("a valid capability token is always ASCII")
+            );
+            request.metadata_mut().insert(
+                "authorization",
+                bearer.parse().expect("bearer token is valid metadata"),
+            );
         }
         // Stamped here rather than in each client, for the reason the token
         // is: a client that stamped the tenant and forgot the binding would

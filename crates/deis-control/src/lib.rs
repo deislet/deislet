@@ -4,9 +4,9 @@ pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 
 pub mod api;
 pub mod audit;
+pub mod capability_issuer;
 pub mod catalog;
 pub mod command;
-pub mod capability_issuer;
 pub mod config;
 pub mod config_manager;
 pub mod database;

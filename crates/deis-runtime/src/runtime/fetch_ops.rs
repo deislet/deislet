@@ -53,11 +53,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use deno_core::{OpState, extension, op2};
+use deno_core::{extension, op2, OpState};
 use deno_error::JsErrorBox;
 
-use super::fetch_policy::{FetchPolicy, loggable};
-use super::ops::{AppId, ExecutionDeadline, subrequest_allowance};
+use super::fetch_policy::{loggable, FetchPolicy};
+use super::ops::{subrequest_allowance, AppId, ExecutionDeadline};
 
 /// How much of the invocation's budget an outbound call is allowed to keep for
 /// itself, so that what is left is enough for the handler to notice the

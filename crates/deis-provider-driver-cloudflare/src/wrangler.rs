@@ -86,20 +86,20 @@ impl WranglerBinary {
         })?;
 
         // Make executable
-        fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o755)).map_err(
-            |error| WranglerError::Io {
+        fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o755)).map_err(|error| {
+            WranglerError::Io {
                 context: format!("setting executable bit on {}", binary_path.display()),
                 error,
-            },
-        )?;
+            }
+        })?;
 
         // Write verification marker
-        fs::write(&verified_path, format!("verified wrangler {version}\n")).map_err(
-            |error| WranglerError::Io {
+        fs::write(&verified_path, format!("verified wrangler {version}\n")).map_err(|error| {
+            WranglerError::Io {
                 context: format!("writing verification marker for {version}"),
                 error,
-            },
-        )?;
+            }
+        })?;
 
         let binary = Self {
             path: binary_path,
@@ -183,10 +183,13 @@ impl WranglerBinary {
         if let Some(data) = stdin_data {
             use tokio::io::AsyncWriteExt;
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(data).await.map_err(|error| WranglerError::Io {
-                    context: "writing to wrangler stdin".to_owned(),
-                    error,
-                })?;
+                stdin
+                    .write_all(data)
+                    .await
+                    .map_err(|error| WranglerError::Io {
+                        context: "writing to wrangler stdin".to_owned(),
+                        error,
+                    })?;
                 drop(stdin);
             }
         }
@@ -358,9 +361,12 @@ fn verify_sha256(data: &[u8], expected_hex: &str) -> Result<(), WranglerError> {
 fn extract_binary_from_tarball(tarball_data: &[u8]) -> Result<Vec<u8>, WranglerError> {
     let cursor = io::Cursor::new(tarball_data);
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(cursor));
-    for entry_result in archive.entries().map_err(|error| WranglerError::Integrity {
-        message: format!("reading tarball: {error}"),
-    })? {
+    for entry_result in archive
+        .entries()
+        .map_err(|error| WranglerError::Integrity {
+            message: format!("reading tarball: {error}"),
+        })?
+    {
         let mut entry = entry_result.map_err(|error| WranglerError::Integrity {
             message: format!("reading tarball entry: {error}"),
         })?;

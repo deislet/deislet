@@ -178,13 +178,10 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
     }
 
     let migration_auth = match config.migration_admin_token.as_deref() {
-        Some(token) => {
-            Some(
-                MigrationAuth::new(token).context(
-                    "invalid migration_admin_token; the management service was not started",
-                )?,
-            )
-        }
+        Some(token) => Some(
+            MigrationAuth::new(token)
+                .context("invalid migration_admin_token; the management service was not started")?,
+        ),
         None => None,
     };
     let migration_enabled = migration_auth.is_some();
@@ -719,11 +716,14 @@ fn load_verifying_key_optional(config: &Config) -> (ed25519_dalek::VerifyingKey,
     // TelemetryAuth can still be constructed even though it will never
     // check anything (enforcing = false).
     let dummy: [u8; 32] = [
-        0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
     ];
-    (VerifyingKey::from_bytes(&dummy).expect("dummy verifying key is valid"), false)
+    (
+        VerifyingKey::from_bytes(&dummy).expect("dummy verifying key is valid"),
+        false,
+    )
 }
 
 #[cfg(test)]

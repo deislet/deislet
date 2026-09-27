@@ -34,20 +34,26 @@ impl QueueAuth {
     /// Build a new interceptor from a verifying key.
     pub fn new(verifying_key: ed25519_dalek::VerifyingKey) -> Self {
         Self {
-            verifier: std::sync::Arc::new(std::sync::Mutex::new(
-                CapabilityVerifier::new(verifying_key),
-            )),
+            verifier: std::sync::Arc::new(std::sync::Mutex::new(CapabilityVerifier::new(
+                verifying_key,
+            ))),
         }
     }
 
     /// Update the minimum accepted auth epoch.
     pub fn set_min_auth_epoch(&self, epoch: u64) {
-        self.verifier.lock().expect("lock poisoned").set_min_auth_epoch(epoch);
+        self.verifier
+            .lock()
+            .expect("lock poisoned")
+            .set_min_auth_epoch(epoch);
     }
 
     /// Replace the revoked JTI list.
     pub fn set_revoked_jtis(&self, jtis: Vec<String>) {
-        self.verifier.lock().expect("lock poisoned").set_revoked_jtis(jtis);
+        self.verifier
+            .lock()
+            .expect("lock poisoned")
+            .set_revoked_jtis(jtis);
     }
 
     /// Whether this service is enforcing capability checks. Always true:
@@ -93,9 +99,7 @@ impl QueueAuth {
             )
         })?;
         let tenant = Self::tenant_from_request(request).ok_or_else(|| {
-            CapabilityError::ParseError(format!(
-                "missing or unreadable {TENANT_HEADER} header"
-            ))
+            CapabilityError::ParseError(format!("missing or unreadable {TENANT_HEADER} header"))
         })?;
 
         self.verifier
@@ -171,7 +175,9 @@ fn map_capability_error(e: CapabilityError) -> Status {
             Status::permission_denied(e.to_string())
         }
         CapabilityError::TenantNotAuthorized { .. } => {
-            tracing::warn!("refused a queue call whose capability does not authorize the requested tenant");
+            tracing::warn!(
+                "refused a queue call whose capability does not authorize the requested tenant"
+            );
             Status::permission_denied(e.to_string())
         }
         CapabilityError::BindingNotAuthorized { .. } => {

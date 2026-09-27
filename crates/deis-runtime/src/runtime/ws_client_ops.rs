@@ -124,26 +124,26 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use deno_core::url::{Host, Url};
-use deno_core::{JsBuffer, OpState, ToJsBuffer, extension, op2};
+use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
 use deno_error::JsErrorBox;
 use deno_runtime::deno_tls::rustls::pki_types::ServerName;
 use deno_runtime::deno_tls::rustls::{ClientConfig, ClientConnection};
-use deno_runtime::deno_tls::{SocketUse, TlsClientConfigOptions, TlsStream, create_client_config};
+use deno_runtime::deno_tls::{create_client_config, SocketUse, TlsClientConfigOptions, TlsStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc, watch};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
-use crate::runtime::fetch_policy::{FetchPolicy, loggable};
+use crate::runtime::fetch_policy::{loggable, FetchPolicy};
 use crate::runtime::isolate::OutboundSockets;
-use crate::runtime::ops::{AppId, ExecutionDeadline, subrequest_allowance};
+use crate::runtime::ops::{subrequest_allowance, AppId, ExecutionDeadline};
 
 /// How many outbound sockets one isolate may hold open at once.
 ///

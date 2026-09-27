@@ -90,10 +90,7 @@ impl CapabilityIssuer {
     ) -> rusqlite::Result<Self> {
         let (key, auth_epoch) = load_or_create_key(conn, master_key)?;
 
-        info!(
-            auth_epoch = auth_epoch,
-            "Capability issuer ready"
-        );
+        info!(auth_epoch = auth_epoch, "Capability issuer ready");
 
         Ok(Self {
             inner: Arc::new(RwLock::new(IssuerInner { key, auth_epoch })),
@@ -210,22 +207,21 @@ fn load_or_create_key(
             )?;
 
             let raw_key = if let Some(mk) = master_key {
-                decrypt_key(&private_key_bytes, mk)
-                    .map_err(|_| {
-                        rusqlite::Error::InvalidParameterName(
-                            "cannot decrypt stored signing key: master key mismatch".to_string(),
-                        )
-                    })?
+                decrypt_key(&private_key_bytes, mk).map_err(|_| {
+                    rusqlite::Error::InvalidParameterName(
+                        "cannot decrypt stored signing key: master key mismatch".to_string(),
+                    )
+                })?
             } else {
                 // Single-box: the stored key is plain
                 private_key_bytes
             };
 
-            let raw: [u8; 32] = raw_key
-                .try_into()
-                .map_err(|_| rusqlite::Error::InvalidParameterName(
+            let raw: [u8; 32] = raw_key.try_into().map_err(|_| {
+                rusqlite::Error::InvalidParameterName(
                     "stored signing key is not 32 bytes".to_string(),
-                ))?;
+                )
+            })?;
 
             let signing_key = SigningKey::from_bytes(&raw);
 
@@ -255,12 +251,9 @@ fn load_or_create_key(
             let private_key_raw = signing_key.to_bytes();
 
             let stored = if let Some(mk) = master_key {
-                encrypt_key(&private_key_raw, mk)
-                    .map_err(|_| {
-                        rusqlite::Error::InvalidParameterName(
-                            "cannot encrypt signing key".to_string(),
-                        )
-                    })?
+                encrypt_key(&private_key_raw, mk).map_err(|_| {
+                    rusqlite::Error::InvalidParameterName("cannot encrypt signing key".to_string())
+                })?
             } else {
                 private_key_raw.to_vec()
             };
@@ -268,7 +261,7 @@ fn load_or_create_key(
             conn.execute(
                 "INSERT INTO capability_signing_keys (key_id, public_key, private_key, created_at, active)
                  VALUES (?1, ?2, ?3, ?4, 1)",
-                rusqlite::params![hex::encode(&public_key), &public_key[..], stored, now],
+                rusqlite::params![hex::encode(public_key), &public_key[..], stored, now],
             )?;
 
             // Seed the auth_epoch
@@ -302,7 +295,9 @@ fn encrypt_key(plain: &[u8], master_key: &[u8; 32]) -> Result<Vec<u8>, &'static 
     let cipher = Aes256Gcm::new_from_slice(master_key).map_err(|_| "bad key size")?;
     let nonce_bytes: [u8; 12] = rand::rngs::OsRng.r#gen();
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let mut ciphertext = cipher.encrypt(nonce, plain.as_ref()).map_err(|_| "encrypt failure")?;
+    let mut ciphertext = cipher
+        .encrypt(nonce, plain.as_ref())
+        .map_err(|_| "encrypt failure")?;
     // Prepend nonce (12 bytes) to ciphertext (plain + 16-byte tag)
     let mut out = nonce_bytes.to_vec();
     out.append(&mut ciphertext);
@@ -319,7 +314,9 @@ fn decrypt_key(encrypted: &[u8], master_key: &[u8; 32]) -> Result<Vec<u8>, &'sta
     let (nonce_bytes, ciphertext) = encrypted.split_at(12);
     let cipher = Aes256Gcm::new_from_slice(master_key).map_err(|_| "bad key size")?;
     let nonce = Nonce::from_slice(nonce_bytes);
-    cipher.decrypt(nonce, ciphertext.as_ref()).map_err(|_| "decrypt failure")
+    cipher
+        .decrypt(nonce, ciphertext.as_ref())
+        .map_err(|_| "decrypt failure")
 }
 
 // The `optional()` combinator rusqlite does not provide by default.
@@ -333,8 +330,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         // Run the capability migration manually for tests.
         // We can't rely on the full migration framework here, so run the SQL directly.
-        conn.execute_batch(include_str!("database/migrations/0003_capability_signing.sql"))
-            .unwrap();
+        conn.execute_batch(include_str!(
+            "database/migrations/0003_capability_signing.sql"
+        ))
+        .unwrap();
         conn
     }
 
@@ -375,11 +374,9 @@ mod tests {
             .unwrap();
 
         let vk_before = issuer.verifying_key().await;
-        let token = issuer.issue(
-            AUD_STORE,
-            "spiffe://deislet/node/n1",
-            vec![],
-        ).await;
+        let token = issuer
+            .issue(AUD_STORE, "spiffe://deislet/node/n1", vec![])
+            .await;
 
         // Re-open the same issuer (simulates restart)
         let issuer2 = CapabilityIssuer::open(&conn, None, "spiffe://deislet/control/main")

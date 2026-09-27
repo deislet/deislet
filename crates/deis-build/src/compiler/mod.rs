@@ -1,5 +1,5 @@
 mod npm_installer;
-pub use npm_installer::{NodeNpmBuildLimits, node_npm_build_limits};
+pub use npm_installer::{node_npm_build_limits, NodeNpmBuildLimits};
 mod transformer;
 mod validator;
 
@@ -3223,8 +3223,8 @@ impl Compiler {
         source_map: bool,
     ) -> anyhow::Result<crate::canonical_artifact::CanonicalArtifactSummary> {
         use crate::canonical_artifact::{
-            ArtifactFileInput, BuildMetadata, CanonicalArtifactInput, Toolchain,
-            canonical_json_bytes,
+            canonical_json_bytes, ArtifactFileInput, BuildMetadata, CanonicalArtifactInput,
+            Toolchain,
         };
         use sha2::{Digest, Sha256};
 

@@ -127,22 +127,21 @@ fn load_verifying_key(config: &Config) -> Result<ed25519_dalek::VerifyingKey> {
 
     // Try the config file first
     if let Some(ref hex_key) = config.capability_public_key {
-        let bytes = hex::decode(hex_key)
-            .context("capability_public_key in config is not valid hex")?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("capability_public_key must be 32 bytes (64 hex chars)"))?;
+        let bytes =
+            hex::decode(hex_key).context("capability_public_key in config is not valid hex")?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            anyhow::anyhow!("capability_public_key must be 32 bytes (64 hex chars)")
+        })?;
         return Ok(VerifyingKey::from_bytes(&bytes)
             .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {e}"))?);
     }
 
     // Try the environment variable
     if let Ok(hex_key) = std::env::var("DEIS_CAPABILITY_PUBLIC_KEY") {
-        let bytes = hex::decode(&hex_key)
-            .context("DEIS_CAPABILITY_PUBLIC_KEY is not valid hex")?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("DEIS_CAPABILITY_PUBLIC_KEY must be 32 bytes (64 hex chars)"))?;
+        let bytes = hex::decode(&hex_key).context("DEIS_CAPABILITY_PUBLIC_KEY is not valid hex")?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            anyhow::anyhow!("DEIS_CAPABILITY_PUBLIC_KEY must be 32 bytes (64 hex chars)")
+        })?;
         return Ok(VerifyingKey::from_bytes(&bytes)
             .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {e}"))?);
     }

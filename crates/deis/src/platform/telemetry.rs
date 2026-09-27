@@ -17,7 +17,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use deis_wire::conventions::{STORAGE_TOKEN_HEADER, storage_token};
+use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+use sha2::{Digest, Sha256};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
@@ -151,7 +152,23 @@ impl TelemetryCredential {
         };
         // A blank secret is already filtered out by the resolver, so anything
         // arriving here is a real value.
-        let derived = storage_token(&setting.value, TELEMETRY_CHANNEL);
+        let hash = Sha256::digest(setting.value.as_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let claims = CapabilityClaims::new(
+            "telemetry.read",
+            "deis-control",
+            "deis-cli",
+            0,
+            std::time::Duration::from_secs(900),
+            vec![CapabilityResource {
+                tenant: String::new(),
+                binding: String::new(),
+                generation: None,
+            }],
+        );
+        let derived = encode(&claims, &signing_key);
         let token = derived.parse::<MetadataValue<Ascii>>().map_err(|_| {
             // The derivation is base64 of an HMAC, so no secret of any shape
             // produces this. Said out loud rather than silently dropped,
@@ -176,9 +193,10 @@ impl TelemetryCredential {
     fn stamp<T>(&self, message: T) -> tonic::Request<T> {
         let mut request = tonic::Request::new(message);
         if let Some(token) = &self.token {
+            let bearer = format!("Bearer {}", token.to_str().unwrap_or(""));
             request
                 .metadata_mut()
-                .insert(STORAGE_TOKEN_HEADER, token.clone());
+                .insert("authorization", bearer.parse().expect("valid metadata"));
         }
         request
     }
@@ -223,9 +241,9 @@ fn refusal(
     match &credential.source {
         Some(source) => anyhow::anyhow!(
             "deis-telemetry at {endpoint} refused {doing}: {message}\nThis command presented the \
-             token derived from the secret in {source}. deis-telemetry derives what it expects \
-             from its own `auth_secret`; when the two are not the same string every node's log, \
-             trace and metric push is being refused as well."
+             token derived from the secret in {source}. deis-telemetry verifies it against its \
+             own `capability_public_key`; when the secret does not derive the same keypair, every \
+             node's log, trace and metric push is being refused as well."
         ),
         None => anyhow::anyhow!(
             "deis-telemetry at {endpoint} refused {doing}: {message}\nThis command presented no \
@@ -539,18 +557,35 @@ mod tests {
     #[test]
     fn the_token_never_reaches_a_debug_line() {
         let secret = "shared-secret";
+        let hash = Sha256::digest(secret.as_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let claims = CapabilityClaims::new(
+            "telemetry.read",
+            "deis-control",
+            "deis-cli",
+            0,
+            std::time::Duration::from_secs(900),
+            vec![CapabilityResource {
+                tenant: String::new(),
+                binding: String::new(),
+                generation: None,
+            }],
+        );
+        let token = encode(&claims, &signing_key);
         let credential = TelemetryCredential {
             token: Some(
-                storage_token(secret, TELEMETRY_CHANNEL)
+                token
                     .parse()
-                    .expect("an HMAC in base64 is a legal header value"),
+                    .expect("a v1 capability token is a legal header value"),
             ),
             source: Some("credentials.toml".to_string()),
         };
         let rendered = format!("{credential:?}");
         assert!(rendered.contains("<present>"), "{rendered}");
         assert!(
-            !rendered.contains(&storage_token(secret, TELEMETRY_CHANNEL)),
+            !rendered.contains(&encode(&claims, &signing_key)),
             "the derived token is the whole authority to read every application's telemetry: \
              {rendered}"
         );
@@ -578,7 +613,7 @@ mod tests {
 
     /// Derive a signing key from a test secret.
     fn signing_key_from_secret(secret: &str) -> ed25519_dalek::SigningKey {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let hash = Sha256::digest(secret.as_bytes());
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&hash);

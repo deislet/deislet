@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::ops::{EnvStore, ResponseStore, init_ops_extension};
+    use crate::runtime::ops::{init_ops_extension, EnvStore, ResponseStore};
     use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -62,9 +62,9 @@ mod tests {
     // store would prove only that the wrapper calls the op, which was never
     // the part in doubt. So these run a real isolate against a real store.
 
-    use crate::runtime::ServiceRouter;
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::test_store::TestStore;
+    use crate::runtime::ServiceRouter;
     use tokio::sync::oneshot;
 
     /// Run one GET through a real isolate wired to `store`'s KV, and return
@@ -78,7 +78,7 @@ mod tests {
             code,
             None,
             IsolateSpec::default(),
-            &store.kv_wiring(),
+            &store.kv_wiring_for(app_id),
             // No pool behind this isolate, so every service call it makes is
             // refused as "not deployed on this node" -- which is what it is.
             ServiceRouter::detached(),
@@ -117,7 +117,7 @@ mod tests {
     ) -> String {
         let code = format!("export default async function handler(ctx) {{\n{body_js}\n}}");
         let wiring =
-            store.wiring_with_bindings(["kv"], deis_bundle::BindingKind::Kv, bindings.to_vec());
+            store.wiring_with_bindings_for(app_id, ["kv"], deis_bundle::BindingKind::Kv, bindings.to_vec());
         let mut runtime = AppRuntime::new(
             app_id.to_string(),
             code,
@@ -479,7 +479,7 @@ mod tests {
             IsolateSpec::default(),
             // The store is running and reachable; this application simply
             // never declared that it uses KV.
-            &store.wiring_for(["database"]),
+            &store.wiring_for_tenant("kv_list_undeclared_app.production", ["database"]),
             // No pool behind this isolate, so every service call it makes is
             // refused as "not deployed on this node" -- which is what it is.
             ServiceRouter::detached(),
@@ -631,8 +631,8 @@ mod tests {
     /// the invocation's rather than to nothing.
     #[test]
     fn a_call_is_charged_to_the_allowance_its_scope_names() {
-        use crate::runtime::ops::{SubrequestBudget, subrequest_allowance};
-        use crate::runtime::response_stream::{StreamOwner, response_streams};
+        use crate::runtime::ops::{subrequest_allowance, SubrequestBudget};
+        use crate::runtime::response_stream::{response_streams, StreamOwner};
         use deno_core::{JsRuntime, RuntimeOptions};
         use std::time::{Duration, Instant};
 

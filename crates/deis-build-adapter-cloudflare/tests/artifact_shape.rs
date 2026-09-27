@@ -4,7 +4,7 @@
  * These tests preserve output assumptions recorded in the unpinned spec.mdc
  * research snapshot. They are not Edge Canon conformance or support evidence.
  */
-use deis_build_adapter_cloudflare::{ASSETS_DIR, generate};
+use deis_build_adapter_cloudflare::{generate, ASSETS_DIR};
 use deis_build_core::{ProjectConfig, StaticAsset};
 
 /// The date the fixtures pin. wrangler will not deploy a Worker without one, so
@@ -44,11 +44,9 @@ fn test_entry_point_format() {
 
     // Verify modules syntax entry point (per spec.mdc)
     assert!(result.router_code.contains("export default"));
-    assert!(
-        result
-            .router_code
-            .contains("async fetch(request, env, ctx)")
-    );
+    assert!(result
+        .router_code
+        .contains("async fetch(request, env, ctx)"));
 
     // Should NOT use service worker syntax
     assert!(!result.router_code.contains("addEventListener"));
@@ -87,16 +85,12 @@ fn standard_context_does_not_expose_cloudflare_objects() {
     let result = generate(&routes, &config, &[]).unwrap();
 
     assert!(!result.context_builder_code.contains("request.cf"));
-    assert!(
-        !result
-            .context_builder_code
-            .contains("passThroughOnException")
-    );
-    assert!(
-        result
-            .context_builder_code
-            .contains("createEdgeCanonContext")
-    );
+    assert!(!result
+        .context_builder_code
+        .contains("passThroughOnException"));
+    assert!(result
+        .context_builder_code
+        .contains("createEdgeCanonContext"));
 }
 
 #[test]
@@ -106,11 +100,9 @@ fn standard_wait_until_is_backed_by_the_native_execution_context() {
 
     let result = generate(&routes, &config, &[]).unwrap();
 
-    assert!(
-        result
-            .context_builder_code
-            .contains("ctx.waitUntil.bind(ctx)")
-    );
+    assert!(result
+        .context_builder_code
+        .contains("ctx.waitUntil.bind(ctx)"));
     let runtime = &result.support_files[0].1;
     assert!(runtime.contains("EC_WAIT_UNTIL_CLOSED"));
     assert!(runtime.contains("EC_WAIT_UNTIL_PROMISE_REQUIRED"));
@@ -503,9 +495,7 @@ fn an_app_with_no_event_handlers_exports_neither() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let result = generate(&routes, &test_config("plain", false), &[]).unwrap();
     assert!(!result.router_code.contains("export async function queue"));
-    assert!(
-        !result
-            .router_code
-            .contains("export async function scheduled")
-    );
+    assert!(!result
+        .router_code
+        .contains("export async function scheduled"));
 }

@@ -8,8 +8,8 @@
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use crate::app::{
-        AppKey, ApplicationManager,
         types::{AppConfig, AppState, ResourceLimits},
+        AppKey, ApplicationManager,
     };
     use once_cell::sync::Lazy;
     use std::sync::{Arc, Mutex};
@@ -230,11 +230,9 @@ mod tests {
 
         let (status, _headers, body) = result.unwrap();
         assert_eq!(status, 200);
-        assert!(
-            String::from_utf8(body.into_bytes().unwrap())
-                .unwrap()
-                .contains("/test/path")
-        );
+        assert!(String::from_utf8(body.into_bytes().unwrap())
+            .unwrap()
+            .contains("/test/path"));
 
         // Cleanup
         let _ = manager.unload_app(&key("test4")).await;
@@ -332,7 +330,11 @@ mod tests {
         "#;
 
         let config = AppConfig {
-            env: store.kv_env(),
+            env: {
+                let mut env = std::collections::HashMap::new();
+                store.kv_wiring_for("kvtest.production").write_to_env(&mut env);
+                env
+            },
             ..AppConfig::default()
         };
         manager
@@ -521,9 +523,7 @@ mod tests {
             .expect("the session starts");
 
         assert!(manager.validate_inspect_token(&key("inspect_compare"), &token));
-        assert!(
-            !manager.validate_inspect_token(&key("inspect_compare"), &token[..token.len() - 1])
-        );
+        assert!(!manager.validate_inspect_token(&key("inspect_compare"), &token[..token.len() - 1]));
         assert!(!manager.validate_inspect_token(&key("inspect_compare"), &format!("{token}x")));
         assert!(!manager.validate_inspect_token(&key("inspect_compare"), ""));
         assert!(

@@ -71,7 +71,7 @@ use std::time::Duration;
 use axum::Router;
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
-use deis_identity::{MachineIdentity, Protocol, SpiffeId, name_presented_by};
+use deis_identity::{name_presented_by, MachineIdentity, Protocol, SpiffeId};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, info, warn};

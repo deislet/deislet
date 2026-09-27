@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use rolldown::{
     AddonOutputOption, Bundler, BundlerOptions, CodeSplittingMode, InjectImport, InputItem,
     OutputFormat, Platform, RawMinifyOptions, ResolveOptions, SourceMapType,

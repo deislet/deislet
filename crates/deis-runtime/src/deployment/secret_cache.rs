@@ -57,12 +57,9 @@ impl SecretCache {
         node_id: &str,
         entries: Vec<SecretFetchEntry>,
     ) -> Result<usize, tonic::Status> {
-        let entries_json =
-            serde_json::to_string(&entries).map_err(|error| {
-                tonic::Status::internal(format!(
-                    "could not serialise secret fetch entries: {error}"
-                ))
-            })?;
+        let entries_json = serde_json::to_string(&entries).map_err(|error| {
+            tonic::Status::internal(format!("could not serialise secret fetch entries: {error}"))
+        })?;
 
         let request = tonic::Request::new(FetchSecretValuesRequest {
             node_id: node_id.to_string(),
@@ -75,11 +72,9 @@ impl SecretCache {
             .await?
             .into_inner();
 
-        let fetched: HashMap<String, String> =
-            serde_json::from_str(&response.values_json).map_err(|error| {
-                tonic::Status::internal(format!(
-                    "could not parse secret fetch response: {error}"
-                ))
+        let fetched: HashMap<String, String> = serde_json::from_str(&response.values_json)
+            .map_err(|error| {
+                tonic::Status::internal(format!("could not parse secret fetch response: {error}"))
             })?;
 
         let count = fetched.len();

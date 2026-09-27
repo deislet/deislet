@@ -637,10 +637,8 @@ mod tests {
 
         let bound_everywhere = FetchPolicy::new(["example.test"], ["0.0.0.0:8085"]).unwrap();
         assert!(bound_everywhere.is_a_platform_service_address("::1".parse().unwrap(), Some(8085)));
-        assert!(
-            bound_everywhere
-                .is_a_platform_service_address("127.0.0.1".parse().unwrap(), Some(8085))
-        );
+        assert!(bound_everywhere
+            .is_a_platform_service_address("127.0.0.1".parse().unwrap(), Some(8085)));
     }
 
     #[test]

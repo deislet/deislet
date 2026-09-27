@@ -224,10 +224,7 @@ impl CapabilityClaims {
 /// Encode a capability token from claims and a signing key.
 ///
 /// Returns the wire-format string: `v1.<base64url(payload)>.<base64url(sig)>`.
-pub fn encode(
-    claims: &CapabilityClaims,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> String {
+pub fn encode(claims: &CapabilityClaims, signing_key: &ed25519_dalek::SigningKey) -> String {
     let payload = serialize_claims(claims);
     let signature = signing_key.sign(&payload);
     let payload_b64 = base64url(&payload);
@@ -245,21 +242,16 @@ pub fn decode(
 ) -> Result<CapabilityClaims, CapabilityError> {
     let (payload_bytes, sig_bytes) = parse_token(token)?;
 
-    let signature =
-        ed25519_dalek::Signature::from_slice(&sig_bytes).map_err(|e| {
-            CapabilityError::ParseError(format!("invalid signature bytes: {e}"))
-        })?;
+    let signature = ed25519_dalek::Signature::from_slice(&sig_bytes)
+        .map_err(|e| CapabilityError::ParseError(format!("invalid signature bytes: {e}")))?;
 
     verifying_key
         .verify_strict(&payload_bytes, &signature)
         .map_err(|e| CapabilityError::BadSignature(e.to_string()))?;
 
-    let claims: CapabilityClaims =
-        serde_json::from_slice(&payload_bytes).map_err(|e| {
-            CapabilityError::InvalidClaims(format!(
-                "claims deserialization failed: {e}"
-            ))
-        })?;
+    let claims: CapabilityClaims = serde_json::from_slice(&payload_bytes).map_err(|e| {
+        CapabilityError::InvalidClaims(format!("claims deserialization failed: {e}"))
+    })?;
 
     Ok(claims)
 }
@@ -267,21 +259,17 @@ pub fn decode(
 /// Parse a token string into its payload and signature byte components
 /// without verifying the signature. Useful for inspecting the claims before
 /// a full verification.
-pub fn parse_token(
-    token: &str,
-) -> Result<(Vec<u8>, Vec<u8>), CapabilityError> {
+pub fn parse_token(token: &str) -> Result<(Vec<u8>, Vec<u8>), CapabilityError> {
     let body = token.strip_prefix(VERSION_PREFIX).ok_or_else(|| {
-        CapabilityError::ParseError(format!(
-            "token must start with {VERSION_PREFIX:?}"
-        ))
+        CapabilityError::ParseError(format!("token must start with {VERSION_PREFIX:?}"))
     })?;
 
-    let (payload_b64, sig_b64) =
-        body.split_once(TOKEN_SEPARATOR).ok_or_else(|| {
-            CapabilityError::ParseError(
-                "token must contain exactly one '.' separator between payload and signature".to_string(),
-            )
-        })?;
+    let (payload_b64, sig_b64) = body.split_once(TOKEN_SEPARATOR).ok_or_else(|| {
+        CapabilityError::ParseError(
+            "token must contain exactly one '.' separator between payload and signature"
+                .to_string(),
+        )
+    })?;
 
     if payload_b64.is_empty() {
         return Err(CapabilityError::ParseError(
@@ -294,16 +282,10 @@ pub fn parse_token(
         ));
     }
 
-    let payload = base64url_decode(payload_b64).map_err(|e| {
-        CapabilityError::ParseError(format!(
-            "payload base64 decode failed: {e}"
-        ))
-    })?;
-    let signature = base64url_decode(sig_b64).map_err(|e| {
-        CapabilityError::ParseError(format!(
-            "signature base64 decode failed: {e}"
-        ))
-    })?;
+    let payload = base64url_decode(payload_b64)
+        .map_err(|e| CapabilityError::ParseError(format!("payload base64 decode failed: {e}")))?;
+    let signature = base64url_decode(sig_b64)
+        .map_err(|e| CapabilityError::ParseError(format!("signature base64 decode failed: {e}")))?;
 
     Ok((payload, signature))
 }
@@ -458,8 +440,7 @@ impl CapabilityVerifier {
 
 /// JCS-canonicalize the claims to deterministic bytes for signing.
 fn serialize_claims(claims: &CapabilityClaims) -> Vec<u8> {
-    serde_jcs::to_vec(claims)
-        .expect("JCS serialization of CapabilityClaims is infallible")
+    serde_jcs::to_vec(claims).expect("JCS serialization of CapabilityClaims is infallible")
 }
 
 /// Base64url encode without padding, as used in the token wire format.
@@ -785,28 +766,32 @@ mod tests {
         let token = encode(&claims, &signing);
 
         // authorized for first resource
-        assert!(verify_for_request(
-            &token,
-            &verifying,
-            "store",
-            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
-            "kv",
-            None,
-            None,
-        )
-        .is_ok());
+        assert!(
+            verify_for_request(
+                &token,
+                &verifying,
+                "store",
+                "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+                "kv",
+                None,
+                None,
+            )
+            .is_ok()
+        );
 
         // authorized for second resource
-        assert!(verify_for_request(
-            &token,
-            &verifying,
-            "store",
-            "v1/018f2518-7e38-7f80-8000-000000000003/018f2518-7e38-7f80-8000-000000000004",
-            "sql",
-            None,
-            None,
-        )
-        .is_ok());
+        assert!(
+            verify_for_request(
+                &token,
+                &verifying,
+                "store",
+                "v1/018f2518-7e38-7f80-8000-000000000003/018f2518-7e38-7f80-8000-000000000004",
+                "sql",
+                None,
+                None,
+            )
+            .is_ok()
+        );
 
         // wrong binding on first tenant
         assert!(matches!(
@@ -942,21 +927,10 @@ mod tests {
         let token = encode(&claims, &signing);
 
         // Empty tenant only matches empty tenant
-        assert!(verify_for_request(
-            &token, &verifying, "store", "", "kv", None, None,
-        )
-        .is_ok());
+        assert!(verify_for_request(&token, &verifying, "store", "", "kv", None, None,).is_ok());
 
         assert!(matches!(
-            verify_for_request(
-                &token,
-                &verifying,
-                "store",
-                "some-tenant",
-                "kv",
-                None,
-                None,
-            ),
+            verify_for_request(&token, &verifying, "store", "some-tenant", "kv", None, None,),
             Err(CapabilityError::TenantNotAuthorized { .. })
         ));
     }

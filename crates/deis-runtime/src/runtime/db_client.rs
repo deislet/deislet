@@ -467,7 +467,8 @@ mod tests {
     /// A client wired the way an application binding is: dialled on first
     /// use, carrying whatever proof the node was handed for this tenant.
     fn client(store: &TestStore, tenant: &str) -> DbClient {
-        let identity = StorageIdentity::new(tenant, None).expect("a legal tenant");
+        let token = store.capability_token_for(tenant, "sql");
+        let identity = StorageIdentity::new(tenant, Some(&token)).expect("a legal tenant");
         DbClient::connect_lazy(&store.endpoint, &identity).expect("client is built")
     }
 

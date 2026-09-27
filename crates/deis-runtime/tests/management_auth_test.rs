@@ -22,8 +22,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use deis_identity::{MachineIdentity, Protocol, SpiffeId, names};
-use deis_identity_test_pki::{TestCa, write_files};
+use deis_identity::{names, MachineIdentity, Protocol, SpiffeId};
+use deis_identity_test_pki::{write_files, TestCa};
 use deis_runtime::app::ApplicationManager;
 use deis_runtime::config::RuntimeConfig;
 use deis_runtime::deployment::DeploymentManager;

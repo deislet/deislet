@@ -187,13 +187,10 @@ pub async fn serve(
     let addr = listener.local_addr().context("listener has no address")?;
     let auth = QueueAuth::new(verifying_key);
     let migration_auth = match config.migration_admin_token.as_deref() {
-        Some(token) => {
-            Some(
-                MigrationAuth::new(token).context(
-                    "invalid migration_admin_token; the management service was not started",
-                )?,
-            )
-        }
+        Some(token) => Some(
+            MigrationAuth::new(token)
+                .context("invalid migration_admin_token; the management service was not started")?,
+        ),
         None => None,
     };
     let queue = open(&config).await?;

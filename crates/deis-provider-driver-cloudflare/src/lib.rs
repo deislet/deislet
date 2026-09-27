@@ -29,8 +29,7 @@ pub mod wrangler;
 /// The lock-entry values this driver hard-codes, so a build that drifts from
 /// the lock file fails at compile time with a clear message.
 pub const EXPECTED_WRANGLER_VERSION: &str = "4.129.0";
-pub const EXPECTED_WRANGLER_NPM_INTEGRITY: &str =
-    "sha512-PGPvs9UPoFrwxT0VogpESSZGvZIctAuTK3wGsLLPHtHsSgS85kNdvtpa2d14UzG8gwLWD64XUGFPGG9tOXG9VQ==";
+pub const EXPECTED_WRANGLER_NPM_INTEGRITY: &str = "sha512-PGPvs9UPoFrwxT0VogpESSZGvZIctAuTK3wGsLLPHtHsSgS85kNdvtpa2d14UzG8gwLWD64XUGFPGG9tOXG9VQ==";
 pub const EXPECTED_WRANGLER_DISTRIBUTION_SHA256: &str =
     "08912bc89315a123bd22c8c29813bde70838e0b0e7eaee4369b8e0ba02dac81c";
 
@@ -43,5 +42,4 @@ pub const WRANGLER_TARBALL_BINARY_PATH: &str = "package/wrangler";
 /// The registry URL recorded in the lock file.
 pub const WRANGLER_REGISTRY: &str = "https://registry.npmjs.org";
 /// The tarball path within the registry.
-pub const WRANGLER_TARBALL: &str =
-    "https://registry.npmjs.org/wrangler/-/wrangler-4.129.0.tgz";
+pub const WRANGLER_TARBALL: &str = "https://registry.npmjs.org/wrangler/-/wrangler-4.129.0.tgz";

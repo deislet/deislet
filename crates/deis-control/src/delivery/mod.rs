@@ -685,11 +685,7 @@ impl DeploymentPayload {
         let declarations = self.environment_declarations.clone()?;
         let snapshot = self.environment_snapshot.clone()?;
         let identity = self.environment_snapshot_id.clone()?;
-        Some((
-            declarations,
-            snapshot,
-            identity,
-        ))
+        Some((declarations, snapshot, identity))
     }
 
     pub fn variable_count(&self) -> usize {
@@ -1534,9 +1530,7 @@ impl DeploymentDeliverer {
             proto::DeploymentAction::Activate => "activate",
             proto::DeploymentAction::Abort => "abort",
             proto::DeploymentAction::Drain => "drain",
-            proto::DeploymentAction::Unspecified => {
-                "apply"
-            }
+            proto::DeploymentAction::Unspecified => "apply",
         };
         let mut report = DeliveryReport {
             reason,
@@ -1612,9 +1606,7 @@ impl DeploymentDeliverer {
             proto::DeploymentAction::Activate => "active",
             proto::DeploymentAction::Abort => "aborted",
             proto::DeploymentAction::Drain => "drained",
-            proto::DeploymentAction::Unspecified => {
-                "applied"
-            }
+            proto::DeploymentAction::Unspecified => "applied",
         };
         for (node, result) in results {
             match result {
@@ -2080,8 +2072,8 @@ fn validate_abort_consumer_generation_response(
 mod tests {
     use super::*;
     use crate::catalog::SecretCipher;
-    use crate::catalog::secrets::secret_aad;
     use crate::catalog::secrets::MASTER_KEY_LEN;
+    use crate::catalog::secrets::secret_aad;
     use crate::database::Database;
     use chrono::Utc;
 
@@ -2931,7 +2923,10 @@ mod tests {
             !rendered.contains("placeholder-from-manifest"),
             "{rendered}"
         );
-        assert!(rendered.contains("API_KEY"), "secret names are safe to show; got {rendered}");
+        assert!(
+            rendered.contains("API_KEY"),
+            "secret names are safe to show; got {rendered}"
+        );
         assert!(
             rendered.contains("redacted"),
             "values field still uses the redacted guard; got {rendered}"

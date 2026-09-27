@@ -3,7 +3,7 @@
 
 use super::bindings::Bound;
 use super::kv_client::KvClient;
-use deno_core::{JsBuffer, OpState, ToJsBuffer, extension, op2};
+use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -943,7 +943,7 @@ pub(crate) const ESCAPING_CASES: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod log_escaping_test {
-    use super::{ESCAPING_CASES, escape_control};
+    use super::{escape_control, ESCAPING_CASES};
 
     #[test]
     fn the_shared_table_is_what_this_crate_escapes_to() {

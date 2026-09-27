@@ -681,7 +681,9 @@ export default async function handler(context) {
         "v1",
         &environment_id.to_string(),
     )
-    .unwrap().with_secrets(HashMap::new()).unwrap();
+    .unwrap()
+    .with_secrets(HashMap::new())
+    .unwrap();
     let bundle = standard_bundle_with_assets(
         "demo",
         HANDLER,
@@ -884,7 +886,12 @@ export default function handler(context) {
         "v1",
         &environment_id.to_string(),
     )
-    .unwrap().with_secrets(HashMap::from([(secret_revision.to_string(), "secret-value".to_string())])).unwrap();
+    .unwrap()
+    .with_secrets(HashMap::from([(
+        secret_revision.to_string(),
+        "secret-value".to_string(),
+    )]))
+    .unwrap();
     let bundle = standard_bundle("demo", HANDLER, &declarations);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
@@ -964,7 +971,12 @@ export default function handler(context) {
         "v1",
         &environment_id.to_string(),
     )
-    .unwrap().with_secrets(HashMap::from([("secret-revision-2".to_string(), "rotated-value".to_string())])).unwrap();
+    .unwrap()
+    .with_secrets(HashMap::from([(
+        "secret-revision-2".to_string(),
+        "rotated-value".to_string(),
+    )]))
+    .unwrap();
     let as_of = deployer.change_stamp();
     let applied = deployer
         .apply_from_assignment(
@@ -1742,7 +1754,9 @@ async fn a_standard_snapshot_is_not_recovered_without_its_memory_only_values() {
         "v1",
         &environment_id.to_string(),
     )
-    .unwrap().with_secrets(HashMap::new()).unwrap();
+    .unwrap()
+    .with_secrets(HashMap::new())
+    .unwrap();
     let bundle = standard_bundle("demo", ECHO_HANDLER, &declarations);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;

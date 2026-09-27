@@ -272,11 +272,10 @@ async fn main() -> Result<(), anyhow::Error> {
     // `CatalogStore::anchor_bundle_paths`.
     deis_control::api::anchor_bundle_paths(&database, &api_config).await;
 
-    let capability_issuer =
-        deis_control::capability_issuer::CapabilityIssuer::ephemeral(
-            "spiffe://deislet/control/main",
-        )
-        .await;
+    let capability_issuer = deis_control::capability_issuer::CapabilityIssuer::ephemeral(
+        "spiffe://deislet/control/main",
+    )
+    .await;
 
     // One stop signal for the whole process, taken before anything is
     // started so every part gets the same edge: the listener stops

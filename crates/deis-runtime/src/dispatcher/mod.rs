@@ -111,7 +111,7 @@ async fn shutdown_signal() -> &'static str {
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         match signal(SignalKind::terminate()) {
             Ok(mut stream) => {
                 stream.recv().await;

@@ -9,11 +9,11 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use deis_build_core::ProjectConfig;
 use deis_bundle::{
-    Asset, Binding, BindingKind, DeclaredBindings, DeclaredCompatibility, DeclaredLimits,
-    MIN_SUPPORTED_SCHEMA, Manifest, QueueConsumer, Route, SUPPORTED_SCHEMA,
+    Asset, Binding, BindingKind, DeclaredBindings, DeclaredCompatibility, DeclaredLimits, Manifest,
+    QueueConsumer, Route, MIN_SUPPORTED_SCHEMA, SUPPORTED_SCHEMA,
 };
 
 use crate::assets::StagedAsset;
@@ -458,11 +458,9 @@ mod tests {
         assert_eq!(manifest.environment, Some(declarations));
         assert!(manifest.env.is_empty());
         assert!(manifest.secrets.is_empty());
-        assert!(
-            !serde_json::to_string(&manifest)
-                .unwrap()
-                .contains("must-not-enter")
-        );
+        assert!(!serde_json::to_string(&manifest)
+            .unwrap()
+            .contains("must-not-enter"));
     }
 
     #[test]

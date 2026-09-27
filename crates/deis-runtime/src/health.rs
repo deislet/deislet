@@ -795,7 +795,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn the_system_application_answers_the_probe_from_the_header() {
-        use crate::app::{AppConfig, AppKey, test_host};
+        use crate::app::{test_host, AppConfig, AppKey};
 
         let _turn = test_host::take();
         let apps = test_host::host();
@@ -895,7 +895,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn the_probe_states_the_reason_the_node_recorded_rather_than_guessing_it() {
-        use crate::app::{AppConfig, AppKey, test_host};
+        use crate::app::{test_host, AppConfig, AppKey};
 
         let _turn = test_host::take();
         let apps = test_host::host();
@@ -1014,7 +1014,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_node_that_states_no_reason_has_none_made_up_for_it() {
-        use crate::app::{AppConfig, AppKey, test_host};
+        use crate::app::{test_host, AppConfig, AppKey};
 
         let _turn = test_host::take();
         let apps = test_host::host();

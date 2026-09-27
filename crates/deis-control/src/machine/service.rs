@@ -26,9 +26,8 @@ use deis_wire::machine::machine_channel_server::MachineChannel;
 use deis_wire::machine::{
     DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
     FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
-    FetchSecretValuesRequest, FetchSecretValuesResponse,
-    IssueCapabilityRequest, IssueCapabilityResponse, RegisterNodeRequest,
-    RegisterNodeResponse,
+    FetchSecretValuesRequest, FetchSecretValuesResponse, IssueCapabilityRequest,
+    IssueCapabilityResponse, RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
@@ -278,12 +277,8 @@ impl MachineChannel for MachineChannelService {
                 ))
             })?;
 
-        let all_assignments = self
-            .state
-            .store
-            .list_assignments()
-            .await
-            .map_err(|error| {
+        let all_assignments =
+            self.state.store.list_assignments().await.map_err(|error| {
                 Status::internal(format!("could not list assignments: {error:?}"))
             })?;
 
@@ -368,12 +363,10 @@ impl MachineChannel for MachineChannelService {
             generation: Option<String>,
         }
 
-        let resource_requests: Vec<ResourceRequest> =
-            serde_json::from_str(&asked.resources_json).map_err(|error| {
-                Status::invalid_argument(format!(
-                    "resources_json could not be parsed: {error}"
-                ))
-            })?;
+        let resource_requests: Vec<ResourceRequest> = serde_json::from_str(&asked.resources_json)
+            .map_err(|error| {
+            Status::invalid_argument(format!("resources_json could not be parsed: {error}"))
+        })?;
 
         let resources: Vec<deis_capability::CapabilityResource> = resource_requests
             .into_iter()

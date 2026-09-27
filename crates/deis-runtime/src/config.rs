@@ -21,7 +21,7 @@
 //! and make startup fail with a pointer to the current name, so an override
 //! that silently stopped applying cannot be mistaken for one that worked.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::net::IpAddr;
@@ -948,14 +948,13 @@ pub struct LoggingConfig {
     #[serde(default)]
     pub endpoint: Option<String>,
 
-    /// The secret deis-telemetry's own `auth_secret` is set to, from which
-    /// this node derives the capability token it presents on every log, trace
-    /// and metric push.
+    /// The secret from which this node derives the Ed25519 signing key for
+    /// the capability token it presents on every log, trace and metric push.
     ///
     /// Unset means the node ships without a token. That is correct for the
-    /// single-box install, where deis-telemetry has no `auth_secret` either
-    /// and therefore both of its listeners are on loopback -- it refuses to
-    /// start otherwise. Against any collector reachable from another host it
+    /// single-box install, where deis-telemetry has no capability public key
+    /// either and therefore both of its listeners are on loopback -- it refuses
+    /// to start otherwise. Against any collector reachable from another host it
     /// is fatal to observability and to nothing else: every push is refused
     /// with `unauthenticated`, the node retries them for as long as it runs,
     /// and `deis logs` and `deis trace` are empty for every application on it.
@@ -2323,10 +2322,10 @@ mod tests {
         // serde refuses it here rather than the policy discovering it per
         // request, which is the same rule every other setting in this file
         // follows: a typo is an operator's startup error.
-        assert!(
-            toml::from_str::<RuntimeConfig>("[node]\nadvertised_addresses = [\"example.com\"]\n")
-                .is_err()
-        );
+        assert!(toml::from_str::<RuntimeConfig>(
+            "[node]\nadvertised_addresses = [\"example.com\"]\n"
+        )
+        .is_err());
     }
 
     #[test]

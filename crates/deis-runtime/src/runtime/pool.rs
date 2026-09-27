@@ -1,6 +1,6 @@
 // Runtime thread pool - multi-core support
 
-use super::bindings::{ServiceWiring, consumer_queue_client};
+use super::bindings::{consumer_queue_client, ServiceWiring};
 use super::header_list::HeaderPairs;
 use super::isolate::{AppRuntime, IsolateSpec};
 use super::queue_client::LeasedMessage;
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 /// Ensure V8 platform is initialized only once
 static V8_INIT: Once = Once::new();
@@ -3095,7 +3095,7 @@ impl RuntimePool {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::runtime::metrics::{ABANDONED_BEFORE_START_TOTAL, REQUESTS_TOTAL, recorder};
+    use crate::runtime::metrics::{recorder, ABANDONED_BEFORE_START_TOTAL, REQUESTS_TOTAL};
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};

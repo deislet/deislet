@@ -3,8 +3,8 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 use deis_identity::MachineIdentity;
 use deis_runtime::app::ApplicationManager;

@@ -36,10 +36,10 @@ impl TestStore {
     /// A store that uses a different signing key, verifying that tokens from
     /// the wrong key are refused.
     pub(crate) async fn start_with_secret(secret: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let hash = sha2::Sha256::digest(secret.as_bytes());
         let mut seed = [0u8; 32];
-        let bytes = secret.as_bytes();
-        let n = bytes.len().min(32);
-        seed[..n].copy_from_slice(&bytes[..n]);
+        seed.copy_from_slice(&hash);
         Self::start_with_key(ed25519_dalek::SigningKey::from_bytes(&seed)).await
     }
 
@@ -61,9 +61,14 @@ impl TestStore {
         let addr = listener.local_addr().expect("local addr");
         let (shutdown, rx) = oneshot::channel();
         tokio::spawn(async move {
-            deis_store::server::serve(config, listener, async {
-                let _ = rx.await;
-            }, verifying_key)
+            deis_store::server::serve(
+                config,
+                listener,
+                async {
+                    let _ = rx.await;
+                },
+                verifying_key,
+            )
             .await
             .expect("serve");
         });
@@ -76,7 +81,7 @@ impl TestStore {
     }
 
     pub(crate) fn capability_token_for(&self, tenant: &str, binding: &str) -> String {
-        use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+        use deis_capability::{encode, CapabilityClaims, CapabilityResource};
         use std::time::Duration;
         let claims = CapabilityClaims::new(
             "store",
@@ -89,6 +94,40 @@ impl TestStore {
                 binding: binding.to_string(),
                 generation: None,
             }],
+        );
+        encode(&claims, &self.signing_key)
+    }
+
+    /// A capability token that covers kv, sql, and blob for a tenant.
+    ///
+    /// Used by `wiring_for_tenant` so that a single wiring can serve
+    /// database, KV, and blob tests alike without a binding-level mismatch.
+    pub(crate) fn capability_token_for_all_bindings(&self, tenant: &str) -> String {
+        use deis_capability::{encode, CapabilityClaims, CapabilityResource};
+        use std::time::Duration;
+        let claims = CapabilityClaims::new(
+            "store",
+            "spiffe://deislet/control/main",
+            "spiffe://deislet/node/test",
+            1,
+            Duration::from_secs(900),
+            vec![
+                CapabilityResource {
+                    tenant: tenant.to_string(),
+                    binding: "kv".into(),
+                    generation: None,
+                },
+                CapabilityResource {
+                    tenant: tenant.to_string(),
+                    binding: "sql".into(),
+                    generation: None,
+                },
+                CapabilityResource {
+                    tenant: tenant.to_string(),
+                    binding: "blob".into(),
+                    generation: None,
+                },
+            ],
         );
         encode(&claims, &self.signing_key)
     }
@@ -108,15 +147,29 @@ impl TestStore {
 
     /// Wiring that declares only KV and points it at this store.
     pub(crate) fn kv_wiring(&self) -> ServiceWiring {
-        self.wiring_for(["kv"])
+        self.kv_wiring_for("default")
+    }
+
+    /// The same, minting a capability token for a specific tenant.
+    pub(crate) fn kv_wiring_for(&self, tenant: &str) -> ServiceWiring {
+        self.wiring_for_tenant(tenant, ["kv"])
     }
 
     /// Wiring that declares the named services and points them all at this
     /// store. The queue endpoint stays empty: deis-queue is a separate
     /// process and nothing here speaks to it.
     pub(crate) fn wiring_for<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> ServiceWiring {
+        self.wiring_for_tenant("default", names)
+    }
+
+    /// The same, minting a capability token for a specific tenant.
+    pub(crate) fn wiring_for_tenant<'a>(
+        &self,
+        tenant: &str,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> ServiceWiring {
         ServiceWiring {
-            storage_token: Some(self.capability_token_for("default", "kv")),
+            storage_token: Some(self.capability_token_for_all_bindings(tenant)),
             declaration: ServiceDeclaration::from_names(names),
             endpoints: ServiceEndpoints {
                 store: Some(self.endpoint.clone()),
@@ -138,7 +191,19 @@ impl TestStore {
         kind: deis_bundle::BindingKind,
         bindings: impl IntoIterator<Item = &'a str>,
     ) -> ServiceWiring {
-        let mut wiring = self.wiring_for(names);
+        self.wiring_with_bindings_for("default", names, kind, bindings)
+    }
+
+    /// The same as `wiring_with_bindings`, minting a capability token for a
+    /// specific tenant.
+    pub(crate) fn wiring_with_bindings_for<'a>(
+        &self,
+        tenant: &str,
+        names: impl IntoIterator<Item = &'a str>,
+        kind: deis_bundle::BindingKind,
+        bindings: impl IntoIterator<Item = &'a str>,
+    ) -> ServiceWiring {
+        let mut wiring = self.wiring_for_tenant(tenant, names);
         for binding in bindings {
             wiring
                 .bindings

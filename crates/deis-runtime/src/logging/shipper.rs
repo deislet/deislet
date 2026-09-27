@@ -516,7 +516,8 @@ impl LogSink for TelemetrySink {
                         "deis-telemetry refused this node's logs: {}. This is a credential \
                          mismatch and not an outage -- retrying cannot fix it, and until it is \
                          fixed no line from any application on this node is queryable. Set \
-                         logging.auth_secret to the same value as deis-telemetry's auth_secret",
+                         logging.auth_secret to the capability signing key secret configured \
+                         in deis-telemetry",
                         status.message()
                     );
                 }

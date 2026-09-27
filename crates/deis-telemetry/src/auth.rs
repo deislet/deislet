@@ -85,12 +85,18 @@ impl TelemetryAuth {
 
     /// Update the minimum accepted auth epoch.
     pub fn set_min_auth_epoch(&self, epoch: u64) {
-        self.verifier.write().expect("lock poisoned").set_min_auth_epoch(epoch);
+        self.verifier
+            .write()
+            .expect("lock poisoned")
+            .set_min_auth_epoch(epoch);
     }
 
     /// Replace the revoked JTI list.
     pub fn set_revoked_jtis(&self, jtis: Vec<String>) {
-        self.verifier.write().expect("lock poisoned").set_revoked_jtis(jtis);
+        self.verifier
+            .write()
+            .expect("lock poisoned")
+            .set_revoked_jtis(jtis);
     }
 
     /// Whether this service is enforcing capability checks.
@@ -168,9 +174,9 @@ impl tonic::service::Interceptor for TelemetryAuth {
         let verifier = self.verifier.clone();
         let token = Self::token_from_request(&request);
 
-        let v = verifier.read().map_err(|_| {
-            Status::internal("lock poisoned")
-        })?;
+        let v = verifier
+            .read()
+            .map_err(|_| Status::internal("lock poisoned"))?;
         let t = token.as_deref().unwrap_or("");
 
         // We cannot determine the gRPC method (PushLogs vs Query/Tail) from

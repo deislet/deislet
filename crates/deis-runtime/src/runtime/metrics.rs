@@ -61,13 +61,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::time::interval;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
 use crate::config::LoggingConfig;
-use crate::telemetry::{TelemetryCredential, report_posture};
+use crate::telemetry::{report_posture, TelemetryCredential};
 
 /// Generated clients for deis-telemetry's `MetricService` and `TraceService`
 /// (package `deis.telemetry`).

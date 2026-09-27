@@ -23,8 +23,8 @@
 pub const VENDOR: &str = "cloudflare";
 
 use deis_build_core::{
-    AdapterArtifacts, BindingKind, ProjectConfig, StaticAsset, build_binding_plan,
-    javascript_runtime_module, javascript_string,
+    build_binding_plan, javascript_runtime_module, javascript_string, AdapterArtifacts,
+    BindingKind, ProjectConfig, StaticAsset,
 };
 
 /// Where the compiler stages this project's static files inside the Cloudflare

@@ -2,25 +2,25 @@
 
 use super::AppState;
 use crate::app::AppKey;
-use crate::runtime::DispatchError;
 use crate::runtime::header_list;
+use crate::runtime::DispatchError;
 use crate::{
-    APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER, PLATFORM_HEADER_PREFIX,
-    is_platform_header,
+    is_platform_header, APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER,
+    PLATFORM_HEADER_PREFIX,
 };
 use axum::{
     body::{Body, Bytes},
     extract::{
-        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
     },
-    http::{HeaderMap, Method, StatusCode, Uri, header},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 use deno_core::url::Url;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Whether this overload refusal gets a warn line of its own.
 ///
@@ -571,8 +571,9 @@ pub async fn handle_request(
     // one for one -- so `curl -H 'x-deis-caller: admin-app'` handed a callee
     // exactly the value a service call would have stamped, and a callee that
     // followed the documented pattern granted admin to anyone who could reach
-    // this node. `x-deis-tenant`, `x-deis-storage-token` and `x-deis-binding`
-    // are the same shape one hop further in.
+    // this node. `x-deis-tenant` and `x-deis-binding` are the same shape
+    // one hop further in; `authorization` (the capability token) is stripped
+    // separately.
     //
     // deis-proxy sweeps the same namespace at the edge. This is not that fix
     // repeated for tidiness: a node is reachable without the proxy -- every

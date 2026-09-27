@@ -155,7 +155,7 @@ mod tests {
             code,
             None,
             IsolateSpec::default(),
-            &store.wiring_for(["database"]),
+            &store.wiring_for_tenant(app_id, ["database"]),
             // No pool behind this isolate, so a service call it made would be
             // refused as "not deployed on this node", which is what it is.
             ServiceRouter::detached(),

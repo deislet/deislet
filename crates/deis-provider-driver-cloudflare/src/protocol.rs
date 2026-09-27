@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use deis_provider_driver::{
-    DriverError, DriverErrorCategory, DriverNextAction, DriverProcessOutcome,
-    DriverProcessRequest, SideEffect,
+    DriverError, DriverErrorCategory, DriverNextAction, DriverProcessOutcome, DriverProcessRequest,
+    SideEffect,
 };
 use deis_wire::CanonicalId;
 use tracing::{error, info, warn};

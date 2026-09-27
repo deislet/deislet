@@ -8,7 +8,7 @@ use crate::app::types::ResourceLimits;
 use crate::app::{AppKey, ApplicationManager};
 use crate::deployment::{Applied, DeploymentManager, DeploymentOrder, StandardEnvironmentOrder};
 use crate::health::NodeHealth;
-use crate::runtime::metrics::{REQUEST_ERRORS_TOTAL, REQUESTS_TOTAL, recorder};
+use crate::runtime::metrics::{recorder, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL};
 
 use super::proto::runtime_management_server::RuntimeManagement;
 use super::proto::*;
@@ -156,8 +156,7 @@ impl RuntimeManagement for RuntimeManagementService {
                 }));
             }
         };
-        if !matches!(action, DeploymentAction::Unspecified) && instruction.0.is_none()
-        {
+        if !matches!(action, DeploymentAction::Unspecified) && instruction.0.is_none() {
             return Ok(Response::new(ApplyDeploymentResponse {
                 success: false,
                 message: format!(

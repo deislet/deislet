@@ -197,13 +197,10 @@ pub async fn serve(
     let auth_sql = StorageAuth::new(verifying_key, "sql");
     let auth_blob = StorageAuth::new(verifying_key, "blob");
     let migration_auth = match config.migration_admin_token.as_deref() {
-        Some(token) => {
-            Some(
-                MigrationAuth::new(token).context(
-                    "invalid migration_admin_token; the management service was not started",
-                )?,
-            )
-        }
+        Some(token) => Some(
+            MigrationAuth::new(token)
+                .context("invalid migration_admin_token; the management service was not started")?,
+        ),
         None => None,
     };
     let stores = Stores::open(&config).await?;

@@ -37,8 +37,8 @@ use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
 use deis_wire::conventions::{
-    BINDING_HEADER, MAX_GRPC_MESSAGE_BYTES, STORAGE_TOKEN_HEADER, STREAM_CHUNK_BYTES,
-    TENANT_HEADER, is_valid_binding_name, split_tenant,
+    BINDING_HEADER, MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES, TENANT_HEADER,
+    is_valid_binding_name, split_tenant,
 };
 
 /// KV and the SQL database share one proto file and one gRPC service
@@ -87,7 +87,8 @@ const MAX_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 struct Identity {
     tenant_header: MetadataValue<Ascii>,
-    token_header: Option<MetadataValue<Ascii>>,
+    /// Raw token string for building the Authorization: Bearer header.
+    token: Option<String>,
     /// Which namespace inside the tenant these calls act in, or `None` for the
     /// tenant's unnamed one - the namespace an application reaches through
     /// `context.services.kv` and the one every application had before named
@@ -114,15 +115,17 @@ impl Identity {
         let tenant_header = tenant.parse::<MetadataValue<Ascii>>().map_err(|_| {
             anyhow!("tenant {tenant:?} cannot be sent as gRPC metadata; every call would fail")
         })?;
-        let token_header = match token.map(str::trim).filter(|t| !t.is_empty()) {
-            Some(token) => Some(token.parse::<MetadataValue<Ascii>>().map_err(|_| {
+        let trimmed_token = token.map(str::trim).filter(|t| !t.is_empty());
+        // Validate the token can be sent as gRPC metadata at construction time,
+        // rather than failing on the first call.
+        if let Some(t) = trimmed_token {
+            t.parse::<MetadataValue<Ascii>>().map_err(|_| {
                 anyhow!(
                     "the storage capability token for {tenant} cannot be sent as gRPC metadata; \
                      the control plane is expected to hand this CLI a base64 value"
                 )
-            })?),
-            None => None,
-        };
+            })?;
+        }
         let binding_header =
             match binding.map(str::trim).filter(|b| !b.is_empty()) {
                 Some(binding) => {
@@ -142,7 +145,7 @@ impl Identity {
             };
         Ok(Self {
             tenant_header,
-            token_header,
+            token: trimmed_token.map(str::to_string),
             binding_header,
         })
     }
@@ -152,10 +155,11 @@ impl Identity {
         request
             .metadata_mut()
             .insert(TENANT_HEADER, self.tenant_header.clone());
-        if let Some(token) = &self.token_header {
+        if let Some(token) = &self.token {
+            let bearer = format!("Bearer {}", token);
             request
                 .metadata_mut()
-                .insert(STORAGE_TOKEN_HEADER, token.clone());
+                .insert("authorization", bearer.parse().expect("valid metadata"));
         }
         // Stamped here rather than per call for the reason the token is: a
         // call that named the tenant and forgot the binding would read and
@@ -184,7 +188,7 @@ impl std::fmt::Debug for Identity {
             )
             .field(
                 "token",
-                &if self.token_header.is_some() {
+                &if self.token.is_some() {
                     "<present>"
                 } else {
                     "<absent>"
@@ -891,7 +895,7 @@ mod tests {
     #[test]
     fn a_valid_tenant_with_no_token_builds() {
         let identity = Identity::new("demo.production".to_string(), None, None).unwrap();
-        assert!(identity.token_header.is_none());
+        assert!(identity.token.is_none());
     }
 
     #[test]
@@ -900,14 +904,14 @@ mod tests {
         // deis-store that checks one; sending nothing at least works against
         // a service that requires no proof.
         let identity = Identity::new("demo.production".to_string(), Some("   "), None).unwrap();
-        assert!(identity.token_header.is_none());
+        assert!(identity.token.is_none());
     }
 
     #[test]
     fn a_real_token_is_carried() {
         let identity =
             Identity::new("demo.production".to_string(), Some("abc123=="), None).unwrap();
-        assert!(identity.token_header.is_some());
+        assert!(identity.token.is_some());
     }
 
     #[tokio::test]

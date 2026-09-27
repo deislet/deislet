@@ -1,15 +1,16 @@
 //! What this node presents to a deis-telemetry that requires a credential.
 //!
 //! Against a real collector, started in this process, because the thing being
-//! tested is an agreement between two crates: this node derives a token over a
-//! subject, deis-telemetry recomputes the expected token over its own subject,
-//! and a push is accepted only if the two strings match. Neither half can
-//! demonstrate that alone -- a unit test on this side would assert that the
-//! node sends whatever it sends -- and drift between the two subjects is
-//! exactly the failure being guarded against, because it is silent: the
-//! collector is up, the node is up, and every log line, invocation trace and
-//! metric sample is refused while the node retries them for as long as it
-//! runs.
+//! tested is an agreement between two crates: this node derives an Ed25519
+//! signing key by hashing the shared `auth_secret` with SHA-256, signs a
+//! capability token, and sends it as `Authorization: Bearer <token>`.
+//! deis-telemetry verifies the token with the matching `capability_public_key`.
+//! Neither half can demonstrate that alone -- a unit test on this side would
+//! assert that the node sends whatever it sends -- and drift between the two
+//! derivations is exactly the failure being guarded against, because it is
+//! silent: the collector is up, the node is up, and every log line, invocation
+//! trace and metric sample is refused while the node retries them for as long
+//! as it runs.
 //!
 //! `deis-telemetry` is a test-only dependency here for the same reason
 //! `deis-store` is: running against the real server is what catches a change
@@ -19,18 +20,23 @@ use std::sync::Arc;
 
 use deis_runtime::config::LoggingConfig;
 use deis_runtime::logging::{LogBuffer, LogEntry, LogLevel, LogShipper, ShipperConfig};
-use deis_runtime::runtime::{
-    recorder, InvocationKind, InvocationTrace, MetricShipper, MetricShipperConfig,
-};
+use deis_runtime::runtime::{MetricShipper, MetricShipperConfig};
 use deis_telemetry::config::Config;
 use deis_telemetry::server::{self, RunningServer};
 use deis_telemetry::store::{LogFilter, TraceFilter};
 use ed25519_dalek::SigningKey;
 
-/// Generate a deterministic signing key for tests.
+use sha2::{Digest, Sha256};
+
+/// The shared secret known to both node and collector in these tests.
+const SHARED_SECRET: &str = "shared-telemetry-secret";
+
+/// Derive a deterministic Ed25519 signing key from the shared secret, the same
+/// way `TelemetryCredential::from_secret` does: SHA-256 of the secret bytes.
 fn test_signing_key() -> SigningKey {
+    let hash = Sha256::digest(SHARED_SECRET.as_bytes());
     let mut seed = [0u8; 32];
-    seed[0..16].copy_from_slice(b"telemetry-e2e-t");
+    seed.copy_from_slice(&hash);
     SigningKey::from_bytes(&seed)
 }
 
@@ -51,14 +57,13 @@ async fn collector(data_dir: &std::path::Path) -> RunningServer {
 }
 
 /// The node's telemetry settings, pointed at `server`.
+///
+/// `auth_secret` is the shared secret used to derive the Ed25519 signing key.
 fn node_settings(server: &RunningServer) -> LoggingConfig {
     LoggingConfig {
         enabled: true,
         endpoint: Some(format!("http://{}", server.grpc_addr)),
-        // NOTE: auth_secret is the HMAC-based token config. After the runtime
-        // migrates to capability tokens (Phase 4+), this will become a
-        // capability-related config field.
-        auth_secret: None,
+        auth_secret: Some(SHARED_SECRET.to_string()),
         flush_interval_secs: 1,
         ..LoggingConfig::default()
     }
@@ -102,20 +107,16 @@ async fn ship_one_line(server: &RunningServer, message: &str) -> usize {
 
 #[tokio::test]
 async fn a_node_that_presents_a_valid_capability_token_has_its_logs_kept() {
-    // NOTE: This test is updated for capability-based auth. The runtime's
-    // LogShipper still uses HMAC tokens (STORAGE_TOKEN_HEADER), so direct
-    // shipping through it will be rejected. This test verifies the server
-    // starts correctly with capability-based config. Full end-to-end token
-    // testing is deferred until the runtime migration.
     let dir = tempfile::tempdir().unwrap();
     let server = collector(dir.path()).await;
 
-    // The server is running with capability auth. Until the runtime is
-    // migrated, the LogShipper sends HMAC tokens which are rejected.
-    // Once migrated, this test should verify capability token acceptance.
-    assert!(
-        server.store.query_logs(&LogFilter::default(), 10, None).is_ok(),
-        "the store should be queryable"
+    // Ship one log line through the real LogShipper with the shared auth_secret.
+    // The runtime now derives an Ed25519 capability token from the secret,
+    // which the collector verifies against its capability_public_key.
+    let count = ship_one_line(&server, "capability-token-test").await;
+    assert_eq!(
+        count, 1,
+        "the log line must be stored; a count of 0 means the capability token was refused"
     );
 
     server.shutdown().await.expect("the collector stops");
@@ -129,7 +130,12 @@ async fn the_trace_and_metric_channels_start_with_capability_auth() {
     let dir = tempfile::tempdir().unwrap();
     let server = collector(dir.path()).await;
 
-    // Verify the store is operational.
+    // Verify the store is operational and reachable with capability auth.
+    // The MetricShipper constructor itself validates the credential via
+    // TelemetryCredential::from_secret.
+    let settings = node_settings(&server);
+    let _config = MetricShipperConfig::from(&settings);
+
     let traces = server
         .store
         .query_traces(&TraceFilter::default(), 10, None)
@@ -141,18 +147,50 @@ async fn the_trace_and_metric_channels_start_with_capability_auth() {
 }
 
 /// The single-box install, which has to keep working untouched: a collector
-/// with no `auth_secret` (only legal with both listeners on loopback) accepts
-/// a node that sends no token.
+/// with no `capability_public_key` (only legal with both listeners on
+/// loopback) accepts a node that sends no token.
 #[tokio::test]
-async fn a_collector_with_capability_auth_starts_and_serves() {
+async fn a_collector_with_no_public_key_accepts_an_unauthenticated_node() {
     let dir = tempfile::tempdir().unwrap();
-    let server = collector(dir.path()).await;
 
-    // The collector starts with capability auth. All callers must present
-    // valid capability tokens. The store is usable once started.
-    assert!(
-        server.store.query_logs(&LogFilter::default(), 10, None).is_ok(),
-        "the store should answer after startup"
+    // Start a collector without a capability public key.
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        metrics_listen: "127.0.0.1:0".to_string(),
+        data_dir: dir.path().to_path_buf(),
+        capability_public_key: None,
+        ..Config::default()
+    };
+    let server = server::start(&config)
+        .await
+        .expect("the collector must start without a key");
+
+    // Use a node with no auth_secret.
+    let mut settings = node_settings(&server);
+    settings.auth_secret = None;
+
+    let buffer = Arc::new(LogBuffer::new(16));
+    buffer.push(line("unauthenticated-message"));
+    let shipper = LogShipper::new(buffer, ShipperConfig::from(&settings));
+    shipper.start().await;
+    shipper.shutdown().await;
+
+    let count = server
+        .store
+        .query_logs(
+            &LogFilter {
+                contains: Some("unauthenticated-message".to_string()),
+                ..LogFilter::default()
+            },
+            10,
+            None,
+        )
+        .expect("the store answers")
+        .records
+        .len();
+    assert_eq!(
+        count, 1,
+        "an unauthenticated collector must accept an unauthenticated node"
     );
 
     server.shutdown().await.expect("the collector stops");

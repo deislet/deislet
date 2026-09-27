@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tonic::Request;
 
 use super::RuntimeManagementService;
-use crate::app::{AppConfig, AppKey, ApplicationManager, test_host};
+use crate::app::{test_host, AppConfig, AppKey, ApplicationManager};
 use crate::config::RuntimeConfig;
 use crate::deployment::DeploymentManager;
 use crate::health::NodeHealth;
@@ -25,7 +25,7 @@ use crate::management::proto::{
     ExecuteCommandRequest, GetStatusRequest, PushConfigRequest, StartInspectRequest,
     UnloadAppRequest, UpdateAppRequest,
 };
-use crate::runtime::metrics::{RequestOutcome, recorder};
+use crate::runtime::metrics::{recorder, RequestOutcome};
 
 const HANDLER: &str = r#"
     export default function handler() { return new Response("ok"); }

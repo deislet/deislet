@@ -15,6 +15,7 @@ use deis_backend_migration::proto::backend_migration_client::BackendMigrationCli
 use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
+use deis_capability::{CapabilityClaims, CapabilityResource, encode};
 use deis_store::config::Config;
 use deis_store::proto::blob::{
     BlobInfo, PutHeader, PutRequest, blob_store_client::BlobStoreClient, get_response, put_request,
@@ -26,7 +27,6 @@ use deis_store::proto::storage::{
 };
 use deis_store::tenant::{BINDING_HEADER, TENANT_HEADER};
 use deis_store::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_capability::{CapabilityClaims, CapabilityResource, encode};
 use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
 use ed25519_dalek::SigningKey;
 use std::time::Duration;
@@ -156,9 +156,14 @@ impl Harness {
         let (shutdown, rx) = oneshot::channel();
         let vk = test_signing_key().verifying_key();
         tokio::spawn(async move {
-            server::serve(config, listener, async {
-                let _ = rx.await;
-            }, vk)
+            server::serve(
+                config,
+                listener,
+                async {
+                    let _ = rx.await;
+                },
+                vk,
+            )
             .await
             .unwrap();
         });
@@ -1580,9 +1585,12 @@ async fn a_token_from_a_different_secret_is_refused() {
         }],
     );
     let bad_token = encode(&bad_claims, &other_key);
-    let mut request = as_tenant(&tenant, GetRequest {
-        key: "greeting".to_string(),
-    });
+    let mut request = as_tenant(
+        &tenant,
+        GetRequest {
+            key: "greeting".to_string(),
+        },
+    );
     request.metadata_mut().insert(
         AUTHORIZATION,
         format!("Bearer {bad_token}").parse().unwrap(),

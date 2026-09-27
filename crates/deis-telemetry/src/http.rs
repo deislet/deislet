@@ -70,7 +70,7 @@ async fn guard(State(auth): State<TelemetryAuth>, request: Request, next: Next) 
                 ],
                 "# deis-telemetry requires a capability token on this endpoint\n",
             )
-                .into_response()
+                .into_response();
         }
     }
 }

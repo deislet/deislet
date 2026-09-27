@@ -22,18 +22,20 @@ mod tests {
             schema_version: 1,
             operation_id: CanonicalId::new_v7(),
             operation,
-            desired_state_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .parse()
-                .unwrap(),
+            desired_state_digest:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .parse()
+                    .unwrap(),
             application_id: CanonicalId::new_v7(),
             environment_id: CanonicalId::new_v7(),
             target: ProviderTargetRef {
                 provider_target_id: CanonicalId::new_v7(),
                 provider_installation_id: CanonicalId::new_v7(),
                 backend_id: "cloudflare-workers-pages".to_owned(),
-                target_config_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                    .parse()
-                    .unwrap(),
+                target_config_digest:
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .parse()
+                        .unwrap(),
             },
             artifact: None,
             plan: ProviderNeutralPlan::default(),
@@ -144,16 +146,15 @@ mod tests {
         let stdout = r#"{"status":"uploading"}
 {"result":{"version_id":"abc-def-ghi","message":"uploaded"}}
 "#;
-        let id =
-            deis_provider_driver_cloudflare::commands::find_version_id_in_output(stdout);
+        let id = deis_provider_driver_cloudflare::commands::find_version_id_in_output(stdout);
         assert_eq!(id, Some("abc-def-ghi".to_owned()));
     }
 
     #[test]
     fn extracts_version_id_from_raw_text() {
-        let stdout = "wrangler versions upload...\nUpload complete! version_id: xyz-789-000\nDone.\n";
-        let id =
-            deis_provider_driver_cloudflare::commands::find_version_id_in_output(stdout);
+        let stdout =
+            "wrangler versions upload...\nUpload complete! version_id: xyz-789-000\nDone.\n";
+        let id = deis_provider_driver_cloudflare::commands::find_version_id_in_output(stdout);
         assert_eq!(id, Some("xyz-789-000".to_owned()));
     }
 

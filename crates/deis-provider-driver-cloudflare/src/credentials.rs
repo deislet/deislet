@@ -21,15 +21,12 @@ impl CloudflareCredential {
     /// or empty. The token value is never logged; the returned error
     /// messages mention only the field name that is wrong.
     pub fn from_env_value(value: &str) -> Result<Self, CredentialError> {
-        let credential: Self = serde_json::from_str(value).map_err(|error| {
-            CredentialError::InvalidJson {
+        let credential: Self =
+            serde_json::from_str(value).map_err(|error| CredentialError::InvalidJson {
                 message: error.to_string(),
-            }
-        })?;
+            })?;
         if credential.api_token.is_empty() {
-            return Err(CredentialError::MissingField {
-                field: "api_token",
-            });
+            return Err(CredentialError::MissingField { field: "api_token" });
         }
         if credential.account_id.is_empty() {
             return Err(CredentialError::MissingField {
@@ -51,7 +48,10 @@ impl std::fmt::Display for CredentialError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidJson { message } => {
-                write!(f, "EDGE_CANON_PROVIDER_CREDENTIAL is not valid JSON: {message}")
+                write!(
+                    f,
+                    "EDGE_CANON_PROVIDER_CREDENTIAL is not valid JSON: {message}"
+                )
             }
             Self::MissingField { field } => {
                 write!(

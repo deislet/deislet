@@ -51,8 +51,7 @@ use deis_wire::machine::machine_channel_server::{MachineChannel, MachineChannelS
 use deis_wire::machine::{
     DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
     FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
-    IssueCapabilityRequest, IssueCapabilityResponse,
-    RegisterNodeRequest, RegisterNodeResponse,
+    IssueCapabilityRequest, IssueCapabilityResponse, RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::transport::Endpoint;
 use tonic::Status;
@@ -126,7 +125,10 @@ impl MachineChannel for MachinePlane {
     async fn fetch_secret_values(
         &self,
         _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
-    ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
+    ) -> std::result::Result<
+        tonic::Response<deis_wire::machine::FetchSecretValuesResponse>,
+        tonic::Status,
+    > {
         Err(tonic::Status::unimplemented("fetch_secret_values"))
     }
 

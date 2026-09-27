@@ -736,7 +736,8 @@ async fn stored_traces_survive_a_restart() {
 /// Deterministic keypair for auth enforcement tests.
 use std::sync::OnceLock;
 fn test_keypair() -> &'static (ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey) {
-    static KEYPAIR: OnceLock<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)> = OnceLock::new();
+    static KEYPAIR: OnceLock<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)> =
+        OnceLock::new();
     KEYPAIR.get_or_init(|| {
         let seed: [u8; 32] = [0x42; 32];
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
@@ -774,7 +775,9 @@ fn signed<T>(message: T, token: &str) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
     request.metadata_mut().insert(
         "authorization",
-        format!("Bearer {token}").parse().expect("a token is valid metadata"),
+        format!("Bearer {token}")
+            .parse()
+            .expect("a token is valid metadata"),
     );
     request
 }
@@ -859,10 +862,7 @@ async fn with_capability_key_configured_only_signed_calls_are_served() {
     let mut logs = connect(&server).await;
     // Forging an entry against somebody else's application: refused before
     // anything is written.
-    for wrong in [
-        None,
-        Some("not-a-token".to_string()),
-    ] {
+    for wrong in [None, Some("not-a-token".to_string())] {
         let request = match &wrong {
             Some(bad) => signed(
                 PushLogsRequest {
@@ -1013,9 +1013,7 @@ async fn a_scrape_needs_the_token_once_a_secret_is_configured() {
     // Both forms a caller may present it in: the platform's own header, and
     // the bearer token a Prometheus scrape configuration produces.
     let bearer = format!("Bearer {good_read}");
-    for header in [
-        ("Authorization", bearer.as_str()),
-    ] {
+    for header in [("Authorization", bearer.as_str())] {
         let served = http_get_with(server.metrics_addr, "/metrics", &[header]).await;
         assert!(served.starts_with("HTTP/1.1 200"), "{served}");
         assert!(served.contains("deis_telemetry_uptime_seconds"), "{served}");
@@ -1395,9 +1393,7 @@ async fn migration_management_is_independently_authenticated_and_fences_only_its
 
 #[tokio::test]
 async fn invalid_or_reused_migration_credentials_fail_before_creating_backend_state() {
-    for (migration_admin_token, expected) in [
-        ("short".to_string(), "at least 32 bytes"),
-    ] {
+    for (migration_admin_token, expected) in [("short".to_string(), "at least 32 bytes")] {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = Config {
             migration_admin_token: Some(migration_admin_token),
