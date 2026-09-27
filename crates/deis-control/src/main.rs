@@ -311,7 +311,10 @@ async fn main() -> Result<(), anyhow::Error> {
             )
         })
         .await
-        .map_err(|e| anyhow::anyhow!("cannot load the capability signing keys: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("cannot load the capability signing keys: {e}"))?
+        // Every token is recorded before it is handed out, and revocations
+        // are served from the same tables.
+        .with_ledger(Arc::clone(&database));
 
     // One stop signal for the whole process, taken before anything is
     // started so every part gets the same edge: the listener stops

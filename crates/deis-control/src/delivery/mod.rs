@@ -273,15 +273,24 @@ impl StorageWiring {
     /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: deis-queue
     /// checks the token names that tenant, the `queue` audience and the
     /// `queue` binding, so a token minted for anything else is refused.
-    pub fn queue_token_for(&self, app_id: &str, environment: &str) -> Option<String> {
-        let issuer = self.issuer.as_ref()?;
+    pub async fn queue_token_for(
+        &self,
+        app_id: &str,
+        environment: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(issuer) = self.issuer.as_ref() else {
+            return Ok(None);
+        };
         let tenant = deis_wire::conventions::tenant_id(app_id, environment);
-        let token = futures::executor::block_on(issuer.issue(
-            AUD_QUEUE,
-            &format!("spiffe://deislet/control/{app_id}"),
-            resources_for_audience(&tenant, AUD_QUEUE),
-        ));
-        Some(token)
+        let token = issuer
+            .issue(
+                AUD_QUEUE,
+                &format!("spiffe://deislet/control/{app_id}"),
+                resources_for_audience(&tenant, AUD_QUEUE),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("could not issue a queue capability: {error}"))?;
+        Ok(Some(token))
     }
 
     /// True when this control plane mints capability tokens at all.
@@ -336,10 +345,12 @@ impl StorageWiring {
                 &subject,
                 resources_for_audience(&tenant, AUD_STORE),
             ));
-            env.insert(
-                deis_wire::conventions::STORAGE_TOKEN_ENV.to_string(),
-                store_token,
-            );
+            match store_token {
+                Ok(token) => {
+                    env.insert(deis_wire::conventions::STORAGE_TOKEN_ENV.to_string(), token);
+                }
+                Err(error) => warn!(app_id = %app_id, %error, "Could not issue a store capability for this deployment's environment; the node obtains its own through IssueCapability"),
+            }
 
             // Queue capability: same tenant, `queue` audience and binding.
             let queue_token = futures::executor::block_on(issuer.issue(
@@ -347,10 +358,12 @@ impl StorageWiring {
                 &subject,
                 resources_for_audience(&tenant, AUD_QUEUE),
             ));
-            env.insert(
-                deis_wire::conventions::QUEUE_TOKEN_ENV.to_string(),
-                queue_token,
-            );
+            match queue_token {
+                Ok(token) => {
+                    env.insert(deis_wire::conventions::QUEUE_TOKEN_ENV.to_string(), token);
+                }
+                Err(error) => warn!(app_id = %app_id, %error, "Could not issue a queue capability for this deployment's environment; the node obtains its own through IssueCapability"),
+            }
         }
     }
 
@@ -410,7 +423,8 @@ impl StorageWiring {
                 anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
             })?,
         );
-        self.stamp_queue_capability(&mut request, app_id, environment)?;
+        self.stamp_queue_capability(&mut request, app_id, environment)
+            .await?;
         Ok(QueueClient::new(channel)
             .prepare_consumer_generation(request)
             .await?
@@ -433,7 +447,8 @@ impl StorageWiring {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
         });
-        self.authorize_queue_request(&mut request, app_id, environment, &tenant)?;
+        self.authorize_queue_request(&mut request, app_id, environment, &tenant)
+            .await?;
         Ok(QueueClient::new(channel)
             .activate_consumer_generation(request)
             .await?
@@ -454,7 +469,8 @@ impl StorageWiring {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
         });
-        self.authorize_queue_request(&mut request, app_id, environment, &tenant)?;
+        self.authorize_queue_request(&mut request, app_id, environment, &tenant)
+            .await?;
         Ok(QueueClient::new(channel)
             .abort_consumer_generation(request)
             .await?
@@ -481,7 +497,7 @@ impl StorageWiring {
         ))
     }
 
-    fn authorize_queue_request<T>(
+    async fn authorize_queue_request<T>(
         &self,
         request: &mut tonic::Request<T>,
         app_id: &str,
@@ -495,17 +511,18 @@ impl StorageWiring {
             })?,
         );
         self.stamp_queue_capability(request, app_id, environment)
+            .await
     }
 
     /// Put this control plane's queue capability in `Authorization: Bearer`,
     /// the one header deis-queue reads it from.
-    fn stamp_queue_capability<T>(
+    async fn stamp_queue_capability<T>(
         &self,
         request: &mut tonic::Request<T>,
         app_id: &str,
         environment: &str,
     ) -> anyhow::Result<()> {
-        if let Some(token) = self.queue_token_for(app_id, environment) {
+        if let Some(token) = self.queue_token_for(app_id, environment).await? {
             request.metadata_mut().insert(
                 "authorization",
                 format!("Bearer {token}").parse().map_err(|error| {
@@ -2859,6 +2876,7 @@ mod tests {
         let mut request = tonic::Request::new(());
         wiring
             .stamp_queue_capability(&mut request, "demo", "production")
+            .await
             .unwrap();
         assert!(
             request

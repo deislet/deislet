@@ -119,14 +119,21 @@ pub async fn storage_token(
         "spiffe://deislet/human/{}",
         principal.account.as_deref().unwrap_or("unknown")
     );
-    let token = state
-        .issuer
-        .issue(AUD_STORE, &subject, resources_for_audience(&tenant, AUD_STORE))
-        .await;
-    let queue_token = state
-        .issuer
-        .issue(AUD_QUEUE, &subject, resources_for_audience(&tenant, AUD_QUEUE))
-        .await;
+    let issued = |aud: &'static str| {
+        let issuer = state.issuer.clone();
+        let subject = subject.clone();
+        let tenant = tenant.clone();
+        async move {
+            issuer
+                .issue(aud, &subject, resources_for_audience(&tenant, aud))
+                .await
+                .map_err(|error| {
+                    ApiError::InternalError(format!("the {aud} capability could not be issued: {error}"))
+                })
+        }
+    };
+    let token = issued(AUD_STORE).await?;
+    let queue_token = issued(AUD_QUEUE).await?;
 
     // The mint is also a row in the audit log, written by the gate that let
     // this call through (action `storage_token.mint`, recorded whatever the

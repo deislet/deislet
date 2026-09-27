@@ -338,7 +338,8 @@ pub(crate) async fn assignments_for(
     })
 }
 
-/// Where one deployment's secrets live, for a node that may read them.
+/// One deployment a node may act for: where its secrets live, and the
+/// storage tenant and generation a capability for it may name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VisibleDeployment {
     /// Primary key of the environment row: the half of a secret revision's
@@ -347,36 +348,66 @@ pub(crate) struct VisibleDeployment {
     /// `None` for a deployment that predates typed snapshots, which binds no
     /// secret revisions and so has nothing to fetch.
     pub snapshot_id: Option<String>,
+    /// `<app>.<environment>`, as `deis_wire::conventions::tenant_id` spells
+    /// it: the tenant a store, queue or telemetry capability names.
+    pub tenant: String,
+    /// The routing generation this deployment serves under.
+    pub routing_generation: String,
 }
 
-/// Which deployments `node_id` may read secret values for, keyed by id.
+/// Which deployments `node_id` may act for - read secret values of, and
+/// obtain capabilities for - keyed by id.
 ///
 /// The single place that decides it, so that a placement model narrows it
-/// here and nowhere else. Today every node runs every application, so this is
-/// every current assignment plus every in-flight plan that names this node as
-/// a target: a PREPARE push reaches the node before the deployment pointer is
-/// written, and the node fetches its secrets while preparing.
+/// here and nowhere else. Today every node of the fleet runs every
+/// application, so this is:
+///
+/// - every current assignment, **if `node_id` is in the fleet** - registered
+///   (with the name it proved) or configured. A machine this control plane
+///   has no record of is running nothing of ours and is owed nothing, even
+///   if it holds a certificate this fleet signed;
+/// - every in-flight plan that names `node_id` as a target: a PREPARE push
+///   reaches the node before the deployment pointer is written, and the node
+///   fetches its secrets while preparing. Plans freeze their targets, so a
+///   node that dropped out of the fleet mid-plan still finishes what it was
+///   sent.
 pub(crate) async fn deployments_visible_to(
     state: &CatalogState,
     node_id: &str,
 ) -> crate::catalog::CatalogResult<BTreeMap<String, VisibleDeployment>> {
     let mut visible = BTreeMap::new();
-    for assignment in state.store.list_assignments().await?.assignments {
-        visible.insert(
-            assignment.deployment_id,
-            VisibleDeployment {
-                env_id: assignment.environment_id,
-                snapshot_id: assignment.snapshot_id,
-            },
-        );
+    if state.nodes.node(node_id).is_some() {
+        for assignment in state.store.list_assignments().await?.assignments {
+            visible.insert(
+                assignment.deployment_id,
+                VisibleDeployment {
+                    env_id: assignment.environment_id,
+                    snapshot_id: assignment.snapshot_id,
+                    tenant: deis_wire::conventions::tenant_id(
+                        &assignment.app_id,
+                        &assignment.environment,
+                    ),
+                    routing_generation: assignment.routing_generation,
+                },
+            );
+        }
     }
     for plan in state.store.nonterminal_deployment_plans().await? {
-        if plan.target_ids.iter().any(|target| target == node_id) {
-            visible.entry(plan.id).or_insert(VisibleDeployment {
+        if !plan.target_ids.iter().any(|target| target == node_id)
+            || visible.contains_key(&plan.id)
+        {
+            continue;
+        }
+        let environment = state.store.get_environment_by_id(&plan.env_id).await?;
+        visible.insert(
+            plan.id,
+            VisibleDeployment {
                 env_id: plan.env_id,
                 snapshot_id: plan.snapshot_id,
-            });
-        }
+                tenant: deis_wire::conventions::tenant_id(&plan.app_id, &environment.name),
+                routing_generation: plan.routing_generation.to_string(),
+            },
+        );
     }
     Ok(visible)
 }

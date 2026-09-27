@@ -723,7 +723,9 @@ pub(crate) mod tests {
             .expect("the stand-in runtime node registers");
         let runtime_nodes_for_state = Arc::clone(&runtime_nodes);
         let sessions = Arc::new(SessionManager::new());
-        let issuer = CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await;
+        let issuer = CapabilityIssuer::ephemeral("spiffe://deislet/control/test")
+            .await
+            .with_ledger(store.database());
         let state = CatalogState {
             store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
