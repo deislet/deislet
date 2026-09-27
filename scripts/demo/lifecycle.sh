@@ -328,6 +328,14 @@ trust_domain = "${FLEET_TRUST_DOMAIN}"
 [routing]
 preview_zone = "${ACME_ZONE}"
 
+# Plaintext requests for a name that already holds a certificate are served,
+# not answered 301 to the TLS port. The redirect is the product default; it is
+# off here because the streaming checks drive the plaintext edge with the
+# certified production name, and a redirect would leave them nothing to read.
+[https]
+auto_redirect_to_https = false
+auto_offload_https = true
+
 [tls]
 ports = [${DEIS_PROXY_TLS_PORT}]
 

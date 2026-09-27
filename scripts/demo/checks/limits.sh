@@ -358,6 +358,18 @@ check_memory_cutoff() {
   status=${answered%% *}
   seconds=${answered##* }
 
+  # The cut-off isolate takes production's placement with it until the
+  # control plane reinstalls the version, a second or two later. Wait for
+  # that here, whatever this check decides, so the groups after this one are
+  # not answered 503 by a recovery this check caused.
+  local recovered=0
+  while [ "$recovered" -lt 30 ]; do
+    app_request "${LOG_DIR}/verify-heap-recovery.headers" "/hello/world" >/dev/null
+    [ "$(http_status "${LOG_DIR}/verify-heap-recovery.headers")" = "200" ] && break
+    recovered=$((recovered + 1))
+    sleep 1
+  done
+
   # Which invocation that was, read off the marker the handler logged before
   # its first allocation. `deis trace` prints the same id as `trace=<id>`.
   local trace

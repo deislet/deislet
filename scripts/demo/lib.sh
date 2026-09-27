@@ -325,6 +325,9 @@ claim_port() {
 #     is signed with no URI subject alternative name at all, which surfaces
 #     much later as `MachineIdentity::load` reporting that a certificate names
 #     no machine, with nothing pointing back at this function.
+#   * the authority carries keyUsage and every leaf carries its key
+#     identifiers, which strict verifiers (Python 3.13+'s ssl module, used by
+#     the streaming checks) refuse a chain without;
 #   * every leaf carries both `serverAuth` and `clientAuth`, because each
 #     process here is a server on one connection and a client on another: the
 #     control plane serves the machine channel and dials its nodes, and a node
@@ -334,7 +337,9 @@ mint_ca() {
   local subject=$2
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
     -keyout "${prefix}.key" -out "${prefix}.crt" -days 2 \
-    -subj "/CN=${subject}" >/dev/null 2>&1
+    -subj "/CN=${subject}" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
   chmod 600 "${prefix}.key"
 }
 
@@ -356,15 +361,18 @@ mint_leaf() {
   openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
     -keyout "${leaf}.key" -out "${leaf}.csr" -subj "/CN=${leaf##*/}" \
     >/dev/null 2>&1
+  chmod 600 "${leaf}.key"
   cat > "${leaf}.ext" <<EXT
 subjectAltName=${san}
 basicConstraints=CA:FALSE
+keyUsage=critical,digitalSignature
 extendedKeyUsage=serverAuth,clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
 EXT
   openssl x509 -req -in "${leaf}.csr" -CA "${ca}.crt" -CAkey "${ca}.key" \
     -CAcreateserial -days 2 -extfile "${leaf}.ext" -out "${leaf}.crt" \
     >/dev/null 2>&1
-  chmod 600 "${leaf}.key"
   rm -f "${leaf}.csr" "${leaf}.ext"
 }
 
@@ -1956,7 +1964,7 @@ deploy_example_app() {
   APP_V2_NUMBER=$(report_field cli-deploy-v2-preview '.version.number')
   echo "   ✓ deis deploy -e ${PREVIEW_ENV_NAME}: version ${APP_V2_NUMBER} (${APP_V2_ID}) is serving ${PREVIEW_ENV_NAME}"
 
-  echo "   Send requests with: ${SCRIPT_DIR}/lib.sh's runtime_curl -H 'x-deis-app-id: ${APP_ID}' https://127.0.0.1:${DEIS_RUNTIME_PORT}/ -- the data port admits only a fleet proxy's certificate"
+  echo "   Send requests with: ${DEMO_SCRIPT_DIR}/demo/lib.sh's runtime_curl -H 'x-deis-app-id: ${APP_ID}' https://127.0.0.1:${DEIS_RUNTIME_PORT}/ -- the data port admits only a fleet proxy's certificate"
 }
 
 # ----------------------------------------------------------------------

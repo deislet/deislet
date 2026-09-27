@@ -47,7 +47,7 @@ deis_cli_as() {
 # the HTTP status alone. Used where the claim is about who is refused, which
 # `deis` deliberately reports as a message rather than as a number.
 control_status() {
-  local method=$1 path=$2 credential=$3 body=${4:-}
+  local method=$1 path=$2 credential=${3:-} body=${4:-}
   local args=(-s -o /dev/null -w '%{http_code}' -X "$method" "$(control_url)${path}")
   if [ -n "$credential" ]; then
     args+=(-H "Authorization: Bearer ${credential}")
@@ -760,7 +760,7 @@ check_a_refused_call_is_recorded_with_the_reason() {
   detail=$(jq -r --arg app "$APP_ID" --arg env "$ENV_NAME" \
     'first(.entries[] | select(.action == "deploy" and .app_id == $app and .environment == $env) | .detail) // empty' \
     < "$report" 2>/dev/null || true)
-  anonymous=$(jq -r '[.entries[] | select(.actor_kind == "anonymous")] | length' < "$report" 2>/dev/null || echo 0)
+  anonymous=$(jq -r '[.entries[] | select(.actor_kind == "unknown")] | length' < "$report" 2>/dev/null || echo 0)
 
   # The anonymous count is asserted rather than only printed. It is the half
   # of the claim that is about callers the platform cannot name - the

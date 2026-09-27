@@ -248,7 +248,7 @@ check_queue_dead_letters() {
   local attempts reason ceiling
   attempts=$(echo "$listed" | jq -r '.attempts // empty' 2>/dev/null || true)
   reason=$(echo "$listed" | jq -r '.reason // empty' 2>/dev/null || true)
-  ceiling=5
+  ceiling=3
 
   # The human report, which is what an operator actually reads.
   if ! deis_cli queue dead-letters --queue jobs > "${out}-report.txt" 2>&1; then

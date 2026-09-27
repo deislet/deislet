@@ -303,7 +303,7 @@ check_data_cli_reads_the_apps_write() {
   # Written through the application, not through the CLI: the point is that
   # the two arrive at the same row, so the write has to come from the side
   # that is not being tested.
-  curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+  runtime_curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "$value" \
     "$(runtime_data_url)/api/kv/${key}"
   if [ "$(http_status "$headers")" != "201" ]; then
@@ -421,13 +421,13 @@ check_a_single_value_cannot_be_bigger_than_a_row_may_be() {
   local message
   message=$(tr '\n' ' ' < "$out" | sed 's/  */ /g')
 
-  if [ "$rc" -ne 0 ] && echo "$message" | grep -q '8388608' \
+  if [ "$rc" -ne 0 ] && echo "$message" | grep -q '2000000' \
     && echo "$message" | grep -q 'blob service'; then
     pass_check "$title" \
-      "deis-store refused a twenty-megabyte cell before allocating it, naming its 8388608-byte ceiling on any single string, blob or row and pointing at the blob service for payloads that size: $(echo "$message" | head -c 240)"
+      "deis-store refused a twenty-megabyte cell before allocating it, naming its 2000000-byte ceiling on any single string, blob or row and pointing at the blob service for payloads that size: $(echo "$message" | head -c 240)"
   else
     fail_check "$title" \
-      "expected a refusal naming the 8388608-byte value ceiling; the call exited ${rc} saying: $(echo "$message" | head -c 300)"
+      "expected a refusal naming the 2000000-byte value ceiling; the call exited ${rc} saying: $(echo "$message" | head -c 300)"
   fi
 }
 
