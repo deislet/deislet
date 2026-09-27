@@ -12,32 +12,49 @@ use tokio::sync::oneshot;
 
 use super::bindings::{ServiceDeclaration, ServiceEndpoints, ServiceWiring};
 
+/// Generate a deterministic Ed25519 signing key for in-process test stores.
+pub fn test_signing_key() -> ed25519_dalek::SigningKey {
+    let mut seed = [0u8; 32];
+    seed[0..8].copy_from_slice(b"rt-store");
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
+
 /// A running deis-store, stopped when the value is dropped.
 pub(crate) struct TestStore {
     _data: tempfile::TempDir,
     pub(crate) endpoint: String,
+    pub(crate) signing_key: ed25519_dalek::SigningKey,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl TestStore {
-    /// The single-box default: no `auth_secret`, so a call that carries only
-    /// the tenant it claims is served.
+    /// Start with a fresh self-signed key for capability-based auth.
     pub(crate) async fn start() -> Self {
-        Self::start_with(None).await
+        Self::start_with_key(test_signing_key()).await
     }
 
-    /// A store that checks the capability token, the way one is configured as
-    /// soon as it is reachable from anywhere but this machine.
+    /// A store that uses a different signing key, verifying that tokens from
+    /// the wrong key are refused.
     pub(crate) async fn start_with_secret(secret: &str) -> Self {
-        Self::start_with(Some(secret)).await
+        let mut seed = [0u8; 32];
+        let bytes = secret.as_bytes();
+        let n = bytes.len().min(32);
+        seed[..n].copy_from_slice(&bytes[..n]);
+        Self::start_with_key(ed25519_dalek::SigningKey::from_bytes(&seed)).await
     }
 
-    async fn start_with(auth_secret: Option<&str>) -> Self {
+    /// Get the verifying key for this test store.
+    pub(crate) fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.signing_key.verifying_key()
+    }
+
+    async fn start_with_key(signing_key: ed25519_dalek::SigningKey) -> Self {
         let data = tempfile::TempDir::new().expect("temp dir");
+        let verifying_key = signing_key.verifying_key();
         let config = deis_store::config::Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
-            auth_secret: auth_secret.map(str::to_string),
+            capability_public_key: Some(hex::encode(verifying_key.as_bytes())),
             ..deis_store::config::Config::default()
         };
         let listener = deis_store::server::bind(&config).await.expect("bind");
@@ -46,15 +63,34 @@ impl TestStore {
         tokio::spawn(async move {
             deis_store::server::serve(config, listener, async {
                 let _ = rx.await;
-            })
+            }, verifying_key)
             .await
             .expect("serve");
         });
         Self {
             _data: data,
             endpoint: format!("http://{addr}"),
+            signing_key,
             shutdown: Some(shutdown),
         }
+    }
+
+    pub(crate) fn capability_token_for(&self, tenant: &str, binding: &str) -> String {
+        use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+        use std::time::Duration;
+        let claims = CapabilityClaims::new(
+            "store",
+            "spiffe://deislet/control/main",
+            "spiffe://deislet/node/test",
+            1,
+            Duration::from_secs(900),
+            vec![CapabilityResource {
+                tenant: tenant.to_string(),
+                binding: binding.to_string(),
+                generation: None,
+            }],
+        );
+        encode(&claims, &self.signing_key)
     }
 
     /// The reserved env entries that carry KV wiring to an isolate.
@@ -80,7 +116,7 @@ impl TestStore {
     /// process and nothing here speaks to it.
     pub(crate) fn wiring_for<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> ServiceWiring {
         ServiceWiring {
-            storage_token: None,
+            storage_token: Some(self.capability_token_for("default", "kv")),
             declaration: ServiceDeclaration::from_names(names),
             endpoints: ServiceEndpoints {
                 store: Some(self.endpoint.clone()),

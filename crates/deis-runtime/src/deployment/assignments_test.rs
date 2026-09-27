@@ -14,7 +14,7 @@ use deis_wire::machine::machine_channel_server::{MachineChannel, MachineChannelS
 use deis_wire::machine::{
     DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
     FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
-    RegisterNodeRequest, RegisterNodeResponse,
+    IssueCapabilityRequest, IssueCapabilityResponse, RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::service::Routes;
 use tonic::transport::Endpoint;
@@ -211,6 +211,13 @@ impl MachineChannel for AssignmentsService {
         _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
     ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("fetch_secret_values"))
+    }
+
+    async fn issue_capability(
+        &self,
+        _request: tonic::Request<IssueCapabilityRequest>,
+    ) -> std::result::Result<tonic::Response<IssueCapabilityResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("issue_capability"))
     }
 }
 
@@ -1170,6 +1177,13 @@ async fn counting_registrar() -> (NodeRegistrar, Arc<std::sync::atomic::AtomicUs
         ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
             Err(tonic::Status::unimplemented("fetch_secret_values"))
         }
+
+        async fn issue_capability(
+            &self,
+            _request: tonic::Request<IssueCapabilityRequest>,
+        ) -> std::result::Result<tonic::Response<IssueCapabilityResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("issue_capability"))
+        }
     }
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1469,6 +1483,13 @@ impl MachineChannel for MachineControlPlane {
         _request: tonic::Request<deis_wire::machine::FetchSecretValuesRequest>,
     ) -> std::result::Result<tonic::Response<deis_wire::machine::FetchSecretValuesResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("fetch_secret_values"))
+    }
+
+    async fn issue_capability(
+        &self,
+        _request: tonic::Request<IssueCapabilityRequest>,
+    ) -> std::result::Result<tonic::Response<IssueCapabilityResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("issue_capability"))
     }
 }
 

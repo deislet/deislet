@@ -80,3 +80,5 @@ deis-queue = { path = "../deis-queue" }
 # against the running service proves the two strings agree. Test-only - this
 # CLI does not link the collector's server, its database or its HTTP stack.
 deis-telemetry = { path = "../deis-telemetry" }
+deis-capability = { path = "../deis-capability" }
+ed25519-dalek = "2.1"

@@ -1,21 +1,11 @@
 //! Operator-facing configuration.
 //!
-//! # `listen` and `auth_secret` are one decision, not two
+//! # Authentication is always enforced
 //!
-//! Whether a caller is authenticated at all is decided by `auth_secret`, and
-//! what happens when it is absent depends on `listen`:
-//!
-//! * `auth_secret` set: every call must carry a capability token for the
-//!   tenant it names, wherever the service is bound. See [`crate::auth`].
-//! * No `auth_secret`, loopback `listen`: the service runs exactly as it did
-//!   before tokens existed - the tenant header is believed, and what keeps
-//!   one tenant's data away from an unrelated client is that the client
-//!   cannot reach the port. This is the default single-box install and it is
-//!   supported; the service says so at startup, at `warn`.
-//! * No `auth_secret`, any other `listen`: the service refuses to start.
-//!   Reachable from another host with nothing checking the tenant header is
-//!   every tenant's data published to that network, and an unconfigured
-//!   secret must not be able to mean that by accident.
+//! Every call must carry an Ed25519-signed capability token in
+//! `Authorization: Bearer <token>`. There is no anonymous mode and no
+//! loopback bypass: the verifying key is fetched from the control plane's
+//! well-known endpoint on startup. See [`crate::auth`].
 //!
 //! # `snapshot_dir` is the difference between having backups and not
 //!
@@ -50,31 +40,26 @@ use std::time::Duration;
 pub struct Config {
     /// Address the gRPC server binds to.
     ///
-    /// Loopback by default, because the default install configures no
-    /// `auth_secret` and then the only thing keeping one tenant's data away
-    /// from an unrelated client is that the client cannot reach the port.
-    /// Binding anywhere else without an `auth_secret` is refused at startup
-    /// rather than warned about; see the module docs.
+    /// Loopback by default. Every call must carry a valid capability token
+    /// regardless of the bind address; there is no anonymous or loopback
+    /// bypass.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Shared secret the per-tenant capability tokens are derived from, or
-    /// `None` to run with no caller authentication at all.
+    /// The control plane's capability verifying key, in hex.
     ///
-    /// The same value must be configured on deis-control, which mints
-    /// `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant and hands
-    /// it to the node running that tenant. Anything that reaches this service
-    /// without a token matching the tenant it names is refused. Rotating the
-    /// value invalidates every token at once, so change it here, on
-    /// deis-queue and on deis-control together.
+    /// This is the Ed25519 public key that deis-control uses to sign
+    /// capability tokens. Every call must carry a token signed by the
+    /// matching private key. The key can also be fetched from
+    /// `/.well-known/deis/capability-public-key` on the machine listener.
     ///
-    /// `None` is only permitted on a loopback bind - [`crate::auth`] has the
-    /// reasoning and the refusal.
+    /// If this is not set, the service fetches the key from the
+    /// `DEIS_CAPABILITY_PUBLIC_KEY_URL` environment variable, or defaults
+    /// to `http://127.0.0.1:8100/.well-known/deis/capability-public-key`.
     #[serde(default)]
-    pub auth_secret: Option<String>,
+    pub capability_public_key: Option<String>,
     /// Independent credential for backend migration inventory and writer
     /// fencing. When absent, the management service is not registered at
-    /// all, including on loopback. It must never reuse `auth_secret`: an
-    /// application storage capability cannot become a migration authority.
+    /// all, including on loopback.
     #[serde(default)]
     pub migration_admin_token: Option<String>,
     /// Directory holding the SQLite database and any on-disk payloads.
@@ -237,7 +222,7 @@ impl Default for Config {
             max_object_bytes: default_max_object_bytes(),
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
-            auth_secret: None,
+            capability_public_key: None,
             migration_admin_token: None,
             snapshot_dir: None,
             snapshot_interval_secs: default_snapshot_interval_secs(),
@@ -300,7 +285,7 @@ mod tests {
 
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
-        assert_eq!(parsed.auth_secret, defaults.auth_secret);
+        assert_eq!(parsed.capability_public_key, defaults.capability_public_key);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.durability, defaults.durability);
         assert_eq!(parsed.snapshot_dir, defaults.snapshot_dir);
@@ -337,10 +322,9 @@ mod tests {
 
     #[test]
     fn the_default_address_is_loopback() {
-        // With no auth_secret - which is the default - the tenant header is
-        // believed, so reachability is the only thing keeping an unrelated
-        // client away from a tenant's data. Anything else is refused at
-        // startup rather than served, so this default is load-bearing.
+        // Every call must carry a valid capability token regardless of the
+        // bind address. The default is loopback as a defence-in-depth
+        // measure.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
     }
@@ -484,7 +468,7 @@ mod tests {
     fn the_secret_and_the_snapshot_keys_are_read_from_a_file() {
         let parsed: Config = toml::from_str(
             r#"
-            auth_secret = "a-shared-secret"
+            capability_public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             migration_admin_token = "an-independent-migration-secret"
             snapshot_dir = "/var/backups/deis-store"
             snapshot_interval_secs = 3600
@@ -492,7 +476,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(parsed.auth_secret.as_deref(), Some("a-shared-secret"));
+        assert_eq!(
+            parsed.capability_public_key.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(
             parsed.migration_admin_token.as_deref(),
             Some("an-independent-migration-secret")

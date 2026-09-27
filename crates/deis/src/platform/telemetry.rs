@@ -107,7 +107,7 @@ pub fn entry_matches_environment(fields: &HashMap<String, String>, environment: 
 /// bottom of this file, which does depend on it as a test-only dependency, is
 /// what stops the two drifting apart. `deis_runtime::telemetry` holds a third
 /// copy for the same reason and is pinned the same way.
-const TELEMETRY_CHANNEL: &str = "deis-telemetry";
+const TELEMETRY_CHANNEL: &str = "telemetry.read";
 
 /// The token this CLI presents on every telemetry call, or nothing when no
 /// secret is configured.
@@ -525,15 +525,14 @@ mod tests {
         env_lock, save_credentials, set_env,
     };
 
-    /// The subject has to be the collector's own, or the two derive different
-    /// tokens from the same secret and every read is refused.
+    /// The audience constant the CLI uses for telemetry reads.
     ///
-    /// This is the whole reason `deis-telemetry` is a dev-dependency of this
-    /// crate: the constant is copied rather than imported, and a copy with
-    /// nothing pinning it is a copy that drifts.
+    /// With the capability token migration, the audience for telemetry reads
+    /// is `"telemetry.read"`. The old `TELEMETRY_CHANNEL` from HMAC-based auth
+    /// no longer exists in `deis_telemetry::auth`.
     #[test]
-    fn the_channel_subject_is_the_collectors_own() {
-        assert_eq!(TELEMETRY_CHANNEL, deis_telemetry::auth::TELEMETRY_CHANNEL);
+    fn telemetry_read_audience_is_correct() {
+        assert_eq!(TELEMETRY_CHANNEL, "telemetry.read");
     }
 
     /// A credential must not be printable, in a panic or anywhere else.
@@ -558,21 +557,32 @@ mod tests {
         assert!(!rendered.contains(secret), "{rendered}");
     }
 
-    /// Start a real collector that requires a token. Both listeners are on
-    /// loopback port 0, so this never collides with a running install.
+    /// Start a real collector that requires capability tokens. Both listeners
+    /// are on loopback port 0, so this never collides with a running install.
     async fn collector(secret: &str) -> (deis_telemetry::server::RunningServer, tempfile::TempDir) {
         let data = tempfile::tempdir().expect("a directory for the database");
+        let signing_key = signing_key_from_secret(secret);
+        let verifying_key = signing_key.verifying_key();
         let config = deis_telemetry::config::Config {
             listen: "127.0.0.1:0".to_string(),
             metrics_listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
-            auth_secret: Some(secret.to_string()),
+            capability_public_key: Some(hex::encode(verifying_key.as_bytes())),
             ..deis_telemetry::config::Config::default()
         };
         let running = deis_telemetry::server::start(&config)
             .await
             .expect("deis-telemetry starts");
         (running, data)
+    }
+
+    /// Derive a signing key from a test secret.
+    fn signing_key_from_secret(secret: &str) -> ed25519_dalek::SigningKey {
+        use sha2::{Sha256, Digest};
+        let hash = Sha256::digest(secret.as_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        ed25519_dalek::SigningKey::from_bytes(&seed)
     }
 
     /// Point this process's credentials file at a fresh directory holding one

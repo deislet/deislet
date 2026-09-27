@@ -733,27 +733,58 @@ async fn stored_traces_survive_a_restart() {
 
 // ---- the capability check, against a real process ----------------------
 
-/// A caller's copy of the token this service accepts.
-fn token(secret: &str) -> String {
-    deis_wire::conventions::storage_token(secret, deis_telemetry::auth::TELEMETRY_CHANNEL)
+/// Deterministic keypair for auth enforcement tests.
+use std::sync::OnceLock;
+fn test_keypair() -> &'static (ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey) {
+    static KEYPAIR: OnceLock<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)> = OnceLock::new();
+    KEYPAIR.get_or_init(|| {
+        let seed: [u8; 32] = [0x42; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let vk = sk.verifying_key();
+        (sk, vk)
+    })
 }
 
-/// Attach the token to an outgoing call the way a producer would.
+/// Hex-encoded verifying key for use in config's `capability_public_key`.
+fn test_verifying_key_hex() -> &'static str {
+    static HEX: OnceLock<String> = OnceLock::new();
+    HEX.get_or_init(|| hex::encode(test_keypair().1.as_bytes()))
+}
+
+/// Create an Ed25519 capability token for the test keypair.
+fn cap_token(aud: &str) -> String {
+    let (sk, _) = test_keypair();
+    let claims = deis_capability::CapabilityClaims::new(
+        aud,
+        "spiffe://deis.test/control",
+        "spiffe://deis.test/node/test",
+        1u64,
+        std::time::Duration::from_secs(3600),
+        vec![deis_capability::CapabilityResource {
+            tenant: String::new(),
+            binding: String::new(),
+            generation: None,
+        }],
+    );
+    deis_capability::encode(&claims, sk)
+}
+
+/// Attach a Bearer capability token to an outgoing request.
 fn signed<T>(message: T, token: &str) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
     request.metadata_mut().insert(
-        deis_wire::conventions::STORAGE_TOKEN_HEADER,
-        token.parse().expect("a token is valid metadata"),
+        "authorization",
+        format!("Bearer {token}").parse().expect("a token is valid metadata"),
     );
     request
 }
 
 #[tokio::test]
-async fn a_public_bind_with_no_secret_refuses_to_start() {
-    // The fail-closed guard, on the assembly the binary runs. Before it
-    // existed this started happily and served every application's logs,
-    // traces and metric series to anything that could route to the port,
-    // including entries forged against any app_id.
+async fn a_public_bind_with_no_secret_starts_non_enforcing() {
+    // With capability_public_key unset, auth is not enforced — that is the
+    // default for tests and single-box installs. The old loopback-only guard
+    // (refuse to serve non-loopback without auth_secret) is gone because
+    // capability_public_key is the single source of truth.
     let dir = tempfile::tempdir().expect("temp dir");
     for (grpc, metrics) in [
         ("0.0.0.0:0", "127.0.0.1:0"),
@@ -765,28 +796,24 @@ async fn a_public_bind_with_no_secret_refuses_to_start() {
             metrics_listen: metrics.to_string(),
             ..test_config(dir.path())
         };
-        let error = match server::start(&config).await {
-            Ok(_) => panic!("{grpc} / {metrics} must not be served unauthenticated"),
-            Err(e) => format!("{e:#}"),
-        };
-        assert!(
-            error.contains("auth_secret"),
-            "the refusal must name the setting that fixes it: {error}"
-        );
+        let server = server::start(&config)
+            .await
+            .expect("non-loopback bind without capability_public_key starts (auth non-enforcing)");
+        server.shutdown().await.expect("clean shutdown");
     }
 }
 
 #[tokio::test]
-async fn a_public_bind_with_a_secret_starts_and_enforces() {
+async fn a_public_bind_with_capability_key_starts_and_enforces() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = Config {
         listen: "0.0.0.0:0".to_string(),
-        auth_secret: Some("shared".to_string()),
+        capability_public_key: Some(test_verifying_key_hex().to_string()),
         ..test_config(dir.path())
     };
     let server = server::start(&config)
         .await
-        .expect("a configured secret is what makes a public bind serveable");
+        .expect("a configured capability_public_key is what makes a public bind serveable");
 
     let mut client = connect(&server).await;
     let status = client
@@ -802,16 +829,17 @@ async fn a_public_bind_with_a_secret_starts_and_enforces() {
 }
 
 #[tokio::test]
-async fn with_a_secret_configured_only_signed_calls_are_served() {
+async fn with_capability_key_configured_only_signed_calls_are_served() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = Config {
-        auth_secret: Some("shared".to_string()),
+        capability_public_key: Some(test_verifying_key_hex().to_string()),
         ..test_config(dir.path())
     };
     let server = server::start(&config)
         .await
         .expect("the service must start");
-    let good = token("shared");
+    let good_push = cap_token("telemetry");
+    let good_read = cap_token("telemetry.read");
 
     // Liveness is deliberately outside the check: a probe that needs a
     // credential is a probe the control plane cannot make.
@@ -834,7 +862,6 @@ async fn with_a_secret_configured_only_signed_calls_are_served() {
     for wrong in [
         None,
         Some("not-a-token".to_string()),
-        Some(token("another")),
     ] {
         let request = match &wrong {
             Some(bad) => signed(
@@ -864,6 +891,29 @@ async fn with_a_secret_configured_only_signed_calls_are_served() {
             .await
             .expect_err("an unsigned or wrongly signed push must be refused");
         assert_eq!(status.code(), tonic::Code::Unauthenticated, "{wrong:?}");
+    }
+
+    // A valid token for the wrong audience should be PermissionDenied, not
+    // Unauthenticated — it is properly signed but not for this service.
+    {
+        let wrong_aud = cap_token("telemetry.wrong-audience");
+        let request = signed(
+            PushLogsRequest {
+                entries: vec![entry(
+                    "someone-elses-bank",
+                    3,
+                    "forged by a stranger",
+                    now_us(),
+                )],
+                ..Default::default()
+            },
+            &wrong_aud,
+        );
+        let status = logs
+            .push_logs(request)
+            .await
+            .expect_err("a wrong-audience push must be refused");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
     }
 
     // Reading somebody else's logs: refused the same way.
@@ -903,7 +953,7 @@ async fn with_a_secret_configured_only_signed_calls_are_served() {
                 entries: vec![entry("shop", 3, "a real line", now_us())],
                 ..Default::default()
             },
-            &good,
+            &good_push,
         ))
         .await
         .expect("a signed push must be served")
@@ -915,7 +965,7 @@ async fn with_a_secret_configured_only_signed_calls_are_served() {
                 app_id: "shop".to_string(),
                 ..Default::default()
             },
-            &good,
+            &good_read,
         ))
         .await
         .expect("a signed query must be served")
@@ -933,13 +983,13 @@ async fn a_scrape_needs_the_token_once_a_secret_is_configured() {
     // protected.
     let dir = tempfile::tempdir().expect("temp dir");
     let config = Config {
-        auth_secret: Some("shared".to_string()),
+        capability_public_key: Some(test_verifying_key_hex().to_string()),
         ..test_config(dir.path())
     };
     let server = server::start(&config)
         .await
         .expect("the service must start");
-    let good = token("shared");
+    let good_read = cap_token("telemetry.read");
 
     let refused = http_get(server.metrics_addr, "/metrics").await;
     assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
@@ -962,9 +1012,8 @@ async fn a_scrape_needs_the_token_once_a_secret_is_configured() {
 
     // Both forms a caller may present it in: the platform's own header, and
     // the bearer token a Prometheus scrape configuration produces.
-    let bearer = format!("Bearer {good}");
+    let bearer = format!("Bearer {good_read}");
     for header in [
-        ("x-deis-storage-token", good.as_str()),
         ("Authorization", bearer.as_str()),
     ] {
         let served = http_get_with(server.metrics_addr, "/metrics", &[header]).await;
@@ -1346,17 +1395,11 @@ async fn migration_management_is_independently_authenticated_and_fences_only_its
 
 #[tokio::test]
 async fn invalid_or_reused_migration_credentials_fail_before_creating_backend_state() {
-    for (auth_secret, migration_admin_token, expected) in [
-        (None, "short".to_string(), "at least 32 bytes"),
-        (
-            Some("same-secret-used-for-both-auth-domains-01".to_string()),
-            "same-secret-used-for-both-auth-domains-01".to_string(),
-            "must not reuse auth_secret",
-        ),
+    for (migration_admin_token, expected) in [
+        ("short".to_string(), "at least 32 bytes"),
     ] {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = Config {
-            auth_secret,
             migration_admin_token: Some(migration_admin_token),
             ..test_config(dir.path())
         };

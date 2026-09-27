@@ -19,6 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum_server::tls_rustls::RustlsConfig;
 use deis_identity::{IdentityFiles, MachineIdentity, Protocol};
@@ -64,12 +67,23 @@ pub fn load_identity(config: &MachineChannelConfig) -> anyhow::Result<Arc<Machin
     Ok(identity)
 }
 
+/// Route for public key distribution so downstream services can discover
+/// the verifying key at startup.
+pub const CAPABILITY_KEY_ROUTE: &str = "/.well-known/deis/capability-public-key";
+
+/// Serve the raw 32-byte Ed25519 verifying key.
+async fn capability_public_key(State(issuer): State<CapabilityIssuer>) -> impl IntoResponse {
+    let vk = issuer.verifying_key().await;
+    (StatusCode::OK, vk.as_bytes().to_vec())
+}
+
 /// Everything a machine may call, and nothing else.
 ///
 /// No CORS, no console fallback and no human authentication layer: none of
 /// them has a caller here, and a layer mounted where it has no caller is a
 /// layer nobody notices is misconfigured.
 pub fn router(state: CatalogState, issuer: CapabilityIssuer, control: ControlServiceServer<GrpcControlService>) -> Router {
+    let issuer_for_key_endpoint = issuer.clone();
     let rpcs = Routes::default()
         .add_service(MachineChannelServer::new(MachineChannelService::new(
             state.clone(),
@@ -84,6 +98,11 @@ pub fn router(state: CatalogState, issuer: CapabilityIssuer, control: ControlSer
         Router::new()
             .route(versions::BUNDLE_ROUTE, get(versions::download_bundle))
             .with_state(state),
+    )
+    .merge(
+        Router::new()
+            .route(CAPABILITY_KEY_ROUTE, get(capability_public_key))
+            .with_state(issuer_for_key_endpoint),
     )
 }
 

@@ -6,11 +6,9 @@
 //! is also where the tenant id is built - here it is one opaque key.
 //!
 //! Who a caller is allowed to be, it does check: a call carries a capability
-//! token for the tenant it names, derived from the `auth_secret` this service
-//! and deis-control share. With no secret configured it listens on loopback
-//! and believes the header, which is the default single-box install; binding
-//! anywhere else in that state is refused at startup. See
-//! [`deis_store::auth`].
+//! token for the tenant it names, an Ed25519-signed JCS-JWT verified against
+//! the control plane's public key. Every call must present a valid token;
+//! there is no anonymous or loopback bypass. See [`deis_store::auth`].
 //!
 //! Beside serving, the binary is also how a data directory is backed up and
 //! put back: `snapshot` and `restore`. Those are subcommands rather than RPCs
@@ -110,7 +108,44 @@ async fn main() -> Result<()> {
 
 async fn serve(config: Config) -> Result<()> {
     let listener = server::bind(&config).await?;
-    server::serve(config, listener, server::shutdown_signal()).await
+
+    // Build the verifying key from the configured hex string, the
+    // DEIS_CAPABILITY_PUBLIC_KEY environment variable, or fetch it
+    // from the control plane.
+    let verifying_key = load_verifying_key(&config)?;
+
+    server::serve(config, listener, server::shutdown_signal(), verifying_key).await
+}
+
+fn load_verifying_key(config: &Config) -> Result<ed25519_dalek::VerifyingKey> {
+    use ed25519_dalek::VerifyingKey;
+
+    // Try the config file first
+    if let Some(ref hex_key) = config.capability_public_key {
+        let bytes = hex::decode(hex_key)
+            .context("capability_public_key in config is not valid hex")?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("capability_public_key must be 32 bytes (64 hex chars)"))?;
+        return Ok(VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {e}"))?);
+    }
+
+    // Try the environment variable
+    if let Ok(hex_key) = std::env::var("DEIS_CAPABILITY_PUBLIC_KEY") {
+        let bytes = hex::decode(&hex_key)
+            .context("DEIS_CAPABILITY_PUBLIC_KEY is not valid hex")?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("DEIS_CAPABILITY_PUBLIC_KEY must be 32 bytes (64 hex chars)"))?;
+        return Ok(VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("invalid Ed25519 public key: {e}"))?);
+    }
+
+    anyhow::bail!(
+        "No capability verifying key configured. Set capability_public_key in the config \
+         file, or set the DEIS_CAPABILITY_PUBLIC_KEY environment variable."
+    )
 }
 
 fn take_snapshot(config: &Config, out: &std::path::Path) -> Result<()> {

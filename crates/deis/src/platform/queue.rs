@@ -456,11 +456,17 @@ mod tests {
         const CEILING: i32 = 2;
 
         let data = tempfile::tempdir().unwrap();
+        let signing_key = {
+            let mut seed = [0u8; 32];
+            seed[..SECRET.len()].copy_from_slice(SECRET.as_bytes());
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let verifying_key = signing_key.verifying_key();
         let config = deis_queue::config::Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
             max_attempts: CEILING,
-            auth_secret: Some(SECRET.to_string()),
+            capability_public_key: Some(hex::encode(verifying_key.as_bytes())),
             ..deis_queue::config::Config::default()
         };
         // Bound before anything is spawned, so the port is known and no part
@@ -471,7 +477,7 @@ mod tests {
         let server = tokio::spawn(async move {
             deis_queue::server::serve(config, listener, async {
                 let _ = stopped.await;
-            })
+            }, verifying_key)
             .await
             .unwrap();
         });

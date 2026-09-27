@@ -1,24 +1,8 @@
 //! Operator-facing configuration.
 //!
-//! # `listen` and `auth_secret` are one decision, not two
-//!
-//! Whether a caller is authenticated at all is decided by `auth_secret`, and
-//! what happens when it is absent depends on `listen`:
-//!
-//! * `auth_secret` set: every call must carry a capability token for the
-//!   tenant it names, wherever the service is bound. See [`crate::auth`].
-//! * No `auth_secret`, loopback `listen`: the service runs exactly as it did
-//!   before tokens existed - the tenant header is believed, and what keeps
-//!   one tenant's messages away from an unrelated client is that the client
-//!   cannot reach the port. This is the default single-box install and it is
-//!   supported; the service says so at startup, at `warn`.
-//! * No `auth_secret`, any other `listen`: the service refuses to start.
-//!   Reachable from another host with nothing checking the tenant header is
-//!   every tenant's queue published to that network, and an unconfigured
-//!   secret must not be able to mean that by accident.
-//!
-//! The value is the same one deis-store is configured with: one secret, one
-//! token per tenant, both services.
+//! Every call must carry an Ed25519-signed capability token in
+//! `Authorization: Bearer <token>`. The verifying key is configured via
+//! `capability_public_key` or fetched from the control plane.
 
 use crate::queue::QueueLimits;
 use serde::Deserialize;
@@ -33,27 +17,17 @@ use std::time::Duration;
 pub struct Config {
     /// Address the gRPC server binds to.
     ///
-    /// Loopback by default, because the default install configures no
-    /// `auth_secret` and then the only thing keeping one tenant's messages
-    /// away from an unrelated client is that the client cannot reach the
-    /// port. Binding anywhere else without an `auth_secret` is refused at
-    /// startup rather than warned about; see the module docs.
+    /// Loopback by default. Every call must carry a valid capability token
+    /// regardless of the bind address; there is no anonymous or loopback
+    /// bypass.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Shared secret the per-tenant capability tokens are derived from, or
-    /// `None` to run with no caller authentication at all.
+    /// The control plane's capability verifying key, in hex.
     ///
-    /// The same value must be configured on deis-store and on deis-control,
-    /// which mints `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant
-    /// and hands it to the node running that tenant. Anything that reaches
-    /// this service without a token matching the tenant it names is refused.
-    /// Rotating the value invalidates every token at once, so change it here,
-    /// on deis-store and on deis-control together.
-    ///
-    /// `None` is only permitted on a loopback bind - [`crate::auth`] has the
-    /// reasoning and the refusal.
+    /// This is the Ed25519 public key that deis-control uses to sign
+    /// capability tokens.
     #[serde(default)]
-    pub auth_secret: Option<String>,
+    pub capability_public_key: Option<String>,
     /// Independent credential for migration inventory and writer fencing.
     /// If absent, the management gRPC service does not exist; there is no
     /// loopback bypass and this must not reuse the application data secret.
@@ -188,7 +162,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
-            auth_secret: None,
+            capability_public_key: None,
             migration_admin_token: None,
             data_dir: default_data_dir(),
             connections: default_connections(),
@@ -255,7 +229,7 @@ mod tests {
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
         assert_eq!(parsed.listen, defaults.listen);
-        assert_eq!(parsed.auth_secret, defaults.auth_secret);
+        assert_eq!(parsed.capability_public_key, defaults.capability_public_key);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.connections, defaults.connections);
@@ -284,10 +258,9 @@ mod tests {
 
     #[test]
     fn the_default_address_is_loopback() {
-        // With no auth_secret - which is the default - the tenant header is
-        // believed, so reachability is the only thing keeping an unrelated
-        // client away from a tenant's messages. Anything else is refused at
-        // startup rather than served, so this default is load-bearing.
+        // Every call must carry a valid capability token regardless of the
+        // bind address. The default is loopback as a defence-in-depth
+        // measure.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
     }
@@ -346,19 +319,21 @@ mod tests {
     }
 
     #[test]
-    fn the_secret_is_read_from_a_file() {
+    fn the_public_key_is_read_from_a_file() {
         let parsed: Config = toml::from_str(
-            "auth_secret = \"a-shared-secret\"\nmigration_admin_token = \"an-independent-migration-secret\"",
+            "capability_public_key = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\nmigration_admin_token = \"an-independent-migration-secret\"",
         )
         .unwrap();
-        assert_eq!(parsed.auth_secret.as_deref(), Some("a-shared-secret"));
+        assert_eq!(
+            parsed.capability_public_key.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(
             parsed.migration_admin_token.as_deref(),
             Some("an-independent-migration-secret")
         );
-        // Unset by default, which is what makes the loopback install work
-        // with no configuration at all.
-        assert_eq!(Config::default().auth_secret, None);
+        // Unset by default.
+        assert_eq!(Config::default().capability_public_key, None);
     }
 
     #[test]

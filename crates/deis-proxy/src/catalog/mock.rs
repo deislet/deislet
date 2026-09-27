@@ -105,6 +105,13 @@ impl MachineChannel for MockService {
     ) -> Result<Response<deis_wire::machine::FetchSecretValuesResponse>, Status> {
         Err(Status::unimplemented("fetch_secret_values"))
     }
+
+    async fn issue_capability(
+        &self,
+        _request: Request<deis_wire::machine::IssueCapabilityRequest>,
+    ) -> Result<Response<deis_wire::machine::IssueCapabilityResponse>, Status> {
+        Err(Status::unimplemented("issue_capability"))
+    }
 }
 
 /// A TLS connection tonic will serve on.

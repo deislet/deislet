@@ -397,6 +397,63 @@ pub fn verify_for_request(
     })
 }
 
+// ---- verifier -------------------------------------------------------------
+
+/// A reusable verifier for capability tokens.
+///
+/// Bundles the verifying key with the two revocation-state inputs
+/// (`min_auth_epoch` and `revoked_jtis`) so a service can construct one
+/// verifier at startup and reuse it for every request.
+#[derive(Debug, Clone)]
+pub struct CapabilityVerifier {
+    /// The Ed25519 public key for verifying signatures.
+    verifying_key: ed25519_dalek::VerifyingKey,
+    /// Minimum auth_epoch accepted (loaded from revocation feed).
+    min_auth_epoch: u64,
+    /// List of revoked JTIs (loaded from revocation feed).
+    revoked_jtis: Vec<String>,
+}
+
+impl CapabilityVerifier {
+    /// Create a verifier with `min_auth_epoch = 0` and an empty revoked list.
+    pub fn new(verifying_key: ed25519_dalek::VerifyingKey) -> Self {
+        Self {
+            verifying_key,
+            min_auth_epoch: 0,
+            revoked_jtis: Vec::new(),
+        }
+    }
+
+    /// Update the minimum accepted auth epoch.
+    pub fn set_min_auth_epoch(&mut self, epoch: u64) {
+        self.min_auth_epoch = epoch;
+    }
+
+    /// Replace the revoked JTI list.
+    pub fn set_revoked_jtis(&mut self, jtis: Vec<String>) {
+        self.revoked_jtis = jtis;
+    }
+
+    /// Verify a token against an expected audience, tenant, and binding.
+    pub fn verify(
+        &self,
+        token: &str,
+        expected_aud: &str,
+        tenant: &str,
+        binding: &str,
+    ) -> Result<VerifiedCapability, CapabilityError> {
+        verify_for_request(
+            token,
+            &self.verifying_key,
+            expected_aud,
+            tenant,
+            binding,
+            Some(self.min_auth_epoch),
+            Some(&self.revoked_jtis),
+        )
+    }
+}
+
 // ---- helpers --------------------------------------------------------------
 
 /// JCS-canonicalize the claims to deterministic bytes for signing.

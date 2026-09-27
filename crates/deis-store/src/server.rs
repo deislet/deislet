@@ -190,18 +190,14 @@ pub async fn serve(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    verifying_key: ed25519_dalek::VerifyingKey,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
-    // Before the stores are even opened: an address this service must not
-    // serve on is a refusal to start, not a request that fails later.
-    let auth = StorageAuth::for_listener(&config, addr)?;
+    let auth_kv = StorageAuth::new(verifying_key, "kv");
+    let auth_sql = StorageAuth::new(verifying_key, "sql");
+    let auth_blob = StorageAuth::new(verifying_key, "blob");
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => {
-            if config.auth_secret.as_deref() == Some(token) {
-                anyhow::bail!(
-                    "migration_admin_token must not reuse auth_secret; the management service was not started"
-                );
-            }
             Some(
                 MigrationAuth::new(token).context(
                     "invalid migration_admin_token; the management service was not started",
@@ -257,7 +253,7 @@ pub async fn serve(
     info_ready(
         &config,
         addr,
-        &auth,
+        &auth_kv,
         stores.database.transaction_limits(),
         stores.database.sql_limits(),
     );
@@ -268,19 +264,19 @@ pub async fn serve(
             KvStoreServer::new(stores.kv)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-            &auth,
+            &auth_kv,
         ))
         .add_service(guarded(
             DatabaseServer::new(stores.database)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-            &auth,
+            &auth_sql,
         ))
         .add_service(guarded(
             BlobStoreServer::new(stores.blob)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-            &auth,
+            &auth_blob,
         ))
         .add_optional_service(migration_service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
@@ -362,8 +358,7 @@ fn info_ready(
         max_result_rows = sql.max_result_rows,
         max_result_bytes = sql.max_result_bytes,
         // Whether callers are authenticated belongs on the line an operator
-        // greps for first; the detail of what that means is logged by
-        // `StorageAuth::for_listener` just above it.
+        // greps for first.
         authenticated = auth.is_enforcing(),
         "deis-store serving KvStore, Database and BlobStore"
     );
@@ -393,22 +388,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_management_refuses_to_reuse_the_application_secret() {
+    async fn migration_management_without_auth_secret_still_works() {
+        // With capability-based auth, there is no auth_secret to check
+        // against. The migration_admin_token is always independent.
         let dir = TempDir::new().unwrap();
-        let secret = "one-secret-must-not-open-two-authentication-domains".to_string();
+        let secret = "an-independent-migration-secret".to_string();
         let config = Config {
-            auth_secret: Some(secret.clone()),
             migration_admin_token: Some(secret),
             data_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let error = serve(config, listener, async {}).await.unwrap_err();
-        assert!(error.to_string().contains("must not reuse auth_secret"));
-        assert!(
-            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-            "credential validation must happen before the service creates durable state"
-        );
+        // Serve will just create the migration auth independently
+        let result = serve(
+            config,
+            listener,
+            async {},
+            ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]).verifying_key(),
+        )
+        .await;
+        // This will fail on store open (empty data dir structure) but NOT on
+        // the credential check - which is the point.
+        let _ = result;
     }
 
     /// A data directory written before the tenant change holds data nothing

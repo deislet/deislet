@@ -59,18 +59,20 @@ pub fn router(state: MetricsState, auth: TelemetryAuth) -> Router {
 /// was supposed to send. With no secret configured this passes everything
 /// through unchanged; see [`crate::auth`].
 async fn guard(State(auth): State<TelemetryAuth>, request: Request, next: Next) -> Response {
-    if auth.check_scrape(request.headers()) {
-        return next.run(request).await;
+    match auth.verify_headers(request.headers()).await {
+        Ok(_) => return next.run(request).await,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [
+                    (header::WWW_AUTHENTICATE, "Bearer"),
+                    (header::CONTENT_TYPE, CONTENT_TYPE),
+                ],
+                "# deis-telemetry requires a capability token on this endpoint\n",
+            )
+                .into_response()
+        }
     }
-    (
-        StatusCode::UNAUTHORIZED,
-        [
-            (header::WWW_AUTHENTICATE, "Bearer"),
-            (header::CONTENT_TYPE, CONTENT_TYPE),
-        ],
-        "# deis-telemetry requires a capability token on this endpoint\n",
-    )
-        .into_response()
 }
 
 async fn scrape(State(state): State<MetricsState>) -> impl IntoResponse {
