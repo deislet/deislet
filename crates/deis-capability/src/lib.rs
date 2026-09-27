@@ -39,10 +39,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod keys;
 #[cfg(feature = "jwks-fetch")]
+pub mod control;
+#[cfg(feature = "jwks-fetch")]
 pub mod exposition;
 #[cfg(feature = "jwks-fetch")]
 pub mod fetch;
 pub mod revocation;
+
+#[cfg(feature = "jwks-fetch")]
+pub use control::{ControlClient, ControlClientConfig, ControlClientError, ServiceIdentityConfig};
+
+/// Where the control plane serves its capability verifying keys as a JWKS
+/// document, on its machine channel.
+pub const JWKS_PATH: &str = "/.well-known/deis/capability-jwks.json";
 
 pub use keys::{Jwk, Jwks, JwksError, KeyRing, key_id};
 pub use revocation::{RevocationList, RevocationListError, SignedRevocationList};

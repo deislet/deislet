@@ -22,10 +22,12 @@ sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+url = { version = "2", optional = true }
 
 [features]
-# Background refresh of a verifier's key ring from the control plane's JWKS.
-jwks-fetch = ["dep:reqwest", "dep:tokio", "dep:tracing"]
+# Background refresh of a verifier's key ring from the control plane's JWKS,
+# read over the machine channel under mutual TLS (see `control`).
+jwks-fetch = ["dep:reqwest", "dep:tokio", "dep:tracing", "dep:url"]
 
 [dev-dependencies]
 tokio = { workspace = true }
