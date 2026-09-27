@@ -54,9 +54,39 @@ fn issued_for(tenants: &[&str]) -> String {
     encode(&claims, &control_key())
 }
 
+/// The authority the collector's certificate is issued by, installed once as
+/// the trust this node checks data services against.
+fn fleet() -> &'static deis_identity_test_pki::TestFleet {
+    static FLEET: std::sync::OnceLock<deis_identity_test_pki::TestFleet> =
+        std::sync::OnceLock::new();
+    FLEET.get_or_init(|| {
+        let fleet = deis_identity_test_pki::TestFleet::new();
+        deis_runtime::runtime::service_tls::install(deis_identity::ServiceTrust::from_identity(
+            fleet.service_identity(deis_identity::ServiceKind::Node),
+        ));
+        fleet
+    })
+}
+
+/// The collector's `[machine_identity]`: served over TLS, as every
+/// deis-telemetry is.
+fn collector_identity() -> Option<deis_capability::ServiceIdentityConfig> {
+    let fleet = fleet();
+    let id = deis_identity::names::telemetry(&fleet.trust_domain, "test").unwrap();
+    let files = fleet.files_for("telemetry", &id);
+    Some(deis_capability::ServiceIdentityConfig {
+        certificate: files.certificate,
+        private_key: files.private_key,
+        trust_root: files.trust_root,
+        control_endpoint: "http://127.0.0.1:1".to_string(),
+        identity_reload_seconds: 60,
+    })
+}
+
 /// A collector on ephemeral loopback ports trusting the control key.
 async fn collector(data_dir: &std::path::Path) -> RunningServer {
     let config = Config {
+        machine_identity: collector_identity(),
         listen: "127.0.0.1:0".to_string(),
         metrics_listen: "127.0.0.1:0".to_string(),
         data_dir: data_dir.to_path_buf(),
@@ -89,7 +119,7 @@ async fn ship_one_line(
 
     let mut config = ShipperConfig::from(&LoggingConfig {
         enabled: true,
-        endpoint: Some(format!("http://{}", server.grpc_addr)),
+        endpoint: Some(format!("https://{}", server.grpc_addr)),
         flush_interval_secs: 1,
         max_retries: 1,
         ..LoggingConfig::default()

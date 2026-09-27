@@ -35,7 +35,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::server::NamedService;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
@@ -161,6 +162,50 @@ fn report_interrupt(result: std::io::Result<()>) {
     }
 }
 
+/// This service's machine identity and its client for the control plane's
+/// machine channel, both from `[machine_identity]`.
+///
+/// Refused before anything is bound: a missing table, a certificate that
+/// does not name a telemetry service - which every caller would refuse, each
+/// with a handshake error of its own - and a control plane reached over
+/// plaintext off this host, which could hand this service any signing key.
+pub fn machine_identity(
+    config: &Config,
+) -> Result<(
+    Arc<deis_identity::MachineIdentity>,
+    deis_capability::ControlClient,
+)> {
+    let identity_config = config.machine_identity.as_ref().context(
+        "deis-telemetry serves only over TLS with its own machine identity, and this \
+         configuration has no [machine_identity] table; see deis-telemetry.example.toml",
+    )?;
+    let identity = identity_config
+        .load(deis_identity::ServiceKind::Telemetry)
+        .context("cannot load this telemetry service's machine identity")?;
+    let control = identity_config
+        .control_client(Arc::clone(&identity))
+        .context("cannot reach the control plane's machine channel as configured")?;
+    Ok((identity, control))
+}
+
+/// Connections on `listener`, each one past its TLS handshake.
+fn tls_incoming(
+    listener: TcpListener,
+    identity: Arc<deis_identity::MachineIdentity>,
+) -> impl tokio_stream::Stream<
+    Item = std::io::Result<
+        deis_wire::served::Served<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    >,
+> {
+    ReceiverStream::new(deis_identity::accept_tls(listener, identity)).map(|accepted| {
+        Ok(deis_wire::served::Served::new(
+            accepted.stream,
+            accepted.local_addr,
+            accepted.remote_addr,
+        ))
+    })
+}
+
 /// Start every part of the service against `config`.
 ///
 /// `keys` is the control plane's key ring every capability is verified
@@ -168,6 +213,7 @@ fn report_interrupt(result: std::io::Result<()>) {
 /// tests fill it by hand) shares it with the guards here.
 pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<RunningServer> {
     config.validate()?;
+    let (identity, _control) = machine_identity(config)?;
 
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => Some(
@@ -317,7 +363,7 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
             .add_service(trace_service)
             .add_service(metric_service)
             .add_optional_service(migration_service)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), grpc_shutdown)
+            .serve_with_incoming_shutdown(tls_incoming(grpc_listener, identity), grpc_shutdown)
             .await;
         match result {
             Ok(()) => info!("gRPC server stopped"),

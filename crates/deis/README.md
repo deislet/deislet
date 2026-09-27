@@ -52,7 +52,13 @@ Three places, in this order of precedence:
 endpoint = "http://127.0.0.1:8085"
 
 [telemetry]
-endpoint = "http://127.0.0.1:8092"
+endpoint = "https://127.0.0.1:8092"
+
+# The authority deis-store, deis-queue and deis-telemetry certificates chain
+# to. A public certificate, so it is safe here; a relative path is read from
+# this directory.
+[services]
+ca = "deploy/ca.crt"
 
 [defaults]
 app = "shop"           # falls back to "name" in .config.json
@@ -64,8 +70,16 @@ environment = "production"
 | `control.endpoint` | `DEIS_CONTROL_ENDPOINT` |
 | `control.token` | `DEIS_CONTROL_TOKEN` |
 | `telemetry.endpoint` | `DEIS_TELEMETRY_ENDPOINT` |
+| `services.ca` | `DEIS_SERVICES_CA` |
 | `defaults.app` | `DEIS_APP` |
 | `defaults.environment` | `DEIS_ENVIRONMENT` |
+
+deis-store, deis-queue and deis-telemetry serve TLS only. `deis kv`, `db`,
+`blob`, `queue`, `logs`, `tail` and `trace` check each server's certificate
+against `services.ca` and refuse one that does not chain to it or that names
+another kind of service, so the capability a command carries is never sent to
+the wrong machine or in the clear. An `http://` address is refused unless it
+is a loopback IP.
 
 ### The credential never goes in the project
 

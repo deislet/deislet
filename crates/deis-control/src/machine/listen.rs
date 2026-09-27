@@ -69,9 +69,10 @@ pub fn load_identity(config: &MachineChannelConfig) -> anyhow::Result<Arc<Machin
 
 /// Serve every published capability verifying key as a JWKS document.
 ///
-/// Public keys only, so it needs no credential; it is on this listener for
-/// callers that hold a machine identity, and on the human one for store and
-/// queue, which do not.
+/// Public keys only, yet served here and nowhere else: whoever answers for
+/// this document decides which capabilities deis-store, deis-queue and
+/// deis-telemetry honour, so they read it under mutual TLS, proving their own
+/// machine identity and requiring this control plane's.
 pub async fn capability_jwks(State(issuer): State<CapabilityIssuer>) -> impl IntoResponse {
     (
         StatusCode::OK,

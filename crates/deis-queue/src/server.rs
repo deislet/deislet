@@ -38,12 +38,14 @@ use anyhow::{Context, Result};
 use deis_backend_migration::MigrationAuth;
 use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 
@@ -180,11 +182,15 @@ fn report_interrupt(result: std::io::Result<()>) {
 /// can learn the port before the server starts accepting. `keys` is the
 /// control plane's key ring; whoever keeps it current (the binary starts a
 /// JWKS refresher, tests fill it by hand) shares it with every guard here.
+/// `identity` is the certificate every connection is served with: the
+/// listener speaks TLS only, so a bearer capability is never readable on the
+/// wire and a caller that checks the certificate knows it reached a queue.
 pub async fn serve(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
     keys: deis_capability::KeyRing,
+    identity: Arc<deis_identity::MachineIdentity>,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
     let auth = QueueAuth::new(keys);
@@ -256,7 +262,7 @@ pub async fn serve(
         }
     };
 
-    info_ready(&config, addr, &auth);
+    info_ready(&config, addr, &identity, &auth);
 
     let mut builder = Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
@@ -274,7 +280,7 @@ pub async fn serve(
             &auth,
         ))
         .add_optional_service(migration_service)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(tls_incoming(listener, identity), shutdown)
         .await;
 
     // Nothing else keeps the sweeper alive, and leaving it running would hold
@@ -300,9 +306,60 @@ pub async fn serve(
     }
 }
 
-fn info_ready(config: &Config, addr: std::net::SocketAddr, auth: &QueueAuth) {
+/// This queue's machine identity and its client for the control plane's
+/// machine channel, both from `[machine_identity]`.
+///
+/// Everything here is refused before a socket is bound: a missing table, a
+/// certificate that does not name a queue, and a control plane reached over
+/// plaintext off this host - which could hand this queue any signing key and
+/// so decide which capabilities it honours.
+pub fn machine_identity(
+    config: &Config,
+) -> Result<(
+    Arc<deis_identity::MachineIdentity>,
+    deis_capability::ControlClient,
+)> {
+    let identity_config = config.machine_identity.as_ref().context(
+        "deis-queue serves only over TLS with its own machine identity, and this configuration \
+         has no [machine_identity] table; see deis-queue.example.toml",
+    )?;
+    let identity = identity_config
+        .load(deis_identity::ServiceKind::Queue)
+        .context("cannot load this queue's machine identity")?;
+    let control = identity_config
+        .control_client(Arc::clone(&identity))
+        .context("cannot reach the control plane's machine channel as configured")?;
+    Ok((identity, control))
+}
+
+/// Connections on `listener`, each one past its TLS handshake.
+fn tls_incoming(
+    listener: TcpListener,
+    identity: Arc<deis_identity::MachineIdentity>,
+) -> impl tokio_stream::Stream<
+    Item = std::io::Result<
+        deis_wire::served::Served<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    >,
+> {
+    ReceiverStream::new(deis_identity::accept_tls(listener, identity)).map(|accepted| {
+        Ok(deis_wire::served::Served::new(
+            accepted.stream,
+            accepted.local_addr,
+            accepted.remote_addr,
+        ))
+    })
+}
+
+fn info_ready(
+    config: &Config,
+    addr: std::net::SocketAddr,
+    identity: &deis_identity::MachineIdentity,
+    auth: &QueueAuth,
+) {
     tracing::info!(
         %addr,
+        identity = %identity.id(),
+        tls = true,
         data_dir = %config.data_dir.display(),
         max_message_size = MAX_GRPC_MESSAGE_BYTES,
         max_body_bytes = config.max_body_bytes,
@@ -355,13 +412,16 @@ mod tests {
             ..Config::default()
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fleet = deis_identity_test_pki::TestFleet::new();
         let result = serve(
             config,
             listener,
             async {},
-            deis_capability::KeyRing::from_keys([
-                ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]).verifying_key(),
-            ]),
+            deis_capability::KeyRing::from_keys([ed25519_dalek::SigningKey::from_bytes(
+                &[0u8; 32],
+            )
+            .verifying_key()]),
+            fleet.service_identity(deis_identity::ServiceKind::Queue),
         )
         .await;
         // Will fail on queue open (empty dir) but NOT on credential check

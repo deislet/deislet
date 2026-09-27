@@ -1,9 +1,11 @@
 //! End-to-end checks against a real deis-store server.
 //!
-//! Everything here goes over a real TCP socket and the real generated
-//! clients, so it exercises the parts unit tests cannot: metadata handling,
-//! the streaming blob protocol, the message size ceiling, and the fact that
-//! the three services are actually registered on the server.
+//! Everything here goes over a real TCP socket, under TLS with a test
+//! authority's certificates, and the real generated clients, so it exercises
+//! the parts unit tests cannot: metadata handling, the streaming blob
+//! protocol, the message size ceiling, the fact that the three services are
+//! actually registered on the server, and that a caller refuses a server the
+//! fleet's authority did not sign for as a store.
 //!
 //! Every call stamps `x-deis-tenant` with an `<app>.<environment>` value,
 //! which is what deis-runtime has to send. The tests below use
@@ -16,6 +18,8 @@ use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
 use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode};
+use deis_identity::{Protocol, ServiceKind};
+use deis_identity_test_pki::TestFleet;
 use deis_store::config::Config;
 use deis_store::proto::blob::{
     BlobInfo, PutHeader, PutRequest, blob_store_client::BlobStoreClient, get_response, put_request,
@@ -33,7 +37,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::Request;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 const AUTHORIZATION: &str = "authorization";
 const TOKEN_LIFETIME_SECS: u64 = 900;
@@ -97,6 +101,7 @@ struct Harness {
     _data: Option<TempDir>,
     endpoint: String,
     shutdown: Option<oneshot::Sender<()>>,
+    fleet: TestFleet,
 }
 
 impl Harness {
@@ -146,6 +151,8 @@ impl Harness {
         let addr = listener.local_addr().unwrap();
         let (shutdown, rx) = oneshot::channel();
         let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
+        let fleet = TestFleet::new();
+        let identity = fleet.service_identity(ServiceKind::Store);
         tokio::spawn(async move {
             server::serve(
                 config,
@@ -154,21 +161,29 @@ impl Harness {
                     let _ = rx.await;
                 },
                 keys,
+                identity,
             )
             .await
             .unwrap();
         });
         Self {
             _data: owned,
-            endpoint: format!("http://{addr}"),
+            endpoint: format!("https://{addr}"),
             shutdown: Some(shutdown),
+            fleet,
         }
     }
 
+    /// A channel that checks the far end is a store of this fleet, the way
+    /// every real caller does.
     async fn channel(&self) -> Channel {
-        Channel::from_shared(self.endpoint.clone())
+        Endpoint::from_shared(self.endpoint.clone())
             .unwrap()
-            .connect()
+            .connect_with_connector(
+                self.fleet
+                    .service_trust()
+                    .dialler(ServiceKind::Store, &[Protocol::Http2]),
+            )
             .await
             .unwrap()
     }
@@ -1627,7 +1642,15 @@ async fn a_public_bind_still_works_when_authenticated() {
     drop(listener);
 
     let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
-    let result = server::serve(config, public, async {}, keys).await;
+    let fleet = TestFleet::new();
+    let result = server::serve(
+        config,
+        public,
+        async {},
+        keys,
+        fleet.service_identity(ServiceKind::Store),
+    )
+    .await;
     // With a verifying key always provided, binding on a public interface
     // is allowed — capability auth secures every call regardless of
     // interface.
@@ -1945,4 +1968,61 @@ async fn migration_management_is_absent_by_default_and_independently_authenticat
         ))
         .await
         .unwrap();
+}
+
+/// The transport half of the store's contract: a caller that trusts this
+/// fleet's authority refuses a server whose certificate that authority did
+/// not sign, and refuses one it did sign for another kind of machine - so a
+/// bearer capability is never handed to whoever merely answers at the
+/// store's address.
+#[tokio::test]
+async fn a_caller_refuses_a_store_the_fleet_did_not_sign_for() {
+    let harness = Harness::start().await;
+
+    // Signed by another authority altogether.
+    let stranger = TestFleet::new();
+    let refused = Endpoint::from_shared(harness.endpoint.clone())
+        .unwrap()
+        .connect_with_connector(
+            stranger
+                .service_trust()
+                .dialler(ServiceKind::Store, &[Protocol::Http2]),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a store certificate from an unknown authority was accepted"
+    );
+
+    // Signed by this fleet, but the caller meant to reach a queue.
+    let refused = Endpoint::from_shared(harness.endpoint.clone())
+        .unwrap()
+        .connect_with_connector(
+            harness
+                .fleet
+                .service_trust()
+                .dialler(ServiceKind::Queue, &[Protocol::Http2]),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a store's certificate answered for a queue"
+    );
+
+    // And plaintext gets no answer a client could mistake for a store.
+    let plaintext = Endpoint::from_shared(harness.endpoint.replace("https://", "http://"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut kv = KvStoreClient::new(plaintext);
+    assert!(
+        kv.get(as_tenant(
+            "app-one.production",
+            GetRequest { key: "k".into() }
+        ))
+        .await
+        .is_err(),
+        "the store answered a plaintext call"
+    );
 }

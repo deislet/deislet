@@ -5,7 +5,17 @@
 //! Every call must carry an Ed25519-signed capability token in
 //! `Authorization: Bearer <token>`. There is no anonymous mode and no
 //! loopback bypass: the verifying keys are fetched from the control plane's
-//! JWKS at `capability_jwks_url` and kept current. See [`crate::auth`].
+//! JWKS over its machine channel and kept current. See [`crate::auth`].
+//!
+//! # `[machine_identity]` is required to serve
+//!
+//! The gRPC listener speaks TLS only, presenting this store's own
+//! certificate (`spiffe://<trust domain>/deislet/store/<id>`), and the same
+//! identity is what the store proves to the control plane when it reads the
+//! JWKS. There is no plaintext listener, so a bearer capability never
+//! crosses the network readable. The table is optional to *parse* so that
+//! the offline subcommands (`snapshot`, `restore`) work without it; `serve`
+//! refuses to start without it.
 //!
 //! # `snapshot_dir` is the difference between having backups and not
 //!
@@ -45,19 +55,16 @@ pub struct Config {
     /// bypass.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Where the control plane publishes its capability verifying keys, as a
-    /// JWKS document.
+    /// This store's machine identity and the control plane's machine
+    /// channel. Required by `serve`; see the module note.
     ///
-    /// Fetched at startup (retried with backoff until the control plane
-    /// answers, refusing every call meanwhile), every 5 minutes after that,
-    /// and whenever a token names a key this process does not hold yet - so
-    /// a control-plane key rotation needs nothing done here. Public keys
-    /// only: no credential is sent or needed.
-    ///
-    /// Defaults to the control plane's human API listener on its default
-    /// port.
-    #[serde(default = "default_capability_jwks_url")]
-    pub capability_jwks_url: String,
+    /// The control plane's JWKS is read from `control_endpoint` at startup
+    /// (retried with backoff until the control plane answers, refusing every
+    /// call meanwhile), every 5 minutes after that, and whenever a token
+    /// names a key this process does not hold yet - so a control-plane key
+    /// rotation needs nothing done here.
+    #[serde(default)]
+    pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
     /// Where the control plane serves its signed revocation list.
     ///
     /// The store polls `{revocation_list_url}/capability/revocation-list`
@@ -220,10 +227,6 @@ fn default_snapshot_retention() -> usize {
     7
 }
 
-fn default_capability_jwks_url() -> String {
-    "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json".to_string()
-}
-
 fn default_revocation_list_url() -> String {
     "http://127.0.0.1:8100".to_string()
 }
@@ -249,7 +252,7 @@ impl Default for Config {
             max_object_bytes: default_max_object_bytes(),
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
-            capability_jwks_url: default_capability_jwks_url(),
+            machine_identity: None,
             revocation_list_url: default_revocation_list_url(),
             metrics_listen: None,
             migration_admin_token: None,
@@ -314,7 +317,7 @@ mod tests {
 
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
-        assert_eq!(parsed.capability_jwks_url, defaults.capability_jwks_url);
+        assert_eq!(parsed.machine_identity, defaults.machine_identity);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.durability, defaults.durability);
         assert_eq!(parsed.snapshot_dir, defaults.snapshot_dir);
@@ -497,7 +500,6 @@ mod tests {
     fn the_secret_and_the_snapshot_keys_are_read_from_a_file() {
         let parsed: Config = toml::from_str(
             r#"
-            capability_jwks_url = "https://control.internal/.well-known/deis/capability-jwks.json"
             migration_admin_token = "an-independent-migration-secret"
             snapshot_dir = "/var/backups/deis-store"
             snapshot_interval_secs = 3600
@@ -506,16 +508,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            parsed.capability_jwks_url,
-            "https://control.internal/.well-known/deis/capability-jwks.json"
-        );
-        assert_eq!(
             parsed.migration_admin_token.as_deref(),
             Some("an-independent-migration-secret")
         );
         let schedule = parsed.snapshot_schedule().unwrap();
         assert_eq!(schedule.interval, Duration::from_secs(3600));
         assert_eq!(schedule.retention, 24);
+    }
+
+    #[test]
+    fn the_machine_identity_table_is_read() {
+        let parsed: Config = toml::from_str(
+            r#"
+            [machine_identity]
+            certificate = "/etc/deis/store.crt"
+            private_key = "/etc/deis/store.key"
+            trust_root = "/etc/deis/ca.crt"
+            control_endpoint = "https://control.internal:8101"
+            "#,
+        )
+        .unwrap();
+        let identity = parsed.machine_identity.expect("the table");
+        assert_eq!(identity.control_endpoint, "https://control.internal:8101");
+        assert_eq!(identity.identity_reload_seconds, 60);
+        assert_eq!(
+            identity.control_client_config().ca_bundle,
+            PathBuf::from("/etc/deis/ca.crt")
+        );
+        // Half a table is a typo, not a default.
+        assert!(
+            toml::from_str::<Config>("[machine_identity]\ncertificate = \"/etc/deis/store.crt\"\n")
+                .is_err()
+        );
     }
 
     #[test]

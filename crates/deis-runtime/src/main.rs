@@ -368,6 +368,13 @@ async fn run(
     // assignment client and the bundle fetcher are built from, so both dial
     // with the one identity and a renewal reaches both.
     let machine_identity = load_machine_identity(&config)?;
+    // The same identity is what deis-store, deis-queue and deis-telemetry
+    // are checked against: every connection to them is TLS, and the far end
+    // must prove a certificate this fleet's authority issued for that kind of
+    // service before a capability is sent to it.
+    deis_runtime::runtime::service_tls::install(deis_identity::ServiceTrust::from_identity(
+        Arc::clone(&machine_identity),
+    ));
 
     // Initialize data storage (Single SQLite DB)
     let data_dir = &config.data_dir;

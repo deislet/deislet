@@ -88,7 +88,7 @@ impl DbClient {
     /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
     /// rather than connecting eagerly.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel = super::bindings::unary_channel(endpoint)?;
+        let channel = super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Store)?;
         let client = DatabaseClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);

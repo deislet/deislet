@@ -877,7 +877,7 @@ fn lazy_channel(endpoint: &str, request_timeout: Option<Duration>) -> Result<Cha
     if let Some(timeout) = request_timeout {
         builder = builder.timeout(timeout);
     }
-    Ok(builder.connect_lazy())
+    super::service_tls::lazy(builder, endpoint, deis_identity::ServiceKind::Store)
 }
 
 #[cfg(test)]

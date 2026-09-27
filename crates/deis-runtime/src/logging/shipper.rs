@@ -450,13 +450,17 @@ impl TelemetrySink {
     /// batch, not a shipper that never recovers.
     async fn client(&mut self) -> Result<&mut LogServiceClient<Channel>> {
         if self.client.is_none() {
-            let channel = Endpoint::from_shared(self.endpoint.clone())
+            let builder = Endpoint::from_shared(self.endpoint.clone())
                 .with_context(|| format!("{} is not a valid gRPC endpoint", self.endpoint))?
                 .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
-                .connect()
-                .await
-                .with_context(|| format!("connecting to deis-telemetry at {}", self.endpoint))?;
+                .timeout(REQUEST_TIMEOUT);
+            let channel = crate::runtime::service_tls::connect(
+                builder,
+                &self.endpoint,
+                deis_identity::ServiceKind::Telemetry,
+            )
+            .await
+            .with_context(|| format!("connecting to deis-telemetry at {}", self.endpoint))?;
 
             info!(endpoint = %self.endpoint, "Connected to deis-telemetry log service");
             self.client = Some(
@@ -511,8 +515,8 @@ impl LogSink for TelemetrySink {
                         carrying_a_token = self.credential.is_present(),
                         "deis-telemetry refused this node's logs: {}. This node has no \
                          telemetry capability from the control plane yet, or the collector \
-                         does not trust the control plane's signing keys (check its \
-                         capability_jwks_url); the batch stays queued",
+                         does not trust the control plane's signing keys (check its\
+                         [machine_identity] control_endpoint); the batch stays queued",
                         status.message()
                     );
                 }

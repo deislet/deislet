@@ -40,11 +40,11 @@ use axum::{
     routing::{delete, get, post, put},
 };
 
+use crate::capability_issuer::CapabilityIssuer;
 use crate::catalog::{
     ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore,
     ProviderDriverDispatcher, SecretsBackend,
 };
-use crate::capability_issuer::CapabilityIssuer;
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
 use crate::runtime_client::RuntimeNodeManager;
 use crate::session::SessionManager;
@@ -430,6 +430,29 @@ pub(crate) mod tests {
         pub _runtime_shutdown: tokio::sync::oneshot::Sender<()>,
         pub _queue_dir: Option<tempfile::TempDir>,
         pub _queue_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        /// The authority the harness queue's certificate is issued by.
+        pub queue_fleet: Option<deis_identity_test_pki::TestFleet>,
+    }
+
+    impl Harness {
+        /// A client of the harness queue that checks its certificate the
+        /// way every real caller does.
+        pub(crate) async fn queue_client(
+            &self,
+        ) -> deis_queue::proto::queue::queue_client::QueueClient<tonic::transport::Channel>
+        {
+            let fleet = self.queue_fleet.as_ref().expect("a harness with a queue");
+            let channel =
+                tonic::transport::Endpoint::from_shared(self.queue_endpoint.clone().unwrap())
+                    .unwrap()
+                    .connect_with_connector(fleet.service_trust().dialler(
+                        deis_identity::ServiceKind::Queue,
+                        &[deis_identity::Protocol::Http2],
+                    ))
+                    .await
+                    .unwrap();
+            deis_queue::proto::queue::queue_client::QueueClient::new(channel)
+        }
     }
 
     struct PreparedRuntime;
@@ -553,19 +576,34 @@ pub(crate) mod tests {
         .await
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = format!("https://{}", listener.local_addr().unwrap());
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        // Served over TLS with a queue's certificate, as deis-queue is: the
+        // control plane's own calls refuse anything else.
+        let fleet = deis_identity_test_pki::TestFleet::new();
+        let queue_identity = fleet.service_identity(deis_identity::ServiceKind::Queue);
+        let control_identity = fleet.service_identity(deis_identity::ServiceKind::Control);
         tokio::spawn(async move {
+            let incoming = tokio_stream::StreamExt::map(
+                tokio_stream::wrappers::ReceiverStream::new(deis_identity::accept_tls(
+                    listener,
+                    queue_identity,
+                )),
+                |accepted| {
+                    Ok::<_, std::io::Error>(deis_wire::served::Served::new(
+                        accepted.stream,
+                        accepted.local_addr,
+                        accepted.remote_addr,
+                    ))
+                },
+            );
             tonic::transport::Server::builder()
                 .add_service(deis_queue::proto::queue::queue_server::QueueServer::new(
                     queue,
                 ))
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    async move {
-                        let _ = shutdown_rx.await;
-                    },
-                )
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = shutdown_rx.await;
+                })
                 .await
                 .unwrap();
         });
@@ -575,11 +613,15 @@ pub(crate) mod tests {
                 ..Default::default()
             },
             crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test"),
-        );
+        )
+        .with_service_trust(Some(deis_identity::ServiceTrust::from_identity(
+            control_identity,
+        )));
         let mut harness = harness_with_storage(secrets_ready, storage).await;
         harness.queue_endpoint = Some(endpoint);
         harness._queue_dir = Some(queue_dir);
         harness._queue_shutdown = Some(shutdown);
+        harness.queue_fleet = Some(fleet);
         harness
     }
 
@@ -808,6 +850,7 @@ pub(crate) mod tests {
             _runtime_shutdown: runtime_shutdown,
             _queue_dir: None,
             _queue_shutdown: None,
+            queue_fleet: None,
             queue_endpoint: None,
             sessions,
         }

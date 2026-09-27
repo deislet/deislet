@@ -152,7 +152,13 @@ pub async fn build_api_router(
     let migration_state =
         migrations::MigrationApiState::new(Arc::clone(&catalog_state.store), &config);
     migration_state.resume_on_start();
-    let restore_state = restores::RestoreApiState::new(Arc::clone(&catalog_state.store), &config);
+    let restore_state = restores::RestoreApiState::new(
+        Arc::clone(&catalog_state.store),
+        &config,
+        deis_runtime_manager
+            .machine_identity()
+            .map(deis_identity::ServiceTrust::from_identity),
+    );
     restore_state.resume_on_start();
 
     // One gate for the whole human surface. It resolves the credential into
@@ -217,16 +223,6 @@ pub async fn build_api_router(
         .route("/health", get(handle_health))
         .route("/deis.svg", get(static_files::serve_favicon))
         .route("/assets/*path", get(static_files::serve_assets))
-        // Public keys, for store and queue, which have no machine identity
-        // to fetch them over the machine channel with.
-        .merge(
-            Router::new()
-                .route(
-                    crate::capability_issuer::JWKS_ROUTE,
-                    get(crate::machine::listen::capability_jwks),
-                )
-                .with_state(issuer.clone()),
-        )
         .merge(protected_routes);
 
     // Cross-origin access to the human API, which is off unless the file
@@ -617,7 +613,11 @@ async fn build_catalog_state(
         );
     }
 
-    let storage = StorageWiring::new(config, issuer.clone());
+    let storage = StorageWiring::new(config, issuer.clone()).with_service_trust(
+        nodes
+            .machine_identity()
+            .map(deis_identity::ServiceTrust::from_identity),
+    );
     if storage.has_no_endpoints() {
         warn!(
             "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so every ctx.services.kv / database / blob / queue call an application makes answers \"service not available\" and declared queue consumers never start"

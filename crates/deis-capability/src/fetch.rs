@@ -1,6 +1,8 @@
 //! Keeping a [`KeyRing`] in step with the control plane's published JWKS.
 //!
-//! A verifier starts with an empty ring and a URL. The refresher fetches the
+//! A verifier starts with an empty ring and a [`ControlClient`] for the
+//! control plane's machine channel, where the document is served at
+//! [`crate::JWKS_PATH`]. The refresher fetches the
 //! document at once (retrying with backoff until the control plane answers,
 //! so a verifier may start before it), then again on a fixed interval, and
 //! again whenever a token names a key the ring does not hold - rate limited,
@@ -16,6 +18,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::control::ControlClient;
 use crate::keys::{Jwks, KeyRing};
 
 /// Timings of the refresher. The defaults suit production; tests shorten
@@ -47,32 +50,19 @@ impl Default for RefreshPolicy {
     }
 }
 
-/// Fetch and parse the JWKS at `url`.
+/// Fetch and parse the control plane's JWKS.
 pub async fn fetch_jwks(
-    client: &reqwest::Client,
-    url: &str,
+    client: &ControlClient,
 ) -> Result<Vec<ed25519_dalek::VerifyingKey>, String> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("answered {status}"));
-    }
-    let jwks: Jwks = response
-        .json()
-        .await
-        .map_err(|e| format!("body is not a JWKS document: {e}"))?;
+    let jwks: Jwks = client.get_json(crate::JWKS_PATH).await?;
     jwks.verifying_keys().map_err(|e| e.to_string())
 }
 
-/// Spawn the task that keeps `ring` current from `url`. Runs until the
-/// process exits.
+/// Spawn the task that keeps `ring` current from the control plane `client`
+/// reaches. Runs until the process exits.
 pub fn spawn_refresher(
     ring: KeyRing,
-    url: String,
+    client: ControlClient,
     policy: RefreshPolicy,
 ) -> tokio::task::JoinHandle<()> {
     let wanted = Arc::new(Notify::new());
@@ -80,25 +70,13 @@ pub fn spawn_refresher(
         let wanted = Arc::clone(&wanted);
         ring.on_unknown_kid(move |_| wanted.notify_one());
     }
+    let client = client.with_timeout(policy.request_timeout);
+    let url = client.url_of(crate::JWKS_PATH);
     tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(policy.request_timeout)
-            .build()
-        {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "Cannot build the HTTP client for the capability key refresher; no key will \
-                     ever be loaded and every capability will be refused"
-                );
-                return;
-            }
-        };
         let mut backoff = policy.initial_backoff;
         loop {
             let fetched_at = Instant::now();
-            let next = match fetch_jwks(&client, &url).await {
+            let next = match fetch_jwks(&client).await {
                 Ok(keys) => {
                     ring.replace(keys);
                     backoff = policy.initial_backoff;
@@ -343,7 +321,7 @@ mod tests {
                 let _ = socket.write_all(response.as_bytes()).await;
             }
         });
-        format!("http://{addr}/jwks.json")
+        format!("http://{addr}")
     }
 
     async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
@@ -479,7 +457,11 @@ mod tests {
             min_on_demand_gap: Duration::from_millis(300),
             ..RefreshPolicy::default()
         };
-        spawn_refresher(ring.clone(), url, policy);
+        spawn_refresher(
+            ring.clone(),
+            ControlClient::loopback(&url).expect("a loopback URL"),
+            policy,
+        );
         eventually("the first fetch", || ring.get(&key_id(&first)).is_some()).await;
 
         // Rotation on the control plane: a token naming the new key arrives.

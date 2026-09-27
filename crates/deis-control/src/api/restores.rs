@@ -48,8 +48,16 @@ enum RestoreCoordinatorAvailability {
 }
 
 impl RestoreApiState {
-    pub fn new(store: Arc<CatalogStore>, config: &ControlConfig) -> Self {
-        let coordinator = match BackendRestoreCoordinator::from_config(Arc::clone(&store), config) {
+    /// `service_trust` is what each backend's certificate is checked against
+    /// when a restore is verified: this control plane's machine identity.
+    pub fn new(
+        store: Arc<CatalogStore>,
+        config: &ControlConfig,
+        service_trust: Option<deis_identity::ServiceTrust>,
+    ) -> Self {
+        let coordinator = match BackendRestoreCoordinator::from_config(Arc::clone(&store), config)
+            .map(|coordinator| coordinator.with_service_trust(service_trust))
+        {
             Ok(coordinator) => {
                 info!("Coordinated embedded-backend restore driver is configured");
                 RestoreCoordinatorAvailability::Ready(Arc::new(coordinator))
@@ -379,7 +387,7 @@ mod tests {
             telemetry_migration_admin_token: Some("t".repeat(32)),
             ..ControlConfig::default()
         };
-        let restore_state = RestoreApiState::new(Arc::clone(&store), &config);
+        let restore_state = RestoreApiState::new(Arc::clone(&store), &config, None);
         if let RestoreCoordinatorAvailability::Unavailable(reason) = &restore_state.coordinator {
             panic!("test restore coordinator is unavailable: {reason}");
         }

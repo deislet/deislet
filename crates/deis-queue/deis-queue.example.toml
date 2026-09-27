@@ -1,19 +1,22 @@
-# deis-queue configuration. Every key is optional; the values below are the
-# defaults, so an empty file behaves exactly like this one.
+# deis-queue configuration. Every key but [machine_identity] is optional, and
+# the values below are the defaults. [machine_identity] is what the service is
+# served with, so `deis-queue serve` refuses to start without it; the offline
+# `snapshot` and `restore` subcommands do not need it.
 
 # Address the gRPC server binds to.
 #
-# Loopback by default; every call is authenticated whatever the address.
+# Loopback by default; every call is authenticated whatever the address, and
+# the listener speaks TLS only (see [machine_identity] at the end).
 listen = "127.0.0.1:8091"
 
 # Every call must carry an Ed25519-signed capability in
 # `Authorization: Bearer <token>`, minted by the control plane for the tenant
 # it names; there is no anonymous or loopback mode. The keys those tokens are
-# checked against are the control plane's public keys, fetched from its JWKS
-# here at startup (calls are refused until the first fetch lands), every five
-# minutes after, and whenever a token names a key not yet fetched - so a key
-# rotation on the control plane needs nothing done on this host.
-capability_jwks_url = "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
+# checked against are the control plane's public keys, read from its JWKS on
+# the machine channel named in [machine_identity] at startup (calls are
+# refused until the first fetch lands), every five minutes after, and whenever
+# a token names a key not yet fetched - so a key rotation on the control plane
+# needs nothing done on this host.
 
 # Enables the separate BackendMigration gRPC service used by Control to
 # acquire durable queue writer fences and collect deterministic inventory.
@@ -85,3 +88,19 @@ dead_letter_sweep_interval_secs = 3600
 # call would hold a connection pool permit until the process was restarted.
 # Zero disables it, and the service warns at startup when you do.
 request_timeout_secs = 30
+
+# This queue's machine identity: a certificate naming
+# spiffe://<trust domain>/deislet/queue/<id>, issued by the fleet's authority.
+# The gRPC listener presents it to every caller, and callers refuse a server
+# whose certificate does not chain to the fleet's trust root or names another
+# kind of machine; the queue proves it to the control plane when it reads the
+# JWKS over mutual TLS. `control_endpoint` is the control plane's machine
+# channel - http:// is refused unless it names a loopback address. Renewed
+# files are picked up every `identity_reload_seconds` without a restart.
+#
+# [machine_identity]
+# certificate = "/etc/deis/queue.crt"
+# private_key = "/etc/deis/queue.key"
+# trust_root = "/etc/deis/ca.crt"
+# control_endpoint = "https://127.0.0.1:8101"
+# identity_reload_seconds = 60

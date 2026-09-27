@@ -2,10 +2,18 @@
 //!
 //! Every call must carry a capability minted by deis-control in
 //! `Authorization: Bearer <token>`; the verifying keys are fetched from the
-//! control plane's JWKS at `capability_jwks_url` and kept current. There is
-//! no setting that turns the check off. See [`crate::auth`].
+//! control plane's JWKS over its machine channel (`[machine_identity]`
+//! `control_endpoint`) and kept current. There is no setting that turns the
+//! check off. See [`crate::auth`].
 //!
 //! Health is public and optional migration management has its own credential.
+//!
+//! `[machine_identity]` is required to serve: the gRPC listener speaks TLS
+//! only, presenting this service's own certificate
+//! (`spiffe://<trust domain>/deislet/telemetry/<id>`), so a bearer capability
+//! is never readable on the wire and a caller that checks the certificate
+//! knows it reached a telemetry service. The table is optional to parse so
+//! that `snapshot` and `restore` work without it.
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -28,12 +36,6 @@ pub struct Config {
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    /// Where the control plane publishes the keys it signs capabilities
-    /// with (its JWKS). Fetched at startup, again every few minutes, and
-    /// whenever a token names a key not yet held; until the first fetch
-    /// lands every call is refused.
-    #[serde(default = "default_capability_jwks_url")]
-    pub capability_jwks_url: String,
     /// Where the control plane serves its signed revocation list.
     ///
     /// Polled at `{revocation_list_url}/capability/revocation-list` every 30
@@ -44,6 +46,13 @@ pub struct Config {
     /// `deis_auth_*`.
     #[serde(default = "default_revocation_list_url")]
     pub revocation_list_url: String,
+    /// This service's machine identity and the control plane's machine
+    /// channel, where the capability JWKS is read from at startup (retried
+    /// until the control plane answers, refusing every call meanwhile), every
+    /// 5 minutes after that, and whenever a token names a key not yet held.
+    /// Required by `serve`; see the module note.
+    #[serde(default)]
+    pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
     /// Independent bearer credential for the backend migration management
     /// RPCs. When absent those RPCs are not registered; ingest still opens
     /// and enforces the durable fence journal so removing this credential
@@ -147,10 +156,6 @@ fn default_metrics_export_window_secs() -> u64 {
     300
 }
 
-fn default_capability_jwks_url() -> String {
-    "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json".to_string()
-}
-
 fn default_revocation_list_url() -> String {
     "http://127.0.0.1:8100".to_string()
 }
@@ -161,8 +166,8 @@ impl Default for Config {
             listen: default_listen(),
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
-            capability_jwks_url: default_capability_jwks_url(),
             revocation_list_url: default_revocation_list_url(),
+            machine_identity: None,
             migration_admin_token: None,
             log_retention_days: default_log_retention_days(),
             metric_retention_days: default_metric_retention_days(),
@@ -184,7 +189,6 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("metrics_listen", &self.metrics_listen)
             .field("data_dir", &self.data_dir)
-            .field("capability_jwks_url", &self.capability_jwks_url)
             .field("revocation_list_url", &self.revocation_list_url)
             .field(
                 "migration_admin_token",
@@ -273,10 +277,6 @@ mod tests {
         assert_eq!(config.log_retention_days, 7);
         assert_eq!(config.trace_retention_days, 3);
         assert_eq!(config.trace_tail_capacity, 4096);
-        assert_eq!(
-            config.capability_jwks_url,
-            "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
-        );
         config.validate().expect("defaults must be valid");
     }
 
@@ -304,7 +304,11 @@ mod tests {
     #[test]
     fn a_static_verifying_key_is_not_a_setting() {
         // The keys come from the control plane's JWKS and nowhere else.
-        for removed in ["capability_public_key = \"00\"", "auth_secret = \"x\""] {
+        for removed in [
+            "capability_public_key = \"00\"",
+            "auth_secret = \"x\"",
+            "capability_jwks_url = \"http://127.0.0.1:8100\"",
+        ] {
             assert!(toml::from_str::<Config>(removed).is_err(), "{removed}");
         }
     }

@@ -47,16 +47,50 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         listen: "127.0.0.1:0".to_string(),
         metrics_listen: "127.0.0.1:0".to_string(),
         data_dir: data_dir.to_path_buf(),
+        machine_identity: test_identity(),
         ..Config::default()
     }
 }
 
-async fn channel(server: &RunningServer) -> Channel {
-    Channel::from_shared(format!("http://{}", server.grpc_addr))
+/// The one authority every server in this file is issued a certificate by.
+///
+/// A static, because a configuration outlives the call that builds it and the
+/// files have to outlive every server started from it.
+fn fleet() -> &'static deis_identity_test_pki::TestFleet {
+    static FLEET: std::sync::OnceLock<deis_identity_test_pki::TestFleet> =
+        std::sync::OnceLock::new();
+    FLEET.get_or_init(deis_identity_test_pki::TestFleet::new)
+}
+
+/// The `[machine_identity]` a test server is started with.
+fn test_identity() -> Option<deis_capability::ServiceIdentityConfig> {
+    let fleet = fleet();
+    let id = deis_identity::names::telemetry(&fleet.trust_domain, "test").unwrap();
+    let files = fleet.files_for("telemetry", &id);
+    Some(deis_capability::ServiceIdentityConfig {
+        certificate: files.certificate,
+        private_key: files.private_key,
+        trust_root: files.trust_root,
+        control_endpoint: "http://127.0.0.1:1".to_string(),
+        identity_reload_seconds: 60,
+    })
+}
+
+/// A channel to a test server's gRPC listener, checking the far end is a
+/// telemetry service of this fleet the way every real caller does.
+async fn tls_channel(addr: SocketAddr) -> Channel {
+    tonic::transport::Endpoint::from_shared(format!("https://{addr}"))
         .expect("endpoint must be a valid URI")
-        .connect()
+        .connect_with_connector(fleet().service_trust().dialler(
+            deis_identity::ServiceKind::Telemetry,
+            &[deis_identity::Protocol::Http2],
+        ))
         .await
         .expect("the gRPC listener must accept the connection")
+}
+
+async fn channel(server: &RunningServer) -> Channel {
+    tls_channel(server.grpc_addr).await
 }
 
 fn entry(message: &str) -> LogEntry {

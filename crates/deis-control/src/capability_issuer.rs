@@ -61,10 +61,10 @@ pub const CAPABILITY_LIFETIME: Duration = Duration::from_secs(900); // 15 minute
 pub use deis_capability::{AUD_QUEUE, AUD_STORE};
 pub const AUD_TELEMETRY: &str = "telemetry";
 
-/// Where every published verifying key is served, as a JWKS document. On
-/// both listeners: store and queue have no machine identity and fetch it
-/// from the human one.
-pub const JWKS_ROUTE: &str = "/.well-known/deis/capability-jwks.json";
+/// Where every published verifying key is served, as a JWKS document: on
+/// the machine listener only, where deis-store, deis-queue and
+/// deis-telemetry read it under mutual TLS.
+pub const JWKS_ROUTE: &str = deis_capability::JWKS_PATH;
 
 /// Where the signed revocation list is served, on the machine listener only.
 pub use deis_capability::revocation::REVOCATION_LIST_PATH as REVOCATION_LIST_ROUTE;

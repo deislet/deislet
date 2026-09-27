@@ -10,6 +10,15 @@
 //! cannot become a fourth unguarded entrance without deleting the call. The
 //! health service is registered without it on purpose - it names no tenant
 //! and reads no data.
+//!
+//! # And it is behind TLS
+//!
+//! Every connection completes a TLS handshake presenting this store's
+//! machine identity before tonic sees a byte of it (see
+//! `deis_identity::accept_tls`). A caller checks that the certificate chains
+//! to the fleet's trust root and names a deis-store, so the bearer capability
+//! it then sends is neither readable on the wire nor handed to a machine that
+//! merely answers at the store's address. There is no plaintext listener.
 
 use crate::MAX_GRPC_MESSAGE_BYTES;
 use crate::auth::StorageAuth;
@@ -25,11 +34,13 @@ use anyhow::{Context, Result};
 use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
 use deis_backend_migration::{MigrationAuth, TenantWriteFences};
 use std::future::Future;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 
@@ -123,6 +134,32 @@ pub fn spawn_kv_sweeper(kv: KvService, interval_secs: u64) -> JoinHandle<()> {
     })
 }
 
+/// This store's machine identity and its client for the control plane's
+/// machine channel, both from `[machine_identity]`.
+///
+/// Everything here is refused before a socket is bound: a missing table, a
+/// certificate that does not name a store, and a control plane reached over
+/// plaintext off this host - which could hand this store any signing key and
+/// so decide which capabilities it honours.
+pub fn machine_identity(
+    config: &Config,
+) -> Result<(
+    Arc<deis_identity::MachineIdentity>,
+    deis_capability::ControlClient,
+)> {
+    let identity_config = config.machine_identity.as_ref().context(
+        "deis-store serves only over TLS with its own machine identity, and this configuration \
+         has no [machine_identity] table; see deis-store.example.toml",
+    )?;
+    let identity = identity_config
+        .load(deis_identity::ServiceKind::Store)
+        .context("cannot load this store's machine identity")?;
+    let control = identity_config
+        .control_client(Arc::clone(&identity))
+        .context("cannot reach the control plane's machine channel as configured")?;
+    Ok((identity, control))
+}
+
 /// Bind the address in `config`.
 pub async fn bind(config: &Config) -> Result<TcpListener> {
     TcpListener::bind(&config.listen)
@@ -188,11 +225,13 @@ fn report_interrupt(result: std::io::Result<()>) {
 /// can learn the port before the server starts accepting. `keys` is the
 /// control plane's key ring; whoever keeps it current (the binary starts a
 /// JWKS refresher, tests fill it by hand) shares it with every guard here.
+/// `identity` is the certificate every connection is served with.
 pub async fn serve(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
     keys: deis_capability::KeyRing,
+    identity: Arc<deis_identity::MachineIdentity>,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
     // One verifier behind all three guards, so the revocation list and the
@@ -279,6 +318,7 @@ pub async fn serve(
     info_ready(
         &config,
         addr,
+        &identity,
         &auth_kv,
         stores.database.transaction_limits(),
         stores.database.sql_limits(),
@@ -305,7 +345,7 @@ pub async fn serve(
             &auth_blob,
         ))
         .add_optional_service(migration_service)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(tls_incoming(listener, identity), shutdown)
         .await;
 
     // Nothing else keeps these alive, and leaving them running would hold a
@@ -354,15 +394,36 @@ fn spawn_snapshots(config: &Config) -> Option<JoinHandle<()>> {
     }
 }
 
+/// Connections on `listener`, each one past its TLS handshake.
+pub(crate) fn tls_incoming(
+    listener: TcpListener,
+    identity: Arc<deis_identity::MachineIdentity>,
+) -> impl tokio_stream::Stream<
+    Item = std::io::Result<
+        deis_wire::served::Served<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    >,
+> {
+    ReceiverStream::new(deis_identity::accept_tls(listener, identity)).map(|accepted| {
+        Ok(deis_wire::served::Served::new(
+            accepted.stream,
+            accepted.local_addr,
+            accepted.remote_addr,
+        ))
+    })
+}
+
 fn info_ready(
     config: &Config,
     addr: std::net::SocketAddr,
+    identity: &deis_identity::MachineIdentity,
     auth: &StorageAuth,
     transactions: TransactionLimits,
     sql: SqlLimits,
 ) {
     tracing::info!(
         %addr,
+        identity = %identity.id(),
+        tls = true,
         data_dir = %config.data_dir.display(),
         max_message_size = MAX_GRPC_MESSAGE_BYTES,
         max_object_bytes = config.max_object_bytes,
@@ -403,6 +464,69 @@ mod tests {
         }
     }
 
+    fn identity_config(
+        fleet: &deis_identity_test_pki::TestFleet,
+        name: &str,
+        id: &deis_identity::SpiffeId,
+        control_endpoint: &str,
+    ) -> deis_capability::ServiceIdentityConfig {
+        let files = fleet.files_for(name, id);
+        deis_capability::ServiceIdentityConfig {
+            certificate: files.certificate,
+            private_key: files.private_key,
+            trust_root: files.trust_root,
+            control_endpoint: control_endpoint.to_string(),
+            identity_reload_seconds: 60,
+        }
+    }
+
+    /// The keys a store honours capabilities against must come from the
+    /// control plane and from nobody on the path, so a plaintext JWKS URL off
+    /// this host is refused at startup rather than fetched.
+    #[tokio::test]
+    async fn a_plaintext_control_plane_off_this_host_is_refused_at_startup() {
+        let fleet = deis_identity_test_pki::TestFleet::new();
+        let store = deis_identity::names::store(&fleet.trust_domain, "s1").unwrap();
+        for (endpoint, accepted) in [
+            ("http://10.1.2.3:8101", false),
+            ("http://control.internal:8101", false),
+            ("http://127.0.0.1:8101", true),
+            ("https://control.internal:8101", true),
+        ] {
+            let config = Config {
+                machine_identity: Some(identity_config(&fleet, "store", &store, endpoint)),
+                ..Config::default()
+            };
+            let outcome = machine_identity(&config);
+            assert_eq!(outcome.is_ok(), accepted, "{endpoint}");
+            if let Err(error) = outcome {
+                assert!(
+                    format!("{error:#}").contains("plain HTTP to another host"),
+                    "the refusal must say why: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_refuses_to_serve_without_an_identity_or_with_another_kinds() {
+        assert!(machine_identity(&Config::default()).is_err());
+
+        let fleet = deis_identity_test_pki::TestFleet::new();
+        let queue = deis_identity::names::queue(&fleet.trust_domain, "q1").unwrap();
+        let config = Config {
+            machine_identity: Some(identity_config(
+                &fleet,
+                "queue",
+                &queue,
+                "https://127.0.0.1:8101",
+            )),
+            ..Config::default()
+        };
+        let error = machine_identity(&config).expect_err("a queue's certificate is not a store's");
+        assert!(format!("{error:#}").contains("is not a Store"), "{error:#}");
+    }
+
     #[tokio::test]
     async fn opening_creates_the_expected_layout() {
         let dir = TempDir::new().unwrap();
@@ -425,14 +549,17 @@ mod tests {
             ..Config::default()
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fleet = deis_identity_test_pki::TestFleet::new();
         // Serve will just create the migration auth independently
         let result = serve(
             config,
             listener,
             async {},
-            deis_capability::KeyRing::from_keys([
-                ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]).verifying_key(),
-            ]),
+            deis_capability::KeyRing::from_keys([ed25519_dalek::SigningKey::from_bytes(
+                &[0u8; 32],
+            )
+            .verifying_key()]),
+            fleet.service_identity(deis_identity::ServiceKind::Store),
         )
         .await;
         // This will fail on store open (empty data dir structure) but NOT on

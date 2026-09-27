@@ -185,7 +185,7 @@ impl QueueClient {
     /// Fails only on an address that is not a URL -- a configuration mistake
     /// that no retry would fix.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel = super::bindings::unary_channel(endpoint)?;
+        let channel = super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Queue)?;
         let client = GrpcQueueClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);

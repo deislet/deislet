@@ -34,6 +34,10 @@ pub const ENV_CONTROL_ENDPOINT: &str = "DEIS_CONTROL_ENDPOINT";
 pub const ENV_CONTROL_TOKEN: &str = "DEIS_CONTROL_TOKEN";
 pub const ENV_TELEMETRY_ENDPOINT: &str = "DEIS_TELEMETRY_ENDPOINT";
 pub const ENV_QUEUE_ENDPOINT: &str = "DEIS_QUEUE_ENDPOINT";
+/// The fleet's trust root, which deis-store, deis-queue and deis-telemetry
+/// certificates chain to. Those three serve TLS only; see
+/// [`crate::platform::service_tls`].
+pub const ENV_SERVICES_CA: &str = "DEIS_SERVICES_CA";
 pub const ENV_APP: &str = "DEIS_APP";
 pub const ENV_ENVIRONMENT: &str = "DEIS_ENVIRONMENT";
 /// Overrides [`config_home`] whole. Set by the tests so they never touch the
@@ -108,6 +112,17 @@ pub struct ProjectFile {
     pub queue: Option<EndpointSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defaults: Option<DefaultsSection>,
+    /// What the platform's data services are checked against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<ServicesSection>,
+}
+
+/// `[services]`: the fleet's trust root, a public certificate and so safe to
+/// commit. A relative path is read from the project directory.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ServicesSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -254,6 +269,8 @@ pub struct Settings {
     pub control_endpoint: Option<Setting>,
     pub telemetry_endpoint: Option<Setting>,
     pub queue_endpoint: Option<Setting>,
+    /// Where the fleet's trust root is; see [`ENV_SERVICES_CA`].
+    pub services_ca: Option<Setting>,
     pub app: Option<Setting>,
     pub environment: Setting,
     /// Never printed. [`Settings::token_source`] is what output uses.
@@ -343,6 +360,15 @@ impl Settings {
                 .map(|v| Setting::new(v, Source::Project)),
         ]);
 
+        let services_ca = first(&[
+            from_env(ENV_SERVICES_CA),
+            project
+                .services
+                .as_ref()
+                .and_then(|s| s.ca.clone())
+                .map(|v| Setting::new(v, Source::Project)),
+        ]);
+
         let app = first(&[
             overrides.app.clone().map(|v| Setting::new(v, Source::Flag)),
             from_env(ENV_APP),
@@ -386,6 +412,7 @@ impl Settings {
             control_endpoint,
             telemetry_endpoint,
             queue_endpoint,
+            services_ca,
             app,
             environment,
             token,
@@ -415,6 +442,19 @@ impl Settings {
                 self.project_dir.join(PROJECT_FILE).display()
             ),
         }
+    }
+
+    /// The fleet's trust root, relative paths read from the project
+    /// directory, or `None` when nothing names one.
+    pub fn services_ca(&self) -> Option<PathBuf> {
+        self.services_ca.as_ref().map(|setting| {
+            let path = PathBuf::from(&setting.value);
+            if path.is_absolute() {
+                path
+            } else {
+                self.project_dir.join(path)
+            }
+        })
     }
 
     /// Where deis-queue listens, or an error that says how to set it.
@@ -553,6 +593,7 @@ pub(crate) fn clear_env() {
         ENV_CONTROL_TOKEN,
         ENV_TELEMETRY_ENDPOINT,
         ENV_QUEUE_ENDPOINT,
+        ENV_SERVICES_CA,
         ENV_APP,
         ENV_ENVIRONMENT,
         ENV_CONFIG_HOME,

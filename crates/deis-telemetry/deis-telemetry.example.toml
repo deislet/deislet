@@ -1,5 +1,6 @@
-# deis-telemetry configuration. Every key is optional; the values below are
-# the defaults, so an empty file starts a working service.
+# deis-telemetry configuration. Every key but [machine_identity] is optional,
+# and the values below are the defaults. [machine_identity], at the end, is
+# what the gRPC listener is served with; the offline subcommands do not need it.
 
 # gRPC endpoint. Four always-on services share it: LogService (PushLogs / Query /
 # Tail), TraceService (PushTraces / QueryTraces / TailTraces), MetricService
@@ -24,11 +25,6 @@ listen = "127.0.0.1:8092"
 # only a platform-wide read capability (GET /api/platform/telemetry-token on
 # deis-control, which needs read:*/*).
 metrics_listen = "127.0.0.1:8093"
-
-# Where deis-control publishes the keys it signs capabilities with. Fetched at
-# startup, every few minutes, and whenever a token names a key not yet held;
-# until the first fetch lands every call is refused.
-capability_jwks_url = "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
 
 # Where deis-control publishes the capability revocation list, polled every
 # 30 seconds.
@@ -88,3 +84,20 @@ query_max_limit = 1000
 # How far back /metrics looks for the latest sample of each series. A series
 # with no sample newer than this is left out rather than exported stale.
 metrics_export_window_secs = 300
+
+# This service's machine identity: a certificate naming
+# spiffe://<trust domain>/deislet/telemetry/<id>, issued by the fleet's
+# authority. The gRPC listener presents it to every caller and speaks TLS
+# only; callers refuse a server whose certificate does not chain to the
+# fleet's trust root or names another kind of machine. `control_endpoint` is
+# the control plane's machine channel - http:// is refused unless it names a
+# loopback address. Renewed files are picked up every
+# `identity_reload_seconds` without a restart. `deis-telemetry serve` refuses
+# to start without this table.
+#
+# [machine_identity]
+# certificate = "/etc/deis/telemetry.crt"
+# private_key = "/etc/deis/telemetry.key"
+# trust_root = "/etc/deis/ca.crt"
+# control_endpoint = "https://127.0.0.1:8101"
+# identity_reload_seconds = 60

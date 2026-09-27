@@ -149,7 +149,9 @@ pub fn project_dir() -> Result<PathBuf> {
 /// control plane for the read capability deis-telemetry wants; see
 /// [`crate::platform::telemetry::TelemetryCredential`].
 pub fn resolve(overrides: &Overrides) -> Result<Settings> {
-    Settings::load(&project_dir()?, overrides)
+    let settings = Settings::load(&project_dir()?, overrides)?;
+    crate::platform::service_tls::configure(settings.services_ca());
+    Ok(settings)
 }
 
 /// Everything a command that talks to the control plane needs: the resolved

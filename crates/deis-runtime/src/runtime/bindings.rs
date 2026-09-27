@@ -797,19 +797,26 @@ fn consumer_number(queue: &str, field: &str, value: Option<&str>) -> Option<u32>
 /// the channel is usable immediately and only attempts a connection when a
 /// call is made on it, retrying on the call after that. Only a malformed
 /// address fails here.
-fn lazy_channel(endpoint: &str, request_timeout: Option<Duration>) -> Result<Channel> {
+///
+/// The connection is TLS, checked against this node's installed trust as a
+/// service of `kind`; see [`super::service_tls`].
+fn lazy_channel(
+    endpoint: &str,
+    kind: deis_identity::ServiceKind,
+    request_timeout: Option<Duration>,
+) -> Result<Channel> {
     let mut builder = Endpoint::from_shared(endpoint.to_string())
         .with_context(|| format!("{endpoint:?} is not a usable gRPC address"))?
         .connect_timeout(CONNECT_TIMEOUT);
     if let Some(timeout) = request_timeout {
         builder = builder.timeout(timeout);
     }
-    Ok(builder.connect_lazy())
+    super::service_tls::lazy(builder, endpoint, kind)
 }
 
 /// A unary-call channel: bounded per call.
-pub(crate) fn unary_channel(endpoint: &str) -> Result<Channel> {
-    lazy_channel(endpoint, Some(REQUEST_TIMEOUT))
+pub(crate) fn unary_channel(endpoint: &str, kind: deis_identity::ServiceKind) -> Result<Channel> {
+    lazy_channel(endpoint, kind, Some(REQUEST_TIMEOUT))
 }
 
 /// A streaming channel: bounded only on the dial.
@@ -817,8 +824,11 @@ pub(crate) fn unary_channel(endpoint: &str) -> Result<Channel> {
 /// A blob download is a stream whose legitimate duration depends on the object
 /// size, so a per-call deadline would cut off large-but-healthy transfers. The
 /// blob client applies its own size ceiling instead.
-pub(crate) fn streaming_channel(endpoint: &str) -> Result<Channel> {
-    lazy_channel(endpoint, None)
+pub(crate) fn streaming_channel(
+    endpoint: &str,
+    kind: deis_identity::ServiceKind,
+) -> Result<Channel> {
+    lazy_channel(endpoint, kind, None)
 }
 
 /// Who a storage call says it is, and the proof that goes with the claim.

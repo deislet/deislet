@@ -178,7 +178,7 @@ fn refusal(
         tonic::Code::Unauthenticated => anyhow::anyhow!(
             "deis-telemetry at {endpoint} refused {doing}: {message}\nThis command presented a \
              capability the control plane minted for {reads}. deis-telemetry verifies it against \
-             the control plane's published keys (its `capability_jwks_url`); a refusal means it \
+             the control plane's published keys (read over its `[machine_identity]` control_endpoint); a refusal means it \
              does not trust this control plane's keys, or the token expired before it was used."
         ),
         tonic::Code::PermissionDenied => anyhow::anyhow!(
@@ -200,17 +200,21 @@ impl Telemetry {
     /// Dial deis-telemetry, carrying `credential` on every call.
     pub async fn connect(endpoint: &str, credential: TelemetryCredential) -> Result<Self> {
         let url = normalise_endpoint(endpoint);
-        let channel = Endpoint::from_shared(url.clone())
+        let builder = Endpoint::from_shared(url.clone())
             .with_context(|| format!("{endpoint} is not a usable address for deis-telemetry"))?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .connect()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "could not reach deis-telemetry at {url}: {e}\nCheck that it is running and \
-                     that the address is right (see `deis config list`)."
-                )
-            })?;
+            .connect_timeout(CONNECT_TIMEOUT);
+        let channel = super::service_tls::connect(
+            builder,
+            &url,
+            deis_identity::ServiceKind::Telemetry,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "could not reach deis-telemetry at {url}: {e}\nCheck that it is running and \
+                 that the address is right (see `deis config list`)."
+            )
+        })?;
 
         let client = LogServiceClient::new(channel)
             .max_decoding_message_size(deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES);
@@ -265,17 +269,21 @@ impl Traces {
     /// call - the same kind [`Telemetry::connect`] carries.
     pub async fn connect(endpoint: &str, credential: TelemetryCredential) -> Result<Self> {
         let url = normalise_endpoint(endpoint);
-        let channel = Endpoint::from_shared(url.clone())
+        let builder = Endpoint::from_shared(url.clone())
             .with_context(|| format!("{endpoint} is not a usable address for deis-telemetry"))?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .connect()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "could not reach deis-telemetry at {url}: {e}\nCheck that it is running and \
-                     that the address is right (see `deis config list`)."
-                )
-            })?;
+            .connect_timeout(CONNECT_TIMEOUT);
+        let channel = super::service_tls::connect(
+            builder,
+            &url,
+            deis_identity::ServiceKind::Telemetry,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "could not reach deis-telemetry at {url}: {e}\nCheck that it is running and \
+                 that the address is right (see `deis config list`)."
+            )
+        })?;
 
         let client = TraceServiceClient::new(channel)
             .max_decoding_message_size(deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES);
@@ -453,7 +461,7 @@ fn normalise_endpoint(endpoint: &str) -> String {
     if trimmed.contains("://") {
         trimmed.to_string()
     } else {
-        format!("http://{trimmed}")
+        format!("https://{trimmed}")
     }
 }
 
@@ -513,6 +521,7 @@ mod tests {
             listen: "127.0.0.1:0".to_string(),
             metrics_listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
+            machine_identity: Some(collector_identity()),
             ..deis_telemetry::config::Config::default()
         };
         let running = deis_telemetry::server::start(
@@ -524,13 +533,28 @@ mod tests {
         (running, data)
     }
 
+    /// The collector's `[machine_identity]`, issued by the authority this
+    /// CLI is configured to trust.
+    fn collector_identity() -> deis_capability::ServiceIdentityConfig {
+        let fleet = crate::platform::service_tls::test_fleet();
+        let id = deis_identity::names::telemetry(&fleet.trust_domain, "test").unwrap();
+        let files = fleet.files_for("telemetry", &id);
+        deis_capability::ServiceIdentityConfig {
+            certificate: files.certificate,
+            private_key: files.private_key,
+            trust_root: files.trust_root,
+            control_endpoint: "http://127.0.0.1:1".to_string(),
+            identity_reload_seconds: 60,
+        }
+    }
+
     /// The read half of observability, against the real collector: all four
     /// call sites present the capability, and each refusal says what the
     /// capability was for.
     #[tokio::test]
     async fn every_telemetry_read_presents_the_capability_and_says_so_when_refused() {
         let (server, _data) = collector().await;
-        let endpoint = format!("http://{}", server.grpc_addr);
+        let endpoint = format!("https://{}", server.grpc_addr);
         let reader = minted(&control_key(), &["demo.production"]);
 
         let mut logs = Telemetry::connect(&endpoint, reader.clone())
@@ -598,7 +622,7 @@ mod tests {
             .await
             .expect_err("a capability the control plane did not sign is refused")
             .to_string();
-        assert!(error.contains("capability_jwks_url"), "{error}");
+        assert!(error.contains("control_endpoint"), "{error}");
 
         server.shutdown().await.expect("the collector stops");
     }
@@ -607,7 +631,7 @@ mod tests {
     fn a_bare_host_and_port_becomes_a_url() {
         assert_eq!(
             normalise_endpoint("127.0.0.1:8092"),
-            "http://127.0.0.1:8092"
+            "https://127.0.0.1:8092"
         );
         assert_eq!(
             normalise_endpoint("http://127.0.0.1:8092/"),

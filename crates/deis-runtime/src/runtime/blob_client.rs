@@ -224,7 +224,8 @@ impl BlobClient {
     /// of the object, so a fixed deadline would cut off large-but-healthy
     /// downloads. [`DEFAULT_MAX_OBJECT_BYTES`] bounds the cost instead.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel = super::bindings::streaming_channel(endpoint)?;
+        let channel =
+            super::bindings::streaming_channel(endpoint, deis_identity::ServiceKind::Store)?;
         let client = GrpcBlobClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);

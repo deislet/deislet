@@ -1265,9 +1265,15 @@ impl MetricShipper {
         }
 
         let channel = match Endpoint::from_shared(endpoint.clone())
-            .map(|e| e.connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT))
-        {
-            Ok(builder) => builder.connect_lazy(),
+            .map_err(anyhow::Error::from)
+            .and_then(|e| {
+                crate::runtime::service_tls::lazy(
+                    e.connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT),
+                    &endpoint,
+                    deis_identity::ServiceKind::Telemetry,
+                )
+            }) {
+            Ok(channel) => channel,
             Err(e) => {
                 error!(
                     %endpoint,
@@ -1451,7 +1457,7 @@ async fn push_once(
             error = %status.message(),
             "deis-telemetry refused this node's metrics: this node has no telemetry capability \
              from the control plane yet, or the collector does not trust the control plane's \
-             signing keys (check its capability_jwks_url). The counters are cumulative, so the \
+             signing keys (check its [machine_identity] control_endpoint). The counters are cumulative, so the \
              next accepted push carries them"
         ),
         Err(status) => warn!(
@@ -1522,7 +1528,7 @@ async fn push_traces_once(
                     "deis-telemetry refused this node's invocation traces: this node has no \
                      telemetry capability from the control plane yet, or the collector does \
                      not trust the control plane's signing keys (check its \
-                     capability_jwks_url). The records queue until the buffer fills and are \
+                     [machine_identity] control_endpoint). The records queue until the buffer fills and are \
                      then discarded"
                 );
             } else {

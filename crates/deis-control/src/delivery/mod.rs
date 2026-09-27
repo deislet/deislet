@@ -204,6 +204,10 @@ pub struct StorageWiring {
     /// to deis-queue (the consumer-generation barrier). Never sent to a node
     /// and never logged.
     issuer: CapabilityIssuer,
+    /// What this control plane checks deis-queue's certificate against when
+    /// it calls the queue itself: its own machine identity. Unset means it
+    /// cannot call the queue at all, rather than calling it unverified.
+    service_trust: Option<deis_identity::ServiceTrust>,
 }
 
 impl std::fmt::Debug for StorageWiring {
@@ -215,6 +219,7 @@ impl std::fmt::Debug for StorageWiring {
         f.debug_struct("StorageWiring")
             .field("store", &self.store)
             .field("queue", &self.queue)
+            .field("service_trust", &self.service_trust)
             .finish_non_exhaustive()
     }
 }
@@ -234,7 +239,49 @@ impl StorageWiring {
             store: clean(&config.store_endpoint),
             queue: clean(&config.queue_endpoint),
             issuer,
+            service_trust: None,
         }
+    }
+
+    /// Attach what deis-queue's certificate is checked against.
+    pub fn with_service_trust(mut self, trust: Option<deis_identity::ServiceTrust>) -> Self {
+        self.service_trust = trust;
+        self
+    }
+
+    /// A channel to deis-queue that dials on first use and refuses any
+    /// server whose certificate does not name a queue of this fleet.
+    ///
+    /// The queue serves TLS only, so an `http://` address is refused here
+    /// rather than dialled into a handshake failure; so is a control plane
+    /// with no identity to check the certificate against, since sending a
+    /// capability to an unverified peer is what the TLS is there to prevent.
+    fn queue_channel(&self) -> anyhow::Result<tonic::transport::Channel> {
+        let endpoint = self
+            .queue
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("queue endpoint is not configured"))?;
+        if !endpoint.starts_with("https://") {
+            anyhow::bail!(
+                "queue_endpoint {endpoint:?} is not https://; deis-queue serves TLS only, and a \
+                 capability is never sent to it in the clear"
+            );
+        }
+        let trust = self.service_trust.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this control plane has no machine identity to check deis-queue's certificate \
+                 against, so it does not call the queue"
+            )
+        })?;
+        Ok(
+            tonic::transport::Endpoint::from_shared(endpoint.to_string())?
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_with_connector_lazy(trust.dialler(
+                    deis_identity::ServiceKind::Queue,
+                    &[deis_identity::Protocol::Http2],
+                )),
+        )
     }
 
     /// The capability this control plane presents to deis-queue for one
@@ -317,16 +364,8 @@ impl StorageWiring {
         use deis_queue::proto::queue::{
             PrepareConsumerGenerationRequest, queue_client::QueueClient,
         };
-        use tonic::transport::Endpoint;
 
-        let endpoint = self
-            .queue
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("queue endpoint is not configured"))?;
-        let channel = Endpoint::from_shared(endpoint.to_string())?
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_lazy();
+        let channel = self.queue_channel()?;
         let tenant = deis_wire::conventions::tenant_id(app_id, environment);
         let mut request = tonic::Request::new(PrepareConsumerGenerationRequest {
             deployment_id: deployment_id.to_string(),
@@ -401,15 +440,7 @@ impl StorageWiring {
         app_id: &str,
         environment: &str,
     ) -> anyhow::Result<(tonic::transport::Channel, String)> {
-        use tonic::transport::Endpoint;
-        let endpoint = self
-            .queue
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("queue endpoint is not configured"))?;
-        let channel = Endpoint::from_shared(endpoint.to_string())?
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_lazy();
+        let channel = self.queue_channel()?;
         Ok((
             channel,
             deis_wire::conventions::tenant_id(app_id, environment),
@@ -2244,6 +2275,7 @@ mod tests {
             store: Some("http://127.0.0.1:8090".to_string()),
             queue: Some("http://127.0.0.1:8091".to_string()),
             issuer: CapabilityIssuer::for_test(ISSUER_ID),
+            service_trust: None,
         }
     }
 
@@ -2253,6 +2285,7 @@ mod tests {
             store: None,
             queue: None,
             issuer: CapabilityIssuer::for_test(ISSUER_ID),
+            service_trust: None,
         }
     }
 

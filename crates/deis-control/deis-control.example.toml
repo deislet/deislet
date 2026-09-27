@@ -310,17 +310,22 @@ data_dir = "/var/lib/deis-control"
 # queue still load, but every ctx.services call they make answers "service
 # not available" and their declared queue consumers never start.
 #
-# They are addresses, not credentials, and are logged like any variable.
-# store_endpoint = "http://127.0.0.1:8090"
-# queue_endpoint = "http://127.0.0.1:8091"
-# telemetry_endpoint = "http://127.0.0.1:8092"
+# They are addresses, not credentials, and are logged like any variable. All
+# three services serve TLS only, so the addresses are https://: a node checks
+# each certificate against the fleet's authority - it must name that kind of
+# service - before a capability leaves it, and so does this control plane
+# when it calls deis-queue itself.
+# store_endpoint = "https://127.0.0.1:8090"
+# queue_endpoint = "https://127.0.0.1:8091"
+# telemetry_endpoint = "https://127.0.0.1:8092"
 
 # There is no storage secret to configure. Calls to deis-store and deis-queue
 # carry Ed25519 capabilities this control plane signs with keys it keeps in
 # its own database, encrypted under secret_key_file above and rotated on
-# their own; the two services fetch the public keys from
-# /.well-known/deis/capability-jwks.json on this listener (their
-# capability_jwks_url setting).
+# their own; the services read the public keys from
+# /.well-known/deis/capability-jwks.json on the [machine] listener below, under
+# mutual TLS with their own machine identities (their [machine_identity]
+# control_endpoint). The human listener does not serve it.
 
 # Independent backend-migration administrator credentials. Each value must
 # match migration_admin_token on the corresponding service, contain at least

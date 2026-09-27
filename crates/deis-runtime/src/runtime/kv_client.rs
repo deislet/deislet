@@ -115,7 +115,7 @@ impl KvClient {
     /// back. Only an address that is not a URL is refused here -- and it would
     /// never start working.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel = super::bindings::unary_channel(endpoint)?;
+        let channel = super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Store)?;
         let client = KvStoreClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
@@ -377,6 +377,8 @@ mod tests {
             let listener = server::bind(&config).await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
             let (shutdown, rx) = oneshot::channel();
+            let identity = crate::runtime::test_store::fleet()
+                .service_identity(deis_identity::ServiceKind::Store);
             tokio::spawn(async move {
                 server::serve(
                     config,
@@ -385,13 +387,14 @@ mod tests {
                         let _ = rx.await;
                     },
                     deis_capability::KeyRing::from_keys([verifying_key]),
+                    identity,
                 )
                 .await
                 .expect("serve");
             });
             Self {
                 _data: data,
-                endpoint: format!("http://{addr}"),
+                endpoint: format!("https://{addr}"),
                 signing_key,
                 shutdown: Some(shutdown),
             }

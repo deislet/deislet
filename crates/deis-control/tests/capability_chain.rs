@@ -5,9 +5,13 @@
 //! as a child process and real deis-store and deis-queue servers over TCP,
 //! and connects them only the way an installation does:
 //!
-//! * the verifiers start with an empty key ring and a URL, before the control
-//!   plane is even up, and learn its keys by fetching its JWKS
-//!   (`deis_capability::fetch`, the same refresher their binaries start);
+//! * the verifiers start with an empty key ring and their own machine
+//!   identity, before the control plane is even up, and learn its keys by
+//!   fetching its JWKS from the machine channel under mutual TLS
+//!   (`deis_capability::fetch`, the same refresher their binaries start,
+//!   built by the same startup step);
+//! * every call to them is TLS, checked the way a real caller checks it: the
+//!   certificate must chain to the fleet's root and name that kind of service;
 //! * a credential is obtained the way `deis kv` obtains one - log in with the
 //!   bootstrap token the control plane wrote into its data directory, then
 //!   `GET .../storage-token` - so the bindings and audiences are whatever the
@@ -30,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use deis_capability::KeyRing;
 use deis_capability::fetch::{RefreshPolicy, spawn_refresher};
-use deis_identity::names;
+use deis_identity::{Protocol, ServiceKind, ServiceTrust, names};
 use deis_identity_test_pki::{TestCa, write_files};
 use deis_queue::proto::queue::{ListDeadLettersRequest, SendRequest, queue_client::QueueClient};
 use deis_store::proto::blob::{ListRequest as BlobListRequest, blob_store_client::BlobStoreClient};
@@ -75,6 +79,7 @@ struct Installation {
     /// A node's identity from the same authority, for reaching the machine
     /// listener as a machine of this fleet does.
     node_identity: deis_identity::IdentityFiles,
+    ca: TestCa,
 }
 
 impl Installation {
@@ -115,8 +120,8 @@ heartbeat_timeout = 90
 data_dir = "{data}"
 bundle_dir = "{bundles}"
 secret_key_file = "{key}"
-store_endpoint = "http://{store}"
-queue_endpoint = "http://{queue}"
+store_endpoint = "https://{store}"
+queue_endpoint = "https://{queue}"
 
 [machine]
 bind_addr = "127.0.0.1"
@@ -141,6 +146,7 @@ trust_root = "{trust_root}"
             port,
             machine_port,
             node_identity,
+            ca,
         }
     }
 
@@ -148,8 +154,38 @@ trust_root = "{trust_root}"
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    fn jwks_url(&self) -> String {
-        format!("{}/.well-known/deis/capability-jwks.json", self.base_url())
+    /// The machine channel, where the JWKS is served and nowhere else.
+    fn machine_url(&self) -> String {
+        format!("https://127.0.0.1:{}", self.machine_port)
+    }
+
+    /// A data service's `[machine_identity]`: a certificate this
+    /// installation's authority issued for `name`, and the machine channel.
+    fn service_identity(
+        &self,
+        file: &str,
+        name: &deis_identity::SpiffeId,
+    ) -> deis_capability::ServiceIdentityConfig {
+        let files = write_files(
+            self.dir.path(),
+            file,
+            &self.ca.issue(name),
+            &self.ca.root_pem,
+        );
+        deis_capability::ServiceIdentityConfig {
+            certificate: files.certificate,
+            private_key: files.private_key,
+            trust_root: files.trust_root,
+            control_endpoint: self.machine_url(),
+            identity_reload_seconds: 60,
+        }
+    }
+
+    /// What a caller holding only this installation's root trusts.
+    fn trust(&self) -> ServiceTrust {
+        let root = self.dir.path().join("fleet-root.pem");
+        std::fs::write(&root, &self.ca.root_pem).expect("write root");
+        ServiceTrust::from_trust_root(&root).expect("the root loads")
     }
 
     fn bootstrap_file(&self) -> PathBuf {
@@ -237,26 +273,47 @@ fn quick_refresh() -> RefreshPolicy {
 }
 
 /// A deis-store or deis-queue server over a real socket, keyed only by what
-/// it fetches from `jwks_url`.
+/// it fetches from the control plane's machine channel.
 struct Service {
     _data: TempDir,
     addr: SocketAddr,
+    kind: ServiceKind,
+    trust: ServiceTrust,
     _shutdown: oneshot::Sender<()>,
 }
 
 impl Service {
-    async fn store(listener: tokio::net::TcpListener, control: &str, jwks_url: String) -> Self {
+    async fn store(
+        listener: tokio::net::TcpListener,
+        installation: &Installation,
+        id: &str,
+    ) -> Self {
+        Self::store_polling(listener, installation, id, installation.base_url()).await
+    }
+
+    /// A store that polls its revocation list at `revocation_list_url`.
+    async fn store_polling(
+        listener: tokio::net::TcpListener,
+        installation: &Installation,
+        id: &str,
+        revocation_list_url: String,
+    ) -> Self {
         let data = TempDir::new().expect("a directory");
         let addr = listener.local_addr().expect("an address");
+        let name = names::store(TRUST_DOMAIN, id).expect("a store name");
         let config = deis_store::config::Config {
             listen: addr.to_string(),
             data_dir: data.path().to_path_buf(),
-            capability_jwks_url: jwks_url.clone(),
-            revocation_list_url: control.to_string(),
+            revocation_list_url,
+            machine_identity: Some(installation.service_identity(id, &name)),
             ..deis_store::config::Config::default()
         };
+        // The binary's own startup step: identity, and a control-plane client
+        // that proves it.
+        let (identity, control) =
+            deis_store::server::machine_identity(&config).expect("the store's identity loads");
         let keys = KeyRing::new();
-        spawn_refresher(keys.clone(), jwks_url, quick_refresh());
+        spawn_refresher(keys.clone(), control, quick_refresh());
         let (shutdown, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             deis_store::server::serve(
@@ -266,6 +323,7 @@ impl Service {
                     let _ = rx.await;
                 },
                 keys,
+                identity,
             )
             .await
             .expect("deis-store serves");
@@ -273,22 +331,31 @@ impl Service {
         Self {
             _data: data,
             addr,
+            kind: ServiceKind::Store,
+            trust: installation.trust(),
             _shutdown: shutdown,
         }
     }
 
-    async fn queue(listener: tokio::net::TcpListener, control: &str, jwks_url: String) -> Self {
+    async fn queue(
+        listener: tokio::net::TcpListener,
+        installation: &Installation,
+        id: &str,
+    ) -> Self {
         let data = TempDir::new().expect("a directory");
         let addr = listener.local_addr().expect("an address");
+        let name = names::queue(TRUST_DOMAIN, id).expect("a queue name");
         let config = deis_queue::config::Config {
             listen: addr.to_string(),
             data_dir: data.path().to_path_buf(),
-            capability_jwks_url: jwks_url.clone(),
-            revocation_list_url: control.to_string(),
+            revocation_list_url: installation.base_url(),
+            machine_identity: Some(installation.service_identity(id, &name)),
             ..deis_queue::config::Config::default()
         };
+        let (identity, control) =
+            deis_queue::server::machine_identity(&config).expect("the queue's identity loads");
         let keys = KeyRing::new();
-        spawn_refresher(keys.clone(), jwks_url, quick_refresh());
+        spawn_refresher(keys.clone(), control, quick_refresh());
         let (shutdown, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             deis_queue::server::serve(
@@ -298,6 +365,7 @@ impl Service {
                     let _ = rx.await;
                 },
                 keys,
+                identity,
             )
             .await
             .expect("deis-queue serves");
@@ -305,14 +373,18 @@ impl Service {
         Self {
             _data: data,
             addr,
+            kind: ServiceKind::Queue,
+            trust: installation.trust(),
             _shutdown: shutdown,
         }
     }
 
+    /// A TLS channel that accepts only a certificate this installation's
+    /// authority issued for this kind of service.
     async fn channel(&self) -> Channel {
-        Channel::from_shared(format!("http://{}", self.addr))
+        tonic::transport::Endpoint::from_shared(format!("https://{}", self.addr))
             .expect("a URI")
-            .connect()
+            .connect_with_connector(self.trust.dialler(self.kind, &[Protocol::Http2]))
             .await
             .expect("connects")
     }
@@ -408,13 +480,17 @@ impl Api {
     }
 }
 
+/// The kids the control plane publishes, read the way a verifier reads them:
+/// over the machine channel, proving a data service's certificate.
 async fn published_kids(installation: &Installation) -> Vec<String> {
-    let jwks: deis_capability::Jwks = reqwest::get(installation.jwks_url())
+    let name = names::store(TRUST_DOMAIN, "kid-reader").expect("a store name");
+    let identity = installation.service_identity("kid-reader", &name);
+    let control = deis_capability::ControlClient::connect(&identity.control_client_config())
+        .expect("a control client");
+    let jwks: deis_capability::Jwks = control
+        .get_json(deis_capability::JWKS_PATH)
         .await
-        .expect("the JWKS answers")
-        .json()
-        .await
-        .expect("a JWKS document");
+        .expect("the JWKS answers on the machine channel");
     let mut kids: Vec<String> = jwks.keys.into_iter().map(|key| key.kid).collect();
     kids.sort();
     kids
@@ -571,9 +647,8 @@ async fn storage_keeps_working_across_a_control_plane_restart() {
         store_listener.local_addr().unwrap(),
         queue_listener.local_addr().unwrap(),
     );
-    let control_url = installation.base_url();
-    let store = Service::store(store_listener, &control_url, installation.jwks_url()).await;
-    let queue = Service::queue(queue_listener, &control_url, installation.jwks_url()).await;
+    let store = Service::store(store_listener, &installation, "store-1").await;
+    let queue = Service::queue(queue_listener, &installation, "queue-1").await;
 
     // First life of the control plane.
     let control = installation.start(1).await;
@@ -590,6 +665,22 @@ async fn storage_keeps_working_across_a_control_plane_restart() {
     assert!(
         !kids_before.is_empty(),
         "a fresh control plane publishes a key"
+    );
+    // And publishes it nowhere else: the human listener is reachable by
+    // whatever reaches a dashboard, and whoever answers for this document
+    // decides which capabilities the data services honour.
+    let on_the_human_listener = reqwest::get(format!(
+        "{}{}",
+        installation.base_url(),
+        deis_capability::JWKS_PATH
+    ))
+    .await
+    .expect("the human listener answers")
+    .json::<deis_capability::Jwks>()
+    .await;
+    assert!(
+        on_the_human_listener.is_err(),
+        "the JWKS must not be served on the human listener"
     );
     let (store_before, queue_before) = api.storage_tokens().await;
 
@@ -617,18 +708,8 @@ async fn storage_keeps_working_across_a_control_plane_restart() {
     // And verifiers that have only ever seen the restarted control plane
     // accept the tokens its previous life minted: nothing about trusting a
     // token depends on having been running before the restart.
-    let fresh_store = Service::store(
-        local_listener().await,
-        &control_url,
-        installation.jwks_url(),
-    )
-    .await;
-    let fresh_queue = Service::queue(
-        local_listener().await,
-        &control_url,
-        installation.jwks_url(),
-    )
-    .await;
+    let fresh_store = Service::store(local_listener().await, &installation, "store-2").await;
+    let fresh_queue = Service::queue(local_listener().await, &installation, "queue-2").await;
     use_store(&fresh_store, &store_before, "old-token-fresh-store").await;
     use_store(&fresh_store, &store_after, "new-token-fresh-store").await;
     use_queue(&fresh_queue, &queue_before, "old-token-fresh-queue").await;
@@ -741,7 +822,7 @@ async fn a_revocation_reaches_the_store_within_one_poll() {
     );
     let _control = installation.start(1).await;
     let relay = revocation_relay(&installation).await;
-    let store = Service::store(store_listener, &relay, installation.jwks_url()).await;
+    let store = Service::store_polling(store_listener, &installation, "store-1", relay.clone()).await;
 
     let api = Api::log_in(&installation).await;
     api.call(reqwest::Method::POST, "/apps", Some(json!({"id": APP})))
@@ -794,7 +875,8 @@ async fn a_revocation_reaches_the_store_within_one_poll() {
         .call(reqwest::Method::POST, "/capabilities/auth-epoch", None)
         .await;
     assert_eq!(bumped["auth_epoch"], 2);
-    let fresh = Service::store(local_listener().await, &relay, installation.jwks_url()).await;
+    let fresh =
+        Service::store_polling(local_listener().await, &installation, "store-2", relay).await;
     refused_eventually(&fresh, &kept, Code::PermissionDenied, DEADLINE).await;
     let (after, _) = api.storage_tokens().await;
     use_store(&fresh, &after, "after-epoch-bump").await;
