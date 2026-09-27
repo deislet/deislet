@@ -1,0 +1,27 @@
+# cargo-nextest configuration. `cargo nextest run` uses the default profile;
+# CI (.github/workflows/checks.yml) runs `--profile ci`.
+
+[profile.default]
+# A test that has run this long is named in the output as SLOW, every minute,
+# so a hang is visible while it is happening rather than at the job timeout.
+slow-timeout = { period = "60s" }
+
+[profile.ci]
+# Every failure, not the first: a CI run is read once, after the fact.
+fail-fast = false
+# One retry. Several suites here start real servers, V8 isolates and
+# subprocesses under a host that is compiling at the same time, and a timing
+# failure on a loaded machine would otherwise fail the run for a reason that
+# is not in the diff. A test that passes only on its retry is still reported
+# as FLAKY in the summary and in the JUnit file: that is a bug to fix, not a
+# pass to forget.
+retries = 1
+# SLOW after a minute; killed after ten, so one hung test cannot hold the job
+# until its two-hour timeout.
+slow-timeout = { period = "60s", terminate-after = 10 }
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+# Relative to the store, target/nextest/ci/ under the workspace root
+# (nextest does not follow CARGO_TARGET_DIR for it).
+path = "junit.xml"

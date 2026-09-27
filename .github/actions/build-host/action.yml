@@ -1,0 +1,45 @@
+# The build host's Rust environment, for every job that runs cargo.
+#
+# The runner is s7 (docs/operations/ci-runner.md), a persistent machine that
+# already carries rustup, sccache with its distributed workers, mold and the
+# canonical target directories. Two things are settled here so that no step
+# below can get them wrong:
+#
+# * CARGO_TARGET_DIR comes from /usr/local/bin/rust-target-env and is exported
+#   through GITHUB_ENV, so every later step of the job uses it. sccache keys
+#   every compilation on the CARGO_* environment and on the paths under the
+#   target directory; one stable directory per checkout is what makes the
+#   second run of this workflow a cache hit rather than a cold build. A step
+#   that set its own --target-dir would throw that away.
+# * The toolchain is the one rust-toolchain.toml pins, installed if missing.
+#
+# Nothing else is set. RUSTFLAGS, CARGO_INCREMENTAL and the profile's debug
+# level come from the runner user's ~/.cargo/config.toml, the same as for a
+# developer on the host: setting any of them here would change every cache key.
+name: build host
+description: Pin the canonical target directory and the pinned toolchain.
+runs:
+  using: composite
+  steps:
+    - name: Canonical target directory
+      shell: bash
+      run: |
+        set -euo pipefail
+        line=$(/usr/local/bin/rust-target-env)
+        if [ -z "$line" ]; then
+          echo "::error::rust-target-env printed nothing; see docs/operations/ci-runner.md (target directories)"
+          exit 1
+        fi
+        echo "$line"
+        echo "${line#export }" >> "$GITHUB_ENV"
+
+    - name: Pinned toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        # With no argument rustup installs what rust-toolchain.toml names,
+        # components included, and does nothing when it is already there.
+        rustup toolchain install
+        rustc --version
+        cargo --version
+        echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-<unset>}"

@@ -18,28 +18,24 @@ EXPECTED_PHASES = [f"phase-{number}" for number in range(6)]
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 WORK_ID = re.compile(r"^P([0-5])-[A-Z]+-[0-9]{3}$")
-EXPECTED_WORKSPACE_TIMEOUT_MINUTES = 60
-EXPECTED_TEST_SHARD_TIMEOUT_MINUTES = 90
-EXPECTED_TEST_SHARDS = {
-    "runtime-tests": "cargo test -p deis-runtime --no-fail-fast",
-    "compiler-cli-tests": (
-        "cargo test -p deis-bundle -p deis-node-contract -p deis-artifact -p deis-build-core "
-        "-p deis-build-adapter-cloudflare -p deis-build-adapter-deislet "
-        "-p deis-build-adapter-deno -p deis-build-adapter-tencent "
-        "-p deis-build -p deis --no-fail-fast"
-    ),
-    "control-services-tests": (
-        "cargo test -p deis-wire -p deis-identity -p deis-identity-test-pki "
-        "-p deis-provider-driver -p deis-backend-migration "
-        "-p deis-backend-topology "
-        "-p deis-control -p deis-store "
-        "-p deis-queue -p deis-telemetry -p deis-proxy "
-        "--no-fail-fast"
-    ),
-}
-EXPECTED_TEST_PREREQUISITES = {
-    "runtime-tests": "cargo build -p deis-proxy",
-}
+# Every CI job runs on the one self-hosted runner (docs/operations/ci-runner.md).
+EXPECTED_RUNS_ON = "runs-on: [self-hosted, linux, x64, deislet]"
+# The guard that keeps pull requests from forks off that runner.
+EXPECTED_FORK_GUARD = (
+    "if: github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name == github.repository"
+)
+EXPECTED_WORKSPACE_TIMEOUT_MINUTES = 120
+# The workspace job's test commands, in order after the build that the
+# runtime integration tests need (two of them start the real deis-proxy
+# binary from the same target directory). `--workspace` is the coverage rule:
+# per-crate lists are how deis-capability and deis-provider-driver-cloudflare
+# went untested, because nobody added them to one.
+EXPECTED_WORKSPACE_TEST_STEPS = (
+    "cargo build --workspace",
+    "cargo nextest run --workspace --profile ci",
+    "cargo test --workspace --doc",
+)
 COMPILER_IDENTITY_EVIDENCE_GLOB = "compiler-identity-*.json"
 PROVIDER_DRIVER_PORTABILITY_EVIDENCE_GLOB = "provider-driver-portability-*.json"
 PROVIDER_DEPLOYMENT_PORTABILITY_EVIDENCE_GLOB = "provider-deployment-portability-*.json"
@@ -81,16 +77,6 @@ def load_json(relative: str) -> dict:
         raise ValidationError(f"{relative}: {error}") from error
     require(isinstance(value, dict), f"{relative}: top-level value must be an object")
     return value
-
-
-def workspace_package_names() -> set[str]:
-    workspace = tomllib.loads(read_text("Cargo.toml"))
-    names: set[str] = set()
-    for member in workspace["workspace"]["members"]:
-        for manifest in ROOT.glob(f"{member}/Cargo.toml"):
-            document = tomllib.loads(manifest.read_text(encoding="utf-8"))
-            names.add(document["package"]["name"])
-    return names
 
 
 def adr_header_fields(text: str) -> dict[str, str]:
@@ -906,58 +892,57 @@ def validate_integration() -> None:
         "official provider tool source lock or schema is missing",
     )
     require("cargo audit" in workflow, "CI dependency audit is missing")
-    workspace_job = re.search(
-        r"(?ms)^  workspace:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
-        workflow,
+    jobs = re.findall(
+        r"(?ms)^  (?P<id>[a-zA-Z0-9_-]+):\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+        workflow.split("\njobs:\n", 1)[1] if "\njobs:\n" in workflow else "",
     )
+    require(jobs, "CI workflow has no jobs")
+    for job_id, body in jobs:
+        require(
+            EXPECTED_RUNS_ON in body,
+            f"CI job {job_id} must run on the self-hosted runner ({EXPECTED_RUNS_ON})",
+        )
+        require(
+            EXPECTED_FORK_GUARD in body,
+            f"CI job {job_id} must refuse pull requests from forks ({EXPECTED_FORK_GUARD})",
+        )
+        require(
+            ("cargo " not in body) or ("uses: ./.github/actions/build-host" in body),
+            f"CI job {job_id} runs cargo without the build-host target directory",
+        )
+        require(
+            not re.search(r"cargo (?:test|nextest run)[^\n]*\s-p\s", body),
+            f"CI job {job_id} tests a hand-kept list of packages; use --workspace",
+        )
+    workspace_job = dict(jobs).get("workspace")
     require(workspace_job is not None, "CI workspace job is missing")
-    timeout = re.search(r"(?m)^    timeout-minutes:\s*([0-9]+)\s*$", workspace_job.group("body"))
+    timeout = re.search(r"(?m)^    timeout-minutes:\s*([0-9]+)\s*$", workspace_job)
     require(timeout is not None, "CI workspace job must have a finite timeout")
     require(
         int(timeout.group(1)) == EXPECTED_WORKSPACE_TIMEOUT_MINUTES,
-        "CI static workspace gates must remain at the measured "
-        f"{EXPECTED_WORKSPACE_TIMEOUT_MINUTES}-minute ceiling",
+        f"CI workspace job must keep the {EXPECTED_WORKSPACE_TIMEOUT_MINUTES}-minute ceiling",
+    )
+    positions = [workspace_job.find(f"run: {step}\n") for step in EXPECTED_WORKSPACE_TEST_STEPS]
+    require(
+        all(position >= 0 for position in positions) and positions == sorted(positions),
+        "CI workspace job must run, in order: " + "; ".join(EXPECTED_WORKSPACE_TEST_STEPS),
     )
     require(
-        "cargo test --workspace" not in workspace_job.group("body"),
-        "CI must not put every workspace test back behind one opaque job ceiling",
+        "--exclude" not in workspace_job,
+        "CI workspace job must not exclude packages from the workspace run",
     )
-    for job_id, command in EXPECTED_TEST_SHARDS.items():
-        shard = re.search(
-            rf"(?ms)^  {re.escape(job_id)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
-            workflow,
-        )
-        require(shard is not None, f"CI test shard {job_id} is missing")
-        shard_timeout = re.search(
-            r"(?m)^    timeout-minutes:\s*([0-9]+)\s*$", shard.group("body")
-        )
-        require(shard_timeout is not None, f"CI test shard {job_id} must have a finite timeout")
-        require(
-            int(shard_timeout.group(1)) == EXPECTED_TEST_SHARD_TIMEOUT_MINUTES,
-            f"CI test shard {job_id} must keep the "
-            f"{EXPECTED_TEST_SHARD_TIMEOUT_MINUTES}-minute ceiling",
-        )
-        require(command in shard.group("body"), f"CI test shard {job_id} command drifted")
-        prerequisite = EXPECTED_TEST_PREREQUISITES.get(job_id)
-        if prerequisite is not None:
-            require(
-                prerequisite in shard.group("body"),
-                f"CI test shard {job_id} lacks required integration-test prerequisite {prerequisite}",
-            )
-    assigned_packages = [
-        package
-        for command in EXPECTED_TEST_SHARDS.values()
-        for package in re.findall(r"(?:^|\s)-p\s+([a-zA-Z0-9_-]+)", command)
-    ]
+    # One hung test must be named and killed, not left to hold the job until
+    # its ceiling with nothing in the log saying which test it was.
+    nextest = tomllib.loads(read_text(".config/nextest.toml"))
+    ci_profile = nextest.get("profile", {}).get("ci", {})
+    slow_timeout = ci_profile.get("slow-timeout", {})
     require(
-        len(assigned_packages) == len(set(assigned_packages)),
-        "CI test shards assign at least one workspace package more than once",
+        isinstance(slow_timeout, dict) and int(slow_timeout.get("terminate-after", 0)) > 0,
+        "nextest ci profile must terminate a hung test (slow-timeout.terminate-after)",
     )
-    packages = workspace_package_names()
     require(
-        set(assigned_packages) == packages,
-        "CI test shards must cover every workspace package exactly once: "
-        f"expected {sorted(packages)}, got {sorted(assigned_packages)}",
+        ci_profile.get("fail-fast") is False,
+        "nextest ci profile must report every failure (fail-fast = false)",
     )
     # These are the first official-action majors that run natively on Node
     # 24. Keep the set explicit: silently falling back to an older major
@@ -966,8 +951,6 @@ def validate_integration() -> None:
     expected_official_actions = {
         "actions/checkout@v5",
         "actions/setup-node@v5",
-        "actions/setup-python@v6",
-        "actions/cache@v5",
         "actions/upload-artifact@v6",
     }
     actual_official_actions = set(re.findall(r"uses:\s+(actions/[a-z-]+@v[0-9]+)", workflow))
