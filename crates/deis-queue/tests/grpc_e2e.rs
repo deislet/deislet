@@ -1285,7 +1285,7 @@ async fn a_call_without_the_tenant_header_is_refused() {
     let mut client = harness.client().await;
 
     // No headers at all: the interceptor catches the missing Authorization
-    // header first and answers InvalidArgument.
+    // header first and answers Unauthenticated, as deis-store does.
     let status = client
         .send(Request::new(SendRequest {
             queue_name: "jobs".to_string(),
@@ -1293,7 +1293,7 @@ async fn a_call_without_the_tenant_header_is_refused() {
         }))
         .await
         .expect_err("a call with no tenant must be refused");
-    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.code(), Code::Unauthenticated);
 
     let status = client
         .pull(Request::new(PullRequest {
@@ -1303,7 +1303,7 @@ async fn a_call_without_the_tenant_header_is_refused() {
         }))
         .await
         .expect_err("a call with no tenant must be refused");
-    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.code(), Code::Unauthenticated);
 
     // The application header is not the storage tenant. A caller that stamps
     // only `x-deis-app-id` - which is what every caller did before this
@@ -1321,8 +1321,8 @@ async fn a_call_without_the_tenant_header_is_refused() {
         .await
         .expect_err("the application header alone must not identify a tenant");
     // The app-id-only call has no Authorization header, so the interceptor
-    // refuses it with InvalidArgument.
-    assert_eq!(status.code(), Code::InvalidArgument);
+    // refuses it with Unauthenticated.
+    assert_eq!(status.code(), Code::Unauthenticated);
 
     // A tenant header but no capability: the interceptor refuses it.
     let status = client
@@ -1336,7 +1336,7 @@ async fn a_call_without_the_tenant_header_is_refused() {
         ))
         .await
         .expect_err("a call with no capability token must be refused");
-    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.code(), Code::Unauthenticated);
 
     // Malformed tenant values: the interceptor passes them (the capability
     // matches what the header says) but the handler's tenant validation
@@ -1601,7 +1601,7 @@ async fn a_call_with_no_token_is_refused() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.code(), Code::Unauthenticated);
 }
 
 #[tokio::test]

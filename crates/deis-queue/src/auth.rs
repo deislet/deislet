@@ -193,7 +193,7 @@ fn map_capability_error(e: CapabilityError) -> Status {
         }
         CapabilityError::ParseError(_) => {
             tracing::warn!("refused a queue call with an unparseable capability token");
-            Status::invalid_argument(e.to_string())
+            Status::unauthenticated(e.to_string())
         }
         CapabilityError::WrongAudience { .. } => {
             tracing::warn!("refused a queue call whose capability has the wrong audience");
