@@ -6,6 +6,7 @@ pub mod api;
 pub mod audit;
 pub mod catalog;
 pub mod command;
+pub mod capability_issuer;
 pub mod config;
 pub mod config_manager;
 pub mod database;

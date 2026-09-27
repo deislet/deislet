@@ -30,6 +30,7 @@ use tonic::service::Routes;
 use tracing::{error, info, warn};
 
 use crate::api::catalog::{CatalogState, versions};
+use crate::capability_issuer::CapabilityIssuer;
 use crate::config::MachineChannelConfig;
 use crate::machine::{MachineChannelService, identity_acceptor};
 
@@ -68,10 +69,11 @@ pub fn load_identity(config: &MachineChannelConfig) -> anyhow::Result<Arc<Machin
 /// No CORS, no console fallback and no human authentication layer: none of
 /// them has a caller here, and a layer mounted where it has no caller is a
 /// layer nobody notices is misconfigured.
-pub fn router(state: CatalogState, control: ControlServiceServer<GrpcControlService>) -> Router {
+pub fn router(state: CatalogState, issuer: CapabilityIssuer, control: ControlServiceServer<GrpcControlService>) -> Router {
     let rpcs = Routes::default()
         .add_service(MachineChannelServer::new(MachineChannelService::new(
             state.clone(),
+            issuer,
         )))
         // The long-lived channel a proxy holds open. It belongs here for the
         // same reason the rest does - it is a machine talking to a machine -
@@ -203,7 +205,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
         let address = listener.local_addr().expect("an address");
-        let app = router(harness.state.clone(), test_control_service());
+        let app = router(harness.state.clone(), CapabilityIssuer::for_test("spiffe://deislet/control/test"), test_control_service());
         tokio::spawn(async move {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });
@@ -260,7 +262,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         listener.set_nonblocking(true).expect("non-blocking");
         let address = listener.local_addr().expect("an address");
-        let app = router(harness.state.clone(), test_control_service());
+        let app = router(harness.state.clone(), CapabilityIssuer::for_test("spiffe://deislet/control/test"), test_control_service());
         tokio::spawn(async move {
             let _ = serve(listener, app, control, std::future::pending()).await;
         });

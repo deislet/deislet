@@ -33,6 +33,9 @@ service MachineChannel {
   // A node asks for the plaintext values of the secrets it needs for a
   // deployment. Secrets no longer travel in the deployment message itself.
   rpc FetchSecretValues(FetchSecretValuesRequest) returns (FetchSecretValuesResponse);
+  // A node asks for a capability token authorizing access to a specific
+  // backend (store, queue, or telemetry) for one or more tenants.
+  rpc IssueCapability(IssueCapabilityRequest) returns (IssueCapabilityResponse);
 }
 
 // ---- what is deliberately not here --------------------------------------
@@ -144,5 +147,21 @@ message FetchSecretValuesResponse {
   // secret value. A key absent from this map means the value is not
   // available (unknown deployment, revision not found, or unauthorized).
   string values_json = 1;
+}
+
+message IssueCapabilityRequest {
+  // Which node is asking. Verified against the peer certificate.
+  string node_id = 1;
+  // Audience: "store", "queue", or "telemetry".
+  string audience = 2;
+  // A JSON array of `{tenant, binding, generation?}` objects, each naming
+  // one (tenant, binding) pair the caller needs a capability for.
+  string resources_json = 3;
+}
+
+message IssueCapabilityResponse {
+  // The signed capability token in wire format:
+  // `v1.<base64url(JCS claims)>.<base64url(Ed25519 signature)>`
+  string capability_token = 1;
 }
 

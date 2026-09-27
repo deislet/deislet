@@ -2224,6 +2224,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deis-capability"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "deis-wire",
+ "ed25519-dalek",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "deis-control"
 version = "0.1.0"
 dependencies = [
@@ -2239,6 +2253,7 @@ dependencies = [
  "deis-artifact",
  "deis-backend-migration",
  "deis-bundle",
+ "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",
  "deis-provider-driver",

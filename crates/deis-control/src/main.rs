@@ -272,6 +272,12 @@ async fn main() -> Result<(), anyhow::Error> {
     // `CatalogStore::anchor_bundle_paths`.
     deis_control::api::anchor_bundle_paths(&database, &api_config).await;
 
+    let capability_issuer =
+        deis_control::capability_issuer::CapabilityIssuer::ephemeral(
+            "spiffe://deislet/control/main",
+        )
+        .await;
+
     // One stop signal for the whole process, taken before anything is
     // started so every part gets the same edge: the listener stops
     // accepting, the node control channels are closed instead of being left
@@ -476,6 +482,7 @@ async fn main() -> Result<(), anyhow::Error> {
             machine_listener.set_nonblocking(true)?;
             let machine_app = deis_control::machine::listen::router(
                 api.catalog_state.clone(),
+                capability_issuer.clone(),
                 // A second server value, not the one merged into the human
                 // app: a tonic service is consumed by the router it is added
                 // to, and both listeners carry this service while the fleet

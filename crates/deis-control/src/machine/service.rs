@@ -27,24 +27,27 @@ use deis_wire::machine::{
     DeregisterNodeRequest, DeregisterNodeResponse, FetchAssignmentsRequest,
     FetchAssignmentsResponse, FetchRoutingTableRequest, FetchRoutingTableResponse,
     FetchSecretValuesRequest, FetchSecretValuesResponse,
-    RegisterNodeRequest, RegisterNodeResponse,
+    IssueCapabilityRequest, IssueCapabilityResponse, RegisterNodeRequest,
+    RegisterNodeResponse,
 };
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
 
 use crate::api::catalog::CatalogState;
 use crate::api::catalog::{assignments, routing_table};
+use crate::capability_issuer::CapabilityIssuer;
 use crate::machine::PeerIdentity;
 
 /// Serves the machine channel's RPCs.
 #[derive(Clone)]
 pub struct MachineChannelService {
     state: CatalogState,
+    issuer: CapabilityIssuer,
 }
 
 impl MachineChannelService {
-    pub fn new(state: CatalogState) -> Self {
-        Self { state }
+    pub fn new(state: CatalogState, issuer: CapabilityIssuer) -> Self {
+        Self { state, issuer }
     }
 
     /// The name this caller proved, if the connection established one.
@@ -339,6 +342,67 @@ impl MachineChannel for MachineChannelService {
         );
         Ok(Response::new(FetchSecretValuesResponse { values_json }))
     }
+
+    async fn issue_capability(
+        &self,
+        request: Request<IssueCapabilityRequest>,
+    ) -> Result<Response<IssueCapabilityResponse>, Status> {
+        let proved = Self::caller(&request)
+            .ok_or_else(no_proved_identity)?
+            .clone();
+        let claimed = &request.get_ref().node_id;
+        match names::node_id_of(&proved) {
+            Some(node_id) if node_id == claimed => {}
+            _ => return Err(refuse_mismatch("node", &proved, claimed)),
+        }
+
+        let asked = request.into_inner();
+
+        // Parse the requested resources from JSON.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ResourceRequest {
+            tenant: String,
+            binding: String,
+            #[serde(default)]
+            generation: Option<String>,
+        }
+
+        let resource_requests: Vec<ResourceRequest> =
+            serde_json::from_str(&asked.resources_json).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "resources_json could not be parsed: {error}"
+                ))
+            })?;
+
+        let resources: Vec<deis_capability::CapabilityResource> = resource_requests
+            .into_iter()
+            .map(|r| deis_capability::CapabilityResource {
+                tenant: r.tenant,
+                binding: r.binding,
+                generation: r.generation,
+            })
+            .collect();
+
+        if resources.is_empty() {
+            return Err(Status::invalid_argument(
+                "at least one resource must be requested",
+            ));
+        }
+
+        let capability_token = self
+            .issuer
+            .issue(&asked.audience, &proved.to_string(), resources)
+            .await;
+
+        debug!(
+            node = %proved,
+            audience = %asked.audience,
+            "Issued capability token"
+        );
+
+        Ok(Response::new(IssueCapabilityResponse { capability_token }))
+    }
 }
 
 #[cfg(test)]
@@ -366,13 +430,18 @@ mod tests {
         names::proxy(TRUST_DOMAIN, id).expect("a proxy name")
     }
 
+    fn make_service(state: CatalogState) -> MachineChannelService {
+        let issuer = CapabilityIssuer::for_test("spiffe://deislet/control/test");
+        MachineChannelService::new(state, issuer)
+    }
+
     /// Registration, over the channel where the caller has proved a name. The
     /// answer records the name, so the fleet listing afterwards shows who the
     /// node is rather than which of a list of shared values it held.
     #[tokio::test]
     async fn a_node_registers_itself_and_is_recorded_by_name() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         let answer = service
             .register(from(
@@ -409,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_cannot_register_a_machine_it_is_not() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         let refusal = service
             .register(from(
@@ -438,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn a_registration_that_is_not_one_is_a_bad_request_rather_than_a_failure() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         let refusal = service
             .register(from(
@@ -456,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_gets_its_own_assignments() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         let answer = service
             .fetch_assignments(from(
@@ -482,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_cannot_ask_for_another_nodes_assignments() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         let refusal = service
             .fetch_assignments(from(
@@ -508,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn a_proxy_cannot_ask_for_a_nodes_assignments() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         let refusal = service
             .fetch_assignments(from(
@@ -526,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn a_call_with_no_proved_identity_is_refused_rather_than_treated_as_anonymous() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         let refusal = service
             .fetch_assignments(Request::new(FetchAssignmentsRequest {
@@ -541,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn any_machine_of_the_fleet_may_read_the_routing_table() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         // Asking for the table claims nothing about who is asking, so no id
         // is checked - the connection already proved this is one of ours.
@@ -560,7 +629,7 @@ mod tests {
     #[tokio::test]
     async fn a_proxy_cannot_acknowledge_a_table_on_another_proxys_behalf() {
         let harness = harness(true).await;
-        let service = MachineChannelService::new(harness.state.clone());
+        let service = make_service(harness.state.clone());
 
         let refusal = service
             .fetch_routing_table(from(
