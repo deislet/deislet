@@ -1,0 +1,17 @@
+[package]
+name = "deis-capability"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["kookyleo <kookyleo@gmail.com>"]
+description = "Ed25519-signed JWT capabilities for Deislet service-to-service authorization"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_jcs = "0.2.0"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+ed25519-dalek = "2.2"
+uuid = { version = "1.17.0", features = ["v7"] }
+thiserror = "2"
+deis-wire = { path = "../deis-wire" }
