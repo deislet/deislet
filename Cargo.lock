@@ -2264,6 +2264,7 @@ dependencies = [
  "deis-identity-test-pki",
  "deis-provider-driver",
  "deis-queue",
+ "deis-store",
  "deis-wire",
  "ed25519-dalek",
  "futures",

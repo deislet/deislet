@@ -121,3 +121,7 @@ deis-identity-test-pki = { path = "../deis-identity-test-pki" }
 deis-provider-driver = { path = "../deis-provider-driver", features = ["test-support"] }
 tar = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
+# The capability chain test runs real verifiers against the real binary.
+deis-store = { path = "../deis-store" }
+deis-queue = { path = "../deis-queue" }
+deis-capability = { path = "../deis-capability", features = ["jwks-fetch"] }
