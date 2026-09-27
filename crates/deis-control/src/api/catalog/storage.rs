@@ -185,7 +185,7 @@ mod tests {
     /// can verify with the issuer's public key.
     #[tokio::test]
     async fn the_token_is_an_ed25519_capability() {
-        let h = platform(storage_wiring(None)).await;
+        let h = platform(storage_wiring(false)).await;
         let (status, body) = json(&h.router, "GET", ROUTE, serde_json::Value::Null).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -215,7 +215,7 @@ mod tests {
     /// tenant, so the two environments of one app must not share one.
     #[tokio::test]
     async fn each_environment_gets_its_own_token() {
-        let h = platform(storage_wiring(None)).await;
+        let h = platform(storage_wiring(false)).await;
         json(
             &h.router,
             "POST",
@@ -258,7 +258,7 @@ mod tests {
     /// credential for a tenant nobody deployed.
     #[tokio::test]
     async fn an_unknown_environment_is_not_minted_for() {
-        let h = platform(storage_wiring(None)).await;
+        let h = platform(storage_wiring(false)).await;
         let (status, _) = json(
             &h.router,
             "GET",

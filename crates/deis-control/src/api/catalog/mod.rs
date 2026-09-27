@@ -506,7 +506,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn harness_with(secrets_ready: bool) -> Harness {
-        harness_with_storage(secrets_ready, storage_wiring(None)).await
+        harness_with_storage(secrets_ready, storage_wiring(false)).await
     }
 
     pub(crate) async fn harness_with_queue(secrets_ready: bool) -> Harness {
@@ -554,12 +554,20 @@ pub(crate) mod tests {
 
     /// Wiring built the way the server builds it, so the harness cannot
     /// drift from the real assembly of a delivery.
-    pub(crate) fn storage_wiring(auth_secret: Option<&str>) -> crate::delivery::StorageWiring {
-        crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
+    pub(crate) fn storage_wiring(with_issuer: bool) -> crate::delivery::StorageWiring {
+        let wiring = crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
             store_endpoint: Some("http://127.0.0.1:8090".to_string()),
-            storage_auth_secret: auth_secret.map(str::to_string),
             ..Default::default()
-        })
+        });
+        if with_issuer {
+            wiring.with_issuer(
+                crate::capability_issuer::CapabilityIssuer::for_test(
+                    "spiffe://deislet/control/test",
+                ),
+            )
+        } else {
+            wiring
+        }
     }
 
     pub(crate) async fn harness_with_storage(
@@ -573,7 +581,7 @@ pub(crate) mod tests {
     /// that cannot acknowledge PREPARE. Used to prove a partial prepare never
     /// moves the production pointer.
     pub(crate) async fn harness_with_failed_runtime(secrets_ready: bool) -> Harness {
-        harness_with_storage_and_failed_runtime(secrets_ready, storage_wiring(None), true).await
+        harness_with_storage_and_failed_runtime(secrets_ready, storage_wiring(false), true).await
     }
 
     async fn harness_with_storage_and_failed_runtime(

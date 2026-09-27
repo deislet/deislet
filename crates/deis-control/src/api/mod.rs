@@ -615,7 +615,7 @@ async fn build_catalog_state(
         );
     }
 
-    let storage = StorageWiring::from_config(config);
+    let storage = StorageWiring::from_config(config).with_issuer(issuer.clone());
     if storage.has_no_endpoints() {
         warn!(
             "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so every ctx.services.kv / database / blob / queue call an application makes answers \"service not available\" and declared queue consumers never start"
@@ -633,11 +633,11 @@ async fn build_catalog_state(
     // the difference only shows up as every storage call being refused.
     if storage.mints_tokens() {
         info!(
-            "storage_auth_secret is configured: every deployment carries a capability token minted for its own tenant, and deis-store and deis-queue must hold the identical auth_secret or every storage call an application makes is refused with Unauthenticated"
+            "Capability issuer is configured: every deployment carries Ed25519-signed capability tokens minted for its own tenant"
         );
     } else {
         warn!(
-            "storage_auth_secret is not configured: deployments carry no storage capability token, so anything that can reach deis-store or deis-queue may name any tenant and be served. That is only safe while both services are bound to loopback and have no auth_secret of their own; set the identical secret in all three places before either is reachable from another host"
+            "No capability issuer: deployments carry no storage capability token, so anything that can reach deis-store or deis-queue may name any tenant and be served"
         );
     }
 

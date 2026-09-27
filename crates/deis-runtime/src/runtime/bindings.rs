@@ -122,12 +122,22 @@ pub const QUEUE_CONSUMERS_KEY: &str = "DEIS_QUEUE_CONSUMERS";
 /// Reserved deployment-env key holding this tenant's storage capability
 /// token, minted by deis-control from a secret the storage services share.
 ///
+/// The name `DEIS_STORAGE_TOKEN` arrives under on the environment map.
+///
+/// Lifted out of the map with the rest of the wiring, and for a stronger
+/// reason than the addresses: an application that could read this value could
+/// call deis-store directly *as its own tenant*, bypassing every check this
+/// node makes on its behalf.
+pub const STORAGE_TOKEN_KEY: &str = deis_wire::conventions::STORAGE_TOKEN_ENV;
+
+/// The name `DEIS_QUEUE_TOKEN` arrives under on the environment map.
+///
 /// Lifted out of the map with the rest of the wiring, and for a stronger
 /// reason than the addresses: an application that could read this value could
 /// call deis-store and deis-queue directly *as its own tenant*, bypassing
 /// every check this node makes on its behalf, and one that could declare the
 /// key would be choosing the credential the node then presents for it.
-pub const STORAGE_TOKEN_KEY: &str = deis_wire::conventions::STORAGE_TOKEN_ENV;
+pub const QUEUE_TOKEN_KEY: &str = deis_wire::conventions::QUEUE_TOKEN_ENV;
 
 /// The name `env.ASSETS` is published under.
 ///
@@ -178,12 +188,13 @@ pub const CALLABLE_BY_KEY: &str = "DEIS_CALLABLE_BY";
 
 /// Every key this module claims. Anything spelled this way in a deployment's
 /// env map is platform wiring and is removed before the app sees the map.
-pub const RESERVED_ENV_KEYS: [&str; 8] = [
+pub const RESERVED_ENV_KEYS: [&str; 9] = [
     SERVICES_KEY,
     STORE_ENDPOINT_KEY,
     QUEUE_ENDPOINT_KEY,
     QUEUE_CONSUMERS_KEY,
     STORAGE_TOKEN_KEY,
+    QUEUE_TOKEN_KEY,
     ASSETS_BINDING_KEY,
     BINDINGS_KEY,
     CALLABLE_BY_KEY,
@@ -384,9 +395,13 @@ pub struct ServiceWiring {
     pub endpoints: ServiceEndpoints,
     pub consumers: Vec<QueueConsumerSpec>,
     /// This tenant's storage capability token, or `None` on a platform whose
-    /// control plane has no shared secret configured. Carried here rather
+    /// control plane has no issuer configured. Carried here rather
     /// than left in the env map because the map becomes `ctx.env`.
     pub storage_token: Option<String>,
+    /// Queue-specific capability token (`aud = "queue"`). Separate from
+    /// `storage_token` because store (KV/SQL/blob) and queue require
+    /// different audience claims in their capability tokens.
+    pub queue_token: Option<String>,
     /// The namespaces and the applications this version reaches by name,
     /// exactly as its manifest declared them.
     ///
@@ -416,6 +431,7 @@ impl std::fmt::Debug for ServiceWiring {
             .field("bindings", &self.bindings.describe())
             .field("callable_by", &self.callable_by)
             .field("storage_token", &token_state(&self.storage_token))
+            .field("queue_token", &token_state(&self.queue_token))
             .finish()
     }
 }
@@ -439,6 +455,7 @@ impl ServiceWiring {
             // Not a manifest concept: it is minted per deployment by the
             // control plane, so a caller that has one adds it afterwards.
             storage_token: None,
+            queue_token: None,
             consumers: manifest
                 .queues
                 .iter()
@@ -462,6 +479,7 @@ impl ServiceWiring {
         let queue = env.remove(QUEUE_ENDPOINT_KEY);
         let consumers = env.remove(QUEUE_CONSUMERS_KEY).unwrap_or_default();
         let storage_token = env.remove(STORAGE_TOKEN_KEY);
+        let queue_token = env.remove(QUEUE_TOKEN_KEY);
         let bindings = env.remove(BINDINGS_KEY).unwrap_or_default();
         let callable_by = env.remove(CALLABLE_BY_KEY).unwrap_or_default();
         // Nothing is read out of it -- the binding is built from the version's
@@ -479,6 +497,7 @@ impl ServiceWiring {
             },
             consumers: parse_consumers(&consumers),
             storage_token: non_empty(storage_token),
+            queue_token: non_empty(queue_token),
             bindings: parse_bindings(&bindings),
             callable_by: callable_by
                 .split(',')
@@ -506,6 +525,9 @@ impl ServiceWiring {
         }
         if let Some(token) = &self.storage_token {
             env.insert(STORAGE_TOKEN_KEY.to_string(), token.clone());
+        }
+        if let Some(token) = &self.queue_token {
+            env.insert(QUEUE_TOKEN_KEY.to_string(), token.clone());
         }
         if !self.bindings.is_empty() {
             env.insert(BINDINGS_KEY.to_string(), encode_bindings(&self.bindings));
@@ -1137,6 +1159,10 @@ impl AppServices {
         // split into an app and an environment, and demanding one of it here
         // would stop it from loading over storage it does not use.
         let identity = || StorageIdentity::new(tenant, wiring.storage_token.as_deref());
+        // Queue clients use a separate token because the queue audience
+        // differs from the store audience in capability tokens.
+        let queue_identity =
+            || StorageIdentity::new(tenant, wiring.queue_token.as_deref());
 
         if !store_kinds.is_empty() {
             match wiring.endpoints.store.as_deref() {
@@ -1211,7 +1237,7 @@ impl AppServices {
         if declares_queue {
             match wiring.endpoints.queue.as_deref() {
                 Some(endpoint) => {
-                    let identity = identity()?;
+                    let identity = queue_identity()?;
                     services.queue = Some(QueueClient::connect_lazy(endpoint, &identity)?);
                     tracing::info!(
                         app_id = tenant,

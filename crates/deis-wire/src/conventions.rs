@@ -373,6 +373,11 @@ pub const STORAGE_TOKEN_HEADER: &str = "x-deis-storage-token";
 /// the storage port, bypassing every check the node makes on its behalf.
 pub const STORAGE_TOKEN_ENV: &str = "DEIS_STORAGE_TOKEN";
 
+/// Deployment-env key carrying the queue-specific capability token.
+/// Separate from STORAGE_TOKEN_ENV because queue requires `aud = "queue"`
+/// while store/DB/blob require `aud = "store"`.
+pub const QUEUE_TOKEN_ENV: &str = "DEIS_QUEUE_TOKEN";
+
 /// The capability token for one tenant, derived from the shared secret.
 ///
 /// `base64(HMAC-SHA256(secret, tenant))`, standard alphabet with padding.
