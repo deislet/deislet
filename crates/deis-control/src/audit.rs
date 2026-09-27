@@ -13,8 +13,10 @@
 //! **refused** call is recorded whatever it was asking for. Successful reads
 //! are not: they are the overwhelming majority of the traffic, and a table
 //! that holds them is a request log in which the two lines that matter cannot
-//! be found. The one read that is always recorded is the storage-token mint,
-//! because what it hands back is a credential.
+//! be found. The two reads that are always recorded are the storage-token
+//! mint, because what it hands back is a credential, and a node's
+//! `secret.fetch` over the machine channel, because what it hands back is
+//! decrypted secret values (the line names the revisions, never a value).
 //!
 //! What never reaches this table is a value. A secret write records the
 //! secret's *name*, taken from the request path, and the recorder never reads

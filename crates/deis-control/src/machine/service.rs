@@ -20,6 +20,7 @@
 //! so the id is in the certificate already, and reading it there is free.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use deis_identity::{SpiffeId, names};
 use deis_wire::machine::machine_channel_server::MachineChannel;
@@ -30,10 +31,11 @@ use deis_wire::machine::{
     IssueCapabilityResponse, RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::api::catalog::CatalogState;
 use crate::api::catalog::{assignments, routing_table};
+use crate::audit::{AuditRecord, AuditStore, Outcome as AuditOutcome};
 use crate::capability_issuer::CapabilityIssuer;
 use crate::machine::PeerIdentity;
 
@@ -42,11 +44,51 @@ use crate::machine::PeerIdentity;
 pub struct MachineChannelService {
     state: CatalogState,
     issuer: CapabilityIssuer,
+    /// The same append-only table the human API writes, over the catalog's
+    /// database, so a secret fetch is found by the same audit query.
+    audit: Arc<AuditStore>,
 }
 
 impl MachineChannelService {
     pub fn new(state: CatalogState, issuer: CapabilityIssuer) -> Self {
-        Self { state, issuer }
+        let audit = Arc::new(AuditStore::new(state.store.database()));
+        Self {
+            state,
+            issuer,
+            audit,
+        }
+    }
+
+    /// Write down a secret fetch that was not answered, and say so in the
+    /// service log. Returns the status so a call site can `return Err` it.
+    async fn refuse_secret_fetch(
+        &self,
+        proved: &SpiffeId,
+        deployment_id: Option<&str>,
+        status: Status,
+    ) -> Status {
+        warn!(
+            proved = %proved,
+            deployment_id = deployment_id.unwrap_or(""),
+            reason = status.message(),
+            "Refused a node's request for secret values"
+        );
+        let http_status = match status.code() {
+            tonic::Code::InvalidArgument => 400,
+            tonic::Code::PermissionDenied => 403,
+            tonic::Code::NotFound => 404,
+            _ => 500,
+        };
+        self.audit
+            .record(secret_fetch_record(
+                proved,
+                deployment_id,
+                AuditOutcome::from_status(http_status),
+                http_status,
+                status.message().to_string(),
+            ))
+            .await;
+        status
     }
 
     /// The name this caller proved, if the connection established one.
@@ -92,19 +134,42 @@ fn refuse_mismatch(kind: &str, proved: &SpiffeId, claimed: &str) -> Status {
     ))
 }
 
-/// The audit line for a refused secret fetch. Names who asked and for what,
-/// never a value; the accepted counterpart is written inline where the
-/// revisions and count are known.
-fn audit_secret_fetch_refused(node: &str, deployment_id: Option<&str>, reason: &str) {
-    warn!(
-        target: "deis_control::audit",
-        event = "secret.fetch",
-        outcome = "refused",
-        node = %node,
-        deployment_id = deployment_id.unwrap_or(""),
-        reason,
-        "Refused a node's request for secret values"
-    );
+/// The path an audit line gives a secret fetch: the gRPC method, so the
+/// line reads like the HTTP ones beside it in the same table.
+const FETCH_SECRET_VALUES_PATH: &str = "/deis.machine.MachineChannel/FetchSecretValues";
+
+/// The action an audit line gives a secret fetch.
+const SECRET_FETCH_ACTION: &str = "secret.fetch";
+
+/// One audit line for a secret fetch, accepted or refused.
+///
+/// The actor is the name the connection proved, never the id the request
+/// claimed; the detail names revisions, never a value. Decrypted secrets are
+/// at least as sensitive as the storage-token mint, which is why this read is
+/// written down at all.
+fn secret_fetch_record(
+    proved: &SpiffeId,
+    deployment_id: Option<&str>,
+    outcome: AuditOutcome,
+    status: u16,
+    detail: String,
+) -> AuditRecord {
+    AuditRecord {
+        actor_kind: "machine".to_string(),
+        actor_account: Some(proved.to_string()),
+        actor_credential: None,
+        action: SECRET_FETCH_ACTION.to_string(),
+        app_id: None,
+        environment: None,
+        target: deployment_id.map(str::to_string),
+        method: "GRPC".to_string(),
+        path: FETCH_SECRET_VALUES_PATH.to_string(),
+        peer: None,
+        outcome,
+        status,
+        detail: Some(detail),
+        request_id: None,
+    }
 }
 
 #[tonic::async_trait]
@@ -283,22 +348,27 @@ impl MachineChannel for MachineChannelService {
         let node_id = match names::node_id_of(&proved) {
             Some(node_id) if node_id == claimed => node_id.to_string(),
             _ => {
-                audit_secret_fetch_refused(claimed, None, "the certificate names another node");
-                return Err(refuse_mismatch("node", &proved, claimed));
+                let refusal = refuse_mismatch("node", &proved, claimed);
+                return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
             }
         };
 
         let entries: Vec<deis_wire::conventions::SecretFetchEntry> =
-            serde_json::from_str(&request.get_ref().entries_json).map_err(|error| {
-                Status::invalid_argument(format!(
-                    "secret fetch entries could not be parsed: {error}"
-                ))
-            })?;
+            match serde_json::from_str(&request.get_ref().entries_json) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    let refusal = Status::invalid_argument(format!(
+                        "secret fetch entries could not be parsed: {error}"
+                    ));
+                    return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
+                }
+            };
         if entries.is_empty() || entries.iter().any(|entry| entry.revisions.is_empty()) {
-            return Err(Status::invalid_argument(
+            let refusal = Status::invalid_argument(
                 "every secret fetch entry must name at least one revision; there is no \
                  \"everything for this deployment\" request",
-            ));
+            );
+            return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
         }
 
         // The node's own name, from the certificate, decides what it may
@@ -315,26 +385,22 @@ impl MachineChannel for MachineChannelService {
         let mut wanted = Vec::with_capacity(entries.len());
         for entry in &entries {
             let Some(deployment) = visible.get(&entry.deployment_id) else {
-                audit_secret_fetch_refused(
-                    &node_id,
-                    Some(&entry.deployment_id),
-                    "the deployment is not assigned to this node",
-                );
-                return Err(Status::permission_denied(format!(
+                let refusal = Status::permission_denied(format!(
                     "deployment {} is not assigned to node {node_id}",
                     entry.deployment_id
-                )));
+                ));
+                return Err(self
+                    .refuse_secret_fetch(&proved, Some(&entry.deployment_id), refusal)
+                    .await);
             };
             let Some(snapshot_id) = deployment.snapshot_id.as_deref() else {
-                audit_secret_fetch_refused(
-                    &node_id,
-                    Some(&entry.deployment_id),
-                    "the deployment binds no secret revisions",
-                );
-                return Err(Status::permission_denied(format!(
+                let refusal = Status::permission_denied(format!(
                     "deployment {} binds no secret revisions",
                     entry.deployment_id
-                )));
+                ));
+                return Err(self
+                    .refuse_secret_fetch(&proved, Some(&entry.deployment_id), refusal)
+                    .await);
             };
             let revisions: BTreeSet<String> = entry.revisions.iter().cloned().collect();
             wanted.push((entry, deployment.env_id.as_str(), snapshot_id, revisions));
@@ -342,18 +408,15 @@ impl MachineChannel for MachineChannelService {
 
         let mut values: BTreeMap<String, String> = BTreeMap::new();
         for (entry, env_id, snapshot_id, revisions) in wanted {
-            let fetched = self
+            let fetched = match self
                 .state
                 .deliverer
                 .snapshot_secret_values(env_id, snapshot_id, &revisions)
                 .await
-                .map_err(|error| {
-                    audit_secret_fetch_refused(
-                        &node_id,
-                        Some(&entry.deployment_id),
-                        &error.to_string(),
-                    );
-                    match error {
+            {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    let refusal = match error {
                         crate::catalog::CatalogError::Forbidden(message) => {
                             Status::permission_denied(message)
                         }
@@ -363,15 +426,26 @@ impl MachineChannel for MachineChannelService {
                         other => {
                             Status::internal(format!("secret values could not be read: {other}"))
                         }
-                    }
-                })?;
-            info!(
-                target: "deis_control::audit",
-                event = "secret.fetch",
-                outcome = "accepted",
+                    };
+                    return Err(self
+                        .refuse_secret_fetch(&proved, Some(&entry.deployment_id), refusal)
+                        .await);
+                }
+            };
+            // Revision ids and a count, never a value.
+            let revision_list = revisions.iter().cloned().collect::<Vec<_>>().join(",");
+            self.audit
+                .record(secret_fetch_record(
+                    &proved,
+                    Some(&entry.deployment_id),
+                    AuditOutcome::Accepted,
+                    200,
+                    format!("revisions={revision_list} count={}", fetched.len()),
+                ))
+                .await;
+            debug!(
                 node = %node_id,
                 deployment_id = %entry.deployment_id,
-                revisions = ?revisions,
                 count = fetched.len(),
                 "A node fetched secret values over the machine channel"
             );
@@ -856,6 +930,76 @@ mod tests {
             .await
             .expect_err("a deployment that does not exist was answered");
         assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// The `secret.fetch` lines in the persistent audit table, oldest first.
+    async fn secret_fetch_lines(state: &CatalogState) -> Vec<crate::audit::AuditEntry> {
+        let audit = AuditStore::new(state.store.database());
+        let mut lines = audit
+            .query_page(
+                crate::audit::AuditQuery {
+                    action: Some(SECRET_FETCH_ACTION.to_string()),
+                    ..Default::default()
+                },
+                100,
+                None,
+            )
+            .await
+            .expect("the audit log reads")
+            .items;
+        lines.reverse();
+        lines
+    }
+
+    /// Both outcomes reach the audit table an operator queries, naming the
+    /// proved machine, the deployment and the revisions - never the value.
+    #[tokio::test]
+    async fn a_secret_fetch_is_written_to_the_audit_log_either_way() {
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+
+        service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect("a node may fetch its own deployment's secrets");
+        service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", "no-such-deployment", &[&revision]),
+            ))
+            .await
+            .expect_err("a deployment that does not exist was answered");
+
+        let lines = secret_fetch_lines(&h.state).await;
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        let proved = node("runtime-test").to_string();
+
+        let accepted = &lines[0];
+        assert_eq!(accepted.outcome, AuditOutcome::Accepted);
+        assert_eq!(accepted.actor_kind, "machine");
+        assert_eq!(accepted.actor_account.as_deref(), Some(proved.as_str()));
+        assert_eq!(accepted.target.as_deref(), Some(deployment_id.as_str()));
+        assert_eq!(accepted.path, FETCH_SECRET_VALUES_PATH);
+        let detail = accepted.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains(&revision), "{detail}");
+
+        let refused = &lines[1];
+        assert_eq!(refused.outcome, AuditOutcome::Refused);
+        assert_eq!(refused.status, 403);
+        assert_eq!(refused.actor_account.as_deref(), Some(proved.as_str()));
+        assert_eq!(refused.target.as_deref(), Some("no-such-deployment"));
+
+        for line in &lines {
+            let text = format!("{line:?}");
+            assert!(
+                !text.contains("first-value"),
+                "a value reached the log: {text}"
+            );
+        }
     }
 
     /// The node the answer is for comes from the certificate: claiming
