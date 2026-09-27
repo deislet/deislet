@@ -134,7 +134,7 @@ Deislet 定位为可信代码平台：平台假设同一安装内部署的应用
 
 ### 必须修复的 client/tooling 缺口
 
-- GitHub Actions `checks.yml` 的 workspace、demo 与静态检查全部只在 `ubuntu-latest`；
+- GitHub Actions `checks.yml` 的 workspace、demo 与静态检查全部只在一台 Linux x64 自托管 runner 上运行（构建机 s7，见 [ci-runner.md](../operations/ci-runner.md)；此前是 `ubuntu-latest`）；
 - compiler 的若干 artifact determinism/path/security tests 标为 `cfg(unix)`，Windows 没有等价证据；
 - CLI 为保持 `--json` stdout 干净使用 Unix-only file-descriptor 重定向，非 Unix 路径会警告输出可能混杂；
 - CLI 的 dev-dependencies 直接引入 `deis-queue`、`deis-telemetry` server crate，可能让 Windows client build 被 Unix server code 拖累；

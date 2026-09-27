@@ -7,14 +7,13 @@ Radix primitives.
 ## How it reaches the browser
 
 There is no separate web server and no separate port. `npm run build` writes
-`dist/`, and `crates/deis-control/src/api/static_files.rs` embeds that
-directory into the `deis-control` binary with `rust-embed`, serving it from the
+`dist/`, the crate's `build.rs` lists that directory into an `include_bytes!`
+table, and `crates/deis-control/src/api/static_files.rs` serves it from the
 same listener that answers the API. So a change here is only live after a
 rebuild of the crate.
 
 `dist/` is a build product and is not in git. The crate's `build.rs` creates an
-empty one when it is missing, because `rust-embed` cannot expand without the
-directory and the crate would otherwise not compile on a fresh clone at all.
+empty one when it is missing, so a fresh clone compiles without it.
 A binary built that way is a working control plane with no dashboard: the API
 answers normally and the dashboard pages return 404, and the build prints a
 warning saying so. To get the dashboard, run `npm run build` here and rebuild

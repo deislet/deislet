@@ -14,6 +14,21 @@
 # compiles it has to `npm ci && npm run build` first or it produces a binary
 # that answers 404 for every dashboard page. Every job below that compiles
 # deis-control does that first.
+#
+# Where it runs: a self-hosted runner on the build host s7, registered for the
+# deislet organisation with the label `deislet`. GitHub-hosted runners stopped
+# starting on 2026-09-04 over a billing problem; docs/operations/ci-runner.md
+# says how the runner is registered and what it expects to find on the host.
+# The host is persistent, so there is no disk to free and no registry cache to
+# restore: the cargo registry, the npm cache and the target directory all
+# survive between runs, and the target directory is the canonical one that
+# `.github/actions/build-host` pins (see that file for why it matters).
+#
+# Every job carries the same guard against pull requests from forks: the
+# runner executes whatever the pull request's workflow and build scripts say,
+# on a machine with credentials for the build cluster, so only branches of this
+# repository may reach it. The organisation settings refuse fork workflows as
+# well; the guard is here so that a settings change alone cannot open it.
 name: checks
 
 on:
@@ -28,45 +43,45 @@ permissions:
 # A second push supersedes the first: these jobs take minutes, and a queue of
 # runs against commits nobody is looking at any more is a queue in front of the
 # one somebody is.
+#
+# Across refs, the cargo jobs are serialised by the runner itself: exactly one
+# runner carries the `deislet` label, and a runner takes one job at a time, so
+# two cargo builds never contend for the host (or for one target directory's
+# lock). A job-level concurrency group would add nothing to that and would
+# cancel a queued run whenever a third arrived.
 concurrency:
   group: checks-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # Nothing here is a performance measurement and every job starts from a cold
-  # target directory or a restored cache, so incremental compilation buys
-  # nothing and costs cache size.
-  CARGO_INCREMENTAL: 0
-  # No debug info in CI builds. The second run of this workflow filled the
-  # runner's disk before `demo.sh start` had finished compiling: a debug
-  # build of this workspace with full debug info (V8, deno, pingora, tonic)
-  # is tens of gigabytes, and the runner starts with about fourteen free.
-  # Nothing here reads a debugger; a panic's backtrace still names functions.
-  CARGO_PROFILE_DEV_DEBUG: 0
-  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   product-governance:
     name: product decisions, standard lock and roadmap agree
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, deislet]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
+      # The host's own python3 in a throwaway virtual environment: the system
+      # interpreter refuses `pip install` outside one (PEP 668), and a venv
+      # per run keeps one job's packages out of the next.
       - name: Install governance schema validator
-        run: python3 -m pip install --disable-pip-version-check -r scripts/governance-requirements.txt
+        run: |
+          python3 -m venv "$RUNNER_TEMP/governance-venv"
+          "$RUNNER_TEMP/governance-venv/bin/python" -m pip install --disable-pip-version-check --quiet \
+            -r scripts/governance-requirements.txt
+          echo "$RUNNER_TEMP/governance-venv/bin" >> "$GITHUB_PATH"
       - name: Validate product governance records
         run: python3 scripts/check-product-governance.py
       - name: Execute shared product contract fixtures
         run: python3 scripts/check-shared-contracts.py
       # The OpenAPI document is generated from the control plane's code and
-      # committed; the drift test in the deis-control shard keeps the two
-      # equal. This step holds the committed file to its invariants and
-      # refuses a change that would break a client written against the
-      # document on main unless its major version bumps. The full history
-      # is needed because the baseline is read off origin/main.
+      # committed; the drift test in deis-control keeps the two equal. This
+      # step holds the committed file to its invariants and refuses a change
+      # that would break a client written against the document on main unless
+      # its major version bumps. The baseline is read off origin/main.
       - name: Hold the Control API OpenAPI document to its compatibility promise
         run: |
           git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main
@@ -83,7 +98,9 @@ jobs:
 
   document-path-literals:
     name: documents reference the path constants
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, deislet]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
@@ -108,7 +125,9 @@ jobs:
 
   document-links:
     name: documents link at files that exist
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, deislet]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
@@ -122,7 +141,9 @@ jobs:
 
   unit-files:
     name: the shipped systemd units verify
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, deislet]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
@@ -130,38 +151,43 @@ jobs:
       # starting anything. The ExecStart binaries are not built here - the
       # workspace job does that - so each unit is verified against a
       # placeholder at the same path, which is enough for the directive
-      # checks and for the slice's existence. Runner noise from the image's
-      # own units is filtered rather than failing on it.
+      # checks and for the slice's existence. Noise from the host's own units
+      # is filtered rather than failing on it. Scratch files live under
+      # RUNNER_TEMP: /tmp on a persistent host is shared with everything else.
       - name: systemd-analyze verify
         run: |
           set -eu
-          mkdir -p /tmp/verify-bin
+          work="$RUNNER_TEMP/verify-bin"
+          rm -rf "$work"
+          mkdir -p "$work"
           for unit in scripts/canary/systemd/*.service; do
             name=$(basename "$unit")
             bin=$(grep '^ExecStart=' "$unit" | head -1 | sed 's/^ExecStart=//' | awk '{print $1}')
-            touch "/tmp/verify-bin/$(basename "$bin")"
-            chmod +x "/tmp/verify-bin/$(basename "$bin")"
-            sed "s|^ExecStart=.*|ExecStart=/tmp/verify-bin/$(basename "$bin")|" "$unit" > "/tmp/verify-bin/$name"
+            touch "$work/$(basename "$bin")"
+            chmod +x "$work/$(basename "$bin")"
+            sed "s|^ExecStart=.*|ExecStart=$work/$(basename "$bin")|" "$unit" > "$work/$name"
           done
-          cp scripts/canary/systemd/deislet.slice /tmp/verify-bin/
-          # verify reads the runner's own installed units too and reports the
-          # image's unrelated problems; what this job answers for is the
-          # files in scripts/canary/systemd/, so only their diagnostics count.
-          systemd-analyze verify /tmp/verify-bin/*.service /tmp/verify-bin/deislet.slice \
-            2> /tmp/verify-err || true
+          cp scripts/canary/systemd/deislet.slice "$work/"
+          # verify reads the host's own installed units too and reports their
+          # unrelated problems; what this job answers for is the files in
+          # scripts/canary/systemd/, so only their diagnostics count.
+          systemd-analyze verify "$work"/*.service "$work/deislet.slice" \
+            2> "$work/verify-err" || true
           echo "---- diagnostics for the shipped units ----"
-          grep -F -f <(printf '%s\n' /tmp/verify-bin/deis-control.service /tmp/verify-bin/deis-proxy.service \
-            /tmp/verify-bin/deis-queue.service /tmp/verify-bin/deis-runtime.service \
-            /tmp/verify-bin/deis-store.service /tmp/verify-bin/deis-telemetry.service \
-            /tmp/verify-bin/deislet.slice) /tmp/verify-err > /tmp/verify-shipped || true
-          cat /tmp/verify-shipped
-          if [ -s /tmp/verify-shipped ]; then
+          grep -F -f <(printf '%s\n' "$work/deis-control.service" "$work/deis-proxy.service" \
+            "$work/deis-queue.service" "$work/deis-runtime.service" \
+            "$work/deis-store.service" "$work/deis-telemetry.service" \
+            "$work/deislet.slice") "$work/verify-err" > "$work/verify-shipped" || true
+          cat "$work/verify-shipped"
+          if [ -s "$work/verify-shipped" ]; then
             exit 1
           fi
 
   demo-witnesses:
     name: the demo's own witnesses hold
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, deislet]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
@@ -176,51 +202,36 @@ jobs:
         run: ./scripts/test-demo-witnesses.sh
 
   workspace:
-    name: audit, format, lint and build the workspace
-    runs-on: ubuntu-latest
-    # The former all-in-one job put a second test-only compilation of Deno and
-    # rolldown after this work and ran into both the 60- and 120-minute job
-    # ceilings. This job now owns only the common static gates and ordinary
-    # workspace build; executable tests are the three bounded shards below.
-    timeout-minutes: 60
+    name: audit, format, lint, build and test the workspace
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, deislet]
+    # One job for every cargo step. The tests used to be three shards on
+    # separate GitHub-hosted machines, each with its own cold target
+    # directory and its own hand-kept list of crates - and a crate nobody
+    # added to a list was never tested at all (deis-capability and
+    # deis-provider-driver-cloudflare were in none). On one persistent host
+    # the shards bought nothing but three copies of the same compilation, so
+    # the tests are now `nextest run --workspace` in the directory the build
+    # step has just filled.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
-      # The version rust-toolchain.toml pins, spelled here as well because
-      # the action installs what it is told and this file must not silently
-      # test a different compiler from the one developers run.
-      - uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          components: clippy, rustfmt
+      - uses: ./.github/actions/build-host
 
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/deis-control/web/package-lock.json
 
-      # The runner image ships toolchains this workspace never uses; the
-      # space they take is the space the build needs. Same step in the demo
-      # job, for the same reason.
-      - name: Free disk space
+      # Pinned tools, installed into the runner user's ~/.cargo/bin the first
+      # time and found there afterwards (`cargo install` of a version that is
+      # already installed does nothing). Outside the canonical target
+      # directory, so a tool's build never shares a lock or a cache key with
+      # the workspace's.
+      - name: Install pinned cargo tools
         run: |
-          set -eu
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h / | tail -1
-
-      # The registry and git checkouts only. `target` is not cached: with
-      # this workspace it is larger than the cache's per-entry ceiling, so a
-      # cached `target` was a slow way of restoring nothing.
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-registry-
+          env -u CARGO_TARGET_DIR cargo install cargo-audit --locked --version 0.22.2
+          env -u CARGO_TARGET_DIR cargo install cargo-nextest --locked --version 0.9.146
 
       # Before anything cargo does. deis-control embeds this directory, and a
       # build without it is a build of a control plane whose dashboard is 404.
@@ -249,9 +260,7 @@ jobs:
       # Keep the written exceptions in .cargo/audit.toml under review while
       # rejecting every advisory that has not been explicitly judged there.
       - name: Audit Rust dependencies
-        run: |
-          cargo install cargo-audit --locked --version 0.22.2
-          cargo audit
+        run: cargo audit
 
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -261,141 +270,65 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Also what the runtime integration tests need: two of them start the
+      # real deis-proxy binary from this target directory, and a package's
+      # tests do not build another package's binaries.
       - name: Build
         run: cargo build --workspace
 
-  runtime-tests:
-    name: runtime tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.96.0
+      # Every test of every workspace crate, one process per test. The `ci`
+      # profile (.config/nextest.toml) retries a failure once and reports a
+      # test that needed it as FLAKY, and writes JUnit next to the run.
+      - name: Tests
+        run: cargo nextest run --workspace --profile ci
 
-      - name: Free disk space
-        run: |
-          set -eu
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h / | tail -1
+      # nextest does not run documentation tests; `cargo test` did.
+      - name: Documentation tests
+        run: cargo test --workspace --doc
 
-      - name: Cache cargo registry
-        uses: actions/cache@v5
+      - name: Keep the test report
+        if: always()
+        # Artifact storage is billed to the organisation; a report that cannot
+        # be uploaded must not turn a green run red.
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-registry-
-
-      # Two runtime integration cases start the real proxy binary. A package
-      # test does not build binaries from another workspace package, and jobs
-      # do not share the static workspace job's target directory.
-      - name: Build the proxy exercised by runtime integration tests
-        run: cargo build -p deis-proxy
-
-      - name: Runtime tests
-        run: cargo test -p deis-runtime --no-fail-fast
-
-  compiler-cli-tests:
-    name: compiler, adapters and CLI tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.96.0
-
-      - name: Free disk space
-        run: |
-          set -eu
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h / | tail -1
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-registry-
-
-      - name: Compiler, adapters and CLI tests
-        run: cargo test -p deis-bundle -p deis-node-contract -p deis-artifact -p deis-build-core -p deis-build-adapter-cloudflare -p deis-build-adapter-deislet -p deis-build-adapter-deno -p deis-build-adapter-tencent -p deis-build -p deis --no-fail-fast
-
-  control-services-tests:
-    name: control plane and service tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.96.0
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/deis-control/web/package-lock.json
-
-      - name: Free disk space
-        run: |
-          set -eu
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h / | tail -1
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-registry-
-
-      - name: Build the web console deis-control embeds
-        working-directory: crates/deis-control/web
-        run: |
-          npm ci
-          npm run build
-
-      - name: Control plane and service tests
-        run: cargo test -p deis-wire -p deis-identity -p deis-identity-test-pki -p deis-provider-driver -p deis-backend-migration -p deis-backend-topology -p deis-control -p deis-store -p deis-queue -p deis-telemetry -p deis-proxy --no-fail-fast
+          name: nextest-junit
+          # nextest keeps its store under the workspace, not CARGO_TARGET_DIR.
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
 
   demo:
     name: the demo runs end to end
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, deislet]
     timeout-minutes: 45
+    # Its own port range. The host is shared with people and agents who run
+    # the demo on its defaults (8085-8097); `claim_port` moves past a port in
+    # use, but a claim is a hint rather than a reservation, so two demos
+    # starting at once on the same range could still take each other's.
+    env:
+      DEIS_CONTROL_PORT: '18085'
+      DEIS_RUNTIME_PORT: '18086'
+      DEIS_PROXY_PORT: '18087'
+      DEIS_PROXY_TLS_PORT: '18088'
+      DEIS_CONTROL_MACHINE_PORT: '18089'
+      ACME_CA_PORT: '18095'
+      DEIS_STORE_PORT: '18090'
+      DEIS_QUEUE_PORT: '18091'
+      DEIS_TELEMETRY_PORT: '18092'
+      DEIS_TELEMETRY_METRICS_PORT: '18093'
+      DEIS_ORIGIN_PORT: '18094'
+      DEIS_RUNTIME_MACHINE_PORT: '18097'
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: ./.github/actions/build-host
 
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/deis-control/web/package-lock.json
-
-      - name: Free disk space
-        run: |
-          set -eu
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h / | tail -1
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-registry-
 
       - name: Build the web console deis-control embeds
         working-directory: crates/deis-control/web
@@ -403,27 +336,44 @@ jobs:
           npm ci
           npm run build
 
-      # curl, jq, python3, openssl and iproute2 are on the runner already.
-      # grpcurl is not, and without it the four checks that ask deis-store and
-      # deis-telemetry directly report a failure rather than skipping - which
-      # is the right behaviour and would fail this job. Installed from the
-      # published release rather than built, and the download is checked
-      # against its own checksum file so a job does not run a tarball it
-      # cannot identify.
+      # curl, jq, python3, openssl and iproute2 are on the host already.
+      # grpcurl may not be, and without it the four checks that ask deis-store
+      # and deis-telemetry directly report a failure rather than skipping -
+      # which is the right behaviour and would fail this job. Installed from
+      # the published release into the runner's tool cache (once; later runs
+      # find it there), and the download is checked against its own checksum
+      # file so a job does not run a tarball it cannot identify.
       - name: Install grpcurl
         env:
           GRPCURL_VERSION: 1.9.3
         run: |
           set -euo pipefail
-          base="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}"
-          curl -sSLf -o grpcurl.tar.gz "${base}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
-          curl -sSLf -o grpcurl.sha256sum "${base}/grpcurl_${GRPCURL_VERSION}_checksums.txt"
-          grep " grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz\$" grpcurl.sha256sum \
-            | sed "s/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz/grpcurl.tar.gz/" \
-            | sha256sum -c -
-          tar -xzf grpcurl.tar.gz grpcurl
-          sudo install -m 0755 grpcurl /usr/local/bin/grpcurl
-          grpcurl --version
+          dir="$RUNNER_TOOL_CACHE/grpcurl/$GRPCURL_VERSION"
+          if [ ! -x "$dir/grpcurl" ]; then
+            work=$(mktemp -d "$RUNNER_TEMP/grpcurl.XXXXXX")
+            cd "$work"
+            base="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}"
+            curl -sSLf -o grpcurl.tar.gz "${base}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
+            curl -sSLf -o grpcurl.sha256sum "${base}/grpcurl_${GRPCURL_VERSION}_checksums.txt"
+            grep " grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz\$" grpcurl.sha256sum \
+              | sed "s/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz/grpcurl.tar.gz/" \
+              | sha256sum -c -
+            tar -xzf grpcurl.tar.gz grpcurl
+            mkdir -p "$dir"
+            install -m 0755 grpcurl "$dir/grpcurl"
+          fi
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/grpcurl" --version
+
+      # A cancelled run does not reach `stop`, and the components it started
+      # outlive the job; `start` then refuses to run beside them. Only this
+      # runner's own binaries match (the pattern is its target directory),
+      # and the runner user cannot signal anybody else's processes anyway.
+      - name: Clear what a cancelled run left behind
+        run: |
+          pkill -f "${CARGO_TARGET_DIR}/debug/deis-" || true
+          pkill -f "${CARGO_TARGET_DIR}/debug/examples/acme_test_ca" || true
+          pkill -f "${GITHUB_WORKSPACE}/.demo/origin/origin.py" || true
 
       - name: Start the demo
         run: ./scripts/demo.sh start
@@ -444,6 +394,7 @@ jobs:
       # the job's output alone: the reason is in these files.
       - name: Keep the run's logs
         if: failure()
+        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: demo-logs

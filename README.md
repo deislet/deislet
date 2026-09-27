@@ -260,16 +260,18 @@ cd crates/deis-control/web && npm ci && npm run build
 
 Three local-build pitfalls worth knowing:
 
-- **Distributed compilation breaks `deis-control`.** The `rust-embed` macro
-  that inlines `web/dist` runs inside the compile job; with sccache-dist that
-  job can run on a worker with no such path, and the build fails with
-  `folder … web/dist does not exist`. Keep the crate off distributed
-  compilation (`SCCACHE_NO_DIST_COMPILE=1`) or build it locally.
+- **The console is embedded as it was at the last build.** `build.rs` lists
+  `web/dist` into a table of `include_bytes!` inputs and reruns whenever a
+  file or directory under it changes, so a new `npm run build` is picked up by
+  the next cargo build; nothing is read from disk at run time. (It used to be
+  a `rust-embed` derive, which listed the directory during macro expansion and
+  so failed on sccache-dist workers; plain `include_bytes!` inputs are shipped
+  to the worker like any other source file.)
 - **A deleted `web/dist` comes back — empty.** The build script emits
-  `cargo:rerun-if-changed=web/dist`, so cargo reruns it when the directory
-  appears or disappears. Deleting the directory therefore does not keep it
-  gone: the next build recreates it, with nothing in it, and the dashboard
-  pages answer 404 until `npm run build` has filled it again.
+  `cargo:rerun-if-changed` for `web/dist` and everything under it, so cargo
+  reruns it when the directory disappears. Deleting the directory therefore
+  does not keep it gone: the next build recreates it, with nothing in it, and
+  the dashboard pages answer 404 until `npm run build` has filled it again.
 - **A corrupt v8 cache fails with `Decompression error`.** The prebuilt v8
   static library is cached after download; clear the cache (`~/.cache/rusty_v8`
   or the file named by `RUSTY_V8_ARCHIVE`) and rebuild, or point
@@ -334,14 +336,19 @@ is not a statement about anything above.
 `.github/workflows/checks.yml` is written to run, on every push to `main` and
 every pull request: the three document checks (path constants, link targets
 and written-down counts), the witness tests below, `cargo fmt --check`,
-`cargo clippy -D warnings`, `cargo build --workspace`, the three test shards,
-and a full `start` → `verify` → `stop`. Until it grew those jobs it held the
+`cargo clippy -D warnings`, `cargo build --workspace`, every test of every
+workspace crate (`cargo nextest run --workspace`, plus the doc tests), and a
+full `start` → `verify` → `stop`. Until it grew those jobs it held the
 document-path check alone, and nothing automatic had ever compiled this
 workspace, run its tests, or run the verification the project's claims are
-quoted from. Status: the last green run is `33848760058`, 2026-09-04. Every
-run since then has failed within seconds — a GitHub billing problem, not a
-build failure — so changes landed after that date carry local evidence only.
-This paragraph is to be updated once CI is running again.
+quoted from. Status: the last green run is `33848760058`, 2026-09-04, on
+GitHub-hosted runners. Every run since then has failed within seconds — a
+GitHub billing problem, not a build failure — so changes landed after that
+date carry local evidence only. The workflow now targets a self-hosted runner
+on the build host instead
+([docs/operations/ci-runner.md](docs/operations/ci-runner.md)); until that
+runner is registered its runs wait in the queue, and this paragraph is to be
+updated with the first green run there.
 
 ```bash
 bash scripts/test-demo-witnesses.sh    # unit tests for verify itself; no demo needed

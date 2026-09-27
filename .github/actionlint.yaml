@@ -1,0 +1,5 @@
+# The custom label of the self-hosted runner (docs/operations/ci-runner.md),
+# so actionlint knows `runs-on: [self-hosted, linux, x64, deislet]` is meant.
+self-hosted-runner:
+  labels:
+    - deislet
